@@ -64,6 +64,8 @@ node src/cli.js handoff --state-dir "$HOME/.config/discord-surface" \
   --handoff-id AUTHORITY_HANDOFF_ID
 ```
 
+If the Discord topic write fails after the local handoff is recorded, repeat the exact handoff ID after checking the channel. The adapter repairs that same generation and rejects reuse of the ID for a different successor.
+
 An interrupted channel create leaves a durable intent. A later invocation may reconcile an exact topic marker or use explicit `--channel-id` adoption. If the create outcome is unknown and no channel evidence exists, the adapter stops rather than creating a possible duplicate. Discord permissions still need to allow channel creation under the selected category. `--task-name` changes presentation only. Ordinary workers and forks have no provisioning path.
 
 The bind and rebind commands reject a malformed UUID. Rebind and unbind wait until all accepted, dispatching, submitted, uncertain, and reply custody states have been reconciled. Unbind leaves an inactive tombstone so replied history remains readable. Each binding generation is persisted and stale native replies are rejected. Provider identity is checked with the UUID at every native reply boundary, so the same UUID under another provider cannot populate custody.
@@ -103,6 +105,8 @@ Claude Channels require opt-in when the native Claude session launches. Start th
 The channel process forwards events only after checking its exact native UUID, binding endpoint, and generation. Its `reply` tool requires the inbound Discord message ID and generation. It persists reply custody before acknowledging the MCP tool call. A Claude session without launch-time channel opt-in is not attached or resumed by this adapter.
 
 Accepted input is durable before a Discord handler returns. During login and reconnect, messages are durably held while a persisted Discord watermark is backfilled. Adoption starts at the newest observed message, so pre-adoption history is not executed. Backfill is bounded at 100 messages per page, 10 pages, 1,000 messages, or 30 seconds. A fetch, processing, or bound failure records a visible gap and readiness stays unavailable until explicit reconciliation. The native output cursor is separate from this inbound Discord watermark.
+
+An empty Discord history response is accepted as coverage only when the bot's effective channel permissions include View Channel and Read Message History. A denied or unknown permission state remains visibly unavailable. `status` exposes both the observed message ID and the confirmed recovered-through ID.
 
 If the native owner is unavailable before submission, the message stays `accepted` with a `dispatch-not-submitted` receipt and no execution-success reply. A process stop during dispatch changes `dispatching` to `uncertain`; it is never retried automatically. A failed or ambiguous Discord send retains the native reply and records `reply_failed` or `reply_unknown` for explicit delivery reconciliation. Replies longer than Discord's 2000-character message limit are durably split into ordered parts, each with a stable nonce and nonce enforcement. The adapter never silently truncates a native reply.
 

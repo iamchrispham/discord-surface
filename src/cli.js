@@ -291,9 +291,20 @@ async function handoffInternal(args) {
     const guild = await client.guilds.fetch(config.guildId);
     const channel = await guild.channels.fetch(channelId);
     if (!channel || channel.parentId !== categoryId) throw new Error('handoff channel is outside the configured vendor category');
-    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
-    const marker = conductorMarker({ provider, nativeId, conductorId, repoKey, generation: binding.generation, readiness: binding.readiness });
-    await setChannelTopic(channel, marker);
+    const current = state.getBinding(channelId);
+    const oldTopicMatches = conductorMarkerMatches(channel.topic, { provider, nativeId: fromNativeId, conductorId, repoKey, generation: fromGeneration }) || legacyAdoptionTopic(channel.topic, provider, fromNativeId);
+    const successorTopicMatches = current && current.generation === fromGeneration + 1 && current.nativeId === nativeId &&
+      conductorMarkerMatches(channel.topic, { provider, nativeId, conductorId, repoKey, generation: current.generation });
+    if (!oldTopicMatches && !successorTopicMatches) throw new Error('handoff channel topic does not match the requested source or exact successor');
+    let binding;
+    try {
+      binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
+      const marker = conductorMarker({ provider, nativeId, conductorId, repoKey, generation: binding.generation, readiness: binding.readiness });
+      await setChannelTopic(channel, marker);
+    } catch (error) {
+      if (binding) state.auditReceipt(null, 'handoff-topic-failed', { channelId, conductorId, provider, handoffId, nativeId, error: error.message });
+      throw error;
+    }
     print({ handedOff: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
   } finally {
     await client?.destroy();
@@ -466,4 +477,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, main, parseArgs, pathsFor, provisionMarker };
+module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, main, parseArgs, pathsFor, provisionMarker, setChannelTopic };

@@ -5,6 +5,43 @@ const { READINESS, RECOVERY_LIMITS } = require('./state');
 
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
 
+function recoveryError(kind, detail) {
+  const error = new Error(detail);
+  error.recoveryKind = kind;
+  return error;
+}
+
+function waitForRecoveryOperation(operation, signal, deadline) {
+  if (signal?.aborted) return Promise.reject(recoveryError('stopped', 'Discord recovery was stopped'));
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(recoveryError('deadline', 'Discord recovery deadline exceeded'));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onAbort = () => finish(reject, recoveryError('stopped', 'Discord recovery was stopped'));
+    timer = setTimeout(() => finish(reject, recoveryError('deadline', 'Discord recovery deadline exceeded')), remaining);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve().then(operation).then(
+      value => finish(resolve, value),
+      error => finish(reject, error)
+    );
+  });
+}
+
+function recoveryKind(error) {
+  return error?.recoveryKind || null;
+}
+
 function compareDiscordIds(left, right) {
   try {
     const a = BigInt(left);
@@ -97,8 +134,8 @@ function createSurfaceConsumer({ state, providers, sendReply, observeOptions = {
     return processAccepted(message, signal);
   }
 
-  async function intakeMessage(message, ready = false) {
-    return state.acceptDiscordMessage(eventToInput(message), { ready });
+  async function intakeMessage(message, ready = false, coverageId = null) {
+    return state.acceptDiscordMessage(eventToInput(message), { ready, coverageId });
   }
 
   async function handleStoredMessage(message, signal) {
@@ -123,8 +160,12 @@ class DiscordGateway {
     this.inFlight = new Set();
     this.stopping = false;
     this.stopPromise = null;
+    this.startPromise = null;
+    this.lifecycleEpoch = 0;
+    this.connectionEpoch = 0;
     this.recoveryController = null;
     this.recoveryPromise = null;
+    this.reconnectPromise = null;
     this.fetchHistoryInjected = typeof fetchHistory === 'function';
     this.fetchHistory = fetchHistory || ((channel, options) => channel.messages?.fetch(options));
     this.historyPageLimit = Math.min(RECOVERY_LIMITS.pageSize, Math.max(1, Number(recoveryOptions.pageLimit || RECOVERY_LIMITS.pageSize)));
@@ -153,15 +194,17 @@ class DiscordGateway {
       work.finally(() => this.inFlight.delete(work));
     };
     this.boundResume = () => {
-      if (this.stopping) return Promise.resolve({ ready: false, state: 'stopped' });
-      this.ready = false;
-      return this.recoverTransport('reconnect')
-        .then(result => result.ready ? this.reconcilePending() : result)
-        .catch(error => this.logger(`Discord recovery failed: ${error.message}`));
+      return this.beginReconnectRecovery('resume');
     };
+    this.boundDisconnect = (_error, code) => this.pauseConnection(`Discord shard disconnected${code === undefined ? '' : ` (${code})`}`);
+    this.boundReconnecting = shardId => this.pauseConnection(`Discord shard reconnecting${shardId === undefined ? '' : ` (${shardId})`}`);
+    this.boundShardReady = shardId => this.beginReconnectRecovery(`shard-ready${shardId === undefined ? '' : ` (${shardId})`}`);
     this.client.on('messageCreate', this.boundMessage);
     this.client.on?.('shardResume', this.boundResume);
     this.client.on?.('resume', this.boundResume);
+    this.client.on?.('shardDisconnect', this.boundDisconnect);
+    this.client.on?.('shardReconnecting', this.boundReconnecting);
+    this.client.on?.('shardReady', this.boundShardReady);
   }
 
   createClient() {
@@ -186,11 +229,60 @@ class DiscordGateway {
     }
   }
 
+  isCurrentLifecycle(epoch) {
+    return !this.stopping && this.lifecycleEpoch === epoch;
+  }
+
+  pauseConnection(detail) {
+    if (this.stopping) return;
+    this.ready = false;
+    this.connectionEpoch += 1;
+    this.recoveryController?.abort();
+    for (const binding of this.state.listBindings().filter(item => item.active)) {
+      try { this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, detail); }
+      catch (error) { this.logger(`Discord disconnect readiness update failed: ${error.message}`); }
+    }
+  }
+
+  beginReconnectRecovery(reason) {
+    if (this.stopping) return Promise.resolve({ ready: false, state: 'stopped' });
+    const connectionEpoch = this.connectionEpoch;
+    const previousRecovery = this.recoveryPromise;
+    const task = (async () => {
+      await previousRecovery?.catch(() => {});
+      if (this.stopping || connectionEpoch !== this.connectionEpoch) return { ready: false, state: 'stopped' };
+      const result = await this.recoverTransport('reconnect', this.lifecycleEpoch);
+      if (result.ready && !this.stopping && connectionEpoch === this.connectionEpoch) await this.reconcilePending();
+      return result;
+    })().catch(error => {
+      this.logger(`Discord recovery failed: ${error.message}`);
+      return { ready: false, state: recoveryKind(error) || 'unavailable', error };
+    });
+    this.reconnectPromise = task;
+    task.finally(() => {
+      if (this.reconnectPromise === task) this.reconnectPromise = null;
+    }).catch(() => {});
+    return task;
+  }
+
   async start(secretFile) {
-    const token = readSecret(secretFile);
-    await this.client.login(token);
-    const recovery = await this.recoverTransport('startup');
-    if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
+    if (this.stopping) throw new Error('Discord gateway is stopping');
+    if (this.startPromise) return this.startPromise;
+    const epoch = ++this.lifecycleEpoch;
+    this.ready = false;
+    const startPromise = (async () => {
+      const token = readSecret(secretFile);
+      await this.client.login(token);
+      if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during login');
+      const recovery = await this.recoverTransport('startup', epoch);
+      if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during recovery');
+      if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
+    })();
+    this.startPromise = startPromise;
+    try { return await startPromise; }
+    finally {
+      if (this.startPromise === startPromise) this.startPromise = null;
+    }
   }
 
   normalizeFetchedMessage(message, channel) {
@@ -210,32 +302,50 @@ class DiscordGateway {
     return [];
   }
 
-  async updateChannelReadiness(channel, readiness) {
+  historyPermission(channel) {
+    if (!this.client.user || typeof channel?.permissionsFor !== 'function') return { known: false, allowed: false };
+    try {
+      const { PermissionFlagsBits } = requireInstalled('discord.js');
+      const permissions = channel.permissionsFor(this.client.user);
+      if (!permissions || typeof permissions.has !== 'function') return { known: false, allowed: false };
+      return {
+        known: true,
+        allowed: permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory)
+      };
+    } catch {
+      return { known: false, allowed: false };
+    }
+  }
+
+  async updateChannelReadiness(channel, readiness, { signal, deadline } = {}) {
     if (!channel) return;
     const topic = topicWithReadiness(channel.topic, readiness);
     if (channel.topic === topic) return;
-    if (typeof channel.setTopic === 'function') await channel.setTopic(topic);
-    else if (typeof channel.edit === 'function') await channel.edit({ topic });
+    if (typeof channel.setTopic === 'function') await waitForRecoveryOperation(() => channel.setTopic(topic), signal, deadline || Date.now() + RECOVERY_LIMITS.timeoutMs);
+    else if (typeof channel.edit === 'function') await waitForRecoveryOperation(() => channel.edit({ topic }), signal, deadline || Date.now() + RECOVERY_LIMITS.timeoutMs);
     else channel.topic = topic;
     if (channel.topic !== topic) throw new Error('Discord channel readiness topic readback mismatch');
   }
 
-  async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null) {
+  async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null, deadline = Date.now() + RECOVERY_LIMITS.timeoutMs) {
+    if (signal?.aborted) return null;
     const watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo);
     const readiness = state === 'ready' ? READINESS.READY : state === 'gap' ? READINESS.GAP : state === 'unavailable' ? READINESS.UNAVAILABLE : READINESS.PENDING;
-    try { await this.updateChannelReadiness(channel, readiness); }
-    catch (error) { this.logger(`Discord readiness topic update failed: ${error.message}`); }
+    try { await this.updateChannelReadiness(channel, readiness, { signal, deadline }); }
+    catch (error) {
+      if (recoveryKind(error) !== 'stopped') this.logger(`Discord readiness topic update failed: ${error.message}`);
+    }
     return watermark;
   }
 
-  async recoverInbound(signal, reason) {
+  async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const bindings = this.state.listBindings().filter(binding => binding.active);
     let failure = null;
     for (const binding of bindings) {
-      if (signal.aborted) return { ready: false, state: 'stopped' };
+      if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (Date.now() >= deadline) {
-        await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`);
+        await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline);
         failure ||= { ready: false, state: 'gap' };
         continue;
       }
@@ -247,33 +357,53 @@ class DiscordGateway {
       }
       let channel;
       try {
-        channel = await this.client.channels.fetch(binding.channelId);
+        channel = await waitForRecoveryOperation(() => this.client.channels.fetch(binding.channelId), signal, deadline);
         if (!channel) throw new Error('Discord channel is unavailable');
       } catch (error) {
-        await this.recordBoundary(binding, null, 'unavailable', error.message);
-        failure ||= { ready: false, state: 'unavailable', error };
+        const kind = recoveryKind(error);
+        if (kind === 'stopped') return { ready: false, state: 'stopped' };
+        await this.recordBoundary(binding, null, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+        failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
         continue;
       }
-      try { await this.updateChannelReadiness(channel, READINESS.RECOVERING); }
-      catch (error) { this.logger(`Discord readiness topic update failed: ${error.message}`); }
-      if (!this.fetchHistoryInjected && typeof channel.messages?.fetch !== 'function') {
-        const error = new Error('Discord history fetch is unavailable for intake recovery');
-        await this.recordBoundary(binding, channel, 'unavailable', error.message);
-        failure ||= { ready: false, state: 'unavailable', error };
-        continue;
-      }
-      if (!watermark?.last_seen_id) {
-        let baseline;
-        try { baseline = this.historyMessages(await this.fetchHistory(channel, { limit: 1, signal })); }
-        catch (error) {
-          await this.recordBoundary(binding, channel, 'unavailable', error.message);
-          failure ||= { ready: false, state: 'unavailable', error };
+      try { await this.updateChannelReadiness(channel, READINESS.RECOVERING, { signal, deadline }); }
+      catch (error) {
+        const kind = recoveryKind(error);
+        if (kind === 'stopped') return { ready: false, state: 'stopped' };
+        if (kind === 'deadline') {
+          await this.recordBoundary(binding, channel, 'gap', error.message, watermark?.recovered_through_id, null, signal, deadline);
+          failure ||= { ready: false, state: 'gap', error };
           continue;
         }
-        if (signal.aborted) return { ready: false, state: 'stopped' };
+        this.logger(`Discord readiness topic update failed: ${error.message}`);
+      }
+      if (!this.fetchHistoryInjected && typeof channel.messages?.fetch !== 'function') {
+        const error = new Error('Discord history fetch is unavailable for intake recovery');
+        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+        failure ||= { ready: false, state: 'unavailable', error };
+        continue;
+      }
+      const permission = this.historyPermission(channel);
+      if (!permission.known || !permission.allowed) {
+        const error = new Error(permission.known ? 'Discord channel lacks ViewChannel or ReadMessageHistory' : 'Discord channel history permission is unknown');
+        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+        failure ||= { ready: false, state: 'unavailable', error };
+        continue;
+      }
+      if (!watermark?.recovered_through_id) {
+        let baseline;
+        try { baseline = this.historyMessages(await waitForRecoveryOperation(() => this.fetchHistory(channel, { limit: 1, signal }), signal, deadline)); }
+        catch (error) {
+          const kind = recoveryKind(error);
+          if (kind === 'stopped') return { ready: false, state: 'stopped' };
+          await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+          failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+          continue;
+        }
+        if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
         if (baseline.some(message => typeof message?.id !== 'string' || !message.id)) {
           const error = new Error('Discord history message has no stable ID');
-          await this.recordBoundary(binding, channel, 'unavailable', error.message);
+          await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
           failure ||= { ready: false, state: 'unavailable', error };
           continue;
         }
@@ -283,23 +413,24 @@ class DiscordGateway {
         } else {
           watermark = this.state.getIntakeWatermark(binding.channelId);
           if (!watermark?.last_seen_id) {
-            await this.recordBoundary(binding, channel, 'ready', `${reason} empty channel baseline`);
+            await this.recordBoundary(binding, channel, 'ready', `${reason} empty channel baseline`, null, null, signal, deadline);
             continue;
           }
+          this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`);
         }
         watermark = this.state.getIntakeWatermark(binding.channelId);
       }
-      let after = watermark?.last_seen_id || null;
+      let after = watermark?.recovered_through_id || null;
       let pages = 0;
       let total = 0;
       let complete = false;
       let attemptedId = null;
       try {
         while (pages < this.historyMaxPages && total < this.historyMaxMessages && Date.now() < deadline) {
-          if (signal.aborted) return { ready: false, state: 'stopped' };
+          if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
           const options = { limit: this.historyPageLimit, signal };
           if (after) options.after = after;
-          const page = this.historyMessages(await this.fetchHistory(channel, options));
+          const page = this.historyMessages(await waitForRecoveryOperation(() => this.fetchHistory(channel, options), signal, deadline));
           pages += 1;
           if (!page.length) { complete = true; break; }
           if (page.some(message => typeof message?.id !== 'string' || !message.id)) throw new Error('Discord history message has no stable ID');
@@ -308,8 +439,10 @@ class DiscordGateway {
           if (!fresh.length) { complete = true; break; }
           for (const message of fresh) {
             if (total >= this.historyMaxMessages) break;
+            if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+            if (Date.now() >= deadline) throw recoveryError('deadline', 'Discord recovery deadline exceeded while admitting history');
             attemptedId = message.id;
-            await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false);
+            await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id);
             total += 1;
             if (!after || compareDiscordIds(message.id, after) > 0) after = message.id;
           }
@@ -320,28 +453,42 @@ class DiscordGateway {
           if (page.length < this.historyPageLimit) { complete = true; break; }
         }
       } catch (error) {
-        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.last_seen_id, attemptedId || after);
-        failure ||= { ready: false, state: 'unavailable', error };
+        const kind = recoveryKind(error);
+        if (kind === 'stopped') return { ready: false, state: 'stopped' };
+        await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, attemptedId || after, signal, deadline);
+        failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
         continue;
       }
       if (!complete) {
         const detail = pages >= this.historyMaxPages ? `history page bound ${this.historyMaxPages} reached` : total >= this.historyMaxMessages ? `history message bound ${this.historyMaxMessages} reached` : `history recovery deadline ${this.recoveryTimeoutMs}ms reached`;
-        await this.recordBoundary(binding, channel, 'gap', detail, watermark?.last_seen_id, after);
+        await this.recordBoundary(binding, channel, 'gap', detail, watermark?.recovered_through_id, after, signal, deadline);
         failure ||= { ready: false, state: 'gap' };
         continue;
       }
-      await this.recordBoundary(binding, channel, 'ready', `${reason} watermark backfill complete`);
+      await this.recordBoundary(binding, channel, 'ready', `${reason} watermark backfill complete`, null, null, signal, deadline);
+      const finalWatermark = this.state.getIntakeWatermark(binding.channelId);
+      const finalBinding = this.state.getBinding(binding.channelId);
+      const liveCustodyAhead = finalWatermark?.last_seen_id && (!finalWatermark.recovered_through_id || compareDiscordIds(finalWatermark.last_seen_id, finalWatermark.recovered_through_id) > 0);
+      if (liveCustodyAhead || finalBinding?.readiness !== READINESS.READY) {
+        const detail = liveCustodyAhead
+          ? 'live Discord custody arrived while recovery readiness was closing'
+          : 'binding readiness changed while recovery readiness was closing';
+        await this.recordBoundary(binding, channel, 'gap', detail, finalWatermark?.recovered_through_id, finalWatermark?.last_seen_id, signal, deadline);
+        failure ||= { ready: false, state: 'gap' };
+      }
     }
     return failure || { ready: true, state: 'ready' };
   }
 
-  async recoverTransport(reason) {
+  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch) {
+    if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
     if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
     this.recoveryPromise = (async () => {
-      const result = await this.recoverInbound(controller.signal, reason);
-      if (result.ready) this.ready = true;
+      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch);
+      if (result.ready && this.isCurrentLifecycle(lifecycleEpoch)) this.ready = true;
+      else if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       return result;
     })();
     try { return await this.recoveryPromise; }
@@ -400,16 +547,23 @@ class DiscordGateway {
 
   async stop() {
     if (this.stopPromise) return this.stopPromise;
+    this.lifecycleEpoch += 1;
+    this.connectionEpoch += 1;
     this.stopping = true;
     this.stopPromise = (async () => {
       this.ready = false;
       this.recoveryController?.abort();
-      await this.recoveryPromise?.catch(() => {});
+      const recovery = this.recoveryPromise;
+      const reconnect = this.reconnectPromise;
+      await Promise.allSettled([recovery, reconnect].filter(Boolean));
       for (const controller of this.controllers) controller.abort();
       await Promise.allSettled([...this.inFlight]);
       this.client.off?.('messageCreate', this.boundMessage);
       this.client.off?.('shardResume', this.boundResume);
       this.client.off?.('resume', this.boundResume);
+      this.client.off?.('shardDisconnect', this.boundDisconnect);
+      this.client.off?.('shardReconnecting', this.boundReconnecting);
+      this.client.off?.('shardReady', this.boundShardReady);
       if (typeof this.client.destroy === 'function') await this.client.destroy();
     })();
     try { await this.stopPromise; }

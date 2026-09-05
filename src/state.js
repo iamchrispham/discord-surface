@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 
-const SCHEMA_VERSION = '1.3';
+const SCHEMA_VERSION = '1.4';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
 const READINESS = Object.freeze({
   PENDING: 'pending',
@@ -299,6 +299,7 @@ class SurfaceState {
         channel_id TEXT PRIMARY KEY,
         guild_id TEXT NOT NULL,
         last_seen_id TEXT,
+        recovered_through_id TEXT,
         last_accepted_id TEXT,
         state TEXT NOT NULL CHECK(state IN ('pending', 'ready', 'gap', 'unavailable')),
         gap_from TEXT,
@@ -323,7 +324,7 @@ class SurfaceState {
   migrateSchema() {
     const version = this.db.prepare("SELECT value FROM meta WHERE key='schema'").get();
     if (!version) throw new StateCorruptError('state schema metadata is missing');
-    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== SCHEMA_VERSION) {
+    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== SCHEMA_VERSION) {
       throw new StateCorruptError(`unsupported state schema ${version.value}`);
     }
     if (version.value === SCHEMA_VERSION) return;
@@ -377,6 +378,7 @@ class SurfaceState {
     const bindings = this.tableColumns('bindings');
     const messages = this.tableColumns('messages');
     const intents = this.tableColumns('provision_intents');
+    const watermarks = this.tableColumns('intake_watermarks');
     this.db.exec('BEGIN IMMEDIATE');
     try {
       if (!bindings.has('conductor_id')) this.db.exec('ALTER TABLE bindings ADD COLUMN conductor_id TEXT');
@@ -386,6 +388,29 @@ class SurfaceState {
       if (!messages.has('repo_key')) this.db.exec('ALTER TABLE messages ADD COLUMN repo_key TEXT');
       if (!intents.has('conductor_id')) this.db.exec('ALTER TABLE provision_intents ADD COLUMN conductor_id TEXT');
       if (!intents.has('repo_key')) this.db.exec('ALTER TABLE provision_intents ADD COLUMN repo_key TEXT');
+      if (watermarks.size && !watermarks.has('recovered_through_id')) {
+        this.db.exec('ALTER TABLE intake_watermarks ADD COLUMN recovered_through_id TEXT');
+        const baselineByChannel = new Map();
+        for (const row of this.db.prepare("SELECT detail FROM receipts WHERE kind='intake-baseline' ORDER BY id").all()) {
+          const detail = parseJson(row.detail, {});
+          if (typeof detail.channelId === 'string' && typeof detail.lastSeenId === 'string') baselineByChannel.set(detail.channelId, detail.lastSeenId);
+        }
+        for (const row of this.db.prepare('SELECT * FROM intake_watermarks').all()) {
+          const baselineId = baselineByChannel.get(row.channel_id);
+          const confirmed = baselineId && row.last_seen_id && compareDiscordIds(baselineId, row.last_seen_id) <= 0 ? baselineId : null;
+          const nextState = confirmed
+            ? (row.state === 'gap' || row.state === 'unavailable' ? row.state : 'pending')
+            : 'gap';
+          const detail = confirmed
+            ? 'schema migration retained the recorded intake baseline; recovery is required'
+            : 'schema migration found an unverified legacy intake cursor; explicit reconciliation is required';
+          this.db.prepare('UPDATE intake_watermarks SET recovered_through_id=?, state=?, detail=?, gap_to=? WHERE channel_id=?')
+            .run(confirmed, nextState, detail, confirmed ? row.gap_to : row.last_seen_id, row.channel_id);
+          this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1')
+            .run(nextState === 'unavailable' ? READINESS.UNAVAILABLE : nextState === 'gap' ? READINESS.GAP : READINESS.PENDING, now(), row.channel_id);
+          this.receipt(null, 'legacy-intake-migration', { channelId: row.channel_id, recoveredThroughId: confirmed, state: nextState });
+        }
+      }
       this.db.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS bindings_conductor_unique ON bindings(provider, conductor_id) WHERE active=1 AND conductor_id IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS provision_conductor_unique ON provision_intents(provider, conductor_id) WHERE conductor_id IS NOT NULL;
@@ -393,6 +418,7 @@ class SurfaceState {
           channel_id TEXT PRIMARY KEY,
           guild_id TEXT NOT NULL,
           last_seen_id TEXT,
+          recovered_through_id TEXT,
           last_accepted_id TEXT,
           state TEXT NOT NULL CHECK(state IN ('pending', 'ready', 'gap', 'unavailable')),
           gap_from TEXT,
@@ -462,6 +488,7 @@ class SurfaceState {
     });
     this.assertColumns('intake_watermarks', {
       channel_id: { type: 'TEXT' }, guild_id: { type: 'TEXT', notnull: true },
+      recovered_through_id: { type: 'TEXT' },
       state: { type: 'TEXT', notnull: true }, updated_at: { type: 'TEXT', notnull: true }
     });
     this.assertColumns('receipts', {
@@ -537,9 +564,11 @@ class SurfaceState {
     const conductorId = binding.conductorId == null ? (existing?.conductorId || null) : assertConductorId(binding.conductorId);
     const repoKey = binding.repoKey == null ? (existing?.repoKey || null) : assertRepoKey(binding.repoKey);
     if (Boolean(conductorId) !== Boolean(repoKey)) throw new BindingError('conductorId and repoKey must be provided together');
+    const readiness = binding.readiness == null ? (existing?.readiness || (conductorId ? READINESS.PENDING : READINESS.READY)) : binding.readiness;
+    if (!Object.values(READINESS).includes(readiness)) throw new BindingError('invalid binding readiness');
     const config = this.requireConfig();
     if (guildId !== config.guildId) throw new BindingError('binding guild is not the configured guild');
-    return { channelId, guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey };
+    return { channelId, guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey, readiness };
   }
 
   bind(binding) {
@@ -555,7 +584,7 @@ class SurfaceState {
         : this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE channel_id=?').get(input.channelId);
       const generation = Number(generationRow.next);
       this.db.prepare(`INSERT INTO bindings(channel_id, guild_id, provider, native_id, workspace, endpoint, category_id, conductor_id, repo_key, readiness, generation, active, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(input.channelId, input.guildId, input.provider, input.nativeId, input.workspace, input.endpoint, input.categoryId, input.conductorId, input.repoKey, READINESS.PENDING, generation, createdAt);
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(input.channelId, input.guildId, input.provider, input.nativeId, input.workspace, input.endpoint, input.categoryId, input.conductorId, input.repoKey, input.readiness, generation, createdAt);
       this.receipt(null, 'bound', { channelId: input.channelId, provider: input.provider, conductorId: input.conductorId, generation });
       return this.getBinding(input.channelId);
     });
@@ -627,6 +656,16 @@ class SurfaceState {
     });
   }
 
+  findConductorHandoff(handoffId) {
+    assertText(handoffId, 'handoffId', 256);
+    const rows = this.db.prepare("SELECT detail FROM receipts WHERE kind='conductor-handoff' ORDER BY id DESC").all();
+    for (const row of rows) {
+      const detail = parseJson(row.detail, {});
+      if (detail.handoffId === handoffId) return detail;
+    }
+    return null;
+  }
+
   handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId }) {
     assertUuid(fromNativeId, 'fromNativeId');
     if (!Number.isInteger(fromGeneration) || fromGeneration < 1) throw new BindingError('fromGeneration must be a positive integer');
@@ -634,6 +673,18 @@ class SurfaceState {
     const existing = this.getBinding(channelId);
     if (!existing || !existing.active) throw new BindingError('channel is not actively bound');
     const input = this.bindingInput({ channelId, provider, conductorId, repoKey, nativeId, workspace, endpoint }, existing);
+    const previous = this.findConductorHandoff(handoffId);
+    if (previous) {
+      const sameRequest = previous.channelId === channelId && previous.provider === provider && previous.conductorId === conductorId &&
+        previous.repoKey === repoKey && previous.fromNativeId === fromNativeId && previous.fromGeneration === fromGeneration &&
+        previous.nativeId === nativeId && previous.generation === existing.generation && existing.nativeId === nativeId &&
+        existing.generation === fromGeneration + 1 && existing.workspace === input.workspace && existing.endpoint === input.endpoint;
+      if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
+      return this.transaction(() => {
+        this.receipt(null, 'conductor-handoff-retry', { channelId, conductorId, provider, handoffId, nativeId, generation: existing.generation });
+        return { ...existing, handoffReconciled: true };
+      });
+    }
     if (existing.provider !== provider || existing.conductorId !== conductorId || existing.repoKey !== repoKey || existing.nativeId !== fromNativeId || existing.generation !== fromGeneration) {
       throw new StaleGenerationError('handoff source identity is stale');
     }
@@ -674,16 +725,26 @@ class SurfaceState {
     return { accepted: false, reason };
   }
 
-  upsertIntakeWatermark(event, ready) {
+  upsertIntakeWatermark(event, ready, coverageId = null) {
     const existing = this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(event.channelId);
     const lastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, event.id) >= 0 ? existing.last_seen_id : event.id;
-    const state = existing?.state === READINESS.GAP ? 'gap' : ready ? 'ready' : 'pending';
+    const recoveredThrough = coverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, coverageId) < 0)
+      ? coverageId
+      : existing?.recovered_through_id || null;
+    const state = existing?.state === READINESS.GAP ? 'gap' : existing?.state === READINESS.UNAVAILABLE ? 'unavailable' : ready ? 'ready' : 'pending';
     if (existing) {
-      this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, state=?, updated_at=? WHERE channel_id=?')
-        .run(event.guildId, lastSeen, state, now(), event.channelId);
+      this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, updated_at=? WHERE channel_id=?')
+        .run(event.guildId, lastSeen, recoveredThrough, state, now(), event.channelId);
     } else {
-      this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, state, updated_at) VALUES(?, ?, ?, ?, ?)')
-        .run(event.channelId, event.guildId, lastSeen, state, now());
+      this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, recovered_through_id, state, updated_at) VALUES(?, ?, ?, ?, ?, ?)')
+        .run(event.channelId, event.guildId, lastSeen, recoveredThrough, state, now());
+    }
+    if (!ready) {
+      const binding = this.getBinding(event.channelId);
+      if (binding?.active && binding.guildId === event.guildId) {
+        this.db.prepare("UPDATE bindings SET readiness='recovering', updated_at=? WHERE channel_id=? AND active=1 AND readiness='ready'")
+          .run(now(), event.channelId);
+      }
     }
   }
 
@@ -702,12 +763,13 @@ class SurfaceState {
       const retainedLastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
         ? existing.last_seen_id
         : lastSeenId;
+      const retainedRecoveredThrough = existing?.recovered_through_id || lastSeenId;
       if (existing) {
-        this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
-          .run(binding.guildId, retainedLastSeen, 'pending', String(detail || '').slice(0, 1000) || null, now(), channelId);
+        this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
+          .run(binding.guildId, retainedLastSeen, retainedRecoveredThrough, 'pending', String(detail || '').slice(0, 1000) || null, now(), channelId);
       } else {
-        this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, state, detail, updated_at) VALUES(?, ?, ?, ?, ?, ?)')
-          .run(channelId, binding.guildId, lastSeenId, 'pending', String(detail || '').slice(0, 1000) || null, now());
+        this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, recovered_through_id, state, detail, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
+          .run(channelId, binding.guildId, lastSeenId, lastSeenId, 'pending', String(detail || '').slice(0, 1000) || null, now());
       }
       this.receipt(null, 'intake-baseline', { channelId, lastSeenId, detail });
       return this.getIntakeWatermark(channelId);
@@ -756,19 +818,20 @@ class SurfaceState {
     });
   }
 
-  acceptDiscordMessage(event, { ready = true } = {}) {
+  acceptDiscordMessage(event, { ready = true, coverageId = null } = {}) {
     const config = this.requireConfig();
+    if (coverageId !== null) assertText(coverageId, 'coverageId', 128);
     if (!event || [event.id, event.guildId, event.channelId, event.authorId, event.content].some(value => typeof value !== 'string' || value.length === 0)) {
       if (event && [event.id, event.guildId, event.channelId].every(value => typeof value === 'string' && value.length > 0)) {
         this.transaction(() => {
-          this.upsertIntakeWatermark(event, ready);
+          this.upsertIntakeWatermark(event, ready, coverageId);
           this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'invalid-event', ready });
         });
       }
       return this.reject('invalid-event');
     }
     return this.transaction(() => {
-      this.upsertIntakeWatermark(event, ready);
+      this.upsertIntakeWatermark(event, ready, coverageId);
       let reason = null;
       if (event.content.length > 10000) reason = 'invalid-event';
       else if (event.isBot) reason = 'bot-source';
@@ -841,6 +904,10 @@ class SurfaceState {
         if (!check.current) {
           this.receipt(messageId, 'dispatch-rejected-auth', { generation: message.generation });
           return { claimed: false, message, reason: 'authorization-revoked' };
+        }
+        if (check.binding.readiness !== READINESS.READY) {
+          this.receipt(messageId, 'dispatch-held-not-ready', { readiness: check.binding.readiness, generation: message.generation });
+          return { claimed: false, message, reason: 'binding-not-ready' };
         }
         this.db.prepare('UPDATE messages SET state=?, updated_at=? WHERE discord_id=? AND state=?')
           .run(MESSAGE_STATES.DISPATCHING, now(), messageId, MESSAGE_STATES.ACCEPTED);
@@ -1183,7 +1250,7 @@ class SurfaceState {
         connectionBackfill: watermarkGap ? (watermarkGap.state === 'gap' ? 'unrecoverable-gap' : 'unavailable') : watermarkPending ? 'pending' : watermarks.length ? 'bounded-by-discord-watermark' : 'pending',
         recovery: RECOVERY_LIMITS
       },
-      intakeWatermarks: watermarks.map(row => ({ channelId: row.channel_id, lastSeenId: row.last_seen_id, state: row.state, gapFrom: row.gap_from, gapTo: row.gap_to, detail: row.detail }))
+      intakeWatermarks: watermarks.map(row => ({ channelId: row.channel_id, lastSeenId: row.last_seen_id, recoveredThroughId: row.recovered_through_id, state: row.state, gapFrom: row.gap_from, gapTo: row.gap_to, detail: row.detail }))
     };
   }
 

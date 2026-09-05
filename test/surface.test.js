@@ -3,11 +3,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
+const { EventEmitter } = require('node:events');
 const { postUnixJson } = require('../src/native');
 const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
 const { CodexProvider, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
-const { bindingArgs, conductorMarker, ensureProvisionedChannel, provisionMarker } = require('../src/cli');
+const { bindingArgs, conductorMarker, ensureProvisionedChannel, provisionMarker, setChannelTopic } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
 
 const CODEX_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
@@ -39,6 +41,10 @@ function discordMessage({ id, channelId, authorId = 'operator-1', bot = false, c
       return { id: `reply-${id}` };
     } }
   };
+}
+
+function historyPermissions(allowed = true) {
+  return { has: () => allowed };
 }
 
 function providers({ calls, reply = '4' } = {}) {
@@ -204,6 +210,7 @@ test('simulated: gateway stop detaches listener and destroys the native client',
   const listeners = new Map();
   let destroyed = false;
   const client = {
+    user: { id: 'bot-1' },
     on(name, fn) { listeners.set(name, fn); },
     off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
     async destroy() { destroyed = true; }
@@ -515,6 +522,42 @@ test('simulated: malformed required columns fail closed even with a known schema
   assert.throws(() => new SurfaceState(db), StateCorruptError);
 });
 
+test('simulated: v1.3 migration preserves a recorded cutoff and recovers older history after held live custody', async () => {
+  const { dir, db, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.setIntakeBaseline('channel-codex', '100', 'recorded v1.3 cutoff');
+  state.markIntakeBoundary('channel-codex', 'ready');
+  state.acceptDiscordMessage({ id: '200', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'held live input' });
+  state.close();
+  const legacy = new DatabaseSync(db);
+  legacy.exec("ALTER TABLE intake_watermarks DROP COLUMN recovered_through_id; UPDATE meta SET value='1.3' WHERE key='schema';");
+  legacy.close();
+
+  const migrated = new SurfaceState(db);
+  assert.equal(migrated.getIntakeWatermark('channel-codex').recovered_through_id, '100');
+  assert.equal(migrated.getBinding('channel-codex').readiness, READINESS.PENDING);
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  const channel = { id: 'channel-codex', guildId: 'guild-1', topic: '', permissionsFor: () => historyPermissions() };
+  const client = {
+    user: { id: 'bot-1' },
+    on() {}, off() {}, async login() {}, channels: { fetch: async () => channel }, async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state: migrated, client, fetchHistory: async (_channel, options) => {
+    assert.equal(options.after, '100');
+    return [
+      { id: '200', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'held live input' },
+      { id: '101', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'older history' }
+    ];
+  } });
+  await gateway.start(secret);
+  assert.ok(migrated.getMessage('101'));
+  assert.ok(migrated.getMessage('200'));
+  assert.equal(migrated.getIntakeWatermark('channel-codex').recovered_through_id, '200');
+  await gateway.stop();
+  migrated.close();
+});
+
 test('simulated: status readiness labels live permission and quota gates as unverified', () => {
   const { dir, state } = fixture();
   const readiness = state.getReadiness();
@@ -640,10 +683,11 @@ test('simulated: gateway stop waits for abortable startup recovery before state 
   const listeners = new Map();
   let destroyed = false;
   const client = {
+    user: { id: 'bot-1' },
     on(name, fn) { listeners.set(name, fn); },
     off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
     async login() {},
-    channels: { fetch: async () => ({ id: 'channel-codex' }) },
+    channels: { fetch: async () => ({ id: 'channel-codex', permissionsFor: () => historyPermissions() }) },
     async destroy() { destroyed = true; }
   };
   const fetchHistory = async (_channel, { signal }) => new Promise(resolve => {
@@ -653,7 +697,7 @@ test('simulated: gateway stop waits for abortable startup recovery before state 
   const starting = gateway.start(secret);
   await new Promise(resolve => setImmediate(resolve));
   await gateway.stop();
-  await assert.rejects(starting, /intake recovery is stopped/);
+  await assert.rejects(starting, /startup was stopped/);
   assert.equal(destroyed, true);
   state.close();
 });
@@ -667,9 +711,11 @@ test('simulated: login-time input is durably held and backfill closes before dis
   const channel = {
     id: 'channel-codex',
     guildId: 'guild-1',
+    permissionsFor: () => historyPermissions(),
     async send() { return { id: 'reply-login-input' }; }
   };
   const client = {
+    user: { id: 'bot-1' },
     on(name, fn) { listeners.set(name, fn); },
     off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
     async login() { await listeners.get('messageCreate')(discordMessage({ id: '101', channelId: 'channel-codex' })); },
@@ -683,6 +729,7 @@ test('simulated: login-time input is durably held and backfill closes before dis
     fetchHistory: async (_channel, options) => {
       history.push(options);
       if (options.limit === 1) return [{ id: '100', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'old', bot: false }, content: 'before adoption' }];
+      if (options.after === '100') return [{ id: '101', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'held live input' }];
       if (options.after === '101') return [];
       throw new Error(`unexpected history cursor ${options.after}`);
     },
@@ -699,7 +746,7 @@ test('simulated: login-time input is durably held and backfill closes before dis
   assert.equal(state.getMessage('101').state, MESSAGE_STATES.REPLIED);
   await listeners.get('resume')();
   assert.equal(state.getBinding('channel-codex').readiness, READINESS.READY);
-  assert.equal(history.length, 2);
+  assert.equal(history.length, 3);
   await gateway.stop();
   state.close();
 });
@@ -709,7 +756,7 @@ test('simulated: bounded intake recovery records a visible gap and requires expl
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
   const secret = path.join(dir, 'discord.env');
   fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
-  const client = { on() {}, off() {}, async login() {}, channels: { fetch: async () => ({ id: 'channel-codex' }) }, async destroy() {} };
+  const client = { user: { id: 'bot-1' }, on() {}, off() {}, async login() {}, channels: { fetch: async () => ({ id: 'channel-codex', permissionsFor: () => historyPermissions() }) }, async destroy() {} };
   const gateway = new DiscordGateway({
     state,
     client,
@@ -729,6 +776,243 @@ test('simulated: bounded intake recovery records a visible gap and requires expl
   assert.equal(state.getBinding('channel-codex').readiness, READINESS.PENDING);
   await gateway.stop();
   state.close();
+});
+
+test('simulated: stop fences a client login that resolves after state close', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  const listeners = new Map();
+  let releaseLogin;
+  let destroyed = false;
+  const client = {
+    user: { id: 'bot-1' },
+    on(name, fn) { listeners.set(name, fn); },
+    off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
+    login: async () => new Promise(resolve => { releaseLogin = resolve; }),
+    channels: { fetch: async () => ({ id: 'channel-codex', permissionsFor: () => historyPermissions() }) },
+    async destroy() { destroyed = true; }
+  };
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [] });
+  const starting = gateway.start(secret);
+  await new Promise(resolve => setImmediate(resolve));
+  await gateway.stop();
+  state.close();
+  releaseLogin();
+  await assert.rejects(starting, /startup was stopped during login/);
+  assert.equal(destroyed, true);
+  assert.equal(listeners.has('messageCreate'), false);
+});
+
+test('simulated: live custody stays ahead of confirmed history coverage without losing older input', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
+  state.markIntakeBoundary('channel-codex', 'ready');
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  const listeners = new Map();
+  const channel = { id: 'channel-codex', guildId: 'guild-1', topic: '', permissionsFor: () => historyPermissions() };
+  const client = {
+    user: { id: 'bot-1' },
+    on(name, fn) { listeners.set(name, fn); },
+    off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
+    async login() { listeners.get('messageCreate')(discordMessage({ id: '200', channelId: 'channel-codex' })); },
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  const requestedAfters = [];
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    fetchHistory: async (_channel, options) => {
+      requestedAfters.push(options.after || null);
+      if (options.after === '100') return [
+        { id: '200', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'live duplicate' },
+        { id: '101', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'older history' }
+      ];
+      return [];
+    }
+  });
+  await gateway.start(secret);
+  assert.ok(state.getMessage('101'));
+  assert.ok(state.getMessage('200'));
+  assert.deepEqual(requestedAfters, ['100']);
+  assert.equal(state.getIntakeWatermark('channel-codex').last_seen_id, '200');
+  assert.equal(state.getIntakeWatermark('channel-codex').recovered_through_id, '200');
+  assert.equal(gateway.ready, true);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: live custody during readiness topic close becomes an explicit recovery gap', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
+  state.markIntakeBoundary('channel-codex', 'ready');
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  const listeners = new Map();
+  let channel;
+  channel = {
+    id: 'channel-codex',
+    guildId: 'guild-1',
+    topic: '',
+    permissionsFor: () => historyPermissions(),
+    async setTopic(topic) {
+      this.topic = topic;
+      if (topic.endsWith('readiness=ready')) listeners.get('messageCreate')?.(discordMessage({ id: '201', channelId: 'channel-codex' }));
+    }
+  };
+  const client = {
+    user: { id: 'bot-1' },
+    on(name, fn) { listeners.set(name, fn); },
+    off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
+    async login() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [] });
+  await assert.rejects(() => gateway.start(secret), /intake recovery is gap/);
+  assert.ok(state.getMessage('201'));
+  assert.equal(state.getIntakeWatermark('channel-codex').recovered_through_id, '100');
+  assert.equal(state.getIntakeWatermark('channel-codex').last_seen_id, '201');
+  assert.equal(state.getIntakeWatermark('channel-codex').state, 'gap');
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: noncooperative history fetch is fenced by the recovery deadline and stop', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
+  state.markIntakeBoundary('channel-codex', 'ready');
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const client = {
+    user: { id: 'bot-1' },
+    on() {},
+    off() {},
+    channels: { fetch: async () => ({ id: 'channel-codex', permissionsFor: () => historyPermissions() }) },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state, client, recoveryOptions: { timeoutMs: 1000 }, fetchHistory: async () => blocked });
+  const started = performance.now();
+  const recovery = gateway.recoverTransport('startup');
+  await assert.doesNotReject(async () => {
+    const result = await recovery;
+    assert.equal(result.ready, false);
+    assert.equal(result.state, 'gap');
+  });
+  const elapsed = performance.now() - started;
+  await gateway.stop();
+  release([]);
+  assert.ok(elapsed < 1500, `recovery exceeded bounded wait: ${elapsed}ms`);
+  assert.equal(state.getIntakeWatermark('channel-codex').state, 'gap');
+  state.close();
+});
+
+test('simulated: disconnect pauses dispatch and shard ready performs fresh recovery', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
+  state.markIntakeBoundary('channel-codex', 'ready');
+  const client = new EventEmitter();
+  client.user = { id: 'bot-1' };
+  client.channels = { fetch: async () => ({ id: 'channel-codex', permissionsFor: () => historyPermissions() }) };
+  client.login = async () => {};
+  client.destroy = async () => {};
+  let scans = 0;
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => { scans += 1; return []; } });
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  await gateway.start(secret);
+  const scansBefore = scans;
+  client.emit('shardDisconnect', new Error('socket lost'), 0);
+  assert.equal(gateway.ready, false);
+  client.emit('shardReconnecting', 0);
+  client.emit('shardReady', 0, new Set());
+  await gateway.reconnectPromise;
+  assert.ok(scans > scansBefore);
+  assert.equal(gateway.ready, true);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: pending successor custody stays accepted until readiness is restored', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'pending-successor', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'pending-conductor', repoKey: 'repo:alpha' });
+  let dispatches = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: { async dispatch() { dispatches += 1; return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } },
+    sendReply: async () => ({ id: 'pending-successor-reply' })
+  });
+  const held = await consumer.handleMessage(discordMessage({ id: 'pending-successor-input', channelId: 'pending-successor' }));
+  assert.equal(held.status, 'binding-not-ready');
+  assert.equal(held.message.state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(dispatches, 0);
+  state.markIntakeBoundary('pending-successor', 'ready');
+  const resumed = await consumer.handleStoredMessage(discordMessage({ id: 'pending-successor-input', channelId: 'pending-successor' }));
+  assert.equal(resumed.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(dispatches, 1);
+  state.close();
+});
+
+test('simulated: failed handoff topic write is repaired by the exact durable handoff', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'handoff-channel', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'handoff-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('handoff-channel', 'ready');
+  const channel = {
+    parentId: 'codex-category',
+    topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'handoff-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }),
+    attempts: 0,
+    async setTopic(topic) {
+      this.attempts += 1;
+      if (this.attempts === 1) throw new Error('topic write failed');
+      this.topic = topic;
+    }
+  };
+  const handoff = {
+    channelId: 'handoff-channel', provider: 'codex', conductorId: 'handoff-conductor', repoKey: 'repo:alpha',
+    fromNativeId: CODEX_ID, fromGeneration: 1, nativeId: SUCCESSOR_ID, workspace: dir, handoffId: 'handoff-repair-1'
+  };
+  const successor = state.handoffConductor(handoff);
+  const marker = conductorMarker({ provider: 'codex', nativeId: SUCCESSOR_ID, conductorId: 'handoff-conductor', repoKey: 'repo:alpha', generation: successor.generation, readiness: successor.readiness });
+  await assert.rejects(() => setChannelTopic(channel, marker), /topic write failed/);
+  const repaired = state.handoffConductor(handoff);
+  assert.equal(repaired.handoffReconciled, true);
+  assert.equal(repaired.generation, 2);
+  await setChannelTopic(channel, marker);
+  assert.equal(channel.topic, marker);
+  assert.throws(() => state.handoffConductor({ ...handoff, handoffId: 'handoff-repair-1', nativeId: CLAUDE_ID }), /already used/);
+  state.close();
+});
+
+test('simulated: empty Discord history requires known effective read permission', async () => {
+  for (const [label, allowed, known] of [['revoked', false, true], ['unknown', false, false]]) {
+    const { dir, state } = fixture();
+    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+    state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
+    state.markIntakeBoundary('channel-codex', 'ready');
+    const secret = path.join(dir, `discord-${label}.env`);
+    fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+    const channel = { id: 'channel-codex', permissionsFor: known ? () => historyPermissions(allowed) : undefined };
+    const client = {
+      user: known ? { id: 'bot-1' } : undefined,
+      on() {}, off() {}, async login() {}, channels: { fetch: async () => channel }, async destroy() {}
+    };
+    const gateway = new DiscordGateway({ state, client, fetchHistory: async () => { throw new Error('history must not be fetched'); } });
+    await assert.rejects(() => gateway.start(secret), /intake recovery is unavailable/);
+    const watermark = state.getIntakeWatermark('channel-codex');
+    assert.equal(watermark.recovered_through_id, '100');
+    assert.equal(watermark.state, 'unavailable');
+    state.acceptDiscordMessage({ id: `held-${label}`, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'held while permission is unavailable' }, { ready: false });
+    assert.equal(state.getIntakeWatermark('channel-codex').state, 'unavailable');
+    await gateway.stop();
+    state.close();
+  }
 });
 
 test('simulated: unknown Discord delivery is reconciled without native redispatch', async () => {
@@ -758,6 +1042,7 @@ test('simulated: stable conductor identity permits distinct IDs and explicit sam
   const { dir, state } = fixture();
   state.bind({ channelId: 'conductor-a', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'conductor-a', repoKey: 'repo:alpha' });
   state.bind({ channelId: 'conductor-b', guildId: 'guild-1', provider: 'codex', nativeId: CLAUDE_ID, workspace: dir, conductorId: 'conductor-b', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('conductor-a', 'ready');
   assert.throws(() => state.bind({ channelId: 'duplicate-conductor', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir, conductorId: 'conductor-a', repoKey: 'repo:alpha' }), /already bound/);
 
   state.acceptDiscordMessage({ id: 'drained', guildId: 'guild-1', channelId: 'conductor-a', authorId: 'operator-1', isBot: false, content: 'drain' });
@@ -781,6 +1066,7 @@ test('simulated: stable conductor identity permits distinct IDs and explicit sam
   assert.equal(successor.generation, 2);
   assert.equal(successor.conductorId, 'conductor-a');
   assert.throws(() => state.recordNativeReply({ provider: 'codex', messageId: 'drained', nativeId: CODEX_ID, generation: 1, text: 'late' }), StaleGenerationError);
+  state.markIntakeBoundary('conductor-a', 'ready');
   state.acceptDiscordMessage({ id: 'successor-input', guildId: 'guild-1', channelId: 'conductor-a', authorId: 'operator-1', isBot: false, content: 'new owner' });
   state.claimDispatch('successor-input');
   state.markSubmitted('successor-input');
