@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, validateNativeId } = require('./state');
-const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
+const { DiscordGateway, readSecret, requireInstalled, topicPublicationOutcome } = require('./discord');
 const { ClaudeChannel } = require('./claude-channel');
 const { conductorMarkerMatches: matchesTopicMarker, topicPresentation } = require('./topic');
 
@@ -95,7 +95,16 @@ function status(args) {
 function recover(args) {
   const { state } = openState(args);
   try {
-    if (args['intake-channel-id']) {
+    if (args['topic-channel-id']) {
+      const resolution = required(args, 'resolution');
+      if (!['published', 'not_published'].includes(resolution)) throw new Error('--resolution must be published or not_published for topic reconciliation');
+      print(state.reconcileTopicPublication(
+        required(args, 'topic-channel-id'),
+        required(args, 'topic-request-id'),
+        resolution,
+        required(args, 'evidence-scope')
+      ));
+    } else if (args['intake-channel-id']) {
       print(state.reconcileIntake(required(args, 'intake-channel-id')));
     } else if (args['message-id'] && ['reply_sent', 'reply_not_sent'].includes(args.resolution)) {
       print(state.reconcileReplyDelivery(required(args, 'message-id'), args.resolution === 'reply_sent' ? 'sent' : 'not_sent', {
@@ -135,6 +144,37 @@ async function setChannelTopic(channel, topic) {
   else channel.topic = topic;
   if (channel.topic !== topic) throw new Error('Discord channel topic readback mismatch');
   return channel;
+}
+
+async function publishHandoffTopic(state, channel, topic, binding) {
+  if (channel.topic === topic) return null;
+  const custody = state.beginTopicPublication(binding.channelId, {
+    desiredReadiness: binding.readiness,
+    desiredTopic: topic
+  }, binding);
+  if (!custody) throw new Error('handoff topic binding changed before publication');
+  try {
+    await setChannelTopic(channel, topic);
+    state.recordTopicPublication(binding.channelId, {
+      requestId: custody.requestId,
+      desiredReadiness: binding.readiness,
+      outcome: 'published',
+      publishedReadiness: binding.readiness,
+      observedTopic: channel.topic
+    }, binding);
+    return custody;
+  } catch (error) {
+    const outcome = topicPublicationOutcome(error);
+    state.recordTopicPublication(binding.channelId, {
+      requestId: custody.requestId,
+      desiredReadiness: binding.readiness,
+      outcome,
+      publicationUnknown: outcome === 'unknown',
+      observedTopic: channel.topic,
+      error: error.message
+    }, binding);
+    throw error;
+  }
 }
 
 async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName, conductorId, repoKey, generation = 1, readiness = READINESS.PENDING, channelId = null, allowCreate = true }) {
@@ -206,6 +246,7 @@ async function provisionInternal(args) {
     if (taskName !== undefined && (typeof taskName !== 'string' || !taskName || taskName.length > 100)) throw new Error('--task-name must be 1 to 100 characters');
     const existingBinding = state.findConductorBinding(conductorId, provider);
     if (existingBinding) {
+      state.assertTopicPublicationSettled(existingBinding.channelId);
       if (existingBinding.repoKey !== repoKey || existingBinding.nativeId !== nativeId || existingBinding.workspace !== workspace || existingBinding.endpoint !== (endpoint || null)) {
         throw new Error('existing conductor binding does not match requested identity; use explicit handoff for a successor');
       }
@@ -297,7 +338,7 @@ async function handoffInternal(args) {
     try {
       binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
       const marker = conductorMarker({ provider, nativeId, conductorId, repoKey, generation: binding.generation, readiness: binding.readiness });
-      await setChannelTopic(channel, marker);
+      await publishHandoffTopic(state, channel, marker, binding);
     } catch (error) {
       if (binding) state.auditReceipt(null, 'handoff-topic-failed', { channelId, conductorId, provider, handoffId, nativeId, error: error.message });
       throw error;
@@ -474,4 +515,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, main, parseArgs, pathsFor, provisionMarker, setChannelTopic };
+module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, main, parseArgs, pathsFor, provisionMarker, publishHandoffTopic, setChannelTopic };

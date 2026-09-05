@@ -26,6 +26,13 @@ const MESSAGE_STATES = Object.freeze({
   REPLY_UNKNOWN: 'reply_unknown',
   REJECTED: 'rejected'
 });
+const TOPIC_PUBLICATION_STATES = Object.freeze({
+  IN_FLIGHT: 'in_flight',
+  UNKNOWN: 'unknown',
+  PUBLISHED: 'published',
+  NOT_PUBLISHED: 'not_published'
+});
+const TOPIC_DEFINITE_NOT_PUBLISHED = new Set(['rate_limited', 'rejected', 'stopped', 'not_published']);
 
 const ACTIVE_STATES = new Set([
   MESSAGE_STATES.ACCEPTED,
@@ -192,12 +199,41 @@ function rowBinding(row) {
   };
 }
 
+function rowTopicPublication(row) {
+  if (!row) return null;
+  return {
+    requestId: row.request_id,
+    channelId: row.channel_id,
+    guildId: row.guild_id,
+    provider: row.provider,
+    nativeId: row.native_id,
+    conductorId: row.conductor_id || null,
+    repoKey: row.repo_key || null,
+    generation: Number(row.generation),
+    desiredReadiness: row.desired_readiness,
+    desiredTopic: row.desired_topic,
+    status: row.status,
+    outcome: row.outcome || null,
+    evidenceScope: row.evidence_scope || null,
+    error: row.error || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
 function bindingMatchesExpected(binding, expected) {
   if (!expected) return true;
   return Boolean(binding) && binding.active === expected.active && binding.channelId === expected.channelId &&
     binding.guildId === expected.guildId && binding.provider === expected.provider &&
     binding.nativeId === expected.nativeId && binding.generation === expected.generation &&
     binding.conductorId === expected.conductorId && binding.repoKey === expected.repoKey;
+}
+
+function bindingIdentityMatchesTopicPublication(binding, publication) {
+  return Boolean(binding?.active) && binding.channelId === publication.channelId && binding.guildId === publication.guildId &&
+    binding.provider === publication.provider && binding.nativeId === publication.nativeId &&
+    binding.generation === publication.generation && binding.conductorId === publication.conductorId &&
+    binding.repoKey === publication.repoKey;
 }
 
 class SurfaceState {
@@ -322,6 +358,26 @@ class SurfaceState {
         detail TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS topic_publications (
+        request_id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),
+        native_id TEXT NOT NULL,
+        conductor_id TEXT,
+        repo_key TEXT,
+        generation INTEGER NOT NULL CHECK(generation > 0),
+        desired_readiness TEXT NOT NULL CHECK(desired_readiness IN ('pending', 'ready', 'unavailable', 'recovering', 'gap')),
+        desired_topic TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('in_flight', 'unknown', 'published', 'not_published')),
+        outcome TEXT,
+        evidence_scope TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS topic_publications_channel_idx ON topic_publications(channel_id, updated_at);
+      CREATE INDEX IF NOT EXISTS topic_publications_unresolved_idx ON topic_publications(channel_id) WHERE status IN ('in_flight', 'unknown');
     `);
   }
 
@@ -335,7 +391,31 @@ class SurfaceState {
     if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== SCHEMA_VERSION) {
       throw new StateCorruptError(`unsupported state schema ${version.value}`);
     }
-    if (version.value === SCHEMA_VERSION) return;
+    if (version.value === SCHEMA_VERSION) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS topic_publications (
+          request_id TEXT PRIMARY KEY,
+          channel_id TEXT NOT NULL,
+          guild_id TEXT NOT NULL,
+          provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),
+          native_id TEXT NOT NULL,
+          conductor_id TEXT,
+          repo_key TEXT,
+          generation INTEGER NOT NULL CHECK(generation > 0),
+          desired_readiness TEXT NOT NULL CHECK(desired_readiness IN ('pending', 'ready', 'unavailable', 'recovering', 'gap')),
+          desired_topic TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('in_flight', 'unknown', 'published', 'not_published')),
+          outcome TEXT,
+          evidence_scope TEXT,
+          error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS topic_publications_channel_idx ON topic_publications(channel_id, updated_at);
+        CREATE INDEX IF NOT EXISTS topic_publications_unresolved_idx ON topic_publications(channel_id) WHERE status IN ('in_flight', 'unknown');
+      `);
+      return;
+    }
     if (version.value === '1.1') {
       const bindings = this.tableColumns('bindings');
       const messages = this.tableColumns('messages');
@@ -434,6 +514,26 @@ class SurfaceState {
           detail TEXT,
           updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS topic_publications (
+          request_id TEXT PRIMARY KEY,
+          channel_id TEXT NOT NULL,
+          guild_id TEXT NOT NULL,
+          provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),
+          native_id TEXT NOT NULL,
+          conductor_id TEXT,
+          repo_key TEXT,
+          generation INTEGER NOT NULL CHECK(generation > 0),
+          desired_readiness TEXT NOT NULL CHECK(desired_readiness IN ('pending', 'ready', 'unavailable', 'recovering', 'gap')),
+          desired_topic TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('in_flight', 'unknown', 'published', 'not_published')),
+          outcome TEXT,
+          evidence_scope TEXT,
+          error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS topic_publications_channel_idx ON topic_publications(channel_id, updated_at);
+        CREATE INDEX IF NOT EXISTS topic_publications_unresolved_idx ON topic_publications(channel_id) WHERE status IN ('in_flight', 'unknown');
         UPDATE meta SET value='${SCHEMA_VERSION}' WHERE key='schema';
       `);
       this.db.exec('COMMIT');
@@ -460,7 +560,7 @@ class SurfaceState {
   }
 
   assertSchema() {
-    const expected = ['meta', 'config', 'bindings', 'messages', 'reply_parts', 'provision_intents', 'intake_watermarks', 'receipts'];
+    const expected = ['meta', 'config', 'bindings', 'messages', 'reply_parts', 'provision_intents', 'intake_watermarks', 'receipts', 'topic_publications'];
     const rows = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
     const found = new Set(rows.map(row => row.name));
     if (expected.some(name => !found.has(name))) throw new StateCorruptError('state schema is incomplete');
@@ -503,6 +603,15 @@ class SurfaceState {
       id: { type: 'INTEGER', notnull: false }, kind: { type: 'TEXT', notnull: true },
       detail: { type: 'TEXT', notnull: true }, created_at: { type: 'TEXT', notnull: true }
     });
+    this.assertColumns('topic_publications', {
+      request_id: { type: 'TEXT', notnull: false }, channel_id: { type: 'TEXT', notnull: true },
+      guild_id: { type: 'TEXT', notnull: true }, provider: { type: 'TEXT', notnull: true },
+      native_id: { type: 'TEXT', notnull: true }, conductor_id: { type: 'TEXT' }, repo_key: { type: 'TEXT' },
+      generation: { type: 'INTEGER', notnull: true }, desired_readiness: { type: 'TEXT', notnull: true },
+      desired_topic: { type: 'TEXT', notnull: true }, status: { type: 'TEXT', notnull: true },
+      outcome: { type: 'TEXT' }, evidence_scope: { type: 'TEXT' }, error: { type: 'TEXT' },
+      created_at: { type: 'TEXT', notnull: true }, updated_at: { type: 'TEXT', notnull: true }
+    });
     this.assertForeignKey('messages', 'channel_id', 'bindings', 'channel_id');
     this.assertForeignKey('reply_parts', 'discord_id', 'messages', 'discord_id');
     this.assertForeignKey('receipts', 'discord_id', 'messages', 'discord_id');
@@ -513,6 +622,13 @@ class SurfaceState {
     if (!index?.sql || !/\(provider\s*,\s*native_id\)/i.test(index.sql) || !/WHERE\s+active\s*=\s*1/i.test(index.sql)) throw new StateCorruptError('native binding uniqueness guard is missing');
     const conductorIndex = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='bindings_conductor_unique'").get();
     if (!conductorIndex?.sql || !/\(provider\s*,\s*conductor_id\)/i.test(conductorIndex.sql)) throw new StateCorruptError('conductor identity uniqueness guard is missing');
+    const topicIndex = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='topic_publications_unresolved_idx'").get();
+    if (!topicIndex?.sql || !/status\s+IN\s*\('in_flight',\s*'unknown'\)/i.test(topicIndex.sql)) throw new StateCorruptError('topic publication custody guard is missing');
+    const topicTable = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='topic_publications'").get();
+    if (!topicTable?.sql || !/CHECK\s*\(provider\s+IN\s*\('codex',\s*'claude'\)\)/i.test(topicTable.sql) ||
+      !/CHECK\s*\(status\s+IN\s*\('in_flight',\s*'unknown',\s*'published',\s*'not_published'\)\)/i.test(topicTable.sql)) {
+      throw new StateCorruptError('topic publication custody constraints are missing');
+    }
   }
 
   transaction(fn) {
@@ -525,6 +641,60 @@ class SurfaceState {
       try { this.db.exec('ROLLBACK'); } catch {}
       throw error;
     }
+  }
+
+  listTopicPublications(channelId = null) {
+    if (channelId !== null) assertText(channelId, 'channelId', 128);
+    const rows = channelId === null
+      ? this.db.prepare('SELECT * FROM topic_publications ORDER BY updated_at, request_id').all()
+      : this.db.prepare('SELECT * FROM topic_publications WHERE channel_id=? ORDER BY updated_at, request_id').all(channelId);
+    return rows.map(rowTopicPublication);
+  }
+
+  getTopicPublication(requestId) {
+    assertText(requestId, 'requestId', 128);
+    return rowTopicPublication(this.db.prepare('SELECT * FROM topic_publications WHERE request_id=?').get(requestId));
+  }
+
+  hasUnresolvedTopicPublication(channelId) {
+    assertText(channelId, 'channelId', 128);
+    return Boolean(this.db.prepare("SELECT 1 FROM topic_publications WHERE channel_id=? AND status IN ('in_flight', 'unknown') LIMIT 1").get(channelId));
+  }
+
+  assertTopicPublicationSettled(channelId) {
+    if (this.hasUnresolvedTopicPublication(channelId)) throw new UnresolvedWorkError('topic publication custody is unresolved');
+  }
+
+  beginTopicPublication(channelId, publication, expectedBinding) {
+    assertText(channelId, 'channelId', 128);
+    if (!expectedBinding) throw new BindingError('topic publication requires an expected binding identity');
+    if (!publication || typeof publication.desiredReadiness !== 'string') throw new BindingError('topic publication readiness is required');
+    if (!Object.values(READINESS).includes(publication.desiredReadiness)) throw new BindingError('invalid topic publication readiness');
+    assertText(publication.desiredTopic, 'desiredTopic', 1024);
+    const publishedAt = publication.publishedAt == null ? null : assertText(publication.publishedAt, 'publishedAt', 64);
+    return this.transaction(() => {
+      const binding = this.getBinding(channelId);
+      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+      this.assertTopicPublicationSettled(channelId);
+      const requestId = crypto.randomUUID();
+      const timestamp = now();
+      this.db.prepare(`INSERT INTO topic_publications(
+        request_id, channel_id, guild_id, provider, native_id, conductor_id, repo_key, generation,
+        desired_readiness, desired_topic, status, outcome, evidence_scope, error, created_at, updated_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)`).run(
+        requestId, channelId, binding.guildId, binding.provider, binding.nativeId, binding.conductorId, binding.repoKey,
+        binding.generation, publication.desiredReadiness, publication.desiredTopic, TOPIC_PUBLICATION_STATES.IN_FLIGHT,
+        timestamp, timestamp
+      );
+      const guardedReadiness = publication.desiredReadiness === READINESS.READY ? READINESS.UNAVAILABLE : publication.desiredReadiness;
+      this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(guardedReadiness, timestamp, channelId);
+      this.receipt(null, 'topic-publication-started', {
+        requestId, channelId, conductorId: binding.conductorId, repoKey: binding.repoKey,
+        provider: binding.provider, nativeId: binding.nativeId, generation: binding.generation,
+        desiredReadiness: publication.desiredReadiness, desiredTopic: publication.desiredTopic, publishedAt
+      });
+      return this.getTopicPublication(requestId);
+    });
   }
 
   setConfig(values) {
@@ -587,6 +757,8 @@ class SurfaceState {
     this.assertConductorOwnerFree(input.provider, input.conductorId);
     const createdAt = now();
     return this.transaction(() => {
+      if (this.getBinding(input.channelId)) throw new BindingError('channel is already bound; use rebind after work drains');
+      this.assertTopicPublicationSettled(input.channelId);
       const generationRow = input.conductorId
         ? this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE provider=? AND conductor_id=?').get(input.provider, input.conductorId)
         : this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE channel_id=?').get(input.channelId);
@@ -609,6 +781,9 @@ class SurfaceState {
     if (existing.conductorId && existing.provider !== input.provider) throw new BindingError('conductor provider changes require an explicit handoff');
     const generation = existing.generation + 1;
     return this.transaction(() => {
+      const current = this.getBinding(channelId);
+      if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
+      this.assertTopicPublicationSettled(channelId);
       this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
         .run(input.guildId, input.provider, input.nativeId, input.workspace, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
       this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
@@ -623,6 +798,9 @@ class SurfaceState {
     if (!binding.active) return true;
     if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot unbind while work is unresolved');
     return this.transaction(() => {
+      const current = this.getBinding(channelId);
+      if (!bindingMatchesExpected(current, binding)) throw new StaleGenerationError('unbind source identity is stale');
+      this.assertTopicPublicationSettled(channelId);
       this.db.prepare('UPDATE bindings SET active=0, updated_at=? WHERE channel_id=?').run(now(), channelId);
       this.receipt(null, 'unbound', { channelId, generation: binding.generation });
       return true;
@@ -690,6 +868,7 @@ class SurfaceState {
         existing.generation === fromGeneration + 1 && existing.workspace === input.workspace && existing.endpoint === input.endpoint;
       if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
       return this.transaction(() => {
+        this.assertTopicPublicationSettled(channelId);
         this.receipt(null, 'conductor-handoff-retry', { channelId, conductorId, provider, handoffId, nativeId, generation: existing.generation });
         return { ...existing, handoffReconciled: true };
       });
@@ -701,6 +880,9 @@ class SurfaceState {
     if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
     this.assertNativeOwnerFree(provider, nativeId, channelId);
     return this.transaction(() => {
+      const current = this.getBinding(channelId);
+      if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('handoff source identity is stale');
+      this.assertTopicPublicationSettled(channelId);
       const generation = existing.generation + 1;
       this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
         .run(input.nativeId, input.workspace, input.endpoint, READINESS.PENDING, generation, now(), channelId, provider, conductorId, fromGeneration, fromNativeId);
@@ -819,27 +1001,87 @@ class SurfaceState {
     assertText(channelId, 'channelId', 128);
     if (!publication || typeof publication.desiredReadiness !== 'string') throw new BindingError('topic publication readiness is required');
     if (!Object.values(READINESS).includes(publication.desiredReadiness)) throw new BindingError('invalid topic publication readiness');
+    const requestId = publication.requestId == null ? null : assertText(publication.requestId, 'requestId', 128);
+    const outcome = String(publication.outcome || 'unknown');
+    const status = outcome === 'published'
+      ? TOPIC_PUBLICATION_STATES.PUBLISHED
+      : TOPIC_DEFINITE_NOT_PUBLISHED.has(outcome) && publication.publicationUnknown !== true
+        ? TOPIC_PUBLICATION_STATES.NOT_PUBLISHED
+        : TOPIC_PUBLICATION_STATES.UNKNOWN;
     return this.transaction(() => {
       const binding = this.getBinding(channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
-      const outcome = String(publication.outcome || 'unknown');
-      const failedReadyPublication = publication.desiredReadiness === READINESS.READY && outcome !== 'published';
-      if (failedReadyPublication) {
+      const custody = requestId ? this.getTopicPublication(requestId) : null;
+      if (requestId && (!custody || custody.channelId !== channelId)) throw new BindingError('topic publication custody is unknown');
+      if (custody && custody.status !== TOPIC_PUBLICATION_STATES.IN_FLIGHT) return binding;
+      if (custody && !bindingIdentityMatchesTopicPublication(binding, custody)) {
+        this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, error=?, updated_at=? WHERE request_id=? AND status=?')
+          .run(TOPIC_PUBLICATION_STATES.UNKNOWN, 'stale', 'topic publication owner changed before settlement', now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT);
+        this.receipt(null, 'topic-publication', {
+          requestId, channelId, conductorId: custody.conductorId, repoKey: custody.repoKey,
+          provider: custody.provider, nativeId: custody.nativeId, generation: custody.generation,
+          desiredReadiness: custody.desiredReadiness, publishedReadiness: null, publishedAt: null,
+          outcome: 'stale', custodyStatus: TOPIC_PUBLICATION_STATES.UNKNOWN,
+          observedTopic: typeof publication.observedTopic === 'string' ? publication.observedTopic : null,
+          error: 'topic publication owner changed before settlement'
+        });
+        return null;
+      }
+      const desiredReadiness = custody?.desiredReadiness || publication.desiredReadiness;
+      const failedReadyPublication = desiredReadiness === READINESS.READY && status !== TOPIC_PUBLICATION_STATES.PUBLISHED;
+      if (binding && (failedReadyPublication || status === TOPIC_PUBLICATION_STATES.UNKNOWN)) {
         this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(READINESS.UNAVAILABLE, now(), channelId);
+      } else if (binding && status === TOPIC_PUBLICATION_STATES.PUBLISHED) {
+        this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(desiredReadiness, now(), channelId);
+      }
+      if (custody) {
+        this.db.prepare(`UPDATE topic_publications SET status=?, outcome=?, error=?, updated_at=? WHERE request_id=? AND status=?`)
+          .run(status, outcome, publication.error ? String(publication.error).slice(0, 200) : null, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT);
       }
       this.receipt(null, 'topic-publication', {
-        channelId,
-        conductorId: binding.conductorId,
-        repoKey: binding.repoKey,
-        provider: binding.provider,
-        nativeId: binding.nativeId,
-        generation: binding.generation,
-        desiredReadiness: publication.desiredReadiness,
+        requestId, channelId,
+        conductorId: custody?.conductorId || binding?.conductorId || null,
+        repoKey: custody?.repoKey || binding?.repoKey || null,
+        provider: custody?.provider || binding?.provider || null,
+        nativeId: custody?.nativeId || binding?.nativeId || null,
+        generation: custody?.generation || binding?.generation || null,
+        desiredReadiness,
         publishedReadiness: publication.publishedReadiness || null,
         publishedAt: publication.publishedAt || null,
         outcome,
+        custodyStatus: status,
         observedTopic: typeof publication.observedTopic === 'string' ? publication.observedTopic : null,
         error: publication.error ? String(publication.error).slice(0, 200) : null
+      });
+      return this.getBinding(channelId);
+    });
+  }
+
+  reconcileTopicPublication(channelId, requestId, resolution, evidenceScope) {
+    assertText(channelId, 'channelId', 128);
+    assertText(requestId, 'requestId', 128);
+    if (!['published', 'not_published'].includes(resolution)) throw new BindingError('topic publication resolution must be published or not_published');
+    assertText(evidenceScope, 'evidenceScope', 2000);
+    return this.transaction(() => {
+      const custody = this.getTopicPublication(requestId);
+      if (!custody || custody.channelId !== channelId) throw new BindingError('topic publication custody is unknown');
+      if (![TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN].includes(custody.status)) {
+        throw new BindingError('topic publication custody is already settled');
+      }
+      const binding = this.getBinding(channelId);
+      if (!binding || !bindingIdentityMatchesTopicPublication(binding, custody)) throw new StaleGenerationError('topic publication reconciliation target is stale');
+      const status = resolution === 'published' ? TOPIC_PUBLICATION_STATES.PUBLISHED : TOPIC_PUBLICATION_STATES.NOT_PUBLISHED;
+      const outcome = resolution === 'published' ? 'reconciled_published' : 'reconciled_not_published';
+      const nextReadiness = status === TOPIC_PUBLICATION_STATES.PUBLISHED
+        ? custody.desiredReadiness
+        : custody.desiredReadiness === READINESS.READY ? READINESS.UNAVAILABLE : custody.desiredReadiness;
+      this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, evidence_scope=?, error=NULL, updated_at=? WHERE request_id=? AND status IN (?, ?)')
+        .run(status, outcome, evidenceScope, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN);
+      this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(nextReadiness, now(), channelId);
+      this.receipt(null, 'topic-publication-reconciled', {
+        requestId, channelId, provider: custody.provider, nativeId: custody.nativeId,
+        conductorId: custody.conductorId, repoKey: custody.repoKey, generation: custody.generation,
+        desiredReadiness: custody.desiredReadiness, resolution, evidenceScope, custodyStatus: status
       });
       return this.getBinding(channelId);
     });
@@ -1162,6 +1404,19 @@ class SurfaceState {
 
   recoverAfterRestart() {
     return this.transaction(() => {
+      const topicPublications = this.db.prepare('SELECT * FROM topic_publications WHERE status=?').all(TOPIC_PUBLICATION_STATES.IN_FLIGHT);
+      for (const row of topicPublications) {
+        this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, error=?, updated_at=? WHERE request_id=? AND status=?')
+          .run(TOPIC_PUBLICATION_STATES.UNKNOWN, 'process_stopped', 'process stopped during topic publication', now(), row.request_id, TOPIC_PUBLICATION_STATES.IN_FLIGHT);
+        if (row.desired_readiness === READINESS.READY) {
+          this.db.prepare("UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1").run(READINESS.UNAVAILABLE, now(), row.channel_id);
+        }
+        this.receipt(null, 'topic-publication-unknown-after-restart', {
+          requestId: row.request_id, channelId: row.channel_id, provider: row.provider,
+          nativeId: row.native_id, conductorId: row.conductor_id, repoKey: row.repo_key,
+          generation: row.generation, desiredReadiness: row.desired_readiness
+        });
+      }
       const dispatching = this.db.prepare('SELECT discord_id FROM messages WHERE state=?').all(MESSAGE_STATES.DISPATCHING);
       for (const row of dispatching) {
         this.db.prepare('UPDATE messages SET state=?, error=?, updated_at=? WHERE discord_id=?')
@@ -1278,8 +1533,9 @@ class SurfaceState {
     const bindings = this.listBindings();
     const messages = this.listMessages();
     const watermarks = this.listIntakeWatermarks();
+    const topicCustody = this.listTopicPublications();
     const topicPublications = new Map();
-    for (const row of this.listReceipts().filter(item => item.kind === 'topic-publication')) {
+    for (const row of this.listReceipts().filter(item => item.kind === 'topic-publication' || item.kind === 'topic-publication-reconciled')) {
       const detail = parseJson(row.detail, {});
       if (detail.channelId) topicPublications.set(detail.channelId, { ...detail, recordedAt: row.created_at });
     }
@@ -1302,7 +1558,8 @@ class SurfaceState {
         recovery: RECOVERY_LIMITS
       },
       intakeWatermarks: watermarks.map(row => ({ channelId: row.channel_id, lastSeenId: row.last_seen_id, recoveredThroughId: row.recovered_through_id, state: row.state, gapFrom: row.gap_from, gapTo: row.gap_to, detail: row.detail })),
-      topicPublications: [...topicPublications.values()]
+      topicPublications: [...topicPublications.values()],
+      topicPublicationCustody: topicCustody
     };
   }
 
@@ -1341,6 +1598,7 @@ module.exports = {
   StaleGenerationError,
   StateCorruptError,
   SurfaceState,
+  TOPIC_PUBLICATION_STATES,
   UnresolvedWorkError,
   UUID,
   discordNonce,

@@ -46,8 +46,9 @@ function recoveryKind(error) {
 }
 
 function topicPublicationOutcome(error) {
+  if (error?.status === 429 || error?.code === 429 || /^RateLimitError(?:\[|$)/.test(String(error?.name || '')) || /^RateLimitError(?:\[|$)/.test(String(error?.message || ''))) return 'rate_limited';
+  if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
   if (recoveryKind(error) === 'stopped') return 'stopped';
-  if (error?.name === 'RateLimitError' || error?.status === 429 || error?.code === 429) return 'rate_limited';
   return 'unknown';
 }
 
@@ -348,6 +349,12 @@ class DiscordGateway {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw recoveryError('deadline', 'Discord recovery deadline exceeded before topic publication');
     const rest = channel?.client?.rest;
+    let operationStarted = false;
+    const unknownAfterAbort = error => {
+      if (!error || !operationStarted) return error;
+      error.publicationUnknown = true;
+      return error;
+    };
     if (rest?.patch && channel.id && rest.options) {
       const controller = new AbortController();
       const abort = () => controller.abort();
@@ -368,7 +375,10 @@ class DiscordGateway {
       try {
         const { Routes } = requireInstalled('discord-api-types/v10');
         const response = await waitForRecoveryOperation(
-          () => rest.patch(Routes.channel(channel.id), { body: { topic }, signal: controller.signal }),
+          () => {
+            operationStarted = true;
+            return rest.patch(Routes.channel(channel.id), { body: { topic }, signal: controller.signal });
+          },
           signal,
           deadline,
           () => controller.abort()
@@ -377,8 +387,8 @@ class DiscordGateway {
         if (Date.now() >= deadline) throw recoveryError('deadline', 'Discord recovery deadline exceeded after topic publication');
         channel.topic = typeof response?.topic === 'string' ? response.topic : topic;
       } catch (error) {
-        if (signal?.aborted) throw recoveryError('stopped', 'Discord recovery was stopped');
-        if (controller.signal.aborted || Date.now() >= deadline) throw recoveryError('deadline', 'Discord recovery deadline exceeded during topic publication');
+        if (signal?.aborted) throw unknownAfterAbort(recoveryError('stopped', 'Discord recovery was stopped'));
+        if (controller.signal.aborted || Date.now() >= deadline) throw unknownAfterAbort(recoveryError('deadline', 'Discord recovery deadline exceeded during topic publication'));
         throw error;
       } finally {
         clearTimeout(timer);
@@ -388,14 +398,17 @@ class DiscordGateway {
       }
       return;
     }
-    if (typeof channel.setTopic === 'function') await waitForRecoveryOperation(() => channel.setTopic(topic), signal, deadline);
-    else if (typeof channel.edit === 'function') await waitForRecoveryOperation(() => channel.edit({ topic }), signal, deadline);
+    if (typeof channel.setTopic === 'function') await waitForRecoveryOperation(() => { operationStarted = true; return channel.setTopic(topic); }, signal, deadline).catch(error => { throw unknownAfterAbort(error); });
+    else if (typeof channel.edit === 'function') await waitForRecoveryOperation(() => { operationStarted = true; return channel.edit({ topic }); }, signal, deadline).catch(error => { throw unknownAfterAbort(error); });
     else channel.topic = topic;
   }
 
   async updateChannelReadiness(channel, readiness, { signal, deadline, expectedBinding } = {}) {
     if (!channel) return { published: false, outcome: 'unavailable', error: 'Discord channel is unavailable' };
     if (expectedBinding && !this.isCurrentBinding(expectedBinding)) return { published: false, outcome: 'stale', stale: true, error: 'Discord recovery binding changed before topic publication' };
+    if (expectedBinding && this.state.hasUnresolvedTopicPublication(expectedBinding.channelId)) {
+      return { published: false, outcome: 'unknown', blocked: true, error: 'Discord topic publication custody is unresolved' };
+    }
     const current = topicPresentation(channel.topic);
     if (current.publishedReadiness === readiness) return { published: true, outcome: 'published', topic: channel.topic, publishedReadiness: readiness, publishedAt: current.publishedAt };
     const publishedAt = new Date().toISOString();
@@ -406,13 +419,20 @@ class DiscordGateway {
       return { published: false, outcome: 'unknown', error: topicPublicationError(error), topic };
     }
     if (channel.topic === topic) return { published: true, outcome: 'published', topic, publishedReadiness: readiness, publishedAt };
+    let custody;
     try {
+      custody = this.state.beginTopicPublication(expectedBinding?.channelId || channel.id, {
+        desiredReadiness: readiness,
+        desiredTopic: topic,
+        publishedAt
+      }, expectedBinding);
+      if (!custody) return { published: false, outcome: 'stale', stale: true, error: 'Discord recovery binding changed before topic publication' };
       await this.publishChannelTopic(channel, topic, signal, deadline || Date.now() + RECOVERY_LIMITS.timeoutMs);
       if (expectedBinding && !this.isCurrentBinding(expectedBinding)) return { published: false, outcome: 'stale', stale: true, error: 'Discord recovery binding changed during topic publication' };
       if (channel.topic !== topic) throw new Error('Discord channel readiness topic readback mismatch');
-      return { published: true, outcome: 'published', topic, publishedReadiness: readiness, publishedAt };
+      return { published: true, outcome: 'published', topic, publishedReadiness: readiness, publishedAt, requestId: custody.requestId };
     } catch (error) {
-      return { published: false, outcome: topicPublicationOutcome(error), error: topicPublicationError(error), topic };
+      return { published: false, outcome: topicPublicationOutcome(error), publicationUnknown: Boolean(error?.publicationUnknown), error: topicPublicationError(error), topic, requestId: custody?.requestId || null, blocked: !custody };
     }
   }
 
@@ -424,15 +444,18 @@ class DiscordGateway {
     const readiness = state === 'ready' ? READINESS.READY : state === 'gap' ? READINESS.GAP : state === 'unavailable' ? READINESS.UNAVAILABLE : READINESS.PENDING;
     if (!channel || readiness === READINESS.PENDING || readiness === READINESS.RECOVERING) return { watermark, topicPublished: true, publication: null };
     const publication = await this.updateChannelReadiness(channel, readiness, { signal, deadline, expectedBinding: binding });
+    if (publication.blocked) return { watermark, topicPublished: false, publication };
     if (publication.stale || !this.isCurrentBinding(binding)) return { watermark, topicPublished: false, stale: true, publication };
     const observed = topicPresentation(channel.topic);
     const recorded = this.state.recordTopicPublication(binding.channelId, {
       desiredReadiness: readiness,
+      requestId: publication.requestId || null,
       publishedReadiness: publication.published ? publication.publishedReadiness : observed.publishedReadiness,
       publishedAt: publication.published ? publication.publishedAt : observed.publishedAt,
       outcome: publication.outcome,
       observedTopic: channel.topic,
-      error: publication.error || null
+      error: publication.error || null,
+      publicationUnknown: publication.publicationUnknown
     }, binding);
     if (!recorded) return { watermark, topicPublished: false, stale: true, publication };
     return { watermark, topicPublished: publication.published, publication };
@@ -720,5 +743,6 @@ module.exports = {
   createSurfaceConsumer,
   eventToInput,
   readSecret,
-  requireInstalled
+  requireInstalled,
+  topicPublicationOutcome
 };
