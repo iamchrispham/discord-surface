@@ -74,6 +74,15 @@ async function waitForProcessGone(pid, timeoutMs = 1000) {
   throw new Error(`timed out waiting for process ${pid} to exit`);
 }
 
+async function waitForCondition(predicate, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.ok(predicate(), 'condition did not become true before timeout');
+}
+
 function liaisonChild(dir, mode, promptPath, pidPath) {
   const scriptPath = path.join(dir, `liaison-child-${mode}.cjs`);
   const script = `
@@ -1554,6 +1563,116 @@ test('simulated: accepted recovery transfers submitted custody without blocking 
   assert.equal(state.getMessage('accepted-recovery-late').state, MESSAGE_STATES.REPLIED);
   assert.equal(sends.filter(payload => payload.content === 'answer after recovery').length, 1);
   assert.equal(state.getMessage('accepted-recovery-late').observerCursor.offset, 12);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: recovered observer drains next accepted message for same native owner', async () => {
+  const { dir, db, state: initial } = fixture();
+  let state = initial;
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'accepted-one', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'first' });
+  await new Promise(resolve => setTimeout(resolve, 2));
+  state.acceptDiscordMessage({ id: 'accepted-two', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'second' });
+  state.close();
+  state = new SurfaceState(db);
+
+  const sends = [];
+  const dispatches = [];
+  const observations = [];
+  const releases = [];
+  const channel = {
+    async send(payload) {
+      sends.push(payload);
+      return { id: `sent-${sends.length}` };
+    }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} },
+    providers: {
+      codex: {
+        async dispatch(message) {
+          dispatches.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message) {
+          observations.push(message.id);
+          return new Promise(resolve => releases.push(resolve));
+        }
+      }
+    }
+  });
+  gateway.ready = true;
+
+  await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
+  assert.deepEqual(dispatches, ['accepted-one']);
+  assert.deepEqual(observations, ['accepted-one']);
+  assert.equal(state.getMessage('accepted-two').state, MESSAGE_STATES.ACCEPTED);
+
+  releases[0]({ text: 'answer-one' });
+  await waitForCondition(() => observations.length === 2);
+  assert.deepEqual(dispatches, ['accepted-one', 'accepted-two']);
+  assert.deepEqual(observations, ['accepted-one', 'accepted-two']);
+  assert.equal(state.getMessage('accepted-one').state, MESSAGE_STATES.REPLIED);
+
+  releases[1]({ text: 'answer-two' });
+  await waitForCondition(() => state.getMessage('accepted-two').state === MESSAGE_STATES.REPLIED);
+  assert.equal(sends.filter(payload => payload.content === 'answer-one').length, 1);
+  assert.equal(sends.filter(payload => payload.content === 'answer-two').length, 1);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: recovered queue tail stays held after native owner change', async () => {
+  const { dir, db, state: initial } = fixture();
+  let state = initial;
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'owner-one', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'first' });
+  await new Promise(resolve => setTimeout(resolve, 2));
+  state.acceptDiscordMessage({ id: 'owner-two', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'second' });
+  state.close();
+  state = new SurfaceState(db);
+
+  const dispatches = [];
+  const observations = [];
+  let release;
+  const sends = [];
+  const channel = {
+    async send(payload) {
+      sends.push(payload);
+      return { id: `sent-${sends.length}` };
+    }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} },
+    providers: {
+      codex: {
+        async dispatch(message) {
+          dispatches.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message) {
+          observations.push(message.id);
+          return new Promise(resolve => { release = resolve; });
+        }
+      }
+    }
+  });
+  gateway.ready = true;
+
+  await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
+  assert.deepEqual(dispatches, ['owner-one']);
+  assert.deepEqual(observations, ['owner-one']);
+  state.setConfig({ operatorId: 'revoked-owner' });
+  release({ text: 'late owner reply' });
+  await waitForCondition(() => state.getMessage('owner-one').state === MESSAGE_STATES.SUBMITTED);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.deepEqual(dispatches, ['owner-one']);
+  assert.deepEqual(observations, ['owner-one']);
+  assert.equal(state.getMessage('owner-two').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(sends.filter(payload => payload.content === 'late owner reply').length, 0);
   await gateway.stop();
   state.close();
 });

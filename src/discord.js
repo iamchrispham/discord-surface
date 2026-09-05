@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const { createRequire } = require('node:module');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
-const { READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
 
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
@@ -158,11 +158,13 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return trackReceiptWork(issueTransportReceipt(message));
   }
 
-  function trackNativeWork(messageId, work) {
+  function trackNativeWork(messageId, work, onSettled = null) {
     const tracked = Promise.resolve(work);
     nativeWork.set(messageId, { promise: tracked, controller: null });
     tracked.finally(() => {
-      if (nativeWork.get(messageId)?.promise === tracked) nativeWork.delete(messageId);
+      if (nativeWork.get(messageId)?.promise !== tracked) return;
+      nativeWork.delete(messageId);
+      try { onSettled?.(messageId); } catch {}
     }).catch(() => {});
     return tracked;
   }
@@ -174,7 +176,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
   }
 
-  function startNativeWork(messageId, signal, workFactory) {
+  function startNativeWork(messageId, signal, workFactory, onSettled = null) {
     const controller = new AbortController();
     const onAbort = () => controller.abort();
     if (signal?.aborted) controller.abort();
@@ -183,7 +185,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       if (controller.signal.aborted) return { status: 'stopped', message: null };
       return workFactory(controller.signal);
     });
-    const tracked = trackNativeWork(messageId, work);
+    const tracked = trackNativeWork(messageId, work, onSettled);
     const entry = nativeWork.get(messageId);
     if (entry?.promise === tracked) entry.controller = controller;
     tracked.finally(() => signal?.removeEventListener('abort', onAbort)).catch(() => {});
@@ -229,7 +231,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return { ...result, message: state.getMessage(ready.message.id) };
   }
 
-  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false } = {}) {
+  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, onSettled = null } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
     let settleHandoff;
@@ -247,7 +249,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
         onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
       });
       return deliverReply(message, result, taskSignal);
-    });
+    }, onSettled);
     if (!handoff) return work;
     work.then(result => settleHandoff?.(result), error => rejectHandoff?.(error));
     return handoffPromise;
@@ -266,12 +268,12 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return intake;
   }
 
-  async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false } = {}) {
+  async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false, onSettled = null } = {}) {
     launchTransportReceipt(message);
-    return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff });
+    return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff, onSettled });
   }
 
-  function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false } = {}) {
+  function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false, onSettled = null } = {}) {
     launchTransportReceipt(message);
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
@@ -279,7 +281,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       const provider = providers[message.provider];
       const result = await observeSubmitted(state, message, provider, { ...observeOptions, signal: taskSignal, continueUntilFinal });
       return deliverReply(message, result, taskSignal);
-    });
+    }, onSettled);
     if (continueUntilFinal) return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
     return work;
   }
@@ -309,6 +311,8 @@ class DiscordGateway {
     this.connectionEpoch = 0;
     this.recoveryController = null;
     this.recoveryPromise = null;
+    this.recoveryDrainPromise = null;
+    this.recoveryDrainRequested = false;
     this.reconnectPromise = null;
     this.fetchHistoryInjected = typeof fetchHistory === 'function';
     this.fetchHistory = fetchHistory || ((channel, options) => channel.messages?.fetch(options));
@@ -745,6 +749,32 @@ class DiscordGateway {
     }
   }
 
+  requestRecoveryDrain(before, messageId) {
+    const settled = this.state.getMessage(messageId);
+    const ownerFree = [MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(settled?.state);
+    if (!ownerFree || this.stopping || !this.ready) return;
+    this.recoveryDrainRequested = true;
+    if (this.recoveryDrainPromise) return;
+    const task = (async () => {
+      while (this.recoveryDrainRequested && !this.stopping && this.ready) {
+        this.recoveryDrainRequested = false;
+        const activeRecovery = this.recoveryPromise;
+        if (activeRecovery) await activeRecovery.catch(() => {});
+        if (this.stopping || !this.ready) return;
+        try {
+          await this.reconcilePending(before);
+        } catch (error) {
+          if (!this.stopping) this.logger(`Discord recovery queue drain failed: ${error.message}`);
+          return;
+        }
+      }
+    })();
+    this.recoveryDrainPromise = task;
+    task.finally(() => {
+      if (this.recoveryDrainPromise === task) this.recoveryDrainPromise = null;
+    }).catch(() => {});
+  }
+
   async reconcilePending(before = new Date().toISOString()) {
     if (!this.ready) throw new Error('Discord gateway is not ready for recovery');
     if (this.recoveryPromise) return this.recoveryPromise;
@@ -790,13 +820,20 @@ class DiscordGateway {
       try {
         if (message.state === 'accepted') {
           result = await waitForRecoveryOperation(
-            () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true }),
+            () => this.consumer.handleStoredMessage(storedMessage, signal, {
+              continueUntilFinal: true,
+              handoff: true,
+              onSettled: settledMessageId => this.requestRecoveryDrain(before, settledMessageId)
+            }),
             signal,
             deadline
           );
         } else if (message.state === 'submitted') {
           result = await waitForRecoveryOperation(
-            () => this.consumer.resumeSubmitted(storedMessage, signal, { continueUntilFinal: true }),
+            () => this.consumer.resumeSubmitted(storedMessage, signal, {
+              continueUntilFinal: true,
+              onSettled: settledMessageId => this.requestRecoveryDrain(before, settledMessageId)
+            }),
             signal,
             deadline
           );
@@ -823,10 +860,12 @@ class DiscordGateway {
     this.started = false;
     this.stopPromise = (async () => {
       this.ready = false;
+      this.recoveryDrainRequested = false;
       this.recoveryController?.abort();
       const recovery = this.recoveryPromise;
       const reconnect = this.reconnectPromise;
-      await Promise.allSettled([recovery, reconnect].filter(Boolean));
+      const recoveryDrain = this.recoveryDrainPromise;
+      await Promise.allSettled([recovery, reconnect, recoveryDrain].filter(Boolean));
       for (const controller of this.controllers) controller.abort();
       for (const controller of this.receiptControllers) controller.abort();
       this.consumer.abortNativeWork();
