@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const { createRequire } = require('node:module');
 const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
@@ -14,6 +15,9 @@ const { deriveLiaisonFacts, rawReceiptFor, runLiaisonDraft, validateLiaisonSelec
 const { bindingArgs, conductorMarker, ensureProvisionedChannel, migrateLegacyTopic, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
 const { conductorMarkerMatches, topicWithReadiness } = require('../src/topic');
+const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
+const { NotificationSchema } = requireInstalled('@modelcontextprotocol/sdk/types.js');
+const { z } = requireInstalled('zod');
 
 const CODEX_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CLAUDE_ID = '01a0701c-5714-7671-a455-db7d67f9fa78';
@@ -644,8 +648,17 @@ test('simulated: Claude channel forwards only the bound generation and closes it
   await channel.start();
   const response = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId: 'claude-event', generation: 1, content: 'reply' });
   assert.equal(response.statusCode, 202);
-  assert.equal(events[0].params.meta.messageId, 'claude-event');
-  assert.equal(events[0].params.meta.generation, 1);
+  const notification = events[0];
+  NotificationSchema.parse(notification);
+  z.object({
+    method: z.literal('notifications/claude/channel'),
+    params: z.object({
+      content: z.string(),
+      meta: z.record(z.string().regex(/^[A-Za-z0-9_]+$/), z.string())
+    })
+  }).parse(notification);
+  assert.equal(notification.params.meta.messageId, 'claude-event');
+  assert.equal(notification.params.meta.generation, '1');
   await channel.stop();
   assert.equal(fs.existsSync(socket), false);
   state.close();

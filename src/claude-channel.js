@@ -124,7 +124,7 @@ class ClaudeChannel {
     try {
       await this.mcp.notification({ method: 'notifications/claude/channel', params: {
         content: body.content,
-        meta: { messageId: body.messageId, generation: body.generation, nativeId: body.nativeId }
+        meta: { messageId: body.messageId, generation: String(body.generation), nativeId: body.nativeId }
       }});
     } catch (error) {
       error.potentiallyDelivered = true;
