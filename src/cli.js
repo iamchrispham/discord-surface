@@ -258,7 +258,7 @@ function provision(args) {
   if (process.env.DISCORD_SURFACE_PROVISION_LOCK_HELD === '1') return provisionInternal(args);
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const forwarded = Object.entries(args).flatMap(([key, value]) => value === true ? [`--${key}`] : [`--${key}`, String(value)]);
-  const result = spawnSync('lockf', ['-n', provisionLock, process.execPath, __filename, 'provision-run', ...forwarded], {
+  const result = spawnSync('lockf', ['-t', '0', '-k', provisionLock, process.execPath, __filename, 'provision-run', ...forwarded], {
     stdio: 'inherit',
     env: { ...process.env, DISCORD_SURFACE_PROVISION_LOCK_HELD: '1' }
   });
@@ -317,7 +317,7 @@ function handoff(args) {
   if (process.env.DISCORD_SURFACE_PROVISION_LOCK_HELD === '1') return handoffInternal(args);
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const forwarded = Object.entries(args).flatMap(([key, value]) => value === true ? [`--${key}`] : [`--${key}`, String(value)]);
-  const result = spawnSync('lockf', ['-n', provisionLock, process.execPath, __filename, 'handoff-run', ...forwarded], {
+  const result = spawnSync('lockf', ['-t', '0', '-k', provisionLock, process.execPath, __filename, 'handoff-run', ...forwarded], {
     stdio: 'inherit',
     env: { ...process.env, DISCORD_SURFACE_PROVISION_LOCK_HELD: '1' }
   });
@@ -371,7 +371,7 @@ function start(args) {
   try { fs.chmodSync(runtimeDir, 0o700); } catch {}
   const guildLock = path.join(runtimeDir, `guild-${config.guildId}.lock`);
   const runArgs = [process.execPath, __filename, 'run', '--state-dir', stateDir, ...(args.db ? ['--db', path.resolve(args.db)] : [])];
-  const result = spawnSync('lockf', ['-n', guildLock, 'lockf', '-n', lock, ...runArgs], {
+  const result = spawnSync('lockf', ['-t', '0', '-k', guildLock, 'lockf', '-t', '0', '-k', lock, ...runArgs], {
     stdio: 'inherit',
     env: { ...process.env, DISCORD_SURFACE_LOCK_HELD: '1' }
   });

@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { EventEmitter } = require('node:events');
+const { spawn, spawnSync } = require('node:child_process');
 const { postUnixJson } = require('../src/native');
 const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
 const { CodexProvider, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
@@ -15,6 +16,8 @@ const { ClaudeChannel } = require('../src/claude-channel');
 const CODEX_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CLAUDE_ID = '01a0701c-5714-7671-a455-db7d67f9fa78';
 const SUCCESSOR_ID = '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b';
+const LOCKF = '/usr/bin/lockf';
+const CLI_PATH = path.resolve(__dirname, '../src/cli.js');
 
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-test-'));
@@ -45,6 +48,27 @@ function discordMessage({ id, channelId, authorId = 'operator-1', bot = false, c
 
 function historyPermissions(allowed = true) {
   return { has: () => allowed };
+}
+
+function lockfRun(lockPath, script) {
+  return spawnSync(LOCKF, ['-t', '0', '-k', lockPath, process.execPath, '-e', script], { encoding: 'utf8' });
+}
+
+async function waitForFile(file, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(file)) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${file}`);
+}
+
+function waitForChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
 }
 
 function providers({ calls, reply = '4' } = {}) {
@@ -1480,4 +1504,64 @@ test('simulated: durable provision intent rejects a second unresolved create att
 
 test('simulated: ordinary worker binding requires explicit conductor identity', () => {
   assert.throws(() => bindingArgs({ 'channel-id': 'worker', 'guild-id': 'guild-1', provider: 'codex', 'native-id': CODEX_ID, workspace: process.cwd() }), /conductor-id/);
+});
+
+test('simulated: installed lockf creates, excludes, releases, and retains the lock inode', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-lock-'));
+  const lockPath = path.join(dir, 'surface.lock');
+  const firstMarker = path.join(dir, 'first');
+  const heldMarker = path.join(dir, 'held');
+  const contenderMarker = path.join(dir, 'contender');
+  const secondMarker = path.join(dir, 'second');
+  const crashMarker = path.join(dir, 'crash');
+  const afterCrashMarker = path.join(dir, 'after-crash');
+  const write = file => `require('node:fs').writeFileSync(${JSON.stringify(file)}, 'written')`;
+  const first = lockfRun(lockPath, write(firstMarker));
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(fs.existsSync(firstMarker), true);
+  assert.equal(fs.existsSync(lockPath), true);
+  const inode = fs.statSync(lockPath).ino;
+
+  const holder = spawn(LOCKF, ['-t', '2', '-k', lockPath, process.execPath, '-e', `${write(heldMarker)}; setTimeout(() => {}, 500)`], { stdio: 'ignore' });
+  let crashed = null;
+  try {
+    await waitForFile(heldMarker);
+    const contender = lockfRun(lockPath, write(contenderMarker));
+    assert.notEqual(contender.status, 0);
+    assert.equal(fs.existsSync(contenderMarker), false);
+    const holderResult = await waitForChild(holder);
+    assert.equal(holderResult.code, 0);
+    const second = lockfRun(lockPath, write(secondMarker));
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(fs.existsSync(secondMarker), true);
+    assert.equal(fs.statSync(lockPath).ino, inode);
+    crashed = spawn(LOCKF, ['-t', '2', '-k', lockPath, process.execPath, '-e', `${write(crashMarker)}; process.kill(process.pid, 'SIGKILL')`], { stdio: 'ignore' });
+    await waitForFile(crashMarker);
+    const crashResult = await waitForChild(crashed);
+    assert.notEqual(crashResult.code, 0);
+    const afterCrash = lockfRun(lockPath, write(afterCrashMarker));
+    assert.equal(afterCrash.status, 0, afterCrash.stderr);
+    assert.equal(fs.existsSync(afterCrashMarker), true);
+    assert.equal(fs.statSync(lockPath).ino, inode);
+  } finally {
+    if (holder.exitCode === null) holder.kill('SIGTERM');
+    if (holder.exitCode === null) await waitForChild(holder).catch(() => {});
+    if (crashed?.exitCode === null) crashed.kill('SIGTERM');
+    if (crashed?.exitCode === null) await waitForChild(crashed).catch(() => {});
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('simulated: public provision lock reaches native validation on a fresh state directory', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-cli-lock-'));
+  try {
+    const result = spawnSync(process.execPath, [CLI_PATH, 'provision', '--state-dir', dir, '--provider', 'codex', '--native-id', 'invalid-native-id', '--conductor-id', 'cli-lock-conductor', '--repo-key', 'repo:alpha', '--workspace', dir, '--category-id', 'codex-category'], { encoding: 'utf8' });
+    const output = `${result.stdout}\n${result.stderr}`;
+    assert.notEqual(result.status, 0);
+    assert.match(output, /nativeId must be an exact UUID/);
+    assert.doesNotMatch(output, /No such file or directory/);
+    assert.equal(fs.existsSync(path.join(dir, 'provision.lock')), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
