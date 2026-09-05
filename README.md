@@ -4,17 +4,21 @@ This local adapter keeps Discord transport custody in SQLite and sends accepted 
 
 The runtime needs Node 22.5 or newer for `node:sqlite`. It resolves `discord.js` and the MCP SDK from `/Users/cphamballer/.codex/mcp/discord/node_modules`; no package installation or bot-token export is required.
 
-Use a private state directory and an owner-only secret file. The secret file must contain only the Discord bot token and have mode `0600`.
+Use a private state directory and an owner-only dotenv file. The secret file must contain a `DISCORD_TOKEN=` assignment and have mode `0600`.
 
 ```sh
 mkdir -m 700 -p "$HOME/.config/discord-surface"
-chmod 600 /path/to/discord-token
+chmod 600 /path/to/discord.env
 node src/cli.js configure \
   --state-dir "$HOME/.config/discord-surface" \
   --guild-id DISCORD_GUILD_ID \
   --operator-id DISCORD_USER_ID \
-  --secret-file /path/to/discord-token
+  --secret-file /path/to/discord.env \
+  --codex-category-id CODEX_CATEGORY_ID \
+  --claude-category-id CLAUDE_CATEGORY_ID
 ```
+
+The adapter reads `DISCORD_TOKEN=...` without exporting or logging the value.
 
 Bind each Discord channel to one exact native session UUID and absolute workspace. A Claude binding also names the Unix socket served by its opted-in MCP channel.
 
@@ -33,13 +37,13 @@ For the `/conduct` integration, `provision` can idempotently create or find one 
 
 ```sh
 node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
-  --category-id CODEX_CATEGORY_ID --provider codex \
+  --provider codex --task-name optional-presentation-name \
   --native-id CODEX_SESSION_UUID --workspace /absolute/workspace
 ```
 
-Run it once per vendor session. A later invocation with the same provider and UUID returns the existing binding without creating another channel. Discord permissions still need to allow channel creation under the selected category.
+Run it once per vendor session. A later invocation with the same provider and UUID verifies the existing category, topic marker, binding, URL, and generation before returning it. An interrupted create leaves a durable intent and the next invocation reconciles the exact topic marker before any new create. Discord permissions still need to allow channel creation under the selected category. `--task-name` changes presentation only.
 
-The bind and rebind commands reject a malformed UUID. Rebind and unbind wait until all accepted, dispatching, submitted, uncertain, and reply custody states have been reconciled. Each binding generation is persisted and stale native replies are rejected.
+The bind and rebind commands reject a malformed UUID. Rebind and unbind wait until all accepted, dispatching, submitted, uncertain, and reply custody states have been reconciled. Unbind leaves an inactive tombstone so replied history remains readable. Each binding generation is persisted and stale native replies are rejected.
 
 Start and stop the one Gateway consumer with the local macOS `lockf` singleton.
 
@@ -51,7 +55,7 @@ node src/cli.js stop --state-dir "$HOME/.config/discord-surface"
 
 The Codex provider queues `codex queue --thread <UUID>` in the bound workspace. It observes only the matching session JSONL file and does not select a task by name, newest activity, directory, or process ID. The runtime never adds approval bypass flags.
 
-Claude Channels require opt-in when the native Claude session launches. Start the channel server with the exact pre-bound UUID and short owner-only socket path, then pass that command in the MCP configuration used to launch the native session. The Claude process must be started with its Channels flag and the normal permission mode chosen by the operator.
+Claude Channels require opt-in when the native Claude session launches. Start the channel server with the exact pre-bound UUID and short owner-only socket path, then pass that command in the MCP configuration used to launch the native session. The Claude process must be started with its Channels flag and the normal permission mode chosen by the operator. EOF or transport close stops the HTTP server, socket, MCP transport, and local state handle.
 
 ```json
 {
@@ -75,7 +79,18 @@ Claude Channels require opt-in when the native Claude session launches. Start th
 
 The channel process forwards events only after checking its exact native UUID, binding endpoint, and generation. Its `reply` tool requires the inbound Discord message ID and generation. It persists reply custody before acknowledging the MCP tool call. A Claude session without launch-time channel opt-in is not attached or resumed by this adapter.
 
-Accepted input is durable before a Discord handler returns. If the native owner is unavailable before submission, the message stays `accepted` with a `dispatch-not-submitted` receipt and no execution-success reply. A process stop during dispatch changes `dispatching` to `uncertain`; it is never retried automatically. A failed or ambiguous Discord send retains the native reply and records `reply_failed` or `reply_unknown` for explicit reconciliation.
+Accepted input is durable before a Discord handler returns. If the native owner is unavailable before submission, the message stays `accepted` with a `dispatch-not-submitted` receipt and no execution-success reply. A process stop during dispatch changes `dispatching` to `uncertain`; it is never retried automatically. A failed or ambiguous Discord send retains the native reply and records `reply_failed` or `reply_unknown` for explicit reconciliation. Replies longer than Discord's 2000-character message limit are durably split into ordered parts, each with a stable nonce and nonce enforcement. The adapter never silently truncates a native reply.
+
+After a restart, the runtime makes one bounded transport recovery pass. It may drain definitely accepted work, resume observation from the saved byte cursor for submitted work, and deliver saved reply parts. Work that was uncertain at the dispatch boundary is never replayed automatically. Reconcile it explicitly after evidence is available:
+
+```sh
+node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
+  --message-id DISCORD_MESSAGE_ID --resolution submitted
+```
+
+`status` reports pending custody and labels live permission, native approval, quota, billing, and connection gates. Simulated tests do not prove those live gates. Completion evidence and live trials remain conductor-owned.
+
+Cswap owns Claude account rotation. The adapter keeps provider plus native UUID and generation as the binding identity, so credential rotation does not recreate a session, reset a generation, discard custody, or replay work. The adapter has no provider account identity API and cannot prove which rotated account is active.
 
 Run the simulated consumer and persistence scenarios with:
 
@@ -83,4 +98,4 @@ Run the simulated consumer and persistence scenarios with:
 npm test
 ```
 
-The tests use injected native providers and fake Discord events. They do not contact Discord, start Codex or Claude, or prove a live round trip. Live two-provider delivery, native channel opt-in, permissions, approvals, billing, and Discord category setup remain operator-owned gates.
+The tests use injected native providers and fake Discord events. They do not contact Discord, start Codex or Claude, or prove a live round trip. Live two-provider delivery, native channel opt-in, permissions, approvals, billing, quota, and Discord category setup remain conductor-owned gates until directly verified.

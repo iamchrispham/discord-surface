@@ -5,8 +5,15 @@ const os = require('node:os');
 const path = require('node:path');
 const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('./state');
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
 }
 
 function codexPrompt(message) {
@@ -83,45 +90,84 @@ function finalText(row, marker) {
     .filter(value => typeof value === 'string')
     .join('')
     .trim();
-  if (!text || !text.includes(marker)) return null;
-  const reply = text.slice(text.indexOf(marker) + marker.length).trim();
+  if (!text || text.split(/\r?\n/, 1)[0].trim() !== marker) return null;
+  const newline = text.indexOf('\n');
+  if (newline < 0) return null;
+  const reply = text.slice(newline + 1).trim();
   return reply || null;
 }
 
-async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), pollMs = 250 } = {}) {
+function cursorTailBytes(cursor) {
+  if (typeof cursor?.tailBytes === 'string') {
+    try { return Buffer.from(cursor.tailBytes, 'base64'); } catch {}
+  }
+  return typeof cursor?.tail === 'string' ? Buffer.from(cursor.tail, 'utf8') : Buffer.alloc(0);
+}
+
+function completeJsonLines(bytes) {
+  const lines = [];
+  let start = 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] !== 0x0a) continue;
+    lines.push(bytes.subarray(start, index));
+    start = index + 1;
+  }
+  return { lines, tailBytes: bytes.subarray(start) };
+}
+
+async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), pollMs = 250, signal, onCursor } = {}) {
   if (!marker) throw new Error('Codex observer requires a unique response marker');
   const startedAt = Date.now();
   let file = cursor?.file || findCodexSessionFile(nativeId, root);
   let offset = Number(cursor?.offset || 0);
+  let tailBytes = cursorTailBytes(cursor);
+  let since = Number(cursor?.since || startedAt);
   while (Date.now() - startedAt < timeoutMs) {
+    if (signal?.aborted) return { stopped: true, cursor: { file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') } };
     if (!file) file = findCodexSessionFile(nativeId, root);
     if (file) {
       try {
-        const content = fs.readFileSync(file, 'utf8');
-        const chunk = content.slice(offset);
-        offset = content.length;
-        for (const line of chunk.split('\n')) {
-          if (!line) continue;
+        const bytes = fs.readFileSync(file);
+        if (bytes.length < offset) {
+          offset = 0;
+          tailBytes = Buffer.alloc(0);
+          since = startedAt;
+        }
+        const chunk = Buffer.concat([tailBytes, bytes.subarray(offset)]);
+        offset = bytes.length;
+        const parsed = completeJsonLines(chunk);
+        tailBytes = parsed.tailBytes;
+        const nextCursor = { file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') };
+        onCursor?.(nextCursor);
+        for (const lineBytes of parsed.lines) {
+          if (!lineBytes.length) continue;
           try {
-            const row = JSON.parse(line);
-            if (Date.parse(row.timestamp || '') < (cursor?.since || startedAt)) continue;
+            const row = JSON.parse(lineBytes.toString('utf8'));
+            if (Date.parse(row.timestamp || '') < since) continue;
             const text = finalText(row, marker);
-            if (text) return { text, cursor: { file, offset } };
+            if (text) return { text, cursor: nextCursor };
           } catch {}
         }
-      } catch {}
+      } catch {
+        onCursor?.({ file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') });
+      }
     }
-    await sleep(pollMs);
+    await sleep(pollMs, signal);
   }
-  return null;
+  return { stopped: Boolean(signal?.aborted), cursor: { file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') } };
 }
 
 function readInitialCursor(nativeId, root = sessionRoot()) {
   const file = findCodexSessionFile(nativeId, root);
-  if (!file) return { file: null, offset: 0, since: Date.now() };
+  if (!file) return { file: null, offset: 0, since: Date.now(), tail: '' };
   let offset = 0;
-  try { offset = fs.statSync(file).size; } catch {}
-  return { file, offset, since: Date.now() };
+  let tailBytes = Buffer.alloc(0);
+  try {
+    const bytes = fs.readFileSync(file);
+    offset = bytes.length;
+    tailBytes = completeJsonLines(bytes).tailBytes;
+  } catch {}
+  return { file, offset, since: Date.now(), tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') };
 }
 
 function runCodex(command, args, options = {}) {
@@ -131,7 +177,7 @@ function runCodex(command, args, options = {}) {
       if (!error) return resolve({ status: 'submitted', stdout, stderr });
       const text = `${error.message} ${stderr || ''}`;
       if (!spawned || error.code === 'ENOENT') return resolve({ status: 'not_submitted', error: new Error(text) });
-      if (/not found|does not exist|unknown thread|no such thread|missing thread/i.test(text)) {
+      if (/not found|does not exist|unknown thread|no such thread|missing thread|no rollout found for thread id/i.test(text)) {
         return resolve({ status: 'not_submitted', error: new Error(text) });
       }
       resolve({ status: 'uncertain', error: new Error(text) });
@@ -162,7 +208,11 @@ class CodexProvider {
   }
 
   observe(message, outcome, options) {
-    return observeCodexReply(message.nativeId, outcome.cursor, { ...options, marker: `[[discord-surface:${message.id}]]`, root: this.root });
+    return observeCodexReply(message.nativeId, outcome.cursor || message.observerCursor, {
+      ...options,
+      marker: `[[discord-surface:${message.id}]]`,
+      root: this.root
+    });
   }
 }
 
@@ -211,18 +261,47 @@ class ClaudeProvider {
   }
 }
 
-async function waitForReply(state, messageId, { timeoutMs = 120000, pollMs = 250 } = {}) {
+async function waitForReply(state, messageId, { timeoutMs = 120000, pollMs = 250, signal } = {}) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
+    if (signal?.aborted) return { stopped: true };
     const message = state.getMessage(messageId);
     if (!message) return null;
-    if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) {
-      return { text: message.replyText };
-    }
+    if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) return { text: message.replyText };
     if ([MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state)) return null;
-    await sleep(pollMs);
+    await sleep(pollMs, signal);
   }
   return null;
+}
+
+async function observeSubmitted(state, message, provider, options = {}) {
+  if (!provider?.observe) {
+    const unavailable = state.markObservationUnavailable(message.id, 'native observer is unavailable');
+    return { status: unavailable?.state || message.state, message: unavailable || state.getMessage(message.id) };
+  }
+  const marker = `[[discord-surface:${message.id}]]`;
+  const outcome = { cursor: message.observerCursor };
+  let reply;
+  try {
+    reply = await provider.observe(message, outcome, {
+      ...options,
+      onCursor: cursor => state.setObserverCursor(message.id, cursor, marker)
+    });
+  } catch (error) {
+    state.markObservationUnavailable(message.id, error);
+    return { status: state.getMessage(message.id)?.state || message.state, message: state.getMessage(message.id), error };
+  }
+  if (reply?.cursor) state.setObserverCursor(message.id, reply.cursor, marker);
+  if (reply?.text) {
+    try {
+      state.recordNativeReply({ messageId: message.id, nativeId: message.nativeId, generation: message.generation, text: reply.text });
+    } catch (error) {
+      return { status: 'stale-reply', message: state.getMessage(message.id), error };
+    }
+  } else if (!reply?.stopped) {
+    state.markObservationUnavailable(message.id, 'native reply was not observed before the bounded window');
+  }
+  return { status: state.getMessage(message.id)?.state || message.state, message: state.getMessage(message.id) };
 }
 
 async function dispatchAndObserve(state, messageId, providers, options = {}) {
@@ -232,7 +311,7 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
   } catch (error) {
     return { status: 'rejected', message: state.getMessage(messageId), error };
   }
-  if (!claimed.claimed) return { status: claimed.message?.state || 'ignored', message: claimed.message };
+  if (!claimed.claimed) return { status: claimed.reason || claimed.message?.state || 'ignored', message: claimed.message };
   const message = claimed.message;
   const provider = providers[message.provider];
   if (!provider) {
@@ -260,22 +339,10 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
     state.markUncertain(message.id, outcome.error);
     return { status: 'uncertain', message: state.getMessage(message.id), error: outcome.error };
   }
-  state.markSubmitted(message.id);
-  let reply;
-  try {
-    reply = await provider.observe?.(message, outcome, options);
-  } catch (error) {
-    return { status: 'submitted', message: state.getMessage(message.id), error };
-  }
-  if (reply?.text) {
-    try {
-      state.recordNativeReply({ messageId: message.id, nativeId: message.nativeId, generation: message.generation, text: reply.text });
-    } catch (error) {
-      return { status: 'stale-reply', message: state.getMessage(message.id), error };
-    }
-  }
-  const saved = state.getMessage(message.id);
-  return { status: saved.state, message: saved };
+  const marker = `[[discord-surface:${message.id}]]`;
+  state.markSubmitted(message.id, outcome.cursor || null, marker);
+  const observation = await observeSubmitted(state, state.getMessage(message.id), provider, options);
+  return observation;
 }
 
 module.exports = {
@@ -285,9 +352,13 @@ module.exports = {
   codexPrompt,
   dispatchAndObserve,
   findCodexSessionFile,
+  finalText,
   observeCodexReply,
+  observeSubmitted,
   postUnixJson,
   readInitialCursor,
   runCodex,
-  waitForReply
+  sessionRoot,
+  waitForReply,
+  walk
 };
