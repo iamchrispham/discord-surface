@@ -138,16 +138,20 @@ async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000,
         const parsed = completeJsonLines(chunk);
         tailBytes = parsed.tailBytes;
         const nextCursor = { file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') };
-        onCursor?.(nextCursor);
+        let foundReply = false;
         for (const lineBytes of parsed.lines) {
           if (!lineBytes.length) continue;
           try {
             const row = JSON.parse(lineBytes.toString('utf8'));
             if (Date.parse(row.timestamp || '') < since) continue;
             const text = finalText(row, marker);
-            if (text) return { text, cursor: nextCursor };
+            if (text) {
+              foundReply = true;
+              return { text, cursor: nextCursor };
+            }
           } catch {}
         }
+        if (!foundReply) onCursor?.(nextCursor);
       } catch {
         onCursor?.({ file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') });
       }
@@ -281,23 +285,27 @@ async function observeSubmitted(state, message, provider, options = {}) {
   }
   const marker = `[[discord-surface:${message.id}]]`;
   const outcome = { cursor: message.observerCursor };
+  let observedCursor = null;
   let reply;
   try {
     reply = await provider.observe(message, outcome, {
       ...options,
-      onCursor: cursor => state.setObserverCursor(message.id, cursor, marker)
+      onCursor: cursor => { observedCursor = cursor; }
     });
   } catch (error) {
     state.markObservationUnavailable(message.id, error);
     return { status: state.getMessage(message.id)?.state || message.state, message: state.getMessage(message.id), error };
   }
-  if (reply?.cursor) state.setObserverCursor(message.id, reply.cursor, marker);
   if (reply?.text) {
     try {
-      state.recordNativeReply({ messageId: message.id, nativeId: message.nativeId, generation: message.generation, text: reply.text });
+      state.recordNativeReply({ provider: message.provider, messageId: message.id, nativeId: message.nativeId, generation: message.generation, text: reply.text });
+      const cursor = reply.cursor || observedCursor;
+      if (cursor) state.setObserverCursor(message.id, cursor, marker);
     } catch (error) {
       return { status: 'stale-reply', message: state.getMessage(message.id), error };
     }
+  } else if (reply?.cursor || observedCursor) {
+    state.setObserverCursor(message.id, reply?.cursor || observedCursor, marker);
   } else if (!reply?.stopped) {
     state.markObservationUnavailable(message.id, 'native reply was not observed before the bounded window');
   }

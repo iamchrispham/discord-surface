@@ -67,7 +67,7 @@ function createDefaultMcp({ nativeId, state }) {
   mcp.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
     if (params.name !== 'reply') throw new Error('unknown Claude channel tool');
     const args = params.arguments || {};
-    const result = state.recordNativeReply({ messageId: args.messageId, nativeId, generation: args.generation, text: args.text });
+    const result = state.recordNativeReply({ provider: 'claude', messageId: args.messageId, nativeId, generation: args.generation, text: args.text });
     return { content: [{ type: 'text', text: result.duplicate ? 'Already recorded.' : 'Recorded.' }] };
   });
   mcp.transportFactory = () => new StdioServerTransport();

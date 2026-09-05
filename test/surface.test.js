@@ -4,14 +4,15 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { postUnixJson } = require('../src/native');
-const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES } = require('../src/state');
+const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
 const { CodexProvider, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
-const { ensureProvisionedChannel, provisionMarker } = require('../src/cli');
+const { bindingArgs, conductorMarker, ensureProvisionedChannel, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
 
 const CODEX_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CLAUDE_ID = '01a0701c-5714-7671-a455-db7d67f9fa78';
+const SUCCESSOR_ID = '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b';
 
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-test-'));
@@ -131,12 +132,12 @@ test('simulated: rebind is blocked by in-flight work and stale reply is rejected
   state.claimDispatch('in-flight');
   assert.throws(() => state.rebind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CLAUDE_ID, workspace: dir }), UnresolvedWorkError);
   state.markSubmitted('in-flight');
-  state.recordNativeReply({ messageId: 'in-flight', nativeId: CODEX_ID, generation: 1, text: 'done' });
+  state.recordNativeReply({ provider: 'codex', messageId: 'in-flight', nativeId: CODEX_ID, generation: 1, text: 'done' });
   state.beginReply('in-flight');
   state.markReplySent('in-flight', 'reply-in-flight');
   const rebound = state.rebind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CLAUDE_ID, workspace: dir });
   assert.equal(rebound.generation, 2);
-  assert.throws(() => state.recordNativeReply({ messageId: 'in-flight', nativeId: CODEX_ID, generation: 1, text: 'stale' }), StaleGenerationError);
+  assert.throws(() => state.recordNativeReply({ provider: 'codex', messageId: 'in-flight', nativeId: CODEX_ID, generation: 1, text: 'stale' }), StaleGenerationError);
   state.close();
 });
 
@@ -146,9 +147,9 @@ test('simulated: reply delivery failure keeps custody and records the failure', 
   const calls = { codex: 0, claude: 0 };
   const consumer = createSurfaceConsumer({ state, providers: providers({ calls }), sendReply: async () => { throw new Error('Discord send failed'); } });
   const result = await consumer.handleMessage(discordMessage({ id: 'reply-fails', channelId: 'channel-codex' }));
-  assert.equal(result.message.state, MESSAGE_STATES.REPLY_FAILED);
+  assert.equal(result.message.state, MESSAGE_STATES.REPLY_UNKNOWN);
   assert.equal(state.getMessage('reply-fails').replyText, '4');
-  assert.ok(state.listReceipts().some(receipt => receipt.kind === 'reply-failed'));
+  assert.ok(state.listReceipts().some(receipt => receipt.kind === 'reply-unknown'));
   state.close();
 });
 
@@ -336,7 +337,7 @@ test('simulated: Claude start failure closes MCP and stop retries a close failur
 test('simulated: secret reader parses the owner-only dotenv assignment without returning the assignment', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-secret-assignment-'));
   const file = path.join(dir, 'discord.env');
-  fs.writeFileSync(file, "# local\nDISCORD_TOKEN='fake-fixture-token'\n", { mode: 0o600 });
+  fs.writeFileSync(file, "# local\nUNRELATED=value\nDISCORD_TOKEN='fake-fixture-token'\n", { mode: 0o600 });
   assert.equal(readSecret(file), 'fake-fixture-token');
   assert.notEqual(readSecret(file), fs.readFileSync(file, 'utf8').trim());
 });
@@ -347,7 +348,7 @@ test('simulated: long replies use durable Discord-sized parts and bounded enforc
   state.acceptDiscordMessage({ id: 'long-reply', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'long' });
   state.claimDispatch('long-reply');
   state.markSubmitted('long-reply');
-  state.recordNativeReply({ messageId: 'long-reply', nativeId: CODEX_ID, generation: 1, text: 'x'.repeat(4500) });
+  state.recordNativeReply({ provider: 'codex', messageId: 'long-reply', nativeId: CODEX_ID, generation: 1, text: 'x'.repeat(4500) });
   const payloads = [];
   const client = { on() {}, off() {}, async destroy() {} };
   const gateway = new DiscordGateway({ state, client });
@@ -369,7 +370,7 @@ test('simulated: reply chunking preserves a surrogate pair at the Discord bounda
   state.claimDispatch('surrogate-boundary');
   state.markSubmitted('surrogate-boundary');
   const text = `${'x'.repeat(1999)}🙂y`;
-  state.recordNativeReply({ messageId: 'surrogate-boundary', nativeId: CODEX_ID, generation: 1, text });
+  state.recordNativeReply({ provider: 'codex', messageId: 'surrogate-boundary', nativeId: CODEX_ID, generation: 1, text });
   const parts = state.listReplyParts('surrogate-boundary');
   assert.equal(parts.length, 2);
   assert.equal(parts.map(part => part.content).join(''), text);
@@ -391,8 +392,22 @@ test('simulated: operator revocation after intake prevents dispatch and native r
   state.claimDispatch('reply-revoked');
   state.markSubmitted('reply-revoked');
   state.setConfig({ operatorId: 'operator-revoked', guildId: 'guild-1', secretFile: path.join(dir, 'discord.secret') });
-  assert.throws(() => state.recordNativeReply({ messageId: 'reply-revoked', nativeId: CODEX_ID, generation: 1, text: 'late' }), /authorization/);
+  assert.throws(() => state.recordNativeReply({ provider: 'codex', messageId: 'reply-revoked', nativeId: CODEX_ID, generation: 1, text: 'late' }), /authorization/);
   assert.ok(state.listReceipts().some(receipt => receipt.kind === 'dispatch-rejected-auth'));
+  state.close();
+});
+
+test('simulated: guild revocation after intake blocks dispatch and reply acceptance', () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'guild-revoked', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.setConfig({ operatorId: 'operator-1', guildId: 'guild-revoked', secretFile: path.join(dir, 'discord.secret') });
+  assert.equal(state.claimDispatch('guild-revoked').reason, 'authorization-revoked');
+  state.setConfig({ operatorId: 'operator-1', guildId: 'guild-1', secretFile: path.join(dir, 'discord.secret') });
+  state.claimDispatch('guild-revoked');
+  state.markSubmitted('guild-revoked');
+  state.setConfig({ operatorId: 'operator-1', guildId: 'guild-revoked', secretFile: path.join(dir, 'discord.secret') });
+  assert.throws(() => state.recordNativeReply({ provider: 'codex', messageId: 'guild-revoked', nativeId: CODEX_ID, generation: 1, text: 'late' }), /authorization/);
   state.close();
 });
 
@@ -413,7 +428,7 @@ test('simulated: unbind tombstones history and rebind increments the generation'
   state.acceptDiscordMessage({ id: 'history', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
   state.claimDispatch('history');
   state.markSubmitted('history');
-  state.recordNativeReply({ messageId: 'history', nativeId: CODEX_ID, generation: 1, text: 'done' });
+  state.recordNativeReply({ provider: 'codex', messageId: 'history', nativeId: CODEX_ID, generation: 1, text: 'done' });
   state.beginReply('history');
   state.markReplySent('history', 'reply-history');
   state.unbind('channel-codex');
@@ -508,7 +523,7 @@ test('simulated: status readiness labels live permission and quota gates as unve
   assert.equal(readiness.limits.nativeApproval, 'unverified-live');
   assert.equal(readiness.limits.quota, 'unverified-live');
   assert.equal(readiness.limits.billing, 'unverified-live');
-  assert.equal(readiness.limits.connectionBackfill, 'bounded-by-observer-cursor');
+  assert.equal(readiness.limits.connectionBackfill, 'pending');
   state.close();
 });
 
@@ -571,4 +586,274 @@ test('simulated: gateway stop surfaces a native client stop failure and can be r
   await gateway.stop();
   assert.equal(destroys, 2);
   state.close();
+});
+
+test('simulated: native observation holds scan cursor until reply custody commits', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'cursor-custody', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('cursor-custody');
+  state.markSubmitted('cursor-custody');
+  const cursor = { file: '/tmp/session.jsonl', offset: 341, since: 1 };
+  const result = await observeSubmitted(state, state.getMessage('cursor-custody'), {
+    async observe(_message, _outcome, options) {
+      options.onCursor(cursor);
+      return { text: 'durable answer' };
+    }
+  });
+  assert.equal(result.message.state, MESSAGE_STATES.REPLY_READY);
+  assert.deepEqual(state.getMessage('cursor-custody').observerCursor, cursor);
+
+  state.acceptDiscordMessage({ id: 'cursor-crash', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'y' });
+  state.claimDispatch('cursor-crash');
+  state.markSubmitted('cursor-crash', { file: '/tmp/session.jsonl', offset: 12 }, '[[discord-surface:cursor-crash]]');
+  const crashed = await observeSubmitted(state, state.getMessage('cursor-crash'), {
+    async observe(_message, _outcome, options) {
+      options.onCursor({ file: '/tmp/session.jsonl', offset: 99 });
+      throw new Error('observer crashed after scanning');
+    }
+  });
+  assert.equal(crashed.message.state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(state.getMessage('cursor-crash').observerCursor.offset, 12);
+  state.close();
+});
+
+test('simulated: provider identity fences same-UUID native replies', () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CODEX_ID, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
+  state.acceptDiscordMessage({ id: 'provider-fence', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('provider-fence');
+  state.markSubmitted('provider-fence');
+  assert.throws(() => state.recordNativeReply({ provider: 'claude', messageId: 'provider-fence', nativeId: CODEX_ID, generation: 1, text: 'wrong owner' }), StaleGenerationError);
+  assert.equal(state.getMessage('provider-fence').state, MESSAGE_STATES.SUBMITTED);
+  state.recordNativeReply({ provider: 'codex', messageId: 'provider-fence', nativeId: CODEX_ID, generation: 1, text: 'right owner' });
+  assert.equal(state.getMessage('provider-fence').state, MESSAGE_STATES.REPLY_READY);
+  state.close();
+});
+
+test('simulated: gateway stop waits for abortable startup recovery before state close', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  const listeners = new Map();
+  let destroyed = false;
+  const client = {
+    on(name, fn) { listeners.set(name, fn); },
+    off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
+    async login() {},
+    channels: { fetch: async () => ({ id: 'channel-codex' }) },
+    async destroy() { destroyed = true; }
+  };
+  const fetchHistory = async (_channel, { signal }) => new Promise(resolve => {
+    signal.addEventListener('abort', () => resolve([]), { once: true });
+  });
+  const gateway = new DiscordGateway({ state, client, fetchHistory });
+  const starting = gateway.start(secret);
+  await new Promise(resolve => setImmediate(resolve));
+  await gateway.stop();
+  await assert.rejects(starting, /intake recovery is stopped/);
+  assert.equal(destroyed, true);
+  state.close();
+});
+
+test('simulated: login-time input is durably held and backfill closes before dispatch', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  const listeners = new Map();
+  const channel = {
+    id: 'channel-codex',
+    guildId: 'guild-1',
+    async send() { return { id: 'reply-login-input' }; }
+  };
+  const client = {
+    on(name, fn) { listeners.set(name, fn); },
+    off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
+    async login() { await listeners.get('messageCreate')(discordMessage({ id: '101', channelId: 'channel-codex' })); },
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  const history = [];
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    fetchHistory: async (_channel, options) => {
+      history.push(options);
+      if (options.limit === 1) return [{ id: '100', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'old', bot: false }, content: 'before adoption' }];
+      if (options.after === '101') return [];
+      throw new Error(`unexpected history cursor ${options.after}`);
+    },
+    providers: {
+      codex: { async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer after recovery' }; } }
+    }
+  });
+  await gateway.start(secret);
+  assert.equal(state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(state.getBinding('channel-codex').readiness, READINESS.READY);
+  assert.equal(state.getIntakeWatermark('channel-codex').last_seen_id, '101');
+  assert.match(channel.topic, /readiness=ready/);
+  await gateway.reconcilePending();
+  assert.equal(state.getMessage('101').state, MESSAGE_STATES.REPLIED);
+  await listeners.get('resume')();
+  assert.equal(state.getBinding('channel-codex').readiness, READINESS.READY);
+  assert.equal(history.length, 2);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: bounded intake recovery records a visible gap and requires explicit reconciliation', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  const client = { on() {}, off() {}, async login() {}, channels: { fetch: async () => ({ id: 'channel-codex' }) }, async destroy() {} };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    recoveryOptions: { pageLimit: 2, maxPages: 1 },
+    fetchHistory: async (_channel, options) => options.limit === 1
+      ? [{ id: '100', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'old', bot: false }, content: 'before adoption' }]
+      : [
+        { id: '101', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'one' },
+        { id: '102', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'two' }
+      ]
+  });
+  await assert.rejects(() => gateway.start(secret), /intake recovery is gap/);
+  assert.equal(state.getBinding('channel-codex').readiness, READINESS.GAP);
+  assert.equal(state.getReadiness().limits.connectionBackfill, 'unrecoverable-gap');
+  assert.equal(state.getIntakeWatermark('channel-codex').state, 'gap');
+  state.reconcileIntake('channel-codex');
+  assert.equal(state.getBinding('channel-codex').readiness, READINESS.PENDING);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: unknown Discord delivery is reconciled without native redispatch', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  let dispatches = 0;
+  let sends = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: { async dispatch() { dispatches += 1; return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } },
+    sendReply: async () => { sends += 1; if (sends === 1) throw new TypeError('send result was not returned'); return { id: 'reply-reconciled' }; }
+  });
+  const first = await consumer.handleMessage(discordMessage({ id: 'delivery-reconcile', channelId: 'channel-codex' }));
+  assert.equal(first.message.state, MESSAGE_STATES.REPLY_UNKNOWN);
+  state.reconcileReplyDelivery('delivery-reconcile', 'not_sent');
+  const second = await consumer.deliverReply(discordMessage({ id: 'delivery-reconcile', channelId: 'channel-codex' }), {
+    status: 'reply_ready',
+    message: state.getMessage('delivery-reconcile')
+  });
+  assert.equal(second.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(dispatches, 1);
+  assert.equal(sends, 2);
+  state.close();
+});
+
+test('simulated: stable conductor identity permits distinct IDs and explicit same-channel successor handoff', () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'conductor-a', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'conductor-a', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'conductor-b', guildId: 'guild-1', provider: 'codex', nativeId: CLAUDE_ID, workspace: dir, conductorId: 'conductor-b', repoKey: 'repo:alpha' });
+  assert.throws(() => state.bind({ channelId: 'duplicate-conductor', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir, conductorId: 'conductor-a', repoKey: 'repo:alpha' }), /already bound/);
+
+  state.acceptDiscordMessage({ id: 'drained', guildId: 'guild-1', channelId: 'conductor-a', authorId: 'operator-1', isBot: false, content: 'drain' });
+  state.claimDispatch('drained');
+  state.markSubmitted('drained');
+  state.recordNativeReply({ provider: 'codex', messageId: 'drained', nativeId: CODEX_ID, generation: 1, text: 'done' });
+  state.beginReply('drained');
+  state.markReplySent('drained', 'reply-drained');
+  const successor = state.handoffConductor({
+    channelId: 'conductor-a',
+    provider: 'codex',
+    conductorId: 'conductor-a',
+    repoKey: 'repo:alpha',
+    fromNativeId: CODEX_ID,
+    fromGeneration: 1,
+    nativeId: SUCCESSOR_ID,
+    workspace: dir,
+    handoffId: 'handoff-1'
+  });
+  assert.equal(successor.channelId, 'conductor-a');
+  assert.equal(successor.generation, 2);
+  assert.equal(successor.conductorId, 'conductor-a');
+  assert.throws(() => state.recordNativeReply({ provider: 'codex', messageId: 'drained', nativeId: CODEX_ID, generation: 1, text: 'late' }), StaleGenerationError);
+  state.acceptDiscordMessage({ id: 'successor-input', guildId: 'guild-1', channelId: 'conductor-a', authorId: 'operator-1', isBot: false, content: 'new owner' });
+  state.claimDispatch('successor-input');
+  state.markSubmitted('successor-input');
+  state.recordNativeReply({ provider: 'codex', messageId: 'successor-input', nativeId: SUCCESSOR_ID, generation: 2, text: 'successor answer' });
+  assert.equal(state.getMessage('successor-input').state, MESSAGE_STATES.REPLY_READY);
+  state.close();
+});
+
+test('simulated: conductor generations remain monotonic after unbind and new-channel bind', () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'old-conductor', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'stable', repoKey: 'repo:alpha' });
+  state.unbind('old-conductor');
+  const rebound = state.bind({ channelId: 'new-conductor', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir, conductorId: 'stable', repoKey: 'repo:alpha' });
+  assert.equal(rebound.generation, 2);
+  state.close();
+});
+
+test('simulated: stable conductor markers repeat, adopt the existing setup channel, and never retry an unresolved create', async () => {
+  const channels = new Map();
+  let creates = 0;
+  const guild = {
+    channels: {
+      cache: { values: () => channels.values() },
+      async fetch() {},
+      async create(options) {
+        creates += 1;
+        const channel = { id: `created-conductor-${creates}`, parentId: options.parent, topic: options.topic, async setTopic(topic) { this.topic = topic; } };
+        channels.set(channel.id, channel);
+        return channel;
+      }
+    }
+  };
+  const first = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', taskName: 'presentation only' });
+  const second = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', taskName: 'renamed presentation' });
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(second.channel.id, first.channel.id);
+  assert.match(first.marker, /conductor=stable-conductor/);
+  assert.equal(creates, 1);
+
+  const existingId = '1545716797217570847';
+  const existing = { id: existingId, parentId: 'codex-category', topic: `Conductor task: codex/${CODEX_ID}`, async setTopic(topic) { this.topic = topic; } };
+  const adoptionGuild = { channels: {
+    cache: { values: () => [existing][Symbol.iterator]() },
+    async fetch(id) { return id ? existing : undefined; },
+    async create() { throw new Error('adoption must not create'); }
+  } };
+  const adopted = await ensureProvisionedChannel({ guild: adoptionGuild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', channelId: existingId });
+  assert.equal(adopted.adopted, true);
+  assert.equal(adopted.channel.id, existingId);
+  assert.match(adopted.channel.topic, /conductor=stable-conductor/);
+
+  const unresolvedGuild = { channels: { cache: { values: () => [][Symbol.iterator]() }, async fetch() {}, async create() { throw new Error('must not retry unknown create'); } } };
+  await assert.rejects(() => ensureProvisionedChannel({ guild: unresolvedGuild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'other-conductor', repoKey: 'repo:alpha', allowCreate: false }), /unresolved/);
+});
+
+test('simulated: durable provision intent rejects a second unresolved create attempt', () => {
+  const { dir, state } = fixture();
+  const intent = {
+    provider: 'codex',
+    nativeId: CODEX_ID,
+    conductorId: 'intent-conductor',
+    repoKey: 'repo:alpha',
+    guildId: 'guild-1',
+    categoryId: 'codex-category',
+    workspace: dir,
+    marker: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'intent-conductor', repoKey: 'repo:alpha' })
+  };
+  assert.equal(state.beginProvisionIntent(intent).fresh, true);
+  assert.equal(state.beginProvisionIntent(intent).fresh, false);
+  state.close();
+});
+
+test('simulated: ordinary worker binding requires explicit conductor identity', () => {
+  assert.throws(() => bindingArgs({ 'channel-id': 'worker', 'guild-id': 'guild-1', provider: 'codex', 'native-id': CODEX_ID, workspace: process.cwd() }), /conductor-id/);
 });

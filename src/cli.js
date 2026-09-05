@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
-const { SurfaceState, PROVIDERS, validateNativeId } = require('./state');
+const { SurfaceState, PROVIDERS, READINESS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
 const { ClaudeChannel } = require('./claude-channel');
 
@@ -67,7 +67,9 @@ function bindingArgs(args) {
     nativeId: required(args, 'native-id'),
     workspace: path.resolve(required(args, 'workspace')),
     endpoint: args.endpoint ? path.resolve(args.endpoint) : undefined,
-    categoryId: args['category-id']
+    categoryId: args['category-id'],
+    conductorId: required(args, 'conductor-id'),
+    repoKey: required(args, 'repo-key')
   };
 }
 
@@ -92,7 +94,14 @@ function status(args) {
 function recover(args) {
   const { state } = openState(args);
   try {
-    if (args['message-id'] && args.resolution) print(state.reconcileUncertain(required(args, 'message-id'), args.resolution));
+    if (args['intake-channel-id']) {
+      print(state.reconcileIntake(required(args, 'intake-channel-id')));
+    } else if (args['message-id'] && ['reply_sent', 'reply_not_sent'].includes(args.resolution)) {
+      print(state.reconcileReplyDelivery(required(args, 'message-id'), args.resolution === 'reply_sent' ? 'sent' : 'not_sent', {
+        partIndex: args['part-index'] === undefined ? null : Number(args['part-index']),
+        replyMessageId: args['reply-message-id']
+      }));
+    } else if (args['message-id'] && args.resolution) print(state.reconcileUncertain(required(args, 'message-id'), args.resolution));
     else print(state.recoverAfterRestart());
   }
   finally { state.close(); }
@@ -102,19 +111,65 @@ function provisionMarker(provider, nativeId) {
   return `discord-surface:v1 provider=${provider} native=${nativeId}`;
 }
 
-async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName }) {
+function conductorMarker({ provider, nativeId, conductorId, repoKey, generation = 1, readiness = READINESS.PENDING }) {
+  if (!conductorId || !repoKey) return provisionMarker(provider, nativeId);
+  const marker = `discord-surface:v2 conductor=${encodeURIComponent(conductorId)} provider=${provider} repo=${encodeURIComponent(repoKey)} native=${nativeId} generation=${generation} readiness=${readiness}`;
+  if (marker.length > 1024) throw new Error('conductor channel topic marker exceeds Discord topic limit');
+  return marker;
+}
+
+function legacyAdoptionTopic(topic, provider, nativeId) {
+  return topic === provisionMarker(provider, nativeId) || topic === `Conductor task: ${provider}/${nativeId}`;
+}
+
+function conductorMarkerMatches(topic, expected) {
+  if (typeof topic !== 'string') return false;
+  const match = topic.match(/^discord-surface:v2 conductor=([^\s]+) provider=(codex|claude) repo=([^\s]+) native=([^\s]+) generation=(\d+) readiness=([^\s]+)$/);
+  if (!match) return false;
+  try {
+    return decodeURIComponent(match[1]) === expected.conductorId && match[2] === expected.provider &&
+      decodeURIComponent(match[3]) === expected.repoKey && match[4] === expected.nativeId &&
+      Number(match[5]) === expected.generation;
+  } catch { return false; }
+}
+
+async function setChannelTopic(channel, topic) {
+  if (channel.topic === topic) return channel;
+  if (typeof channel.setTopic === 'function') await channel.setTopic(topic);
+  else if (typeof channel.edit === 'function') await channel.edit({ topic });
+  else channel.topic = topic;
+  if (channel.topic !== topic) throw new Error('Discord channel topic readback mismatch');
+  return channel;
+}
+
+async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName, conductorId, repoKey, generation = 1, readiness = READINESS.PENDING, channelId = null, allowCreate = true }) {
   if (provider !== PROVIDERS.CODEX && provider !== PROVIDERS.CLAUDE) throw new Error('unsupported provider');
   validateNativeId(nativeId);
   if (typeof categoryId !== 'string' || !categoryId) throw new Error('categoryId is required');
-  const marker = provisionMarker(provider, nativeId);
+  const marker = conductorMarker({ provider, nativeId, conductorId, repoKey, generation, readiness });
   if (typeof guild.channels?.fetch === 'function') await guild.channels.fetch();
   const channels = guild.channels?.cache ? [...guild.channels.cache.values()] : [];
-  const marked = channels.filter(channel => channel.topic === marker);
+  let adopted = false;
+  let marked;
+  if (channelId) {
+    const channel = typeof guild.channels.fetch === 'function' ? await guild.channels.fetch(channelId) : channels.find(item => item.id === channelId);
+    if (!channel) throw new Error('requested adoption channel was not found');
+    if (channel.parentId !== categoryId) throw new Error('requested adoption channel is outside the configured vendor category');
+    if (channel.topic !== marker) {
+      const v2Match = conductorMarkerMatches(channel.topic, { provider, nativeId, conductorId, repoKey, generation });
+      if (!v2Match && !legacyAdoptionTopic(channel.topic, provider, nativeId)) throw new Error('requested adoption channel metadata does not match the native identity');
+      adopted = true;
+    }
+    await setChannelTopic(channel, marker);
+    return { channel, created: false, adopted, marker };
+  }
+  marked = channels.filter(channel => channel.topic === marker || conductorMarkerMatches(channel.topic, { provider, nativeId, conductorId, repoKey, generation }));
   if (marked.length > 1) throw new Error('duplicate provision markers require reconciliation');
   const existingMarker = marked[0];
   if (existingMarker && existingMarker.parentId !== categoryId) throw new Error('provision marker exists under the wrong category');
   const existing = existingMarker;
-  if (existing) return { channel: existing, created: false, marker };
+  if (existing) return { channel: existing, created: false, marker: existing.topic };
+  if (!allowCreate) throw new Error('provision intent is unresolved and has no reconciled Discord channel; use explicit --channel-id adoption before retrying');
   const type = requireInstalled('discord.js').ChannelType.GuildText;
   const presentationName = typeof taskName === 'string' && taskName ? taskName : `${provider}-${nativeId.slice(0, 8)}`;
   const channel = await guild.channels.create({
@@ -124,7 +179,7 @@ async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId,
     topic: marker,
     reason: 'Create an explicitly bound native Discord surface'
   });
-  return { channel, created: true, marker };
+  return { channel, created: true, adopted: false, marker };
 }
 
 function categoryFor(provider, args, config) {
@@ -140,6 +195,8 @@ async function provisionInternal(args) {
   const provider = required(args, 'provider');
   const nativeId = required(args, 'native-id');
   validateNativeId(nativeId);
+  const conductorId = required(args, 'conductor-id');
+  const repoKey = required(args, 'repo-key');
   if (provider === PROVIDERS.CLAUDE && !args.endpoint) throw new Error('Claude provisioning requires --endpoint');
   const workspace = path.resolve(required(args, 'workspace'));
   const endpoint = args.endpoint ? path.resolve(args.endpoint) : undefined;
@@ -150,29 +207,45 @@ async function provisionInternal(args) {
     const categoryId = categoryFor(provider, args, config);
     const taskName = args['task-name'];
     if (taskName !== undefined && (typeof taskName !== 'string' || !taskName || taskName.length > 100)) throw new Error('--task-name must be 1 to 100 characters');
-    const marker = provisionMarker(provider, nativeId);
-    const intent = state.beginProvisionIntent({ provider, nativeId, guildId: config.guildId, categoryId, workspace, endpoint, marker, taskName });
+    const existingBinding = state.findConductorBinding(conductorId, provider);
+    if (existingBinding) {
+      if (existingBinding.repoKey !== repoKey || existingBinding.nativeId !== nativeId || existingBinding.workspace !== workspace || existingBinding.endpoint !== (endpoint || null)) {
+        throw new Error('existing conductor binding does not match requested identity; use explicit handoff for a successor');
+      }
+      const marker = conductorMarker({ provider, nativeId, conductorId, repoKey, generation: existingBinding.generation, readiness: existingBinding.readiness });
+      const { Client, GatewayIntentBits } = requireInstalled('discord.js');
+      client = new Client({ intents: [GatewayIntentBits.Guilds] });
+      await client.login(readSecret(config.secretFile));
+      const guild = await client.guilds.fetch(config.guildId);
+      const boundChannel = await guild.channels.fetch(existingBinding.channelId);
+      if (!boundChannel || boundChannel.parentId !== categoryId || boundChannel.topic !== marker) {
+        throw new Error('existing conductor channel does not match requested metadata');
+      }
+      print({ created: false, adopted: false, bound: true, marker, conductorId, repoKey, channelId: existingBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingBinding.channelId}`, binding: existingBinding });
+      return;
+    }
+    const marker = conductorMarker({ provider, nativeId, conductorId, repoKey });
+    const intent = state.beginProvisionIntent({ provider, nativeId, conductorId, repoKey, guildId: config.guildId, categoryId, workspace, endpoint, marker, taskName });
     const { Client, GatewayIntentBits } = requireInstalled('discord.js');
     client = new Client({ intents: [GatewayIntentBits.Guilds] });
     await client.login(readSecret(config.secretFile));
     const guild = await client.guilds.fetch(config.guildId);
-    const result = await ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName });
-    const existingBinding = state.findNativeBinding(nativeId, provider);
-    if (existingBinding) {
-      if (!existingBinding.active || existingBinding.provider !== provider || existingBinding.workspace !== workspace || existingBinding.endpoint !== (endpoint || null)) {
+    const result = await ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName, conductorId, repoKey, channelId: args['channel-id'] || intent.channel_id, allowCreate: intent.fresh });
+    const existingNativeBinding = state.findNativeBinding(nativeId, provider);
+    if (existingNativeBinding) {
+      if (!existingNativeBinding.active || existingNativeBinding.provider !== provider || existingNativeBinding.workspace !== workspace || existingNativeBinding.endpoint !== (endpoint || null) || existingNativeBinding.conductorId !== conductorId || existingNativeBinding.repoKey !== repoKey) {
         throw new Error('existing native binding does not match requested provision identity');
       }
-      const boundChannel = await guild.channels.fetch(existingBinding.channelId);
-      if (!boundChannel || boundChannel.parentId !== categoryId || boundChannel.topic !== marker) {
-        throw new Error('existing bound channel does not match requested provider category marker');
+      if (existingNativeBinding.channelId !== result.channel.id) {
+        throw new Error('native session is already bound to another conductor channel');
       }
-      state.completeProvisionIntent(provider, nativeId, existingBinding.channelId);
-      print({ created: false, bound: true, marker, channelId: existingBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingBinding.channelId}`, binding: existingBinding, intent });
+      state.completeProvisionIntent(provider, nativeId, existingNativeBinding.channelId, conductorId);
+      print({ created: false, adopted: result.adopted, bound: true, marker, conductorId, repoKey, channelId: existingNativeBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingNativeBinding.channelId}`, binding: existingNativeBinding, intent });
       return;
     }
-    const binding = state.bind({ channelId: result.channel.id, guildId: config.guildId, provider, nativeId, workspace, endpoint, categoryId });
-    state.completeProvisionIntent(provider, nativeId, result.channel.id);
-    print({ created: result.created, bound: true, marker: result.marker, channelId: result.channel.id,
+    const binding = state.bind({ channelId: result.channel.id, guildId: config.guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey });
+    state.completeProvisionIntent(provider, nativeId, result.channel.id, conductorId);
+    print({ created: result.created, adopted: result.adopted, bound: true, marker: result.marker, conductorId, repoKey, channelId: result.channel.id,
       url: `https://discord.com/channels/${config.guildId}/${result.channel.id}`, binding, intent });
   } finally {
     await client?.destroy();
@@ -186,6 +259,54 @@ function provision(args) {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const forwarded = Object.entries(args).flatMap(([key, value]) => value === true ? [`--${key}`] : [`--${key}`, String(value)]);
   const result = spawnSync('lockf', ['-n', provisionLock, process.execPath, __filename, 'provision-run', ...forwarded], {
+    stdio: 'inherit',
+    env: { ...process.env, DISCORD_SURFACE_PROVISION_LOCK_HELD: '1' }
+  });
+  if (result.error) throw result.error;
+  process.exitCode = result.status ?? 1;
+}
+
+async function handoffInternal(args) {
+  const provider = required(args, 'provider');
+  const conductorId = required(args, 'conductor-id');
+  const repoKey = required(args, 'repo-key');
+  const fromNativeId = required(args, 'from-native-id');
+  const nativeId = required(args, 'native-id');
+  validateNativeId(fromNativeId);
+  validateNativeId(nativeId);
+  const fromGeneration = Number(required(args, 'from-generation'));
+  const endpoint = args.endpoint ? path.resolve(args.endpoint) : undefined;
+  if (provider === PROVIDERS.CLAUDE && !endpoint) throw new Error('Claude handoff requires --endpoint');
+  const workspace = path.resolve(required(args, 'workspace'));
+  const channelId = required(args, 'channel-id');
+  const handoffId = required(args, 'handoff-id');
+  const { state } = openState(args);
+  let client;
+  try {
+    const config = state.requireConfig();
+    const categoryId = categoryFor(provider, args, config);
+    const { Client, GatewayIntentBits } = requireInstalled('discord.js');
+    client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    await client.login(readSecret(config.secretFile));
+    const guild = await client.guilds.fetch(config.guildId);
+    const channel = await guild.channels.fetch(channelId);
+    if (!channel || channel.parentId !== categoryId) throw new Error('handoff channel is outside the configured vendor category');
+    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
+    const marker = conductorMarker({ provider, nativeId, conductorId, repoKey, generation: binding.generation, readiness: binding.readiness });
+    await setChannelTopic(channel, marker);
+    print({ handedOff: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
+  } finally {
+    await client?.destroy();
+    state.close();
+  }
+}
+
+function handoff(args) {
+  const { stateDir, provisionLock } = pathsFor(args);
+  if (process.env.DISCORD_SURFACE_PROVISION_LOCK_HELD === '1') return handoffInternal(args);
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const forwarded = Object.entries(args).flatMap(([key, value]) => value === true ? [`--${key}`] : [`--${key}`, String(value)]);
+  const result = spawnSync('lockf', ['-n', provisionLock, process.execPath, __filename, 'handoff-run', ...forwarded], {
     stdio: 'inherit',
     env: { ...process.env, DISCORD_SURFACE_PROVISION_LOCK_HELD: '1' }
   });
@@ -324,13 +445,17 @@ async function main() {
     case 'provision-run':
       if (process.env.DISCORD_SURFACE_PROVISION_LOCK_HELD !== '1') throw new Error('provision-run is internal; use provision so the singleton lock is held');
       return provisionInternal(args);
+    case 'handoff': return handoff(args);
+    case 'handoff-run':
+      if (process.env.DISCORD_SURFACE_PROVISION_LOCK_HELD !== '1') throw new Error('handoff-run is internal; use handoff so the singleton lock is held');
+      return handoffInternal(args);
     case 'start': return start(args);
     case 'run':
       if (process.env.DISCORD_SURFACE_LOCK_HELD !== '1') throw new Error('run is internal; use start so the singleton lock is held');
       return runRuntime(args);
     case 'stop': return stop(args);
     case 'claude-channel': return claudeChannel(args);
-    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, start, stop, claude-channel');
+    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel');
   }
 }
 
@@ -341,4 +466,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, ensureProvisionedChannel, main, parseArgs, pathsFor, provisionMarker };
+module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, main, parseArgs, pathsFor, provisionMarker };
