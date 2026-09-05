@@ -118,6 +118,16 @@ The channel process forwards events only after checking its exact native UUID, b
 
 Accepted input is durable before a Discord handler returns. After authorized intake commits, live input gets one deterministic transport receipt. The receipt says either `Receipt: saved for this conductor.` or `Receipt: saved. Delivery was paused when this receipt was prepared.` It is a reply to the source message with mentions disabled. It never claims that the native agent has read, acted on, or answered the input. Receipt delivery is independent of native forwarding, uses a stable nonce, and never retries an uncertain send. Duplicate or rejected input gets no receipt attempt.
 
+An operator may request one manual Spark preview from an existing durable receipt. The command reads one persisted source message and its transport receipt, keeps that raw evidence beside the result, and sends only code-derived facts to the isolated read-only Spark subprocess. The result is labeled `liaison draft`; it is never posted to Discord and never changes forwarding or custody. Missing receipts, unavailable Spark, invalid output, quota failure, timeout, and cancellation return `draft: null`.
+
+```sh
+node src/cli.js liaison draft \
+  --state-dir "$HOME/.config/discord-surface" \
+  --receipt-id DURABLE_RECEIPT_ID
+```
+
+`--receipt-id` accepts the source Discord message ID or the numeric SQLite receipt row ID. Both forms must resolve to one persisted transport receipt.
+
 During login and reconnect, messages are durably held while a persisted Discord watermark is backfilled. Adoption starts at the newest observed message, so pre-adoption history is not executed. Backfill is bounded at 100 messages per page, 10 pages, 1,000 messages, or 30 seconds. A fetch, processing, or bound failure records a visible gap and readiness stays unavailable until explicit reconciliation. The native output cursor is separate from this inbound Discord watermark.
 
 An empty Discord history response is accepted as coverage only when the bot's effective channel permissions include View Channel and Read Message History. A denied or unknown permission state remains visibly unavailable. `status` exposes both the observed message ID and the confirmed recovered-through ID.
@@ -152,4 +162,4 @@ Run the simulated consumer and persistence scenarios with:
 npm test
 ```
 
-The tests use injected native providers and fake Discord events. They do not contact Discord, start Codex or Claude, or prove a live round trip. Live two-provider delivery, native channel opt-in, permissions, approvals, billing, quota, and Discord category setup remain conductor-owned gates until directly verified.
+The tests use injected native providers and fake Discord events. They do not contact Discord, start Codex, Claude, or Spark, or prove a live round trip. Live two-provider delivery, native channel opt-in, permissions, approvals, billing, quota, and Discord category setup remain conductor-owned gates until directly verified.

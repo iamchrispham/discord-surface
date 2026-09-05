@@ -7,6 +7,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
 const { ClaudeChannel } = require('./claude-channel');
+const { runLiaisonDraft } = require('./liaison');
 const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
 
 function parseArgs(argv) {
@@ -23,7 +24,7 @@ function parseArgs(argv) {
     else if (argv[i + 1] && !argv[i + 1].startsWith('--')) args[key] = argv[++i];
     else args[key] = true;
   }
-  return { command: positional[0], args };
+  return { command: positional[0], subcommand: positional[1], args };
 }
 
 function pathsFor(args) {
@@ -90,6 +91,13 @@ function status(args) {
   const { state } = openState(args);
   try { print({ config: state.getConfig(), readiness: state.getReadiness(), bindings: state.listBindings(), messages: state.listMessages(), receipts: state.listReceipts() }); }
   finally { state.close(); }
+}
+
+async function liaisonDraft(args) {
+  const { state } = openState(args);
+  try {
+    print(await runLiaisonDraft({ state, receiptId: required(args, 'receipt-id') }));
+  } finally { state.close(); }
 }
 
 function recover(args) {
@@ -601,7 +609,7 @@ function stop(args) {
 }
 
 async function main() {
-  const { command, args } = parseArgs(process.argv.slice(2));
+  const { command, subcommand, args } = parseArgs(process.argv.slice(2));
   switch (command) {
     case 'configure': return configure(args);
     case 'bind': return bind(args);
@@ -623,7 +631,10 @@ async function main() {
       return runRuntime(args);
     case 'stop': return stop(args);
     case 'claude-channel': return claudeChannel(args);
-    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel');
+    case 'liaison':
+      if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
+      return liaisonDraft(args);
+    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, liaison draft');
   }
 }
 
@@ -634,4 +645,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };
+module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, liaisonDraft, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };
