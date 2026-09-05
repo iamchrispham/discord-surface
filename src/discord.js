@@ -59,6 +59,20 @@ function topicWithReadiness(topic, readiness) {
   return `${current.slice(0, Math.max(0, 1024 - suffix.length))}${suffix}`;
 }
 
+function conductorMarkerMatchesTopic(topic, binding) {
+  if (!binding.conductorId && !binding.repoKey) return true;
+  if (!binding.conductorId || !binding.repoKey || typeof topic !== 'string') return false;
+  const match = topic.match(/^discord-surface:v2 conductor=([^\s]+) provider=(codex|claude) repo=([^\s]+) native=([^\s]+) generation=(\d+) readiness=([^\s]+)$/);
+  if (!match) return false;
+  try {
+    return decodeURIComponent(match[1]) === binding.conductorId && match[2] === binding.provider &&
+      decodeURIComponent(match[3]) === binding.repoKey && match[4] === binding.nativeId &&
+      Number(match[5]) === binding.generation;
+  } catch {
+    return false;
+  }
+}
+
 function readSecret(secretFile) {
   if (!fs.existsSync(secretFile)) throw new Error('Discord secret file does not exist');
   const mode = fs.statSync(secretFile).mode & 0o777;
@@ -366,6 +380,12 @@ class DiscordGateway {
         failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
         continue;
       }
+      if (!conductorMarkerMatchesTopic(channel.topic, binding)) {
+        const error = new Error('Discord channel topic does not identify the current conductor and native generation');
+        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+        failure ||= { ready: false, state: 'unavailable', error };
+        continue;
+      }
       try { await this.updateChannelReadiness(channel, READINESS.RECOVERING, { signal, deadline }); }
       catch (error) {
         const kind = recoveryKind(error);
@@ -512,6 +532,7 @@ class DiscordGateway {
   }
 
   async _reconcilePending(before, signal) {
+    const deadline = Date.now() + this.recoveryTimeoutMs;
     const candidates = this.state.recoveryCandidates(before);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const sessionTails = new Set();
@@ -520,7 +541,8 @@ class DiscordGateway {
       const key = `${message.provider}:${message.nativeId}`;
       if (sessionTails.has(key)) continue;
       let channel;
-      try { channel = await this.client.channels.fetch(message.channelId); } catch (error) {
+      try { channel = await waitForRecoveryOperation(() => this.client.channels.fetch(message.channelId), signal, deadline); } catch (error) {
+        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before);
         this.state.markObservationUnavailable(message.id, error);
         continue;
       }
@@ -529,6 +551,7 @@ class DiscordGateway {
         continue;
       }
       const storedMessage = {
+        ...message,
         id: message.id,
         guildId: message.guildId,
         channelId: message.channelId,
@@ -538,7 +561,7 @@ class DiscordGateway {
       };
       let result;
       if (message.state === 'accepted') result = await this.consumer.handleStoredMessage(storedMessage, signal);
-      else if (message.state === 'submitted') result = await this.consumer.resumeSubmitted(message, signal);
+      else if (message.state === 'submitted') result = await this.consumer.resumeSubmitted(storedMessage, signal);
       else result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
       if (['accepted', 'submitted', 'reply_ready', 'replying'].includes(result?.message?.state)) sessionTails.add(key);
     }

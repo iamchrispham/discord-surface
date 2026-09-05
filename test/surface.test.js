@@ -913,6 +913,118 @@ test('simulated: noncooperative history fetch is fenced by the recovery deadline
   state.close();
 });
 
+test('simulated: submitted recovery retains the Discord channel and never redispatches', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  let sends = 0;
+  let dispatches = 0;
+  const channel = {
+    async send() {
+      sends += 1;
+      return { id: 'reply-submitted-recovery' };
+    }
+  };
+  const client = {
+    on() {},
+    off() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {
+      codex: {
+        async dispatch() {
+          dispatches += 1;
+          throw new Error('submitted recovery must not redispatch');
+        },
+        async observe() { return { text: 'recovered reply' }; }
+      }
+    }
+  });
+  await gateway.consumer.intakeMessage(discordMessage({ id: 'submitted-recovery', channelId: 'channel-codex', content: 'already sent' }), true);
+  state.claimDispatch('submitted-recovery');
+  state.markSubmitted('submitted-recovery');
+  gateway.ready = true;
+  await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
+  assert.equal(sends, 1);
+  assert.equal(dispatches, 0);
+  assert.equal(state.getMessage('submitted-recovery').state, MESSAGE_STATES.REPLIED);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: pending recovery channel fetch is bounded and stop settles without losing custody', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  await createSurfaceConsumer({ state, providers: {}, sendReply: async () => ({ id: 'unused' }) })
+    .intakeMessage(discordMessage({ id: 'pending-recovery', channelId: 'channel-codex' }), true);
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const client = {
+    on() {},
+    off() {},
+    channels: { fetch: async () => blocked },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state, client, recoveryOptions: { timeoutMs: 1000 } });
+  gateway.ready = true;
+  let recoverySettled = false;
+  const recovery = gateway.reconcilePending(new Date(Date.now() + 1).toISOString()).finally(() => { recoverySettled = true; });
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  assert.equal(recoverySettled, true);
+  let stopSettled = false;
+  const stop = gateway.stop().finally(() => { stopSettled = true; });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(stopSettled, true);
+  release(null);
+  await Promise.all([recovery, stop]);
+  assert.equal(state.getMessage('pending-recovery').state, MESSAGE_STATES.ACCEPTED);
+  state.close();
+});
+
+test('simulated: stale handoff topic keeps recovery unavailable until exact repair', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'handoff-recovery', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'handoff-recovery-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('handoff-recovery', 'ready');
+  const oldMarker = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'handoff-recovery-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY });
+  const channel = {
+    id: 'handoff-recovery',
+    topic: oldMarker,
+    permissionsFor: () => historyPermissions(),
+    async setTopic(topic) { this.topic = topic; }
+  };
+  const client = {
+    user: { id: 'bot-1' },
+    on() {},
+    off() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  state.handoffConductor({
+    channelId: 'handoff-recovery',
+    provider: 'codex',
+    conductorId: 'handoff-recovery-conductor',
+    repoKey: 'repo:alpha',
+    fromNativeId: CODEX_ID,
+    fromGeneration: 1,
+    nativeId: SUCCESSOR_ID,
+    workspace: dir,
+    handoffId: 'handoff-recovery-1'
+  });
+  let historyCalls = 0;
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => { historyCalls += 1; return []; } });
+  const result = await gateway.recoverTransport('restart');
+  assert.equal(result.ready, false);
+  assert.equal(result.state, 'unavailable');
+  assert.equal(state.getBinding('handoff-recovery').readiness, READINESS.UNAVAILABLE);
+  assert.equal(historyCalls, 0);
+  assert.match(channel.topic, /native=9caa5d21-2169-429d-918b-5f08651b5dbd generation=1/);
+  await gateway.stop();
+  state.close();
+});
+
 test('simulated: disconnect pauses dispatch and shard ready performs fresh recovery', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
