@@ -192,6 +192,14 @@ function rowBinding(row) {
   };
 }
 
+function bindingMatchesExpected(binding, expected) {
+  if (!expected) return true;
+  return Boolean(binding) && binding.active === expected.active && binding.channelId === expected.channelId &&
+    binding.guildId === expected.guildId && binding.provider === expected.provider &&
+    binding.nativeId === expected.nativeId && binding.generation === expected.generation &&
+    binding.conductorId === expected.conductorId && binding.repoKey === expected.repoKey;
+}
+
 class SurfaceState {
   constructor(dbPath, options = {}) {
     if (!path.isAbsolute(dbPath)) throw new TypeError('dbPath must be absolute');
@@ -644,12 +652,13 @@ class SurfaceState {
     return rowBinding(this.db.prepare('SELECT * FROM bindings WHERE conductor_id=? AND provider=? ORDER BY active DESC, generation DESC LIMIT 1').get(conductorId, provider));
   }
 
-  setBindingReadiness(channelId, readiness, detail = null) {
+  setBindingReadiness(channelId, readiness, detail = null, expectedBinding = null) {
     assertText(channelId, 'channelId', 128);
     if (!Object.values(READINESS).includes(readiness)) throw new BindingError('invalid binding readiness');
     return this.transaction(() => {
       const binding = this.getBinding(channelId);
       if (!binding) throw new BindingError('channel is not bound');
+      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
       this.receipt(null, 'binding-readiness', { channelId, conductorId: binding.conductorId, readiness, detail: detail || undefined });
       return this.getBinding(channelId);
@@ -753,12 +762,13 @@ class SurfaceState {
     return this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(channelId) || null;
   }
 
-  setIntakeBaseline(channelId, lastSeenId, detail) {
+  setIntakeBaseline(channelId, lastSeenId, detail, expectedBinding = null) {
     assertText(channelId, 'channelId', 128);
     assertText(lastSeenId, 'lastSeenId', 128);
     return this.transaction(() => {
       const binding = this.getBinding(channelId);
       if (!binding) throw new BindingError('intake channel is unknown');
+      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       const existing = this.getIntakeWatermark(channelId);
       const retainedLastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
         ? existing.last_seen_id
@@ -780,12 +790,13 @@ class SurfaceState {
     return this.db.prepare('SELECT * FROM intake_watermarks ORDER BY channel_id').all();
   }
 
-  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null) {
+  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null) {
     assertText(channelId, 'channelId', 128);
     if (!['pending', 'ready', 'gap', 'unavailable'].includes(state)) throw new BindingError('invalid intake watermark state');
     return this.transaction(() => {
       const binding = this.getBinding(channelId);
       const existing = this.getIntakeWatermark(channelId);
+      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       if (!existing && !binding) throw new BindingError('intake channel is unknown');
       const guildId = existing?.guild_id || binding.guildId;
       if (existing) {
@@ -818,25 +829,30 @@ class SurfaceState {
     });
   }
 
-  acceptDiscordMessage(event, { ready = true, coverageId = null } = {}) {
+  acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null } = {}) {
     const config = this.requireConfig();
     if (coverageId !== null) assertText(coverageId, 'coverageId', 128);
     if (!event || [event.id, event.guildId, event.channelId, event.authorId, event.content].some(value => typeof value !== 'string' || value.length === 0)) {
       if (event && [event.id, event.guildId, event.channelId].every(value => typeof value === 'string' && value.length > 0)) {
-        this.transaction(() => {
+        const result = this.transaction(() => {
+          const binding = this.getBinding(event.channelId);
+          if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
           this.upsertIntakeWatermark(event, ready, coverageId);
           this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'invalid-event', ready });
+          return null;
         });
+        if (result?.stale) return result;
       }
       return this.reject('invalid-event');
     }
     return this.transaction(() => {
+      const binding = this.getBinding(event.channelId);
+      if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
       this.upsertIntakeWatermark(event, ready, coverageId);
       let reason = null;
       if (event.content.length > 10000) reason = 'invalid-event';
       else if (event.isBot) reason = 'bot-source';
       else if (event.guildId !== config.guildId || event.authorId !== config.operatorId) reason = 'unauthorized-sender';
-      const binding = this.getBinding(event.channelId);
       if (!reason && (!binding || !binding.active || binding.guildId !== event.guildId)) reason = 'unknown-binding';
       if (reason) {
         this.receipt(null, 'intake-rejected', { discordId: event.id, reason, ready });

@@ -154,8 +154,8 @@ function createSurfaceConsumer({ state, providers, sendReply, observeOptions = {
     return processAccepted(message, signal);
   }
 
-  async function intakeMessage(message, ready = false, coverageId = null) {
-    return state.acceptDiscordMessage(eventToInput(message), { ready, coverageId });
+  async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null) {
+    return state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding });
   }
 
   async function handleStoredMessage(message, signal) {
@@ -259,7 +259,7 @@ class DiscordGateway {
     this.connectionEpoch += 1;
     this.recoveryController?.abort();
     for (const binding of this.state.listBindings().filter(item => item.active)) {
-      try { this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, detail); }
+      try { this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, detail, binding); }
       catch (error) { this.logger(`Discord disconnect readiness update failed: ${error.message}`); }
     }
   }
@@ -350,7 +350,8 @@ class DiscordGateway {
   async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null, deadline = Date.now() + RECOVERY_LIMITS.timeoutMs) {
     if (signal?.aborted) return null;
     if (!this.isCurrentBinding(binding)) return null;
-    const watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo);
+    const watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo, binding);
+    if (!watermark) return null;
     const readiness = state === 'ready' ? READINESS.READY : state === 'gap' ? READINESS.GAP : state === 'unavailable' ? READINESS.UNAVAILABLE : READINESS.PENDING;
     try { await this.updateChannelReadiness(channel, readiness, { signal, deadline }); }
     catch (error) {
@@ -375,7 +376,11 @@ class DiscordGateway {
         failure ||= { ready: false, state: 'gap' };
         continue;
       }
-      this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, `${reason} intake recovery in progress`);
+      const recovering = this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, `${reason} intake recovery in progress`, binding);
+      if (!recovering) {
+        failure ||= { ready: false, state: 'unavailable' };
+        continue;
+      }
       let watermark = this.state.getIntakeWatermark(binding.channelId);
       if (watermark && ['gap', 'unavailable'].includes(watermark.state)) {
         failure ||= { ready: false, state: watermark.state };
@@ -453,7 +458,11 @@ class DiscordGateway {
         }
         const newest = baseline.sort((a, b) => compareDiscordIds(b.id, a.id))[0];
         if (newest?.id) {
-          this.state.setIntakeBaseline(binding.channelId, newest.id, `${reason} cutoff excludes pre-adoption backlog`);
+          const baseline = this.state.setIntakeBaseline(binding.channelId, newest.id, `${reason} cutoff excludes pre-adoption backlog`, binding);
+          if (!baseline) {
+            failure ||= { ready: false, state: 'unavailable' };
+            continue;
+          }
         } else {
           watermark = this.state.getIntakeWatermark(binding.channelId);
           if (!watermark?.last_seen_id) {
@@ -461,7 +470,11 @@ class DiscordGateway {
             if (!this.isCurrentBinding(binding)) failure ||= { ready: false, state: 'unavailable' };
             continue;
           }
-          this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`);
+          const baseline = this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`, binding);
+          if (!baseline) {
+            failure ||= { ready: false, state: 'unavailable' };
+            continue;
+          }
         }
         watermark = this.state.getIntakeWatermark(binding.channelId);
       }
@@ -488,7 +501,8 @@ class DiscordGateway {
             if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
             if (Date.now() >= deadline) throw recoveryError('deadline', 'Discord recovery deadline exceeded while admitting history');
             attemptedId = message.id;
-            await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id);
+            const admitted = await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id, binding);
+            if (admitted?.stale) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
             if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
             total += 1;
             if (!after || compareDiscordIds(message.id, after) > 0) after = message.id;

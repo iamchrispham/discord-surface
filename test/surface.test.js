@@ -1108,6 +1108,149 @@ test('simulated: handoff during readiness topic write cannot authorize the succe
   state.close();
 });
 
+test('simulated: readiness transaction rejects a second-connection successor', () => {
+  const { dir, db, state } = fixture();
+  state.bind({ channelId: 'atomic-readiness', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'atomic-readiness-conductor', repoKey: 'repo:alpha' });
+  const old = state.getBinding('atomic-readiness');
+  const other = new SurfaceState(db);
+  other.handoffConductor({ ...old, fromNativeId: old.nativeId, fromGeneration: old.generation, nativeId: SUCCESSOR_ID, handoffId: 'atomic-readiness-1' });
+  assert.equal(state.setBindingReadiness('atomic-readiness', READINESS.RECOVERING, 'stale recovery', old), null);
+  assert.equal(state.getBinding('atomic-readiness').readiness, READINESS.PENDING);
+  other.close();
+  state.close();
+});
+
+test('simulated: boundary transaction rejects a handoff committed by a second connection', async () => {
+  const { dir, db, state } = fixture();
+  state.bind({ channelId: 'atomic-boundary', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'atomic-boundary-conductor', repoKey: 'repo:alpha' });
+  state.setIntakeBaseline('atomic-boundary', '100', 'previous completed recovery');
+  state.markIntakeBoundary('atomic-boundary', 'ready');
+  const old = state.getBinding('atomic-boundary');
+  const other = new SurfaceState(db);
+  const original = state.markIntakeBoundary.bind(state);
+  let changed = false;
+  state.markIntakeBoundary = (...args) => {
+    if (args[1] === 'ready' && !changed) {
+      changed = true;
+      other.handoffConductor({ ...old, fromNativeId: old.nativeId, fromGeneration: old.generation, nativeId: SUCCESSOR_ID, handoffId: 'atomic-boundary-1' });
+    }
+    return original(...args);
+  };
+  const channel = {
+    id: 'atomic-boundary',
+    topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'atomic-boundary-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }),
+    permissionsFor: () => historyPermissions(),
+    async setTopic(topic) { this.topic = topic; }
+  };
+  const client = {
+    user: { id: 'bot-1' },
+    on() {},
+    off() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [] });
+  try {
+    const result = await gateway.recoverTransport('restart');
+    assert.equal(result.ready, false);
+    assert.equal(result.state, 'unavailable');
+    assert.equal(state.getBinding('atomic-boundary').readiness, READINESS.PENDING);
+    assert.equal(state.getIntakeWatermark('atomic-boundary').state, 'ready');
+  } finally {
+    state.markIntakeBoundary = original;
+    await gateway.stop();
+    other.close();
+    state.close();
+  }
+});
+
+test('simulated: baseline transaction rejects a handoff before cutoff custody', async () => {
+  const { dir, db, state } = fixture();
+  state.bind({ channelId: 'atomic-baseline', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'atomic-baseline-conductor', repoKey: 'repo:alpha' });
+  const old = state.getBinding('atomic-baseline');
+  const other = new SurfaceState(db);
+  const original = state.setIntakeBaseline.bind(state);
+  let changed = false;
+  state.setIntakeBaseline = (...args) => {
+    if (args[3] && !changed) {
+      changed = true;
+      other.handoffConductor({ ...old, fromNativeId: old.nativeId, fromGeneration: old.generation, nativeId: SUCCESSOR_ID, handoffId: 'atomic-baseline-1' });
+    }
+    return original(...args);
+  };
+  const channel = {
+    id: 'atomic-baseline',
+    topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'atomic-baseline-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.PENDING }),
+    permissionsFor: () => historyPermissions(),
+    async setTopic(topic) { this.topic = topic; }
+  };
+  const client = {
+    user: { id: 'bot-1' },
+    on() {},
+    off() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [{ id: '101', guildId: 'guild-1', channelId: 'atomic-baseline', author: { id: 'operator-1', bot: false }, content: 'cutoff' }] });
+  try {
+    const result = await gateway.recoverTransport('restart');
+    assert.equal(result.ready, false);
+    assert.equal(result.state, 'unavailable');
+    assert.equal(state.getBinding('atomic-baseline').readiness, READINESS.PENDING);
+    assert.equal(state.getIntakeWatermark('atomic-baseline'), null);
+  } finally {
+    state.setIntakeBaseline = original;
+    await gateway.stop();
+    other.close();
+    state.close();
+  }
+});
+
+test('simulated: history admission transaction rejects a handoff before coverage custody', async () => {
+  const { dir, db, state } = fixture();
+  state.bind({ channelId: 'atomic-admission', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'atomic-admission-conductor', repoKey: 'repo:alpha' });
+  state.setIntakeBaseline('atomic-admission', '100', 'previous completed recovery');
+  state.markIntakeBoundary('atomic-admission', 'ready');
+  const old = state.getBinding('atomic-admission');
+  const other = new SurfaceState(db);
+  const original = state.acceptDiscordMessage.bind(state);
+  let changed = false;
+  state.acceptDiscordMessage = (event, options) => {
+    if (options?.expectedBinding && !changed) {
+      changed = true;
+      other.handoffConductor({ ...old, fromNativeId: old.nativeId, fromGeneration: old.generation, nativeId: SUCCESSOR_ID, handoffId: 'atomic-admission-1' });
+    }
+    return original(event, options);
+  };
+  const channel = {
+    id: 'atomic-admission',
+    topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'atomic-admission-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }),
+    permissionsFor: () => historyPermissions(),
+    async setTopic(topic) { this.topic = topic; }
+  };
+  const client = {
+    user: { id: 'bot-1' },
+    on() {},
+    off() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [{ id: '101', guildId: 'guild-1', channelId: 'atomic-admission', author: { id: 'operator-1', bot: false }, content: 'history' }] });
+  try {
+    const result = await gateway.recoverTransport('restart');
+    assert.equal(result.ready, false);
+    assert.equal(result.state, 'unavailable');
+    assert.equal(state.getBinding('atomic-admission').readiness, READINESS.PENDING);
+    assert.equal(state.getIntakeWatermark('atomic-admission').recovered_through_id, '100');
+    assert.equal(state.getMessage('101'), null);
+  } finally {
+    state.acceptDiscordMessage = original;
+    await gateway.stop();
+    other.close();
+    state.close();
+  }
+});
+
 test('simulated: disconnect pauses dispatch and shard ready performs fresh recovery', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
