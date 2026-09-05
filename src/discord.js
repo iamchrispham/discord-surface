@@ -73,6 +73,12 @@ function conductorMarkerMatchesTopic(topic, binding) {
   }
 }
 
+function bindingIdentityMatches(expected, current) {
+  return Boolean(current?.active) && current.channelId === expected.channelId && current.guildId === expected.guildId &&
+    current.provider === expected.provider && current.nativeId === expected.nativeId &&
+    current.generation === expected.generation && current.conductorId === expected.conductorId && current.repoKey === expected.repoKey;
+}
+
 function readSecret(secretFile) {
   if (!fs.existsSync(secretFile)) throw new Error('Discord secret file does not exist');
   const mode = fs.statSync(secretFile).mode & 0o777;
@@ -343,13 +349,19 @@ class DiscordGateway {
 
   async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null, deadline = Date.now() + RECOVERY_LIMITS.timeoutMs) {
     if (signal?.aborted) return null;
+    if (!this.isCurrentBinding(binding)) return null;
     const watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo);
     const readiness = state === 'ready' ? READINESS.READY : state === 'gap' ? READINESS.GAP : state === 'unavailable' ? READINESS.UNAVAILABLE : READINESS.PENDING;
     try { await this.updateChannelReadiness(channel, readiness, { signal, deadline }); }
     catch (error) {
       if (recoveryKind(error) !== 'stopped') this.logger(`Discord readiness topic update failed: ${error.message}`);
     }
+    if (!this.isCurrentBinding(binding)) return null;
     return watermark;
+  }
+
+  isCurrentBinding(binding) {
+    return bindingIdentityMatches(binding, this.state.getBinding(binding.channelId));
   }
 
   async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch) {
@@ -380,6 +392,10 @@ class DiscordGateway {
         failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
         continue;
       }
+      if (!this.isCurrentBinding(binding)) {
+        failure ||= { ready: false, state: 'unavailable' };
+        continue;
+      }
       if (!conductorMarkerMatchesTopic(channel.topic, binding)) {
         const error = new Error('Discord channel topic does not identify the current conductor and native generation');
         await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
@@ -396,6 +412,10 @@ class DiscordGateway {
           continue;
         }
         this.logger(`Discord readiness topic update failed: ${error.message}`);
+      }
+      if (!this.isCurrentBinding(binding)) {
+        failure ||= { ready: false, state: 'unavailable' };
+        continue;
       }
       if (!this.fetchHistoryInjected && typeof channel.messages?.fetch !== 'function') {
         const error = new Error('Discord history fetch is unavailable for intake recovery');
@@ -421,6 +441,10 @@ class DiscordGateway {
           continue;
         }
         if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+        if (!this.isCurrentBinding(binding)) {
+          failure ||= { ready: false, state: 'unavailable' };
+          continue;
+        }
         if (baseline.some(message => typeof message?.id !== 'string' || !message.id)) {
           const error = new Error('Discord history message has no stable ID');
           await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
@@ -434,6 +458,7 @@ class DiscordGateway {
           watermark = this.state.getIntakeWatermark(binding.channelId);
           if (!watermark?.last_seen_id) {
             await this.recordBoundary(binding, channel, 'ready', `${reason} empty channel baseline`, null, null, signal, deadline);
+            if (!this.isCurrentBinding(binding)) failure ||= { ready: false, state: 'unavailable' };
             continue;
           }
           this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`);
@@ -451,6 +476,7 @@ class DiscordGateway {
           const options = { limit: this.historyPageLimit, signal };
           if (after) options.after = after;
           const page = this.historyMessages(await waitForRecoveryOperation(() => this.fetchHistory(channel, options), signal, deadline));
+          if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'Discord recovery binding changed during history fetch');
           pages += 1;
           if (!page.length) { complete = true; break; }
           if (page.some(message => typeof message?.id !== 'string' || !message.id)) throw new Error('Discord history message has no stable ID');
@@ -463,6 +489,7 @@ class DiscordGateway {
             if (Date.now() >= deadline) throw recoveryError('deadline', 'Discord recovery deadline exceeded while admitting history');
             attemptedId = message.id;
             await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id);
+            if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
             total += 1;
             if (!after || compareDiscordIds(message.id, after) > 0) after = message.id;
           }
@@ -475,6 +502,10 @@ class DiscordGateway {
       } catch (error) {
         const kind = recoveryKind(error);
         if (kind === 'stopped') return { ready: false, state: 'stopped' };
+        if (kind === 'stale') {
+          failure ||= { ready: false, state: 'unavailable', error };
+          continue;
+        }
         await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, attemptedId || after, signal, deadline);
         failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
         continue;
@@ -486,6 +517,10 @@ class DiscordGateway {
         continue;
       }
       await this.recordBoundary(binding, channel, 'ready', `${reason} watermark backfill complete`, null, null, signal, deadline);
+      if (!this.isCurrentBinding(binding)) {
+        failure ||= { ready: false, state: 'unavailable' };
+        continue;
+      }
       const finalWatermark = this.state.getIntakeWatermark(binding.channelId);
       const finalBinding = this.state.getBinding(binding.channelId);
       const liveCustodyAhead = finalWatermark?.last_seen_id && (!finalWatermark.recovered_through_id || compareDiscordIds(finalWatermark.last_seen_id, finalWatermark.recovered_through_id) > 0);

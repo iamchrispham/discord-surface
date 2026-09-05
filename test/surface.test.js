@@ -1025,6 +1025,89 @@ test('simulated: stale handoff topic keeps recovery unavailable until exact repa
   state.close();
 });
 
+test('simulated: handoff during history fetch cannot authorize the successor', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'mid-fetch-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'mid-fetch-conductor', repoKey: 'repo:alpha' });
+  state.setIntakeBaseline('mid-fetch-handoff', '100', 'previous completed recovery');
+  state.markIntakeBoundary('mid-fetch-handoff', 'ready');
+  const old = state.getBinding('mid-fetch-handoff');
+  const channel = {
+    id: 'mid-fetch-handoff',
+    topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'mid-fetch-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }),
+    permissionsFor: () => historyPermissions(),
+    async setTopic(topic) { this.topic = topic; }
+  };
+  const client = {
+    user: { id: 'bot-1' },
+    on() {},
+    off() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  let historyCalls = 0;
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    fetchHistory: async () => {
+      historyCalls += 1;
+      state.handoffConductor({ ...old, fromNativeId: old.nativeId, fromGeneration: old.generation, nativeId: SUCCESSOR_ID, handoffId: 'mid-fetch-handoff-1' });
+      return [];
+    }
+  });
+  const result = await gateway.recoverTransport('restart');
+  const current = state.getBinding('mid-fetch-handoff');
+  assert.equal(result.ready, false);
+  assert.equal(result.state, 'unavailable');
+  assert.equal(current.nativeId, SUCCESSOR_ID);
+  assert.equal(current.generation, 2);
+  assert.equal(current.readiness, READINESS.PENDING);
+  assert.equal(historyCalls, 1);
+  assert.match(channel.topic, /generation=1 readiness=recovering/);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: handoff during readiness topic write cannot authorize the successor', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'mid-topic-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'mid-topic-conductor', repoKey: 'repo:alpha' });
+  state.setIntakeBaseline('mid-topic-handoff', '100', 'previous completed recovery');
+  state.markIntakeBoundary('mid-topic-handoff', 'ready');
+  const old = state.getBinding('mid-topic-handoff');
+  let handedOff = false;
+  const channel = {
+    id: 'mid-topic-handoff',
+    topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'mid-topic-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }),
+    permissionsFor: () => historyPermissions(),
+    async setTopic(topic) {
+      if (!handedOff) {
+        handedOff = true;
+        state.handoffConductor({ ...old, fromNativeId: old.nativeId, fromGeneration: old.generation, nativeId: SUCCESSOR_ID, handoffId: 'mid-topic-handoff-1' });
+      }
+      this.topic = topic;
+    }
+  };
+  const client = {
+    user: { id: 'bot-1' },
+    on() {},
+    off() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  let historyCalls = 0;
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => { historyCalls += 1; return []; } });
+  const result = await gateway.recoverTransport('restart');
+  const current = state.getBinding('mid-topic-handoff');
+  assert.equal(result.ready, false);
+  assert.equal(result.state, 'unavailable');
+  assert.equal(current.nativeId, SUCCESSOR_ID);
+  assert.equal(current.generation, 2);
+  assert.equal(current.readiness, READINESS.PENDING);
+  assert.equal(historyCalls, 0);
+  assert.match(channel.topic, /generation=1 readiness=recovering/);
+  await gateway.stop();
+  state.close();
+});
+
 test('simulated: disconnect pauses dispatch and shard ready performs fresh recovery', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
