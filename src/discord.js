@@ -181,6 +181,8 @@ class DiscordGateway {
     this.stopping = false;
     this.stopPromise = null;
     this.startPromise = null;
+    this.starting = false;
+    this.started = false;
     this.lifecycleEpoch = 0;
     this.connectionEpoch = 0;
     this.recoveryController = null;
@@ -218,7 +220,10 @@ class DiscordGateway {
     };
     this.boundDisconnect = (_error, code) => this.pauseConnection(`Discord shard disconnected${code === undefined ? '' : ` (${code})`}`);
     this.boundReconnecting = shardId => this.pauseConnection(`Discord shard reconnecting${shardId === undefined ? '' : ` (${shardId})`}`);
-    this.boundShardReady = shardId => this.beginReconnectRecovery(`shard-ready${shardId === undefined ? '' : ` (${shardId})`}`);
+    this.boundShardReady = shardId => {
+      if (!this.started) return Promise.resolve({ ready: false, state: this.starting ? 'starting' : 'stopped' });
+      return this.beginReconnectRecovery(`shard-ready${shardId === undefined ? '' : ` (${shardId})`}`);
+    };
     this.client.on('messageCreate', this.boundMessage);
     this.client.on?.('shardResume', this.boundResume);
     this.client.on?.('resume', this.boundResume);
@@ -290,6 +295,8 @@ class DiscordGateway {
     if (this.startPromise) return this.startPromise;
     const epoch = ++this.lifecycleEpoch;
     this.ready = false;
+    this.starting = true;
+    this.started = false;
     const startPromise = (async () => {
       const token = readSecret(secretFile);
       await this.client.login(token);
@@ -297,11 +304,13 @@ class DiscordGateway {
       const recovery = await this.recoverTransport('startup', epoch);
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during recovery');
       if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
+      this.started = true;
     })();
     this.startPromise = startPromise;
     try { return await startPromise; }
     finally {
       if (this.startPromise === startPromise) this.startPromise = null;
+      this.starting = false;
     }
   }
 
@@ -622,6 +631,7 @@ class DiscordGateway {
     this.lifecycleEpoch += 1;
     this.connectionEpoch += 1;
     this.stopping = true;
+    this.started = false;
     this.stopPromise = (async () => {
       this.ready = false;
       this.recoveryController?.abort();

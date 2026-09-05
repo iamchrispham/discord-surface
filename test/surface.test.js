@@ -1302,6 +1302,33 @@ test('simulated: disconnect pauses dispatch and shard ready performs fresh recov
   state.close();
 });
 
+test('simulated: initial shard ready stays startup-owned and does not duplicate recovery', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const client = new EventEmitter();
+  client.user = { id: 'bot-1' };
+  client.channels = { fetch: async () => ({ id: 'channel-codex', topic: '', permissionsFor: () => historyPermissions() }) };
+  client.login = async () => { client.emit('shardReady', 0, new Set()); };
+  client.destroy = async () => {};
+  const recoveries = [];
+  let scans = 0;
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => { scans += 1; return []; } });
+  const recoverTransport = gateway.recoverTransport.bind(gateway);
+  gateway.recoverTransport = async (reason, epoch) => {
+    recoveries.push(reason);
+    return recoverTransport(reason, epoch);
+  };
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  await gateway.start(secret);
+  assert.deepEqual(recoveries, ['startup']);
+  assert.equal(scans, 1);
+  assert.equal(gateway.ready, true);
+  assert.equal(gateway.reconnectPromise, null);
+  await gateway.stop();
+  state.close();
+});
+
 test('simulated: pending successor custody stays accepted until readiness is restored', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'pending-successor', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'pending-conductor', repoKey: 'repo:alpha' });
