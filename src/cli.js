@@ -4,10 +4,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
-const { SurfaceState, PROVIDERS, READINESS, validateNativeId } = require('./state');
+const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
 const { ClaudeChannel } = require('./claude-channel');
-const { conductorMarkerMatches: matchesTopicMarker, staticConductorMarker, topicPresentation } = require('./topic');
+const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
 
 function parseArgs(argv) {
   const args = {};
@@ -136,7 +136,142 @@ function conductorMarkerMatches(topic, expected) {
   return matchesTopicMarker(topic, expected);
 }
 
-async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName, conductorId, repoKey, generation = 1, readiness = READINESS.PENDING, channelId = null, allowCreate = true }) {
+function migrationRequested(args) {
+  return args['migrate-legacy-topic'] === true || args['migrate-legacy-topic'] === 'true';
+}
+
+function validateLegacyMetadata(topic, expected) {
+  const parsed = parseLegacyConductorMarker(topic);
+  if (parsed) {
+    const matches = conductorMarkerMatches(topic, {
+      provider: expected.provider,
+      nativeId: expected.nativeId,
+      conductorId: expected.conductorId,
+      repoKey: expected.repoKey,
+      generation: parsed.generation
+    });
+    if (!matches || (expected.generation != null && parsed.generation !== expected.generation)) {
+      throw new Error('legacy channel topic does not match the requested provider, conductor, repository, native UUID, or generation');
+    }
+    return parsed;
+  }
+  if (legacyAdoptionTopic(topic, expected.provider, expected.nativeId)) {
+    return { version: 'v1', provider: expected.provider, nativeId: expected.nativeId, conductorId: expected.conductorId, repoKey: expected.repoKey, generation: null };
+  }
+  throw new Error('channel topic is not a recognized legacy marker');
+}
+
+function legacyMarkerMatches(topic, expected) {
+  const parsed = parseLegacyConductorMarker(topic);
+  if (parsed) {
+    return conductorMarkerMatches(topic, {
+      provider: expected.provider,
+      nativeId: expected.nativeId,
+      conductorId: expected.conductorId,
+      repoKey: expected.repoKey,
+      generation: parsed.generation
+    });
+  }
+  return legacyAdoptionTopic(topic, expected.provider, expected.nativeId);
+}
+
+async function cancelResponseBody(response) {
+  try {
+    await response?.body?.cancel?.();
+  } catch {}
+}
+
+function topicPatchOutcome(error) {
+  if (error?.status === 429 || error?.code === 429) return 'rate_limited';
+  if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
+  return 'unknown';
+}
+
+async function patchDiscordTopic({ token, channelId, topic, signal }) {
+  if (typeof globalThis.fetch !== 'function') throw new Error('Discord topic migration fetch is unavailable');
+  const response = await globalThis.fetch(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bot ${token}`,
+      'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ topic }),
+    signal
+  });
+  if (!response.ok) {
+    await cancelResponseBody(response);
+    const error = new Error('Discord legacy topic migration was rejected');
+    error.status = response.status;
+    throw error;
+  }
+  try { return await response.json(); }
+  catch (error) {
+    await cancelResponseBody(response);
+    throw error;
+  }
+}
+
+async function migrateLegacyTopic({ state, channel, binding, token, request = patchDiscordTopic, timeoutMs = RECOVERY_LIMITS.timeoutMs }) {
+  const desiredTopic = staticConductorMarker({ provider: binding.provider, conductorId: binding.conductorId, repoKey: binding.repoKey });
+  if (channel.topic === desiredTopic) return { migrated: false, topic: desiredTopic, binding };
+  const custody = state.beginTopicPublication(channel.id, {
+    desiredReadiness: binding.readiness,
+    desiredTopic
+  }, binding);
+  if (!custody) throw new Error('legacy topic migration binding changed before custody started');
+  const controller = new AbortController();
+  const boundedMs = Math.max(1, Number(timeoutMs || RECOVERY_LIMITS.timeoutMs));
+  let timer;
+  let settled = false;
+  try {
+    const operation = Promise.resolve().then(() => request({ token, channelId: channel.id, topic: desiredTopic, signal: controller.signal }));
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        const error = new Error('Discord legacy topic migration deadline exceeded');
+        error.publicationUnknown = true;
+        reject(error);
+      }, boundedMs);
+    });
+    const response = await Promise.race([operation, deadline]);
+    if (!response || response.topic !== desiredTopic) {
+      const error = new Error('Discord legacy topic migration response did not confirm the static marker');
+      error.publicationUnknown = true;
+      throw error;
+    }
+    const recorded = state.recordTopicPublication(channel.id, {
+      requestId: custody.requestId,
+      desiredReadiness: binding.readiness,
+      outcome: 'published',
+      publishedReadiness: binding.readiness,
+      observedTopic: response.topic,
+      remoteTerminal: true
+    }, binding);
+    settled = true;
+    channel.topic = response.topic;
+    return { migrated: true, topic: response.topic, custody: recorded, binding };
+  } catch (error) {
+    const outcome = topicPatchOutcome(error);
+    if (!settled) {
+      state.recordTopicPublication(channel.id, {
+        requestId: custody.requestId,
+        desiredReadiness: binding.readiness,
+        outcome,
+        publicationUnknown: outcome === 'unknown',
+        observedTopic: channel.topic,
+        error: error.message,
+        remoteTerminal: outcome !== 'unknown'
+      }, binding);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+
+async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName, conductorId, repoKey, generation = 1, readiness = READINESS.PENDING, channelId = null, allowCreate = true, allowLegacy = false }) {
   if (provider !== PROVIDERS.CODEX && provider !== PROVIDERS.CLAUDE) throw new Error('unsupported provider');
   validateNativeId(nativeId);
   if (typeof conductorId !== 'string' || !conductorId || typeof repoKey !== 'string' || !repoKey) throw new Error('conductor identity is required for channel provisioning');
@@ -151,11 +286,13 @@ async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId,
     if (!channel) throw new Error('requested adoption channel was not found');
     if (channel.parentId !== categoryId) throw new Error('requested adoption channel is outside the configured vendor category');
     if (channel.topic !== marker) {
-      const v2Match = conductorMarkerMatches(channel.topic, { provider, nativeId, conductorId, repoKey, generation });
+      const legacy = parseLegacyConductorMarker(channel.topic);
+      const v2Match = legacy && conductorMarkerMatches(channel.topic, { provider, nativeId, conductorId, repoKey, generation: legacy.generation });
       const legacyMatch = legacyAdoptionTopic(channel.topic, provider, nativeId);
       if (!v2Match && !legacyMatch) throw new Error('requested adoption channel metadata does not match the native identity');
+      if (!allowLegacy) throw new Error('legacy channel topic requires explicit --migrate-legacy-topic --channel-id');
       adopted = legacyMatch;
-      return { channel, created: false, adopted, legacy: true, marker: channel.topic };
+      return { channel, created: false, adopted, legacy: true, legacyMetadata: legacy || { version: 'v1', provider, nativeId, generation: null }, marker: channel.topic };
     }
     return { channel, created: false, adopted, marker };
   }
@@ -164,7 +301,11 @@ async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId,
   const existingMarker = marked[0];
   if (existingMarker && existingMarker.parentId !== categoryId) throw new Error('provision marker exists under the wrong category');
   const existing = existingMarker;
-  if (existing) return { channel: existing, created: false, marker: existing.topic };
+  const legacyMarkers = channels.filter(channel => legacyMarkerMatches(channel.topic, { provider, nativeId, conductorId, repoKey }));
+  if (legacyMarkers.length > 1) throw new Error('duplicate legacy provision markers require explicit reconciliation');
+  if (legacyMarkers[0] && legacyMarkers[0].parentId !== categoryId) throw new Error('legacy provision marker exists under the wrong category');
+  if (existing) throw new Error('existing static conductor marker requires explicit --channel-id adoption');
+  if (legacyMarkers[0]) throw new Error('existing legacy conductor marker requires explicit --channel-id adoption');
   if (!allowCreate) throw new Error('provision intent is unresolved and has no reconciled Discord channel; use explicit --channel-id adoption before retrying');
   const type = requireInstalled('discord.js').ChannelType.GuildText;
   const presentationName = typeof taskName === 'string' && taskName ? taskName : `${provider}-${nativeId.slice(0, 8)}`;
@@ -193,6 +334,8 @@ async function provisionInternal(args) {
   validateNativeId(nativeId);
   const conductorId = required(args, 'conductor-id');
   const repoKey = required(args, 'repo-key');
+  const migrate = migrationRequested(args);
+  if (migrate && !args['channel-id']) throw new Error('--migrate-legacy-topic requires --channel-id');
   if (provider === PROVIDERS.CLAUDE && !args.endpoint) throw new Error('Claude provisioning requires --endpoint');
   const workspace = path.resolve(required(args, 'workspace'));
   const endpoint = args.endpoint ? path.resolve(args.endpoint) : undefined;
@@ -208,29 +351,48 @@ async function provisionInternal(args) {
       if (existingBinding.repoKey !== repoKey || existingBinding.nativeId !== nativeId || existingBinding.workspace !== workspace || existingBinding.endpoint !== (endpoint || null)) {
         throw new Error('existing conductor binding does not match requested identity; use explicit handoff for a successor');
       }
-      const marker = conductorMarker({ provider, nativeId, conductorId, repoKey, generation: existingBinding.generation, readiness: existingBinding.readiness });
+      if (migrate && args['channel-id'] !== existingBinding.channelId) throw new Error('--channel-id must identify the locally bound conductor channel');
+      const marker = staticConductorMarker({ provider, conductorId, repoKey });
       const { Client, GatewayIntentBits } = requireInstalled('discord.js');
       client = new Client({ intents: [GatewayIntentBits.Guilds] });
-      await client.login(readSecret(config.secretFile));
+      const token = readSecret(config.secretFile);
+      await client.login(token);
       const guild = await client.guilds.fetch(config.guildId);
       const boundChannel = await guild.channels.fetch(existingBinding.channelId);
       const markerMatches = boundChannel && boundChannel.topic === marker;
-      const legacyMatches = boundChannel && (conductorMarkerMatches(boundChannel.topic, { provider, nativeId, conductorId, repoKey, generation: existingBinding.generation }) || legacyAdoptionTopic(boundChannel.topic, provider, nativeId));
-      if (!boundChannel || boundChannel.parentId !== categoryId || (!markerMatches && !legacyMatches)) {
+      let legacyMetadata = null;
+      if (boundChannel && !markerMatches) {
+        try {
+          legacyMetadata = validateLegacyMetadata(boundChannel.topic, { provider, nativeId, conductorId, repoKey, generation: existingBinding.generation });
+        } catch {
+          legacyMetadata = null;
+        }
+      }
+      if (!boundChannel || boundChannel.parentId !== categoryId || (!markerMatches && !legacyMetadata)) {
         throw new Error('existing conductor channel does not match requested metadata');
       }
-      if (legacyMatches && !markerMatches) state.assertLegacyMigrationSafe(existingBinding.channelId);
-      print({ created: false, adopted: false, legacy: !markerMatches, bound: true, marker: boundChannel.topic, conductorId, repoKey, channelId: existingBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingBinding.channelId}`, binding: existingBinding });
+      if (legacyMetadata) {
+        if (!migrate) throw new Error('legacy channel topic requires explicit --migrate-legacy-topic --channel-id');
+        state.assertLegacyMigrationSafe(existingBinding.channelId);
+        await migrateLegacyTopic({ state, channel: boundChannel, binding: existingBinding, token });
+      }
+      print({ created: false, adopted: false, legacy: Boolean(legacyMetadata), migrated: Boolean(legacyMetadata), bound: true, marker: boundChannel.topic, conductorId, repoKey, channelId: existingBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingBinding.channelId}`, binding: state.getBinding(existingBinding.channelId) });
       return;
     }
-    const marker = conductorMarker({ provider, nativeId, conductorId, repoKey });
+    const marker = staticConductorMarker({ provider, conductorId, repoKey });
     const intent = state.beginProvisionIntent({ provider, nativeId, conductorId, repoKey, guildId: config.guildId, categoryId, workspace, endpoint, marker, taskName });
     const { Client, GatewayIntentBits } = requireInstalled('discord.js');
     client = new Client({ intents: [GatewayIntentBits.Guilds] });
-    await client.login(readSecret(config.secretFile));
+    const token = readSecret(config.secretFile);
+    await client.login(token);
     const guild = await client.guilds.fetch(config.guildId);
-    const result = await ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName, conductorId, repoKey, channelId: args['channel-id'] || intent.channel_id, allowCreate: intent.fresh });
-    if (result.legacy) state.assertLegacyMigrationSafe(result.channel.id);
+    const result = await ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName, conductorId, repoKey, channelId: args['channel-id'] || intent.channel_id, allowCreate: intent.fresh, allowLegacy: migrate });
+    let legacyMetadata = null;
+    if (result.legacy) {
+      if (!migrate) throw new Error('legacy channel topic requires explicit --migrate-legacy-topic --channel-id');
+      legacyMetadata = validateLegacyMetadata(result.channel.topic, { provider, nativeId, conductorId, repoKey, generation: result.legacyMetadata?.generation ?? null });
+      state.assertLegacyMigrationSafe(result.channel.id);
+    }
     const existingNativeBinding = state.findNativeBinding(nativeId, provider);
     if (existingNativeBinding) {
       if (!existingNativeBinding.active || existingNativeBinding.provider !== provider || existingNativeBinding.workspace !== workspace || existingNativeBinding.endpoint !== (endpoint || null) || existingNativeBinding.conductorId !== conductorId || existingNativeBinding.repoKey !== repoKey) {
@@ -240,13 +402,14 @@ async function provisionInternal(args) {
         throw new Error('native session is already bound to another conductor channel');
       }
       state.completeProvisionIntent(provider, nativeId, existingNativeBinding.channelId, conductorId);
-      print({ created: false, adopted: result.adopted, bound: true, marker, conductorId, repoKey, channelId: existingNativeBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingNativeBinding.channelId}`, binding: existingNativeBinding, intent });
+      print({ created: false, adopted: result.adopted, legacy: Boolean(legacyMetadata), migrated: false, bound: true, marker: result.channel.topic, conductorId, repoKey, channelId: existingNativeBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingNativeBinding.channelId}`, binding: existingNativeBinding, intent });
       return;
     }
-    const binding = state.bind({ channelId: result.channel.id, guildId: config.guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey });
+    const binding = state.bind({ channelId: result.channel.id, guildId: config.guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey, generation: legacyMetadata?.generation ?? undefined });
     state.completeProvisionIntent(provider, nativeId, result.channel.id, conductorId);
-    print({ created: result.created, adopted: result.adopted, legacy: result.legacy || false, bound: true, marker: result.marker, conductorId, repoKey, channelId: result.channel.id,
-      url: `https://discord.com/channels/${config.guildId}/${result.channel.id}`, binding, intent });
+    if (legacyMetadata) await migrateLegacyTopic({ state, channel: result.channel, binding, token });
+    print({ created: result.created, adopted: result.adopted, legacy: Boolean(legacyMetadata), migrated: Boolean(legacyMetadata), bound: true, marker: result.channel.topic, conductorId, repoKey, channelId: result.channel.id,
+      url: `https://discord.com/channels/${config.guildId}/${result.channel.id}`, binding: state.getBinding(result.channel.id), intent });
   } finally {
     await client?.destroy();
     state.close();
@@ -292,8 +455,10 @@ async function handoffInternal(args) {
     const channel = await guild.channels.fetch(channelId);
     if (!channel || channel.parentId !== categoryId) throw new Error('handoff channel is outside the configured vendor category');
     const current = state.getBinding(channelId);
-    if (!current || current.provider !== provider || current.conductorId !== conductorId || current.repoKey !== repoKey ||
-      ![conductorMarkerMatches(channel.topic, { provider, nativeId: current.nativeId, conductorId, repoKey, generation: current.generation }), legacyAdoptionTopic(channel.topic, provider, current.nativeId)].some(Boolean)) {
+    const expectedMarker = current && staticConductorMarker({ provider, conductorId, repoKey });
+    const legacy = current && (parseLegacyConductorMarker(channel.topic) || legacyAdoptionTopic(channel.topic, provider, current.nativeId));
+    if (legacy) throw new Error('legacy channel topic requires explicit --migrate-legacy-topic --channel-id before handoff');
+    if (!current || current.provider !== provider || current.conductorId !== conductorId || current.repoKey !== repoKey || channel.topic !== expectedMarker) {
       throw new Error('handoff channel topic does not match the locally bound conductor address');
     }
     const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
@@ -469,4 +634,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, main, parseArgs, pathsFor, provisionMarker };
+module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };

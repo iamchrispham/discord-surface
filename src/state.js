@@ -719,7 +719,7 @@ class SurfaceState {
       const guardedReadiness = publication.desiredReadiness === READINESS.READY ? READINESS.UNAVAILABLE : publication.desiredReadiness;
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(guardedReadiness, timestamp, channelId);
       if (publication.desiredReadiness === READINESS.READY) {
-        this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, updated_at=? WHERE channel_id=?")
+        this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, updated_at=? WHERE channel_id=? AND state <> 'gap'")
           .run('Discord topic publication custody is unresolved', timestamp, channelId);
       }
       this.receipt(null, 'topic-publication-started', {
@@ -776,11 +776,13 @@ class SurfaceState {
     const conductorId = binding.conductorId == null ? (existing?.conductorId || null) : assertConductorId(binding.conductorId);
     const repoKey = binding.repoKey == null ? (existing?.repoKey || null) : assertRepoKey(binding.repoKey);
     if (Boolean(conductorId) !== Boolean(repoKey)) throw new BindingError('conductorId and repoKey must be provided together');
+    const generation = binding.generation == null ? null : Number(binding.generation);
+    if (generation !== null && (!Number.isInteger(generation) || generation < 1)) throw new BindingError('generation must be a positive integer');
     const readiness = binding.readiness == null ? (existing?.readiness || (conductorId ? READINESS.PENDING : READINESS.READY)) : binding.readiness;
     if (!Object.values(READINESS).includes(readiness)) throw new BindingError('invalid binding readiness');
     const config = this.requireConfig();
     if (guildId !== config.guildId) throw new BindingError('binding guild is not the configured guild');
-    return { channelId, guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey, readiness };
+    return { channelId, guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey, readiness, generation };
   }
 
   bind(binding) {
@@ -795,7 +797,9 @@ class SurfaceState {
       const generationRow = input.conductorId
         ? this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE provider=? AND conductor_id=?').get(input.provider, input.conductorId)
         : this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE channel_id=?').get(input.channelId);
-      const generation = Number(generationRow.next);
+      const nextGeneration = Number(generationRow.next);
+      const generation = input.generation == null ? nextGeneration : input.generation;
+      if (generation < nextGeneration) throw new BindingError('binding generation would move backwards');
       this.db.prepare(`INSERT INTO bindings(channel_id, guild_id, provider, native_id, workspace, endpoint, category_id, conductor_id, repo_key, readiness, generation, active, updated_at)
         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(input.channelId, input.guildId, input.provider, input.nativeId, input.workspace, input.endpoint, input.categoryId, input.conductorId, input.repoKey, input.readiness, generation, createdAt);
       this.receipt(null, 'bound', { channelId: input.channelId, provider: input.provider, conductorId: input.conductorId, generation });
@@ -870,6 +874,7 @@ class SurfaceState {
       const binding = this.getBinding(channelId);
       if (!binding) throw new BindingError('channel is not bound');
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+      if (readiness === READINESS.READY) this.assertLegacyMigrationSafe(channelId);
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
       this.receipt(null, 'binding-readiness', { channelId, conductorId: binding.conductorId, readiness, detail: detail || undefined });
       return this.getBinding(channelId);
@@ -1013,6 +1018,7 @@ class SurfaceState {
       const existing = this.getIntakeWatermark(channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       if (!existing && !binding) throw new BindingError('intake channel is unknown');
+      if (state === 'ready') this.assertLegacyMigrationSafe(channelId);
       const guildId = existing?.guild_id || binding.guildId;
       if (existing) {
         this.db.prepare('UPDATE intake_watermarks SET state=?, detail=?, gap_from=?, gap_to=?, updated_at=? WHERE channel_id=?')

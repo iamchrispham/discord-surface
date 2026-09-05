@@ -44,7 +44,7 @@ node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
   --native-id CODEX_SESSION_UUID --workspace /absolute/workspace
 ```
 
-Repeated setup with the same conductor ID verifies the existing category, fixed marker, binding, URL, and generation before returning the same channel. It does not rewrite the topic. An existing setup channel can be adopted explicitly after category and legacy native metadata validation:
+Repeated setup with the same conductor ID verifies the existing category, fixed marker, binding, URL, and generation before returning the same channel. It does not rewrite the topic. A fresh invocation that sees a remote marker must carry `--channel-id` before it can adopt that channel. An existing setup channel can be adopted explicitly after category and legacy native metadata validation:
 
 ```sh
 node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
@@ -52,6 +52,18 @@ node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
   --repo-key CANONICAL_REPOSITORY_KEY --native-id CODEX_SESSION_UUID \
   --workspace /absolute/workspace --channel-id EXISTING_CHANNEL_ID
 ```
+
+Legacy v1 or v2 topics are read-only evidence. Ordinary setup and handoff reject them. A one-time migration requires the explicit channel ID and flag below. It validates the local conductor, repository, provider, native UUID, generation, guild, and category before one bounded topic update:
+
+```sh
+node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
+  --provider codex --conductor-id CONDUCTOR_ID \
+  --repo-key CANONICAL_REPOSITORY_KEY --native-id CODEX_SESSION_UUID \
+  --workspace /absolute/workspace --channel-id EXISTING_CHANNEL_ID \
+  --migrate-legacy-topic
+```
+
+A definite Discord response records migration success or rejection. A lost response stays unresolved and blocks migration, rebind, handoff, and readiness until the existing evidence-based reconciliation command proves its outcome. Migration never recreates a channel, retries a request, or restores execution readiness by itself.
 
 A successor native session keeps the same channel only through an explicit drained or reconciled handoff. Account rotation does not change the binding. The handoff requires a caller-supplied handoff ID from the existing authority mechanism, records it, and increases the generation:
 

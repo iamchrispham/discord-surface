@@ -10,7 +10,7 @@ const { postUnixJson } = require('../src/native');
 const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
 const { CodexProvider, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
-const { bindingArgs, conductorMarker, ensureProvisionedChannel, provisionMarker } = require('../src/cli');
+const { bindingArgs, conductorMarker, ensureProvisionedChannel, migrateLegacyTopic, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
 const { conductorMarkerMatches, topicWithReadiness } = require('../src/topic');
 
@@ -465,6 +465,50 @@ test('simulated: real-client receipt uses one abortable request without SDK send
   }
 });
 
+test('simulated: rejected receipt response cancels its body before dropping the request handle', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'receipt-body', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-body-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('receipt-body', 'ready');
+  const listeners = new Map();
+  let fetchCalls = 0;
+  let bodyCancelled = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return {
+      ok: false,
+      status: 500,
+      body: { cancel() { bodyCancelled = true; return Promise.resolve(); } }
+    };
+  };
+  const channel = { id: 'receipt-body', async send() { return { id: 'native-reply' }; } };
+  const client = {
+    rest: {},
+    user: { id: 'bot-1' },
+    on(name, fn) { listeners.set(name, fn); },
+    off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: { codex: { async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } }
+  });
+  gateway.discordToken = 'fake-token';
+  try {
+    const result = await gateway.consumer.handleMessage({ id: 'receipt-body-input', guildId: 'guild-1', channelId: 'receipt-body', content: 'hello', author: { id: 'operator-1', bot: false }, channel });
+    assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+    await gateway.consumer.waitForReceipts();
+    assert.equal(fetchCalls, 1);
+    assert.equal(bodyCancelled, true);
+    assert.equal(state.getTransportReceipt('receipt-body-input').outcome.outcome, 'unknown');
+  } finally {
+    globalThis.fetch = originalFetch;
+    await gateway.stop();
+    state.close();
+  }
+});
+
 test('simulated: secret reader refuses group-readable token files', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-secret-'));
   const file = path.join(dir, 'secret');
@@ -478,7 +522,7 @@ test('simulated: conductor provisioning is idempotent by static address marker',
   const guild = {
     channels: {
       cache: { values: () => channels.values() },
-      async fetch() {},
+      async fetch(id) { return id ? channels.get(id) : undefined; },
       async create(options) {
         creates += 1;
         const channel = { id: `created-${creates}`, parentId: options.parent, topic: options.topic };
@@ -488,12 +532,34 @@ test('simulated: conductor provisioning is idempotent by static address marker',
     }
   };
   const first = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'idempotent', repoKey: 'repo:alpha' });
-  const second = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'idempotent', repoKey: 'repo:alpha' });
+  const second = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'idempotent', repoKey: 'repo:alpha', channelId: first.channel.id });
   assert.equal(first.created, true);
   assert.equal(second.created, false);
   assert.equal(second.channel.id, first.channel.id);
   assert.match(first.marker, /^discord-surface:v3 conductor=idempotent provider=codex repo=repo%3Aalpha \[address only, not live status\]$/);
   assert.equal(creates, 1);
+});
+
+test('simulated: fresh provisioning never adopts a remote static marker without explicit channel evidence', async () => {
+  const channel = {
+    id: 'remote-static',
+    parentId: 'codex-category',
+    topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'fresh-conductor', repoKey: 'repo:alpha' })
+  };
+  let creates = 0;
+  const guild = {
+    channels: {
+      cache: { values: () => [channel][Symbol.iterator]() },
+      async fetch() { return channel; },
+      async create() { creates += 1; throw new Error('fresh marker must not create or adopt'); }
+    }
+  };
+  const options = { guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'fresh-conductor', repoKey: 'repo:alpha' };
+  await assert.rejects(() => ensureProvisionedChannel(options), /explicit --channel-id adoption/);
+  await assert.rejects(() => ensureProvisionedChannel(options), /explicit --channel-id adoption/);
+  const adopted = await ensureProvisionedChannel({ ...options, channelId: channel.id });
+  assert.equal(adopted.channel.id, channel.id);
+  assert.equal(creates, 0);
 });
 
 test('simulated: provisioning rejects a static marker outside the configured vendor category', async () => {
@@ -1490,8 +1556,9 @@ test('simulated: unresolved legacy publication fences ownership changes, not loc
     desiredTopic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'topic-custody-guards', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY })
   }, binding);
   assert.equal(custody.status, 'in_flight');
-  state.setBindingReadiness('topic-custody-guards', READINESS.READY);
-  state.markIntakeBoundary('topic-custody-guards', 'ready');
+  assert.throws(() => state.setBindingReadiness('topic-custody-guards', READINESS.READY), UnresolvedWorkError);
+  assert.throws(() => state.markIntakeBoundary('topic-custody-guards', 'ready'), UnresolvedWorkError);
+  assert.equal(state.getBinding('topic-custody-guards').readiness, READINESS.UNAVAILABLE);
   assert.throws(() => state.rebind({ channelId: 'topic-custody-guards', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir }), UnresolvedWorkError);
   assert.throws(() => state.unbind('topic-custody-guards'), UnresolvedWorkError);
   assert.throws(() => state.handoffConductor({
@@ -1923,7 +1990,7 @@ test('simulated: stable conductor markers repeat, adopt the existing setup chann
   const guild = {
     channels: {
       cache: { values: () => channels.values() },
-      async fetch() {},
+      async fetch(id) { return id ? channels.get(id) : undefined; },
       async create(options) {
         creates += 1;
         const channel = { id: `created-conductor-${creates}`, parentId: options.parent, topic: options.topic, async setTopic(topic) { this.topic = topic; } };
@@ -1933,7 +2000,7 @@ test('simulated: stable conductor markers repeat, adopt the existing setup chann
     }
   };
   const first = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', taskName: 'presentation only' });
-  const second = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', taskName: 'renamed presentation' });
+  const second = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', taskName: 'renamed presentation', channelId: first.channel.id });
   assert.equal(first.created, true);
   assert.equal(second.created, false);
   assert.equal(second.channel.id, first.channel.id);
@@ -1948,7 +2015,8 @@ test('simulated: stable conductor markers repeat, adopt the existing setup chann
     async fetch(id) { return id ? existing : undefined; },
     async create() { throw new Error('adoption must not create'); }
   } };
-  const adopted = await ensureProvisionedChannel({ guild: adoptionGuild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', channelId: existingId });
+  await assert.rejects(() => ensureProvisionedChannel({ guild: adoptionGuild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', channelId: existingId }), /explicit --migrate-legacy-topic/);
+  const adopted = await ensureProvisionedChannel({ guild: adoptionGuild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', channelId: existingId, allowLegacy: true });
   assert.equal(adopted.adopted, true);
   assert.equal(adopted.channel.id, existingId);
   assert.equal(adopted.channel.topic, `Conductor task: codex/${CODEX_ID}`);
@@ -1956,6 +2024,59 @@ test('simulated: stable conductor markers repeat, adopt the existing setup chann
 
   const unresolvedGuild = { channels: { cache: { values: () => [][Symbol.iterator]() }, async fetch() {}, async create() { throw new Error('must not retry unknown create'); } } };
   await assert.rejects(() => ensureProvisionedChannel({ guild: unresolvedGuild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'other-conductor', repoKey: 'repo:alpha', allowCreate: false }), /unresolved/);
+});
+
+test('simulated: explicit legacy migration records terminal custody and never rewrites a static address', async () => {
+  const { dir, state } = fixture();
+  const channelId = 'legacy-migration';
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'legacy-migration-conductor', repoKey: 'repo:alpha', generation: 3 });
+  const binding = state.getBinding(channelId);
+  const legacyTopic = `discord-surface:v2 conductor=legacy-migration-conductor provider=codex repo=repo%3Aalpha native=${CODEX_ID} generation=3 readiness=pending`;
+  const channel = { id: channelId, topic: legacyTopic };
+  const staticTopic = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: binding.conductorId, repoKey: binding.repoKey });
+  let requests = 0;
+  const result = await migrateLegacyTopic({
+    state,
+    channel,
+    binding,
+    token: 'fake-token',
+    request: async ({ signal, topic }) => {
+      requests += 1;
+      assert.equal(signal.aborted, false);
+      return { topic };
+    },
+    timeoutMs: 50
+  });
+  assert.equal(result.migrated, true);
+  assert.equal(channel.topic, staticTopic);
+  assert.equal(requests, 1);
+  assert.equal(state.listTopicPublications(channelId)[0].status, 'published');
+  const repeated = await migrateLegacyTopic({ state, channel, binding: state.getBinding(channelId), token: 'fake-token', request: async () => { requests += 1; return { topic: staticTopic }; } });
+  assert.equal(repeated.migrated, false);
+  assert.equal(requests, 1);
+  state.close();
+});
+
+test('simulated: unknown legacy migration keeps readiness fenced until explicit reconciliation', async () => {
+  const { dir, state } = fixture();
+  const channelId = 'legacy-migration-unknown';
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'legacy-unknown-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary(channelId, 'ready', 'prior verified history');
+  const binding = state.getBinding(channelId);
+  const channel = { id: channelId, topic: `discord-surface:v2 conductor=legacy-unknown-conductor provider=codex repo=repo%3Aalpha native=${CODEX_ID} generation=1 readiness=ready` };
+  await assert.rejects(() => migrateLegacyTopic({
+    state,
+    channel,
+    binding,
+    token: 'fake-token',
+    request: async () => { throw new Error('socket closed before a Discord response'); },
+    timeoutMs: 50
+  }), /socket closed/);
+  assert.equal(state.listTopicPublications(channelId)[0].status, 'unknown');
+  assert.equal(state.getBinding(channelId).readiness, READINESS.UNAVAILABLE);
+  assert.throws(() => state.setBindingReadiness(channelId, READINESS.READY), UnresolvedWorkError);
+  assert.throws(() => state.markIntakeBoundary(channelId, 'ready'), UnresolvedWorkError);
+  state.close();
 });
 
 test('simulated: static address marker is strict and repeated adoption preserves it', async () => {
@@ -2059,6 +2180,18 @@ test('simulated: public provision lock reaches native validation on a fresh stat
     assert.match(output, /nativeId must be an exact UUID/);
     assert.doesNotMatch(output, /No such file or directory/);
     assert.equal(fs.existsSync(path.join(dir, 'provision.lock')), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('simulated: public migration flag requires explicit channel adoption evidence', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-cli-migration-'));
+  try {
+    const result = spawnSync(process.execPath, [CLI_PATH, 'provision', '--state-dir', dir, '--provider', 'codex', '--native-id', CODEX_ID, '--conductor-id', 'cli-migration-conductor', '--repo-key', 'repo:alpha', '--workspace', dir, '--category-id', 'codex-category', '--migrate-legacy-topic'], { encoding: 'utf8' });
+    const output = `${result.stdout}\n${result.stderr}`;
+    assert.notEqual(result.status, 0);
+    assert.match(output, /--migrate-legacy-topic requires --channel-id/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

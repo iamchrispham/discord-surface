@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const { createRequire } = require('node:module');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
-const { READINESS, RECOVERY_LIMITS } = require('./state');
+const { READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
 
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
@@ -105,6 +105,12 @@ function classifyTransportReceiptError(error) {
   if (error?.status === 429 || error?.code === 429 || /^RateLimitError(?:\[|$)/.test(String(error?.name || '')) || /^RateLimitError(?:\[|$)/.test(String(error?.message || ''))) return 'rate_limited';
   if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
   return 'unknown';
+}
+
+async function cancelResponseBody(response) {
+  try {
+    await response?.body?.cancel?.();
+  } catch {}
 }
 
 function transportReceiptText(message, attempt) {
@@ -332,11 +338,17 @@ class DiscordGateway {
             signal: controller.signal
           }).then(async response => {
             if (!response.ok) {
+              await cancelResponseBody(response);
               const error = new Error('Discord transport receipt request rejected');
               error.status = response.status;
               throw error;
             }
-            const body = await response.json().catch(() => null);
+            let body;
+            try { body = await response.json(); }
+            catch (error) {
+              await cancelResponseBody(response);
+              throw error;
+            }
             if (!body?.id) throw new Error('Discord did not return a transport receipt message id');
             return body;
           });
@@ -461,7 +473,15 @@ class DiscordGateway {
 
   async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null) {
     if (signal?.aborted || !this.isCurrentBinding(binding)) return null;
-    const watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo, binding);
+    let watermark;
+    try {
+      watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo, binding);
+    } catch (error) {
+      if (!(error instanceof UnresolvedWorkError) || state !== 'ready') throw error;
+      const blockedDetail = `${detail}; legacy topic migration custody is unresolved`;
+      watermark = this.state.markIntakeBoundary(binding.channelId, READINESS.UNAVAILABLE, blockedDetail, gapFrom, gapTo, binding);
+      return watermark ? { watermark, topicPublished: false, publication: null, blocked: true, error } : null;
+    }
     if (!watermark) return null;
     return { watermark, topicPublished: true, publication: null };
   }
@@ -557,7 +577,7 @@ class DiscordGateway {
           watermark = this.state.getIntakeWatermark(binding.channelId);
           if (!watermark?.last_seen_id) {
             const boundary = await this.recordBoundary(binding, channel, 'ready', `${reason} empty channel baseline`, null, null, signal, deadline);
-            if (!boundary || boundary.stale) failure ||= { ready: false, state: 'unavailable' };
+            if (!boundary || boundary.stale || boundary.blocked) failure ||= { ready: false, state: 'unavailable', error: boundary?.error };
             continue;
           }
           const baseline = this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`, binding);
@@ -621,7 +641,7 @@ class DiscordGateway {
         continue;
       }
       const boundary = await this.recordBoundary(binding, channel, 'ready', `${reason} watermark backfill complete`, null, null, signal, deadline);
-      if (!boundary || boundary.stale || !this.isCurrentBinding(binding)) {
+      if (!boundary || boundary.stale || boundary.blocked || !this.isCurrentBinding(binding)) {
         failure ||= { ready: false, state: 'unavailable' };
         continue;
       }

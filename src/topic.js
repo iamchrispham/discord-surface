@@ -46,6 +46,25 @@ function conductorMarkerMatches(topic, expected) {
   }
 }
 
+function parseLegacyConductorMarker(topic) {
+  const base = topicPresentation(topic).base;
+  const match = LEGACY_CONDUCTOR_MARKER.exec(base);
+  if (!match) return null;
+  try {
+    return {
+      version: 'v2',
+      conductorId: decodeURIComponent(match[1]),
+      provider: match[2],
+      repoKey: decodeURIComponent(match[3]),
+      nativeId: match[4],
+      generation: Number(match[5]),
+      readiness: match[6]
+    };
+  } catch {
+    return null;
+  }
+}
+
 function staticConductorMarker({ provider, conductorId, repoKey }) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('unsupported provider');
   if (typeof conductorId !== 'string' || !conductorId || typeof repoKey !== 'string' || !repoKey) {
@@ -70,4 +89,4 @@ function topicWithReadiness(topic, readiness, publishedAt = new Date().toISOStri
   return `${nextBase.slice(0, Math.max(0, 1024 - suffix.length))}${suffix}`;
 }
 
-module.exports = { ADDRESS_QUALIFIER, conductorMarkerMatches, staticConductorMarker, topicPresentation, topicWithReadiness };
+module.exports = { ADDRESS_QUALIFIER, conductorMarkerMatches, parseLegacyConductorMarker, staticConductorMarker, topicPresentation, topicWithReadiness };
