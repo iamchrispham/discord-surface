@@ -35,7 +35,7 @@ node src/cli.js bind --state-dir "$HOME/.config/discord-surface" \
   --conductor-id CONDUCTOR_ID --repo-key CANONICAL_REPOSITORY_KEY
 ```
 
-For the `/conduct` integration, `provision` creates or reuses one text channel for the stable conductor under its configured vendor category. It stores the conductor ID, canonical repository key, provider, native UUID, generation, and readiness in the topic, then binds the channel. It never creates a native executor or resumes a session. The category comes from configuration, so a Codex command cannot choose the Claude category.
+For the `/conduct` integration, `provision` creates or reuses one text channel for the stable conductor under its configured vendor category. Its topic is a fixed address marker. Local SQLite stores the provider, canonical repository key, native UUID, generation, readiness, history coverage, and custody. It never creates a native executor or resumes a session. The category comes from configuration, so a Codex command cannot choose the Claude category.
 
 ```sh
 node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
@@ -44,7 +44,7 @@ node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
   --native-id CODEX_SESSION_UUID --workspace /absolute/workspace
 ```
 
-Repeated setup with the same conductor ID verifies the existing category, topic marker, binding, URL, and generation before returning the same channel. An existing setup channel can be adopted explicitly after category and legacy native metadata validation:
+Repeated setup with the same conductor ID verifies the existing category, fixed marker, binding, URL, and generation before returning the same channel. It does not rewrite the topic. An existing setup channel can be adopted explicitly after category and legacy native metadata validation:
 
 ```sh
 node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
@@ -64,7 +64,7 @@ node src/cli.js handoff --state-dir "$HOME/.config/discord-surface" \
   --handoff-id AUTHORITY_HANDOFF_ID
 ```
 
-If the Discord topic write fails after the local handoff is recorded, the adapter retains publication custody. A definite rejection can be retried with the exact handoff ID. An ambiguous or interrupted write requires explicit topic reconciliation first, then the exact handoff ID repairs that same generation. Reuse of the ID for a different successor is rejected.
+Handoff changes the local native binding and generation after explicit authority and drained or reconciled custody. It does not edit the topic. Legacy topic publication custody, when present, must be explicitly reconciled before migration or handoff. A late legacy publication settles only its own audit record and cannot change local readiness or history coverage.
 
 An interrupted channel create leaves a durable intent. A later invocation may reconcile an exact topic marker or use explicit `--channel-id` adoption. If the create outcome is unknown and no channel evidence exists, the adapter stops rather than creating a possible duplicate. Discord permissions still need to allow channel creation under the selected category. `--task-name` changes presentation only. Ordinary workers and forks have no provisioning path.
 
@@ -104,27 +104,13 @@ Claude Channels require opt-in when the native Claude session launches. Start th
 
 The channel process forwards events only after checking its exact native UUID, binding endpoint, and generation. Its `reply` tool requires the inbound Discord message ID and generation. It persists reply custody before acknowledging the MCP tool call. A Claude session without launch-time channel opt-in is not attached or resumed by this adapter.
 
-Accepted input is durable before a Discord handler returns. During login and reconnect, messages are durably held while a persisted Discord watermark is backfilled. Adoption starts at the newest observed message, so pre-adoption history is not executed. Backfill is bounded at 100 messages per page, 10 pages, 1,000 messages, or 30 seconds. A fetch, processing, or bound failure records a visible gap and readiness stays unavailable until explicit reconciliation. The native output cursor is separate from this inbound Discord watermark.
+Accepted input is durable before a Discord handler returns. After authorized intake commits, live input gets one deterministic transport receipt. The receipt says either `Receipt: saved for this conductor.` or `Receipt: saved. Delivery was paused when this receipt was prepared.` It is a reply to the source message with mentions disabled. It never claims that the native agent has read, acted on, or answered the input. Receipt delivery is independent of native forwarding, uses a stable nonce, and never retries an uncertain send. Duplicate or rejected input gets no receipt attempt.
+
+During login and reconnect, messages are durably held while a persisted Discord watermark is backfilled. Adoption starts at the newest observed message, so pre-adoption history is not executed. Backfill is bounded at 100 messages per page, 10 pages, 1,000 messages, or 30 seconds. A fetch, processing, or bound failure records a visible gap and readiness stays unavailable until explicit reconciliation. The native output cursor is separate from this inbound Discord watermark.
 
 An empty Discord history response is accepted as coverage only when the bot's effective channel permissions include View Channel and Read Message History. A denied or unknown permission state remains visibly unavailable. `status` exposes both the observed message ID and the confirmed recovered-through ID.
 
-Recovery changes local intake custody before it publishes a terminal Discord topic. It does not publish a transient `recovering` topic. A successful terminal topic includes a narrowly parsed qualifier such as `[last-published-intake=ready at=2026-09-05T12:00:00.000Z]`. That qualifier describes the last published intake status and does not promise current Gateway connectivity or native-owner availability. If Discord rate-limits or ambiguously completes the topic request, confirmed history coverage and accepted message custody remain durable, but the binding becomes unavailable and native dispatch stays blocked. `status` records the desired status, published status, observed topic, outcome, error, and receipt time. Recovery never sleeps or retries that topic request. An explicit reconciliation owns the next attempt.
-
-There is no documented Discord-side compare-and-swap used by this path. Before each bound REST or channel topic request, the adapter writes durable publication custody with the exact channel, conductor, provider, native UUID, generation, desired topic, and request ID. Handoff, rebind, unbind, and provisioning refuse while that custody is in flight or unknown. A process restart changes in-flight custody to unknown and never clears it automatically. Timeout, abort, socket failure, and process stop do not prove that Discord did not apply the request. The custody remains blocked until the original request produces a definite Discord response; a fresh topic readback is also required before any explicit reconciliation of an otherwise ambiguous terminal record.
-
-F27 ruling: local intake custody is authoritative for recovery. The accepted cost is that a Discord topic can lag that custody after a rate limit or ambiguous request, with the old topic and the `status` publication receipt providing the visible evidence. Reopen this ruling if a live 429 or ambiguous terminal write leaves dispatch enabled, if successful history coverage is discarded, if a stale write makes a successor appear current, if repeated setup creates a channel or rewrites an unchanged qualifier, or if an explicit reconciliation retries native execution.
-
-The added publication guard starts with no timer and no request. Its clock starts when a terminal topic request is prepared. An empty or malformed qualifier is not ignored and leaves recovery unavailable. At deadline or stop, the REST signal is aborted, REST retries are disabled for that request, and transport-level completion does not clear unknown custody. A definite Discord success or rejection settles the request and records the remote terminal time. After a failed or given-up ready publication, the current binding owns `unavailable` state while accepted custody stays available for explicit reconciliation. A handoff changes the expected identity and generation, so an old recovery cannot record a publication for the successor. Reconcile topic custody only after persisted remote terminal evidence and a fresh exact topic readback:
-
-```sh
-node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
-  --topic-channel-id CHANNEL_ID --topic-request-id REQUEST_ID \
-  --resolution published --evidence-scope "fresh Discord topic readback" \
-  --topic-readback "EXACT_CURRENT_TOPIC" \
-  --topic-readback-at "2026-09-05T12:00:00.000Z"
-```
-
-Use `--resolution not_published` only after persisted remote terminal evidence and a readback that does not contain the desired topic. A timed-out or aborted request with no definite Discord response cannot be cleared by caller text. This clears only topic publication custody. It never retries native execution or silently repeats a topic request.
+The topic is exactly `discord-surface:v3 conductor=<encoded-conductor-id> provider=<vendor> repo=<encoded-repo-key> [address only, not live status]`. It never carries native UUID, generation, readiness, connectivity, or timestamps. Recovery, reconnect, handoff, account rotation, and message handling perform no topic PATCH. Local status is authoritative for native availability and history coverage. `status` also exposes receipt attempts and outcomes. Legacy v1/v2 topics remain read-only evidence for explicit channel adoption or migration. Unresolved legacy publication custody blocks that migration until the existing evidence-based reconciliation is complete. The `recover --topic-channel-id` path is legacy-only and never changes local execution readiness.
 
 If the native owner is unavailable before submission, the message stays `accepted` with a `dispatch-not-submitted` receipt and no execution-success reply. A process stop during dispatch changes `dispatching` to `uncertain`; it is never retried automatically. A failed or ambiguous Discord send retains the native reply and records `reply_failed` or `reply_unknown` for explicit delivery reconciliation. Replies longer than Discord's 2000-character message limit are durably split into ordered parts, each with a stable nonce and nonce enforcement. The adapter never silently truncates a native reply.
 

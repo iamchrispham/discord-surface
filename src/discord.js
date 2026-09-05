@@ -1,8 +1,8 @@
 const fs = require('node:fs');
 const { createRequire } = require('node:module');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
-const { READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
-const { conductorMarkerMatches, topicPresentation, topicWithReadiness } = require('./topic');
+const { READINESS, RECOVERY_LIMITS } = require('./state');
+const { conductorMarkerMatches } = require('./topic');
 
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
 
@@ -43,21 +43,6 @@ function waitForRecoveryOperation(operation, signal, deadline, onDeadline = null
 
 function recoveryKind(error) {
   return error?.recoveryKind || null;
-}
-
-function topicPublicationOutcome(error) {
-  if (error?.status === 429 || error?.code === 429 || /^RateLimitError(?:\[|$)/.test(String(error?.name || '')) || /^RateLimitError(?:\[|$)/.test(String(error?.message || ''))) return 'rate_limited';
-  if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
-  if (recoveryKind(error) === 'stopped') return 'stopped';
-  return 'unknown';
-}
-
-function topicPublicationRemoteTerminal(outcome) {
-  return outcome === 'published' || outcome === 'rate_limited' || outcome === 'rejected';
-}
-
-function topicPublicationError(error) {
-  return String(error?.message || error || 'Discord topic publication failed').slice(0, 200);
 }
 
 function compareDiscordIds(left, right) {
@@ -116,7 +101,56 @@ function classifyReplyError(error) {
   return 'unknown';
 }
 
-function createSurfaceConsumer({ state, providers, sendReply, observeOptions = {} }) {
+function classifyTransportReceiptError(error) {
+  if (error?.status === 429 || error?.code === 429 || /^RateLimitError(?:\[|$)/.test(String(error?.name || '')) || /^RateLimitError(?:\[|$)/.test(String(error?.message || ''))) return 'rate_limited';
+  if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
+  return 'unknown';
+}
+
+function transportReceiptText(message, attempt) {
+  if (attempt.readiness === 'ready') return 'Receipt: saved for this conductor.';
+  return 'Receipt: saved. Delivery was paused when this receipt was prepared.';
+}
+
+function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, trackReceipt, observeOptions = {} }) {
+  const receiptWork = new Set();
+
+  function trackReceiptWork(work) {
+    const tracked = Promise.resolve(work).catch(() => null);
+    receiptWork.add(tracked);
+    tracked.finally(() => receiptWork.delete(tracked)).catch(() => {});
+    trackReceipt?.(tracked);
+    return tracked;
+  }
+
+  async function issueTransportReceipt(message) {
+    const started = state.beginTransportReceipt(message.id);
+    if (!started.started) return started;
+    const authorized = state.authorizeTransportReceipt(message.id, started.binding);
+    if (!authorized) return state.recordTransportReceiptOutcome(message.id, 'stale', { reason: 'authorization changed before receipt send' });
+    const payload = {
+      ...authorized.attempt,
+      content: transportReceiptText(message, authorized.attempt),
+      nonce: authorized.nonce,
+      enforceNonce: true,
+      allowedMentions: { parse: [], repliedUser: false },
+      reply: { messageReference: message.id, failIfNotExists: false }
+    };
+    const sender = sendTransportReceipt || ((source, receipt) => source.channel?.send(receipt));
+    try {
+      const sent = await sender(message, payload);
+      const receiptMessageId = sent?.id || sent?.messageId;
+      if (!receiptMessageId) throw new Error('Discord did not return a transport receipt message id');
+      return state.recordTransportReceiptOutcome(message.id, 'sent', { receiptMessageId });
+    } catch (error) {
+      return state.recordTransportReceiptOutcome(message.id, classifyTransportReceiptError(error), { error: String(error?.message || error).slice(0, 200) });
+    }
+  }
+
+  function launchTransportReceipt(message) {
+    return trackReceiptWork(issueTransportReceipt(message));
+  }
+
   async function deliverReply(message, result, signal) {
     if (result.message?.state !== 'reply_ready') return result;
     let ready;
@@ -154,24 +188,33 @@ function createSurfaceConsumer({ state, providers, sendReply, observeOptions = {
   async function handleMessage(message, signal) {
     const intake = state.acceptDiscordMessage(eventToInput(message));
     if (!intake.accepted) return intake;
+    launchTransportReceipt(message);
     return processAccepted(message, signal);
   }
 
-  async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null) {
-    return state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding });
+  async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false) {
+    const intake = await state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding });
+    if (emitReceipt && intake.accepted) launchTransportReceipt(message);
+    return intake;
   }
 
   async function handleStoredMessage(message, signal) {
+    launchTransportReceipt(message);
     return processAccepted(message, signal);
   }
 
   async function resumeSubmitted(message, signal) {
+    launchTransportReceipt(message);
     const provider = providers[message.provider];
     const result = await observeSubmitted(state, message, provider, { ...observeOptions, signal });
     return deliverReply(message, result, signal);
   }
 
-  return { deliverReply, handleMessage, handleStoredMessage, intakeMessage, processAccepted, resumeSubmitted };
+  async function waitForReceipts() {
+    await Promise.allSettled([...receiptWork]);
+  }
+
+  return { deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, resumeSubmitted, waitForReceipts };
 }
 
 class DiscordGateway {
@@ -179,7 +222,9 @@ class DiscordGateway {
     this.state = state;
     this.logger = logger;
     this.client = client || this.createClient();
+    this.discordToken = null;
     this.controllers = new Set();
+    this.receiptControllers = new Set();
     this.inFlight = new Set();
     this.stopping = false;
     this.stopPromise = null;
@@ -206,13 +251,14 @@ class DiscordGateway {
       state,
       providers: this.providers,
       sendReply: (message, reply) => this.sendReply(message, reply),
+      sendTransportReceipt: (message, receipt) => this.sendTransportReceipt(message, receipt),
       observeOptions
     });
     this.boundMessage = message => {
       if (this.stopping) return;
       const controller = new AbortController();
       this.controllers.add(controller);
-      const work = (this.ready ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false))
+      const work = (this.ready ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false, null, null, true))
         .catch(error => this.logger(`message handling failed: ${error.message}`))
         .finally(() => this.controllers.delete(controller));
       this.inFlight.add(work);
@@ -254,6 +300,68 @@ class DiscordGateway {
     } catch (error) {
       if (!error.outcome) error.outcome = classifyReplyError(error);
       throw error;
+    }
+  }
+
+  async sendTransportReceipt(message, receipt) {
+    const controller = new AbortController();
+    this.receiptControllers.add(controller);
+    try {
+      let sendPromise;
+      try {
+        // discord.js channel.send drops the signal and uses the shared REST retry queue.
+        if (this.discordToken && this.client?.rest && typeof globalThis.fetch === 'function') {
+          const url = `https://discord.com/api/v10/channels/${encodeURIComponent(message.channel.id)}/messages`;
+          sendPromise = globalThis.fetch(url, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bot ${this.discordToken}`,
+              'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              content: receipt.content,
+              nonce: receipt.nonce,
+              enforce_nonce: true,
+              allowed_mentions: { parse: [], replied_user: false },
+              message_reference: {
+                message_id: message.id,
+                fail_if_not_exists: false
+              }
+            }),
+            signal: controller.signal
+          }).then(async response => {
+            if (!response.ok) {
+              const error = new Error('Discord transport receipt request rejected');
+              error.status = response.status;
+              throw error;
+            }
+            const body = await response.json().catch(() => null);
+            if (!body?.id) throw new Error('Discord did not return a transport receipt message id');
+            return body;
+          });
+        } else if (this.discordToken && this.client?.rest) {
+          throw new Error('Discord transport receipt fetch is unavailable');
+        } else {
+          sendPromise = message.channel.send({
+            content: receipt.content,
+            nonce: receipt.nonce,
+            enforceNonce: true,
+            allowedMentions: receipt.allowedMentions,
+            reply: receipt.reply
+          });
+        }
+      } catch (error) {
+        sendPromise = Promise.reject(error);
+      }
+      return await waitForRecoveryOperation(
+        () => sendPromise,
+        controller.signal,
+        Date.now() + this.recoveryTimeoutMs,
+        () => controller.abort()
+      );
+    } finally {
+      this.receiptControllers.delete(controller);
     }
   }
 
@@ -302,6 +410,7 @@ class DiscordGateway {
     this.started = false;
     const startPromise = (async () => {
       const token = readSecret(secretFile);
+      this.discordToken = token;
       await this.client.login(token);
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during login');
       const recovery = await this.recoverTransport('startup', epoch);
@@ -314,6 +423,7 @@ class DiscordGateway {
     finally {
       if (this.startPromise === startPromise) this.startPromise = null;
       this.starting = false;
+      if (!this.started) this.discordToken = null;
     }
   }
 
@@ -349,168 +459,11 @@ class DiscordGateway {
     }
   }
 
-  async publishChannelTopic(channel, topic, signal, deadline, onSettled = null) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw recoveryError('deadline', 'Discord recovery deadline exceeded before topic publication');
-    const rest = channel?.client?.rest;
-    let operationStarted = false;
-    let operationReported = false;
-    const reportSettlement = result => {
-      if (operationReported) return;
-      operationReported = true;
-      try { onSettled?.(result); } catch (error) { this.logger(`Discord topic settlement recording failed: ${error.message}`); }
-    };
-    const trackOperation = operation => {
-      operationStarted = true;
-      let pending;
-      try { pending = operation(); }
-      catch (error) {
-        const outcome = topicPublicationOutcome(error);
-        reportSettlement({ outcome, remoteTerminal: topicPublicationRemoteTerminal(outcome), error });
-        throw error;
-      }
-      Promise.resolve(pending).then(
-        response => reportSettlement({ outcome: 'published', remoteTerminal: true, response }),
-        error => {
-          const outcome = topicPublicationOutcome(error);
-          reportSettlement({ outcome, remoteTerminal: topicPublicationRemoteTerminal(outcome), error });
-        }
-      ).catch(error => this.logger(`Discord topic settlement observation failed: ${error.message}`));
-      return pending;
-    };
-    const unknownAfterAbort = error => {
-      if (!error || !operationStarted) return error;
-      error.publicationUnknown = true;
-      return error;
-    };
-    if (rest?.patch && channel.id && rest.options) {
-      const controller = new AbortController();
-      const abort = () => controller.abort();
-      let timer;
-      const previousRejectOnRateLimit = rest.options.rejectOnRateLimit;
-      const previousRetries = rest.options.retries;
-      const rejectTopicRateLimit = data => {
-        if (data?.method === 'PATCH' && data?.route === '/channels/:id') return true;
-        if (typeof previousRejectOnRateLimit === 'function') return previousRejectOnRateLimit(data);
-        if (Array.isArray(previousRejectOnRateLimit)) return previousRejectOnRateLimit.includes(data?.route);
-        return Boolean(previousRejectOnRateLimit);
-      };
-      if (signal?.aborted) throw recoveryError('stopped', 'Discord recovery was stopped');
-      signal?.addEventListener('abort', abort, { once: true });
-      timer = setTimeout(() => controller.abort(), remaining);
-      rest.options.rejectOnRateLimit = rejectTopicRateLimit;
-      rest.options.retries = 0;
-      try {
-        const { Routes } = requireInstalled('discord-api-types/v10');
-        const response = await waitForRecoveryOperation(
-          () => trackOperation(() => rest.patch(Routes.channel(channel.id), { body: { topic }, signal: controller.signal })),
-          signal,
-          deadline,
-          () => controller.abort()
-        );
-        if (signal?.aborted) throw recoveryError('stopped', 'Discord recovery was stopped');
-        if (Date.now() >= deadline) throw recoveryError('deadline', 'Discord recovery deadline exceeded after topic publication');
-        channel.topic = typeof response?.topic === 'string' ? response.topic : topic;
-      } catch (error) {
-        if (signal?.aborted) throw unknownAfterAbort(recoveryError('stopped', 'Discord recovery was stopped'));
-        if (controller.signal.aborted || Date.now() >= deadline) throw unknownAfterAbort(recoveryError('deadline', 'Discord recovery deadline exceeded during topic publication'));
-        throw error;
-      } finally {
-        clearTimeout(timer);
-        signal?.removeEventListener('abort', abort);
-        rest.options.rejectOnRateLimit = previousRejectOnRateLimit;
-        rest.options.retries = previousRetries;
-      }
-      return;
-    }
-    if (typeof channel.setTopic === 'function') await waitForRecoveryOperation(() => trackOperation(() => channel.setTopic(topic)), signal, deadline).catch(error => { throw unknownAfterAbort(error); });
-    else if (typeof channel.edit === 'function') await waitForRecoveryOperation(() => trackOperation(() => channel.edit({ topic })), signal, deadline).catch(error => { throw unknownAfterAbort(error); });
-    else {
-      channel.topic = topic;
-      reportSettlement({ outcome: 'published', remoteTerminal: true });
-    }
-  }
-
-  async updateChannelReadiness(channel, readiness, { signal, deadline, expectedBinding } = {}) {
-    if (!channel) return { published: false, outcome: 'unavailable', error: 'Discord channel is unavailable' };
-    if (expectedBinding && !this.isCurrentBinding(expectedBinding)) return { published: false, outcome: 'stale', stale: true, error: 'Discord recovery binding changed before topic publication' };
-    if (expectedBinding && this.state.hasUnresolvedTopicPublication(expectedBinding.channelId)) {
-      return { published: false, outcome: 'unknown', blocked: true, error: 'Discord topic publication custody is unresolved' };
-    }
-    const current = topicPresentation(channel.topic);
-    if (current.publishedReadiness === readiness) return { published: true, outcome: 'published', topic: channel.topic, publishedReadiness: readiness, publishedAt: current.publishedAt, remoteTerminal: true };
-    const publishedAt = new Date().toISOString();
-    let topic;
-    try {
-      topic = topicWithReadiness(channel.topic, readiness, publishedAt);
-    } catch (error) {
-      return { published: false, outcome: 'unknown', error: topicPublicationError(error), topic };
-    }
-    if (channel.topic === topic) return { published: true, outcome: 'published', topic, publishedReadiness: readiness, publishedAt, remoteTerminal: true };
-    let custody;
-    try {
-      custody = this.state.beginTopicPublication(expectedBinding?.channelId || channel.id, {
-        desiredReadiness: readiness,
-        desiredTopic: topic,
-        publishedAt
-      }, expectedBinding);
-      if (!custody) return { published: false, outcome: 'stale', stale: true, error: 'Discord recovery binding changed before topic publication' };
-      await this.publishChannelTopic(channel, topic, signal, deadline || Date.now() + RECOVERY_LIMITS.timeoutMs, settlement => {
-        try {
-          this.state.recordTopicPublication(expectedBinding?.channelId || channel.id, {
-            desiredReadiness: readiness,
-            requestId: custody.requestId,
-            outcome: settlement.outcome,
-            observedTopic: typeof settlement.response?.topic === 'string' ? settlement.response.topic : channel.topic,
-            error: settlement.error ? topicPublicationError(settlement.error) : null,
-            publicationUnknown: !settlement.remoteTerminal,
-            remoteTerminal: settlement.remoteTerminal
-          }, expectedBinding);
-        } catch (error) {
-          this.logger(`Discord late topic settlement could not be persisted: ${error.message}`);
-        }
-      });
-      if (expectedBinding && !this.isCurrentBinding(expectedBinding)) return { published: false, outcome: 'stale', stale: true, error: 'Discord recovery binding changed during topic publication' };
-      if (channel.topic !== topic) throw new Error('Discord channel readiness topic readback mismatch');
-      return { published: true, outcome: 'published', topic, publishedReadiness: readiness, publishedAt, requestId: custody.requestId, remoteTerminal: true };
-    } catch (error) {
-      const outcome = topicPublicationOutcome(error);
-      const remoteTerminal = topicPublicationRemoteTerminal(outcome) ||
-        (!error?.publicationUnknown && ['deadline', 'stopped'].includes(recoveryKind(error)));
-      return { published: false, outcome, publicationUnknown: Boolean(error?.publicationUnknown), remoteTerminal, error: topicPublicationError(error), topic, requestId: custody?.requestId || null, blocked: !custody };
-    }
-  }
-
-  async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null, deadline = Date.now() + RECOVERY_LIMITS.timeoutMs) {
-    if (signal?.aborted) return null;
-    if (!this.isCurrentBinding(binding)) return null;
-    let watermark;
-    try {
-      watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo, binding);
-    } catch (error) {
-      if (error instanceof UnresolvedWorkError) return { watermark: this.state.getIntakeWatermark(binding.channelId), topicPublished: false, publication: { blocked: true, outcome: 'unknown', error: error.message } };
-      throw error;
-    }
+  async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null) {
+    if (signal?.aborted || !this.isCurrentBinding(binding)) return null;
+    const watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo, binding);
     if (!watermark) return null;
-    const readiness = state === 'ready' ? READINESS.READY : state === 'gap' ? READINESS.GAP : state === 'unavailable' ? READINESS.UNAVAILABLE : READINESS.PENDING;
-    if (!channel || readiness === READINESS.PENDING || readiness === READINESS.RECOVERING) return { watermark, topicPublished: true, publication: null };
-    const publication = await this.updateChannelReadiness(channel, readiness, { signal, deadline, expectedBinding: binding });
-    if (publication.blocked) return { watermark, topicPublished: false, publication };
-    if (publication.stale || !this.isCurrentBinding(binding)) return { watermark, topicPublished: false, stale: true, publication };
-    const observed = topicPresentation(channel.topic);
-    const recorded = this.state.recordTopicPublication(binding.channelId, {
-      desiredReadiness: readiness,
-      requestId: publication.requestId || null,
-      publishedReadiness: publication.published ? publication.publishedReadiness : observed.publishedReadiness,
-      publishedAt: publication.published ? publication.publishedAt : observed.publishedAt,
-      outcome: publication.outcome,
-      observedTopic: channel.topic,
-      error: publication.error || null,
-      publicationUnknown: publication.publicationUnknown,
-      remoteTerminal: publication.remoteTerminal
-    }, binding);
-    if (!recorded) return { watermark, topicPublished: false, stale: true, publication };
-    return { watermark, topicPublished: publication.published, publication };
+    return { watermark, topicPublished: true, publication: null };
   }
 
   isCurrentBinding(binding) {
@@ -605,7 +558,6 @@ class DiscordGateway {
           if (!watermark?.last_seen_id) {
             const boundary = await this.recordBoundary(binding, channel, 'ready', `${reason} empty channel baseline`, null, null, signal, deadline);
             if (!boundary || boundary.stale) failure ||= { ready: false, state: 'unavailable' };
-            else if (!boundary.topicPublished) failure ||= { ready: false, state: 'unavailable', error: boundary.publication?.error };
             continue;
           }
           const baseline = this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`, binding);
@@ -671,10 +623,6 @@ class DiscordGateway {
       const boundary = await this.recordBoundary(binding, channel, 'ready', `${reason} watermark backfill complete`, null, null, signal, deadline);
       if (!boundary || boundary.stale || !this.isCurrentBinding(binding)) {
         failure ||= { ready: false, state: 'unavailable' };
-        continue;
-      }
-      if (!boundary.topicPublished) {
-        failure ||= { ready: false, state: 'unavailable', error: boundary.publication?.error };
         continue;
       }
       const finalWatermark = this.state.getIntakeWatermark(binding.channelId);
@@ -772,14 +720,20 @@ class DiscordGateway {
       const reconnect = this.reconnectPromise;
       await Promise.allSettled([recovery, reconnect].filter(Boolean));
       for (const controller of this.controllers) controller.abort();
+      for (const controller of this.receiptControllers) controller.abort();
       await Promise.allSettled([...this.inFlight]);
+      await this.consumer.waitForReceipts();
       this.client.off?.('messageCreate', this.boundMessage);
       this.client.off?.('shardResume', this.boundResume);
       this.client.off?.('resume', this.boundResume);
       this.client.off?.('shardDisconnect', this.boundDisconnect);
       this.client.off?.('shardReconnecting', this.boundReconnecting);
       this.client.off?.('shardReady', this.boundShardReady);
-      if (typeof this.client.destroy === 'function') await this.client.destroy();
+      try {
+        if (typeof this.client.destroy === 'function') await this.client.destroy();
+      } finally {
+        this.discordToken = null;
+      }
     })();
     try { await this.stopPromise; }
     finally {
@@ -796,5 +750,4 @@ module.exports = {
   eventToInput,
   readSecret,
   requireInstalled,
-  topicPublicationOutcome
 };

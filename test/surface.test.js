@@ -10,7 +10,7 @@ const { postUnixJson } = require('../src/native');
 const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
 const { CodexProvider, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
-const { bindingArgs, conductorMarker, ensureProvisionedChannel, provisionMarker, publishHandoffTopic } = require('../src/cli');
+const { bindingArgs, conductorMarker, ensureProvisionedChannel, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
 const { conductorMarkerMatches, topicWithReadiness } = require('../src/topic');
 
@@ -132,6 +132,133 @@ test('simulated: duplicate Discord ID is a durable dedupe guard', async () => {
   state.close();
 });
 
+test('simulated: deterministic saved receipt follows durable intake and does not delay native forwarding', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'receipt-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('receipt-codex', 'ready');
+  let receiptPayload;
+  let releaseReceipt;
+  let dispatchStarted = false;
+  const receiptBlocked = new Promise(resolve => { releaseReceipt = resolve; });
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: { async dispatch() { dispatchStarted = true; return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } },
+    sendReply: async () => ({ id: 'native-reply' }),
+    sendTransportReceipt: async (_message, payload) => {
+      receiptPayload = payload;
+      assert.equal(state.getMessage('receipt-input').state, MESSAGE_STATES.ACCEPTED);
+      await receiptBlocked;
+      return { id: 'receipt-message' };
+    }
+  });
+  const resultPromise = consumer.handleMessage(discordMessage({ id: 'receipt-input', channelId: 'receipt-codex' }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(dispatchStarted, true);
+  assert.equal(receiptPayload.content, 'Receipt: saved for this conductor.');
+  assert.equal(receiptPayload.enforceNonce, true);
+  assert.ok(receiptPayload.nonce.length <= 25);
+  assert.deepEqual(receiptPayload.reply, { messageReference: 'receipt-input', failIfNotExists: false });
+  assert.deepEqual(receiptPayload.allowedMentions, { parse: [], repliedUser: false });
+  releaseReceipt();
+  const result = await resultPromise;
+  await consumer.waitForReceipts();
+  const receiptOutcome = state.getTransportReceipt('receipt-input').outcome;
+  assert.equal(receiptOutcome.outcome, 'sent');
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  state.close();
+});
+
+test('simulated: receipt failure is isolated from native dispatch and has no retry', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'receipt-failure', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-failure-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('receipt-failure', 'ready');
+  let dispatches = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: { async dispatch() { dispatches += 1; return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } },
+    sendReply: async () => ({ id: 'native-reply' }),
+    sendTransportReceipt: async () => { throw Object.assign(new Error('Discord rate limit'), { status: 429 }); }
+  });
+  const result = await consumer.handleMessage(discordMessage({ id: 'receipt-rate-limited', channelId: 'receipt-failure' }));
+  await consumer.waitForReceipts();
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(dispatches, 1);
+  assert.equal(state.getBinding('receipt-failure').readiness, READINESS.READY);
+  assert.equal(state.getTransportReceipt('receipt-rate-limited').outcome.outcome, 'rate_limited');
+  await consumer.issueTransportReceipt(discordMessage({ id: 'receipt-rate-limited', channelId: 'receipt-failure' }));
+  assert.equal(state.listReceipts().filter(item => item.kind === 'transport-receipt-attempt').length, 1);
+  state.close();
+});
+
+test('simulated: restart settles an incomplete transport receipt as unknown without retry', async () => {
+  const first = fixture();
+  first.state.bind({ channelId: 'receipt-restart', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: first.dir, conductorId: 'receipt-restart-conductor', repoKey: 'repo:alpha' });
+  first.state.acceptDiscordMessage({ id: 'receipt-restart-input', guildId: 'guild-1', channelId: 'receipt-restart', authorId: 'operator-1', isBot: false, content: 'x' });
+  assert.equal(first.state.beginTransportReceipt('receipt-restart-input').started, true);
+  first.state.close();
+
+  const state = new SurfaceState(first.db);
+  state.recoverAfterRestart();
+  const recovered = state.getTransportReceipt('receipt-restart-input');
+  assert.equal(recovered.outcome.outcome, 'unknown');
+  assert.match(recovered.outcome.reason, /stopped before transport receipt outcome/);
+  let sends = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: providers({ calls: { codex: 0, claude: 0 } }),
+    sendReply: async () => ({ id: 'native-reply' }),
+    sendTransportReceipt: async () => { sends += 1; return { id: 'must-not-send' }; }
+  });
+  const result = await consumer.issueTransportReceipt(discordMessage({ id: 'receipt-restart-input', channelId: 'receipt-restart' }));
+  assert.equal(result.started, false);
+  assert.equal(sends, 0);
+  state.close();
+});
+
+test('simulated: accepted recovery creates the missing receipt without replaying intake', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'receipt-recovery', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-recovery-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('receipt-recovery', 'ready');
+  state.acceptDiscordMessage({ id: 'receipt-recovery-input', guildId: 'guild-1', channelId: 'receipt-recovery', authorId: 'operator-1', isBot: false, content: 'x' });
+  let receipts = 0;
+  let dispatches = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: { async dispatch() { dispatches += 1; return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } },
+    sendReply: async () => ({ id: 'native-reply' }),
+    sendTransportReceipt: async () => { receipts += 1; return { id: 'transport-receipt' }; }
+  });
+  const result = await consumer.handleStoredMessage(discordMessage({ id: 'receipt-recovery-input', channelId: 'receipt-recovery' }));
+  await consumer.waitForReceipts();
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(dispatches, 1);
+  assert.equal(receipts, 1);
+  assert.equal(state.getTransportReceipt('receipt-recovery-input').outcome.outcome, 'sent');
+  state.close();
+});
+
+test('simulated: duplicate and rejected inputs create no transport receipt attempt', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'receipt-guards', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-guards-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('receipt-guards', 'ready');
+  let receipts = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: { async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } },
+    sendReply: async () => ({ id: 'native-reply' }),
+    sendTransportReceipt: async () => { receipts += 1; return { id: `receipt-${receipts}` }; }
+  });
+  await consumer.handleMessage(discordMessage({ id: 'receipt-duplicate', channelId: 'receipt-guards' }));
+  await consumer.waitForReceipts();
+  const duplicate = await consumer.handleMessage(discordMessage({ id: 'receipt-duplicate', channelId: 'receipt-guards' }));
+  const rejected = await consumer.handleMessage(discordMessage({ id: 'receipt-rejected', channelId: 'receipt-guards', authorId: 'intruder' }));
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(rejected.reason, 'unauthorized-sender');
+  assert.equal(receipts, 1);
+  assert.equal(state.listReceipts().filter(item => item.kind === 'transport-receipt-attempt').length, 1);
+  state.close();
+});
+
 test('simulated: intake transaction failure leaves no accepted row or receipt', () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
@@ -247,6 +374,97 @@ test('simulated: gateway stop detaches listener and destroys the native client',
   state.close();
 });
 
+test('simulated: stopping the gateway settles an uncertain receipt without touching native custody', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'receipt-stop', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-stop-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('receipt-stop', 'ready');
+  const listeners = new Map();
+  const channel = {
+    async send(payload) {
+      if (payload.content.startsWith('Receipt:')) return new Promise(() => {});
+      return { id: 'native-reply' };
+    }
+  };
+  const client = {
+    user: { id: 'bot-1' },
+    on(name, fn) { listeners.set(name, fn); },
+    off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: { codex: { async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } }
+  });
+  const message = { id: 'receipt-stop-input', guildId: 'guild-1', channelId: 'receipt-stop', content: 'hello', author: { id: 'operator-1', bot: false }, channel };
+  const result = await gateway.consumer.handleMessage(message);
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  await gateway.stop();
+  assert.equal(state.getTransportReceipt('receipt-stop-input').outcome.outcome, 'unknown');
+  assert.equal(state.getMessage('receipt-stop-input').state, MESSAGE_STATES.REPLIED);
+  state.close();
+});
+
+test('simulated: real-client receipt uses one abortable request without SDK send', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'receipt-http', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-http-conductor', repoKey: 'repo:alpha' });
+  state.markIntakeBoundary('receipt-http', 'ready');
+  const listeners = new Map();
+  let fetchCalls = 0;
+  let capturedUrl;
+  let capturedOptions;
+  let capturedSignal;
+  let channelSendCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (url, options) => {
+    fetchCalls += 1;
+    capturedUrl = url;
+    capturedOptions = options;
+    capturedSignal = options.signal;
+    return new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(Object.assign(new Error('receipt request aborted'), { name: 'AbortError' })), { once: true });
+    });
+  };
+  const channel = {
+    id: 'receipt-http',
+    async send() {
+      channelSendCalls += 1;
+      return { id: 'native-reply' };
+    }
+  };
+  const client = {
+    rest: {},
+    user: { id: 'bot-1' },
+    on(name, fn) { listeners.set(name, fn); },
+    off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: { codex: { async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } }
+  });
+  gateway.discordToken = 'fake-token';
+  try {
+    const result = await gateway.consumer.handleMessage({ id: 'receipt-http-input', guildId: 'guild-1', channelId: 'receipt-http', content: 'hello', author: { id: 'operator-1', bot: false }, channel });
+    assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+    await gateway.stop();
+    assert.equal(fetchCalls, 1);
+    assert.equal(capturedUrl, 'https://discord.com/api/v10/channels/receipt-http/messages');
+    assert.equal(capturedOptions.headers.Authorization, 'Bot fake-token');
+    assert.equal(JSON.parse(capturedOptions.body).enforce_nonce, true);
+    assert.deepEqual(JSON.parse(capturedOptions.body).allowed_mentions, { parse: [], replied_user: false });
+    assert.deepEqual(JSON.parse(capturedOptions.body).message_reference, { message_id: 'receipt-http-input', fail_if_not_exists: false });
+    assert.equal(capturedSignal.aborted, true);
+    assert.equal(channelSendCalls, 1);
+    assert.equal(state.getTransportReceipt('receipt-http-input').outcome.outcome, 'unknown');
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (!gateway.stopping) await gateway.stop();
+    state.close();
+  }
+});
+
 test('simulated: secret reader refuses group-readable token files', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-secret-'));
   const file = path.join(dir, 'secret');
@@ -254,7 +472,7 @@ test('simulated: secret reader refuses group-readable token files', () => {
   assert.throws(() => readSecret(file), /owner-only/);
 });
 
-test('simulated: vendor provisioning is idempotent by topic marker and exact UUID', async () => {
+test('simulated: conductor provisioning is idempotent by static address marker', async () => {
   const channels = new Map();
   let creates = 0;
   const guild = {
@@ -269,19 +487,19 @@ test('simulated: vendor provisioning is idempotent by topic marker and exact UUI
       }
     }
   };
-  const first = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category' });
-  const second = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category' });
+  const first = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'idempotent', repoKey: 'repo:alpha' });
+  const second = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'idempotent', repoKey: 'repo:alpha' });
   assert.equal(first.created, true);
   assert.equal(second.created, false);
   assert.equal(second.channel.id, first.channel.id);
-  assert.equal(first.marker, provisionMarker('codex', CODEX_ID));
+  assert.match(first.marker, /^discord-surface:v3 conductor=idempotent provider=codex repo=repo%3Aalpha \[address only, not live status\]$/);
   assert.equal(creates, 1);
 });
 
-test('simulated: provisioning rejects a marker outside the configured vendor category', async () => {
-  const channels = new Map([['wrong', { id: 'wrong', parentId: 'claude-category', topic: provisionMarker('codex', CODEX_ID) }]]);
+test('simulated: provisioning rejects a static marker outside the configured vendor category', async () => {
+  const channels = new Map([['wrong', { id: 'wrong', parentId: 'claude-category', topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'wrong-category', repoKey: 'repo:alpha' }) }]]);
   const guild = { channels: { cache: { values: () => channels.values() }, async fetch() {}, async create() { throw new Error('must not create a duplicate'); } } };
-  await assert.rejects(() => ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category' }), /wrong category/);
+  await assert.rejects(() => ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'wrong-category', repoKey: 'repo:alpha' }), /wrong category/);
 });
 
 test('simulated: Claude channel forwards only the bound generation and closes its socket', async () => {
@@ -736,6 +954,7 @@ test('simulated: login-time input is durably held and backfill closes before dis
   const channel = {
     id: 'channel-codex',
     guildId: 'guild-1',
+    topic: '',
     permissionsFor: () => historyPermissions(),
     async send() { return { id: 'reply-login-input' }; }
   };
@@ -766,7 +985,7 @@ test('simulated: login-time input is durably held and backfill closes before dis
   assert.equal(state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
   assert.equal(state.getBinding('channel-codex').readiness, READINESS.READY);
   assert.equal(state.getIntakeWatermark('channel-codex').last_seen_id, '101');
-  assert.match(channel.topic, /readiness=ready/);
+  assert.equal(channel.topic, '');
   await gateway.reconcilePending();
   assert.equal(state.getMessage('101').state, MESSAGE_STATES.REPLIED);
   await listeners.get('resume')();
@@ -871,7 +1090,7 @@ test('simulated: live custody stays ahead of confirmed history coverage without 
   state.close();
 });
 
-test('simulated: live custody during readiness topic close becomes an explicit recovery gap', async () => {
+test('simulated: live custody recovery never patches the static address topic', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
   state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
@@ -879,16 +1098,13 @@ test('simulated: live custody during readiness topic close becomes an explicit r
   const secret = path.join(dir, 'discord.env');
   fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
   const listeners = new Map();
-  let channel;
-  channel = {
+  let topicWrites = 0;
+  const channel = {
     id: 'channel-codex',
     guildId: 'guild-1',
     topic: '',
     permissionsFor: () => historyPermissions(),
-    async setTopic(topic) {
-      this.topic = topic;
-      if (/\breadiness=ready\b/.test(topic)) listeners.get('messageCreate')?.(discordMessage({ id: '201', channelId: 'channel-codex' }));
-    }
+    async setTopic() { topicWrites += 1; throw new Error('static D6 topic must not be patched'); }
   };
   const client = {
     user: { id: 'bot-1' },
@@ -899,11 +1115,10 @@ test('simulated: live custody during readiness topic close becomes an explicit r
     async destroy() {}
   };
   const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [] });
-  await assert.rejects(() => gateway.start(secret), /intake recovery is gap/);
-  assert.ok(state.getMessage('201'));
+  await gateway.start(secret);
+  assert.equal(topicWrites, 0);
   assert.equal(state.getIntakeWatermark('channel-codex').recovered_through_id, '100');
-  assert.equal(state.getIntakeWatermark('channel-codex').last_seen_id, '201');
-  assert.equal(state.getIntakeWatermark('channel-codex').state, 'gap');
+  assert.equal(state.getIntakeWatermark('channel-codex').state, 'ready');
   await gateway.stop();
   state.close();
 });
@@ -1009,7 +1224,7 @@ test('simulated: pending recovery channel fetch is bounded and stop settles with
   state.close();
 });
 
-test('simulated: stale handoff topic keeps recovery unavailable until exact repair', async () => {
+test('simulated: static address survives successor handoff without a topic rewrite', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'handoff-recovery', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'handoff-recovery-conductor', repoKey: 'repo:alpha' });
   state.markIntakeBoundary('handoff-recovery', 'ready');
@@ -1041,11 +1256,11 @@ test('simulated: stale handoff topic keeps recovery unavailable until exact repa
   let historyCalls = 0;
   const gateway = new DiscordGateway({ state, client, fetchHistory: async () => { historyCalls += 1; return []; } });
   const result = await gateway.recoverTransport('restart');
-  assert.equal(result.ready, false);
-  assert.equal(result.state, 'unavailable');
-  assert.equal(state.getBinding('handoff-recovery').readiness, READINESS.UNAVAILABLE);
-  assert.equal(historyCalls, 0);
-  assert.match(channel.topic, /native=9caa5d21-2169-429d-918b-5f08651b5dbd generation=1/);
+  assert.equal(result.ready, true);
+  assert.equal(result.state, 'ready');
+  assert.equal(state.getBinding('handoff-recovery').readiness, READINESS.READY);
+  assert.equal(historyCalls, 1);
+  assert.equal(channel.topic, oldMarker);
   await gateway.stop();
   state.close();
 });
@@ -1094,7 +1309,7 @@ test('simulated: handoff during history fetch cannot authorize the successor', a
   state.close();
 });
 
-test('simulated: publication custody refuses handoff during readiness topic write', async () => {
+test('simulated: recovery and successor handoff share a static topic address', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'mid-topic-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'mid-topic-conductor', repoKey: 'repo:alpha' });
   state.setIntakeBaseline('mid-topic-handoff', '100', 'previous completed recovery');
@@ -1129,19 +1344,19 @@ test('simulated: publication custody refuses handoff during readiness topic writ
   const gateway = new DiscordGateway({ state, client, fetchHistory: async () => { historyCalls += 1; return []; } });
   const result = await gateway.recoverTransport('restart');
   const current = state.getBinding('mid-topic-handoff');
-  assert.equal(result.ready, false);
-  assert.equal(result.state, 'unavailable');
+  assert.equal(result.ready, true);
+  assert.equal(result.state, 'ready');
   assert.equal(current.nativeId, CODEX_ID);
   assert.equal(current.generation, 1);
-  assert.equal(current.readiness, READINESS.UNAVAILABLE);
+  assert.equal(current.readiness, READINESS.READY);
   assert.equal(historyCalls, 1);
-  assert.match(channel.topic, /native=9caa5d21-2169-429d-918b-5f08651b5dbd generation=1 readiness=ready/);
-  assert.equal(conductorMarkerMatches(channel.topic, { provider: 'codex', nativeId: SUCCESSOR_ID, conductorId: 'mid-topic-conductor', repoKey: 'repo:alpha', generation: 2 }), false);
+  assert.equal(channel.topic, conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'mid-topic-conductor', repoKey: 'repo:alpha' }));
+  assert.equal(conductorMarkerMatches(channel.topic, { provider: 'codex', nativeId: SUCCESSOR_ID, conductorId: 'mid-topic-conductor', repoKey: 'repo:alpha', generation: 2 }), true);
   await gateway.stop();
   state.close();
 });
 
-test('simulated: terminal publication custody blocks successor commit during write', async () => {
+test('simulated: terminal recovery does not create publication custody', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'terminal-topic-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'terminal-topic-conductor', repoKey: 'repo:alpha' });
   state.setIntakeBaseline('terminal-topic-handoff', '100', 'previous completed recovery');
@@ -1173,19 +1388,19 @@ test('simulated: terminal publication custody blocks successor commit during wri
   const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [] });
   const result = await gateway.recoverTransport('restart');
   const current = state.getBinding('terminal-topic-handoff');
-  assert.equal(result.ready, false);
-  assert.equal(result.state, 'unavailable');
-  assert.equal(topicWrites, 1);
+  assert.equal(result.ready, true);
+  assert.equal(result.state, 'ready');
+  assert.equal(topicWrites, 0);
   assert.equal(current.nativeId, CODEX_ID);
   assert.equal(current.generation, 1);
-  assert.equal(current.readiness, READINESS.UNAVAILABLE);
-  assert.equal(conductorMarkerMatches(channel.topic, { provider: 'codex', nativeId: SUCCESSOR_ID, conductorId: 'terminal-topic-conductor', repoKey: 'repo:alpha', generation: 2 }), false);
-  assert.equal(state.getReadiness().topicPublications.length, 1);
+  assert.equal(current.readiness, READINESS.READY);
+  assert.equal(conductorMarkerMatches(channel.topic, { provider: 'codex', nativeId: SUCCESSOR_ID, conductorId: 'terminal-topic-conductor', repoKey: 'repo:alpha', generation: 2 }), true);
+  assert.equal(state.getReadiness().legacyTopicPublications.length, 0);
   await gateway.stop();
   state.close();
 });
 
-test('simulated: terminal topic rate limit keeps history custody and blocks dispatch', async () => {
+test('simulated: old topic rate limits are irrelevant to static recovery', async () => {
   for (const [label, makeError, expectedOutcome] of [
     ['rate limit', () => Object.assign(new Error('RateLimitError[/channels/:id]'), { name: 'RateLimitError[/channels/:id]' }), 'rate_limited'],
     ['ambiguous send', () => Object.assign(new Error('socket closed after topic send'), { code: 'ECONNRESET' }), 'unknown']
@@ -1214,37 +1429,32 @@ test('simulated: terminal topic rate limit keeps history custody and blocks disp
     const result = await gateway.recoverTransport('restart');
     const watermark = state.getIntakeWatermark(channelId);
     const binding = state.getBinding(channelId);
-    const publication = state.getReadiness().topicPublications.find(item => item.channelId === channelId);
-    const custody = state.listTopicPublications().find(item => item.channelId === channelId);
-    assert.equal(result.ready, false, label);
-    assert.equal(result.state, 'unavailable', label);
+    assert.equal(result.ready, true, label);
+    assert.equal(result.state, 'ready', label);
     assert.equal(watermark.recovered_through_id, '100', label);
-    assert.equal(watermark.state, READINESS.PENDING, label);
-    assert.equal(binding.readiness, READINESS.UNAVAILABLE, label);
-    assert.equal(publication.outcome, expectedOutcome, label);
-    assert.equal(custody.status, expectedOutcome === 'rate_limited' ? 'not_published' : 'unknown', label);
-    assert.equal(publication.desiredReadiness, READINESS.READY, label);
+    assert.equal(watermark.state, READINESS.READY, label);
+    assert.equal(binding.readiness, READINESS.READY, label);
+    assert.equal(state.listTopicPublications().length, 0, label);
     assert.equal(rest.options.rejectOnRateLimit, null, label);
     const held = await gateway.consumer.handleMessage(discordMessage({ id: `held-${label}`, channelId }));
-    assert.equal(dispatches, 0, label);
-    assert.equal(held.status, 'binding-not-ready', label);
-    assert.equal(state.getMessage(`held-${label}`).state, MESSAGE_STATES.ACCEPTED, label);
+    assert.equal(dispatches, 1, label);
+    assert.equal(held.message.state, MESSAGE_STATES.REPLIED, label);
     await gateway.stop();
     state.close();
   }
 });
 
-test('simulated: uncooperative terminal topic request is deadline-fenced and leaves coverage durable', async () => {
+test('simulated: uncooperative legacy topic clients are never called during recovery', async () => {
   const { dir, state } = fixture();
   const channelId = 'topic-deadline';
   state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-deadline-conductor', repoKey: 'repo:alpha' });
   state.setIntakeBaseline(channelId, '100', 'previous completed recovery');
   state.markIntakeBoundary(channelId, 'ready');
-  let aborted = false;
+  let topicCalls = 0;
   const rest = {
     options: { rejectOnRateLimit: null, retries: 3 },
-    async patch(_route, { signal }) {
-      signal.addEventListener('abort', () => { aborted = true; }, { once: true });
+    async patch() {
+      topicCalls += 1;
       return new Promise(() => {});
     }
   };
@@ -1259,19 +1469,19 @@ test('simulated: uncooperative terminal topic request is deadline-fenced and lea
   const started = Date.now();
   const result = await gateway.recoverTransport('restart');
   assert.ok(Date.now() - started < 1400);
-  assert.equal(result.ready, false);
-  assert.equal(result.state, 'unavailable');
-  assert.equal(aborted, true);
+  assert.equal(result.ready, true);
+  assert.equal(result.state, 'ready');
+  assert.equal(topicCalls, 0);
   assert.equal(rest.options.rejectOnRateLimit, null);
   assert.equal(rest.options.retries, 3);
   assert.equal(state.getIntakeWatermark(channelId).recovered_through_id, '100');
-  assert.equal(state.getIntakeWatermark(channelId).state, READINESS.PENDING);
-  assert.equal(state.getBinding(channelId).readiness, READINESS.UNAVAILABLE);
+  assert.equal(state.getIntakeWatermark(channelId).state, READINESS.READY);
+  assert.equal(state.getBinding(channelId).readiness, READINESS.READY);
   await gateway.stop();
   state.close();
 });
 
-test('simulated: in-flight topic publication fences every binding ownership change', () => {
+test('simulated: unresolved legacy publication fences ownership changes, not local readiness', () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'topic-custody-guards', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-custody-guards', repoKey: 'repo:alpha' });
   const binding = state.getBinding('topic-custody-guards');
@@ -1280,8 +1490,8 @@ test('simulated: in-flight topic publication fences every binding ownership chan
     desiredTopic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'topic-custody-guards', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY })
   }, binding);
   assert.equal(custody.status, 'in_flight');
-  assert.throws(() => state.setBindingReadiness('topic-custody-guards', READINESS.READY), UnresolvedWorkError);
-  assert.throws(() => state.markIntakeBoundary('topic-custody-guards', 'ready'), UnresolvedWorkError);
+  state.setBindingReadiness('topic-custody-guards', READINESS.READY);
+  state.markIntakeBoundary('topic-custody-guards', 'ready');
   assert.throws(() => state.rebind({ channelId: 'topic-custody-guards', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir }), UnresolvedWorkError);
   assert.throws(() => state.unbind('topic-custody-guards'), UnresolvedWorkError);
   assert.throws(() => state.handoffConductor({
@@ -1291,45 +1501,23 @@ test('simulated: in-flight topic publication fences every binding ownership chan
   state.close();
 });
 
-test('simulated: deferred topic request stays fenced until a definite server response', async () => {
-  const { dir, db, state } = fixture();
+test('simulated: legacy publication settlement cannot clear a newer intake gap', () => {
+  const { dir, state } = fixture();
   const channelId = 'topic-restart-reconcile';
   state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-restart-conductor', repoKey: 'repo:alpha' });
-  state.setIntakeBaseline(channelId, '100', 'previous completed recovery');
-  state.markIntakeBoundary(channelId, 'ready');
-  const marker = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'topic-restart-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY });
-  let rejectPatch;
-  const blockedRest = { options: { rejectOnRateLimit: null, retries: 3 }, async patch() { return new Promise((_resolve, reject) => { rejectPatch = reject; }); } };
-  const blockedChannel = { id: channelId, topic: marker, permissionsFor: () => historyPermissions(), client: { rest: blockedRest } };
-  const blockedClient = { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => blockedChannel }, async destroy() {} };
-  const blockedGateway = new DiscordGateway({ state, client: blockedClient, recoveryOptions: { timeoutMs: 1000 }, fetchHistory: async () => [] });
-  const blockedResult = await blockedGateway.recoverTransport('restart');
-  assert.equal(blockedResult.ready, false);
-  assert.equal(state.listTopicPublications().at(-1).status, 'unknown');
-  const requestId = state.listTopicPublications().at(-1).requestId;
-  assert.equal(state.getTopicPublication(requestId).operationEndedAt, null);
-  assert.throws(() => state.reconcileTopicPublication(channelId, requestId, 'not_published', 'caller text', {
-    topic: marker,
-    observedAt: new Date().toISOString()
-  }), UnresolvedWorkError);
+  const binding = state.getBinding(channelId);
+  const desiredTopic = 'discord-surface:v2 conductor=topic-restart-conductor provider=codex repo=repo%3Aalpha native=' + CODEX_ID + ' generation=1 readiness=ready';
+  const custody = state.beginTopicPublication(channelId, { desiredReadiness: READINESS.READY, desiredTopic }, binding);
+  state.markIntakeBoundary(channelId, 'gap', 'newer history gap');
+  state.recordTopicPublication(channelId, { requestId: custody.requestId, desiredReadiness: READINESS.READY, outcome: 'unknown', remoteTerminal: false }, binding);
+  assert.equal(state.getBinding(channelId).readiness, READINESS.GAP);
+  assert.equal(state.getIntakeWatermark(channelId).state, READINESS.GAP);
+  assert.equal(state.getTopicPublication(custody.requestId).status, 'unknown');
   assert.throws(() => state.handoffConductor({
     channelId, provider: 'codex', conductorId: 'topic-restart-conductor', repoKey: 'repo:alpha',
     fromNativeId: CODEX_ID, fromGeneration: 1, nativeId: SUCCESSOR_ID, workspace: dir, handoffId: 'topic-restart-handoff'
   }), UnresolvedWorkError);
-  rejectPatch(Object.assign(new Error('RateLimitError[/channels/:id]'), { name: 'RateLimitError[/channels/:id]', status: 429 }));
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(state.getTopicPublication(requestId).status, 'not_published');
-  assert.ok(state.getTopicPublication(requestId).operationEndedAt);
-  const successor = state.handoffConductor({
-    channelId, provider: 'codex', conductorId: 'topic-restart-conductor', repoKey: 'repo:alpha',
-    fromNativeId: CODEX_ID, fromGeneration: 1, nativeId: SUCCESSOR_ID, workspace: dir, handoffId: 'topic-restart-handoff'
-  });
-  assert.equal(successor.generation, 2);
-  await blockedGateway.stop();
   state.close();
-  const restarted = new SurfaceState(db);
-  assert.equal(restarted.getTopicPublication(requestId).status, 'not_published');
-  restarted.close();
 });
 
 test('simulated: topic reconciliation requires remote terminal evidence and fresh readback', () => {
@@ -1337,8 +1525,8 @@ test('simulated: topic reconciliation requires remote terminal evidence and fres
   const channelId = 'topic-reconcile-proof';
   state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-reconcile-proof', repoKey: 'repo:alpha' });
   const binding = state.getBinding(channelId);
-  const oldTopic = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'topic-reconcile-proof', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.PENDING });
-  const desiredTopic = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'topic-reconcile-proof', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY });
+  const oldTopic = 'discord-surface:v2 conductor=topic-reconcile-proof provider=codex repo=repo%3Aalpha native=' + CODEX_ID + ' generation=1 readiness=pending';
+  const desiredTopic = 'discord-surface:v2 conductor=topic-reconcile-proof provider=codex repo=repo%3Aalpha native=' + CODEX_ID + ' generation=1 readiness=ready';
   const custody = state.beginTopicPublication(channelId, { desiredReadiness: READINESS.READY, desiredTopic }, binding);
   state.recordTopicPublication(channelId, { requestId: custody.requestId, desiredReadiness: READINESS.READY, outcome: 'unknown', remoteTerminal: true, observedTopic: oldTopic }, binding);
   const operationEndedAt = state.getTopicPublication(custody.requestId).operationEndedAt;
@@ -1353,32 +1541,45 @@ test('simulated: topic reconciliation requires remote terminal evidence and fres
     observedAt: new Date(Date.parse(operationEndedAt) + 1).toISOString()
   });
   assert.equal(state.getTopicPublication(custody.requestId).status, 'not_published');
+  assert.equal(state.getBinding(channelId).readiness, READINESS.UNAVAILABLE);
   state.close();
 });
 
-test('simulated: aborted topic request cannot authorize handoff after a late remote mutation', async () => {
+test('simulated: explicit legacy adoption fails closed on unresolved publication custody', () => {
+  const { dir, state } = fixture();
+  const channelId = 'legacy-adoption';
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'legacy-adoption-conductor', repoKey: 'repo:alpha' });
+  const binding = state.getBinding(channelId);
+  const custody = state.beginTopicPublication(channelId, {
+    desiredReadiness: READINESS.READY,
+    desiredTopic: 'discord-surface:v2 conductor=legacy-adoption-conductor provider=codex repo=repo%3Aalpha native=' + CODEX_ID + ' generation=1 readiness=ready'
+  }, binding);
+  assert.equal(custody.status, 'in_flight');
+  assert.throws(() => state.assertLegacyMigrationSafe(channelId), UnresolvedWorkError);
+  state.recordTopicPublication(channelId, { requestId: custody.requestId, desiredReadiness: READINESS.READY, outcome: 'rejected', remoteTerminal: true }, binding);
+  assert.doesNotThrow(() => state.assertLegacyMigrationSafe(channelId));
+  assert.equal(state.getBinding(channelId).nativeId, CODEX_ID);
+  state.close();
+});
+
+test('simulated: legacy publication audit cannot mutate successor readiness', () => {
   const { dir, state } = fixture();
   const channelId = 'topic-late-mutation';
   state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-late-mutation', repoKey: 'repo:alpha' });
   const binding = state.getBinding(channelId);
-  const oldTopic = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'topic-late-mutation', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.PENDING });
-  const channel = { id: channelId, topic: oldTopic, client: { rest: { options: { rejectOnRateLimit: null, retries: 2 }, async patch(_route, { signal }) {
-    signal.addEventListener('abort', () => setTimeout(() => { channel.topic = oldTopic; }, 25), { once: true });
-    return new Promise((_resolve, reject) => signal.addEventListener('abort', () => setTimeout(() => reject(new Error('AbortError')), 25), { once: true }));
-  } } } };
-  const gateway = new DiscordGateway({ state, client: { on() {}, off() {} } });
-  const result = await gateway.recordBoundary(binding, channel, 'ready', 'late mutation test', null, null, new AbortController().signal, Date.now() + 20);
-  assert.equal(result.topicPublished, false);
-  const requestId = state.listTopicPublications().at(-1).requestId;
-  assert.equal(state.getTopicPublication(requestId).status, 'unknown');
-  await new Promise(resolve => setTimeout(resolve, 60));
-  assert.equal(state.getTopicPublication(requestId).status, 'unknown');
-  assert.equal(state.getTopicPublication(requestId).operationEndedAt, null);
-  assert.throws(() => state.handoffConductor({
+  const desiredTopic = 'discord-surface:v2 conductor=topic-late-mutation provider=codex repo=repo%3Aalpha native=' + CODEX_ID + ' generation=1 readiness=ready';
+  const custody = state.beginTopicPublication(channelId, { desiredReadiness: READINESS.READY, desiredTopic }, binding);
+  state.recordTopicPublication(channelId, { requestId: custody.requestId, desiredReadiness: READINESS.READY, outcome: 'rate_limited', remoteTerminal: true }, binding);
+  const successor = state.handoffConductor({
     channelId, provider: 'codex', conductorId: 'topic-late-mutation', repoKey: 'repo:alpha',
     fromNativeId: CODEX_ID, fromGeneration: 1, nativeId: SUCCESSOR_ID, workspace: dir, handoffId: 'topic-late-mutation-handoff'
-  }), UnresolvedWorkError);
-  await gateway.stop();
+  });
+  assert.equal(successor.generation, 2);
+  state.markIntakeBoundary(channelId, 'gap', 'successor history gap');
+  state.recordTopicPublication(channelId, { requestId: custody.requestId, desiredReadiness: READINESS.READY, outcome: 'published', remoteTerminal: true }, binding);
+  assert.equal(state.getBinding(channelId).nativeId, SUCCESSOR_ID);
+  assert.equal(state.getBinding(channelId).readiness, READINESS.GAP);
+  assert.equal(state.getIntakeWatermark(channelId).state, READINESS.GAP);
   state.close();
 });
 
@@ -1599,35 +1800,25 @@ test('simulated: pending successor custody stays accepted until readiness is res
   state.close();
 });
 
-test('simulated: failed handoff topic write is repaired by the exact durable handoff', async () => {
+test('simulated: handoff changes local owner without a topic write', () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'handoff-channel', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'handoff-conductor', repoKey: 'repo:alpha' });
   state.markIntakeBoundary('handoff-channel', 'ready');
   const channel = {
     parentId: 'codex-category',
     topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'handoff-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }),
-    attempts: 0,
-    async setTopic(topic) {
-      this.attempts += 1;
-      if (this.attempts === 1) throw Object.assign(new Error('RateLimitError[/channels/:id]'), { name: 'RateLimitError[/channels/:id]', status: 429 });
-      this.topic = topic;
-    }
+    async setTopic() { throw new Error('handoff must not patch the static address'); }
   };
   const handoff = {
     channelId: 'handoff-channel', provider: 'codex', conductorId: 'handoff-conductor', repoKey: 'repo:alpha',
     fromNativeId: CODEX_ID, fromGeneration: 1, nativeId: SUCCESSOR_ID, workspace: dir, handoffId: 'handoff-repair-1'
   };
   const successor = state.handoffConductor(handoff);
-  const marker = conductorMarker({ provider: 'codex', nativeId: SUCCESSOR_ID, conductorId: 'handoff-conductor', repoKey: 'repo:alpha', generation: successor.generation, readiness: successor.readiness });
-  await assert.rejects(() => publishHandoffTopic(state, channel, marker, successor), /RateLimitError/);
-  const requestId = state.listTopicPublications().at(-1).requestId;
-  assert.equal(state.getTopicPublication(requestId).status, 'not_published');
-  assert.ok(state.getTopicPublication(requestId).operationEndedAt);
+  assert.equal(channel.topic, conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'handoff-conductor', repoKey: 'repo:alpha' }));
   const repaired = state.handoffConductor(handoff);
   assert.equal(repaired.handoffReconciled, true);
   assert.equal(repaired.generation, 2);
-  await publishHandoffTopic(state, channel, marker, repaired);
-  assert.equal(channel.topic, marker);
+  assert.equal(channel.topic, conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'handoff-conductor', repoKey: 'repo:alpha' }));
   assert.throws(() => state.handoffConductor({ ...handoff, handoffId: 'handoff-repair-1', nativeId: CLAUDE_ID }), /already used/);
   state.close();
 });
@@ -1750,7 +1941,8 @@ test('simulated: stable conductor markers repeat, adopt the existing setup chann
   assert.equal(creates, 1);
 
   const existingId = '1545716797217570847';
-  const existing = { id: existingId, parentId: 'codex-category', topic: `Conductor task: codex/${CODEX_ID}`, async setTopic(topic) { this.topic = topic; } };
+  let adoptionWrites = 0;
+  const existing = { id: existingId, parentId: 'codex-category', topic: `Conductor task: codex/${CODEX_ID}`, async setTopic() { adoptionWrites += 1; } };
   const adoptionGuild = { channels: {
     cache: { values: () => [existing][Symbol.iterator]() },
     async fetch(id) { return id ? existing : undefined; },
@@ -1759,18 +1951,23 @@ test('simulated: stable conductor markers repeat, adopt the existing setup chann
   const adopted = await ensureProvisionedChannel({ guild: adoptionGuild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'stable-conductor', repoKey: 'repo:alpha', channelId: existingId });
   assert.equal(adopted.adopted, true);
   assert.equal(adopted.channel.id, existingId);
-  assert.match(adopted.channel.topic, /conductor=stable-conductor/);
+  assert.equal(adopted.channel.topic, `Conductor task: codex/${CODEX_ID}`);
+  assert.equal(adoptionWrites, 0);
 
   const unresolvedGuild = { channels: { cache: { values: () => [][Symbol.iterator]() }, async fetch() {}, async create() { throw new Error('must not retry unknown create'); } } };
   await assert.rejects(() => ensureProvisionedChannel({ guild: unresolvedGuild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'other-conductor', repoKey: 'repo:alpha', allowCreate: false }), /unresolved/);
 });
 
-test('simulated: intake topic qualifier is strict and repeated adoption preserves it', async () => {
+test('simulated: static address marker is strict and repeated adoption preserves it', async () => {
   const marker = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, categoryId: 'unused', conductorId: 'qualified-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY });
   const publishedAt = '2026-09-05T12:00:00.000Z';
-  const qualified = topicWithReadiness(marker, READINESS.READY, publishedAt);
+  const qualified = marker;
+  const dynamicLegacy = topicWithReadiness(`discord-surface:v2 conductor=qualified-conductor provider=codex repo=repo%3Aalpha native=${CODEX_ID} generation=1 readiness=pending`, READINESS.READY, publishedAt);
   const expected = { provider: 'codex', nativeId: CODEX_ID, conductorId: 'qualified-conductor', repoKey: 'repo:alpha', generation: 1 };
   assert.equal(conductorMarkerMatches(qualified, expected), true);
+  assert.equal(conductorMarkerMatches(dynamicLegacy, expected), true);
+  assert.equal(conductorMarkerMatches(`${qualified} [last-published-intake=ready at=${publishedAt}]`, expected), false);
+  assert.equal(conductorMarkerMatches('discord-surface:v3 conductor=%71ualified-conductor provider=codex repo=repo%3Aalpha [address only, not live status]', expected), false);
   assert.equal(conductorMarkerMatches(`${qualified} trailing text`, expected), false);
   let writes = 0;
   const existing = { id: 'qualified-channel', parentId: 'codex-category', topic: qualified, async setTopic() { writes += 1; } };

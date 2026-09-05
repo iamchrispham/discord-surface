@@ -33,6 +33,9 @@ const TOPIC_PUBLICATION_STATES = Object.freeze({
   NOT_PUBLISHED: 'not_published'
 });
 const TOPIC_DEFINITE_NOT_PUBLISHED = new Set(['rate_limited', 'rejected', 'stopped', 'not_published']);
+const TRANSPORT_RECEIPT_ATTEMPT = 'transport-receipt-attempt';
+const TRANSPORT_RECEIPT_OUTCOME = 'transport-receipt-outcome';
+const TRANSPORT_RECEIPT_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
 
 const ACTIVE_STATES = new Set([
   MESSAGE_STATES.ACCEPTED,
@@ -126,6 +129,10 @@ function ensurePrivateDir(dir) {
 function discordNonce(messageId, partIndex = 0) {
   const digest = crypto.createHash('sha256').update(`${messageId}:${partIndex}`).digest('base64url');
   return `ds-${digest.slice(0, 21)}`;
+}
+
+function transportReceiptNonce(messageId) {
+  return discordNonce(`transport:${messageId}`, 0);
 }
 
 function splitReply(text) {
@@ -682,6 +689,12 @@ class SurfaceState {
     if (this.hasUnresolvedTopicPublication(channelId)) throw new UnresolvedWorkError('topic publication custody is unresolved');
   }
 
+  assertLegacyMigrationSafe(channelId) {
+    assertText(channelId, 'channelId', 128);
+    this.assertTopicPublicationSettled(channelId);
+    return true;
+  }
+
   beginTopicPublication(channelId, publication, expectedBinding) {
     assertText(channelId, 'channelId', 128);
     if (!expectedBinding) throw new BindingError('topic publication requires an expected binding identity');
@@ -779,7 +792,6 @@ class SurfaceState {
     const createdAt = now();
     return this.transaction(() => {
       if (this.getBinding(input.channelId)) throw new BindingError('channel is already bound; use rebind after work drains');
-      this.assertTopicPublicationSettled(input.channelId);
       const generationRow = input.conductorId
         ? this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE provider=? AND conductor_id=?').get(input.provider, input.conductorId)
         : this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE channel_id=?').get(input.channelId);
@@ -804,7 +816,7 @@ class SurfaceState {
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
-      this.assertTopicPublicationSettled(channelId);
+      this.assertLegacyMigrationSafe(channelId);
       this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
         .run(input.guildId, input.provider, input.nativeId, input.workspace, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
       this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
@@ -821,7 +833,7 @@ class SurfaceState {
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, binding)) throw new StaleGenerationError('unbind source identity is stale');
-      this.assertTopicPublicationSettled(channelId);
+      this.assertLegacyMigrationSafe(channelId);
       this.db.prepare('UPDATE bindings SET active=0, updated_at=? WHERE channel_id=?').run(now(), channelId);
       this.receipt(null, 'unbound', { channelId, generation: binding.generation });
       return true;
@@ -858,7 +870,6 @@ class SurfaceState {
       const binding = this.getBinding(channelId);
       if (!binding) throw new BindingError('channel is not bound');
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
-      if (readiness === READINESS.READY) this.assertTopicPublicationSettled(channelId);
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
       this.receipt(null, 'binding-readiness', { channelId, conductorId: binding.conductorId, readiness, detail: detail || undefined });
       return this.getBinding(channelId);
@@ -904,7 +915,7 @@ class SurfaceState {
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('handoff source identity is stale');
-      this.assertTopicPublicationSettled(channelId);
+      this.assertLegacyMigrationSafe(channelId);
       const generation = existing.generation + 1;
       this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
         .run(input.nativeId, input.workspace, input.endpoint, READINESS.PENDING, generation, now(), channelId, provider, conductorId, fromGeneration, fromNativeId);
@@ -1002,7 +1013,6 @@ class SurfaceState {
       const existing = this.getIntakeWatermark(channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       if (!existing && !binding) throw new BindingError('intake channel is unknown');
-      if (state === 'ready') this.assertTopicPublicationSettled(channelId);
       const guildId = existing?.guild_id || binding.guildId;
       if (existing) {
         this.db.prepare('UPDATE intake_watermarks SET state=?, detail=?, gap_from=?, gap_to=?, updated_at=? WHERE channel_id=?')
@@ -1055,17 +1065,6 @@ class SurfaceState {
         return null;
       }
       const desiredReadiness = custody?.desiredReadiness || publication.desiredReadiness;
-      const failedReadyPublication = desiredReadiness === READINESS.READY && status !== TOPIC_PUBLICATION_STATES.PUBLISHED;
-      if (binding && (failedReadyPublication || status === TOPIC_PUBLICATION_STATES.UNKNOWN)) {
-        this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(READINESS.UNAVAILABLE, now(), channelId);
-      } else if (binding && status === TOPIC_PUBLICATION_STATES.PUBLISHED) {
-        this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(desiredReadiness, now(), channelId);
-      }
-      if (desiredReadiness === READINESS.READY) {
-        const intakeState = status === TOPIC_PUBLICATION_STATES.PUBLISHED ? 'ready' : 'pending';
-        this.db.prepare('UPDATE intake_watermarks SET state=?, detail=?, updated_at=? WHERE channel_id=?')
-          .run(intakeState, status === TOPIC_PUBLICATION_STATES.PUBLISHED ? null : 'Discord topic publication is not confirmed', now(), channelId);
-      }
       if (custody) {
         const endedAt = remoteTerminal ? (custody.operationEndedAt || now()) : custody.operationEndedAt;
         this.db.prepare(`UPDATE topic_publications SET status=?, outcome=?, error=?, operation_ended_at=?, updated_at=? WHERE request_id=? AND status IN (?, ?)`)
@@ -1114,16 +1113,8 @@ class SurfaceState {
       if (!binding || !bindingIdentityMatchesTopicPublication(binding, custody)) throw new StaleGenerationError('topic publication reconciliation target is stale');
       const status = resolution === 'published' ? TOPIC_PUBLICATION_STATES.PUBLISHED : TOPIC_PUBLICATION_STATES.NOT_PUBLISHED;
       const outcome = resolution === 'published' ? 'reconciled_published' : 'reconciled_not_published';
-      const nextReadiness = status === TOPIC_PUBLICATION_STATES.PUBLISHED
-        ? custody.desiredReadiness
-        : custody.desiredReadiness === READINESS.READY ? READINESS.UNAVAILABLE : custody.desiredReadiness;
       this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, evidence_scope=?, error=NULL, readback_at=?, readback_topic=?, updated_at=? WHERE request_id=? AND status IN (?, ?)')
         .run(status, outcome, evidenceScope, readback.observedAt, readback.topic, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN);
-      this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(nextReadiness, now(), channelId);
-      if (custody.desiredReadiness === READINESS.READY) {
-        this.db.prepare('UPDATE intake_watermarks SET state=?, detail=?, updated_at=? WHERE channel_id=?')
-          .run(status === TOPIC_PUBLICATION_STATES.PUBLISHED ? 'ready' : 'pending', status === TOPIC_PUBLICATION_STATES.PUBLISHED ? null : 'Discord topic publication is not confirmed', now(), channelId);
-      }
       this.receipt(null, 'topic-publication-reconciled', {
         requestId, channelId, provider: custody.provider, nativeId: custody.nativeId,
         conductorId: custody.conductorId, repoKey: custody.repoKey, generation: custody.generation,
@@ -1197,6 +1188,75 @@ class SurfaceState {
       this.receipt(event.id, 'accepted', { channelId: event.channelId, conductorId: binding.conductorId, generation: binding.generation, readiness: ready ? 'ready' : 'pending' });
       if (!ready) this.receipt(event.id, 'intake-held-not-ready', { channelId: event.channelId });
       return { accepted: true, message: this.getMessage(event.id) };
+    });
+  }
+
+  getTransportReceipt(messageId) {
+    assertText(messageId, 'messageId', 128);
+    const rows = this.db.prepare('SELECT kind, detail, created_at FROM receipts WHERE discord_id=? AND kind IN (?, ?) ORDER BY id')
+      .all(messageId, TRANSPORT_RECEIPT_ATTEMPT, TRANSPORT_RECEIPT_OUTCOME);
+    let attempt = null;
+    let outcome = null;
+    for (const row of rows) {
+      const detail = parseJson(row.detail, {});
+      if (row.kind === TRANSPORT_RECEIPT_ATTEMPT) attempt = { ...detail, recordedAt: row.created_at };
+      if (row.kind === TRANSPORT_RECEIPT_OUTCOME) outcome = { ...detail, recordedAt: row.created_at };
+    }
+    if (!attempt && !outcome) return null;
+    return { messageId, attempt, outcome };
+  }
+
+  beginTransportReceipt(messageId) {
+    assertText(messageId, 'messageId', 128);
+    return this.transaction(() => {
+      const existing = this.getTransportReceipt(messageId);
+      if (existing) return { started: false, ...existing, reason: 'already-attempted' };
+      const message = this.getMessage(messageId);
+      if (!message) throw new BindingError('message is unknown');
+      if (message.state !== MESSAGE_STATES.ACCEPTED) return { started: false, message, reason: 'message-not-accepted' };
+      const check = this.currentMessageBinding(message);
+      if (!check.current) {
+        const detail = { nonce: transportReceiptNonce(messageId), outcome: 'stale', reason: 'authorization revoked before receipt attempt' };
+        this.receipt(messageId, TRANSPORT_RECEIPT_OUTCOME, detail);
+        return { started: false, message, outcome: detail.outcome, detail, reason: 'stale-authority' };
+      }
+      const detail = {
+        nonce: transportReceiptNonce(messageId),
+        channelId: message.channelId,
+        provider: check.binding.provider,
+        conductorId: check.binding.conductorId,
+        repoKey: check.binding.repoKey,
+        generation: check.binding.generation,
+        readiness: check.binding.readiness,
+        status: 'attempted'
+      };
+      this.receipt(messageId, TRANSPORT_RECEIPT_ATTEMPT, detail);
+      return { started: true, message, binding: check.binding, attempt: detail, nonce: detail.nonce };
+    });
+  }
+
+  authorizeTransportReceipt(messageId, expectedBinding) {
+    assertText(messageId, 'messageId', 128);
+    return this.transaction(() => {
+      const record = this.getTransportReceipt(messageId);
+      if (!record?.attempt || record.outcome) return null;
+      const message = this.getMessage(messageId);
+      const check = message ? this.currentMessageBinding(message) : null;
+      if (!check?.current || !bindingMatchesExpected(check.binding, expectedBinding)) return null;
+      return { message, binding: check.binding, attempt: record.attempt, nonce: record.attempt.nonce };
+    });
+  }
+
+  recordTransportReceiptOutcome(messageId, outcome, detail = {}) {
+    assertText(messageId, 'messageId', 128);
+    if (!TRANSPORT_RECEIPT_OUTCOMES.includes(outcome)) throw new BindingError('invalid transport receipt outcome');
+    return this.transaction(() => {
+      const record = this.getTransportReceipt(messageId);
+      if (!record?.attempt) throw new BindingError('transport receipt attempt is unknown');
+      if (record.outcome) return record;
+      const next = { ...detail, nonce: record.attempt.nonce, outcome };
+      this.receipt(messageId, TRANSPORT_RECEIPT_OUTCOME, next);
+      return this.getTransportReceipt(messageId);
     });
   }
 
@@ -1455,13 +1515,27 @@ class SurfaceState {
       for (const row of topicPublications) {
         this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, error=?, updated_at=? WHERE request_id=? AND status=?')
           .run(TOPIC_PUBLICATION_STATES.UNKNOWN, 'process_stopped', 'process stopped during topic publication', now(), row.request_id, TOPIC_PUBLICATION_STATES.IN_FLIGHT);
-        if (row.desired_readiness === READINESS.READY) {
-          this.db.prepare("UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1").run(READINESS.UNAVAILABLE, now(), row.channel_id);
-        }
         this.receipt(null, 'topic-publication-unknown-after-restart', {
           requestId: row.request_id, channelId: row.channel_id, provider: row.provider,
           nativeId: row.native_id, conductorId: row.conductor_id, repoKey: row.repo_key,
           generation: row.generation, desiredReadiness: row.desired_readiness
+        });
+      }
+      const transportAttempts = this.db.prepare(`
+        SELECT attempt.discord_id, attempt.detail
+        FROM receipts AS attempt
+        LEFT JOIN receipts AS outcome
+          ON outcome.discord_id = attempt.discord_id
+         AND outcome.kind = ?
+         AND outcome.id > attempt.id
+        WHERE attempt.kind = ? AND outcome.id IS NULL
+        ORDER BY attempt.id
+      `).all(TRANSPORT_RECEIPT_OUTCOME, TRANSPORT_RECEIPT_ATTEMPT);
+      for (const row of transportAttempts) {
+        this.receipt(row.discord_id, TRANSPORT_RECEIPT_OUTCOME, {
+          ...parseJson(row.detail, {}),
+          outcome: 'unknown',
+          reason: 'process stopped before transport receipt outcome'
         });
       }
       const dispatching = this.db.prepare('SELECT discord_id FROM messages WHERE state=?').all(MESSAGE_STATES.DISPATCHING);
@@ -1605,8 +1679,8 @@ class SurfaceState {
         recovery: RECOVERY_LIMITS
       },
       intakeWatermarks: watermarks.map(row => ({ channelId: row.channel_id, lastSeenId: row.last_seen_id, recoveredThroughId: row.recovered_through_id, state: row.state, gapFrom: row.gap_from, gapTo: row.gap_to, detail: row.detail })),
-      topicPublications: [...topicPublications.values()],
-      topicPublicationCustody: topicCustody
+      legacyTopicPublications: [...topicPublications.values()],
+      legacyTopicPublicationCustody: topicCustody
     };
   }
 
@@ -1645,6 +1719,9 @@ module.exports = {
   StaleGenerationError,
   StateCorruptError,
   SurfaceState,
+  TRANSPORT_RECEIPT_ATTEMPT,
+  TRANSPORT_RECEIPT_OUTCOME,
+  TRANSPORT_RECEIPT_OUTCOMES,
   TOPIC_PUBLICATION_STATES,
   UnresolvedWorkError,
   UUID,

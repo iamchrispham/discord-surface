@@ -5,9 +5,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, validateNativeId } = require('./state');
-const { DiscordGateway, readSecret, requireInstalled, topicPublicationOutcome } = require('./discord');
+const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
 const { ClaudeChannel } = require('./claude-channel');
-const { conductorMarkerMatches: matchesTopicMarker, topicPresentation } = require('./topic');
+const { conductorMarkerMatches: matchesTopicMarker, staticConductorMarker, topicPresentation } = require('./topic');
 
 function parseArgs(argv) {
   const args = {};
@@ -124,9 +124,7 @@ function provisionMarker(provider, nativeId) {
 
 function conductorMarker({ provider, nativeId, conductorId, repoKey, generation = 1, readiness = READINESS.PENDING }) {
   if (!conductorId || !repoKey) return provisionMarker(provider, nativeId);
-  const marker = `discord-surface:v2 conductor=${encodeURIComponent(conductorId)} provider=${provider} repo=${encodeURIComponent(repoKey)} native=${nativeId} generation=${generation} readiness=${readiness}`;
-  if (marker.length > 1024) throw new Error('conductor channel topic marker exceeds Discord topic limit');
-  return marker;
+  return staticConductorMarker({ provider, conductorId, repoKey });
 }
 
 function legacyAdoptionTopic(topic, provider, nativeId) {
@@ -138,51 +136,10 @@ function conductorMarkerMatches(topic, expected) {
   return matchesTopicMarker(topic, expected);
 }
 
-async function setChannelTopic(channel, topic) {
-  if (channel.topic === topic) return channel;
-  if (typeof channel.setTopic === 'function') await channel.setTopic(topic);
-  else if (typeof channel.edit === 'function') await channel.edit({ topic });
-  else channel.topic = topic;
-  if (channel.topic !== topic) throw new Error('Discord channel topic readback mismatch');
-  return channel;
-}
-
-async function publishHandoffTopic(state, channel, topic, binding) {
-  if (channel.topic === topic) return null;
-  const custody = state.beginTopicPublication(binding.channelId, {
-    desiredReadiness: binding.readiness,
-    desiredTopic: topic
-  }, binding);
-  if (!custody) throw new Error('handoff topic binding changed before publication');
-  try {
-    await setChannelTopic(channel, topic);
-    state.recordTopicPublication(binding.channelId, {
-      requestId: custody.requestId,
-      desiredReadiness: binding.readiness,
-      outcome: 'published',
-      publishedReadiness: binding.readiness,
-      observedTopic: channel.topic,
-      remoteTerminal: true
-    }, binding);
-    return custody;
-  } catch (error) {
-    const outcome = topicPublicationOutcome(error);
-    state.recordTopicPublication(binding.channelId, {
-      requestId: custody.requestId,
-      desiredReadiness: binding.readiness,
-      outcome,
-      publicationUnknown: outcome === 'unknown',
-      remoteTerminal: outcome === 'rate_limited' || outcome === 'rejected',
-      observedTopic: channel.topic,
-      error: error.message
-    }, binding);
-    throw error;
-  }
-}
-
 async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName, conductorId, repoKey, generation = 1, readiness = READINESS.PENDING, channelId = null, allowCreate = true }) {
   if (provider !== PROVIDERS.CODEX && provider !== PROVIDERS.CLAUDE) throw new Error('unsupported provider');
   validateNativeId(nativeId);
+  if (typeof conductorId !== 'string' || !conductorId || typeof repoKey !== 'string' || !repoKey) throw new Error('conductor identity is required for channel provisioning');
   if (typeof categoryId !== 'string' || !categoryId) throw new Error('categoryId is required');
   const marker = conductorMarker({ provider, nativeId, conductorId, repoKey, generation, readiness });
   if (typeof guild.channels?.fetch === 'function') await guild.channels.fetch();
@@ -198,12 +155,11 @@ async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId,
       const legacyMatch = legacyAdoptionTopic(channel.topic, provider, nativeId);
       if (!v2Match && !legacyMatch) throw new Error('requested adoption channel metadata does not match the native identity');
       adopted = legacyMatch;
-      if (v2Match) return { channel, created: false, adopted, marker };
+      return { channel, created: false, adopted, legacy: true, marker: channel.topic };
     }
-    await setChannelTopic(channel, marker);
     return { channel, created: false, adopted, marker };
   }
-  marked = channels.filter(channel => channel.topic === marker || conductorMarkerMatches(channel.topic, { provider, nativeId, conductorId, repoKey, generation }));
+  marked = channels.filter(channel => channel.topic === marker);
   if (marked.length > 1) throw new Error('duplicate provision markers require reconciliation');
   const existingMarker = marked[0];
   if (existingMarker && existingMarker.parentId !== categoryId) throw new Error('provision marker exists under the wrong category');
@@ -249,7 +205,6 @@ async function provisionInternal(args) {
     if (taskName !== undefined && (typeof taskName !== 'string' || !taskName || taskName.length > 100)) throw new Error('--task-name must be 1 to 100 characters');
     const existingBinding = state.findConductorBinding(conductorId, provider);
     if (existingBinding) {
-      state.assertTopicPublicationSettled(existingBinding.channelId);
       if (existingBinding.repoKey !== repoKey || existingBinding.nativeId !== nativeId || existingBinding.workspace !== workspace || existingBinding.endpoint !== (endpoint || null)) {
         throw new Error('existing conductor binding does not match requested identity; use explicit handoff for a successor');
       }
@@ -259,10 +214,13 @@ async function provisionInternal(args) {
       await client.login(readSecret(config.secretFile));
       const guild = await client.guilds.fetch(config.guildId);
       const boundChannel = await guild.channels.fetch(existingBinding.channelId);
-      if (!boundChannel || boundChannel.parentId !== categoryId || !conductorMarkerMatches(boundChannel.topic, { provider, nativeId, conductorId, repoKey, generation: existingBinding.generation })) {
+      const markerMatches = boundChannel && boundChannel.topic === marker;
+      const legacyMatches = boundChannel && (conductorMarkerMatches(boundChannel.topic, { provider, nativeId, conductorId, repoKey, generation: existingBinding.generation }) || legacyAdoptionTopic(boundChannel.topic, provider, nativeId));
+      if (!boundChannel || boundChannel.parentId !== categoryId || (!markerMatches && !legacyMatches)) {
         throw new Error('existing conductor channel does not match requested metadata');
       }
-      print({ created: false, adopted: false, bound: true, marker, conductorId, repoKey, channelId: existingBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingBinding.channelId}`, binding: existingBinding });
+      if (legacyMatches && !markerMatches) state.assertLegacyMigrationSafe(existingBinding.channelId);
+      print({ created: false, adopted: false, legacy: !markerMatches, bound: true, marker: boundChannel.topic, conductorId, repoKey, channelId: existingBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingBinding.channelId}`, binding: existingBinding });
       return;
     }
     const marker = conductorMarker({ provider, nativeId, conductorId, repoKey });
@@ -272,6 +230,7 @@ async function provisionInternal(args) {
     await client.login(readSecret(config.secretFile));
     const guild = await client.guilds.fetch(config.guildId);
     const result = await ensureProvisionedChannel({ guild, provider, nativeId, categoryId, taskName, conductorId, repoKey, channelId: args['channel-id'] || intent.channel_id, allowCreate: intent.fresh });
+    if (result.legacy) state.assertLegacyMigrationSafe(result.channel.id);
     const existingNativeBinding = state.findNativeBinding(nativeId, provider);
     if (existingNativeBinding) {
       if (!existingNativeBinding.active || existingNativeBinding.provider !== provider || existingNativeBinding.workspace !== workspace || existingNativeBinding.endpoint !== (endpoint || null) || existingNativeBinding.conductorId !== conductorId || existingNativeBinding.repoKey !== repoKey) {
@@ -286,7 +245,7 @@ async function provisionInternal(args) {
     }
     const binding = state.bind({ channelId: result.channel.id, guildId: config.guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey });
     state.completeProvisionIntent(provider, nativeId, result.channel.id, conductorId);
-    print({ created: result.created, adopted: result.adopted, bound: true, marker: result.marker, conductorId, repoKey, channelId: result.channel.id,
+    print({ created: result.created, adopted: result.adopted, legacy: result.legacy || false, bound: true, marker: result.marker, conductorId, repoKey, channelId: result.channel.id,
       url: `https://discord.com/channels/${config.guildId}/${result.channel.id}`, binding, intent });
   } finally {
     await client?.destroy();
@@ -333,19 +292,11 @@ async function handoffInternal(args) {
     const channel = await guild.channels.fetch(channelId);
     if (!channel || channel.parentId !== categoryId) throw new Error('handoff channel is outside the configured vendor category');
     const current = state.getBinding(channelId);
-    const oldTopicMatches = conductorMarkerMatches(channel.topic, { provider, nativeId: fromNativeId, conductorId, repoKey, generation: fromGeneration }) || legacyAdoptionTopic(channel.topic, provider, fromNativeId);
-    const successorTopicMatches = current && current.generation === fromGeneration + 1 && current.nativeId === nativeId &&
-      conductorMarkerMatches(channel.topic, { provider, nativeId, conductorId, repoKey, generation: current.generation });
-    if (!oldTopicMatches && !successorTopicMatches) throw new Error('handoff channel topic does not match the requested source or exact successor');
-    let binding;
-    try {
-      binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
-      const marker = conductorMarker({ provider, nativeId, conductorId, repoKey, generation: binding.generation, readiness: binding.readiness });
-      await publishHandoffTopic(state, channel, marker, binding);
-    } catch (error) {
-      if (binding) state.auditReceipt(null, 'handoff-topic-failed', { channelId, conductorId, provider, handoffId, nativeId, error: error.message });
-      throw error;
+    if (!current || current.provider !== provider || current.conductorId !== conductorId || current.repoKey !== repoKey ||
+      ![conductorMarkerMatches(channel.topic, { provider, nativeId: current.nativeId, conductorId, repoKey, generation: current.generation }), legacyAdoptionTopic(channel.topic, provider, current.nativeId)].some(Boolean)) {
+      throw new Error('handoff channel topic does not match the locally bound conductor address');
     }
+    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
     print({ handedOff: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
   } finally {
     await client?.destroy();
@@ -518,4 +469,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, main, parseArgs, pathsFor, provisionMarker, publishHandoffTopic, setChannelTopic };
+module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, main, parseArgs, pathsFor, provisionMarker };
