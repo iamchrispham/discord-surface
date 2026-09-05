@@ -1,0 +1,13 @@
+{
+  "name": "discord-surface",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "bin": {
+    "discord-surface": "src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test test/surface.test.js",
+    "start": "node src/cli.js start"
+  }
+}
