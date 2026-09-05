@@ -8,11 +8,18 @@ const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('./state');
 function sleep(ms, signal) {
   if (signal?.aborted) return Promise.resolve();
   return new Promise(resolve => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener('abort', () => {
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       resolve();
-    }, { once: true });
+    };
+    const onAbort = () => finish();
+    timer = setTimeout(finish, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -115,15 +122,15 @@ function completeJsonLines(bytes) {
   return { lines, tailBytes: bytes.subarray(start) };
 }
 
-async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), pollMs = 250, signal, onCursor } = {}) {
+async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), pollMs = 250, signal, onCursor, continueUntilFinal = false, isCurrent } = {}) {
   if (!marker) throw new Error('Codex observer requires a unique response marker');
   const startedAt = Date.now();
   let file = cursor?.file || findCodexSessionFile(nativeId, root);
   let offset = Number(cursor?.offset || 0);
   let tailBytes = cursorTailBytes(cursor);
   let since = Number(cursor?.since || startedAt);
-  while (Date.now() - startedAt < timeoutMs) {
-    if (signal?.aborted) return { stopped: true, cursor: { file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') } };
+  while (continueUntilFinal || Date.now() - startedAt < timeoutMs) {
+    if (signal?.aborted || (isCurrent && !isCurrent())) return { stopped: true, cursor: { file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') } };
     if (!file) file = findCodexSessionFile(nativeId, root);
     if (file) {
       try {
@@ -265,13 +272,14 @@ class ClaudeProvider {
   }
 }
 
-async function waitForReply(state, messageId, { timeoutMs = 120000, pollMs = 250, signal } = {}) {
+async function waitForReply(state, messageId, { timeoutMs = 120000, pollMs = 250, signal, continueUntilFinal = false, isCurrent } = {}) {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
+  while (continueUntilFinal || Date.now() - startedAt < timeoutMs) {
     if (signal?.aborted) return { stopped: true };
     const message = state.getMessage(messageId);
     if (!message) return null;
     if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) return { text: message.replyText };
+    if (isCurrent && !isCurrent()) return { stopped: true };
     if ([MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state)) return null;
     await sleep(pollMs, signal);
   }
@@ -287,9 +295,20 @@ async function observeSubmitted(state, message, provider, options = {}) {
   const outcome = { cursor: message.observerCursor };
   let observedCursor = null;
   let reply;
+  const isCurrent = () => {
+    try {
+      const currentMessage = state.getMessage(message.id);
+      if (!currentMessage || currentMessage.state !== MESSAGE_STATES.SUBMITTED) return false;
+      const check = state.currentMessageBinding(currentMessage);
+      return check.current && currentMessage.provider === message.provider && currentMessage.nativeId === message.nativeId && currentMessage.generation === message.generation;
+    } catch {
+      return false;
+    }
+  };
   try {
     reply = await provider.observe(message, outcome, {
       ...options,
+      isCurrent,
       onCursor: cursor => { observedCursor = cursor; }
     });
   } catch (error) {

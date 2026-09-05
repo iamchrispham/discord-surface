@@ -120,6 +120,7 @@ function transportReceiptText(message, attempt) {
 
 function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, trackReceipt, observeOptions = {} }) {
   const receiptWork = new Set();
+  const nativeWork = new Map();
 
   function trackReceiptWork(work) {
     const tracked = Promise.resolve(work).catch(() => null);
@@ -157,6 +158,22 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return trackReceiptWork(issueTransportReceipt(message));
   }
 
+  function trackNativeWork(messageId, work) {
+    const tracked = Promise.resolve(work);
+    nativeWork.set(messageId, tracked);
+    tracked.finally(() => {
+      if (nativeWork.get(messageId) === tracked) nativeWork.delete(messageId);
+    }).catch(() => {});
+    return tracked;
+  }
+
+  function existingNativeWork(message, awaitExisting) {
+    const existing = nativeWork.get(message.id);
+    if (!existing) return null;
+    if (awaitExisting) return existing;
+    return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
+  }
+
   async function deliverReply(message, result, signal) {
     if (result.message?.state !== 'reply_ready') return result;
     let ready;
@@ -186,9 +203,14 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return { ...result, message: state.getMessage(ready.message.id) };
   }
 
-  async function processAccepted(message, signal) {
-    const result = await dispatchAndObserve(state, message.id, providers, { ...observeOptions, signal });
-    return deliverReply(message, result, signal);
+  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true } = {}) {
+    const existing = existingNativeWork(message, awaitExisting);
+    if (existing) return existing;
+    const work = (async () => {
+      const result = await dispatchAndObserve(state, message.id, providers, { ...observeOptions, signal, continueUntilFinal });
+      return deliverReply(message, result, signal);
+    })();
+    return trackNativeWork(message.id, work);
   }
 
   async function handleMessage(message, signal) {
@@ -206,14 +228,19 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
 
   async function handleStoredMessage(message, signal) {
     launchTransportReceipt(message);
-    return processAccepted(message, signal);
+    return processAccepted(message, signal, { continueUntilFinal: false, awaitExisting: false });
   }
 
-  async function resumeSubmitted(message, signal) {
+  function resumeSubmitted(message, signal, { awaitExisting = false } = {}) {
     launchTransportReceipt(message);
-    const provider = providers[message.provider];
-    const result = await observeSubmitted(state, message, provider, { ...observeOptions, signal });
-    return deliverReply(message, result, signal);
+    const existing = existingNativeWork(message, awaitExisting);
+    if (existing) return existing;
+    const work = (async () => {
+      const provider = providers[message.provider];
+      const result = await observeSubmitted(state, message, provider, { ...observeOptions, signal, continueUntilFinal: false });
+      return deliverReply(message, result, signal);
+    })();
+    return trackNativeWork(message.id, work);
   }
 
   async function waitForReceipts() {

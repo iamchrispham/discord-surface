@@ -95,9 +95,25 @@ function status(args) {
 
 async function liaisonDraft(args) {
   const { state } = openState(args);
+  const controller = new AbortController();
+  let receivedSignal = null;
+  const abort = signal => {
+    if (receivedSignal) return;
+    receivedSignal = signal;
+    controller.abort();
+  };
+  process.once('SIGINT', abort);
+  process.once('SIGTERM', abort);
   try {
-    print(await runLiaisonDraft({ state, receiptId: required(args, 'receipt-id') }));
-  } finally { state.close(); }
+    const result = await runLiaisonDraft({ state, receiptId: required(args, 'receipt-id'), signal: controller.signal });
+    print(result);
+    if (receivedSignal) process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
+    return result;
+  } finally {
+    process.removeListener('SIGINT', abort);
+    process.removeListener('SIGTERM', abort);
+    state.close();
+  }
 }
 
 function recover(args) {

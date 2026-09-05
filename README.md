@@ -138,6 +138,8 @@ If the native owner is unavailable before submission, the message stays `accepte
 
 After a restart, the runtime makes one bounded transport recovery pass. It may drain definitely accepted work, resume observation from the saved byte cursor for submitted work, and deliver saved reply parts. Work that was uncertain at the dispatch boundary is never replayed automatically. Reconcile it explicitly after evidence is available:
 
+While the Gateway is running, each live submitted message keeps its one native observer beyond that bounded recovery window until a final response, explicit cancellation, shutdown, or binding fence. Reconnect recovery reuses that observer and does not start a second one.
+
 ```sh
 node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
   --message-id DISCORD_MESSAGE_ID --resolution submitted

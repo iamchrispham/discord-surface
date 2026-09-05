@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
-const { EventEmitter } = require('node:events');
+const { EventEmitter, getEventListeners } = require('node:events');
 const { spawn, spawnSync } = require('node:child_process');
 const { postUnixJson } = require('../src/native');
 const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
@@ -835,6 +835,177 @@ test('simulated: Unicode and split JSONL observation keeps a byte cursor and fin
   assert.equal(result.text, '返信🙂');
   assert.equal(result.cursor.offset, fs.statSync(file).size);
   assert.equal(finalText(JSON.parse(prior), marker), null);
+});
+
+test('simulated: live Codex consumer keeps observing past the bounded recovery window', async () => {
+  const { dir, state } = fixture();
+  const root = path.join(dir, 'sessions');
+  fs.mkdirSync(root, { mode: 0o700 });
+  const file = path.join(root, `${CODEX_ID}.jsonl`);
+  fs.writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { session_id: CODEX_ID }, timestamp: new Date().toISOString() })}\n`, { mode: 0o600 });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  let dispatches = 0;
+  let sends = 0;
+  const provider = new CodexProvider({
+    root,
+    run: async () => { dispatches += 1; return { status: 'submitted' }; }
+  });
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: provider },
+    observeOptions: { timeoutMs: 25, pollMs: 5 },
+    sendTransportReceipt: async () => ({ id: 'receipt-live' }),
+    sendReply: async () => { sends += 1; return { id: 'reply-live' }; }
+  });
+  const pending = consumer.handleMessage(discordMessage({ id: 'live-long-observation', channelId: 'channel-codex' }));
+  await new Promise(resolve => setTimeout(resolve, 70));
+  const marker = '[[discord-surface:live-long-observation]]';
+  fs.appendFileSync(file, `${JSON.stringify({ type: 'event_msg', payload: { type: 'item_completed', item: { phase: 'final_answer', content: [{ type: 'Text', text: `${marker}\nlive answer` }] } }, timestamp: new Date().toISOString() })}\n`);
+  const result = await pending;
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(result.message.replyText, 'live answer');
+  assert.equal(dispatches, 1);
+  assert.equal(sends, 1);
+  assert.equal(state.getMessage('live-long-observation').observerCursor.offset, fs.statSync(file).size);
+  state.close();
+});
+
+test('simulated: repeated native polls do not accumulate abort listeners', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-observer-'));
+  const file = path.join(root, `${CODEX_ID}.jsonl`);
+  fs.writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { session_id: CODEX_ID }, timestamp: new Date().toISOString() })}\n`, { mode: 0o600 });
+  const controller = new AbortController();
+  const observation = observeCodexReply(CODEX_ID, readInitialCursor(CODEX_ID, root), {
+    marker: '[[discord-surface:never-finished]]',
+    root,
+    pollMs: 3,
+    timeoutMs: 10,
+    continueUntilFinal: true,
+    signal: controller.signal
+  });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.ok(getEventListeners(controller.signal, 'abort').length <= 1);
+  controller.abort();
+  const result = await observation;
+  assert.equal(result.stopped, true);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('simulated: gateway stop cancels the live native observer without redispatch', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.markIntakeBoundary('channel-codex', 'ready');
+  const client = new EventEmitter();
+  client.destroy = async () => {};
+  let dispatches = 0;
+  let observations = 0;
+  let stopped = 0;
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {
+      codex: {
+        async dispatch() { dispatches += 1; return { status: 'submitted' }; },
+        async observe(_message, _outcome, { signal }) {
+          observations += 1;
+          return new Promise(resolve => {
+            const onAbort = () => { stopped += 1; resolve({ stopped: true }); };
+            signal.addEventListener('abort', onAbort, { once: true });
+          });
+        }
+      }
+    }
+  });
+  gateway.ready = true;
+  gateway.started = true;
+  client.emit('messageCreate', discordMessage({ id: 'stop-live-observer', channelId: 'channel-codex' }));
+  for (let attempt = 0; attempt < 100 && observations === 0; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(observations, 1);
+  await gateway.stop();
+  assert.equal(stopped, 1);
+  assert.equal(dispatches, 1);
+  assert.equal(state.getMessage('stop-live-observer').state, MESSAGE_STATES.SUBMITTED);
+  state.close();
+});
+
+test('simulated: reconnect recovery reuses the live observer without starting a duplicate', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
+  state.markIntakeBoundary('channel-codex', 'ready');
+  const channel = {
+    id: 'channel-codex',
+    guildId: 'guild-1',
+    topic: '',
+    permissionsFor: () => historyPermissions(),
+    async send() { return { id: 'receipt-reconnect' }; }
+  };
+  const client = new EventEmitter();
+  client.user = { id: 'bot-1' };
+  client.channels = { fetch: async () => channel };
+  client.destroy = async () => {};
+  let observations = 0;
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {
+      codex: {
+        async dispatch() { return { status: 'submitted' }; },
+        async observe(_message, _outcome, { signal }) {
+          observations += 1;
+          return new Promise(resolve => signal.addEventListener('abort', () => resolve({ stopped: true }), { once: true }));
+        }
+      }
+    },
+    fetchHistory: async (_channel, options) => {
+      if (options.after === '100') return [{ id: '101', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'live input' }];
+      return [];
+    }
+  });
+  gateway.ready = true;
+  gateway.started = true;
+  client.emit('messageCreate', discordMessage({ id: '101', channelId: 'channel-codex', sends: [] }));
+  for (let attempt = 0; attempt < 100 && observations === 0; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(observations, 1);
+  client.emit('shardDisconnect', new Error('socket lost'), 0);
+  client.emit('shardReady', 0, new Set());
+  await gateway.reconnectPromise;
+  assert.equal(observations, 1);
+  assert.equal(gateway.ready, true);
+  assert.equal(state.getMessage('101').state, MESSAGE_STATES.SUBMITTED);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: live native reply is fenced after operator revocation', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  let release;
+  let observations = 0;
+  let sends = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: {
+      codex: {
+        async dispatch() { return { status: 'submitted' }; },
+        async observe() {
+          observations += 1;
+          return new Promise(resolve => { release = resolve; });
+        }
+      }
+    },
+    sendTransportReceipt: async () => ({ id: 'receipt-fenced' }),
+    sendReply: async () => { sends += 1; return { id: 'reply-fenced' }; }
+  });
+  const pending = consumer.handleMessage(discordMessage({ id: 'revoked-live-reply', channelId: 'channel-codex' }));
+  for (let attempt = 0; attempt < 100 && observations === 0; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
+  state.setConfig({ operatorId: 'different-operator', guildId: 'guild-1', secretFile: path.join(dir, 'discord.env') });
+  release({ text: 'late native reply' });
+  const result = await pending;
+  assert.equal(result.status, 'stale-reply');
+  assert.equal(state.getMessage('revoked-live-reply').state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(sends, 0);
+  state.close();
 });
 
 test('simulated: unmatched Claude IPC custody is rejected and notification failure is uncertain', async () => {
@@ -2378,6 +2549,53 @@ test('simulated: liaison cancellation kills child process and does not touch nat
   await waitForProcessGone(childPid);
   assert.equal(state.getMessage('liaison-input').state, MESSAGE_STATES.ACCEPTED);
   state.close();
+});
+
+test('simulated: public liaison SIGTERM aborts the child group before closing state', async () => {
+  const { state, dir } = liaisonReceiptFixture();
+  state.close();
+  const preloadPath = path.join(dir, 'liaison-spawn-preload.cjs');
+  const childPidPath = path.join(dir, 'liaison-public-child.pid');
+  fs.writeFileSync(preloadPath, `
+const fs = require('node:fs');
+const childProcess = require('node:child_process');
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = (_command, _args, options) => {
+  const child = originalSpawn(process.execPath, ['-e', "process.stdin.resume(); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"], options);
+  fs.writeFileSync(process.env.DISCORD_SURFACE_TEST_CHILD_PID, String(child.pid));
+  return child;
+};
+`, { mode: 0o600 });
+  const cli = spawn(process.execPath, [CLI_PATH, 'liaison', 'draft', '--state-dir', dir, '--receipt-id', 'liaison-input'], {
+    env: {
+      ...process.env,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ? `${process.env.NODE_OPTIONS} ` : ''}--require ${preloadPath}`,
+      DISCORD_SURFACE_TEST_CHILD_PID: childPidPath
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let stdout = '';
+  let stderr = '';
+  cli.stdout.on('data', chunk => { stdout += chunk; });
+  cli.stderr.on('data', chunk => { stderr += chunk; });
+  let childPid = null;
+  try {
+    await waitForFile(childPidPath, 2000);
+    childPid = Number(fs.readFileSync(childPidPath, 'utf8'));
+    process.kill(cli.pid, 'SIGTERM');
+    const exit = await waitForChild(cli);
+    assert.equal(exit.code, 143, stderr);
+    const output = JSON.parse(stdout);
+    assert.equal(output.status, 'unavailable');
+    assert.equal(output.reason, 'cancelled');
+    await waitForProcessGone(childPid, 1000);
+  } finally {
+    if (cli.exitCode === null && cli.signalCode === null) cli.kill('SIGKILL');
+    if (childPid) {
+      try { process.kill(-childPid, 'SIGKILL'); } catch {}
+      try { process.kill(childPid, 'SIGKILL'); } catch {}
+    }
+  }
 });
 
 test('simulated: public liaison command returns deterministic null for unknown receipt', () => {
