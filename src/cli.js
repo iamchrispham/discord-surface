@@ -102,7 +102,8 @@ function recover(args) {
         required(args, 'topic-channel-id'),
         required(args, 'topic-request-id'),
         resolution,
-        required(args, 'evidence-scope')
+        required(args, 'evidence-scope'),
+        { topic: required(args, 'topic-readback'), observedAt: required(args, 'topic-readback-at') }
       ));
     } else if (args['intake-channel-id']) {
       print(state.reconcileIntake(required(args, 'intake-channel-id')));
@@ -160,7 +161,8 @@ async function publishHandoffTopic(state, channel, topic, binding) {
       desiredReadiness: binding.readiness,
       outcome: 'published',
       publishedReadiness: binding.readiness,
-      observedTopic: channel.topic
+      observedTopic: channel.topic,
+      remoteTerminal: true
     }, binding);
     return custody;
   } catch (error) {
@@ -170,6 +172,7 @@ async function publishHandoffTopic(state, channel, topic, binding) {
       desiredReadiness: binding.readiness,
       outcome,
       publicationUnknown: outcome === 'unknown',
+      remoteTerminal: outcome === 'rate_limited' || outcome === 'rejected',
       observedTopic: channel.topic,
       error: error.message
     }, binding);

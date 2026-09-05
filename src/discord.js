@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const { createRequire } = require('node:module');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
-const { READINESS, RECOVERY_LIMITS } = require('./state');
+const { READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches, topicPresentation, topicWithReadiness } = require('./topic');
 
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
@@ -50,6 +50,10 @@ function topicPublicationOutcome(error) {
   if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
   if (recoveryKind(error) === 'stopped') return 'stopped';
   return 'unknown';
+}
+
+function topicPublicationRemoteTerminal(outcome) {
+  return outcome === 'published' || outcome === 'rate_limited' || outcome === 'rejected';
 }
 
 function topicPublicationError(error) {
@@ -345,11 +349,35 @@ class DiscordGateway {
     }
   }
 
-  async publishChannelTopic(channel, topic, signal, deadline) {
+  async publishChannelTopic(channel, topic, signal, deadline, onSettled = null) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw recoveryError('deadline', 'Discord recovery deadline exceeded before topic publication');
     const rest = channel?.client?.rest;
     let operationStarted = false;
+    let operationReported = false;
+    const reportSettlement = result => {
+      if (operationReported) return;
+      operationReported = true;
+      try { onSettled?.(result); } catch (error) { this.logger(`Discord topic settlement recording failed: ${error.message}`); }
+    };
+    const trackOperation = operation => {
+      operationStarted = true;
+      let pending;
+      try { pending = operation(); }
+      catch (error) {
+        const outcome = topicPublicationOutcome(error);
+        reportSettlement({ outcome, remoteTerminal: topicPublicationRemoteTerminal(outcome), error });
+        throw error;
+      }
+      Promise.resolve(pending).then(
+        response => reportSettlement({ outcome: 'published', remoteTerminal: true, response }),
+        error => {
+          const outcome = topicPublicationOutcome(error);
+          reportSettlement({ outcome, remoteTerminal: topicPublicationRemoteTerminal(outcome), error });
+        }
+      ).catch(error => this.logger(`Discord topic settlement observation failed: ${error.message}`));
+      return pending;
+    };
     const unknownAfterAbort = error => {
       if (!error || !operationStarted) return error;
       error.publicationUnknown = true;
@@ -375,10 +403,7 @@ class DiscordGateway {
       try {
         const { Routes } = requireInstalled('discord-api-types/v10');
         const response = await waitForRecoveryOperation(
-          () => {
-            operationStarted = true;
-            return rest.patch(Routes.channel(channel.id), { body: { topic }, signal: controller.signal });
-          },
+          () => trackOperation(() => rest.patch(Routes.channel(channel.id), { body: { topic }, signal: controller.signal })),
           signal,
           deadline,
           () => controller.abort()
@@ -398,9 +423,12 @@ class DiscordGateway {
       }
       return;
     }
-    if (typeof channel.setTopic === 'function') await waitForRecoveryOperation(() => { operationStarted = true; return channel.setTopic(topic); }, signal, deadline).catch(error => { throw unknownAfterAbort(error); });
-    else if (typeof channel.edit === 'function') await waitForRecoveryOperation(() => { operationStarted = true; return channel.edit({ topic }); }, signal, deadline).catch(error => { throw unknownAfterAbort(error); });
-    else channel.topic = topic;
+    if (typeof channel.setTopic === 'function') await waitForRecoveryOperation(() => trackOperation(() => channel.setTopic(topic)), signal, deadline).catch(error => { throw unknownAfterAbort(error); });
+    else if (typeof channel.edit === 'function') await waitForRecoveryOperation(() => trackOperation(() => channel.edit({ topic })), signal, deadline).catch(error => { throw unknownAfterAbort(error); });
+    else {
+      channel.topic = topic;
+      reportSettlement({ outcome: 'published', remoteTerminal: true });
+    }
   }
 
   async updateChannelReadiness(channel, readiness, { signal, deadline, expectedBinding } = {}) {
@@ -410,7 +438,7 @@ class DiscordGateway {
       return { published: false, outcome: 'unknown', blocked: true, error: 'Discord topic publication custody is unresolved' };
     }
     const current = topicPresentation(channel.topic);
-    if (current.publishedReadiness === readiness) return { published: true, outcome: 'published', topic: channel.topic, publishedReadiness: readiness, publishedAt: current.publishedAt };
+    if (current.publishedReadiness === readiness) return { published: true, outcome: 'published', topic: channel.topic, publishedReadiness: readiness, publishedAt: current.publishedAt, remoteTerminal: true };
     const publishedAt = new Date().toISOString();
     let topic;
     try {
@@ -418,7 +446,7 @@ class DiscordGateway {
     } catch (error) {
       return { published: false, outcome: 'unknown', error: topicPublicationError(error), topic };
     }
-    if (channel.topic === topic) return { published: true, outcome: 'published', topic, publishedReadiness: readiness, publishedAt };
+    if (channel.topic === topic) return { published: true, outcome: 'published', topic, publishedReadiness: readiness, publishedAt, remoteTerminal: true };
     let custody;
     try {
       custody = this.state.beginTopicPublication(expectedBinding?.channelId || channel.id, {
@@ -427,19 +455,42 @@ class DiscordGateway {
         publishedAt
       }, expectedBinding);
       if (!custody) return { published: false, outcome: 'stale', stale: true, error: 'Discord recovery binding changed before topic publication' };
-      await this.publishChannelTopic(channel, topic, signal, deadline || Date.now() + RECOVERY_LIMITS.timeoutMs);
+      await this.publishChannelTopic(channel, topic, signal, deadline || Date.now() + RECOVERY_LIMITS.timeoutMs, settlement => {
+        try {
+          this.state.recordTopicPublication(expectedBinding?.channelId || channel.id, {
+            desiredReadiness: readiness,
+            requestId: custody.requestId,
+            outcome: settlement.outcome,
+            observedTopic: typeof settlement.response?.topic === 'string' ? settlement.response.topic : channel.topic,
+            error: settlement.error ? topicPublicationError(settlement.error) : null,
+            publicationUnknown: !settlement.remoteTerminal,
+            remoteTerminal: settlement.remoteTerminal
+          }, expectedBinding);
+        } catch (error) {
+          this.logger(`Discord late topic settlement could not be persisted: ${error.message}`);
+        }
+      });
       if (expectedBinding && !this.isCurrentBinding(expectedBinding)) return { published: false, outcome: 'stale', stale: true, error: 'Discord recovery binding changed during topic publication' };
       if (channel.topic !== topic) throw new Error('Discord channel readiness topic readback mismatch');
-      return { published: true, outcome: 'published', topic, publishedReadiness: readiness, publishedAt, requestId: custody.requestId };
+      return { published: true, outcome: 'published', topic, publishedReadiness: readiness, publishedAt, requestId: custody.requestId, remoteTerminal: true };
     } catch (error) {
-      return { published: false, outcome: topicPublicationOutcome(error), publicationUnknown: Boolean(error?.publicationUnknown), error: topicPublicationError(error), topic, requestId: custody?.requestId || null, blocked: !custody };
+      const outcome = topicPublicationOutcome(error);
+      const remoteTerminal = topicPublicationRemoteTerminal(outcome) ||
+        (!error?.publicationUnknown && ['deadline', 'stopped'].includes(recoveryKind(error)));
+      return { published: false, outcome, publicationUnknown: Boolean(error?.publicationUnknown), remoteTerminal, error: topicPublicationError(error), topic, requestId: custody?.requestId || null, blocked: !custody };
     }
   }
 
   async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null, deadline = Date.now() + RECOVERY_LIMITS.timeoutMs) {
     if (signal?.aborted) return null;
     if (!this.isCurrentBinding(binding)) return null;
-    const watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo, binding);
+    let watermark;
+    try {
+      watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo, binding);
+    } catch (error) {
+      if (error instanceof UnresolvedWorkError) return { watermark: this.state.getIntakeWatermark(binding.channelId), topicPublished: false, publication: { blocked: true, outcome: 'unknown', error: error.message } };
+      throw error;
+    }
     if (!watermark) return null;
     const readiness = state === 'ready' ? READINESS.READY : state === 'gap' ? READINESS.GAP : state === 'unavailable' ? READINESS.UNAVAILABLE : READINESS.PENDING;
     if (!channel || readiness === READINESS.PENDING || readiness === READINESS.RECOVERING) return { watermark, topicPublished: true, publication: null };
@@ -455,7 +506,8 @@ class DiscordGateway {
       outcome: publication.outcome,
       observedTopic: channel.topic,
       error: publication.error || null,
-      publicationUnknown: publication.publicationUnknown
+      publicationUnknown: publication.publicationUnknown,
+      remoteTerminal: publication.remoteTerminal
     }, binding);
     if (!recorded) return { watermark, topicPublished: false, stale: true, publication };
     return { watermark, topicPublished: publication.published, publication };

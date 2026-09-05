@@ -216,6 +216,9 @@ function rowTopicPublication(row) {
     outcome: row.outcome || null,
     evidenceScope: row.evidence_scope || null,
     error: row.error || null,
+    operationEndedAt: row.operation_ended_at || null,
+    readbackAt: row.readback_at || null,
+    readbackTopic: row.readback_topic || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -373,6 +376,9 @@ class SurfaceState {
         outcome TEXT,
         evidence_scope TEXT,
         error TEXT,
+        operation_ended_at TEXT,
+        readback_at TEXT,
+        readback_topic TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -408,12 +414,19 @@ class SurfaceState {
           outcome TEXT,
           evidence_scope TEXT,
           error TEXT,
+          operation_ended_at TEXT,
+          readback_at TEXT,
+          readback_topic TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS topic_publications_channel_idx ON topic_publications(channel_id, updated_at);
         CREATE INDEX IF NOT EXISTS topic_publications_unresolved_idx ON topic_publications(channel_id) WHERE status IN ('in_flight', 'unknown');
       `);
+      const topicColumns = this.tableColumns('topic_publications');
+      if (!topicColumns.has('operation_ended_at')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN operation_ended_at TEXT');
+      if (!topicColumns.has('readback_at')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN readback_at TEXT');
+      if (!topicColumns.has('readback_topic')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN readback_topic TEXT');
       return;
     }
     if (version.value === '1.1') {
@@ -529,6 +542,9 @@ class SurfaceState {
           outcome TEXT,
           evidence_scope TEXT,
           error TEXT,
+          operation_ended_at TEXT,
+          readback_at TEXT,
+          readback_topic TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -610,6 +626,7 @@ class SurfaceState {
       generation: { type: 'INTEGER', notnull: true }, desired_readiness: { type: 'TEXT', notnull: true },
       desired_topic: { type: 'TEXT', notnull: true }, status: { type: 'TEXT', notnull: true },
       outcome: { type: 'TEXT' }, evidence_scope: { type: 'TEXT' }, error: { type: 'TEXT' },
+      operation_ended_at: { type: 'TEXT' }, readback_at: { type: 'TEXT' }, readback_topic: { type: 'TEXT' },
       created_at: { type: 'TEXT', notnull: true }, updated_at: { type: 'TEXT', notnull: true }
     });
     this.assertForeignKey('messages', 'channel_id', 'bindings', 'channel_id');
@@ -688,6 +705,10 @@ class SurfaceState {
       );
       const guardedReadiness = publication.desiredReadiness === READINESS.READY ? READINESS.UNAVAILABLE : publication.desiredReadiness;
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(guardedReadiness, timestamp, channelId);
+      if (publication.desiredReadiness === READINESS.READY) {
+        this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, updated_at=? WHERE channel_id=?")
+          .run('Discord topic publication custody is unresolved', timestamp, channelId);
+      }
       this.receipt(null, 'topic-publication-started', {
         requestId, channelId, conductorId: binding.conductorId, repoKey: binding.repoKey,
         provider: binding.provider, nativeId: binding.nativeId, generation: binding.generation,
@@ -837,6 +858,7 @@ class SurfaceState {
       const binding = this.getBinding(channelId);
       if (!binding) throw new BindingError('channel is not bound');
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+      if (readiness === READINESS.READY) this.assertTopicPublicationSettled(channelId);
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
       this.receipt(null, 'binding-readiness', { channelId, conductorId: binding.conductorId, readiness, detail: detail || undefined });
       return this.getBinding(channelId);
@@ -980,6 +1002,7 @@ class SurfaceState {
       const existing = this.getIntakeWatermark(channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       if (!existing && !binding) throw new BindingError('intake channel is unknown');
+      if (state === 'ready') this.assertTopicPublicationSettled(channelId);
       const guildId = existing?.guild_id || binding.guildId;
       if (existing) {
         this.db.prepare('UPDATE intake_watermarks SET state=?, detail=?, gap_from=?, gap_to=?, updated_at=? WHERE channel_id=?')
@@ -1003,9 +1026,10 @@ class SurfaceState {
     if (!Object.values(READINESS).includes(publication.desiredReadiness)) throw new BindingError('invalid topic publication readiness');
     const requestId = publication.requestId == null ? null : assertText(publication.requestId, 'requestId', 128);
     const outcome = String(publication.outcome || 'unknown');
-    const status = outcome === 'published'
+    const remoteTerminal = publication.remoteTerminal === true;
+    const status = remoteTerminal && outcome === 'published'
       ? TOPIC_PUBLICATION_STATES.PUBLISHED
-      : TOPIC_DEFINITE_NOT_PUBLISHED.has(outcome) && publication.publicationUnknown !== true
+      : remoteTerminal && TOPIC_DEFINITE_NOT_PUBLISHED.has(outcome) && publication.publicationUnknown !== true
         ? TOPIC_PUBLICATION_STATES.NOT_PUBLISHED
         : TOPIC_PUBLICATION_STATES.UNKNOWN;
     return this.transaction(() => {
@@ -1013,15 +1037,18 @@ class SurfaceState {
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       const custody = requestId ? this.getTopicPublication(requestId) : null;
       if (requestId && (!custody || custody.channelId !== channelId)) throw new BindingError('topic publication custody is unknown');
-      if (custody && custody.status !== TOPIC_PUBLICATION_STATES.IN_FLIGHT) return binding;
+      if (custody && ![TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN].includes(custody.status)) return binding;
+      if (custody && custody.status === TOPIC_PUBLICATION_STATES.UNKNOWN && !remoteTerminal) return binding;
       if (custody && !bindingIdentityMatchesTopicPublication(binding, custody)) {
-        this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, error=?, updated_at=? WHERE request_id=? AND status=?')
-          .run(TOPIC_PUBLICATION_STATES.UNKNOWN, 'stale', 'topic publication owner changed before settlement', now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT);
+        const settledAt = remoteTerminal ? now() : null;
+        this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, error=?, operation_ended_at=COALESCE(operation_ended_at, ?), updated_at=? WHERE request_id=? AND status IN (?, ?)')
+          .run(TOPIC_PUBLICATION_STATES.UNKNOWN, 'stale', 'topic publication owner changed before settlement', settledAt, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN);
         this.receipt(null, 'topic-publication', {
           requestId, channelId, conductorId: custody.conductorId, repoKey: custody.repoKey,
           provider: custody.provider, nativeId: custody.nativeId, generation: custody.generation,
           desiredReadiness: custody.desiredReadiness, publishedReadiness: null, publishedAt: null,
           outcome: 'stale', custodyStatus: TOPIC_PUBLICATION_STATES.UNKNOWN,
+          remoteTerminal,
           observedTopic: typeof publication.observedTopic === 'string' ? publication.observedTopic : null,
           error: 'topic publication owner changed before settlement'
         });
@@ -1034,9 +1061,15 @@ class SurfaceState {
       } else if (binding && status === TOPIC_PUBLICATION_STATES.PUBLISHED) {
         this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(desiredReadiness, now(), channelId);
       }
+      if (desiredReadiness === READINESS.READY) {
+        const intakeState = status === TOPIC_PUBLICATION_STATES.PUBLISHED ? 'ready' : 'pending';
+        this.db.prepare('UPDATE intake_watermarks SET state=?, detail=?, updated_at=? WHERE channel_id=?')
+          .run(intakeState, status === TOPIC_PUBLICATION_STATES.PUBLISHED ? null : 'Discord topic publication is not confirmed', now(), channelId);
+      }
       if (custody) {
-        this.db.prepare(`UPDATE topic_publications SET status=?, outcome=?, error=?, updated_at=? WHERE request_id=? AND status=?`)
-          .run(status, outcome, publication.error ? String(publication.error).slice(0, 200) : null, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT);
+        const endedAt = remoteTerminal ? (custody.operationEndedAt || now()) : custody.operationEndedAt;
+        this.db.prepare(`UPDATE topic_publications SET status=?, outcome=?, error=?, operation_ended_at=?, updated_at=? WHERE request_id=? AND status IN (?, ?)`)
+          .run(status, outcome, publication.error ? String(publication.error).slice(0, 200) : null, endedAt, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN);
       }
       this.receipt(null, 'topic-publication', {
         requestId, channelId,
@@ -1050,6 +1083,7 @@ class SurfaceState {
         publishedAt: publication.publishedAt || null,
         outcome,
         custodyStatus: status,
+        remoteTerminal,
         observedTopic: typeof publication.observedTopic === 'string' ? publication.observedTopic : null,
         error: publication.error ? String(publication.error).slice(0, 200) : null
       });
@@ -1057,17 +1091,25 @@ class SurfaceState {
     });
   }
 
-  reconcileTopicPublication(channelId, requestId, resolution, evidenceScope) {
+  reconcileTopicPublication(channelId, requestId, resolution, evidenceScope, readback = null) {
     assertText(channelId, 'channelId', 128);
     assertText(requestId, 'requestId', 128);
     if (!['published', 'not_published'].includes(resolution)) throw new BindingError('topic publication resolution must be published or not_published');
     assertText(evidenceScope, 'evidenceScope', 2000);
+    if (!readback || typeof readback !== 'object') throw new BindingError('fresh topic readback is required');
+    assertText(readback.topic, 'readback.topic', 2048);
+    assertText(readback.observedAt, 'readback.observedAt', 64);
+    if (!Number.isFinite(Date.parse(readback.observedAt))) throw new BindingError('readback.observedAt must be an ISO timestamp');
     return this.transaction(() => {
       const custody = this.getTopicPublication(requestId);
       if (!custody || custody.channelId !== channelId) throw new BindingError('topic publication custody is unknown');
       if (![TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN].includes(custody.status)) {
         throw new BindingError('topic publication custody is already settled');
       }
+      if (!custody.operationEndedAt) throw new UnresolvedWorkError('topic publication operation has not terminated');
+      if (Date.parse(readback.observedAt) < Date.parse(custody.operationEndedAt)) throw new BindingError('topic readback predates operation termination');
+      if (resolution === 'published' && readback.topic !== custody.desiredTopic) throw new BindingError('topic readback does not confirm the desired publication');
+      if (resolution === 'not_published' && readback.topic === custody.desiredTopic) throw new BindingError('topic readback confirms the desired publication');
       const binding = this.getBinding(channelId);
       if (!binding || !bindingIdentityMatchesTopicPublication(binding, custody)) throw new StaleGenerationError('topic publication reconciliation target is stale');
       const status = resolution === 'published' ? TOPIC_PUBLICATION_STATES.PUBLISHED : TOPIC_PUBLICATION_STATES.NOT_PUBLISHED;
@@ -1075,13 +1117,18 @@ class SurfaceState {
       const nextReadiness = status === TOPIC_PUBLICATION_STATES.PUBLISHED
         ? custody.desiredReadiness
         : custody.desiredReadiness === READINESS.READY ? READINESS.UNAVAILABLE : custody.desiredReadiness;
-      this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, evidence_scope=?, error=NULL, updated_at=? WHERE request_id=? AND status IN (?, ?)')
-        .run(status, outcome, evidenceScope, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN);
+      this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, evidence_scope=?, error=NULL, readback_at=?, readback_topic=?, updated_at=? WHERE request_id=? AND status IN (?, ?)')
+        .run(status, outcome, evidenceScope, readback.observedAt, readback.topic, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN);
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(nextReadiness, now(), channelId);
+      if (custody.desiredReadiness === READINESS.READY) {
+        this.db.prepare('UPDATE intake_watermarks SET state=?, detail=?, updated_at=? WHERE channel_id=?')
+          .run(status === TOPIC_PUBLICATION_STATES.PUBLISHED ? 'ready' : 'pending', status === TOPIC_PUBLICATION_STATES.PUBLISHED ? null : 'Discord topic publication is not confirmed', now(), channelId);
+      }
       this.receipt(null, 'topic-publication-reconciled', {
         requestId, channelId, provider: custody.provider, nativeId: custody.nativeId,
         conductorId: custody.conductorId, repoKey: custody.repoKey, generation: custody.generation,
-        desiredReadiness: custody.desiredReadiness, resolution, evidenceScope, custodyStatus: status
+        desiredReadiness: custody.desiredReadiness, resolution, evidenceScope, custodyStatus: status,
+        operationEndedAt: custody.operationEndedAt, readbackAt: readback.observedAt, readbackTopic: readback.topic
       });
       return this.getBinding(channelId);
     });
