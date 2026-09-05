@@ -1677,6 +1677,127 @@ test('simulated: recovered queue tail stays held after native owner change', asy
   state.close();
 });
 
+test('simulated: gateway owner queue orders recovered and live inputs during recovery', async () => {
+  const { dir, db, state: initial } = fixture();
+  let state = initial;
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'old-A', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'old A' });
+  await new Promise(resolve => setTimeout(resolve, 2));
+  state.acceptDiscordMessage({ id: 'old-B', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'old B' });
+  state.close();
+  state = new SurfaceState(db);
+
+  const dispatches = [];
+  const observations = [];
+  const releases = new Map();
+  const sends = [];
+  let fetchCount = 0;
+  let releaseSecondFetch;
+  const secondFetch = new Promise(resolve => { releaseSecondFetch = resolve; });
+  const channel = {
+    async send(payload) {
+      sends.push(payload);
+      return { id: `sent-${sends.length}` };
+    }
+  };
+  const client = new EventEmitter();
+  client.channels = {
+    fetch: async () => {
+      fetchCount += 1;
+      if (fetchCount === 2) await secondFetch;
+      return channel;
+    }
+  };
+  client.destroy = async () => {};
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {
+      codex: {
+        async dispatch(message) {
+          dispatches.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message) {
+          observations.push(message.id);
+          return new Promise(resolve => releases.set(message.id, resolve));
+        }
+      }
+    }
+  });
+  gateway.ready = true;
+
+  const recovery = gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
+  await waitForCondition(() => observations.includes('old-A'));
+  client.emit('messageCreate', discordMessage({ id: 'live-C', channelId: 'channel-codex', content: 'live C', sends }));
+  await waitForCondition(() => state.getMessage('live-C')?.state === MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(dispatches, ['old-A']);
+  releaseSecondFetch();
+  await recovery;
+  assert.deepEqual(dispatches, ['old-A']);
+
+  releases.get('old-A')({ text: 'answer A' });
+  await waitForCondition(() => observations.includes('old-B'));
+  assert.deepEqual(dispatches, ['old-A', 'old-B']);
+  releases.get('old-B')({ text: 'answer B' });
+  await waitForCondition(() => observations.includes('live-C'));
+  assert.deepEqual(dispatches, ['old-A', 'old-B', 'live-C']);
+  releases.get('live-C')({ text: 'answer C' });
+  await waitForCondition(() => state.getMessage('live-C').state === MESSAGE_STATES.REPLIED);
+  assert.deepEqual(observations, ['old-A', 'old-B', 'live-C']);
+  assert.deepEqual(sends.filter(payload => ['answer A', 'answer B', 'answer C'].includes(payload.content)).map(payload => payload.content), ['answer A', 'answer B', 'answer C']);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: live same-owner inputs keep durable FIFO order', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const dispatches = [];
+  const observations = [];
+  const releases = new Map();
+  const client = new EventEmitter();
+  client.destroy = async () => {};
+  client.channels = { fetch: async () => ({ async send() { return { id: 'unused' }; } }) };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {
+      codex: {
+        async dispatch(message) {
+          dispatches.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message) {
+          observations.push(message.id);
+          return new Promise(resolve => releases.set(message.id, resolve));
+        }
+      }
+    }
+  });
+  gateway.ready = true;
+
+  client.emit('messageCreate', discordMessage({ id: 'live-one', channelId: 'channel-codex' }));
+  await waitForCondition(() => observations.includes('live-one'));
+  await new Promise(resolve => setTimeout(resolve, 2));
+  client.emit('messageCreate', discordMessage({ id: 'live-two', channelId: 'channel-codex' }));
+  await new Promise(resolve => setTimeout(resolve, 2));
+  client.emit('messageCreate', discordMessage({ id: 'live-three', channelId: 'channel-codex' }));
+  await waitForCondition(() => state.getMessage('live-three')?.state === MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(dispatches, ['live-one']);
+
+  releases.get('live-one')({ text: 'one' });
+  await waitForCondition(() => observations.includes('live-two'));
+  releases.get('live-two')({ text: 'two' });
+  await waitForCondition(() => observations.includes('live-three'));
+  releases.get('live-three')({ text: 'three' });
+  await waitForCondition(() => state.getMessage('live-three').state === MESSAGE_STATES.REPLIED);
+  assert.deepEqual(dispatches, ['live-one', 'live-two', 'live-three']);
+  assert.deepEqual(observations, ['live-one', 'live-two', 'live-three']);
+  await gateway.stop();
+  state.close();
+});
+
 test('simulated: recovered observer stop cancels custody without native redispatch', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });

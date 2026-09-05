@@ -121,6 +121,9 @@ function transportReceiptText(message, attempt) {
 function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, trackReceipt, observeOptions = {} }) {
   const receiptWork = new Set();
   const nativeWork = new Map();
+  const ownerQueues = new Map();
+  const queuedNativeWork = new Map();
+  let queueSequence = 0;
 
   function trackReceiptWork(work) {
     const tracked = Promise.resolve(work).catch(() => null);
@@ -158,6 +161,165 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return trackReceiptWork(issueTransportReceipt(message));
   }
 
+  function nativeOwnerKey(message) {
+    const durable = message.provider && message.nativeId ? message : state.getMessage(message.id) || message;
+    return `${durable.provider}:${durable.nativeId}`;
+  }
+
+  function ownerCanAdvance(messageId) {
+    const message = state.getMessage(messageId);
+    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state);
+  }
+
+  function ownerQueueFor(key) {
+    let queue = ownerQueues.get(key);
+    if (!queue) {
+      queue = { active: null, blockedMessageId: null, entries: [] };
+      ownerQueues.set(key, queue);
+    }
+    return queue;
+  }
+
+  function blockingEarlierOwnerMessage(message) {
+    const messages = state.listMessages();
+    const currentIndex = messages.findIndex(candidate => candidate.id === message.id);
+    if (currentIndex < 0) return null;
+    return messages.slice(0, currentIndex).find(candidate => nativeOwnerKey(candidate) === nativeOwnerKey(message) &&
+      [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLYING].includes(candidate.state)) || null;
+  }
+
+  function removeAbortHandler(entry) {
+    entry.signal?.removeEventListener('abort', entry.onAbort);
+    entry.onAbort = null;
+  }
+
+  function finishOwner(entry) {
+    const queue = ownerQueues.get(entry.ownerKey);
+    if (!queue || queue.active !== entry) return;
+    if (!ownerCanAdvance(entry.message.id)) {
+      queue.blockedMessageId = entry.message.id;
+      return;
+    }
+    queue.blockedMessageId = null;
+    queue.active = null;
+    pumpOwner(entry.ownerKey);
+  }
+
+  function cancelQueuedEntry(entry) {
+    if (entry.started || entry.cancelled) return;
+    entry.cancelled = true;
+    removeAbortHandler(entry);
+    queuedNativeWork.delete(entry.message.id);
+    const queue = ownerQueues.get(entry.ownerKey);
+    if (queue) {
+      queue.entries = queue.entries.filter(item => item !== entry);
+      if (!queue.active && !queue.blockedMessageId && queue.entries.length === 0) ownerQueues.delete(entry.ownerKey);
+    }
+    entry.resolve({ status: 'stopped', message: state.getMessage(entry.message.id) });
+  }
+
+  function startOwnerEntry(entry) {
+    entry.started = true;
+    queuedNativeWork.delete(entry.message.id);
+    removeAbortHandler(entry);
+    let result;
+    try {
+      result = entry.starter(() => finishOwner(entry));
+    } catch (error) {
+      finishOwner(entry);
+      entry.reject(error);
+      return;
+    }
+    Promise.resolve(result).then(entry.resolve, entry.reject);
+  }
+
+  function pumpOwner(ownerKey) {
+    const queue = ownerQueues.get(ownerKey);
+    if (!queue || queue.active || queue.blockedMessageId) return;
+    while (queue.entries.length) {
+      const entry = queue.entries.shift();
+      if (entry.cancelled || entry.signal?.aborted) {
+        cancelQueuedEntry(entry);
+        continue;
+      }
+      queue.active = entry;
+      startOwnerEntry(entry);
+      return;
+    }
+    ownerQueues.delete(ownerKey);
+  }
+
+  function existingNativeWork(message, awaitExisting) {
+    const existing = nativeWork.get(message.id)?.promise;
+    if (existing) return awaitExisting ? existing : Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
+    const queued = queuedNativeWork.get(message.id);
+    if (!queued) return null;
+    return awaitExisting ? queued.promise : Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
+  }
+
+  function enqueueOwnerWork(message, signal, starter, awaitExisting = true, returnWhenQueued = false) {
+    const existing = existingNativeWork(message, awaitExisting);
+    if (existing) return existing;
+    const ownerKey = nativeOwnerKey(message);
+    const queue = ownerQueueFor(ownerKey);
+    const queueMessage = state.getMessage(message.id) || message;
+    if (queue.blockedMessageId && ownerCanAdvance(queue.blockedMessageId)) {
+      if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
+      queue.blockedMessageId = null;
+    }
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    promise.catch(() => {});
+    const entry = {
+      message,
+      queueMessage,
+      ownerKey,
+      starter,
+      signal,
+      promise,
+      resolve,
+      reject,
+      sequence: queueSequence++,
+      started: false,
+      cancelled: false,
+      onAbort: null
+    };
+    if (!queue.active && queue.blockedMessageId === message.id) {
+      queue.blockedMessageId = null;
+      queue.active = entry;
+      startOwnerEntry(entry);
+      return promise;
+    }
+    if (queue.active?.message.id === message.id && !queue.active.started) {
+      queue.active = entry;
+      startOwnerEntry(entry);
+      return promise;
+    }
+    if (queue.active && queue.active.message.id === message.id && !ownerCanAdvance(message.id)) {
+      queue.active = entry;
+      startOwnerEntry(entry);
+      return promise;
+    }
+    const earlier = blockingEarlierOwnerMessage(queueMessage);
+    if (!queue.active && !queue.blockedMessageId && earlier && !nativeWork.has(earlier.id) && !queuedNativeWork.has(earlier.id)) {
+      queue.blockedMessageId = earlier.id;
+    }
+    queue.entries.push(entry);
+    queue.entries.sort((left, right) => left.queueMessage.createdAt.localeCompare(right.queueMessage.createdAt) || left.sequence - right.sequence);
+    queuedNativeWork.set(message.id, entry);
+    if (signal) {
+      entry.onAbort = () => cancelQueuedEntry(entry);
+      if (signal.aborted) entry.onAbort();
+      else signal.addEventListener('abort', entry.onAbort, { once: true });
+    }
+    pumpOwner(ownerKey);
+    return returnWhenQueued ? Promise.resolve({ status: 'observing', message: state.getMessage(message.id) }) : promise;
+  }
+
   function trackNativeWork(messageId, work, onSettled = null) {
     const tracked = Promise.resolve(work);
     nativeWork.set(messageId, { promise: tracked, controller: null });
@@ -167,13 +329,6 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       try { onSettled?.(messageId); } catch {}
     }).catch(() => {});
     return tracked;
-  }
-
-  function existingNativeWork(message, awaitExisting) {
-    const existing = nativeWork.get(message.id)?.promise;
-    if (!existing) return null;
-    if (awaitExisting) return existing;
-    return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
   }
 
   function startNativeWork(messageId, signal, workFactory, onSettled = null) {
@@ -194,6 +349,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
 
   function abortNativeWork() {
     for (const entry of nativeWork.values()) entry.controller?.abort();
+    for (const entry of queuedNativeWork.values()) cancelQueuedEntry(entry);
+    ownerQueues.clear();
   }
 
   async function waitForNativeWork() {
@@ -231,28 +388,32 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return { ...result, message: state.getMessage(ready.message.id) };
   }
 
-  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, onSettled = null } = {}) {
+  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
-    let settleHandoff;
-    let rejectHandoff;
-    const handoffPromise = handoff ? new Promise((resolve, reject) => {
-      settleHandoff = resolve;
-      rejectHandoff = reject;
-    }) : null;
-    handoffPromise?.catch(() => {});
-    const work = startNativeWork(message.id, signal, async taskSignal => {
-      const result = await dispatchAndObserve(state, message.id, providers, {
-        ...observeOptions,
-        signal: taskSignal,
-        continueUntilFinal,
-        onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
+    return enqueueOwnerWork(message, signal, onNativeSettled => {
+      let settleHandoff;
+      let rejectHandoff;
+      const handoffPromise = handoff ? new Promise((resolve, reject) => {
+        settleHandoff = resolve;
+        rejectHandoff = reject;
+      }) : null;
+      handoffPromise?.catch(() => {});
+      const work = startNativeWork(message.id, signal, async taskSignal => {
+        const result = await dispatchAndObserve(state, message.id, providers, {
+          ...observeOptions,
+          signal: taskSignal,
+          continueUntilFinal,
+          onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
+        });
+        return deliverReply(message, result, taskSignal);
+      }, () => {
+        onNativeSettled();
       });
-      return deliverReply(message, result, taskSignal);
-    }, onSettled);
-    if (!handoff) return work;
-    work.then(result => settleHandoff?.(result), error => rejectHandoff?.(error));
-    return handoffPromise;
+      if (!handoff) return work;
+      work.then(result => settleHandoff?.(result), error => rejectHandoff?.(error));
+      return handoffPromise;
+    }, awaitExisting, handoff);
   }
 
   async function handleMessage(message, signal) {
@@ -268,22 +429,26 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return intake;
   }
 
-  async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false, onSettled = null } = {}) {
+  async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false } = {}) {
     launchTransportReceipt(message);
-    return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff, onSettled });
+    return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff });
   }
 
-  function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false, onSettled = null } = {}) {
+  function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false } = {}) {
     launchTransportReceipt(message);
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
-    const work = startNativeWork(message.id, signal, async taskSignal => {
-      const provider = providers[message.provider];
-      const result = await observeSubmitted(state, message, provider, { ...observeOptions, signal: taskSignal, continueUntilFinal });
-      return deliverReply(message, result, taskSignal);
-    }, onSettled);
-    if (continueUntilFinal) return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
-    return work;
+    return enqueueOwnerWork(message, signal, onNativeSettled => {
+      const work = startNativeWork(message.id, signal, async taskSignal => {
+        const provider = providers[message.provider];
+        const result = await observeSubmitted(state, message, provider, { ...observeOptions, signal: taskSignal, continueUntilFinal });
+        return deliverReply(message, result, taskSignal);
+      }, () => {
+        onNativeSettled();
+      });
+      if (continueUntilFinal) return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
+      return work;
+    }, awaitExisting, continueUntilFinal);
   }
 
   async function waitForReceipts() {
@@ -311,8 +476,6 @@ class DiscordGateway {
     this.connectionEpoch = 0;
     this.recoveryController = null;
     this.recoveryPromise = null;
-    this.recoveryDrainPromise = null;
-    this.recoveryDrainRequested = false;
     this.reconnectPromise = null;
     this.fetchHistoryInjected = typeof fetchHistory === 'function';
     this.fetchHistory = fetchHistory || ((channel, options) => channel.messages?.fetch(options));
@@ -749,32 +912,6 @@ class DiscordGateway {
     }
   }
 
-  requestRecoveryDrain(before, messageId) {
-    const settled = this.state.getMessage(messageId);
-    const ownerFree = [MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(settled?.state);
-    if (!ownerFree || this.stopping || !this.ready) return;
-    this.recoveryDrainRequested = true;
-    if (this.recoveryDrainPromise) return;
-    const task = (async () => {
-      while (this.recoveryDrainRequested && !this.stopping && this.ready) {
-        this.recoveryDrainRequested = false;
-        const activeRecovery = this.recoveryPromise;
-        if (activeRecovery) await activeRecovery.catch(() => {});
-        if (this.stopping || !this.ready) return;
-        try {
-          await this.reconcilePending(before);
-        } catch (error) {
-          if (!this.stopping) this.logger(`Discord recovery queue drain failed: ${error.message}`);
-          return;
-        }
-      }
-    })();
-    this.recoveryDrainPromise = task;
-    task.finally(() => {
-      if (this.recoveryDrainPromise === task) this.recoveryDrainPromise = null;
-    }).catch(() => {});
-  }
-
   async reconcilePending(before = new Date().toISOString()) {
     if (!this.ready) throw new Error('Discord gateway is not ready for recovery');
     if (this.recoveryPromise) return this.recoveryPromise;
@@ -792,18 +929,20 @@ class DiscordGateway {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const candidates = this.state.recoveryCandidates(before);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    const sessionTails = new Set();
+    const blockedOwners = new Set();
     for (const message of ordered) {
       if (signal?.aborted) return this.state.recoveryCandidates(before);
       const key = `${message.provider}:${message.nativeId}`;
-      if (sessionTails.has(key)) continue;
+      if (blockedOwners.has(key)) continue;
       let channel;
       try { channel = await waitForRecoveryOperation(() => this.client.channels.fetch(message.channelId), signal, deadline); } catch (error) {
         if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before);
+        blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
         continue;
       }
       if (!channel) {
+        blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, new Error('Discord channel is unavailable during recovery'));
         continue;
       }
@@ -820,20 +959,13 @@ class DiscordGateway {
       try {
         if (message.state === 'accepted') {
           result = await waitForRecoveryOperation(
-            () => this.consumer.handleStoredMessage(storedMessage, signal, {
-              continueUntilFinal: true,
-              handoff: true,
-              onSettled: settledMessageId => this.requestRecoveryDrain(before, settledMessageId)
-            }),
+            () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true }),
             signal,
             deadline
           );
         } else if (message.state === 'submitted') {
           result = await waitForRecoveryOperation(
-            () => this.consumer.resumeSubmitted(storedMessage, signal, {
-              continueUntilFinal: true,
-              onSettled: settledMessageId => this.requestRecoveryDrain(before, settledMessageId)
-            }),
+            () => this.consumer.resumeSubmitted(storedMessage, signal, { continueUntilFinal: true }),
             signal,
             deadline
           );
@@ -842,12 +974,10 @@ class DiscordGateway {
         }
       } catch (error) {
         if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before);
-        const current = this.state.getMessage(message.id);
-        if (['accepted', 'dispatching', 'submitted', 'reply_ready', 'replying'].includes(current?.state)) sessionTails.add(key);
+        blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
         continue;
       }
-      if (['accepted', 'dispatching', 'submitted', 'reply_ready', 'replying'].includes(result?.message?.state)) sessionTails.add(key);
     }
     return this.state.recoveryCandidates(before);
   }
@@ -860,12 +990,10 @@ class DiscordGateway {
     this.started = false;
     this.stopPromise = (async () => {
       this.ready = false;
-      this.recoveryDrainRequested = false;
       this.recoveryController?.abort();
       const recovery = this.recoveryPromise;
       const reconnect = this.reconnectPromise;
-      const recoveryDrain = this.recoveryDrainPromise;
-      await Promise.allSettled([recovery, reconnect, recoveryDrain].filter(Boolean));
+      await Promise.allSettled([recovery, reconnect].filter(Boolean));
       for (const controller of this.controllers) controller.abort();
       for (const controller of this.receiptControllers) controller.abort();
       this.consumer.abortNativeWork();
