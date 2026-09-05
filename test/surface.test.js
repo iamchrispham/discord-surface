@@ -1445,17 +1445,25 @@ test('simulated: noncooperative history fetch is fenced by the recovery deadline
   state.close();
 });
 
-test('simulated: submitted recovery retains the Discord channel and never redispatches', async () => {
-  const { dir, state } = fixture();
+test('simulated: submitted recovery transfers custody to one live observer without redispatch', async () => {
+  const { dir, db, state: initial } = fixture();
+  let state = initial;
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
   let sends = 0;
   let dispatches = 0;
+  let observations = 0;
+  let release;
   const channel = {
     async send() {
       sends += 1;
       return { id: 'reply-submitted-recovery' };
     }
   };
+  await state.acceptDiscordMessage({ id: 'submitted-recovery', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'already sent' });
+  state.claimDispatch('submitted-recovery');
+  state.markSubmitted('submitted-recovery', { file: '/tmp/recovered-session.jsonl', offset: 4 }, '[[discord-surface:submitted-recovery]]');
+  state.close();
+  state = new SurfaceState(db);
   const client = {
     on() {},
     off() {},
@@ -1471,18 +1479,152 @@ test('simulated: submitted recovery retains the Discord channel and never redisp
           dispatches += 1;
           throw new Error('submitted recovery must not redispatch');
         },
-        async observe() { return { text: 'recovered reply' }; }
+        async observe(_message, _outcome, options) {
+          observations += 1;
+          options.onCursor({ file: '/tmp/recovered-session.jsonl', offset: 8 });
+          return new Promise(resolve => { release = resolve; });
+        }
       }
     }
   });
-  await gateway.consumer.intakeMessage(discordMessage({ id: 'submitted-recovery', channelId: 'channel-codex', content: 'already sent' }), true);
-  state.claimDispatch('submitted-recovery');
-  state.markSubmitted('submitted-recovery');
+  gateway.ready = true;
+  const started = performance.now();
+  await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
+  assert.ok(performance.now() - started < 250);
+  assert.equal(dispatches, 0);
+  assert.equal(observations, 1);
+  assert.equal(sends, 0);
+  assert.equal(state.getMessage('submitted-recovery').state, MESSAGE_STATES.SUBMITTED);
+  release({ text: 'recovered reply' });
+  for (let attempt = 0; attempt < 100 && state.getMessage('submitted-recovery').state !== MESSAGE_STATES.REPLIED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(state.getMessage('submitted-recovery').state, MESSAGE_STATES.REPLIED);
+  assert.equal(sends, 1);
+  assert.equal(state.getMessage('submitted-recovery').observerCursor.offset, 8);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: accepted recovery transfers submitted custody without blocking on the final', async () => {
+  const { dir, db, state: initial } = fixture();
+  let state = initial;
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  await state.acceptDiscordMessage({ id: 'accepted-recovery-late', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'held before restart' });
+  state.close();
+  state = new SurfaceState(db);
+  const sends = [];
+  let dispatches = 0;
+  let observations = 0;
+  let release;
+  const channel = {
+    async send(payload) {
+      sends.push(payload);
+      return { id: `sent-${sends.length}` };
+    }
+  };
+  const client = {
+    on() {},
+    off() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {
+      codex: {
+        async dispatch() { dispatches += 1; return { status: 'submitted' }; },
+        async observe(_message, _outcome, options) {
+          observations += 1;
+          options.onCursor({ file: '/tmp/accepted-recovery.jsonl', offset: 12 });
+          return new Promise(resolve => { release = resolve; });
+        }
+      }
+    }
+  });
+  gateway.ready = true;
+  const started = performance.now();
+  await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
+  assert.ok(performance.now() - started < 250);
+  assert.equal(dispatches, 1);
+  assert.equal(observations, 1);
+  assert.equal(state.getMessage('accepted-recovery-late').state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(sends.filter(payload => String(payload.content).startsWith('Receipt:')).length, 1);
+  release({ text: 'answer after recovery' });
+  for (let attempt = 0; attempt < 100 && state.getMessage('accepted-recovery-late').state !== MESSAGE_STATES.REPLIED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(state.getMessage('accepted-recovery-late').state, MESSAGE_STATES.REPLIED);
+  assert.equal(sends.filter(payload => payload.content === 'answer after recovery').length, 1);
+  assert.equal(state.getMessage('accepted-recovery-late').observerCursor.offset, 12);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: recovered observer stop cancels custody without native redispatch', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'submitted-recovery-stop', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'stop me' });
+  state.claimDispatch('submitted-recovery-stop');
+  state.markSubmitted('submitted-recovery-stop');
+  let observations = 0;
+  let stopped = 0;
+  const client = {
+    on() {},
+    off() {},
+    channels: { fetch: async () => ({ async send() { return { id: 'receipt-stop' }; } }) },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {
+      codex: {
+        async dispatch() { throw new Error('recovery stop must not redispatch'); },
+        async observe(_message, _outcome, { signal }) {
+          observations += 1;
+          return new Promise(resolve => signal.addEventListener('abort', () => { stopped += 1; resolve({ stopped: true }); }, { once: true }));
+        }
+      }
+    }
+  });
   gateway.ready = true;
   await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
-  assert.equal(sends, 1);
-  assert.equal(dispatches, 0);
-  assert.equal(state.getMessage('submitted-recovery').state, MESSAGE_STATES.REPLIED);
+  assert.equal(observations, 1);
+  await gateway.stop();
+  assert.equal(stopped, 1);
+  assert.equal(state.getMessage('submitted-recovery-stop').state, MESSAGE_STATES.SUBMITTED);
+  state.close();
+});
+
+test('simulated: recovered observer rejects a late reply after owner revocation', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'submitted-recovery-owner', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'owner fence' });
+  state.claimDispatch('submitted-recovery-owner');
+  state.markSubmitted('submitted-recovery-owner');
+  let release;
+  let sends = 0;
+  const client = {
+    on() {},
+    off() {},
+    channels: { fetch: async () => ({ async send() { sends += 1; return { id: 'unexpected-reply' }; } }) },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {
+      codex: {
+        async dispatch() { throw new Error('owner fence must not redispatch'); },
+        async observe() { return new Promise(resolve => { release = resolve; }); }
+      }
+    }
+  });
+  gateway.ready = true;
+  await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
+  state.setConfig({ operatorId: 'revoked-owner', guildId: 'guild-1', secretFile: path.join(dir, 'discord.env') });
+  release({ text: 'late after owner change' });
+  for (let attempt = 0; attempt < 100 && state.getMessage('submitted-recovery-owner').state === MESSAGE_STATES.SUBMITTED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(state.getMessage('submitted-recovery-owner').state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(sends, 0);
   await gateway.stop();
   state.close();
 });

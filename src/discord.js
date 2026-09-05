@@ -160,18 +160,44 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
 
   function trackNativeWork(messageId, work) {
     const tracked = Promise.resolve(work);
-    nativeWork.set(messageId, tracked);
+    nativeWork.set(messageId, { promise: tracked, controller: null });
     tracked.finally(() => {
-      if (nativeWork.get(messageId) === tracked) nativeWork.delete(messageId);
+      if (nativeWork.get(messageId)?.promise === tracked) nativeWork.delete(messageId);
     }).catch(() => {});
     return tracked;
   }
 
   function existingNativeWork(message, awaitExisting) {
-    const existing = nativeWork.get(message.id);
+    const existing = nativeWork.get(message.id)?.promise;
     if (!existing) return null;
     if (awaitExisting) return existing;
     return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
+  }
+
+  function startNativeWork(messageId, signal, workFactory) {
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
+    const work = Promise.resolve().then(() => {
+      if (controller.signal.aborted) return { status: 'stopped', message: null };
+      return workFactory(controller.signal);
+    });
+    const tracked = trackNativeWork(messageId, work);
+    const entry = nativeWork.get(messageId);
+    if (entry?.promise === tracked) entry.controller = controller;
+    tracked.finally(() => signal?.removeEventListener('abort', onAbort)).catch(() => {});
+    return tracked;
+  }
+
+  function abortNativeWork() {
+    for (const entry of nativeWork.values()) entry.controller?.abort();
+  }
+
+  async function waitForNativeWork() {
+    while (nativeWork.size) {
+      await Promise.allSettled([...nativeWork.values()].map(entry => entry.promise));
+    }
   }
 
   async function deliverReply(message, result, signal) {
@@ -203,14 +229,28 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return { ...result, message: state.getMessage(ready.message.id) };
   }
 
-  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true } = {}) {
+  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
-    const work = (async () => {
-      const result = await dispatchAndObserve(state, message.id, providers, { ...observeOptions, signal, continueUntilFinal });
-      return deliverReply(message, result, signal);
-    })();
-    return trackNativeWork(message.id, work);
+    let settleHandoff;
+    let rejectHandoff;
+    const handoffPromise = handoff ? new Promise((resolve, reject) => {
+      settleHandoff = resolve;
+      rejectHandoff = reject;
+    }) : null;
+    handoffPromise?.catch(() => {});
+    const work = startNativeWork(message.id, signal, async taskSignal => {
+      const result = await dispatchAndObserve(state, message.id, providers, {
+        ...observeOptions,
+        signal: taskSignal,
+        continueUntilFinal,
+        onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
+      });
+      return deliverReply(message, result, taskSignal);
+    });
+    if (!handoff) return work;
+    work.then(result => settleHandoff?.(result), error => rejectHandoff?.(error));
+    return handoffPromise;
   }
 
   async function handleMessage(message, signal) {
@@ -226,28 +266,29 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return intake;
   }
 
-  async function handleStoredMessage(message, signal) {
+  async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false } = {}) {
     launchTransportReceipt(message);
-    return processAccepted(message, signal, { continueUntilFinal: false, awaitExisting: false });
+    return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff });
   }
 
-  function resumeSubmitted(message, signal, { awaitExisting = false } = {}) {
+  function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false } = {}) {
     launchTransportReceipt(message);
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
-    const work = (async () => {
+    const work = startNativeWork(message.id, signal, async taskSignal => {
       const provider = providers[message.provider];
-      const result = await observeSubmitted(state, message, provider, { ...observeOptions, signal, continueUntilFinal: false });
-      return deliverReply(message, result, signal);
-    })();
-    return trackNativeWork(message.id, work);
+      const result = await observeSubmitted(state, message, provider, { ...observeOptions, signal: taskSignal, continueUntilFinal });
+      return deliverReply(message, result, taskSignal);
+    });
+    if (continueUntilFinal) return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
+    return work;
   }
 
   async function waitForReceipts() {
     await Promise.allSettled([...receiptWork]);
   }
 
-  return { deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, resumeSubmitted, waitForReceipts };
+  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, resumeSubmitted, waitForNativeWork, waitForReceipts };
 }
 
 class DiscordGateway {
@@ -746,10 +787,30 @@ class DiscordGateway {
         channel
       };
       let result;
-      if (message.state === 'accepted') result = await this.consumer.handleStoredMessage(storedMessage, signal);
-      else if (message.state === 'submitted') result = await this.consumer.resumeSubmitted(storedMessage, signal);
-      else result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
-      if (['accepted', 'submitted', 'reply_ready', 'replying'].includes(result?.message?.state)) sessionTails.add(key);
+      try {
+        if (message.state === 'accepted') {
+          result = await waitForRecoveryOperation(
+            () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true }),
+            signal,
+            deadline
+          );
+        } else if (message.state === 'submitted') {
+          result = await waitForRecoveryOperation(
+            () => this.consumer.resumeSubmitted(storedMessage, signal, { continueUntilFinal: true }),
+            signal,
+            deadline
+          );
+        } else {
+          result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
+        }
+      } catch (error) {
+        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before);
+        const current = this.state.getMessage(message.id);
+        if (['accepted', 'dispatching', 'submitted', 'reply_ready', 'replying'].includes(current?.state)) sessionTails.add(key);
+        this.state.markObservationUnavailable(message.id, error);
+        continue;
+      }
+      if (['accepted', 'dispatching', 'submitted', 'reply_ready', 'replying'].includes(result?.message?.state)) sessionTails.add(key);
     }
     return this.state.recoveryCandidates(before);
   }
@@ -768,7 +829,9 @@ class DiscordGateway {
       await Promise.allSettled([recovery, reconnect].filter(Boolean));
       for (const controller of this.controllers) controller.abort();
       for (const controller of this.receiptControllers) controller.abort();
+      this.consumer.abortNativeWork();
       await Promise.allSettled([...this.inFlight]);
+      await this.consumer.waitForNativeWork();
       await this.consumer.waitForReceipts();
       this.client.off?.('messageCreate', this.boundMessage);
       this.client.off?.('shardResume', this.boundResume);

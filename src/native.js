@@ -368,6 +368,7 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
   }
   const marker = `[[discord-surface:${message.id}]]`;
   state.markSubmitted(message.id, outcome.cursor || null, marker);
+  try { options.onSubmitted?.(state.getMessage(message.id)); } catch {}
   const observation = await observeSubmitted(state, state.getMessage(message.id), provider, options);
   return observation;
 }
