@@ -815,6 +815,36 @@ class SurfaceState {
     });
   }
 
+  recordTopicPublication(channelId, publication, expectedBinding = null) {
+    assertText(channelId, 'channelId', 128);
+    if (!publication || typeof publication.desiredReadiness !== 'string') throw new BindingError('topic publication readiness is required');
+    if (!Object.values(READINESS).includes(publication.desiredReadiness)) throw new BindingError('invalid topic publication readiness');
+    return this.transaction(() => {
+      const binding = this.getBinding(channelId);
+      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+      const outcome = String(publication.outcome || 'unknown');
+      const failedReadyPublication = publication.desiredReadiness === READINESS.READY && outcome !== 'published';
+      if (failedReadyPublication) {
+        this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1').run(READINESS.UNAVAILABLE, now(), channelId);
+      }
+      this.receipt(null, 'topic-publication', {
+        channelId,
+        conductorId: binding.conductorId,
+        repoKey: binding.repoKey,
+        provider: binding.provider,
+        nativeId: binding.nativeId,
+        generation: binding.generation,
+        desiredReadiness: publication.desiredReadiness,
+        publishedReadiness: publication.publishedReadiness || null,
+        publishedAt: publication.publishedAt || null,
+        outcome,
+        observedTopic: typeof publication.observedTopic === 'string' ? publication.observedTopic : null,
+        error: publication.error ? String(publication.error).slice(0, 200) : null
+      });
+      return this.getBinding(channelId);
+    });
+  }
+
   reconcileIntake(channelId) {
     assertText(channelId, 'channelId', 128);
     return this.transaction(() => {
@@ -1248,6 +1278,11 @@ class SurfaceState {
     const bindings = this.listBindings();
     const messages = this.listMessages();
     const watermarks = this.listIntakeWatermarks();
+    const topicPublications = new Map();
+    for (const row of this.listReceipts().filter(item => item.kind === 'topic-publication')) {
+      const detail = parseJson(row.detail, {});
+      if (detail.channelId) topicPublications.set(detail.channelId, { ...detail, recordedAt: row.created_at });
+    }
     const watermarkGap = watermarks.find(row => row.state === 'gap' || row.state === 'unavailable');
     const watermarkPending = watermarks.some(row => row.state === 'pending');
     return {
@@ -1266,7 +1301,8 @@ class SurfaceState {
         connectionBackfill: watermarkGap ? (watermarkGap.state === 'gap' ? 'unrecoverable-gap' : 'unavailable') : watermarkPending ? 'pending' : watermarks.length ? 'bounded-by-discord-watermark' : 'pending',
         recovery: RECOVERY_LIMITS
       },
-      intakeWatermarks: watermarks.map(row => ({ channelId: row.channel_id, lastSeenId: row.last_seen_id, recoveredThroughId: row.recovered_through_id, state: row.state, gapFrom: row.gap_from, gapTo: row.gap_to, detail: row.detail }))
+      intakeWatermarks: watermarks.map(row => ({ channelId: row.channel_id, lastSeenId: row.last_seen_id, recoveredThroughId: row.recovered_through_id, state: row.state, gapFrom: row.gap_from, gapTo: row.gap_to, detail: row.detail })),
+      topicPublications: [...topicPublications.values()]
     };
   }
 

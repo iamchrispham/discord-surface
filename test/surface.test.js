@@ -12,6 +12,7 @@ const { CodexProvider, dispatchAndObserve, finalText, observeCodexReply, observe
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
 const { bindingArgs, conductorMarker, ensureProvisionedChannel, provisionMarker, setChannelTopic } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
+const { conductorMarkerMatches, topicWithReadiness } = require('../src/topic');
 
 const CODEX_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CLAUDE_ID = '01a0701c-5714-7671-a455-db7d67f9fa78';
@@ -886,7 +887,7 @@ test('simulated: live custody during readiness topic close becomes an explicit r
     permissionsFor: () => historyPermissions(),
     async setTopic(topic) {
       this.topic = topic;
-      if (topic.endsWith('readiness=ready')) listeners.get('messageCreate')?.(discordMessage({ id: '201', channelId: 'channel-codex' }));
+      if (/\breadiness=ready\b/.test(topic)) listeners.get('messageCreate')?.(discordMessage({ id: '201', channelId: 'channel-codex' }));
     }
   };
   const client = {
@@ -1055,11 +1056,12 @@ test('simulated: handoff during history fetch cannot authorize the successor', a
   state.setIntakeBaseline('mid-fetch-handoff', '100', 'previous completed recovery');
   state.markIntakeBoundary('mid-fetch-handoff', 'ready');
   const old = state.getBinding('mid-fetch-handoff');
+  let topicWrites = 0;
   const channel = {
     id: 'mid-fetch-handoff',
     topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'mid-fetch-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }),
     permissionsFor: () => historyPermissions(),
-    async setTopic(topic) { this.topic = topic; }
+    async setTopic(topic) { topicWrites += 1; this.topic = topic; }
   };
   const client = {
     user: { id: 'bot-1' },
@@ -1086,7 +1088,8 @@ test('simulated: handoff during history fetch cannot authorize the successor', a
   assert.equal(current.generation, 2);
   assert.equal(current.readiness, READINESS.PENDING);
   assert.equal(historyCalls, 1);
-  assert.match(channel.topic, /generation=1 readiness=recovering/);
+  assert.equal(topicWrites, 0);
+  assert.equal(channel.topic, conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'mid-fetch-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }));
   await gateway.stop();
   state.close();
 });
@@ -1126,8 +1129,132 @@ test('simulated: handoff during readiness topic write cannot authorize the succe
   assert.equal(current.nativeId, SUCCESSOR_ID);
   assert.equal(current.generation, 2);
   assert.equal(current.readiness, READINESS.PENDING);
-  assert.equal(historyCalls, 0);
-  assert.match(channel.topic, /generation=1 readiness=recovering/);
+  assert.equal(historyCalls, 1);
+  assert.match(channel.topic, /native=9caa5d21-2169-429d-918b-5f08651b5dbd generation=1 readiness=ready/);
+  assert.equal(conductorMarkerMatches(channel.topic, { provider: 'codex', nativeId: SUCCESSOR_ID, conductorId: 'mid-topic-conductor', repoKey: 'repo:alpha', generation: 2 }), false);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: terminal topic publication is fenced when handoff commits during write', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'terminal-topic-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'terminal-topic-conductor', repoKey: 'repo:alpha' });
+  state.setIntakeBaseline('terminal-topic-handoff', '100', 'previous completed recovery');
+  state.markIntakeBoundary('terminal-topic-handoff', 'ready');
+  const old = state.getBinding('terminal-topic-handoff');
+  let topicWrites = 0;
+  const channel = {
+    id: 'terminal-topic-handoff',
+    topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'terminal-topic-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }),
+    permissionsFor: () => historyPermissions(),
+    async setTopic(topic) {
+      topicWrites += 1;
+      state.handoffConductor({ ...old, fromNativeId: old.nativeId, fromGeneration: old.generation, nativeId: SUCCESSOR_ID, handoffId: 'terminal-topic-handoff-1' });
+      this.topic = topic;
+    }
+  };
+  const client = {
+    user: { id: 'bot-1' },
+    on() {},
+    off() {},
+    channels: { fetch: async () => channel },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [] });
+  const result = await gateway.recoverTransport('restart');
+  const current = state.getBinding('terminal-topic-handoff');
+  assert.equal(result.ready, false);
+  assert.equal(result.state, 'unavailable');
+  assert.equal(topicWrites, 1);
+  assert.equal(current.nativeId, SUCCESSOR_ID);
+  assert.equal(current.generation, 2);
+  assert.equal(current.readiness, READINESS.PENDING);
+  assert.equal(conductorMarkerMatches(channel.topic, { provider: 'codex', nativeId: SUCCESSOR_ID, conductorId: 'terminal-topic-conductor', repoKey: 'repo:alpha', generation: 2 }), false);
+  assert.equal(state.getReadiness().topicPublications.length, 0);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: terminal topic rate limit keeps history custody and blocks dispatch', async () => {
+  for (const [label, makeError, expectedOutcome] of [
+    ['rate limit', () => Object.assign(new Error('Discord topic rate limited'), { name: 'RateLimitError', status: 429 }), 'rate_limited'],
+    ['ambiguous send', () => Object.assign(new Error('socket closed after topic send'), { code: 'ECONNRESET' }), 'unknown']
+  ]) {
+    const { dir, state } = fixture();
+    state.bind({ channelId: `topic-${label.replace(/\s/g, '-')}`, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: `topic-${label}`, repoKey: 'repo:alpha' });
+    const channelId = `topic-${label.replace(/\s/g, '-')}`;
+    state.setIntakeBaseline(channelId, '100', 'previous completed recovery');
+    state.markIntakeBoundary(channelId, 'ready');
+    const marker = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: `topic-${label}`, repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY });
+    const rest = { options: { rejectOnRateLimit: null }, async patch(route, options) {
+      assert.equal(route, `/channels/${channelId}`);
+      assert.equal(options.body.topic.includes('last-published-intake=ready'), true);
+      assert.equal(rest.options.rejectOnRateLimit({ method: 'PATCH', route: '/channels/:id' }), true);
+      throw makeError();
+    } };
+    const channel = { id: channelId, topic: marker, client: { rest }, permissionsFor: () => historyPermissions() };
+    const client = { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} };
+    let dispatches = 0;
+    const gateway = new DiscordGateway({
+      state,
+      client,
+      providers: { codex: { async dispatch() { dispatches += 1; return { status: 'submitted' }; }, async observe() { return { text: 'unused' }; } } },
+      fetchHistory: async () => []
+    });
+    const result = await gateway.recoverTransport('restart');
+    const watermark = state.getIntakeWatermark(channelId);
+    const binding = state.getBinding(channelId);
+    const publication = state.getReadiness().topicPublications.find(item => item.channelId === channelId);
+    assert.equal(result.ready, false, label);
+    assert.equal(result.state, 'unavailable', label);
+    assert.equal(watermark.recovered_through_id, '100', label);
+    assert.equal(watermark.state, READINESS.READY, label);
+    assert.equal(binding.readiness, READINESS.UNAVAILABLE, label);
+    assert.equal(publication.outcome, expectedOutcome, label);
+    assert.equal(publication.desiredReadiness, READINESS.READY, label);
+    assert.equal(rest.options.rejectOnRateLimit, null, label);
+    const held = await gateway.consumer.handleMessage(discordMessage({ id: `held-${label}`, channelId }));
+    assert.equal(dispatches, 0, label);
+    assert.equal(held.status, 'binding-not-ready', label);
+    assert.equal(state.getMessage(`held-${label}`).state, MESSAGE_STATES.ACCEPTED, label);
+    await gateway.stop();
+    state.close();
+  }
+});
+
+test('simulated: uncooperative terminal topic request is deadline-fenced and leaves coverage durable', async () => {
+  const { dir, state } = fixture();
+  const channelId = 'topic-deadline';
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-deadline-conductor', repoKey: 'repo:alpha' });
+  state.setIntakeBaseline(channelId, '100', 'previous completed recovery');
+  state.markIntakeBoundary(channelId, 'ready');
+  let aborted = false;
+  const rest = {
+    options: { rejectOnRateLimit: null, retries: 3 },
+    async patch(_route, { signal }) {
+      signal.addEventListener('abort', () => { aborted = true; }, { once: true });
+      return new Promise(() => {});
+    }
+  };
+  const channel = {
+    id: channelId,
+    topic: conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'topic-deadline-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY }),
+    client: { rest },
+    permissionsFor: () => historyPermissions()
+  };
+  const client = { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} };
+  const gateway = new DiscordGateway({ state, client, recoveryOptions: { timeoutMs: 1000 }, fetchHistory: async () => [] });
+  const started = Date.now();
+  const result = await gateway.recoverTransport('restart');
+  assert.ok(Date.now() - started < 1400);
+  assert.equal(result.ready, false);
+  assert.equal(result.state, 'unavailable');
+  assert.equal(aborted, true);
+  assert.equal(rest.options.rejectOnRateLimit, null);
+  assert.equal(rest.options.retries, 3);
+  assert.equal(state.getIntakeWatermark(channelId).recovered_through_id, '100');
+  assert.equal(state.getIntakeWatermark(channelId).state, READINESS.READY);
+  assert.equal(state.getBinding(channelId).readiness, READINESS.UNAVAILABLE);
   await gateway.stop();
   state.close();
 });
@@ -1510,6 +1637,27 @@ test('simulated: stable conductor markers repeat, adopt the existing setup chann
 
   const unresolvedGuild = { channels: { cache: { values: () => [][Symbol.iterator]() }, async fetch() {}, async create() { throw new Error('must not retry unknown create'); } } };
   await assert.rejects(() => ensureProvisionedChannel({ guild: unresolvedGuild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'other-conductor', repoKey: 'repo:alpha', allowCreate: false }), /unresolved/);
+});
+
+test('simulated: intake topic qualifier is strict and repeated adoption preserves it', async () => {
+  const marker = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, categoryId: 'unused', conductorId: 'qualified-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY });
+  const publishedAt = '2026-09-05T12:00:00.000Z';
+  const qualified = topicWithReadiness(marker, READINESS.READY, publishedAt);
+  const expected = { provider: 'codex', nativeId: CODEX_ID, conductorId: 'qualified-conductor', repoKey: 'repo:alpha', generation: 1 };
+  assert.equal(conductorMarkerMatches(qualified, expected), true);
+  assert.equal(conductorMarkerMatches(`${qualified} trailing text`, expected), false);
+  let writes = 0;
+  const existing = { id: 'qualified-channel', parentId: 'codex-category', topic: qualified, async setTopic() { writes += 1; } };
+  const guild = { channels: {
+    cache: { values: () => [existing][Symbol.iterator]() },
+    async fetch() { return existing; },
+    async create() { throw new Error('qualified marker must reuse channel'); }
+  } };
+  const result = await ensureProvisionedChannel({ guild, provider: 'codex', nativeId: CODEX_ID, categoryId: 'codex-category', conductorId: 'qualified-conductor', repoKey: 'repo:alpha', channelId: existing.id });
+  assert.equal(result.created, false);
+  assert.equal(result.adopted, false);
+  assert.equal(existing.topic, qualified);
+  assert.equal(writes, 0);
 });
 
 test('simulated: durable provision intent rejects a second unresolved create attempt', () => {

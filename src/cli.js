@@ -7,6 +7,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
 const { ClaudeChannel } = require('./claude-channel');
+const { conductorMarkerMatches: matchesTopicMarker, topicPresentation } = require('./topic');
 
 function parseArgs(argv) {
   const args = {};
@@ -119,18 +120,12 @@ function conductorMarker({ provider, nativeId, conductorId, repoKey, generation 
 }
 
 function legacyAdoptionTopic(topic, provider, nativeId) {
-  return topic === provisionMarker(provider, nativeId) || topic === `Conductor task: ${provider}/${nativeId}`;
+  const base = topicPresentation(topic).base;
+  return base === provisionMarker(provider, nativeId) || base === `Conductor task: ${provider}/${nativeId}`;
 }
 
 function conductorMarkerMatches(topic, expected) {
-  if (typeof topic !== 'string') return false;
-  const match = topic.match(/^discord-surface:v2 conductor=([^\s]+) provider=(codex|claude) repo=([^\s]+) native=([^\s]+) generation=(\d+) readiness=([^\s]+)$/);
-  if (!match) return false;
-  try {
-    return decodeURIComponent(match[1]) === expected.conductorId && match[2] === expected.provider &&
-      decodeURIComponent(match[3]) === expected.repoKey && match[4] === expected.nativeId &&
-      Number(match[5]) === expected.generation;
-  } catch { return false; }
+  return matchesTopicMarker(topic, expected);
 }
 
 async function setChannelTopic(channel, topic) {
@@ -157,8 +152,10 @@ async function ensureProvisionedChannel({ guild, provider, nativeId, categoryId,
     if (channel.parentId !== categoryId) throw new Error('requested adoption channel is outside the configured vendor category');
     if (channel.topic !== marker) {
       const v2Match = conductorMarkerMatches(channel.topic, { provider, nativeId, conductorId, repoKey, generation });
-      if (!v2Match && !legacyAdoptionTopic(channel.topic, provider, nativeId)) throw new Error('requested adoption channel metadata does not match the native identity');
-      adopted = true;
+      const legacyMatch = legacyAdoptionTopic(channel.topic, provider, nativeId);
+      if (!v2Match && !legacyMatch) throw new Error('requested adoption channel metadata does not match the native identity');
+      adopted = legacyMatch;
+      if (v2Match) return { channel, created: false, adopted, marker };
     }
     await setChannelTopic(channel, marker);
     return { channel, created: false, adopted, marker };
@@ -218,7 +215,7 @@ async function provisionInternal(args) {
       await client.login(readSecret(config.secretFile));
       const guild = await client.guilds.fetch(config.guildId);
       const boundChannel = await guild.channels.fetch(existingBinding.channelId);
-      if (!boundChannel || boundChannel.parentId !== categoryId || boundChannel.topic !== marker) {
+      if (!boundChannel || boundChannel.parentId !== categoryId || !conductorMarkerMatches(boundChannel.topic, { provider, nativeId, conductorId, repoKey, generation: existingBinding.generation })) {
         throw new Error('existing conductor channel does not match requested metadata');
       }
       print({ created: false, adopted: false, bound: true, marker, conductorId, repoKey, channelId: existingBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingBinding.channelId}`, binding: existingBinding });
