@@ -12,7 +12,7 @@ const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkErr
 const { CodexProvider, claudeEvent, codexPrompt, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
 const { deriveLiaisonFacts, rawReceiptFor, runLiaisonDraft, validateLiaisonSelection } = require('../src/liaison');
-const { bindingArgs, conductorMarker, ensureProvisionedChannel, migrateLegacyTopic, provisionMarker } = require('../src/cli');
+const { bindingArgs, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, migrateLegacyTopic, pathsFor, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
 const { conductorMarkerMatches, topicWithReadiness } = require('../src/topic');
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
@@ -1397,6 +1397,51 @@ test('simulated: v1.4 migration adds empty attachment metadata to legacy message
   assert.deepEqual(migrated.getMessage('legacy-text').attachments, []);
   assert.equal(migrated.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.5');
   migrated.close();
+});
+
+test('simulated: status distinguishes matching, stopped, stale, and unknown Gateway owners', async () => {
+  const { dir, state } = fixture();
+  state.close();
+  const paths = pathsFor({ 'state-dir': dir });
+  const status = () => gatewayProcessStatus(paths);
+  assert.deepEqual(status(), { state: 'stopped', pid: null, connection: 'unavailable', reason: 'pid-file-missing' });
+
+  const childScript = 'setInterval(() => {}, 1000)';
+  const matching = spawn(process.execPath, ['-e', childScript, CLI_PATH, 'run', '--state-dir', dir], { stdio: 'ignore' });
+  try {
+    fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
+    const running = status();
+    assert.equal(running.state, 'running');
+    assert.equal(running.pid, matching.pid);
+    assert.equal(running.connection, 'unverified-live');
+    const printed = spawnSync(process.execPath, [CLI_PATH, 'status', '--state-dir', dir], { encoding: 'utf8' });
+    assert.equal(printed.status, 0, printed.stderr);
+    assert.equal(JSON.parse(printed.stdout).gateway.state, 'running');
+    assert.equal(fs.existsSync(paths.pid), true);
+  } finally {
+    matching.kill('SIGTERM');
+    await waitForProcessGone(matching.pid);
+  }
+
+  const stale = status();
+  assert.equal(stale.state, 'stale');
+  assert.equal(stale.pid, matching.pid);
+  assert.equal(stale.connection, 'unavailable');
+
+  const wrong = spawn(process.execPath, ['-e', childScript, CLI_PATH, 'wrong-command', '--state-dir', dir], { stdio: 'ignore' });
+  try {
+    fs.writeFileSync(paths.pid, JSON.stringify({ pid: wrong.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
+    assert.deepEqual(status(), { state: 'unknown', pid: wrong.pid, connection: 'unknown', reason: 'pid-owner-mismatch' });
+  } finally {
+    wrong.kill('SIGTERM');
+    await waitForProcessGone(wrong.pid);
+  }
+
+  fs.writeFileSync(paths.pid, '{not-json', { mode: 0o600 });
+  assert.deepEqual(status(), { state: 'unknown', pid: null, connection: 'unknown', reason: 'pid-file-corrupt' });
+  fs.writeFileSync(paths.pid, JSON.stringify({ pid: 'nope', stateDir: dir, command: 'run' }), { mode: 0o600 });
+  assert.deepEqual(status(), { state: 'unknown', pid: null, connection: 'unknown', reason: 'pid-file-invalid' });
+  fs.unlinkSync(paths.pid);
 });
 
 test('simulated: status readiness labels live permission and quota gates as unverified', () => {

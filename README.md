@@ -90,6 +90,8 @@ node src/cli.js status --state-dir "$HOME/.config/discord-surface"
 node src/cli.js stop --state-dir "$HOME/.config/discord-surface"
 ```
 
+`status` includes a `gateway` process object. Its `state` is `running` only when the runtime PID file and the matching `ps` command identify this adapter and state directory. `stopped` means no PID file exists, `stale` means the recorded process is gone, and `unknown` means the PID file or owner identity cannot be verified. A `running` process reports `connection: unverified-live`; it does not claim a Discord connection.
+
 The Codex provider queues `codex queue --thread <UUID>` in the bound workspace. It observes only the matching session JSONL file and does not select a task by name, newest activity, directory, or process ID. The runtime never adds approval bypass flags.
 
 Claude Channels require opt-in when the native Claude session launches. Start the channel server with the exact pre-bound UUID and short owner-only socket path, then pass that command in the MCP configuration used to launch the native session. The Claude process must be started with its Channels flag and the normal permission mode chosen by the operator. EOF or transport close stops the HTTP server, socket, MCP transport, and local state handle.

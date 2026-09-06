@@ -90,7 +90,7 @@ function unbind(args) {
 
 function status(args) {
   const { state } = openState(args);
-  try { print({ config: state.getConfig(), readiness: state.getReadiness(), bindings: state.listBindings(), messages: state.listMessages(), receipts: state.listReceipts() }); }
+  try { print({ config: state.getConfig(), gateway: gatewayProcessStatus(pathsFor(args)), readiness: state.getReadiness(), bindings: state.listBindings(), messages: state.listMessages(), receipts: state.listReceipts() }); }
   finally { state.close(); }
 }
 
@@ -649,12 +649,52 @@ function claudeReply(args) {
   } finally { state.close(); }
 }
 
-function pidMatches(value, stateDir) {
+function readProcessCommand(pid) {
+  return execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
+}
+
+function pidMatches(value, stateDir, command) {
   if (!value || value.command !== 'run' || value.stateDir !== stateDir) return false;
   try {
-    const command = execFileSync('ps', ['-p', String(value.pid), '-o', 'command='], { encoding: 'utf8' });
-    return command.includes(__filename) && command.includes(' run ') && command.includes(stateDir);
+    const actualCommand = command ?? readProcessCommand(value.pid);
+    return actualCommand.includes(__filename) && actualCommand.includes(' run ') && actualCommand.includes(stateDir);
   } catch { return false; }
+}
+
+function gatewayProcessStatus(paths) {
+  if (!fs.existsSync(paths.pid)) {
+    return { state: 'stopped', pid: null, connection: 'unavailable', reason: 'pid-file-missing' };
+  }
+
+  let value;
+  try { value = JSON.parse(fs.readFileSync(paths.pid, 'utf8')); }
+  catch { return { state: 'unknown', pid: null, connection: 'unknown', reason: 'pid-file-corrupt' }; }
+
+  const runtimePid = Number(value?.pid);
+  if (!Number.isSafeInteger(runtimePid) || runtimePid < 1) {
+    return { state: 'unknown', pid: null, connection: 'unknown', reason: 'pid-file-invalid' };
+  }
+
+  try { process.kill(runtimePid, 0); }
+  catch (error) {
+    if (error.code === 'ESRCH') return { state: 'stale', pid: runtimePid, connection: 'unavailable', reason: 'pid-not-running' };
+    return { state: 'unknown', pid: runtimePid, connection: 'unknown', reason: 'process-probe-failed' };
+  }
+
+  let command;
+  try { command = readProcessCommand(runtimePid); }
+  catch { return { state: 'unknown', pid: runtimePid, connection: 'unknown', reason: 'process-inspection-failed' }; }
+  if (!pidMatches(value, paths.stateDir, command)) {
+    return { state: 'unknown', pid: runtimePid, connection: 'unknown', reason: 'pid-owner-mismatch' };
+  }
+  return {
+    state: 'running',
+    pid: runtimePid,
+    connection: 'unverified-live',
+    guildId: value.guildId,
+    stateDir: value.stateDir,
+    startedAt: value.startedAt
+  };
 }
 
 function waitForExit(pid, timeoutMs = 10000) {
@@ -725,4 +765,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, ensureProvisionedChannel, handoffInternal, liaisonDraft, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };
