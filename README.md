@@ -116,6 +116,18 @@ Claude Channels require opt-in when the native Claude session launches. Start th
 
 The channel process forwards events only after checking its exact native UUID, binding endpoint, and generation. Its `reply` tool requires the inbound Discord message ID and generation. It persists reply custody before acknowledging the MCP tool call. A Claude session without launch-time channel opt-in is not attached or resumed by this adapter.
 
+A running Claude session may opt into the same transport through its native `Monitor` tool without a session restart. Start this blocking command from `Monitor` with the exact bound UUID and socket. The command writes no startup text. Each accepted event becomes one JSON line on stdout, and the event includes the exact message ID, native UUID, generation, a suggested owner-only reply directory and file, and the `claude-reply` command. Create the directory if needed, write the final answer to that file, then run the command from the event. The command calls the same durable `recordNativeReply` path as the Claude channel tool.
+
+```text
+Monitor command:
+node /absolute/path/to/discord-surface/src/cli.js claude-monitor \
+  --state-dir /Users/you/.config/discord-surface \
+  --native-id CLAUDE_SESSION_UUID \
+  --socket /tmp/discord-surface-claude-501/probe.sock
+```
+
+The Monitor process owns its listener lifetime. It ignores stdin EOF, stops on native cancellation or signal, and removes only its own socket. Reply files belong to the native owner and are never blanket-cleaned by the adapter. A second listener on the same socket is rejected. Monitor startup does not promote native execution readiness. Discord intake readiness and native execution status remain separate. A stopped or abruptly lost Monitor never causes submitted work to be sent again.
+
 Accepted input is durable before a Discord handler returns. After authorized intake commits, live input gets one deterministic transport receipt. The receipt says either `Receipt: saved for this conductor.` or `Receipt: saved. Delivery was paused when this receipt was prepared.` It is a reply to the source message with mentions disabled. It never claims that the native agent has read, acted on, or answered the input. Receipt delivery is independent of native forwarding, uses a stable nonce, and never retries an uncertain send. Duplicate or rejected input gets no receipt attempt.
 
 An operator may request one manual Spark preview from an existing durable receipt. The command reads one persisted source message and its transport receipt, keeps that raw evidence beside the result, and sends only code-derived facts to the isolated read-only Spark subprocess. The result is labeled `liaison draft`; it is never posted to Discord and never changes forwarding or custody. Missing receipts, unavailable Spark, invalid output, quota failure, timeout, and cancellation return `draft: null`.

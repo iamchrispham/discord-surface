@@ -25,9 +25,9 @@ const SUCCESSOR_ID = '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b';
 const LOCKF = '/usr/bin/lockf';
 const CLI_PATH = path.resolve(__dirname, '../src/cli.js');
 
-function fixture() {
+function fixture(dbName = 'surface.sqlite') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-test-'));
-  const db = path.join(dir, 'surface.sqlite');
+  const db = path.join(dir, dbName);
   const state = new SurfaceState(db);
   state.setConfig({ operatorId: 'operator-1', guildId: 'guild-1', secretFile: path.join(dir, 'discord.secret') });
   return { dir, db, state };
@@ -76,6 +76,63 @@ async function waitForProcessGone(pid, timeoutMs = 1000) {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
   throw new Error(`timed out waiting for process ${pid} to exit`);
+}
+
+function collectStdoutJson(child) {
+  let buffer = '';
+  let failure = null;
+  const events = [];
+  const waiters = [];
+  const settle = () => {
+    for (let index = waiters.length - 1; index >= 0; index -= 1) {
+      const waiter = waiters[index];
+      if (failure) {
+        waiters.splice(index, 1);
+        clearTimeout(waiter.timer);
+        waiter.reject(failure);
+      } else if (events.length >= waiter.count) {
+        waiters.splice(index, 1);
+        clearTimeout(waiter.timer);
+        waiter.resolve();
+      }
+    }
+  };
+  const fail = error => {
+    failure = error;
+    settle();
+  };
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    try {
+      for (const line of lines) {
+        if (line.trim()) events.push(JSON.parse(line));
+      }
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    settle();
+  });
+  child.stdout.on('error', fail);
+  return {
+    events,
+    waitForCount(count, timeoutMs = 2000) {
+      if (failure) return Promise.reject(failure);
+      if (events.length >= count) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const waiter = { count, resolve, reject, timer: null };
+        waiter.timer = setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          reject(new Error(`timed out waiting for ${count} child JSON events`));
+        }, timeoutMs);
+        waiters.push(waiter);
+      });
+    }
+  };
 }
 
 async function waitForCondition(predicate, timeoutMs = 1000) {
@@ -662,6 +719,86 @@ test('simulated: Claude channel forwards only the bound generation and closes it
   await channel.stop();
   assert.equal(fs.existsSync(socket), false);
   state.close();
+});
+
+test('simulated: Claude Monitor child emits one event and CLI reply records exact custody', async () => {
+  const { dir, db, state } = fixture('monitor-custom.sqlite');
+  const socketDir = fs.mkdtempSync('/tmp/dsm-');
+  fs.chmodSync(socketDir, 0o700);
+  const socket = path.join(socketDir, 'monitor.sock');
+  const messageId = 'claude-monitor-event';
+  const content = 'raw monitor content ✓\nkeep exact';
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.acceptDiscordMessage({ id: messageId, guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content });
+  state.claimDispatch(messageId);
+  state.markSubmitted(messageId);
+  state.close();
+
+  const child = spawn(process.execPath, [CLI_PATH, 'claude-monitor', '--state-dir', dir, '--db', db, '--native-id', CLAUDE_ID, '--socket', socket], {
+    cwd: path.dirname(CLI_PATH),
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const stdout = collectStdoutJson(child);
+  let foreignReplyFile;
+  try {
+    await waitForFile(socket);
+    child.stdin.end();
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.doesNotThrow(() => process.kill(child.pid, 0));
+
+    const response = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId, generation: 1, content: 'tampered transport content' });
+    assert.equal(response.statusCode, 202);
+    await stdout.waitForCount(1);
+    const event = stdout.events[0];
+    assert.equal(event.type, 'discord-surface/claude-monitor');
+    assert.equal(event.content, content);
+    assert.deepEqual(event.meta, { messageId, nativeId: CLAUDE_ID, generation: '1' });
+    assert.equal(event.reply.messageId, messageId);
+    assert.equal(event.reply.nativeId, CLAUDE_ID);
+    assert.equal(event.reply.generation, 1);
+    assert.deepEqual(event.reply.command.slice(2, 4), ['claude-reply', '--state-dir']);
+    const dbIndex = event.reply.command.indexOf('--db');
+    assert.equal(event.reply.command[dbIndex + 1], db);
+    assert.equal(fs.existsSync(event.reply.textFile), false);
+    fs.mkdirSync(path.dirname(event.reply.textFile), { recursive: true, mode: 0o700 });
+    foreignReplyFile = path.join(path.dirname(event.reply.textFile), 'foreign-conductor.txt');
+    fs.writeFileSync(foreignReplyFile, 'keep this file');
+
+    const wrongGenerationFile = path.join(dir, 'wrong-generation.txt');
+    fs.writeFileSync(wrongGenerationFile, 'wrong generation');
+    const wrongGeneration = spawnSync(process.execPath, [
+      CLI_PATH, 'claude-reply', '--state-dir', dir, '--db', db, '--message-id', messageId,
+      '--native-id', CLAUDE_ID, '--generation', '2', '--text-file', wrongGenerationFile
+    ], { encoding: 'utf8' });
+    assert.notEqual(wrongGeneration.status, 0);
+    assert.match(wrongGeneration.stderr, /native reply is stale/);
+
+    const duplicate = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId, generation: 1, content: 'tampered duplicate content' });
+    assert.equal(duplicate.statusCode, 202);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(stdout.events.length, 1);
+    assert.equal(fs.existsSync(event.reply.textFile), false);
+
+    fs.writeFileSync(event.reply.textFile, 'exact Claude answer ✓');
+    const reply = spawnSync(process.execPath, event.reply.command.slice(1), { encoding: 'utf8' });
+    assert.equal(reply.status, 0, reply.stderr);
+    assert.deepEqual(JSON.parse(reply.stdout), { messageId, recorded: true, duplicate: false, state: 'reply_ready' });
+
+    const checked = new SurfaceState(db);
+    assert.equal(checked.getMessage(messageId).state, MESSAGE_STATES.REPLY_READY);
+    assert.equal(checked.getMessage(messageId).replyText, 'exact Claude answer ✓');
+    checked.close();
+
+    const concurrent = spawnSync(process.execPath, [CLI_PATH, 'claude-monitor', '--state-dir', dir, '--db', db, '--native-id', CLAUDE_ID, '--socket', socket], { encoding: 'utf8' });
+    assert.notEqual(concurrent.status, 0);
+    assert.match(concurrent.stderr, /socket already exists/);
+  } finally {
+    if (child.exitCode === null) child.kill('SIGTERM');
+    await waitForProcessGone(child.pid);
+    assert.equal(fs.existsSync(socket), false);
+    if (foreignReplyFile) assert.equal(fs.readFileSync(foreignReplyFile, 'utf8'), 'keep this file');
+    try { fs.rmSync(socketDir, { recursive: true, force: true }); } catch {}
+  }
 });
 
 test('simulated: Claude dispatch rechecks authorization after intake', async () => {

@@ -7,6 +7,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
 const { ClaudeChannel } = require('./claude-channel');
+const { createClaudeMonitor } = require('./claude-monitor');
 const { runLiaisonDraft } = require('./liaison');
 const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
 
@@ -587,6 +588,67 @@ async function claudeChannel(args) {
   catch (error) { await stop(); throw error; }
 }
 
+async function claudeMonitor(args) {
+  const { paths, state } = openState(args);
+  let monitor;
+  let stopPromise;
+  const stop = async () => {
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      try { await monitor?.stop(); } finally { state.close(); }
+    })();
+    return stopPromise;
+  };
+  const handleSignal = signal => {
+    stop().then(() => {
+      process.exitCode = 128 + (os.constants.signals?.[signal] || 1);
+    }).catch(error => {
+      process.stderr.write(`discord-surface: Claude Monitor stop failed: ${error.message}\n`);
+      process.exitCode = 1;
+    });
+  };
+  process.once('SIGINT', handleSignal);
+  process.once('SIGTERM', handleSignal);
+  try {
+    monitor = createClaudeMonitor({
+      state,
+      nativeId: required(args, 'native-id'),
+      socketPath: path.resolve(required(args, 'socket')),
+      stateDir: paths.stateDir,
+      dbPath: paths.db,
+      cliPath: __filename
+    });
+    await monitor.start();
+  } catch (error) {
+    await stop();
+    throw error;
+  }
+}
+
+function claudeReply(args) {
+  const { state } = openState(args);
+  try {
+    const generation = Number(required(args, 'generation'));
+    if (!Number.isSafeInteger(generation) || generation < 1) throw new Error('generation must be a positive integer');
+    const textFile = path.resolve(required(args, 'text-file'));
+    const stat = fs.statSync(textFile);
+    if (!stat.isFile()) throw new Error('text file must be a regular file');
+    const result = state.recordNativeReply({
+      provider: 'claude',
+      messageId: required(args, 'message-id'),
+      nativeId: required(args, 'native-id'),
+      generation,
+      text: fs.readFileSync(textFile, 'utf8')
+    });
+    print({
+      messageId: required(args, 'message-id'),
+      recorded: !result.duplicate,
+      duplicate: Boolean(result.duplicate),
+      state: result.message.state
+    });
+  } finally { state.close(); }
+}
+
 function pidMatches(value, stateDir) {
   if (!value || value.command !== 'run' || value.stateDir !== stateDir) return false;
   try {
@@ -647,10 +709,12 @@ async function main() {
       return runRuntime(args);
     case 'stop': return stop(args);
     case 'claude-channel': return claudeChannel(args);
+    case 'claude-monitor': return claudeMonitor(args);
+    case 'claude-reply': return claudeReply(args);
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, liaison draft');
+    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, claude-reply, liaison draft');
   }
 }
 
@@ -661,4 +725,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, conductorMarker, ensureProvisionedChannel, handoffInternal, liaisonDraft, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, ensureProvisionedChannel, handoffInternal, liaisonDraft, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };
