@@ -1421,6 +1421,12 @@ class SurfaceState {
           this.receipt(messageId, 'dispatch-held-not-ready', { readiness: check.binding.readiness, generation: message.generation });
           return { claimed: false, message, reason: 'binding-not-ready' };
         }
+        const pendingReference = this.db.prepare('SELECT 1 FROM receipts WHERE discord_id=? AND kind=? LIMIT 1')
+          .get(messageId, PENDING_REFERENCE_RECEIPT);
+        if (pendingReference) {
+          this.receipt(messageId, 'dispatch-held-publication-reference', { generation: message.generation });
+          return { claimed: false, message, reason: 'publication-reference-pending' };
+        }
         this.db.prepare('UPDATE messages SET state=?, updated_at=? WHERE discord_id=? AND state=?')
           .run(MESSAGE_STATES.DISPATCHING, now(), messageId, MESSAGE_STATES.ACCEPTED);
         this.receipt(messageId, 'dispatching', { generation: message.generation });

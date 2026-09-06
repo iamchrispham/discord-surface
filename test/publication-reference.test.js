@@ -125,6 +125,24 @@ test('unresolved publication reply targets settle when the bot echo arrives', as
   assert.equal(message.publicationReference.snapshotId, 'snapshot-original');
 });
 
+test('pending publication reply targets hold dispatch until settlement', async t => {
+  const f = fixture(t);
+  f.state.db.prepare("UPDATE publication_posts SET status='unknown', message_id=NULL").run();
+  const accepted = await accept(f, { ...human(), reference: { messageId: '201' } });
+  assert.equal(accepted.accepted, true);
+  f.state.setBindingReadiness('channel', 'ready');
+
+  const held = f.state.claimDispatch('200');
+  assert.equal(held.claimed, false);
+  assert.equal(held.reason, 'publication-reference-pending');
+  assert.equal(held.message.state, 'accepted');
+
+  f.state.publications.sent(f.post.id, '201', 3000);
+  const claimed = f.state.claimDispatch('200');
+  assert.equal(claimed.claimed, true);
+  assert.equal(claimed.message.publicationReference.messageId, '201');
+});
+
 test('reference and accepted input roll back together when reference persistence fails', async t => {
   const f = fixture(t);
   const original = f.state.receipt.bind(f.state);
