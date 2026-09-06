@@ -47,7 +47,7 @@ async function until(check, message = 'condition', timeout = 4000) {
   }
 }
 function start(f, options = {}) {
-  const p = watchPublications({ state: f.state, registry: f.registry,
+  const p = watchPublications({ state: f.state, registry: f.registry, interpret: async () => ({ status: 'unavailable', reason: 'fixture' }),
     cadence: { burstMs: 15, publicationMs: 150, retryMs: 150 }, ...options });
   f.publishers.push(p);
   return p;
@@ -201,7 +201,7 @@ test('Gateway startup owns one publisher and stop leaves no file-triggered sends
   const client = { on() {}, off() {}, login: async () => { logins++; }, destroy: async () => {},
     channels: { fetch: async () => ({ send: async () => ({ id: String(700 + ++sends) }) }) } };
   const gateway = new DiscordGateway({ state: f.state, client, providers: {},
-    publicationOptions: { registry: f.registry, cadence: { burstMs: 10, publicationMs: 50, retryMs: 50 } } });
+    publicationOptions: { registry: f.registry, interpret: async () => ({ status: 'unavailable', reason: 'fixture' }), cadence: { burstMs: 10, publicationMs: 50, retryMs: 50 } } });
   gateway.recoverInbound = async () => ({ ready: true, state: 'ready' });
   await gateway.start(secret);
   const publisher = gateway.publications;
@@ -397,4 +397,150 @@ test('bot echo releases newer pending publication through events and preserves c
   assert.equal(f.state.listMessages().length, 0);
   await p.stop();
   assert.equal(f.state.publications.listenerCount('settled'), 0);
+});
+
+function heldInterpreter() {
+  const calls = [];
+  const interpret = (snapshot, { signal }) => new Promise(resolve => {
+    let timer;
+    const finish = result => { clearTimeout(timer); signal.removeEventListener('abort', abort); resolve(result); };
+    const abort = () => { timer = setTimeout(() => finish({ status: 'unavailable', reason: 'cancelled' }), 50); };
+    signal.addEventListener('abort', abort, { once: true });
+    calls.push({ snapshot, finish, signal });
+  });
+  return { calls, interpret };
+}
+function usefulContext(snapshot) {
+  return { status: 'ready', snapshotId: snapshot.id, preview: '**Possible connection · Luna**\nDevice evidence supports the recorded proof obligation.',
+    interpretation: { decision: 'context' } };
+}
+
+test('slow interpretation never delays board and current note wakes once without a file event or restart repeat', async t => {
+  const f = fixture(t);
+  const model = heldInterpreter();
+  const sent = [];
+  const send = async (_binding, post) => { sent.push({ ...post, at: Date.now() }); return { id: String(9000 + sent.length) }; };
+  const p = start(f, { send, interpret: model.interpret });
+  await until(() => sent.length === 1 && model.calls.length === 1);
+  assert.equal(sent[0].kind, 'board');
+  model.calls[0].finish(usefulContext(model.calls[0].snapshot));
+  await until(() => sent.length === 2, 'context completion wakes sender');
+  assert.equal(sent[1].kind, 'context');
+  assert.ok(sent[1].at >= sent[0].at + 150);
+  assert.equal(sent[1].board_id, sent[0].id);
+  await p.stop(); f.reopen();
+  const restarted = start(f, { send, interpret: model.interpret });
+  await restarted.drain();
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.equal(sent.length, 2);
+  assert.equal(model.calls.length, 1);
+});
+
+test('newer source and shutdown discard late interpretation without reviving its note', async t => {
+  const f = fixture(t);
+  const model = heldInterpreter();
+  const sent = [];
+  const p = start(f, { interpret: model.interpret, send: async (_binding, post) => { sent.push(post); return { id: String(9100 + sent.length) }; } });
+  await until(() => model.calls.length === 1);
+  const old = model.calls[0];
+  f.data._conductors['owner.md'].next = ['Newer device check']; f.write();
+  await until(() => old.signal.aborted);
+  old.finish(usefulContext(old.snapshot));
+  await until(() => model.calls.length === 2 && sent.length === 2);
+  assert.ok(sent.every(post => post.kind === 'board'));
+  assert.match(sent[1].content, /Newer device check/);
+  const stop = p.stop();
+  model.calls[1].finish(usefulContext(model.calls[1].snapshot));
+  await stop;
+  assert.equal(f.state.db.prepare("SELECT COUNT(*) AS n FROM publication_posts WHERE kind='context'").get().n, 0);
+});
+
+test('unknown context delivery does not block a newer deterministic board', async t => {
+  const f = fixture(t);
+  const sent = [];
+  const p = start(f, { interpret: async snapshot => usefulContext(snapshot), send: async (_binding, post) => {
+    sent.push(post);
+    if (post.kind === 'context') throw new Error('context send outcome unknown');
+    return { id: String(9200 + sent.length) };
+  } });
+  await until(() => f.state.db.prepare("SELECT id FROM publication_posts WHERE kind='context' AND status='unknown'").get());
+  f.data._conductors['owner.md'].next = ['Urgent new deterministic step']; f.write();
+  await until(() => sent.filter(post => post.kind === 'board').length === 2);
+  assert.match(sent.at(-1).content, /Urgent new deterministic step/);
+  await p.stop(); f.reopen();
+  let retries = 0;
+  const restarted = start(f, { interpret: async () => { throw new Error('must not repeat'); }, send: async () => { retries++; return { id: 'unexpected' }; } });
+  await restarted.drain();
+  assert.equal(retries, 0);
+});
+
+test('ready context survives result-before-send restart and abandoned inference never relaunches', async t => {
+  const f = fixture(t);
+  const sent = [];
+  let models = 0;
+  const send = async (_binding, post) => { sent.push(post); return { id: String(9300 + sent.length) }; };
+  const p = start(f, { send, interpret: async snapshot => { models++; return usefulContext(snapshot); } });
+  await until(() => f.state.db.prepare("SELECT id FROM publication_posts WHERE kind='context' AND status='pending'").get());
+  await p.stop(); f.reopen();
+  const restarted = start(f, { send, interpret: async () => { models++; return { status: 'unavailable' }; } });
+  await until(() => sent.length === 2);
+  assert.equal(models, 1);
+  await restarted.stop();
+  f.state.db.prepare("UPDATE publication_context SET status='running'").run();
+  f.reopen();
+  const recovered = start(f, { send, interpret: async () => { models++; return { status: 'unavailable' }; } });
+  await recovered.drain();
+  assert.equal(models, 1);
+  assert.equal(sent.length, 2);
+  assert.equal(f.state.db.prepare('SELECT reason FROM publication_context').get().reason, 'interrupted');
+});
+
+test('two selected bindings share one inference slot while both boards remain independent', async t => {
+  const f = fixture(t);
+  const second = { ...f.binding, channelId: 'second', nativeId: '79e3da8e-94b4-4aff-8f88-b45b3a451dd1', conductorId: 'second.md', repoKey: 'repo:second' };
+  f.state.bind(second); f.state.setBindingReadiness('second', 'ready');
+  f.state.publications.setEnabled(f.state.getBinding('second'), true);
+  f.data._conductors['second.md'] = { ...f.data._conductors['owner.md'], repository: second.repoKey, nativeId: second.nativeId };
+  f.write();
+  const model = heldInterpreter();
+  const sent = [];
+  const p = start(f, { interpret: model.interpret, send: async (binding, post) => { sent.push({ ...post, channel: binding.channelId }); return { id: String(9400 + sent.length) }; } });
+  await until(() => sent.length === 2 && model.calls.length === 1);
+  assert.equal(new Set(sent.map(post => post.channel)).size, 2);
+  model.calls[0].finish({ status: 'ready', snapshotId: model.calls[0].snapshot.id, interpretation: { decision: 'quiet' } });
+  await until(() => model.calls.length === 2);
+  model.calls[1].finish(usefulContext(model.calls[1].snapshot));
+  await until(() => sent.length === 3);
+  assert.equal(sent[2].kind, 'context');
+  await p.stop();
+  assert.equal(f.state.db.prepare("SELECT COUNT(*) AS n FROM publication_context WHERE status='quiet'").get().n, 1);
+});
+
+test('automatic publication consumes the bounded interpreter process and its validated rendered result', async t => {
+  const { interpretSnapshot } = require('../src/context-interpretation');
+  const f = fixture(t);
+  const sent = [];
+  let pid, directory;
+  const p = start(f, { interpret: (snapshot, options) => interpretSnapshot(snapshot, { ...options,
+    onSpawn: child => { pid = child.pid; }, buildCommand: ({ cwd, answerPath }) => {
+      directory = cwd;
+      return { command: process.execPath, args: ['-e', `
+        const fs = require('node:fs'); let input = '';
+        process.stdin.on('data', chunk => input += chunk);
+        process.stdin.on('end', () => {
+          const packet = JSON.parse(input.trim().split('\\n').at(-1));
+          fs.writeFileSync(${JSON.stringify(answerPath)}, JSON.stringify({ snapshotId: packet.snapshotId,
+            decision: 'context', summary: 'The recorded check connects the device-evidence intent with the proof owed to the operator.',
+            evidenceIds: ['context.intent','context.next','context.owedToOperator'], uncertainties: [] }));
+        });`] };
+    }
+  }), send: async (_binding, post) => { sent.push(post); return { id: String(9500 + sent.length) }; } });
+  await until(() => sent.length === 2);
+  assert.equal(sent[0].kind, 'board');
+  assert.equal(sent[1].kind, 'context');
+  assert.match(sent[1].content, /Possible connection · Luna/);
+  assert.match(sent[1].content, /Sources: context.intent/);
+  await p.stop();
+  assert.equal(fs.existsSync(directory), false);
+  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
 });

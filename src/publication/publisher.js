@@ -4,12 +4,13 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { readSnapshot, renderSnapshot } = require('../snapshot');
 const { ownerKey } = require('./store');
+const { contextualPublications } = require('./context');
 
 const CADENCE = Object.freeze({ burstMs: 500, publicationMs: 60000, retryMs: 60000 });
 
 function watchPublications({ state, send, ready = () => true, logger = () => {},
   registry = path.join(os.homedir(), '.agents/work-control/pr-lanes.json'),
-  read = readSnapshot, cadence = CADENCE, clock = Date.now, watchFactory = fs.watch, rearmMs = 1000 } = {}) {
+  read = readSnapshot, interpret, cadence = CADENCE, clock = Date.now, watchFactory = fs.watch, rearmMs = 1000 } = {}) {
   const store = state.publications;
   const controller = new AbortController();
   let closed = false;
@@ -20,6 +21,7 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
   let bindingSignature = '';
   const watchers = [];
   store.recover();
+  const context = contextualPublications({ store, interpret, schedule, clock });
 
   function bindings() {
     return state.listBindings().filter(binding => binding.active && binding.conductorId && binding.repoKey && store.enabled(binding));
@@ -46,6 +48,7 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
         }
         if (!snapshot.unavailable && snapshot.context.state !== 'recorded' && !store.head(binding)) continue;
         store.stage(binding, snapshot, renderSnapshot(snapshot));
+        context.observe(binding, snapshot);
         if (snapshot.expiresAt * 1000 > clock()) nextWake = Math.min(nextWake, snapshot.expiresAt * 1000);
         const post = store.pending(binding);
         if (!post) continue;
@@ -57,12 +60,14 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
         try {
           const response = await send(binding, post, controller.signal);
           store.sent(post.id, response?.id, clock());
+          if (store.pending(binding)) nextWake = Math.min(nextWake, clock() + cadence.publicationMs);
         } catch (error) {
           store.failed(post.id, error, clock(), cadence.retryMs);
           if (store.pending(binding)) nextWake = Math.min(nextWake, clock() + cadence.retryMs);
           logger(`publication ${post.id.slice(0, 10)}: ${error.message}`);
         }
       }
+      context.pump();
       if (!closed && Number.isFinite(nextWake)) {
         wake = setTimeout(() => { wake = null; drain(); }, Math.max(1, nextWake - clock()));
       }
@@ -123,7 +128,9 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
       }
       clearTimeout(burst);
       clearTimeout(wake);
+      const contextStop = context.stop();
       await running;
+      await contextStop;
     }
   };
 }

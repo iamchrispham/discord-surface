@@ -1,6 +1,8 @@
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
+const POST_KIND = Object.freeze({ BOARD: 'board', CONTEXT: 'context' });
+const CONTEXT_STATUS = Object.freeze({ QUEUED: 'queued', RUNNING: 'running', READY: 'ready', QUIET: 'quiet', UNAVAILABLE: 'unavailable' });
 const STATUS = Object.freeze({ PENDING: 'pending', SENDING: 'sending', SENT: 'sent', UNKNOWN: 'unknown', SUPERSEDED: 'superseded' });
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 function ownerKey(binding) {
@@ -16,8 +18,15 @@ const TABLES = {
   publication_posts: `CREATE TABLE publication_posts (
     id TEXT PRIMARY KEY, owner_key TEXT NOT NULL, channel_id TEXT NOT NULL, guild_id TEXT NOT NULL,
     snapshot_id TEXT NOT NULL, content TEXT NOT NULL, nonce TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL DEFAULT 'board' CHECK(kind IN ('board','context')), board_id TEXT,
     status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','unknown','superseded')),
     message_id TEXT UNIQUE, attempted_at INTEGER, sent_at INTEGER, error TEXT
+  )`,
+  publication_context: `CREATE TABLE publication_context (
+    owner_key TEXT NOT NULL, sequence INTEGER NOT NULL, snapshot_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('queued','running','ready','quiet','unavailable')),
+    started_at INTEGER, finished_at INTEGER, reason TEXT,
+    PRIMARY KEY(owner_key,sequence)
   )`
 };
 function createPublicationSchema(db) {
@@ -87,9 +96,16 @@ class PublicationStore extends EventEmitter {
   }
   pending(binding) {
     const key = ownerKey(binding);
-    if (this.db.prepare('SELECT id FROM publication_posts WHERE owner_key=? AND status IN (?,?) LIMIT 1')
-      .get(key, STATUS.SENDING, STATUS.UNKNOWN)) return null;
-    return this.db.prepare('SELECT * FROM publication_posts WHERE owner_key=? AND status=? LIMIT 1').get(key, STATUS.PENDING);
+    const blocked = this.db.prepare('SELECT kind,status FROM publication_posts WHERE owner_key=? AND status IN (?,?)')
+      .all(key, STATUS.SENDING, STATUS.UNKNOWN);
+    if (blocked.some(post => post.kind === POST_KIND.BOARD || post.status === STATUS.SENDING)) return null;
+    const board = this.db.prepare('SELECT * FROM publication_posts WHERE owner_key=? AND status=? AND kind=? ORDER BY rowid LIMIT 1')
+      .get(key, STATUS.PENDING, POST_KIND.BOARD);
+    if (board) return board;
+    if (blocked.length) return null;
+    return this.db.prepare(`SELECT p.* FROM publication_posts p JOIN publication_posts b ON b.id=p.board_id
+      WHERE p.owner_key=? AND p.status=? AND p.kind=? AND b.status=? ORDER BY p.rowid LIMIT 1`)
+      .get(key, STATUS.PENDING, POST_KIND.CONTEXT, STATUS.SENT);
   }
   begin(binding, id, now) {
     return this.state.transaction(() => {
@@ -120,6 +136,37 @@ class PublicationStore extends EventEmitter {
       this.db.prepare('UPDATE publication_posts SET status=?, error=? WHERE id=?')
         .run(status, String(error?.message || error).slice(0, 300), id);
       if (definite) this.db.prepare('UPDATE publication_heads SET retry_at=? WHERE owner_key=?').run(now + retryMs, post.owner_key);
+    });
+  }
+  queueContext(binding, snapshot) {
+    const head = this.head(binding);
+    if (!head || !this.current(binding) || !this.enabled(binding)) return;
+    this.db.prepare('INSERT OR IGNORE INTO publication_context(owner_key,sequence,snapshot_id,status) VALUES(?,?,?,?)')
+      .run(ownerKey(binding), head.sequence, snapshot.id, CONTEXT_STATUS.QUEUED);
+  }
+  contextWork() {
+    return this.db.prepare('SELECT * FROM publication_context WHERE status=? ORDER BY rowid').all(CONTEXT_STATUS.QUEUED);
+  }
+  finishContext(work, result, now) {
+    return this.state.transaction(() => {
+      const head = this.db.prepare('SELECT * FROM publication_heads WHERE owner_key=?').get(work.owner_key);
+      const binding = head && JSON.parse(head.binding);
+      const current = head?.sequence === work.sequence && head.processed_id === work.snapshot_id && this.current(binding) && this.enabled(binding);
+      const useful = current && result?.status === 'ready' && result.snapshotId === work.snapshot_id &&
+        typeof result.preview === 'string' && result.preview.trim() && result.preview.length <= 2000;
+      let outcome = CONTEXT_STATUS.UNAVAILABLE;
+      if (useful) {
+        const board = this.db.prepare('SELECT id FROM publication_posts WHERE owner_key=? AND snapshot_id=? AND kind=? ORDER BY rowid DESC LIMIT 1')
+          .get(work.owner_key, work.snapshot_id, POST_KIND.BOARD);
+        const id = hash(['context', work.owner_key, work.sequence]);
+        this.db.prepare(`INSERT OR IGNORE INTO publication_posts(id,owner_key,channel_id,guild_id,snapshot_id,content,nonce,kind,board_id,status)
+          VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, work.owner_key, binding.channelId, binding.guildId, work.snapshot_id,
+            result.preview, 'sp-' + id.slice(0, 22), POST_KIND.CONTEXT, board.id, STATUS.PENDING);
+        outcome = CONTEXT_STATUS.READY;
+      } else if (current && result?.status === 'ready' && result.interpretation?.decision === 'quiet') outcome = CONTEXT_STATUS.QUIET;
+      this.db.prepare('UPDATE publication_context SET status=?,finished_at=?,reason=? WHERE owner_key=? AND sequence=?')
+        .run(outcome, now, current ? result?.reason || null : 'superseded', work.owner_key, work.sequence);
+      return outcome;
     });
   }
   status() {
@@ -159,4 +206,4 @@ class PublicationStore extends EventEmitter {
   }
 }
 
-module.exports = { STATUS, ownerKey, createPublicationSchema, PublicationStore };
+module.exports = { STATUS, POST_KIND, CONTEXT_STATUS, ownerKey, createPublicationSchema, PublicationStore };
