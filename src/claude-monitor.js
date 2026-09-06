@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const path = require('node:path');
 const { ClaudeChannel } = require('./claude-channel');
 
@@ -7,6 +8,45 @@ function replyFileFor(directory, messageId, generation) {
     .update(`${messageId}\0${generation}`)
     .digest('hex');
   return path.join(path.resolve(directory), '.claude-monitor-replies', `${key}.txt`);
+}
+
+function payloadFileFor(directory, messageId, nativeId, generation, dbPath) {
+  const scope = dbPath ? path.resolve(dbPath) : path.resolve(directory);
+  const key = crypto.createHash('sha256')
+    .update(`${scope}\0${messageId}\0${nativeId}\0${generation}`)
+    .digest('hex')
+    .slice(0, 32);
+  return path.join(path.resolve(directory), '.cm-e', `${key}.json`);
+}
+
+function writePayloadFile(payloadPath, payload) {
+  const directory = path.dirname(payloadPath);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const directoryStat = fs.lstatSync(directory);
+  if (!directoryStat.isDirectory() || (directoryStat.mode & 0o077)) throw new Error('Claude Monitor payload directory must be owner-only');
+  try {
+    const existing = fs.lstatSync(payloadPath);
+    if (!existing.isFile() || (existing.mode & 0o077)) throw new Error('Claude Monitor payload path is not an owner-only file');
+    if (fs.readFileSync(payloadPath, 'utf8') !== payload) throw new Error('Claude Monitor payload identity collision');
+    return;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const temporary = `${payloadPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(temporary, 'wx', 0o600);
+    fs.writeFileSync(descriptor, payload, 'utf8');
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporary, payloadPath);
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+    try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
 }
 
 function writeStdoutLine(stdout, line) {
@@ -78,6 +118,15 @@ function monitorEvent({ content, messageId, nativeId, generation, stateDir, dbPa
   };
 }
 
+function monitorPointer({ messageId, nativeId, generation, payloadPath }) {
+  return {
+    type: 'discord-surface/claude-monitor',
+    payloadPath: path.resolve(payloadPath),
+    meta: { messageId, nativeId, generation: String(generation) },
+    instructions: 'Read the payload with Read, then run reply.command.'
+  };
+}
+
 function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(stateDir || '.'), 'surface.sqlite'), stdout = process.stdout, cliPath = path.join(__dirname, 'cli.js') } = {}) {
   if (!state) throw new TypeError('state is required');
   if (typeof stateDir !== 'string' || !stateDir) throw new TypeError('stateDir is required');
@@ -97,17 +146,19 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
         throw new Error('Claude Monitor event has no accepted custody');
       }
       const textFile = replyFileFor(stateDir, values.messageId, values.generation);
+      const payloadPath = payloadFileFor(stateDir, values.messageId, values.nativeId, values.generation, dbPath);
       const operation = (async () => {
-        try {
-          await writeStdoutLine(stdout, JSON.stringify(monitorEvent({
-            ...values,
-            content: message.content,
-            stateDir: path.resolve(stateDir),
-            dbPath: path.resolve(dbPath),
-            cliPath: path.resolve(cliPath),
-            textFile
-          })));
-        } catch (error) {
+        const payload = monitorEvent({
+          ...values,
+          content: message.content,
+          stateDir: path.resolve(stateDir),
+          dbPath: path.resolve(dbPath),
+          cliPath: path.resolve(cliPath),
+          textFile
+        });
+        writePayloadFile(payloadPath, JSON.stringify(payload));
+        try { await writeStdoutLine(stdout, JSON.stringify(monitorPointer({ ...values, payloadPath }))); }
+        catch (error) {
           error.potentiallyDelivered = true;
           throw error;
         }
@@ -132,6 +183,9 @@ module.exports = {
   createMonitorMcp,
   eventValues,
   monitorEvent,
+  monitorPointer,
+  payloadFileFor,
   replyFileFor,
+  writePayloadFile,
   writeStdoutLine
 };

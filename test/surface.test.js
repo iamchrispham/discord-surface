@@ -727,7 +727,7 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
   fs.chmodSync(socketDir, 0o700);
   const socket = path.join(socketDir, 'monitor.sock');
   const messageId = 'claude-monitor-event';
-  const content = 'raw monitor content ✓\nkeep exact';
+  const content = `raw monitor content ✓\n${'keep exact ✓ '.repeat(300)}`;
   state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
   state.acceptDiscordMessage({ id: messageId, guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content });
   state.claimDispatch(messageId);
@@ -749,7 +749,17 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
     const response = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId, generation: 1, content: 'tampered transport content' });
     assert.equal(response.statusCode, 202);
     await stdout.waitForCount(1);
-    const event = stdout.events[0];
+    const pointer = stdout.events[0];
+    assert.equal(pointer.type, 'discord-surface/claude-monitor');
+    assert.ok(pointer.payloadPath);
+    assert.ok(JSON.stringify(pointer).length < 500);
+    assert.deepEqual(pointer.meta, { messageId, nativeId: CLAUDE_ID, generation: '1' });
+    assert.match(pointer.instructions, /Read the payload/);
+    assert.equal(path.dirname(path.dirname(pointer.payloadPath)), path.resolve(dir));
+    assert.equal(fs.statSync(path.dirname(pointer.payloadPath)).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(pointer.payloadPath).mode & 0o777, 0o600);
+    assert.ok(fs.statSync(pointer.payloadPath).size > 500);
+    const event = JSON.parse(fs.readFileSync(pointer.payloadPath, 'utf8'));
     assert.equal(event.type, 'discord-surface/claude-monitor');
     assert.equal(event.content, content);
     assert.deepEqual(event.meta, { messageId, nativeId: CLAUDE_ID, generation: '1' });
@@ -796,6 +806,10 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
     if (child.exitCode === null) child.kill('SIGTERM');
     await waitForProcessGone(child.pid);
     assert.equal(fs.existsSync(socket), false);
+    if (stdout.events[0]?.payloadPath) {
+      assert.equal(fs.existsSync(stdout.events[0].payloadPath), true);
+      assert.equal(JSON.parse(fs.readFileSync(stdout.events[0].payloadPath, 'utf8')).content, content);
+    }
     if (foreignReplyFile) assert.equal(fs.readFileSync(foreignReplyFile, 'utf8'), 'keep this file');
     try { fs.rmSync(socketDir, { recursive: true, force: true }); } catch {}
   }

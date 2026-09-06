@@ -116,7 +116,7 @@ Claude Channels require opt-in when the native Claude session launches. Start th
 
 The channel process forwards events only after checking its exact native UUID, binding endpoint, and generation. Its `reply` tool requires the inbound Discord message ID and generation. It persists reply custody before acknowledging the MCP tool call. A Claude session without launch-time channel opt-in is not attached or resumed by this adapter.
 
-A running Claude session may opt into the same transport through its native `Monitor` tool without a session restart. Start this blocking command from `Monitor` with the exact bound UUID and socket. The command writes no startup text. Each accepted event becomes one JSON line on stdout, and the event includes the exact message ID, native UUID, generation, a suggested owner-only reply directory and file, and the `claude-reply` command. Create the directory if needed, write the final answer to that file, then run the command from the event. The command calls the same durable `recordNativeReply` path as the Claude channel tool.
+A running Claude session may opt into the same transport through its native `Monitor` tool without a session restart. Start this blocking command from `Monitor` with the exact bound UUID and socket. The command writes no startup text. Each accepted event becomes one compact JSON line on stdout with the exact IDs and an owner-only `payloadPath`. Use `Read` on that path for the complete event, then follow its reply instructions. The payload is retained for recovery. The final answer goes to its suggested reply file and the command calls the same durable `recordNativeReply` path as the Claude channel tool.
 
 ```text
 Monitor command:
