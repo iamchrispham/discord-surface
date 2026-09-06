@@ -373,7 +373,12 @@ def main():
         else:
             commit.extend(['--handoff-id', second_handoff_id])
         try:
-            result = subprocess.run(commit, check=False, capture_output=True, text=True, timeout=30, env={**os.environ, 'DISCORD_SURFACE_HANDOFF_GATE_HELD': '1'})
+            # The child must retain the directory lock if this gate process is terminated by its caller.
+            result = subprocess.run(
+                commit, check=False, capture_output=True, text=True, timeout=30,
+                env={**os.environ, 'DISCORD_SURFACE_HANDOFF_GATE_HELD': '1'},
+                pass_fds=(parent_descriptor,)
+            )
         except (OSError, subprocess.SubprocessError) as error:
             fail(f'local handoff commit failed to run: {error}')
         if result.stdout:

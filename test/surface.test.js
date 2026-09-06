@@ -3039,6 +3039,128 @@ Module._load = (request, parent, isMain) => request === 'discord.js' ? fake : or
   }
 });
 
+test('simulated: handoff gate survives parent termination until its child exits', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-pickup-gate-'));
+  const lockDir = path.join(dir, 'lock');
+  const sessionRoot = path.join(dir, 'sessions');
+  const workersDir = path.join(dir, 'workers');
+  fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(sessionRoot, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(workersDir, { recursive: true, mode: 0o700 });
+  const repo = 'https://github.com/example/discord-pickup.git';
+  const repoKey = 'github.com/example/discord-pickup';
+  const oldNativeId = CODEX_ID;
+  const successorNativeId = SUCCESSOR_ID;
+  const oldOwner = `session-codex-${oldNativeId.slice(0, 8)}`;
+  const successorOwner = `session-codex-${successorNativeId.slice(0, 8)}`;
+  const conductorId = 'conductor-gate.md';
+  const beacon = path.join(lockDir, conductorId);
+  const lockFile = path.join(lockDir, 'conductor.lock.json');
+  const lockScript = path.join(dir, 'lock-readback.sh');
+  const identity = { repo_key: repoKey, vendor: 'codex', beacon };
+  const inspect = {
+    repo_key: repoKey,
+    vendor: 'codex',
+    slot: {
+      state: 'HELD',
+      vendor: 'codex',
+      beacon,
+      owner: successorOwner,
+      history: [
+        { at: '2026-09-05T00:00:00Z', verb: 'release', who: oldOwner, note: 'release predecessor' },
+        { at: '2026-09-05T00:01:00Z', verb: 'claim', who: successorOwner, note: 'claim successor' }
+      ]
+    }
+  };
+  const identityJson = JSON.stringify(identity);
+  const inspectJson = JSON.stringify(inspect);
+  fs.writeFileSync(lockScript, `#!/bin/sh
+case "$5" in
+  identity) printf '%s\\n' ${JSON.stringify(identityJson)} ;;
+  inspect) printf '%s\\n' ${JSON.stringify(inspectJson)} ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o700 });
+  fs.writeFileSync(lockFile, '{}', { mode: 0o600 });
+  fs.writeFileSync(beacon, 'beacon', { mode: 0o600 });
+  const transcript = path.join(sessionRoot, `rollout-test-${successorNativeId}.jsonl`);
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: 'session_meta', payload: { id: successorNativeId } })}\n`, { mode: 0o600 });
+  const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: dir, stdio: 'ignore' });
+  const workerManifest = path.join(workersDir, `${successorOwner}.json`);
+  const childStarted = path.join(dir, 'child-started');
+  const childRelease = path.join(dir, 'child-release');
+  const childDone = path.join(dir, 'child-done');
+  const childScript = path.join(dir, 'commit-child.cjs');
+  fs.writeFileSync(childScript, `
+const fs = require('node:fs');
+const waiter = new Int32Array(new SharedArrayBuffer(4));
+fs.writeFileSync(process.env.DISCORD_SURFACE_GATE_CHILD_STARTED, String(process.pid));
+while (!fs.existsSync(process.env.DISCORD_SURFACE_GATE_CHILD_RELEASE)) Atomics.wait(waiter, 0, 0, 25);
+fs.writeFileSync(process.env.DISCORD_SURFACE_GATE_CHILD_DONE, 'done');
+`, { mode: 0o700 });
+  const contenderScript = `
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+fcntl.flock(fd, fcntl.LOCK_EX)
+with open(sys.argv[2], 'w', encoding='utf-8') as output:
+    output.write('acquired')
+`;
+  let gate;
+  let contender;
+  let childPid = null;
+  try {
+    fs.writeFileSync(workerManifest, JSON.stringify({
+      laneId: `${successorOwner}-9eaba20295e60eb88306d751eb0aeae1`, worktree: dir, state: 'active', harness: 'codex',
+      sessionId: successorNativeId, fullUUID: successorNativeId, pid: worker.pid,
+      processStartTime: processStartTime(worker.pid), generation: 1
+    }), { mode: 0o600 });
+    gate = spawn(process.env.DISCORD_SURFACE_PYTHON || 'python3', [path.resolve(__dirname, '../src/conductor-lock-gate.py'),
+      '--lock-script', lockScript, '--repo', repo, '--repo-key', repoKey, '--provider', 'codex',
+      '--conductor-id', conductorId, '--channel-id', 'gate-channel', '--from-native-id', oldNativeId,
+      '--from-generation', '1', '--from-workspace', dir, '--native-id', successorNativeId,
+      '--workspace', dir, '--session-file', transcript, '--worker-file', workerManifest,
+      '--node-path', process.execPath, '--cli-path', childScript, '--state-dir', path.join(dir, 'state'),
+      '--db', path.join(dir, 'state.sqlite')], {
+      env: {
+        ...process.env,
+        CONDUCTOR_LOCK_FILE: lockFile,
+        CONDUCTOR_CODEX_SESSIONS_DIR: sessionRoot,
+        DISCORD_SURFACE_GATE_CHILD_STARTED: childStarted,
+        DISCORD_SURFACE_GATE_CHILD_RELEASE: childRelease,
+        DISCORD_SURFACE_GATE_CHILD_DONE: childDone
+      }, stdio: 'ignore'
+    });
+    await waitForFile(childStarted, 2000);
+    childPid = Number(fs.readFileSync(childStarted, 'utf8'));
+    assert.ok(Number.isInteger(childPid) && childPid > 0);
+    gate.kill('SIGTERM');
+    const gateExit = await waitForChild(gate);
+    assert.equal(gateExit.signal, 'SIGTERM');
+
+    const acquired = path.join(dir, 'writer-acquired');
+    contender = spawn(process.env.DISCORD_SURFACE_PYTHON || 'python3', ['-c', contenderScript, lockDir, acquired], { stdio: 'ignore' });
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(fs.existsSync(acquired), false);
+    fs.writeFileSync(childRelease, 'release');
+    await waitForFile(childDone, 2000);
+    await waitForProcessGone(childPid, 2000);
+    const contenderExit = await waitForChild(contender);
+    assert.equal(contenderExit.code, 0);
+    assert.equal(fs.existsSync(acquired), true);
+  } finally {
+    fs.writeFileSync(childRelease, 'release');
+    if (gate?.exitCode === null) gate.kill('SIGTERM');
+    if (contender?.exitCode === null) contender.kill('SIGTERM');
+    if (childPid) {
+      try { process.kill(childPid, 'SIGTERM'); } catch {}
+      await waitForProcessGone(childPid).catch(() => {});
+    }
+    if (worker.exitCode === null) worker.kill('SIGTERM');
+    if (worker.exitCode === null) await waitForChild(worker).catch(() => {});
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('simulated: empty Discord history requires known effective read permission', async () => {
   for (const [label, allowed, known] of [['revoked', false, true], ['unknown', false, false]]) {
     const { dir, state } = fixture();
