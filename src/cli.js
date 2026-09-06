@@ -13,6 +13,7 @@ const { recordNativeAcknowledgment } = require('./acknowledgment');
 const { readSnapshot, renderSnapshot } = require('./snapshot');
 const { interpretSnapshot } = require('./context-interpretation');
 const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
+const { runDirectPost } = require('./direct-post');
 
 function parseArgs(argv) {
   const args = {};
@@ -91,9 +92,21 @@ function unbind(args) {
   finally { state.close(); }
 }
 
+function publicationPolicy(subcommand, args) {
+  if (!['enable', 'disable'].includes(subcommand)) throw new Error('usage: publication enable|disable --channel-id ID --native-id UUID --generation N');
+  const { state } = openState(args);
+  try {
+    const binding = state.getBinding(required(args, 'channel-id'));
+    if (!binding || binding.nativeId !== required(args, 'native-id') || binding.generation !== Number(required(args, 'generation'))) {
+      throw new Error('publication policy binding is stale');
+    }
+    print(state.publications.setEnabled(binding, subcommand === 'enable'));
+  } finally { state.close(); }
+}
+
 function status(args) {
   const { state } = openState(args);
-  try { print({ config: state.getConfig(), gateway: gatewayProcessStatus(pathsFor(args)), readiness: state.getReadiness(), bindings: state.listBindings(), messages: state.listMessages(), receipts: state.listReceipts() }); }
+  try { print({ config: state.getConfig(), gateway: gatewayProcessStatus(pathsFor(args)), readiness: state.getReadiness(), bindings: state.listBindings(), publications: state.publications.status(), messages: state.listMessages(), receipts: state.listReceipts() }); }
   finally { state.close(); }
 }
 
@@ -754,6 +767,41 @@ function claudeReply(args) {
   } finally { state.close(); }
 }
 
+async function directPost(args, provider = null) {
+  const { state } = openState(args);
+  const controller = new AbortController();
+  let receivedSignal = null;
+  const handleSignal = signal => {
+    if (receivedSignal) return;
+    receivedSignal = signal;
+    controller.abort();
+  };
+  process.once('SIGINT', handleSignal);
+  process.once('SIGTERM', handleSignal);
+  try {
+    const config = state.requireConfig();
+    const result = await runDirectPost({
+      state,
+      token: readSecret(config.secretFile),
+      nativeId: required(args, 'native-id'),
+      generation: required(args, 'generation'),
+      channelId: args['channel-id'] || null,
+      provider,
+      textFile: required(args, 'text-file'),
+      requestId: args['request-id'],
+      signal: controller.signal
+    });
+    print(result);
+    if (result.status !== 'sent') process.exitCode = 1;
+    if (receivedSignal) process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
+    return result;
+  } finally {
+    process.removeListener('SIGINT', handleSignal);
+    process.removeListener('SIGTERM', handleSignal);
+    state.close();
+  }
+}
+
 async function snapshotPreview(args) {
   const { state } = openState(args);
   const controller = new AbortController();
@@ -869,6 +917,7 @@ async function main() {
     case 'rebind': return bind(args, true);
     case 'unbind': return unbind(args);
     case 'status': return status(args);
+    case 'publication': return publicationPolicy(subcommand, args);
     case 'recover': return recover(args);
     case 'provision': return provision(args);
     case 'provision-run':
@@ -894,10 +943,12 @@ async function main() {
       finally { state.close(); }
     }
     case 'claude-reply': return claudeReply(args);
+    case 'post': return directPost(args);
+    case 'claude-post': return directPost(args, 'claude');
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, snapshot, liaison draft');
+    default: throw new Error('usage: configure, bind, rebind, unbind, status, publication enable|disable, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, post, claude-post, snapshot, liaison draft');
   }
 }
 
@@ -908,4 +959,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, directPost, ensureProvisionedChannel, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };

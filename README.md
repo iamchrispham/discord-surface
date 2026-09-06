@@ -207,3 +207,22 @@ The private repository preserves the existing transport history. The sidecar fea
 The snapshot reads existing conductor records and the shared progress ladder without invoking a native conductor or `/cs`. Add `--interpret` to the `snapshot --channel-id CHANNEL` command for a separate optional Luna-low interpretation beside the deterministic preview. It uses the existing subscription runner, at most 32 KiB of packet data, 8 KiB of answer data, a 60-second deadline and one concurrent interpretation per process. It refreshes source data after inference, including provider failure, and discards results after source or binding changes. Temporary inference files are removed after the child exits. No preview is posted to Discord.
 
 Source-reference validation is structural, not proof that the interpretation is true. Automatic publication and end-to-end context exclusion remain under development. No hosted CI or portable dependency installation is configured yet. Run the local owning suite before pushing a feature update.
+
+
+## Conductor milestone announcements
+
+`post` sends an explicit milestone from an existing bound conductor without an inbound message, a running Gateway, or sidecar inference. `claude-post` is the Claude-only alias. Use it for a landing, a blocker, or a ruling the operator may want to override. Keep round-by-round detail in beacons and PR bodies. Human-grade events retain the existing phone path. This command sends no Telegram copy.
+
+```sh
+node src/cli.js claude-post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --db "$HOME/.config/discord-surface/surface.sqlite" \
+  --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
+  --text-file /absolute/path/to/milestone.txt
+```
+
+The native ID must resolve to exactly one active conductor binding. Use `--channel-id` if it is ambiguous. The command refuses a stale generation and checks authority again before every split part. The same `splitReply` implementation and 10,000-character text limit apply to native replies and announcements. Mentions are suppressed.
+
+Repeat the same command and unchanged file to inspect or resume the same milestone, not create a duplicate. Use `--request-id` to name a distinct milestone explicitly. Reusing an explicit ID with changed text is refused. Confirmed parts are skipped on retry. A request interrupted after its durable attempt stays uncertain and is never blindly resent. Definite unsent failures can be retried explicitly. Each part's attempt and delivery result are recorded in the existing receipts table.
+
+No native session, channel binding, automatic publication selection or phone configuration is changed. A successful receipt means Discord accepted the returned message IDs, not that the operator read them.

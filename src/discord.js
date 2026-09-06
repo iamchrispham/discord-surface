@@ -1,3 +1,4 @@
+const { watchPublications } = require('./publication/publisher');
 const fs = require('node:fs');
 const { REACTION, acknowledgmentCommand, watchAcknowledgments } = require('./acknowledgment');
 const { createRequire } = require('node:module');
@@ -103,7 +104,8 @@ function eventToInput(message) {
     authorId: message.author?.id,
     isBot: Boolean(message.author?.bot),
     content: message.content,
-    attachments
+    attachments,
+    nonce: message.nonce == null ? null : String(message.nonce)
   };
 }
 
@@ -126,6 +128,68 @@ async function cancelResponseBody(response) {
   try {
     await response?.body?.cancel?.();
   } catch {}
+}
+
+async function sendDiscordMessage({ token, channelId, content, nonce, signal, timeoutMs = RECOVERY_LIMITS.timeoutMs,
+  fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] } }) {
+  if (typeof fetchImpl !== 'function') throw Object.assign(new Error('Discord message fetch is unavailable'), { outcome: 'not_sent' });
+  if (signal?.aborted) throw Object.assign(new Error('Discord message send stopped before request'), { outcome: 'not_sent' });
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  let timer;
+  let started = false;
+  const operation = (async () => {
+    started = true;
+    let response;
+    try {
+      response = await fetchImpl(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bot ${token}`,
+          'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          content, nonce, enforce_nonce: true, allowed_mentions: allowedMentions,
+          ...(messageReference ? { message_reference: messageReference } : {})
+        }),
+        signal: controller.signal
+      });
+    } catch (error) {
+      if (!error.outcome) error.outcome = started ? 'unknown' : 'not_sent';
+      throw error;
+    }
+    if (!response?.ok) {
+      await cancelResponseBody(response);
+      const error = new Error('Discord direct post request rejected');
+      error.status = response?.status;
+      error.outcome = response?.status === 429 ? 'rate_limited' : [400, 401, 403, 404].includes(response?.status) ? 'not_sent' : 'unknown';
+      throw error;
+    }
+    let body;
+    try { body = await response.json(); }
+    catch (error) { await cancelResponseBody(response); error.outcome = 'unknown'; throw error; }
+    if (!body?.id) {
+      await cancelResponseBody(response);
+      throw Object.assign(new Error('Discord direct post response lacks message id'), { outcome: 'unknown' });
+    }
+    return body;
+  })();
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(Object.assign(new Error('Discord direct post deadline exceeded'), { outcome: 'unknown' }));
+    }, Math.max(1, Number(timeoutMs)));
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+    controller.abort();
+    operation.catch(() => {});
+  }
 }
 
 function transportReceiptText(message, attempt) {
@@ -477,12 +541,14 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
 }
 
 class DiscordGateway {
-  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {} } = {}) {
+  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, publicationOptions = {} } = {}) {
     this.state = state;
     this.logger = logger;
     this.client = client || this.createClient();
     this.discordToken = null;
     this.acknowledgments = null;
+    this.publications = null;
+    this.publicationOptions = publicationOptions;
     this.controllers = new Set();
     this.receiptControllers = new Set();
     this.inFlight = new Set();
@@ -569,55 +635,76 @@ class DiscordGateway {
     return this.sendTransportReceipt(message, { reaction });
   }
 
+  async sendPublication(binding, post, signal) {
+    if (typeof post.content !== 'string' || !post.content.trim() || post.content.length > 2000 ||
+        typeof post.nonce !== 'string' || !post.nonce || post.nonce.length > 25) {
+      throw Object.assign(new Error('invalid publication content or nonce'), { outcome: 'not_sent' });
+    }
+    if (signal.aborted || !this.ready || !this.isCurrentBinding(binding) || !this.state.publications.enabled(binding)) {
+      throw Object.assign(new Error('publication binding or connection changed'), { outcome: 'not_sent' });
+    }
+    let channel;
+    if (!this.discordToken || !this.client?.rest) {
+      channel = await waitForRecoveryOperation(() => this.client.channels.fetch(binding.channelId), signal, Date.now() + this.recoveryTimeoutMs);
+    }
+    if (signal.aborted || !this.ready || !this.isCurrentBinding(binding) || !this.state.publications.enabled(binding)) {
+      throw Object.assign(new Error('publication binding or connection changed'), { outcome: 'not_sent' });
+    }
+    try {
+      return await this.sendAuxiliaryMessage({ channelId: binding.channelId, channel }, {
+        content: post.content, nonce: post.nonce, allowedMentions: { parse: [] }
+      }, signal);
+    } catch (error) {
+      if ([400, 401, 403, 404, 429].includes(error.status)) error.outcome = 'not_sent';
+      throw error;
+    }
+  }
+
   async sendTransportReceipt(message, receipt) {
+    return this.sendAuxiliaryMessage(message, receipt);
+  }
+
+  async sendAuxiliaryMessage(message, receipt, signal) {
     const controller = new AbortController();
     this.receiptControllers.add(controller);
+    const abort = () => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) controller.abort();
     try {
+      if (controller.signal.aborted) throw Object.assign(new Error('send stopped before request'), { outcome: 'not_sent' });
       let sendPromise;
       try {
         // discord.js channel.send drops the signal and uses the shared REST retry queue.
         if (this.discordToken && this.client?.rest && typeof globalThis.fetch === 'function') {
           const channelId = message.channelId || message.channel.id;
-          const base = `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`;
-          const url = receipt.reaction ? `${base}/${encodeURIComponent(message.id)}/reactions/${encodeURIComponent(receipt.reaction)}/@me` : base;
-          sendPromise = globalThis.fetch(url, {
-            method: receipt.reaction ? 'PUT' : 'POST',
-            headers: {
-              Authorization: `Bot ${this.discordToken}`,
-              'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
-              'Content-Type': 'application/json'
-            },
-            body: receipt.reaction ? undefined : JSON.stringify({
-              content: receipt.content,
-              nonce: receipt.nonce,
-              enforce_nonce: true,
-              allowed_mentions: { parse: [], replied_user: false },
-              message_reference: {
-                message_id: message.id,
-                fail_if_not_exists: false
+          if (!receipt.reaction) {
+            sendPromise = sendDiscordMessage({
+              token: this.discordToken, channelId, content: receipt.content, nonce: receipt.nonce,
+              signal: controller.signal, timeoutMs: this.recoveryTimeoutMs, allowedMentions: receipt.allowedMentions || { parse: [], replied_user: false },
+              messageReference: message.id ? { message_id: message.id, fail_if_not_exists: false } : null
+            });
+          } else {
+            const base = `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`;
+            const url = `${base}/${encodeURIComponent(message.id)}/reactions/${encodeURIComponent(receipt.reaction)}/@me`;
+            sendPromise = globalThis.fetch(url, {
+              method: 'PUT',
+              headers: {
+                Authorization: `Bot ${this.discordToken}`,
+                'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
+                'Content-Type': 'application/json'
+              },
+              signal: controller.signal
+            }).then(async response => {
+              if (!response.ok) {
+                await cancelResponseBody(response);
+                const error = new Error('Discord transport receipt request rejected');
+                error.status = response.status;
+                throw error;
               }
-            }),
-            signal: controller.signal
-          }).then(async response => {
-            if (!response.ok) {
-              await cancelResponseBody(response);
-              const error = new Error('Discord transport receipt request rejected');
-              error.status = response.status;
-              throw error;
-            }
-            if (receipt.reaction) {
               await cancelResponseBody(response);
               return { id: message.id, reaction: receipt.reaction };
-            }
-            let body;
-            try { body = await response.json(); }
-            catch (error) {
-              await cancelResponseBody(response);
-              throw error;
-            }
-            if (!body?.id) throw new Error('Discord did not return a transport receipt message id');
-            return body;
-          });
+            });
+          }
         } else if (this.discordToken && this.client?.rest) {
           throw new Error('Discord transport receipt fetch is unavailable');
         } else {
@@ -641,6 +728,7 @@ class DiscordGateway {
         () => controller.abort()
       );
     } finally {
+      signal?.removeEventListener('abort', abort);
       this.receiptControllers.delete(controller);
     }
   }
@@ -684,6 +772,7 @@ class DiscordGateway {
   async start(secretFile) {
     if (this.stopping) throw new Error('Discord gateway is stopping');
     if (this.startPromise) return this.startPromise;
+    if (this.started) return;
     const epoch = ++this.lifecycleEpoch;
     this.ready = false;
     this.starting = true;
@@ -699,6 +788,9 @@ class DiscordGateway {
       this.started = true;
       this.acknowledgments = watchAcknowledgments({ state: this.state,
         send: (message, reaction) => this.sendAcknowledgment(message, reaction), logger: this.logger });
+      this.publications = watchPublications({ ...this.publicationOptions, state: this.state,
+        send: (binding, post, signal) => this.sendPublication(binding, post, signal),
+        ready: () => this.ready && !this.stopping, logger: this.logger });
     })();
     this.startPromise = startPromise;
     try { return await startPromise; }
@@ -936,7 +1028,10 @@ class DiscordGateway {
     const controller = this.recoveryController;
     this.recoveryPromise = (async () => {
       const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch);
-      if (result.ready && this.isCurrentLifecycle(lifecycleEpoch)) this.ready = true;
+      if (result.ready && this.isCurrentLifecycle(lifecycleEpoch)) {
+        this.ready = true;
+        this.publications?.schedule();
+      }
       else if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       return result;
     })();
@@ -1031,6 +1126,8 @@ class DiscordGateway {
       await Promise.allSettled([recovery, reconnect].filter(Boolean));
       for (const controller of this.controllers) controller.abort();
       for (const controller of this.receiptControllers) controller.abort();
+      const publicationStop = this.publications?.stop();
+      this.publications = null;
       const acknowledgmentStop = this.acknowledgments?.stop();
       this.acknowledgments = null;
       this.consumer.abortNativeWork();
@@ -1038,6 +1135,7 @@ class DiscordGateway {
       await this.consumer.waitForNativeWork();
       await this.consumer.waitForReceipts();
       await acknowledgmentStop;
+      await publicationStop;
       this.client.off?.('messageCreate', this.boundMessage);
       this.client.off?.('shardResume', this.boundResume);
       this.client.off?.('resume', this.boundResume);
@@ -1065,4 +1163,5 @@ module.exports = {
   eventToInput,
   readSecret,
   requireInstalled,
+  sendDiscordMessage,
 };
