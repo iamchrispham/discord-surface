@@ -656,8 +656,9 @@ function readProcessCommand(pid) {
 function pidMatches(value, stateDir, command) {
   if (!value || value.command !== 'run' || value.stateDir !== stateDir) return false;
   try {
-    const actualCommand = command ?? readProcessCommand(value.pid);
-    return actualCommand.includes(__filename) && actualCommand.includes(' run ') && actualCommand.includes(stateDir);
+    const actualCommand = (command ?? readProcessCommand(value.pid)).trim();
+    const expectedPrefix = `${process.execPath} ${__filename} run --state-dir ${stateDir}`;
+    return actualCommand === expectedPrefix || actualCommand.startsWith(`${expectedPrefix} --db `);
   } catch { return false; }
 }
 

@@ -1400,21 +1400,36 @@ test('simulated: v1.4 migration adds empty attachment metadata to legacy message
 });
 
 test('simulated: status distinguishes matching, stopped, stale, and unknown Gateway owners', async () => {
-  const { dir, state } = fixture();
+  const { dir, db, state } = fixture('gateway-status.sqlite');
   state.close();
-  const paths = pathsFor({ 'state-dir': dir });
+  const paths = pathsFor({ 'state-dir': dir, db });
   const status = () => gatewayProcessStatus(paths);
   assert.deepEqual(status(), { state: 'stopped', pid: null, connection: 'unavailable', reason: 'pid-file-missing' });
 
-  const childScript = 'setInterval(() => {}, 1000)';
-  const matching = spawn(process.execPath, ['-e', childScript, CLI_PATH, 'run', '--state-dir', dir], { stdio: 'ignore' });
+  const preload = path.join(dir, 'status-gateway-preload.cjs');
+  fs.writeFileSync(preload, `
+const target = require.resolve(${JSON.stringify(path.resolve(__dirname, '../src/discord.js'))});
+const loaded = require(target);
+class FixtureGateway {
+  constructor() { this.timer = setInterval(() => {}, 1000); }
+  async start() {}
+  async reconcilePending() {}
+  async stop() { clearInterval(this.timer); }
+}
+require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
+`, { mode: 0o600 });
+  const matching = spawn(process.execPath, [CLI_PATH, 'run', '--state-dir', dir, '--db', db], {
+    env: { ...process.env, NODE_OPTIONS: `--require=${preload}`, DISCORD_SURFACE_LOCK_HELD: '1' },
+    stdio: 'ignore'
+  });
   try {
+    await waitForFile(paths.pid);
     fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
     const running = status();
     assert.equal(running.state, 'running');
     assert.equal(running.pid, matching.pid);
     assert.equal(running.connection, 'unverified-live');
-    const printed = spawnSync(process.execPath, [CLI_PATH, 'status', '--state-dir', dir], { encoding: 'utf8' });
+    const printed = spawnSync(process.execPath, [CLI_PATH, 'status', '--state-dir', dir, '--db', db], { encoding: 'utf8' });
     assert.equal(printed.status, 0, printed.stderr);
     assert.equal(JSON.parse(printed.stdout).gateway.state, 'running');
     assert.equal(fs.existsSync(paths.pid), true);
@@ -1423,12 +1438,13 @@ test('simulated: status distinguishes matching, stopped, stale, and unknown Gate
     await waitForProcessGone(matching.pid);
   }
 
+  fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
   const stale = status();
   assert.equal(stale.state, 'stale');
   assert.equal(stale.pid, matching.pid);
   assert.equal(stale.connection, 'unavailable');
 
-  const wrong = spawn(process.execPath, ['-e', childScript, CLI_PATH, 'wrong-command', '--state-dir', dir], { stdio: 'ignore' });
+  const wrong = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', CLI_PATH, 'run', '--state-dir', dir], { stdio: 'ignore' });
   try {
     fs.writeFileSync(paths.pid, JSON.stringify({ pid: wrong.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
     assert.deepEqual(status(), { state: 'unknown', pid: wrong.pid, connection: 'unknown', reason: 'pid-owner-mismatch' });
@@ -1437,11 +1453,22 @@ test('simulated: status distinguishes matching, stopped, stale, and unknown Gate
     await waitForProcessGone(wrong.pid);
   }
 
+  const siblingDir = `${dir}-sibling`;
+  const sibling = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', CLI_PATH, 'run', '--state-dir', siblingDir], { stdio: 'ignore' });
+  try {
+    fs.writeFileSync(paths.pid, JSON.stringify({ pid: sibling.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
+    assert.deepEqual(status(), { state: 'unknown', pid: sibling.pid, connection: 'unknown', reason: 'pid-owner-mismatch' });
+  } finally {
+    sibling.kill('SIGTERM');
+    await waitForProcessGone(sibling.pid);
+  }
+
   fs.writeFileSync(paths.pid, '{not-json', { mode: 0o600 });
   assert.deepEqual(status(), { state: 'unknown', pid: null, connection: 'unknown', reason: 'pid-file-corrupt' });
   fs.writeFileSync(paths.pid, JSON.stringify({ pid: 'nope', stateDir: dir, command: 'run' }), { mode: 0o600 });
   assert.deepEqual(status(), { state: 'unknown', pid: null, connection: 'unknown', reason: 'pid-file-invalid' });
   fs.unlinkSync(paths.pid);
+  fs.unlinkSync(preload);
 });
 
 test('simulated: status readiness labels live permission and quota gates as unverified', () => {
