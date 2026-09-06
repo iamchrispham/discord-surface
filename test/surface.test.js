@@ -9,7 +9,7 @@ const { EventEmitter, getEventListeners } = require('node:events');
 const { spawn, spawnSync } = require('node:child_process');
 const { postUnixJson } = require('../src/native');
 const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
-const { CodexProvider, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
+const { CodexProvider, claudeEvent, codexPrompt, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
 const { deriveLiaisonFacts, rawReceiptFor, runLiaisonDraft, validateLiaisonSelection } = require('../src/liaison');
 const { bindingArgs, conductorMarker, ensureProvisionedChannel, migrateLegacyTopic, provisionMarker } = require('../src/cli');
@@ -38,17 +38,28 @@ function bindBoth(state, dir) {
   state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: '/tmp/discord-surface-test.sock' });
 }
 
-function discordMessage({ id, channelId, authorId = 'operator-1', bot = false, content = 'calculate 2 + 2', sends } = {}) {
+function discordMessage({ id, channelId, authorId = 'operator-1', bot = false, content = 'calculate 2 + 2', attachments, sends } = {}) {
   return {
     id,
     guildId: 'guild-1',
     channelId,
     content,
     author: { id: authorId, bot },
+    attachments,
     channel: { send: async payload => {
       sends?.push(payload);
       return { id: `reply-${id}` };
     } }
+  };
+}
+
+function attachmentMetadata(overrides = {}) {
+  return {
+    url: 'https://cdn.discordapp.com/attachments/1/image.png?sig=test',
+    filename: 'image.png',
+    contentType: 'image/png',
+    size: 321,
+    ...overrides
   };
 }
 
@@ -225,6 +236,79 @@ test('simulated: two provider bindings route and persist attributable replies', 
   assert.equal(claude.message.state, MESSAGE_STATES.REPLIED);
   assert.deepEqual(calls, { codex: 1, claude: 1 });
   assert.deepEqual(sends, ['4', '4']);
+  state.close();
+});
+
+test('simulated: attachment metadata survives intake, reopen, and native payload shaping', async () => {
+  const { dir, db, state } = fixture('attachments.sqlite');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: '/tmp/discord-surface-attachments.sock' });
+  const attachment = attachmentMetadata();
+  const text = state.acceptDiscordMessage({
+    id: 'attachment-text', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1',
+    isBot: false, content: 'inspect this image', attachments: [attachment]
+  });
+  const only = state.acceptDiscordMessage({
+    id: 'attachment-only', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1',
+    isBot: false, content: '', attachments: [attachment]
+  });
+  assert.equal(text.accepted, true);
+  assert.equal(only.accepted, true);
+  state.close();
+
+  const reopened = new SurfaceState(db);
+  const textMessage = reopened.getMessage('attachment-text');
+  const onlyMessage = reopened.getMessage('attachment-only');
+  assert.deepEqual(textMessage.attachments, [attachment]);
+  assert.deepEqual(onlyMessage.attachments, [attachment]);
+
+  const prompt = codexPrompt(textMessage);
+  assert.match(prompt, /inspect this image/);
+  assert.match(prompt, /Attachment references supplied by the user/);
+  assert.match(prompt, new RegExp(attachment.url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const event = claudeEvent(onlyMessage);
+  assert.equal(event.content.endsWith('\n'), false);
+  assert.match(event.content, /Attachment references supplied by the user/);
+  assert.deepEqual(event.attachments, [attachment]);
+
+  let codexArgs;
+  const provider = new CodexProvider({ root: dir, run: async (_command, args) => {
+    codexArgs = args;
+    return { status: 'not_submitted', error: new Error('fixture') };
+  } });
+  const outcome = await provider.dispatch(textMessage);
+  assert.equal(outcome.status, 'not_submitted');
+  const messageIndex = codexArgs.indexOf('--message');
+  assert.ok(messageIndex >= 0);
+  assert.match(codexArgs[messageIndex + 1], /image\.png/);
+  reopened.close();
+});
+
+test('simulated: attachment-only live intake reaches the provider and malformed metadata is rejected', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const attachment = attachmentMetadata({ filename: 'live.png', contentType: null });
+  const sdkAttachment = { url: attachment.url, name: attachment.filename, contentType: null, size: attachment.size };
+  let dispatched;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: { async dispatch(message) { dispatched = message; return { status: 'not_submitted', error: new Error('fixture') }; } } },
+    sendReply: async () => ({ id: 'unused' })
+  });
+  const accepted = await consumer.handleMessage(discordMessage({ id: 'attachment-live', channelId: 'channel-codex', content: '', attachments: new Map([['attachment-id', sdkAttachment]]) }));
+  assert.equal(accepted.status, 'not_submitted');
+  assert.equal(state.getMessage('attachment-live').state, MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(dispatched.attachments, [attachment]);
+  assert.deepEqual(state.getMessage('attachment-live').attachments, [attachment]);
+  const malformed = await consumer.handleMessage(discordMessage({
+    id: 'attachment-invalid', channelId: 'channel-codex', content: '',
+    attachments: [attachmentMetadata({ url: 'file:///private/image.png' })]
+  }));
+  assert.equal(malformed.accepted, false);
+  assert.equal(malformed.reason, 'invalid-event');
+  assert.equal(state.getMessage('attachment-invalid'), null);
+  state.db.prepare('UPDATE messages SET attachments=? WHERE discord_id=?').run('null', 'attachment-live');
+  assert.throws(() => state.getMessage('attachment-live'), StateCorruptError);
   state.close();
 });
 
@@ -721,6 +805,35 @@ test('simulated: Claude channel forwards only the bound generation and closes it
   state.close();
 });
 
+test('simulated: Claude channel validates and forwards attachment-only events', async () => {
+  const { dir, state } = fixture();
+  const socketDir = fs.mkdtempSync('/tmp/dsa-');
+  fs.chmodSync(socketDir, 0o700);
+  const socket = path.join(socketDir, 'channel.sock');
+  const attachment = attachmentMetadata();
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.acceptDiscordMessage({ id: 'claude-attachment', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: '', attachments: [attachment] });
+  state.claimDispatch('claude-attachment');
+  state.markSubmitted('claude-attachment');
+  const events = [];
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async event => events.push(event) } });
+  await channel.start();
+  const response = await postUnixJson(socket, {
+    nativeId: CLAUDE_ID, messageId: 'claude-attachment', generation: 1, content: '',
+    attachments: [attachment]
+  });
+  assert.equal(response.statusCode, 202);
+  assert.deepEqual(events[0].params.attachments, [attachment]);
+  const rejected = await postUnixJson(socket, {
+    nativeId: CLAUDE_ID, messageId: 'claude-attachment', generation: 1, content: '',
+    attachments: [attachmentMetadata({ url: 'javascript:alert(1)' })]
+  });
+  assert.equal(rejected.statusCode, 400);
+  assert.equal(events.length, 1);
+  await channel.stop();
+  state.close();
+});
+
 test('simulated: Claude Monitor child emits one event and CLI reply records exact custody', async () => {
   const { dir, db, state } = fixture('monitor-custom.sqlite');
   const socketDir = fs.mkdtempSync('/tmp/dsm-');
@@ -728,8 +841,9 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
   const socket = path.join(socketDir, 'monitor.sock');
   const messageId = 'claude-monitor-event';
   const content = `raw monitor content ✓\n${'keep exact ✓ '.repeat(300)}`;
+  const attachments = [attachmentMetadata({ filename: 'monitor.png', size: 777 })];
   state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
-  state.acceptDiscordMessage({ id: messageId, guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content });
+  state.acceptDiscordMessage({ id: messageId, guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content, attachments });
   state.claimDispatch(messageId);
   state.markSubmitted(messageId);
   state.close();
@@ -746,7 +860,10 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
     await new Promise(resolve => setTimeout(resolve, 25));
     assert.doesNotThrow(() => process.kill(child.pid, 0));
 
-    const response = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId, generation: 1, content: 'tampered transport content' });
+    const response = await postUnixJson(socket, {
+      nativeId: CLAUDE_ID, messageId, generation: 1, content: 'tampered transport content',
+      attachments: [attachmentMetadata({ url: 'https://attacker.invalid/tampered.txt', filename: 'tampered.txt' })]
+    });
     assert.equal(response.statusCode, 202);
     await stdout.waitForCount(1);
     const pointer = stdout.events[0];
@@ -762,6 +879,7 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
     const event = JSON.parse(fs.readFileSync(pointer.payloadPath, 'utf8'));
     assert.equal(event.type, 'discord-surface/claude-monitor');
     assert.equal(event.content, content);
+    assert.deepEqual(event.attachments, attachments);
     assert.deepEqual(event.meta, { messageId, nativeId: CLAUDE_ID, generation: '1' });
     assert.equal(event.reply.messageId, messageId);
     assert.equal(event.reply.nativeId, CLAUDE_ID);
@@ -1251,18 +1369,33 @@ test('simulated: v1.3 migration preserves a recorded cutoff and recovers older h
     user: { id: 'bot-1' },
     on() {}, off() {}, async login() {}, channels: { fetch: async () => channel }, async destroy() {}
   };
+  const historyAttachment = attachmentMetadata({ filename: 'history.png', size: 654 });
   const gateway = new DiscordGateway({ state: migrated, client, fetchHistory: async (_channel, options) => {
     assert.equal(options.after, '100');
     return [
       { id: '200', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'held live input' },
-      { id: '101', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'older history' }
+      { id: '101', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'older history', attachments: [historyAttachment] }
     ];
   } });
   await gateway.start(secret);
   assert.ok(migrated.getMessage('101'));
   assert.ok(migrated.getMessage('200'));
+  assert.deepEqual(migrated.getMessage('101').attachments, [historyAttachment]);
   assert.equal(migrated.getIntakeWatermark('channel-codex').recovered_through_id, '200');
   await gateway.stop();
+  migrated.close();
+});
+
+test('simulated: v1.4 migration adds empty attachment metadata to legacy messages', () => {
+  const { dir, db, state } = fixture('legacy-attachments.sqlite');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'legacy-text', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'legacy text' });
+  state.db.exec("ALTER TABLE messages DROP COLUMN attachments; UPDATE meta SET value='1.4' WHERE key='schema';");
+  state.close();
+
+  const migrated = new SurfaceState(db);
+  assert.deepEqual(migrated.getMessage('legacy-text').attachments, []);
+  assert.equal(migrated.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.5');
   migrated.close();
 });
 

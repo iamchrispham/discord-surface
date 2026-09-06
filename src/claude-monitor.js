@@ -2,6 +2,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { ClaudeChannel } = require('./claude-channel');
+const { normalizeAttachments } = require('./state');
 
 function replyFileFor(directory, messageId, generation) {
   const key = crypto.createHash('sha256')
@@ -75,6 +76,7 @@ function eventValues(event) {
   }
   const content = event.params.content;
   const meta = event.params.meta;
+  const attachments = normalizeAttachments(event.params.attachments);
   if (typeof content !== 'string' || !meta || typeof meta !== 'object') throw new Error('invalid Claude Monitor event');
   const messageId = meta.messageId;
   const nativeId = meta.nativeId;
@@ -82,11 +84,11 @@ function eventValues(event) {
   if (typeof messageId !== 'string' || !messageId || typeof nativeId !== 'string' || !nativeId || !Number.isInteger(generation) || generation < 1) {
     throw new Error('invalid Claude Monitor event metadata');
   }
-  return { content, messageId, nativeId, generation };
+  return { content, messageId, nativeId, generation, attachments };
 }
 
-function monitorEvent({ content, messageId, nativeId, generation, stateDir, dbPath, cliPath, textFile }) {
-  return {
+function monitorEvent({ content, messageId, nativeId, generation, attachments = [], stateDir, dbPath, cliPath, textFile }) {
+  const event = {
     type: 'discord-surface/claude-monitor',
     content,
     meta: { messageId, nativeId, generation: String(generation) },
@@ -116,6 +118,8 @@ function monitorEvent({ content, messageId, nativeId, generation, stateDir, dbPa
       ]
     }
   };
+  if (attachments.length) event.attachments = attachments;
+  return event;
 }
 
 function monitorPointer({ messageId, nativeId, generation, payloadPath }) {
@@ -151,6 +155,7 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
         const payload = monitorEvent({
           ...values,
           content: message.content,
+          attachments: message.attachments,
           stateDir: path.resolve(stateDir),
           dbPath: path.resolve(dbPath),
           cliPath: path.resolve(cliPath),

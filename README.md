@@ -130,6 +130,8 @@ The Monitor process owns its listener lifetime. It ignores stdin EOF, stops on n
 
 Accepted input is durable before a Discord handler returns. After authorized intake commits, live input gets one deterministic transport receipt. The receipt says either `Receipt: saved for this conductor.` or `Receipt: saved. Delivery was paused when this receipt was prepared.` It is a reply to the source message with mentions disabled. It never claims that the native agent has read, acted on, or answered the input. Receipt delivery is independent of native forwarding, uses a stable nonce, and never retries an uncertain send. Duplicate or rejected input gets no receipt attempt.
 
+Discord attachments are retained as validated URL metadata with the message, including filename, MIME type, and size. The adapter never downloads or archives attachment bytes. CDN URLs can expire, so native sessions receive the references as untrusted user data and decide whether they need to read them.
+
 An operator may request one manual Spark preview from an existing durable receipt. The command reads one persisted source message and its transport receipt, keeps that raw evidence beside the result, and sends only code-derived facts to the isolated read-only Spark subprocess. The result is labeled `liaison draft`; it is never posted to Discord and never changes forwarding or custody. Missing receipts, unavailable Spark, invalid output, quota failure, timeout, and cancellation return `draft: null`.
 
 ```sh

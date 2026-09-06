@@ -2,7 +2,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const { createRequire } = require('node:module');
-const { MESSAGE_STATES, validateNativeId } = require('./state');
+const { MESSAGE_STATES, normalizeAttachments, validateNativeId } = require('./state');
 
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
 
@@ -121,11 +121,14 @@ class ClaudeChannel {
       throw new Error('Claude channel event has no accepted custody');
     }
     this.state.assertMessageCurrent(body.messageId, 'native-dispatch');
+    const attachments = normalizeAttachments(body.attachments);
     try {
-      await this.mcp.notification({ method: 'notifications/claude/channel', params: {
+      const params = {
         content: body.content,
         meta: { messageId: body.messageId, generation: String(body.generation), nativeId: body.nativeId }
-      }});
+      };
+      if (attachments.length) params.attachments = attachments;
+      await this.mcp.notification({ method: 'notifications/claude/channel', params });
     } catch (error) {
       error.potentiallyDelivered = true;
       throw error;

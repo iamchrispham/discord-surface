@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 
-const SCHEMA_VERSION = '1.4';
+const SCHEMA_VERSION = '1.5';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
 const READINESS = Object.freeze({
   PENDING: 'pending',
@@ -92,6 +92,26 @@ function assertEndpoint(value) {
   return value;
 }
 
+function normalizeAttachments(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new TypeError('attachments must be an array');
+  if (value.length > 25) throw new TypeError('attachments must contain at most 25 items');
+  return value.map((attachment, index) => {
+    if (!attachment || typeof attachment !== 'object' || Array.isArray(attachment)) throw new TypeError(`attachment ${index} must be an object`);
+    const url = attachment.url;
+    if (typeof url !== 'string' || url.length === 0 || url.length > 2048 || /[\u0000-\u001f\u007f]/.test(url)) throw new TypeError(`attachment ${index} url is invalid`);
+    let parsed;
+    try { parsed = new URL(url); } catch { throw new TypeError(`attachment ${index} url is invalid`); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new TypeError(`attachment ${index} url must be an http or https URL`);
+    const filename = attachment.filename;
+    if (typeof filename !== 'string' || filename.length === 0 || filename.length > 255 || /[\u0000-\u001f\u007f]/.test(filename)) throw new TypeError(`attachment ${index} filename is invalid`);
+    const contentType = attachment.contentType === undefined || attachment.contentType === null ? null : attachment.contentType;
+    if (contentType !== null && (typeof contentType !== 'string' || contentType.length === 0 || contentType.length > 255 || /[\u0000-\u001f\u007f]/.test(contentType))) throw new TypeError(`attachment ${index} contentType is invalid`);
+    if (!Number.isSafeInteger(attachment.size) || attachment.size < 0) throw new TypeError(`attachment ${index} size is invalid`);
+    return { url, filename, contentType, size: attachment.size };
+  });
+}
+
 function safeDetail(value) {
   if (value === undefined) return '{}';
   try {
@@ -161,12 +181,22 @@ function rowReplyPart(row) {
 
 function rowMessage(row) {
   if (!row) return null;
+  let attachments;
+  try {
+    if (typeof row.attachments !== 'string') throw new TypeError('attachments column is not text');
+    const parsed = JSON.parse(row.attachments);
+    if (!Array.isArray(parsed)) throw new TypeError('attachments must be an array');
+    attachments = normalizeAttachments(parsed);
+  } catch (error) {
+    throw new StateCorruptError(`message attachments are invalid: ${error.message}`);
+  }
   return {
     id: row.discord_id,
     guildId: row.guild_id,
     channelId: row.channel_id,
     authorId: row.author_id,
     content: row.content,
+    attachments,
     provider: row.provider,
     nativeId: row.native_id,
     workspace: row.workspace,
@@ -301,6 +331,7 @@ class SurfaceState {
         channel_id TEXT NOT NULL REFERENCES bindings(channel_id),
         author_id TEXT NOT NULL,
         content TEXT NOT NULL,
+        attachments TEXT NOT NULL DEFAULT '[]',
         provider TEXT NOT NULL,
         native_id TEXT NOT NULL,
         workspace TEXT NOT NULL,
@@ -401,7 +432,7 @@ class SurfaceState {
   migrateSchema() {
     const version = this.db.prepare("SELECT value FROM meta WHERE key='schema'").get();
     if (!version) throw new StateCorruptError('state schema metadata is missing');
-    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== SCHEMA_VERSION) {
+    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== SCHEMA_VERSION) {
       throw new StateCorruptError(`unsupported state schema ${version.value}`);
     }
     if (version.value === SCHEMA_VERSION) {
@@ -494,6 +525,7 @@ class SurfaceState {
       if (!bindings.has('readiness')) this.db.exec("ALTER TABLE bindings ADD COLUMN readiness TEXT NOT NULL DEFAULT 'pending'");
       if (!messages.has('conductor_id')) this.db.exec('ALTER TABLE messages ADD COLUMN conductor_id TEXT');
       if (!messages.has('repo_key')) this.db.exec('ALTER TABLE messages ADD COLUMN repo_key TEXT');
+      if (!messages.has('attachments')) this.db.exec("ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'");
       if (!intents.has('conductor_id')) this.db.exec('ALTER TABLE provision_intents ADD COLUMN conductor_id TEXT');
       if (!intents.has('repo_key')) this.db.exec('ALTER TABLE provision_intents ADD COLUMN repo_key TEXT');
       if (watermarks.size && !watermarks.has('recovered_through_id')) {
@@ -601,7 +633,7 @@ class SurfaceState {
     this.assertColumns('messages', {
       discord_id: { type: 'TEXT' }, guild_id: { type: 'TEXT', notnull: true },
       channel_id: { type: 'TEXT', notnull: true }, author_id: { type: 'TEXT', notnull: true },
-      content: { type: 'TEXT', notnull: true }, conductor_id: { type: 'TEXT' }, repo_key: { type: 'TEXT' }, state: { type: 'TEXT', notnull: true },
+      content: { type: 'TEXT', notnull: true }, attachments: { type: 'TEXT', notnull: true }, conductor_id: { type: 'TEXT' }, repo_key: { type: 'TEXT' }, state: { type: 'TEXT', notnull: true },
       reply_next_part: { type: 'INTEGER', notnull: true }, created_at: { type: 'TEXT', notnull: true },
       updated_at: { type: 'TEXT', notnull: true }
     });
@@ -1148,7 +1180,11 @@ class SurfaceState {
   acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null } = {}) {
     const config = this.requireConfig();
     if (coverageId !== null) assertText(coverageId, 'coverageId', 128);
-    if (!event || [event.id, event.guildId, event.channelId, event.authorId, event.content].some(value => typeof value !== 'string' || value.length === 0)) {
+    let attachments;
+    try { attachments = normalizeAttachments(event?.attachments); } catch { attachments = null; }
+    const validEvent = event && [event.id, event.guildId, event.channelId, event.authorId].every(value => typeof value === 'string' && value.length > 0) &&
+      typeof event.content === 'string' && event.content.length <= 10000 && attachments !== null && (event.content.length > 0 || attachments.length > 0);
+    if (!validEvent) {
       if (event && [event.id, event.guildId, event.channelId].every(value => typeof value === 'string' && value.length > 0)) {
         const result = this.transaction(() => {
           const binding = this.getBinding(event.channelId);
@@ -1166,7 +1202,7 @@ class SurfaceState {
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
       this.upsertIntakeWatermark(event, ready, coverageId);
       let reason = null;
-      if (event.content.length > 10000) reason = 'invalid-event';
+      if (typeof event.content !== 'string' || event.content.length > 10000 || attachments === null || (event.content.length === 0 && attachments?.length === 0)) reason = 'invalid-event';
       else if (event.isBot) reason = 'bot-source';
       else if (event.guildId !== config.guildId || event.authorId !== config.operatorId) reason = 'unauthorized-sender';
       if (!reason && (!binding || !binding.active || binding.guildId !== event.guildId)) reason = 'unknown-binding';
@@ -1181,9 +1217,9 @@ class SurfaceState {
         throw new Error('injected intake transaction failure');
       }
       const timestamp = now();
-      this.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, author_id, content, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        event.id, event.guildId, event.channelId, event.authorId, event.content, binding.provider, binding.nativeId,
+      this.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, author_id, content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        event.id, event.guildId, event.channelId, event.authorId, event.content, JSON.stringify(attachments), binding.provider, binding.nativeId,
         binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
       );
       const watermark = this.getIntakeWatermark(event.channelId);
@@ -1732,6 +1768,7 @@ module.exports = {
   UnresolvedWorkError,
   UUID,
   discordNonce,
+  normalizeAttachments,
   splitReply,
   validateNativeId
 };

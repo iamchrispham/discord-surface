@@ -82,13 +82,27 @@ function readSecret(secretFile) {
 }
 
 function eventToInput(message) {
+  let attachments = message.attachments;
+  if (attachments === undefined || attachments === null) attachments = [];
+  else if (!Array.isArray(attachments) && typeof attachments.values === 'function') {
+    try { attachments = [...attachments.values()]; } catch {}
+  }
+  if (Array.isArray(attachments)) {
+    attachments = attachments.map(attachment => attachment && typeof attachment === 'object' ? {
+      url: attachment.url,
+      filename: attachment.filename ?? attachment.name,
+      contentType: attachment.contentType ?? null,
+      size: attachment.size
+    } : attachment);
+  }
   return {
     id: message.id,
     guildId: message.guildId,
     channelId: message.channelId,
     authorId: message.author?.id,
     isBot: Boolean(message.author?.bot),
-    content: message.content
+    content: message.content,
+    attachments
   };
 }
 
