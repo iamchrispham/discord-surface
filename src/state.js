@@ -1798,7 +1798,7 @@ class SurfaceState {
         if (!outcome) return { claimed: false, status: 'in_flight', attemptId: latest.detail.attemptId, nonce: latest.detail.nonce };
         const status = outcome.detail.outcome;
         if (status === 'sent' || status === 'unknown') return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
-        if (!['not_sent', 'rejected', 'rate_limited'].includes(status)) return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
+        if (!['not_sent', 'rejected', 'rate_limited', 'stale'].includes(status)) return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
       }
       const ownerIdentity = this.directPostOwnerIdentity(process.pid);
       this.receipt(null, DIRECT_POST_ATTEMPT, {
