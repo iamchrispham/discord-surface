@@ -339,16 +339,14 @@ test('old-generation unknown custody stays visible after a handoff', async t => 
 test('watch failure rearms the subscription and reads missed changes without source polling', async t => {
   const f = fixture(t);
   const watchers = [];
-  const callbacks = [];
   const sent = [];
   let reads = 0;
   const p = start(f, { rearmMs: 30, send: async (_binding, post) => { sent.push(post); return { id: String(1100 + sent.length) }; },
     read: async (...args) => { reads++; return f.readSnapshot(...args); },
-    watchFactory: (_directory, callback) => { const watcher = new EventEmitter(); watcher.close = () => {}; callbacks.push(callback); watchers.push(watcher); return watcher; } });
+    watchFactory: (_directory, _callback) => { const watcher = new EventEmitter(); watcher.close = () => {}; watchers.push(watcher); return watcher; } });
   await until(() => sent.length === 1);
   watchers[0].emit('error', new Error('fixture watcher failure'));
   f.data._conductors['owner.md'].next = ['Changed while subscription was down']; f.write();
-  callbacks[0]('rename', 'registry.json');
   await until(() => sent.length === 2, 'rearm reads missed change');
   assert.match(sent[1].content, /Changed while subscription was down/);
   assert.equal(watchers.length, 4, 'one replacement subscription');
