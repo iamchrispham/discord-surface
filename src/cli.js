@@ -94,13 +94,14 @@ function unbind(args) {
 
 function publicationPolicy(subcommand, args) {
   if (!['enable', 'disable'].includes(subcommand)) throw new Error('usage: publication enable|disable --channel-id ID --native-id UUID --generation N');
+  if (args.context !== undefined && (args.context !== true || subcommand !== 'enable')) throw new Error('--context is an enable-only flag');
   const { state } = openState(args);
   try {
     const binding = state.getBinding(required(args, 'channel-id'));
     if (!binding || binding.nativeId !== required(args, 'native-id') || binding.generation !== Number(required(args, 'generation'))) {
       throw new Error('publication policy binding is stale');
     }
-    print(state.publications.setEnabled(binding, subcommand === 'enable'));
+    print(state.publications.setEnabled(binding, subcommand === 'enable', { context: args.context === true }));
   } finally { state.close(); }
 }
 

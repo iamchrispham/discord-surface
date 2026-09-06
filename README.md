@@ -227,4 +227,15 @@ Repeat the same command and unchanged file to inspect or resume the same milesto
 
 No native session, channel binding, automatic publication selection or phone configuration is changed. A successful receipt means Discord accepted the returned message IDs, not that the operator read them.
 
-Selected automatic publication runs bounded Luna-low interpretation after staging the deterministic board. Useful current context appears as a separate labeled note under the same routine cadence. Model failure or interrupted inference does not suppress newer deterministic boards. The contextual publisher remains a candidate pending prospective quality and live rollout proof. See docs/contextual-publication-proof.md.
+Automatic publication defaults to deterministic boards only. Enable it for an exact current binding:
+
+```sh
+node src/cli.js publication enable --state-dir "$HOME/.config/discord-surface" \
+  --channel-id CHANNEL --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION
+```
+
+Add `--context` to that command to opt into bounded Luna-low interpretation after staging the board. Repeating `enable` without `--context` returns to deterministic-only publication. `disable` stops both forms. Status and the policy receipt expose `contextEnabled`. Context policy follows the same operator, guild, vendor, conductor and repository scope as board policy.
+
+Removing context opt-in cancels active inference, rejects late results and prevents pending notes from starting a request. A request already initiated retains its real outcome and custody. Pending notes are preserved while disabled. Interrupted inference is not automatically rerun when re-enabled, so a new source may be needed before another interpretation. No native input or acknowledgment depends on this policy.
+
+Explicitly selected contextual publication runs bounded Luna-low interpretation after staging the deterministic board. Useful current context appears as a separate labeled note under the same routine cadence. Model failure or interrupted inference does not suppress newer deterministic boards. The contextual publisher remains a candidate pending prospective quality and live rollout proof. See docs/contextual-publication-proof.md.

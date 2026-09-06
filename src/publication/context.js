@@ -11,7 +11,7 @@ function contextualPublications({ store, interpret = interpretSnapshot, schedule
     const head = store.db.prepare('SELECT * FROM publication_heads WHERE owner_key=?').get(work.owner_key);
     if (!head || head.sequence !== work.sequence || head.processed_id !== work.snapshot_id) return null;
     const binding = JSON.parse(head.binding);
-    if (!store.current(binding) || !store.enabled(binding)) return null;
+    if (!store.current(binding) || !store.contextEnabled(binding)) return null;
     const snapshot = JSON.parse(head.snapshot);
     if (snapshot.expiresAt && snapshot.expiresAt * 1000 <= clock()) return null;
     return contextPacket(snapshot) ? snapshot : null;

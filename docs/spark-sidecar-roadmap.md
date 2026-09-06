@@ -140,3 +140,8 @@ September 6 combined publication and milestone integration: all five registered 
 September 6 bounded human reference implementation: explicit replies to automatic posts now preserve a single historical post and its original provenance through intake, restart, Codex and both Claude delivery shapes. Same-role successor references are allowed by the three-lens panel ruling. Foreign roles attach no context. Six registered files passed 168 tests. Independent review clear, scope and Monitor negative controls fail as intended. Not installed or live-proven. See publication-reference-proof.md.
 
 Contextual automatic publication is implemented in the candidate. Deterministic boards do not await Luna. Current useful output takes the next normal cadence slot without a new source event. Durable attempt state and separate context delivery custody preserve restart behavior. Unknown context sends cannot block newer boards. Six registered files passed 174 tests. Independent review clear. Controlled child-process integration is not real model quality or live Discord proof. See contextual-publication-proof.md.
+
+
+## Context activation after prospective screening
+
+The three real source captures yielded mostly repetitive notes. A four-call paired prompt experiment did not reduce that repetition and failed its synthetic positive control, so the prompt patch was rejected. Automatic publication now supports the already-approved artifact-only trial: boards by default, explicit `--context` opt-in for interpretation. Context usefulness and both-vendor live acceptance remain open. See docs/context-activation-proof.md in the candidate and outputs/context-baseline-trial/assessment.md in the owning workspace. This changes activation, not the goal requirements.

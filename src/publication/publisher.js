@@ -106,7 +106,7 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
   });
   const dbName = path.basename(state.dbPath);
   function changedBindings() {
-    const signature = JSON.stringify(bindings().map(binding => [ownerKey(binding), binding.readiness]).sort());
+    const signature = JSON.stringify(bindings().map(binding => [ownerKey(binding), binding.readiness, store.contextEnabled(binding)]).sort());
     if (signature !== bindingSignature) { bindingSignature = signature; schedule(); }
   }
   watch(path.dirname(state.dbPath), (_event, name) => {

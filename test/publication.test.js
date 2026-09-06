@@ -415,8 +415,101 @@ function usefulContext(snapshot) {
     interpretation: { decision: 'context' } };
 }
 
+test('board-only default survives restart and CLI context opt-in starts one model', async t => {
+  const { spawnSync } = require('node:child_process');
+  const f = fixture(t);
+  const model = heldInterpreter();
+  const sent = [];
+  const send = async (_binding, post) => { sent.push(post); return { id: String(8900 + sent.length) }; };
+  const first = start(f, { send, interpret: model.interpret });
+  await until(() => sent.length === 1);
+  await first.drain();
+  assert.equal(model.calls.length, 0);
+  assert.equal(f.state.db.prepare('SELECT COUNT(*) AS n FROM publication_context').get().n, 0);
+  await first.stop(); f.reopen();
+  const second = start(f, { send, interpret: model.interpret });
+  await second.drain();
+  assert.equal(model.calls.length, 0);
+  const cli = spawnSync(process.execPath, [require.resolve('../src/cli'), 'publication', 'enable',
+    '--state-dir', f.dir, '--channel-id', 'channel', '--native-id', NATIVE, '--generation', '1', '--context'], { encoding: 'utf8' });
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.equal(JSON.parse(cli.stdout).contextEnabled, true);
+  await until(() => model.calls.length === 1, 'policy file event starts opted-in model');
+  model.calls[0].finish(usefulContext(model.calls[0].snapshot));
+  await until(() => sent.length === 2);
+  assert.equal(sent[1].kind, 'context');
+  await second.stop(); f.reopen();
+  assert.equal(f.state.publications.contextEnabled(f.binding), true);
+  f.state.setConfig({ operatorId: 'other-operator' });
+  assert.equal(f.state.publications.contextEnabled(f.binding), false);
+});
+
+test('removing context policy aborts inference and discards late output without stopping boards', async t => {
+  const f = fixture(t);
+  f.state.publications.setEnabled(f.binding, true, { context: true });
+  const model = heldInterpreter();
+  const sent = [];
+  const send = async (_binding, post) => { sent.push(post); return { id: String(8950 + sent.length) }; };
+  const p = start(f, { send, interpret: model.interpret });
+  await until(() => model.calls.length === 1 && sent.length === 1);
+  const active = model.calls[0];
+  f.state.publications.setEnabled(f.binding, true);
+  await until(() => active.signal.aborted, 'policy change aborts without registry event');
+  active.finish(usefulContext(active.snapshot));
+  f.data._conductors['owner.md'].next = ['Continue deterministic proof']; f.write();
+  await until(() => sent.length === 2);
+  assert.ok(sent.every(post => post.kind === 'board'));
+  assert.equal(f.state.db.prepare("SELECT COUNT(*) AS n FROM publication_posts WHERE kind='context'").get().n, 0);
+  await p.stop(); f.reopen();
+  const restarted = start(f, { send, interpret: model.interpret });
+  await restarted.drain();
+  assert.equal(model.calls.length, 1);
+  assert.equal(f.state.publications.status()[0].contextEnabled, false);
+});
+
+test('disabled context stays pending and cannot start a request after asynchronous lookup', async t => {
+  const f = fixture(t);
+  f.state.publications.setEnabled(f.binding, true, { context: true });
+  const store = f.state.publications;
+  const snapshot = await readSnapshot(f.binding, { registry: f.registry });
+  store.stage(f.binding, snapshot, 'Board');
+  const board = store.pending(f.binding);
+  assert.equal(store.begin(f.binding, board.id, Date.now()), true);
+  store.sent(board.id, '8970', Date.now());
+  store.queueContext(f.binding, snapshot);
+  store.finishContext(store.contextWork()[0], usefulContext(snapshot), Date.now());
+  const post = store.pending(f.binding);
+  assert.equal(post.kind, 'context');
+  f.state.publications.setEnabled(f.binding, true);
+  assert.equal(store.pending(f.binding), null);
+  assert.equal(store.begin(f.binding, post.id, Date.now()), false);
+  f.state.publications.setEnabled(f.binding, true, { context: true });
+  assert.equal(store.begin(f.binding, post.id, Date.now()), true);
+  let release;
+  let sends = 0;
+  const channel = { send: async () => { sends++; return { id: '8971' }; } };
+  const gateway = new DiscordGateway({ state: f.state,
+    client: { channels: { fetch: () => new Promise(resolve => { release = () => resolve(channel); }) }, on() {}, off() {} }, providers: {} });
+  gateway.ready = true;
+  t.after(() => gateway.stop());
+  const pending = gateway.sendPublication(f.binding, post, new AbortController().signal);
+  const rejected = assert.rejects(pending, error => {
+    assert.equal(error.outcome, 'not_sent');
+    store.failed(post.id, error, Date.now(), 150);
+    return true;
+  });
+  await until(() => release);
+  store.setEnabled(f.binding, true);
+  release();
+  await rejected;
+  assert.equal(sends, 0);
+  assert.equal(store.pending(f.binding), null);
+  assert.equal(f.state.db.prepare('SELECT status FROM publication_posts WHERE id=?').get(post.id).status, STATUS.PENDING);
+});
+
 test('slow interpretation never delays board and current note wakes once without a file event or restart repeat', async t => {
   const f = fixture(t);
+  f.state.publications.setEnabled(f.binding, true, { context: true });
   const model = heldInterpreter();
   const sent = [];
   const send = async (_binding, post) => { sent.push({ ...post, at: Date.now() }); return { id: String(9000 + sent.length) }; };
@@ -438,6 +531,7 @@ test('slow interpretation never delays board and current note wakes once without
 
 test('newer source and shutdown discard late interpretation without reviving its note', async t => {
   const f = fixture(t);
+  f.state.publications.setEnabled(f.binding, true, { context: true });
   const model = heldInterpreter();
   const sent = [];
   const p = start(f, { interpret: model.interpret, send: async (_binding, post) => { sent.push(post); return { id: String(9100 + sent.length) }; } });
@@ -457,6 +551,7 @@ test('newer source and shutdown discard late interpretation without reviving its
 
 test('unknown context delivery does not block a newer deterministic board', async t => {
   const f = fixture(t);
+  f.state.publications.setEnabled(f.binding, true, { context: true });
   const sent = [];
   const p = start(f, { interpret: async snapshot => usefulContext(snapshot), send: async (_binding, post) => {
     sent.push(post);
@@ -476,6 +571,7 @@ test('unknown context delivery does not block a newer deterministic board', asyn
 
 test('ready context survives result-before-send restart and abandoned inference never relaunches', async t => {
   const f = fixture(t);
+  f.state.publications.setEnabled(f.binding, true, { context: true });
   const sent = [];
   let models = 0;
   const send = async (_binding, post) => { sent.push(post); return { id: String(9300 + sent.length) }; };
@@ -497,9 +593,10 @@ test('ready context survives result-before-send restart and abandoned inference 
 
 test('two selected bindings share one inference slot while both boards remain independent', async t => {
   const f = fixture(t);
+  f.state.publications.setEnabled(f.binding, true, { context: true });
   const second = { ...f.binding, channelId: 'second', nativeId: '79e3da8e-94b4-4aff-8f88-b45b3a451dd1', conductorId: 'second.md', repoKey: 'repo:second' };
   f.state.bind(second); f.state.setBindingReadiness('second', 'ready');
-  f.state.publications.setEnabled(f.state.getBinding('second'), true);
+  f.state.publications.setEnabled(f.state.getBinding('second'), true, { context: true });
   f.data._conductors['second.md'] = { ...f.data._conductors['owner.md'], repository: second.repoKey, nativeId: second.nativeId };
   f.write();
   const model = heldInterpreter();
@@ -519,6 +616,7 @@ test('two selected bindings share one inference slot while both boards remain in
 test('automatic publication consumes the bounded interpreter process and its validated rendered result', async t => {
   const { interpretSnapshot } = require('../src/context-interpretation');
   const f = fixture(t);
+  f.state.publications.setEnabled(f.binding, true, { context: true });
   const sent = [];
   let pid, directory;
   const p = start(f, { interpret: (snapshot, options) => interpretSnapshot(snapshot, { ...options,

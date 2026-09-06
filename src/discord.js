@@ -641,14 +641,14 @@ class DiscordGateway {
         typeof post.nonce !== 'string' || !post.nonce || post.nonce.length > 25) {
       throw Object.assign(new Error('invalid publication content or nonce'), { outcome: 'not_sent' });
     }
-    if (signal.aborted || !this.ready || !this.isCurrentBinding(binding) || !this.state.publications.enabled(binding)) {
+    if (signal.aborted || !this.ready || !this.isCurrentBinding(binding) || !this.state.publications.canPublish(binding, post)) {
       throw Object.assign(new Error('publication binding or connection changed'), { outcome: 'not_sent' });
     }
     let channel;
     if (!this.discordToken || !this.client?.rest) {
       channel = await waitForRecoveryOperation(() => this.client.channels.fetch(binding.channelId), signal, Date.now() + this.recoveryTimeoutMs);
     }
-    if (signal.aborted || !this.ready || !this.isCurrentBinding(binding) || !this.state.publications.enabled(binding)) {
+    if (signal.aborted || !this.ready || !this.isCurrentBinding(binding) || !this.state.publications.canPublish(binding, post)) {
       throw Object.assign(new Error('publication binding or connection changed'), { outcome: 'not_sent' });
     }
     try {

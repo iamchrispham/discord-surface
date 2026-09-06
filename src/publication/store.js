@@ -58,15 +58,26 @@ class PublicationStore extends EventEmitter {
     return Boolean(binding.conductorId && binding.repoKey) && binding.guildId === config.guildId &&
       this.db.prepare('SELECT value FROM config WHERE key=?').get(policyKey(binding, config.operatorId))?.value === 'true';
   }
-  setEnabled(binding, enabled) {
-    if (typeof enabled !== 'boolean' || !binding?.conductorId || !binding?.repoKey) throw new Error('publication requires a conductor binding and boolean policy');
+  contextEnabled(binding) {
+    return this.enabled(binding) && this.db.prepare('SELECT value FROM config WHERE key=?')
+      .get(policyKey(binding, this.state.getConfig().operatorId) + ':context')?.value === 'true';
+  }
+  canPublish(binding, post) {
+    return this.enabled(binding) && (post.kind !== POST_KIND.CONTEXT || this.contextEnabled(binding));
+  }
+  setEnabled(binding, enabled, { context = false } = {}) {
+    if (typeof enabled !== 'boolean' || typeof context !== 'boolean' || !binding?.conductorId || !binding?.repoKey) throw new Error('publication requires a conductor binding and boolean policy');
     return this.state.transaction(() => {
       if (!this.current(binding)) throw new Error('publication policy binding is stale');
+      const key = policyKey(binding, this.state.requireConfig().operatorId);
+      const contextEnabled = enabled && context;
       this.db.prepare('INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
-        .run(policyKey(binding, this.state.requireConfig().operatorId), String(enabled));
+        .run(key, String(enabled));
+      this.db.prepare('INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+        .run(key + ':context', String(contextEnabled));
       this.state.receipt(null, 'publication-policy', { channelId: binding.channelId, provider: binding.provider,
-        conductorId: binding.conductorId, repoKey: binding.repoKey, enabled });
-      return { channelId: binding.channelId, enabled };
+        conductorId: binding.conductorId, repoKey: binding.repoKey, enabled, contextEnabled });
+      return { channelId: binding.channelId, enabled, contextEnabled };
     });
   }
   head(binding) { return this.db.prepare('SELECT * FROM publication_heads WHERE owner_key=?').get(ownerKey(binding)); }
@@ -102,7 +113,7 @@ class PublicationStore extends EventEmitter {
     const board = this.db.prepare('SELECT * FROM publication_posts WHERE owner_key=? AND status=? AND kind=? ORDER BY rowid LIMIT 1')
       .get(key, STATUS.PENDING, POST_KIND.BOARD);
     if (board) return board;
-    if (blocked.length) return null;
+    if (blocked.length || !this.contextEnabled(binding)) return null;
     return this.db.prepare(`SELECT p.* FROM publication_posts p JOIN publication_posts b ON b.id=p.board_id
       WHERE p.owner_key=? AND p.status=? AND p.kind=? AND b.status=? ORDER BY p.rowid LIMIT 1`)
       .get(key, STATUS.PENDING, POST_KIND.CONTEXT, STATUS.SENT);
@@ -140,7 +151,7 @@ class PublicationStore extends EventEmitter {
   }
   queueContext(binding, snapshot) {
     const head = this.head(binding);
-    if (!head || !this.current(binding) || !this.enabled(binding)) return;
+    if (!head || !this.current(binding) || !this.contextEnabled(binding)) return;
     this.db.prepare('INSERT OR IGNORE INTO publication_context(owner_key,sequence,snapshot_id,status) VALUES(?,?,?,?)')
       .run(ownerKey(binding), head.sequence, snapshot.id, CONTEXT_STATUS.QUEUED);
   }
@@ -151,7 +162,7 @@ class PublicationStore extends EventEmitter {
     return this.state.transaction(() => {
       const head = this.db.prepare('SELECT * FROM publication_heads WHERE owner_key=?').get(work.owner_key);
       const binding = head && JSON.parse(head.binding);
-      const current = head?.sequence === work.sequence && head.processed_id === work.snapshot_id && this.current(binding) && this.enabled(binding);
+      const current = head?.sequence === work.sequence && head.processed_id === work.snapshot_id && this.current(binding) && this.contextEnabled(binding);
       const useful = current && result?.status === 'ready' && result.snapshotId === work.snapshot_id &&
         typeof result.preview === 'string' && result.preview.trim() && result.preview.length <= 2000;
       let outcome = CONTEXT_STATUS.UNAVAILABLE;
@@ -179,7 +190,7 @@ class PublicationStore extends EventEmitter {
       const head = this.head(binding);
       const posts = this.db.prepare('SELECT status,COUNT(*) AS count FROM publication_posts WHERE owner_key=? GROUP BY status').all(ownerKey(binding));
       return { channelId: binding.channelId, nativeId: binding.nativeId, generation: binding.generation,
-        current: Boolean(this.current(binding)), enabled: this.enabled(binding),
+        current: Boolean(this.current(binding)), enabled: this.enabled(binding), contextEnabled: this.contextEnabled(binding),
         processedSnapshotId: head?.processed_id || null, successfulAt: head?.successful_at ?? null,
         retryAt: head?.retry_at || null, counts: Object.fromEntries(posts.map(row => [row.status, Number(row.count)])) };
     });
