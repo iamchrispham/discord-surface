@@ -2975,7 +2975,7 @@ Module._load = (request, parent, isMain) => request === 'discord.js' ? fake : or
   state.close();
   try {
     fs.writeFileSync(workerManifest, JSON.stringify({
-      laneId: successorOwner, worktree: dir, state: 'active', harness: 'codex',
+      laneId: `${successorOwner}-9eaba20295e60eb88306d751eb0aeae1`, worktree: dir, state: 'active', harness: 'codex',
       sessionId: successorNativeId, fullUUID: successorNativeId, pid: worker.pid,
       processStartTime: processStartTime(worker.pid), generation: 1
     }), { mode: 0o600 });

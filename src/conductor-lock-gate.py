@@ -140,8 +140,9 @@ def process_start_time(pid):
 
 def verify_worker(path, provider, native_id, owner, workspace):
     worker = read_json(path, 'worker manifest')
-    if worker.get('laneId') != owner:
-        fail('worker manifest lane does not match the current lock owner')
+    lane_id = worker.get('laneId')
+    if owner_token(lane_id, provider) != owner_token(owner, provider):
+        fail('worker manifest lane token does not match the current lock owner')
     session_id = worker.get('sessionId')
     full_uuid = worker.get('fullUUID') or worker.get('fullUuid')
     if session_id is not None and session_id != native_id:
