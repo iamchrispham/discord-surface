@@ -2,12 +2,14 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 
+const SNAPSHOT_MAX_BUFFER = 4 * 1024 * 1024;
+
 function readSnapshot(binding, { registry = path.join(os.homedir(), '.agents/work-control/pr-lanes.json'),
   ladderDir = path.join(os.homedir(), '.claude/skills/conduct-status/scripts'), now, signal } = {}) {
   const args = [path.join(__dirname, 'snapshot.py'), '--registry', registry, '--ladder-dir', ladderDir];
   if (now !== undefined) args.push('--now', String(now));
   return new Promise(resolve => {
-    const child = execFile('/usr/bin/python3', args, { timeout: 3000, maxBuffer: 2 * 1024 * 1024, signal }, (error, stdout) => {
+    const child = execFile('/usr/bin/python3', args, { timeout: 3000, maxBuffer: SNAPSHOT_MAX_BUFFER, signal }, (error, stdout) => {
       try {
         const result = JSON.parse(stdout);
         resolve(error ? { unavailable: result.unavailable || 'snapshot reader failed' } : result);
