@@ -9,7 +9,7 @@ const { EventEmitter, getEventListeners } = require('node:events');
 const { spawn, spawnSync } = require('node:child_process');
 const { postUnixJson } = require('../src/native');
 const { ACK, REACTION, acknowledgmentCommand, recordNativeAcknowledgment, watchAcknowledgments } = require('../src/acknowledgment');
-const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
+const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS, splitReply } = require('../src/state');
 const { CodexProvider, claudeEvent, codexPrompt, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
 const { deriveLiaisonFacts, rawReceiptFor, runLiaisonDraft, validateLiaisonSelection } = require('../src/liaison');
@@ -1268,6 +1268,58 @@ test('simulated: reply chunking preserves a surrogate pair at the Discord bounda
   assert.equal(parts.map(part => part.content).join(''), text);
   assert.ok(parts.every(part => part.content.length <= 2000));
   state.close();
+});
+
+test('simulated: newline reply parts reach both providers and persist across restart', async () => {
+  const { dir, db, state } = fixture();
+  let reopened;
+  const gateway = new DiscordGateway({ state, client: { on() {}, off() {}, async destroy() {} } });
+  const text = 'a'.repeat(1100) + '\n' + 'b'.repeat(700) + '\n' + 'c'.repeat(500);
+  const expected = [text.slice(0, 1802), text.slice(1802)];
+  const saved = {};
+  try {
+    bindBoth(state, dir);
+    for (const [provider, nativeId] of [['codex', CODEX_ID], ['claude', CLAUDE_ID]]) {
+      const id = `newline-${provider}`;
+      state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: `channel-${provider}`, authorId: 'operator-1', isBot: false, content: 'board' });
+      state.claimDispatch(id); state.markSubmitted(id);
+      state.recordNativeReply({ provider, messageId: id, nativeId, generation: 1, text });
+      const payloads = [];
+      const source = discordMessage({ id, channelId: `channel-${provider}`, sends: payloads });
+      const result = await gateway.consumer.deliverReply(source, { status: 'reply_ready', message: state.getMessage(id) });
+      assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+      assert.deepEqual(payloads.map(payload => payload.content), expected);
+      assert.equal(payloads.map(payload => payload.content).join(''), text);
+      assert.notEqual(payloads[0].nonce, payloads[1].nonce);
+      saved[id] = state.listReplyParts(id);
+    }
+    await gateway.stop(); state.close();
+    reopened = new SurfaceState(db);
+    for (const [provider, nativeId] of [['codex', CODEX_ID], ['claude', CLAUDE_ID]]) {
+      const id = `newline-${provider}`;
+      const duplicate = reopened.recordNativeReply({ provider, messageId: id, nativeId, generation: 1, text: 'different duplicate' });
+      assert.equal(duplicate.duplicate, true);
+      assert.deepEqual(reopened.listReplyParts(id), saved[id]);
+    }
+  } finally {
+    await gateway.stop(); reopened?.close();
+    try { state.close(); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('simulated: newline splitting retains long-line fallback and padded board boundaries', () => {
+  const padded = 'first block\n' + '\n'.repeat(2000 - 'first block\n'.length);
+  assert.deepEqual(splitReply(padded + 'last block'), [padded, 'last block']);
+  const leading = '\n' + 'x'.repeat(2200);
+  assert.deepEqual(splitReply(leading), [leading.slice(0, 2000), leading.slice(2000)]);
+  const unicode = 'x'.repeat(1999) + '🙂tail';
+  assert.deepEqual(splitReply(unicode), ['x'.repeat(1999), '🙂tail']);
+  for (const spaced of ['a\n' + ' '.repeat(2000) + 'b', 'a\n' + ' '.repeat(1999) + '🙂']) {
+    assert.deepEqual(splitReply(spaced), [spaced.slice(0, 2000), spaced.slice(2000)]);
+  }
+  const laterBlank = 'a\n' + 'x'.repeat(2000) + ' '.repeat(2000) + 'b';
+  assert.deepEqual(splitReply(laterBlank), [laterBlank.slice(0, 2000), laterBlank.slice(2000, 4000), laterBlank.slice(4000)]);
 });
 
 test('simulated: operator revocation after intake prevents dispatch and native reply acceptance', async () => {

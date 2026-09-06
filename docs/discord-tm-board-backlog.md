@@ -4,6 +4,8 @@ Received directly from the TM conductor after the operator requested a fuller Di
 
 Priority 1: split reply text at the last newline before `REPLY_LIMIT`, preserving content and retaining a hard-limit fallback for a single long line. Existing owner: `state.js` `splitReply`. TM currently pads every nonfinal part to exactly 2,000 characters to force block boundaries. Remove the need for that workaround once adapter behavior is proved and the producer is coordinated.
 
+Implementation is now in the sidecar feature branch. New replies prefer newline boundaries, retaining Unicode-safe hard splitting if the proposed partition contains any blank-only part. Existing persisted parts and their nonces are not rebuilt. Local tests exercise actual delivery through both provider paths, reopen/duplicate preservation, padded boards and hard-line fallbacks. Independent review found and verified the blank-part correction. This is not installed or live-proved; keep producer padding until the loaded Gateway is coordinated. Newline splitting may use more parts than fixed-width splitting.
+
 Priority 3: update a pinned board message in place, using an explicit target message ID, rather than creating another board for each refresh. Prove target ownership and preserve delivery/custody semantics before connecting it to an automatic sidecar. Pinning itself and deleting prior messages are not implied by an edit request.
 
 Remaining requested capabilities:

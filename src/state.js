@@ -155,16 +155,30 @@ function transportReceiptNonce(messageId) {
   return discordNonce(`transport:${messageId}`, 0);
 }
 
-function splitReply(text) {
+function replyBoundary(text, offset) {
+  let end = Math.min(text.length, offset + REPLY_LIMIT);
+  if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
+  return end;
+}
+
+function partitionReply(text, preferNewlines) {
   const parts = [];
   let offset = 0;
   while (offset < text.length) {
-    let end = Math.min(text.length, offset + REPLY_LIMIT);
-    if (end < text.length && end > offset && /[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
+    let end = replyBoundary(text, offset);
+    if (preferNewlines && end < text.length) {
+      const newline = text.lastIndexOf('\n', end - 1);
+      if (newline >= offset) end = newline + 1;
+    }
     parts.push(text.slice(offset, end));
     offset = end;
   }
   return parts.length ? parts : [''];
+}
+
+function splitReply(text) {
+  const parts = partitionReply(text, true);
+  return parts.some(part => !part.trim()) ? partitionReply(text, false) : parts;
 }
 
 function rowReplyPart(row) {
