@@ -1,4 +1,5 @@
 const fs = require('node:fs');
+const { REACTION, acknowledgmentCommand, watchAcknowledgments } = require('./acknowledgment');
 const { createRequire } = require('node:module');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
@@ -155,6 +156,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const payload = {
       ...authorized.attempt,
       content: transportReceiptText(message, authorized.attempt),
+      reaction: authorized.attempt.readiness === 'ready' ? REACTION.SAVED : null,
       nonce: authorized.nonce,
       enforceNonce: true,
       allowedMentions: { parse: [], repliedUser: false },
@@ -165,7 +167,9 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       const sent = await sender(message, payload);
       const receiptMessageId = sent?.id || sent?.messageId;
       if (!receiptMessageId) throw new Error('Discord did not return a transport receipt message id');
-      return state.recordTransportReceiptOutcome(message.id, 'sent', { receiptMessageId });
+      return state.recordTransportReceiptOutcome(message.id, 'sent', payload.reaction
+        ? { reaction: payload.reaction, targetMessageId: message.id }
+        : { receiptMessageId });
     } catch (error) {
       return state.recordTransportReceiptOutcome(message.id, classifyTransportReceiptError(error), { error: String(error?.message || error).slice(0, 200) });
     }
@@ -478,6 +482,7 @@ class DiscordGateway {
     this.logger = logger;
     this.client = client || this.createClient();
     this.discordToken = null;
+    this.acknowledgments = null;
     this.controllers = new Set();
     this.receiptControllers = new Set();
     this.inFlight = new Set();
@@ -499,7 +504,7 @@ class DiscordGateway {
     this.recoveryTimeoutMs = Math.min(RECOVERY_LIMITS.timeoutMs, Math.max(1000, Number(recoveryOptions.timeoutMs || RECOVERY_LIMITS.timeoutMs)));
     this.ready = false;
     this.providers = providers || {
-      codex: new CodexProvider(),
+      codex: new CodexProvider({ acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath) }),
       claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(state, id, options) })
     };
     this.consumer = createSurfaceConsumer({
@@ -558,6 +563,12 @@ class DiscordGateway {
     }
   }
 
+  async sendAcknowledgment(message, reaction) {
+    if (this.stopping) throw new Error('Discord acknowledgment stopped');
+    this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
+    return this.sendTransportReceipt(message, { reaction });
+  }
+
   async sendTransportReceipt(message, receipt) {
     const controller = new AbortController();
     this.receiptControllers.add(controller);
@@ -566,15 +577,17 @@ class DiscordGateway {
       try {
         // discord.js channel.send drops the signal and uses the shared REST retry queue.
         if (this.discordToken && this.client?.rest && typeof globalThis.fetch === 'function') {
-          const url = `https://discord.com/api/v10/channels/${encodeURIComponent(message.channel.id)}/messages`;
+          const channelId = message.channelId || message.channel.id;
+          const base = `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`;
+          const url = receipt.reaction ? `${base}/${encodeURIComponent(message.id)}/reactions/${encodeURIComponent(receipt.reaction)}/@me` : base;
           sendPromise = globalThis.fetch(url, {
-            method: 'POST',
+            method: receipt.reaction ? 'PUT' : 'POST',
             headers: {
               Authorization: `Bot ${this.discordToken}`,
               'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
               'Content-Type': 'application/json'
             },
-            body: JSON.stringify({
+            body: receipt.reaction ? undefined : JSON.stringify({
               content: receipt.content,
               nonce: receipt.nonce,
               enforce_nonce: true,
@@ -592,6 +605,10 @@ class DiscordGateway {
               error.status = response.status;
               throw error;
             }
+            if (receipt.reaction) {
+              await cancelResponseBody(response);
+              return { id: message.id, reaction: receipt.reaction };
+            }
             let body;
             try { body = await response.json(); }
             catch (error) {
@@ -604,7 +621,9 @@ class DiscordGateway {
         } else if (this.discordToken && this.client?.rest) {
           throw new Error('Discord transport receipt fetch is unavailable');
         } else {
-          sendPromise = message.channel.send({
+          sendPromise = receipt.reaction
+            ? Promise.resolve(message.react ? message.react(receipt.reaction) : message.channel.messages.fetch(message.id).then(source => source.react(receipt.reaction))).then(() => ({ id: message.id }))
+            : message.channel.send({
             content: receipt.content,
             nonce: receipt.nonce,
             enforceNonce: true,
@@ -678,6 +697,8 @@ class DiscordGateway {
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during recovery');
       if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
       this.started = true;
+      this.acknowledgments = watchAcknowledgments({ state: this.state,
+        send: (message, reaction) => this.sendAcknowledgment(message, reaction), logger: this.logger });
     })();
     this.startPromise = startPromise;
     try { return await startPromise; }
@@ -1010,10 +1031,13 @@ class DiscordGateway {
       await Promise.allSettled([recovery, reconnect].filter(Boolean));
       for (const controller of this.controllers) controller.abort();
       for (const controller of this.receiptControllers) controller.abort();
+      const acknowledgmentStop = this.acknowledgments?.stop();
+      this.acknowledgments = null;
       this.consumer.abortNativeWork();
       await Promise.allSettled([...this.inFlight]);
       await this.consumer.waitForNativeWork();
       await this.consumer.waitForReceipts();
+      await acknowledgmentStop;
       this.client.off?.('messageCreate', this.boundMessage);
       this.client.off?.('shardResume', this.boundResume);
       this.client.off?.('resume', this.boundResume);

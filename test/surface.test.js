@@ -8,6 +8,7 @@ const { DatabaseSync } = require('node:sqlite');
 const { EventEmitter, getEventListeners } = require('node:events');
 const { spawn, spawnSync } = require('node:child_process');
 const { postUnixJson } = require('../src/native');
+const { ACK, REACTION, acknowledgmentCommand, recordNativeAcknowledgment, watchAcknowledgments } = require('../src/acknowledgment');
 const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
 const { CodexProvider, claudeEvent, codexPrompt, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
@@ -25,6 +26,138 @@ const SUCCESSOR_ID = '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b';
 const LOCKF = '/usr/bin/lockf';
 const CONDUCTOR_LOCK = '/Users/cphamballer/.claude/skills/conductor-handoff/scripts/conductor-lock.sh';
 const CLI_PATH = path.resolve(__dirname, '../src/cli.js');
+
+test('simulated: native acknowledgment requires exact dispatched owner and never completes custody', () => {
+  const { dir, state } = fixture();
+  try {
+    bindBoth(state, dir);
+    for (const provider of ['codex', 'claude']) {
+      const id = `ack-${provider}`;
+      state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: `channel-${provider}`, authorId: 'operator-1', isBot: false, content: 'work' });
+      const nativeId = provider === 'codex' ? CODEX_ID : CLAUDE_ID;
+      const args = { provider, messageId: id, nativeId, generation: 1 };
+      assert.throws(() => recordNativeAcknowledgment(state, args), /not accepted/);
+      state.claimDispatch(id);
+      assert.throws(() => recordNativeAcknowledgment(state, { ...args, nativeId: SUCCESSOR_ID }), /stale/);
+      assert.throws(() => recordNativeAcknowledgment(state, { ...args, generation: 2 }), /stale/);
+      assert.throws(() => recordNativeAcknowledgment(state, { ...args, provider: provider === 'codex' ? 'claude' : 'codex' }), /stale/);
+      assert.equal(recordNativeAcknowledgment(state, args).recorded, true);
+      assert.equal(recordNativeAcknowledgment(state, args).duplicate, true);
+      assert.equal(state.getMessage(id).state, MESSAGE_STATES.DISPATCHING);
+      state.markSubmitted(id);
+      assert.equal(state.getMessage(id).state, MESSAGE_STATES.SUBMITTED);
+      assert.equal(state.listReceipts().filter(row => row.discord_id === id && row.kind === ACK.RECEIVED).length, 1);
+    }
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('simulated: real acknowledgment command wakes a directory watcher once and restart does not repeat it', async () => {
+  const { dir, db, state } = fixture();
+  let watcher;
+  try {
+    bindBoth(state, dir);
+    state.acceptDiscordMessage({ id: 'watched-ack', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'work' });
+    state.claimDispatch('watched-ack');
+    state.markSubmitted('watched-ack');
+    const sends = [];
+    let observed;
+    const delivery = new Promise(resolve => { observed = resolve; });
+    watcher = watchAcknowledgments({ state, send: async (message, reaction) => { sends.push([message.id, reaction]); observed(); } });
+    await watcher.drain();
+    assert.deepEqual(sends, []);
+    const command = acknowledgmentCommand(state.getMessage('watched-ack'), db);
+    const result = spawnSync(command[0], command.slice(1), { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    let timer;
+    try { await Promise.race([delivery, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('acknowledgment event never delivered')), 3000); })]); }
+    finally { clearTimeout(timer); }
+    await watcher.stop();
+    assert.deepEqual(sends, [['watched-ack', REACTION.ACKNOWLEDGED]]);
+    watcher = watchAcknowledgments({ state, send: async () => { sends.push('duplicate'); } });
+    await watcher.drain();
+    await watcher.stop();
+    assert.equal(sends.length, 1);
+    assert.equal(state.getMessage('watched-ack').state, MESSAGE_STATES.SUBMITTED);
+  } finally { await watcher?.stop(); state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('simulated: Gateway reaction uses idempotent PUT after save without an extra Discord message', async () => {
+  const { dir, state } = fixture();
+  const originalFetch = globalThis.fetch;
+  let gateway;
+  try {
+    bindBoth(state, dir);
+    state.markIntakeBoundary('channel-codex', READINESS.READY);
+    const requests = [];
+    globalThis.fetch = async (url, options) => {
+      assert.ok(state.getMessage('quiet-save'));
+      requests.push({ url, method: options.method, body: options.body });
+      return { ok: true, status: 204, body: null };
+    };
+    let replies = 0;
+    const client = new EventEmitter();
+    client.rest = {};
+    client.destroy = async () => {};
+    gateway = new DiscordGateway({ state, client, providers: { codex: {
+      async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; }
+    } } });
+    gateway.discordToken = 'fixture-token';
+    await gateway.consumer.handleMessage({ id: 'quiet-save', guildId: 'guild-1', channelId: 'channel-codex', content: 'work', author: { id: 'operator-1', bot: false },
+      channel: { id: 'channel-codex', async send() { replies += 1; return { id: 'actual-reply' }; } } });
+    await gateway.consumer.waitForReceipts();
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].method, 'PUT');
+    assert.equal(requests[0].body, undefined);
+    assert.ok(requests[0].url.endsWith(`/quiet-save/reactions/${encodeURIComponent(REACTION.SAVED)}/@me`));
+    assert.equal(replies, 1);
+    assert.equal(state.getMessage('quiet-save').state, MESSAGE_STATES.REPLIED);
+    assert.equal(state.getTransportReceipt('quiet-save').outcome.targetMessageId, 'quiet-save');
+    assert.equal(state.listReceipts().some(row => row.kind === ACK.RECEIVED), false);
+  } finally { globalThis.fetch = originalFetch; await gateway?.stop(); state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('simulated: acknowledgment bypasses channel lookup and Gateway stop aborts its REST request', async () => {
+  const { dir, state } = fixture();
+  const originalFetch = globalThis.fetch;
+  let gateway;
+  let releaseLookup;
+  try {
+    bindBoth(state, dir);
+    state.acceptDiscordMessage({ id: 'stop-ack', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'work' });
+    state.claimDispatch('stop-ack');
+    recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'stop-ack', nativeId: CODEX_ID, generation: 1 });
+    const client = new EventEmitter();
+    client.rest = {};
+    client.destroy = async () => {};
+    let lookups = 0;
+    client.channels = { fetch: () => { lookups += 1; return new Promise(resolve => { releaseLookup = resolve; }); } };
+    let signal;
+    globalThis.fetch = async (_url, options) => {
+      signal = options.signal;
+      return new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+    };
+    gateway = new DiscordGateway({ state, client });
+    gateway.discordToken = 'fixture-token';
+    gateway.acknowledgments = watchAcknowledgments({ state, send: (message, reaction) => gateway.sendAcknowledgment(message, reaction) });
+    const drain = gateway.acknowledgments.drain();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(lookups, 0);
+    assert.ok(signal);
+    let timer;
+    try { await Promise.race([gateway.stop(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Gateway stop blocked on acknowledgment')), 1000); })]); }
+    finally { clearTimeout(timer); }
+    await drain;
+    assert.equal(signal.aborted, true);
+    assert.equal(state.getMessage('stop-ack').state, MESSAGE_STATES.DISPATCHING);
+    const outcome = state.listReceipts().find(row => row.kind === ACK.OUTCOME);
+    assert.equal(JSON.parse(outcome.detail).outcome, 'unknown');
+  } finally {
+    releaseLookup?.({ id: 'channel-codex' });
+    await gateway?.stop();
+    globalThis.fetch = originalFetch;
+    state.close(); fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 function fixture(dbName = 'surface.sqlite') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-test-'));
@@ -383,7 +516,7 @@ test('simulated: deterministic saved receipt follows durable intake and does not
   const resultPromise = consumer.handleMessage(discordMessage({ id: 'receipt-input', channelId: 'receipt-codex' }));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(dispatchStarted, true);
-  assert.equal(receiptPayload.content, 'Receipt: saved for this conductor.');
+  assert.equal(receiptPayload.reaction, REACTION.SAVED);
   assert.equal(receiptPayload.enforceNonce, true);
   assert.ok(receiptPayload.nonce.length <= 25);
   assert.deepEqual(receiptPayload.reply, { messageReference: 'receipt-input', failIfNotExists: false });
@@ -679,11 +812,10 @@ test('simulated: real-client receipt uses one abortable request without SDK send
     assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
     await gateway.stop();
     assert.equal(fetchCalls, 1);
-    assert.equal(capturedUrl, 'https://discord.com/api/v10/channels/receipt-http/messages');
+    assert.equal(capturedUrl, `https://discord.com/api/v10/channels/receipt-http/messages/receipt-http-input/reactions/${encodeURIComponent(REACTION.SAVED)}/@me`);
     assert.equal(capturedOptions.headers.Authorization, 'Bot fake-token');
-    assert.equal(JSON.parse(capturedOptions.body).enforce_nonce, true);
-    assert.deepEqual(JSON.parse(capturedOptions.body).allowed_mentions, { parse: [], replied_user: false });
-    assert.deepEqual(JSON.parse(capturedOptions.body).message_reference, { message_id: 'receipt-http-input', fail_if_not_exists: false });
+    assert.equal(capturedOptions.method, 'PUT');
+    assert.equal(capturedOptions.body, undefined);
     assert.equal(capturedSignal.aborted, true);
     assert.equal(channelSendCalls, 1);
     assert.equal(state.getTransportReceipt('receipt-http-input').outcome.outcome, 'unknown');
@@ -891,7 +1023,7 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
     assert.ok(pointer.payloadPath);
     assert.ok(JSON.stringify(pointer).length < 500);
     assert.deepEqual(pointer.meta, { messageId, nativeId: CLAUDE_ID, generation: '1' });
-    assert.match(pointer.instructions, /Read the payload/);
+    assert.match(pointer.instructions, /Read payloadPath with Read/);
     assert.equal(path.dirname(path.dirname(pointer.payloadPath)), path.resolve(dir));
     assert.equal(fs.statSync(path.dirname(pointer.payloadPath)).mode & 0o777, 0o700);
     assert.equal(fs.statSync(pointer.payloadPath).mode & 0o777, 0o600);
@@ -908,6 +1040,12 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
     const dbIndex = event.reply.command.indexOf('--db');
     assert.equal(event.reply.command[dbIndex + 1], db);
     assert.equal(fs.existsSync(event.reply.textFile), false);
+    const acknowledged = spawnSync(event.acknowledgment.command[0], event.acknowledgment.command.slice(1), { encoding: 'utf8' });
+    assert.equal(acknowledged.status, 0, acknowledged.stderr);
+    const afterAck = new SurfaceState(db);
+    assert.equal(afterAck.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
+    assert.equal(afterAck.listReceipts().filter(row => row.kind === ACK.RECEIVED).length, 1);
+    afterAck.close();
     fs.mkdirSync(path.dirname(event.reply.textFile), { recursive: true, mode: 0o700 });
     foreignReplyFile = path.join(path.dirname(event.reply.textFile), 'foreign-conductor.txt');
     fs.writeFileSync(foreignReplyFile, 'keep this file');
@@ -1910,10 +2048,12 @@ test('simulated: accepted recovery transfers submitted custody without blocking 
   state.close();
   state = new SurfaceState(db);
   const sends = [];
+  const reactions = [];
   let dispatches = 0;
   let observations = 0;
   let release;
   const channel = {
+    messages: { fetch: async id => ({ react: async reaction => { reactions.push([id, reaction]); } }) },
     async send(payload) {
       sends.push(payload);
       return { id: `sent-${sends.length}` };
@@ -1946,7 +2086,9 @@ test('simulated: accepted recovery transfers submitted custody without blocking 
   assert.equal(dispatches, 1);
   assert.equal(observations, 1);
   assert.equal(state.getMessage('accepted-recovery-late').state, MESSAGE_STATES.SUBMITTED);
-  assert.equal(sends.filter(payload => String(payload.content).startsWith('Receipt:')).length, 1);
+  await gateway.consumer.waitForReceipts();
+  assert.deepEqual(reactions, [['accepted-recovery-late', REACTION.SAVED]]);
+  assert.equal(sends.length, 0);
   release({ text: 'answer after recovery' });
   for (let attempt = 0; attempt < 100 && state.getMessage('accepted-recovery-late').state !== MESSAGE_STATES.REPLIED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
   assert.equal(state.getMessage('accepted-recovery-late').state, MESSAGE_STATES.REPLIED);
