@@ -14,17 +14,22 @@ function disabledSkillConfig() {
     path.join(os.homedir(), '.agents', 'skills'),
     path.join(os.homedir(), '.codex', 'skills', '.system')
   ];
-  const paths = new Set();
+  const names = new Set();
   for (const root of roots) {
     let entries;
     try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       const skill = path.join(root, entry.name, 'SKILL.md');
-      try { if (fs.statSync(skill).isFile()) paths.add(path.resolve(path.join(root, entry.name))); } catch {}
+      try {
+        const body = fs.readFileSync(skill, 'utf8');
+        const header = body.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
+        const name = header?.match(/^name:\s*["']?([^\r\n"']+)["']?\s*$/m)?.[1].trim();
+        if (name) names.add(name);
+      } catch {}
     }
   }
-  return [...paths].sort().map(item => `{path=${JSON.stringify(item)},enabled=false}`).join(',');
+  return [...names].sort().map(name => `{name=${JSON.stringify(name)},enabled=false}`).join(',');
 }
 
 function buildSparkCommand({ cwd, schemaPath, answerPath }) {
