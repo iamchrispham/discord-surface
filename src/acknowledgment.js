@@ -24,7 +24,9 @@ function recordNativeAcknowledgment(state, { provider, messageId, nativeId, gene
     }
     const duplicate = state.db.prepare('SELECT id FROM receipts WHERE discord_id=? AND kind=? LIMIT 1').get(messageId, ACK.RECEIVED);
     if (duplicate) return { recorded: false, duplicate: true, messageId };
-    if (![MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED].includes(message.state)) {
+    if (![MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY,
+      MESSAGE_STATES.REPLYING, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
+      MESSAGE_STATES.REPLIED].includes(message.state)) {
       throw new Error(`native acknowledgment is not accepted in state ${message.state}`);
     }
     state.receipt(messageId, ACK.RECEIVED, { provider, nativeId, generation });

@@ -11,6 +11,14 @@ const { contextPacket, interpretSnapshot, validateAnswer } = require('../src/con
 async function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'context-check-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const ladderDir = path.join(directory, 'ladder');
+  fs.mkdirSync(ladderDir);
+  fs.writeFileSync(path.join(ladderDir, 'lane_progress_ladder.py'), [
+    'PCT = {"building": 50, "held": 50, "parked": 50, "frozen": 50}',
+    'def canonical(value):',
+    '    return value if isinstance(value, str) else ""',
+    ''
+  ].join('\n'));
   const binding = { conductorId: 'owner.md', repoKey: 'repo:ours', provider: 'codex',
     nativeId: '9caa5d21-2169-429d-918b-5f08651b5dbd', generation: 1, channelId: 'ours' };
   const registry = path.join(directory, 'registry.json');
@@ -23,9 +31,9 @@ async function fixture(t) {
     state_note: 'Waiting for test device', next: 'Run the device check', pr: 1 },
   foreign: { conductor: 'elsewhere', vendor: 'codex', phase: 'building', state_note: 'FOREIGN PRIVATE CONTEXT', pr: 2 } });
   fs.writeFileSync(registry, original);
-  const snapshot = await readSnapshot(binding, { registry, now: Date.parse('2026-09-06T06:05:00Z') / 1000 });
+  const snapshot = await readSnapshot(binding, { registry, ladderDir, now: Date.parse('2026-09-06T06:05:00Z') / 1000 });
   assert.equal(snapshot.unavailable, undefined);
-  return { directory, registry, original, snapshot, binding };
+  return { directory, ladderDir, registry, original, snapshot, binding };
 }
 
 function childCommand(directory, mode = 'valid') {

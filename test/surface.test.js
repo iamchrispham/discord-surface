@@ -120,6 +120,26 @@ test('simulated: native acknowledgment requires exact dispatched owner and never
       assert.equal(state.getMessage(id).state, MESSAGE_STATES.SUBMITTED);
       assert.equal(state.listReceipts().filter(row => row.discord_id === id && row.kind === ACK.RECEIVED).length, 1);
     }
+    for (const [suffix, expectedState, finish] of [['replying', MESSAGE_STATES.REPLYING, messageId => {
+      state.recordNativeReply({ provider: 'codex', messageId, nativeId: CODEX_ID, generation: 1, text: 'answer' });
+      state.beginReply(messageId);
+    }], ['reply-failed', MESSAGE_STATES.REPLY_FAILED, messageId => {
+      state.recordNativeReply({ provider: 'codex', messageId, nativeId: CODEX_ID, generation: 1, text: 'answer' });
+      state.beginReply(messageId);
+      state.markReplyFailure(messageId, new Error('failed'));
+    }], ['reply-unknown', MESSAGE_STATES.REPLY_UNKNOWN, messageId => {
+      state.recordNativeReply({ provider: 'codex', messageId, nativeId: CODEX_ID, generation: 1, text: 'answer' });
+      state.beginReply(messageId);
+      state.markReplyFailure(messageId, new Error('unknown'), true);
+    }]]) {
+      const id = `ack-${suffix}`;
+      state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'work' });
+      state.claimDispatch(id);
+      state.markSubmitted(id);
+      finish(id);
+      assert.equal(state.getMessage(id).state, expectedState);
+      assert.equal(recordNativeAcknowledgment(state, { provider: 'codex', messageId: id, nativeId: CODEX_ID, generation: 1 }).recorded, true);
+    }
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -894,6 +914,28 @@ test('simulated: real-client receipt uses one abortable request without SDK send
   } finally {
     globalThis.fetch = originalFetch;
     if (!gateway.stopping) await gateway.stop();
+    state.close();
+  }
+});
+
+test('simulated: raw REST receipt translates SDK reply mention suppression', async () => {
+  const { state } = fixture();
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return { ok: true, async json() { return { id: 'rest-receipt' }; } };
+  };
+  const gateway = new DiscordGateway({ state, client: { rest: {}, on() {}, off() {}, async destroy() {} }, providers: {} });
+  gateway.discordToken = 'fake-token';
+  try {
+    await gateway.sendTransportReceipt({ id: 'source', channelId: 'receipt-rest' }, {
+      content: 'Receipt: saved.', nonce: 'receipt-nonce', allowedMentions: { parse: [], repliedUser: false }
+    });
+    assert.deepEqual(JSON.parse(requests[0].options.body).allowed_mentions, { parse: [], replied_user: false });
+  } finally {
+    globalThis.fetch = originalFetch;
+    await gateway.stop();
     state.close();
   }
 });

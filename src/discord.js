@@ -679,9 +679,14 @@ class DiscordGateway {
         if (this.discordToken && this.client?.rest && typeof globalThis.fetch === 'function') {
           const channelId = message.channelId || message.channel.id;
           if (!receipt.reaction) {
+            const allowedMentions = { ...(receipt.allowedMentions || { parse: [], replied_user: false }) };
+            if (Object.hasOwn(allowedMentions, 'repliedUser')) {
+              allowedMentions.replied_user = allowedMentions.repliedUser;
+              delete allowedMentions.repliedUser;
+            }
             sendPromise = sendDiscordMessage({
               token: this.discordToken, channelId, content: receipt.content, nonce: receipt.nonce,
-              signal: controller.signal, timeoutMs: this.recoveryTimeoutMs, allowedMentions: receipt.allowedMentions || { parse: [], replied_user: false },
+              signal: controller.signal, timeoutMs: this.recoveryTimeoutMs, allowedMentions,
               messageReference: message.id ? { message_id: message.id, fail_if_not_exists: false } : null
             });
           } else {

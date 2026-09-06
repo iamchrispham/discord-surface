@@ -12,6 +12,13 @@ const { DiscordGateway, createSurfaceConsumer } = require('../src/discord');
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 function fixture(t, provider = 'codex') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-'));
+  const ladderDir = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-ladder-'));
+  fs.writeFileSync(path.join(ladderDir, 'lane_progress_ladder.py'), [
+    'PCT = {"building": 50, "held": 50, "parked": 50, "frozen": 50}',
+    'def canonical(value):',
+    '    return value if isinstance(value, str) else ""',
+    ''
+  ].join('\n'));
   let state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'fixture.secret') });
   const binding = { channelId: 'channel', guildId: 'guild', provider, nativeId: NATIVE,
@@ -34,8 +41,10 @@ function fixture(t, provider = 'codex') {
     for (const publisher of publishers) await publisher.stop();
     state.close();
     fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(ladderDir, { recursive: true, force: true });
   });
-  return { dir, registry, data, write, publishers, get state() { return state; },
+  const readFixture = (binding, options = {}) => readSnapshot(binding, { ...options, ladderDir });
+  return { dir, ladderDir, registry, data, write, readSnapshot: readFixture, publishers, get state() { return state; },
     get binding() { return state.getBinding('channel'); },
     reopen() { const dbPath = state.dbPath; state.close(); state = new SurfaceState(dbPath); return state; } };
 }
@@ -47,8 +56,12 @@ async function until(check, message = 'condition', timeout = 4000) {
   }
 }
 function start(f, options = {}) {
+  const requestedRead = options.read;
+  const read = requestedRead
+    ? (binding, readOptions) => requestedRead(binding, { ...readOptions, ladderDir: f.ladderDir })
+    : (binding, readOptions) => f.readSnapshot(binding, readOptions);
   const p = watchPublications({ state: f.state, registry: f.registry, interpret: async () => ({ status: 'unavailable', reason: 'fixture' }),
-    cadence: { burstMs: 15, publicationMs: 150, retryMs: 150 }, ...options });
+    cadence: { burstMs: 15, publicationMs: 150, retryMs: 150 }, ...options, read });
   f.publishers.push(p);
   return p;
 }
@@ -58,7 +71,7 @@ test('real file events coalesce, retain newest source during cooldown, and stay 
   const sent = [];
   let reads = 0;
   const send = async (_binding, post) => { sent.push(post); return { id: String(100 + sent.length) }; };
-  const p = start(f, { send, read: async (...args) => { reads++; return readSnapshot(...args); } });
+  const p = start(f, { send, read: async (...args) => { reads++; return f.readSnapshot(...args); } });
   await until(() => sent.length === 1, 'startup publication');
   await new Promise(resolve => setTimeout(resolve, 80));
   const stableReads = reads;
@@ -151,7 +164,7 @@ test('binding change during source read suppresses old owner and stop aborts out
   const f = fixture(t);
   let calls = 0;
   const p = start(f, { read: async (...args) => {
-    const result = await readSnapshot(...args);
+    const result = await f.readSnapshot(...args);
     f.state.db.prepare('UPDATE bindings SET generation=generation+1 WHERE channel_id=?').run('channel');
     return result;
   }, send: async () => { calls++; return { id: '500' }; } });
@@ -218,7 +231,7 @@ test('Gateway startup owns one publisher and stop leaves no file-triggered sends
 test('crash between claim and response holds custody after startup and exposes it in CLI status', async t => {
   const { spawnSync } = require('node:child_process');
   const f = fixture(t);
-  const snapshot = await readSnapshot(f.binding, { registry: f.registry });
+  const snapshot = await f.readSnapshot(f.binding, { registry: f.registry });
   f.state.publications.stage(f.binding, snapshot, 'Automatic fixture');
   const post = f.state.publications.pending(f.binding);
   assert.equal(f.state.publications.begin(f.binding, post.id, Date.now()), true);
@@ -263,7 +276,7 @@ test('publication needs explicit role selection, survives same-role pickup, and 
 
 test('human nonce collision is accepted but known automatic message IDs remain excluded', async t => {
   const f = fixture(t);
-  const snapshot = await readSnapshot(f.binding, { registry: f.registry });
+  const snapshot = await f.readSnapshot(f.binding, { registry: f.registry });
   f.state.publications.stage(f.binding, snapshot, 'Automatic snapshot');
   const post = f.state.publications.pending(f.binding);
   f.state.publications.begin(f.binding, post.id, Date.now());
@@ -301,7 +314,7 @@ test('watch failure rearms the subscription and reads missed changes without sou
   const sent = [];
   let reads = 0;
   const p = start(f, { rearmMs: 30, send: async (_binding, post) => { sent.push(post); return { id: String(1100 + sent.length) }; },
-    read: async (...args) => { reads++; return readSnapshot(...args); },
+    read: async (...args) => { reads++; return f.readSnapshot(...args); },
     watchFactory: (...args) => { const watcher = fs.watch(...args); watchers.push(watcher); return watcher; } });
   await until(() => sent.length === 1);
   watchers[0].emit('error', new Error('fixture watcher failure'));
@@ -326,7 +339,7 @@ test('shutdown aborts the real bounded Python reader while its source FIFO is bl
   let reading = false, settled = false;
   const p = start(f, { registry: fifo, read: async (...args) => {
     reading = true;
-    try { return await readSnapshot(...args); } finally { settled = true; }
+    try { return await f.readSnapshot(...args); } finally { settled = true; }
   }, send: async () => { assert.fail('blocked source must not send'); } });
   await until(() => reading);
   await new Promise(resolve => setTimeout(resolve, 30));
@@ -471,7 +484,7 @@ test('disabled context stays pending and cannot start a request after asynchrono
   const f = fixture(t);
   f.state.publications.setEnabled(f.binding, true, { context: true });
   const store = f.state.publications;
-  const snapshot = await readSnapshot(f.binding, { registry: f.registry });
+  const snapshot = await f.readSnapshot(f.binding, { registry: f.registry });
   store.stage(f.binding, snapshot, 'Board');
   const board = store.pending(f.binding);
   assert.equal(store.begin(f.binding, board.id, Date.now()), true);
