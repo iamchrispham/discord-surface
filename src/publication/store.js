@@ -86,7 +86,7 @@ class PublicationStore extends EventEmitter {
     return current?.active && current.guildId === this.state.getConfig().guildId && ownerKey(current) === ownerKey(binding);
   }
   stage(binding, snapshot, content) {
-    if (!snapshot?.id || JSON.stringify(snapshot).length > 100000 || typeof content !== 'string' || !content.trim() || content.length > 2000) {
+    if (!snapshot?.id || typeof content !== 'string' || !content.trim() || content.length > 2000) {
       throw new Error('invalid publication snapshot or content');
     }
     return this.state.transaction(() => {
@@ -200,17 +200,21 @@ class PublicationStore extends EventEmitter {
     this.db.prepare('UPDATE publication_posts SET status=?, error=? WHERE status=?')
       .run(STATUS.UNKNOWN, 'process stopped during publication; readback required', STATUS.SENDING);
   }
-  findEvent(event) {
+  findEvent(event, botUserId) {
+    const authenticatedBot = event.isBot && typeof botUserId === 'string' && botUserId.length > 0 && event.authorId === botUserId;
     return this.db.prepare(`SELECT * FROM publication_posts WHERE channel_id=? AND guild_id=?
       AND (message_id=? OR (nonce=? AND status IN (?,?,?))) LIMIT 1`)
-      .get(event.channelId, event.guildId, event.id, event.isBot && typeof event.nonce === 'string' ? event.nonce : '', STATUS.SENDING, STATUS.UNKNOWN, STATUS.SENT);
+      .get(event.channelId, event.guildId, event.id,
+        authenticatedBot && typeof event.nonce === 'string' ? event.nonce : '',
+        STATUS.SENDING, STATUS.UNKNOWN, STATUS.SENT);
   }
-  excludeEvent(event) {
-    const post = this.findEvent(event);
+  excludeEvent(event, botUserId) {
+    const post = this.findEvent(event, botUserId);
     if (!post) return false;
     // Only a Discord bot echo can settle uncertain transport custody. An ID match
     // still excludes a replay whose normalization lost the bot flag.
-    if (event.isBot && post.status !== STATUS.SENT) {
+    const authenticatedBot = event.isBot && typeof botUserId === 'string' && botUserId.length > 0 && event.authorId === botUserId;
+    if (authenticatedBot && post.status !== STATUS.SENT) {
       this.sent(post.id, event.id, Date.now());
       this.emit('settled');
     }

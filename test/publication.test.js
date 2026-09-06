@@ -163,9 +163,12 @@ test('uncertain send stays held, bot echo settles it, replay never enters either
     assert.equal(f.state.publications.pending(f.binding), null);
     let nativeCalls = 0;
     const consumer = createSurfaceConsumer({ state: f.state,
-      providers: { [provider]: { submit: async () => { nativeCalls++; } } }, sendReply: async () => { throw new Error('no native reply expected'); } });
+      providers: { [provider]: { submit: async () => { nativeCalls++; } } }, sendReply: async () => { throw new Error('no native reply expected'); },
+      getBotUserId: () => 'bot' });
     const echo = { id: '400', guildId: 'guild', channelId: 'channel', content: post.content,
       nonce: post.nonce, author: { id: 'bot', bot: true } };
+    assert.equal((await consumer.handleMessage({ ...echo, id: '401', author: { id: 'other-bot', bot: true } })).accepted, false);
+    assert.equal(f.state.db.prepare('SELECT status FROM publication_posts WHERE id=?').get(post.id).status, STATUS.UNKNOWN);
     assert.equal((await consumer.handleMessage(echo)).accepted, false);
     assert.equal(f.state.db.prepare('SELECT status FROM publication_posts WHERE id=?').get(post.id).status, STATUS.SENT);
     const replay = { ...echo, nonce: undefined, author: { id: 'operator', bot: false } };
@@ -313,6 +316,14 @@ test('schema constraints cannot be removed while retaining superficially matchin
   assert.throws(() => new SurfaceState(f.state.dbPath), /publication schema mismatch/);
 });
 
+test('large schema snapshots stage even when their stored context exceeds the preview bound', t => {
+  const f = fixture(t);
+  const snapshot = { id: 'large-snapshot', context: { owedByOperator: { state: 'valid', value: ['x'.repeat(105000)] } } };
+  assert.ok(JSON.stringify(snapshot).length > 100000);
+  assert.equal(f.state.publications.stage(f.binding, snapshot, 'Automatic board'), true);
+  assert.equal(f.state.publications.head(f.binding).processed_id, snapshot.id);
+});
+
 test('old-generation unknown custody stays visible after a handoff', async t => {
   const f = fixture(t);
   const p = start(f, { send: async () => { throw new Error('unknown transport'); } });
@@ -416,7 +427,10 @@ test('bot echo releases newer pending publication through events and preserves c
   await until(() => f.state.db.prepare('SELECT id FROM publication_posts WHERE status=?').get(STATUS.UNKNOWN));
   f.data._conductors['owner.md'].next = ['Deliver the newer plan']; f.write();
   await until(() => f.state.db.prepare('SELECT id FROM publication_posts WHERE status=?').get(STATUS.PENDING));
-  const consumer = createSurfaceConsumer({ state: f.state, providers: {} });
+  const consumer = createSurfaceConsumer({ state: f.state, providers: {}, getBotUserId: () => 'bot' });
+  assert.equal((await consumer.handleMessage({ id: 'foreign-echo', guildId: 'guild', channelId: 'channel',
+    content: sent[0].content, nonce: sent[0].nonce, author: { id: 'other-bot', bot: true } })).accepted, false);
+  assert.equal(f.state.db.prepare('SELECT status FROM publication_posts WHERE nonce=?').get(sent[0].nonce).status, STATUS.UNKNOWN);
   assert.equal((await consumer.handleMessage({ id: 'settled-echo', guildId: 'guild', channelId: 'channel',
     content: sent[0].content, nonce: sent[0].nonce, author: { id: 'bot', bot: true } })).accepted, false);
   const settledAt = f.state.publications.head(f.binding).successful_at;

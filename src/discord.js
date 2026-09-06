@@ -198,7 +198,7 @@ function transportReceiptText(message, attempt) {
   return 'Receipt: saved. Delivery was paused when this receipt was prepared.';
 }
 
-function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, trackReceipt, observeOptions = {} }) {
+function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, trackReceipt, observeOptions = {}, getBotUserId = () => null }) {
   const receiptWork = new Set();
   const nativeWork = new Map();
   const ownerQueues = new Map();
@@ -500,14 +500,14 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleMessage(message, signal) {
-    const intake = state.acceptDiscordMessage(eventToInput(message));
+    const intake = state.acceptDiscordMessage(eventToInput(message), { botUserId: getBotUserId() });
     if (!intake.accepted) return intake;
     launchTransportReceipt(message);
     return processAccepted(message, signal);
   }
 
   async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false) {
-    const intake = await state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding });
+    const intake = await state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding, botUserId: getBotUserId() });
     if (emitReceipt && intake.accepted) launchTransportReceipt(message);
     return intake;
   }
@@ -579,6 +579,7 @@ class DiscordGateway {
       providers: this.providers,
       sendReply: (message, reply) => this.sendReply(message, reply),
       sendTransportReceipt: (message, receipt) => this.sendTransportReceipt(message, receipt),
+      getBotUserId: () => this.client.user?.id || null,
       observeOptions
     });
     this.boundMessage = message => {
@@ -632,7 +633,6 @@ class DiscordGateway {
 
   async sendAcknowledgment(message, reaction) {
     if (this.stopping) throw new Error('Discord acknowledgment stopped');
-    this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
     return this.sendTransportReceipt(message, { reaction });
   }
 

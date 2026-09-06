@@ -251,6 +251,46 @@ test('simulated: acknowledgment bypasses channel lookup and Gateway stop aborts 
   }
 });
 
+test('simulated: recorded acknowledgment reaction survives a successor handoff', async () => {
+  const { dir, state } = fixture('handoff-ack.sqlite');
+  const originalFetch = globalThis.fetch;
+  let watcher;
+  try {
+    const binding = state.bind({ channelId: 'ack-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID,
+      workspace: dir, conductorId: 'ack-handoff-conductor', repoKey: 'repo:alpha' });
+    state.markIntakeBoundary(binding.channelId, READINESS.READY);
+    state.acceptDiscordMessage({ id: 'handoff-ack-message', guildId: 'guild-1', channelId: binding.channelId,
+      authorId: 'operator-1', isBot: false, content: 'work' });
+    state.claimDispatch('handoff-ack-message');
+    state.markSubmitted('handoff-ack-message');
+    state.recordNativeReply({ provider: 'codex', messageId: 'handoff-ack-message', nativeId: CODEX_ID, generation: 1, text: 'answer' });
+    state.beginReply('handoff-ack-message');
+    state.markReplySent('handoff-ack-message', 'reply-1');
+    recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'handoff-ack-message', nativeId: CODEX_ID, generation: 1 });
+    state.handoffConductor({ channelId: binding.channelId, provider: 'codex', conductorId: 'ack-handoff-conductor', repoKey: 'repo:alpha',
+      fromNativeId: CODEX_ID, fromGeneration: 1, nativeId: SUCCESSOR_ID, workspace: dir, handoffId: 'ack-handoff-1' });
+
+    const requests = [];
+    globalThis.fetch = async (url, options) => { requests.push({ url, method: options.method }); return { ok: true, status: 204, body: null }; };
+    const client = new EventEmitter();
+    client.rest = {};
+    client.destroy = async () => {};
+    const gateway = new DiscordGateway({ state, client });
+    gateway.discordToken = 'fixture-token';
+    watcher = watchAcknowledgments({ state, send: (message, reaction) => gateway.sendAcknowledgment(message, reaction) });
+    await watcher.drain();
+    const outcome = state.listReceipts().find(row => row.discord_id === 'handoff-ack-message' && row.kind === ACK.OUTCOME);
+    assert.equal(JSON.parse(outcome.detail).outcome, 'sent');
+    assert.equal(requests.length, 1);
+    await gateway.stop();
+  } finally {
+    await watcher?.stop();
+    globalThis.fetch = originalFetch;
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function fixture(dbName = 'surface.sqlite') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-test-'));
   const db = path.join(dir, dbName);

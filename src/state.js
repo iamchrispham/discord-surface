@@ -1243,7 +1243,7 @@ class SurfaceState {
     });
   }
 
-  acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null } = {}) {
+  acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null, botUserId = null } = {}) {
     const config = this.requireConfig();
     if (coverageId !== null) assertText(coverageId, 'coverageId', 128);
     let attachments;
@@ -1263,7 +1263,7 @@ class SurfaceState {
       }
       return this.reject('invalid-event');
     }
-    const automaticPost = this.publications.excludeEvent(event) || this.excludeDirectPost(event);
+    const automaticPost = this.publications.excludeEvent(event, botUserId) || this.excludeDirectPost(event);
     return this.transaction(() => {
       const binding = this.getBinding(event.channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
