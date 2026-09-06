@@ -455,6 +455,7 @@ function provision(args) {
 }
 
 async function handoffInternal(args) {
+  if (fromLockRequested(args)) return handoffFromLockInternal(args);
   const provider = required(args, 'provider');
   const conductorId = required(args, 'conductor-id');
   const repoKey = required(args, 'repo-key');
@@ -505,6 +506,107 @@ function handoff(args) {
   });
   if (result.error) throw result.error;
   process.exitCode = result.status ?? 1;
+}
+
+function fromLockRequested(args) {
+  return args['from-lock'] === true || args['from-lock'] === 'true';
+}
+
+function conductorLockScript() {
+  return path.resolve(process.env.DISCORD_SURFACE_LOCK_SCRIPT || path.join(os.homedir(), '.claude', 'skills', 'conductor-handoff', 'scripts', 'conductor-lock.sh'));
+}
+
+function localHandoff(args) {
+  if (process.env.DISCORD_SURFACE_HANDOFF_GATE_HELD !== '1') throw new Error('handoff-local is internal; use handoff --from-lock');
+  const provider = required(args, 'provider');
+  const conductorId = required(args, 'conductor-id');
+  const repoKey = required(args, 'repo-key');
+  const channelId = required(args, 'channel-id');
+  const nativeId = required(args, 'native-id');
+  validateNativeId(nativeId);
+  const fromNativeId = required(args, 'from-native-id');
+  validateNativeId(fromNativeId);
+  const fromGeneration = Number(required(args, 'from-generation'));
+  const workspace = path.resolve(required(args, 'workspace'));
+  const endpoint = args.endpoint ? path.resolve(args.endpoint) : undefined;
+  if (provider === PROVIDERS.CLAUDE && !endpoint) throw new Error('Claude handoff requires --endpoint');
+  const reuse = args.reuse === true || args.reuse === 'true';
+  const handoffId = reuse ? null : required(args, 'handoff-id');
+  const { state } = openState(args);
+  try {
+    const config = state.requireConfig();
+    const current = state.findConductorBinding(conductorId, provider);
+    if (!current || !current.active || current.channelId !== channelId || current.repoKey !== repoKey) throw new Error('local handoff binding no longer matches the verified conductor');
+    if (reuse) {
+      if (current.nativeId !== nativeId || current.generation !== fromGeneration || current.workspace !== workspace || current.endpoint !== (endpoint || null)) throw new Error('local handoff reuse target no longer matches the verified native binding');
+      print({ handedOff: false, reused: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding: current, readiness: current.readiness });
+      return;
+    }
+    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
+    print({ handedOff: true, reused: false, conductorId, repoKey, channelId, handoffId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
+  } finally { state.close(); }
+}
+
+function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace, endpoint }) {
+  const paths = pathsFor(args);
+  const helperArgs = [
+    path.join(__dirname, 'conductor-lock-gate.py'),
+    '--lock-script', conductorLockScript(), '--repo', required(args, 'repo'), '--repo-key', required(args, 'repo-key'),
+    '--provider', current.provider, '--conductor-id', current.conductorId, '--channel-id', current.channelId,
+    '--from-native-id', current.nativeId, '--from-generation', String(current.generation), '--native-id', required(args, 'native-id'),
+    '--from-workspace', current.workspace, '--workspace', workspace, '--session-file', sessionFile, '--worker-file', workerFile,
+    '--node-path', process.execPath, '--cli-path', __filename, '--state-dir', paths.stateDir, '--db', paths.db
+  ];
+  if (current.endpoint) helperArgs.push('--from-endpoint', current.endpoint);
+  if (endpoint) helperArgs.push('--endpoint', endpoint);
+  if (reuse) helperArgs.push('--reuse');
+  const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', helperArgs, {
+    encoding: 'utf8', timeout: 35000, env: { ...process.env }
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error((result.stderr || result.stdout || 'lock-gated handoff failed').trim());
+  if (result.stdout) process.stdout.write(result.stdout);
+  return result.stdout;
+}
+
+async function handoffFromLockInternal(args) {
+  const provider = required(args, 'provider');
+  const conductorId = required(args, 'conductor-id');
+  const repoKey = required(args, 'repo-key');
+  const repo = required(args, 'repo');
+  const nativeId = required(args, 'native-id');
+  validateNativeId(nativeId);
+  const endpoint = args.endpoint ? path.resolve(args.endpoint) : undefined;
+  if (provider === PROVIDERS.CLAUDE && !endpoint) throw new Error('Claude handoff requires --endpoint');
+  const workspace = path.resolve(required(args, 'workspace'));
+  const sessionFile = path.resolve(required(args, 'session-file'));
+  const workerFile = path.resolve(required(args, 'worker-file'));
+  if (args['channel-id'] || args['from-native-id'] || args['from-generation'] || args['handoff-id']) throw new Error('--from-lock derives the existing binding and handoff authority');
+  let state = openState(args).state;
+  let client;
+  try {
+    const config = state.requireConfig();
+    const current = state.findConductorBinding(conductorId, provider);
+    if (!current || !current.active || current.repoKey !== repoKey) throw new Error('no active local binding matches the requested conductor and repository');
+    const categoryId = categoryFor(provider, args, config);
+    const { Client, GatewayIntentBits } = requireInstalled('discord.js');
+    client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    await client.login(readSecret(config.secretFile));
+    const guild = await client.guilds.fetch(config.guildId);
+    const channel = await guild.channels.fetch(current.channelId);
+    const marker = staticConductorMarker({ provider, conductorId, repoKey });
+    if (!channel || channel.id !== current.channelId || channel.parentId !== categoryId || channel.topic !== marker) throw new Error('handoff channel does not match the static conductor address');
+    const reuse = current.nativeId === nativeId;
+    await client.destroy();
+    client = null;
+    state.close();
+    state = null;
+    handoffGate({ ...args, repo }, current, { reuse, sessionFile, workerFile, workspace, endpoint });
+    return;
+  } finally {
+    await client?.destroy();
+    state?.close();
+  }
 }
 
 function writePid(pidFile, guildId, stateDir) {
@@ -741,6 +843,7 @@ async function main() {
       if (process.env.DISCORD_SURFACE_PROVISION_LOCK_HELD !== '1') throw new Error('provision-run is internal; use provision so the singleton lock is held');
       return provisionInternal(args);
     case 'handoff': return handoff(args);
+    case 'handoff-local': return localHandoff(args);
     case 'handoff-run':
       if (process.env.DISCORD_SURFACE_PROVISION_LOCK_HELD !== '1') throw new Error('handoff-run is internal; use handoff so the singleton lock is held');
       return handoffInternal(args);

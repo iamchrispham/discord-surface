@@ -23,6 +23,7 @@ const CODEX_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CLAUDE_ID = '01a0701c-5714-7671-a455-db7d67f9fa78';
 const SUCCESSOR_ID = '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b';
 const LOCKF = '/usr/bin/lockf';
+const CONDUCTOR_LOCK = '/Users/cphamballer/.claude/skills/conductor-handoff/scripts/conductor-lock.sh';
 const CLI_PATH = path.resolve(__dirname, '../src/cli.js');
 
 function fixture(dbName = 'surface.sqlite') {
@@ -69,6 +70,25 @@ function historyPermissions(allowed = true) {
 
 function lockfRun(lockPath, script) {
   return spawnSync(LOCKF, ['-t', '0', '-k', lockPath, process.execPath, '-e', script], { encoding: 'utf8' });
+}
+
+function conductorLock(env, args) {
+  return spawnSync(CONDUCTOR_LOCK, args, { env: { ...process.env, ...env }, encoding: 'utf8' });
+}
+
+function processStartTime(pid) {
+  const result = spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  const timestamp = Date.parse(result.stdout.trim());
+  assert.ok(Number.isFinite(timestamp), `could not parse process start time: ${result.stdout}`);
+  return Math.floor(timestamp / 1000);
+}
+
+function lockArtifacts(identity, repoKey, provider, owner) {
+  fs.mkdirSync(path.dirname(identity.beacon), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.dirname(identity.checkpoint), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(identity.beacon, `repository: ${repoKey}\nvendor: ${provider}\nowner-session: ${owner}\nstate: HELD\n`, { mode: 0o600 });
+  fs.writeFileSync(identity.checkpoint, `repository: ${repoKey}\nvendor: ${provider}\nowner-session: ${owner}\nstate: successor-ready\n`, { mode: 0o600 });
 }
 
 async function waitForFile(file, timeoutMs = 1000) {
@@ -2639,6 +2659,36 @@ test('simulated: readiness transaction rejects a second-connection successor', (
   state.close();
 });
 
+test('simulated: handoff rechecks unresolved message custody inside its commit transaction', () => {
+  const { dir, db, state } = fixture();
+  const channelId = 'atomic-message-custody';
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'atomic-message-custody-conductor', repoKey: 'repo:alpha' });
+  const old = state.getBinding(channelId);
+  const other = new SurfaceState(db);
+  const originalHasUnresolved = state.hasUnresolved.bind(state);
+  let injected = false;
+  state.hasUnresolved = channel => {
+    if (!injected) {
+      injected = true;
+      other.acceptDiscordMessage({ id: 'atomic-message-custody-input', guildId: 'guild-1', channelId, authorId: 'operator-1', isBot: false, content: 'arrived during handoff' });
+      return false;
+    }
+    return originalHasUnresolved(channel);
+  };
+  try {
+    assert.throws(() => state.handoffConductor({
+      ...old, fromNativeId: old.nativeId, fromGeneration: old.generation,
+      nativeId: SUCCESSOR_ID, handoffId: 'atomic-message-custody-1'
+    }), /cannot handoff while work is unresolved/);
+    assert.equal(state.getBinding(channelId).nativeId, CODEX_ID);
+    assert.equal(state.getMessage('atomic-message-custody-input').state, MESSAGE_STATES.ACCEPTED);
+  } finally {
+    state.hasUnresolved = originalHasUnresolved;
+    other.close();
+    state.close();
+  }
+});
+
 test('simulated: boundary transaction rejects a handoff committed by a second connection', async () => {
   const { dir, db, state } = fixture();
   state.bind({ channelId: 'atomic-boundary', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'atomic-boundary-conductor', repoKey: 'repo:alpha' });
@@ -2865,6 +2915,128 @@ test('simulated: handoff changes local owner without a topic write', () => {
   assert.equal(channel.topic, conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'handoff-conductor', repoKey: 'repo:alpha' }));
   assert.throws(() => state.handoffConductor({ ...handoff, handoffId: 'handoff-repair-1', nativeId: CLAUDE_ID }), /already used/);
   state.close();
+});
+
+test('simulated: from-lock pickup verifies the successor and commits through the lock gate', async () => {
+  const { dir, db, state } = fixture('from-lock.sqlite');
+  const repo = 'https://github.com/example/discord-pickup.git';
+  const oldNativeId = CODEX_ID;
+  const successorNativeId = SUCCESSOR_ID;
+  const oldOwner = `session-codex-${oldNativeId.slice(0, 8)}`;
+  const successorOwner = `session-codex-${successorNativeId.slice(0, 8)}`;
+  const lockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-pickup-lock-'));
+  const lockEnv = {
+    CONDUCTOR_LOCK_FILE: path.join(lockDir, 'conductor.lock.json'),
+    CONDUCTOR_WORKERS_DIR: path.join(lockDir, 'workers'),
+    CONDUCTOR_CODEX_SESSIONS_DIR: path.join(lockDir, 'sessions'),
+    CONDUCTOR_CLAUDE_PROJECTS_DIR: path.join(lockDir, 'claude-projects')
+  };
+  fs.mkdirSync(lockEnv.CONDUCTOR_CODEX_SESSIONS_DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(lockEnv.CONDUCTOR_WORKERS_DIR, { recursive: true, mode: 0o700 });
+  const claim = conductorLock(lockEnv, ['--repo', repo, '--vendor', 'codex', 'claim', oldOwner, 'pickup predecessor']);
+  assert.equal(claim.status, 0, claim.stderr);
+  const identityResult = conductorLock(lockEnv, ['--repo', repo, '--vendor', 'codex', 'identity']);
+  assert.equal(identityResult.status, 0, identityResult.stderr);
+  const identity = JSON.parse(identityResult.stdout);
+  const repoKey = identity.repo_key;
+  const conductorId = path.basename(identity.beacon);
+  lockArtifacts(identity, repoKey, 'codex', oldOwner);
+  const release = conductorLock(lockEnv, ['--repo', repo, '--vendor', 'codex', 'release', oldOwner, 'successor pickup']);
+  assert.equal(release.status, 0, release.stderr);
+  const successorClaim = conductorLock(lockEnv, ['--repo', repo, '--vendor', 'codex', 'claim', successorOwner, 'pickup successor']);
+  assert.equal(successorClaim.status, 0, successorClaim.stderr);
+  lockArtifacts(identity, repoKey, 'codex', successorOwner);
+
+  const categoryId = 'codex-category';
+  state.setConfig({ codexCategoryId: categoryId });
+  state.bind({ channelId: 'from-lock-channel', guildId: 'guild-1', provider: 'codex', nativeId: oldNativeId, workspace: dir, categoryId, conductorId, repoKey });
+  const marker = conductorMarker({ provider: 'codex', conductorId, repoKey });
+  const secret = path.join(dir, 'discord.secret');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  const transcriptRoot = lockEnv.CONDUCTOR_CODEX_SESSIONS_DIR;
+  const transcript = path.join(transcriptRoot, `rollout-test-${successorNativeId}.jsonl`);
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: 'session_meta', payload: { id: successorNativeId } })}\n`, { mode: 0o600 });
+  const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: dir, stdio: 'ignore' });
+  const workerManifest = path.join(lockDir, 'workers', `${successorOwner}.json`);
+  const preload = path.join(dir, 'from-lock-discord-preload.cjs');
+  fs.writeFileSync(preload, `
+const Module = require('node:module');
+const originalLoad = Module._load;
+const fake = {
+  GatewayIntentBits: { Guilds: 1 },
+  Client: class {
+    constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => ({ id: process.env.DISCORD_SURFACE_TEST_CHANNEL, parentId: process.env.DISCORD_SURFACE_TEST_CATEGORY, topic: process.env.DISCORD_SURFACE_TEST_TOPIC }) } }) }; }
+    async login() {}
+    async destroy() {}
+  }
+};
+Module._load = (request, parent, isMain) => request === 'discord.js' ? fake : originalLoad(request, parent, isMain);
+`, { mode: 0o600 });
+  state.close();
+  try {
+    fs.writeFileSync(workerManifest, JSON.stringify({
+      laneId: successorOwner, worktree: dir, state: 'active', harness: 'codex',
+      sessionId: successorNativeId, fullUUID: successorNativeId, pid: worker.pid,
+      processStartTime: processStartTime(worker.pid), generation: 1
+    }), { mode: 0o600 });
+    const result = spawnSync(process.execPath, [CLI_PATH, 'handoff', '--state-dir', dir, '--db', db,
+      '--from-lock', '--repo', repo, '--provider', 'codex', '--conductor-id', conductorId,
+      '--repo-key', repoKey, '--native-id', successorNativeId, '--workspace', dir,
+      '--session-file', transcript, '--worker-file', workerManifest], {
+      env: {
+        ...process.env, ...lockEnv, DISCORD_SURFACE_LOCK_SCRIPT: CONDUCTOR_LOCK,
+        DISCORD_SURFACE_TEST_CHANNEL: 'from-lock-channel', DISCORD_SURFACE_TEST_CATEGORY: categoryId, DISCORD_SURFACE_TEST_TOPIC: marker,
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preload}`].filter(Boolean).join(' ')
+      }, stdio: 'inherit'
+    });
+    assert.equal(result.status, 0);
+    const updated = new SurfaceState(db);
+    const binding = updated.getBinding('from-lock-channel');
+    assert.equal(binding.nativeId, successorNativeId);
+    assert.equal(binding.generation, 2);
+    assert.equal(binding.channelId, 'from-lock-channel');
+    updated.close();
+
+    const retry = spawnSync(process.execPath, [CLI_PATH, 'handoff', '--state-dir', dir, '--db', db,
+      '--from-lock', '--repo', repo, '--provider', 'codex', '--conductor-id', conductorId,
+      '--repo-key', repoKey, '--native-id', successorNativeId, '--workspace', dir,
+      '--session-file', transcript, '--worker-file', workerManifest], {
+      env: {
+        ...process.env, ...lockEnv, DISCORD_SURFACE_LOCK_SCRIPT: CONDUCTOR_LOCK,
+        DISCORD_SURFACE_TEST_CHANNEL: 'from-lock-channel', DISCORD_SURFACE_TEST_CATEGORY: categoryId, DISCORD_SURFACE_TEST_TOPIC: marker,
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preload}`].filter(Boolean).join(' ')
+      }, stdio: 'ignore'
+    });
+    assert.equal(retry.status, 0);
+    const reusedState = new SurfaceState(db);
+    try {
+      const reused = reusedState.getBinding('from-lock-channel');
+      assert.equal(reused.generation, 2);
+      assert.equal(reused.nativeId, successorNativeId);
+    } finally { reusedState.close(); }
+
+    const lockDocument = JSON.parse(fs.readFileSync(lockEnv.CONDUCTOR_LOCK_FILE, 'utf8'));
+    const slot = lockDocument.repos[repoKey].vendors.codex;
+    const releaseRow = slot.history.find(row => row.verb === 'release');
+    releaseRow.verb = 'override';
+    fs.writeFileSync(lockEnv.CONDUCTOR_LOCK_FILE, JSON.stringify(lockDocument), { mode: 0o600 });
+    const forced = spawnSync(process.execPath, [CLI_PATH, 'handoff', '--state-dir', dir, '--db', db,
+      '--from-lock', '--repo', repo, '--provider', 'codex', '--conductor-id', conductorId,
+      '--repo-key', repoKey, '--native-id', successorNativeId, '--workspace', dir,
+      '--session-file', transcript, '--worker-file', workerManifest], {
+      env: {
+        ...process.env, ...lockEnv, DISCORD_SURFACE_LOCK_SCRIPT: CONDUCTOR_LOCK,
+        DISCORD_SURFACE_TEST_CHANNEL: 'from-lock-channel', DISCORD_SURFACE_TEST_CATEGORY: categoryId, DISCORD_SURFACE_TEST_TOPIC: marker,
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preload}`].filter(Boolean).join(' ')
+      }, stdio: 'ignore'
+    });
+    assert.notEqual(forced.status, 0);
+  } finally {
+    worker.kill('SIGTERM');
+    await waitForProcessGone(worker.pid);
+    fs.rmSync(lockDir, { recursive: true, force: true });
+    fs.unlinkSync(preload);
+  }
 });
 
 test('simulated: empty Discord history requires known effective read permission', async () => {

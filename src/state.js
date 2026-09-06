@@ -952,6 +952,7 @@ class SurfaceState {
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('handoff source identity is stale');
+      if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       this.assertLegacyMigrationSafe(channelId);
       const generation = existing.generation + 1;
       this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
