@@ -451,6 +451,10 @@ class SurfaceState {
       );
       CREATE INDEX IF NOT EXISTS topic_publications_channel_idx ON topic_publications(channel_id, updated_at);
       CREATE INDEX IF NOT EXISTS topic_publications_unresolved_idx ON topic_publications(channel_id) WHERE status IN ('in_flight', 'unknown');
+      CREATE INDEX IF NOT EXISTS direct_post_outcome_message_idx
+        ON receipts(json_extract(detail, '$.messageId')) WHERE kind='direct-post-outcome';
+      CREATE INDEX IF NOT EXISTS direct_post_outcome_nonce_idx
+        ON receipts(json_extract(detail, '$.nonce')) WHERE kind='direct-post-outcome';
     `);
   }
 
@@ -1646,23 +1650,73 @@ class SurfaceState {
     });
   }
 
-  recoverDirectPostReceipts(ownerAlive = pid => {
+  directPostOwnerIdentity(pid) {
+    if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return null;
+    const normalizedPid = Number(pid);
+    if (normalizedPid === process.pid) {
+      if (!this.constructor.directPostProcessIdentity) {
+        this.constructor.directPostProcessIdentity = {
+          ownerPid: process.pid,
+          ownerStartTime: `local:${Date.now()}:${process.uptime()}`,
+          ownerCommand: process.argv.join('\0') || null
+        };
+      }
+      return this.constructor.directPostProcessIdentity;
+    }
+    let ownerStartTime = null;
+    let ownerCommand = null;
+    try {
+      const stat = require('node:fs').readFileSync(`/proc/${normalizedPid}/stat`, 'utf8');
+      const close = stat.lastIndexOf(')');
+      if (close > 0) ownerStartTime = stat.slice(close + 2).trim().split(/\s+/)[19] || null;
+      const command = require('node:fs').readFileSync(`/proc/${normalizedPid}/cmdline`, 'utf8');
+      ownerCommand = command.split('\0').filter(Boolean).join('\0') || null;
+    } catch (error) {
+      try {
+        ownerStartTime = require('node:child_process').execFileSync('ps', ['-p', String(normalizedPid), '-o', 'lstart='], {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
+        }).trim().replace(/\s+/g, ' ') || null;
+        ownerCommand = require('node:child_process').execFileSync('ps', ['-p', String(normalizedPid), '-o', 'command='], {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
+        }).trim() || null;
+      } catch (fallbackError) {
+        return null;
+      }
+    }
+    if (!ownerStartTime && !ownerCommand) return null;
+    return { ownerPid: normalizedPid, ownerStartTime, ownerCommand };
+  }
+
+  directPostOwnerAlive(pid, expectedIdentity = null) {
+    if (!Number.isInteger(Number(pid)) || Number(pid) < 1 || !expectedIdentity) return false;
+    try { process.kill(Number(pid), 0); } catch (error) { return false; }
+    const actualIdentity = this.directPostOwnerIdentity(pid);
+    if (!actualIdentity) return false;
+    if (expectedIdentity.ownerStartTime && actualIdentity.ownerStartTime !== expectedIdentity.ownerStartTime) return false;
+    if (expectedIdentity.ownerCommand && actualIdentity.ownerCommand !== expectedIdentity.ownerCommand) return false;
+    return Boolean(
+      (expectedIdentity.ownerStartTime && actualIdentity.ownerStartTime) ||
+      (expectedIdentity.ownerCommand && actualIdentity.ownerCommand)
+    );
+  }
+
+  recoverDirectPostReceipts(ownerAlive = (pid, expectedIdentity) => {
     if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
-    try { process.kill(Number(pid), 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
+    return this.directPostOwnerAlive(pid, expectedIdentity);
   }) {
     return this.transaction(() => this.recoverDirectPostReceiptsInternal(ownerAlive));
   }
 
-  recoverDirectPostReceiptsInternal(ownerAlive = pid => {
+  recoverDirectPostReceiptsInternal(ownerAlive = (pid, expectedIdentity) => {
     if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
-    try { process.kill(Number(pid), 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
+    return this.directPostOwnerAlive(pid, expectedIdentity);
   }) {
     const rows = this.directPostRows();
     const outcomes = new Set(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail?.attemptId).map(row => row.detail.attemptId));
     let recovered = 0;
     for (const row of rows.filter(item => item.kind === DIRECT_POST_ATTEMPT)) {
       if (outcomes.has(row.detail.attemptId)) continue;
-      if (ownerAlive(row.detail.ownerPid)) continue;
+      if (ownerAlive(row.detail.ownerPid, row.detail)) continue;
       this.receipt(null, DIRECT_POST_OUTCOME, {
         ...row.detail,
         outcome: 'unknown',
@@ -1706,8 +1760,9 @@ class SurfaceState {
         if (status === 'sent' || status === 'unknown') return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
         if (!['not_sent', 'rejected', 'rate_limited'].includes(status)) return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
       }
+      const ownerIdentity = this.directPostOwnerIdentity(process.pid);
       this.receipt(null, DIRECT_POST_ATTEMPT, {
-        journal: 'direct-post-v1', ...meta, ownerPid: process.pid, status: 'attempted'
+        journal: 'direct-post-v1', ...meta, ...ownerIdentity, status: 'attempted'
       });
       return { claimed: true, status: 'claimed', attemptId: meta.attemptId, nonce: meta.nonce };
     });
@@ -1729,12 +1784,27 @@ class SurfaceState {
     });
   }
 
+  directPostOutcomeMatches(event, key, value) {
+    const jsonPath = { messageId: '$.messageId', nonce: '$.nonce' }[key];
+    if (!jsonPath) throw new BindingError('direct post outcome lookup key is invalid');
+    const rows = this.db.prepare(`SELECT detail FROM receipts
+      WHERE discord_id IS NULL AND kind=?
+        AND json_extract(detail, '${jsonPath}')=?
+        AND json_extract(detail, '$.channelId')=?
+        AND json_extract(detail, '$.guildId')=?`).all(
+      DIRECT_POST_OUTCOME, value, event.channelId, event.guildId
+    );
+    return rows.some(row => {
+      const detail = parseJson(row.detail, null);
+      if (!detail || detail.journal !== 'direct-post-v1') throw new StateCorruptError('direct post receipt is malformed');
+      return detail.outcome === 'sent' && detail[key] === value;
+    });
+  }
+
   excludeDirectPost(event) {
     if (!event || typeof event.id !== 'string' || typeof event.channelId !== 'string' || typeof event.guildId !== 'string') return false;
-    const rows = this.directPostRows();
-    return rows.some(row => row.kind === DIRECT_POST_OUTCOME && row.detail.outcome === 'sent' &&
-      row.detail.channelId === event.channelId && row.detail.guildId === event.guildId &&
-      (row.detail.messageId === event.id || (event.isBot && typeof event.nonce === 'string' && row.detail.nonce === event.nonce)));
+    if (this.directPostOutcomeMatches(event, 'messageId', event.id)) return true;
+    return Boolean(event.isBot && typeof event.nonce === 'string' && this.directPostOutcomeMatches(event, 'nonce', event.nonce));
   }
 
   recoveryCandidates(before = null) {
