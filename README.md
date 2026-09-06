@@ -1,5 +1,7 @@
 # Discord surface
 
+Planning: [Discord decision interactions roadmap](docs/discord-decisions-roadmap.md) describes proposed work and its acceptance gates. The decision interface is not implemented by that plan.
+
 This local adapter keeps Discord transport custody in SQLite and sends accepted messages to an already-owned native Codex task or an explicitly channel-enabled Claude session. It does not start a model executor, resume a history file, change native approval settings, or switch providers.
 
 The runtime needs Node 22.5 or newer for `node:sqlite`. It resolves `discord.js` and the MCP SDK from `/Users/cphamballer/.codex/mcp/discord/node_modules`; no package installation or bot-token export is required.
