@@ -204,4 +204,6 @@ The private repository preserves the existing transport history. The sidecar fea
 - [Final roadmap stress test](docs/spark-sidecar-roadmap-pro-verbatim.md)
 - [Acknowledgment slice local proof](docs/spark-sidecar-ack-proof.json)
 
-The snapshot reads existing conductor records and the shared progress ladder without invoking a native conductor or `/cs`. Automatic publication, model experiments and end-to-end context exclusion remain under development. No hosted CI or portable dependency installation is configured yet. Run the local owning suite before pushing a feature update.
+The snapshot reads existing conductor records and the shared progress ladder without invoking a native conductor or `/cs`. Add `--interpret` to the `snapshot --channel-id CHANNEL` command for a separate optional Luna-low interpretation beside the deterministic preview. It uses the existing subscription runner, at most 32 KiB of packet data, 8 KiB of answer data, a 60-second deadline and one concurrent interpretation per process. It refreshes source data after inference, including provider failure, and discards results after source or binding changes. Temporary inference files are removed after the child exits. No preview is posted to Discord.
+
+Source-reference validation is structural, not proof that the interpretation is true. Automatic publication and end-to-end context exclusion remain under development. No hosted CI or portable dependency installation is configured yet. Run the local owning suite before pushing a feature update.

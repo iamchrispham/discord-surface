@@ -11,6 +11,7 @@ const { createClaudeMonitor } = require('./claude-monitor');
 const { runLiaisonDraft } = require('./liaison');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
 const { readSnapshot, renderSnapshot } = require('./snapshot');
+const { interpretSnapshot } = require('./context-interpretation');
 const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
 
 function parseArgs(argv) {
@@ -755,12 +756,31 @@ function claudeReply(args) {
 
 async function snapshotPreview(args) {
   const { state } = openState(args);
+  const controller = new AbortController();
+  const abort = () => { controller.abort(); process.exitCode = 130; };
+  process.once('SIGINT', abort);
+  process.once('SIGTERM', abort);
   try {
     const binding = state.getBinding(required(args, 'channel-id'));
     if (!binding?.active) throw new Error('snapshot requires an active binding');
-    const snapshot = await readSnapshot(binding, { registry: args.registry });
-    print({ snapshot, preview: renderSnapshot(snapshot) });
-  } finally { state.close(); }
+    let snapshot = await readSnapshot(binding, { registry: args.registry, signal: controller.signal });
+    let context = args.interpret ? await interpretSnapshot(snapshot, { signal: controller.signal }) : undefined;
+    if (context) {
+      const latest = await readSnapshot(binding, { registry: args.registry, signal: controller.signal });
+      if (context.status === 'ready' && latest.id !== snapshot.id) context = { status: 'unavailable', reason: 'snapshot-changed', interpretation: null };
+      snapshot = latest;
+    }
+    const current = state.getBinding(binding.channelId);
+    if (!current?.active || current.generation !== binding.generation || current.nativeId !== binding.nativeId) {
+      print({ unavailable: 'binding-changed' });
+      return;
+    }
+    print({ snapshot, preview: renderSnapshot(snapshot), ...(context ? { context } : {}) });
+  } finally {
+    process.removeListener('SIGINT', abort);
+    process.removeListener('SIGTERM', abort);
+    state.close();
+  }
 }
 
 function readProcessCommand(pid) {

@@ -72,6 +72,10 @@ September 6 role ruling, accepted by the operator: direct Luna low is the initia
 
 ## S4 Integrated publication outside conductor context
 
+September 6 implementation progress: `snapshot --interpret` now calls the reusable bounded Luna-low interpreter, retaining deterministic output and refreshing it even after model failure. The packet preserves exact snapshot identity, source references, owed-item direction and omitted-lane count. Only one interpretation runs per process. The output remains local and advisory. Six companion checks include the actual CLI and child processes; the owning suite includes 130 tests. The first real integrated trial invented event ordering despite valid source IDs. A corrected prompt and repeat on that frozen input removed that overclaim; this is a corrective diagnostic, not independent generalization evidence. See `docs/context-interpretation-proof.md`. Automatic publishing and fresh prospective semantic checks remain required.
+
+Operator added Spark emoji selection as a possible small job. It may select presentation for an already recognized message. It must not infer durable save or native recognition, and the fixed saved/recognized pair does not require another model call.
+
 - [ ] S4.1 Attach the sidecar to the existing selected conductor channels and source events. Automatic updates are visibly labeled and use the conductor-owned publication policy. Spark has no separate channel/session binding or authority to answer incoming messages.
 - [ ] S4.2 Routine snapshots and interpretation produce no native `codex queue`, Claude Monitor input, conductor `/cs` invocation or review request. Verify normal input, replay and backfill paths all exclude automatic sidecar posts.
 - [ ] S4.3 Continue deterministic publication if the optional model is slow, unavailable or returns unusable output. Model completion cannot revive a superseded snapshot. Dedupe the same warning across unchanged evidence without suppressing required status or alerts.

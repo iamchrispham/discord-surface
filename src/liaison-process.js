@@ -32,10 +32,10 @@ function disabledSkillConfig() {
   return [...names].sort().map(name => `{name=${JSON.stringify(name)},enabled=false}`).join(',');
 }
 
-function buildSparkCommand({ cwd, schemaPath, answerPath }) {
+function buildCommand({ cwd, schemaPath, answerPath }, model) {
   const args = [
     'exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only',
-    '--model', SPARK_MODEL, '--cd', cwd, '--json', '--output-schema', schemaPath,
+    '--model', model, '--cd', cwd, '--json', '--output-schema', schemaPath,
     '--output-last-message', answerPath,
     '-c', `model_reasoning_effort="${SPARK_EFFORT}"`,
     '-c', 'forced_login_method="chatgpt"',
@@ -50,6 +50,9 @@ function buildSparkCommand({ cwd, schemaPath, answerPath }) {
   ];
   return { command: SPARK_COMMAND, args };
 }
+
+function buildSparkCommand(options) { return buildCommand(options, SPARK_MODEL); }
+function buildContextCommand(options) { return buildCommand(options, 'gpt-5.6-luna'); }
 
 function scrubEnvironment(input) {
   const env = { ...input };
@@ -144,4 +147,4 @@ async function runBoundedSpark({ command, args, cwd, prompt, signal, timeoutMs, 
   }
 }
 
-module.exports = { buildSparkCommand, runBoundedSpark };
+module.exports = { buildSparkCommand, buildContextCommand, runBoundedSpark };
