@@ -88,7 +88,7 @@ function acknowledgmentFailureStatus(error) {
     const status = Number(candidate);
     if (Number.isInteger(status) && status >= 100 && status <= 599) return status;
   }
-  const match = String(error?.message || error || '').match(/\b(403|404)\b/);
+  const match = String(error?.message || error || '').match(/\b(4\d{2})\b/);
   return match ? Number(match[1]) : null;
 }
 
@@ -125,7 +125,7 @@ function watchAcknowledgments({ state, send, logger = () => {}, watchFactory = f
           const status = acknowledgmentFailureStatus(error);
           const detail = { error: String(error.message || error).slice(0, 200) };
           if (status !== null) detail.status = status;
-          if (status === 403 || status === 404) {
+          if (status !== null && status >= 400 && status < 500 && status !== 429) {
             outcome(id, ACK_OUTCOMES.FAILED, detail);
             continue;
           }

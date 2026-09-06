@@ -2,7 +2,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 
-const SNAPSHOT_MAX_BUFFER = 4 * 1024 * 1024;
+const SNAPSHOT_MAX_BUFFER = 8 * 1024 * 1024;
 
 function readSnapshot(binding, { registry = path.join(os.homedir(), '.agents/work-control/pr-lanes.json'),
   ladderDir = path.join(os.homedir(), '.claude/skills/conduct-status/scripts'), now, signal } = {}) {
