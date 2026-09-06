@@ -86,6 +86,17 @@ Evidence: fake-provider negative controls plus live sidecar publications through
 - [ ] S5.4 Report observed conductor turns/context growth, model overhead, corrections and warnings. Offline answerability or estimated avoided turns are not causal proof that the operator would otherwise have invoked `/cs`. Label the observation window and remaining limitations rather than requiring an invented savings percentage.
 - [ ] S5.5 Update the local operator guide, source references and this checklist. Clean test processes/fixtures. Keep intended production services running. Complete the goal only after the requirement-by-requirement audit has evidence for every active item.
 
+## S6 Shared agent channel, after Spark
+
+Operator requested September 6, 2026. Deferred until the Spark sidecar is delivered. This milestone does not expand the current Spark completion gate.
+
+- [ ] S6.1 Provide a shared Discord channel for collaboration across vendors and operating systems, while retaining dedicated conductor channels and persistent native identities.
+- [ ] S6.2 Reuse existing binding and delivery ownership. Identify the participating conductor, vendor and host explicitly. A shared channel must not create replacement sessions or dispatch every message to every agent.
+- [ ] S6.3 Support directed requests, replies and handoffs in the shared conversation with durable recipient and correlation records. Distinguish a saved message from actual agent recognition. Keep collaborative messages distinct from execution authority.
+- [ ] S6.4 Prove a real cross-vendor exchange on two operating systems, followed by delivery across a conductor's binding change. Verify the intended recipient receives the message once, replies reach the shared channel, and native session history remains intact. A same-machine fixture does not close cross-OS proof.
+
+Routing syntax and host transport remain design work for this milestone. Start from existing coordination facilities, then implement the smallest missing boundary.
+
 ## Explicit exclusions
 
 No new coordination framework, second obligation store, full-session polling, general code investigation/fixing, terminal `/rc` control, autonomous model authority, per-message approval loop, billing/API/overage expansion or broad failure campaign. Decision breadcrumbs, steering-message interpretation and polished decision briefs remain possible later extensions, not extra active lanes.
