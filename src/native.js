@@ -93,7 +93,7 @@ function findCodexSessionFile(nativeId, root = sessionRoot()) {
   for (const file of walk(root)) {
     if (!file.includes(nativeId)) continue;
     try {
-      const line = fs.readFileSync(file, 'utf8').split('\n', 1)[0];
+      const line = readSessionHeader(file);
       const row = JSON.parse(line);
       if (row.type === 'session_meta' && (row.payload?.session_id || row.payload?.id) === nativeId) return file;
     } catch {}
@@ -133,15 +133,50 @@ function cursorTailBytes(cursor) {
   return typeof cursor?.tail === 'string' ? Buffer.from(cursor.tail, 'utf8') : Buffer.alloc(0);
 }
 
-function completeJsonLines(bytes) {
-  const lines = [];
-  let start = 0;
-  for (let index = 0; index < bytes.length; index += 1) {
-    if (bytes[index] !== 0x0a) continue;
-    lines.push(bytes.subarray(start, index));
-    start = index + 1;
+// This bounds each read, not record size. A valid JSONL record may span blocks.
+const TRANSCRIPT_BLOCK_BYTES = 64 * 1024;
+
+function readTranscriptBlock(fd, position, length) {
+  const bytes = Buffer.allocUnsafe(length);
+  let read = 0;
+  while (read < length) {
+    const count = fs.readSync(fd, bytes, read, length - read, position + read);
+    if (!count) throw new Error('transcript shortened during read');
+    read += count;
   }
-  return { lines, tailBytes: bytes.subarray(start) };
+  return bytes;
+}
+
+function readSessionHeader(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    const parts = [];
+    for (let position = 0; position < size;) {
+      const bytes = readTranscriptBlock(fd, position, Math.min(TRANSCRIPT_BLOCK_BYTES, size - position));
+      const newline = bytes.indexOf(0x0a);
+      parts.push(newline < 0 ? bytes : bytes.subarray(0, newline));
+      if (newline >= 0) break;
+      position += bytes.length;
+    }
+    return Buffer.concat(parts).toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readTranscriptTail(fd, size) {
+  const parts = [];
+  for (let end = size; end > 0;) {
+    const start = Math.max(0, end - TRANSCRIPT_BLOCK_BYTES);
+    const bytes = readTranscriptBlock(fd, start, end - start);
+    const newline = bytes.lastIndexOf(0x0a);
+    parts.push(bytes.subarray(newline + 1));
+    if (newline >= 0) break;
+    end = start;
+  }
+  // Copy the suffix; a tiny tail must not keep the last read buffer alive.
+  return Buffer.concat(parts.reverse());
 }
 
 async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), pollMs = 250, signal, onCursor, continueUntilFinal = false, isCurrent } = {}) {
@@ -151,43 +186,61 @@ async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000,
   let offset = Number(cursor?.offset || 0);
   let tailBytes = cursorTailBytes(cursor);
   let since = Number(cursor?.since || startedAt);
+  const currentCursor = () => ({ file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') });
+  const stopped = () => signal?.aborted || (isCurrent && !isCurrent());
   while (continueUntilFinal || Date.now() - startedAt < timeoutMs) {
-    if (signal?.aborted || (isCurrent && !isCurrent())) return { stopped: true, cursor: { file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') } };
+    if (stopped()) return { stopped: true, cursor: currentCursor() };
     if (!file) file = findCodexSessionFile(nativeId, root);
     if (file) {
       try {
-        const bytes = fs.readFileSync(file);
-        if (bytes.length < offset) {
-          offset = 0;
-          tailBytes = Buffer.alloc(0);
-          since = startedAt;
-        }
-        const chunk = Buffer.concat([tailBytes, bytes.subarray(offset)]);
-        offset = bytes.length;
-        const parsed = completeJsonLines(chunk);
-        tailBytes = parsed.tailBytes;
-        const nextCursor = { file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') };
-        let foundReply = false;
-        for (const lineBytes of parsed.lines) {
-          if (!lineBytes.length) continue;
-          try {
-            const row = JSON.parse(lineBytes.toString('utf8'));
-            if (Date.parse(row.timestamp || '') < since) continue;
-            const text = finalText(row, marker);
-            if (text) {
-              foundReply = true;
-              return { text, cursor: nextCursor };
+        const fd = fs.openSync(file, 'r');
+        let text = null;
+        try {
+          const end = fs.fstatSync(fd).size;
+          const truncated = end < offset;
+          const nextSince = truncated ? startedAt : since;
+          let position = truncated ? 0 : offset;
+          const pending = truncated ? Buffer.alloc(0) : tailBytes;
+          let parts = pending.length ? [pending] : [];
+          // Hold only the unfinished record; still scan to snapshot EOF after a
+          // match so the returned offset and trailing bytes keep their semantics.
+          while (position < end) {
+            if (stopped()) return { stopped: true, cursor: currentCursor() };
+            const bytes = readTranscriptBlock(fd, position, Math.min(TRANSCRIPT_BLOCK_BYTES, end - position));
+            position += bytes.length;
+            let start = 0;
+            for (let newline = bytes.indexOf(0x0a); newline >= 0; newline = bytes.indexOf(0x0a, start)) {
+              if (!text && (parts.length || newline > start)) {
+                const piece = bytes.subarray(start, newline);
+                const line = parts.length ? Buffer.concat([...parts, piece]) : piece;
+                try {
+                  const row = JSON.parse(line.toString('utf8'));
+                  if (!(Date.parse(row.timestamp || '') < nextSince)) text = finalText(row, marker);
+                } catch {}
+              }
+              parts = [];
+              start = newline + 1;
             }
-          } catch {}
+            // Own the suffix: do not retain a whole block via a small subarray.
+            if (start < bytes.length) parts.push(Buffer.from(bytes.subarray(start)));
+          }
+          if (stopped()) return { stopped: true, cursor: currentCursor() };
+          // Commit only a fully read snapshot. A failed read must not lose bytes.
+          offset = end;
+          tailBytes = parts.length === 1 ? parts[0] : Buffer.concat(parts);
+          since = nextSince;
+        } finally {
+          fs.closeSync(fd);
         }
-        if (!foundReply) onCursor?.(nextCursor);
+        if (text) return { text, cursor: currentCursor() };
+        onCursor?.(currentCursor());
       } catch {
-        onCursor?.({ file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') });
+        onCursor?.(currentCursor());
       }
     }
     await sleep(pollMs, signal);
   }
-  return { stopped: Boolean(signal?.aborted), cursor: { file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') } };
+  return { stopped: Boolean(signal?.aborted), cursor: currentCursor() };
 }
 
 function readInitialCursor(nativeId, root = sessionRoot()) {
@@ -196,9 +249,14 @@ function readInitialCursor(nativeId, root = sessionRoot()) {
   let offset = 0;
   let tailBytes = Buffer.alloc(0);
   try {
-    const bytes = fs.readFileSync(file);
-    offset = bytes.length;
-    tailBytes = completeJsonLines(bytes).tailBytes;
+    const fd = fs.openSync(file, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      tailBytes = readTranscriptTail(fd, size);
+      offset = size;
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {}
   return { file, offset, since: Date.now(), tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') };
 }
