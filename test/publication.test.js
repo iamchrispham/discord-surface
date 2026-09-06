@@ -704,3 +704,57 @@ test('automatic publication consumes the bounded interpreter process and its val
   assert.equal(fs.existsSync(directory), false);
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
 });
+
+test('future source crossed during read becomes current without another file event', async t => {
+  const f = fixture(t);
+  let clock = 100000;
+  let reads = 0;
+  f.data._conductors['owner.md'].updated = new Date(clock + 10).toISOString(); f.write();
+  const p = start(f, { clock: () => clock, ready: () => false, read: async (binding, options) => {
+    const result = await f.readSnapshot(binding, options);
+    if (++reads === 1) clock += 20;
+    return result;
+  } });
+  await until(() => reads >= 2, 'future-to-current reread');
+  await until(() => JSON.parse(f.state.publications.head(f.binding).snapshot).context.freshness === 'current', 'current snapshot');
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(reads, 2, 'one crossed boundary must not keep waking');
+  await p.stop();
+});
+
+test('unknown source with no expiry does not acquire an immediate wake', async t => {
+  const f = fixture(t);
+  delete f.data._conductors['owner.md'].updated; f.write();
+  let reads = 0;
+  const p = start(f, { ready: () => false, read: async (...args) => { reads++; return f.readSnapshot(...args); } });
+  await until(() => reads === 1);
+  await new Promise(resolve => setTimeout(resolve, 70));
+  assert.equal(reads, 1);
+  await p.stop();
+});
+
+test('snapshot reads equal-size same-second ladder edits despite existing bytecode', async t => {
+  const { execFileSync } = require('node:child_process');
+  const f = fixture(t);
+  f.data.lane = { vendor: 'codex', conductor: 'owner.md', phase: 'building' }; f.write();
+  const modulePath = path.join(f.ladderDir, 'lane_progress_ladder.py');
+  const stamp = Math.floor(Date.now() / 1000) - 5;
+  fs.utimesSync(modulePath, stamp, stamp);
+  const previousCache = process.env.PYTHONPYCACHEPREFIX;
+  process.env.PYTHONPYCACHEPREFIX = path.join(f.dir, 'python-cache');
+  t.after(() => {
+    if (previousCache === undefined) delete process.env.PYTHONPYCACHEPREFIX;
+    else process.env.PYTHONPYCACHEPREFIX = previousCache;
+  });
+  const cache = execFileSync('/usr/bin/python3', ['-c', 'import py_compile,sys; print(py_compile.compile(sys.argv[1], doraise=True))', modulePath],
+    { encoding: 'utf8' }).trim();
+  assert.ok(fs.existsSync(cache));
+  const first = await f.readSnapshot(f.binding, { registry: f.registry });
+  assert.equal(first.lanes[0].percent, 50);
+  const source = fs.readFileSync(modulePath, 'utf8');
+  fs.writeFileSync(modulePath, source.replace('"building": 50', '"building": 75'));
+  fs.utimesSync(modulePath, stamp, stamp);
+  assert.equal(fs.statSync(modulePath).size, Buffer.byteLength(source));
+  const second = await f.readSnapshot(f.binding, { registry: f.registry });
+  assert.equal(second.lanes[0].percent, 75);
+});

@@ -1,5 +1,5 @@
 const crypto = require('node:crypto');
-const { REFERENCE_INSTRUCTIONS } = require('./publication/reference');
+const { REFERENCE_INSTRUCTIONS, REFERENCE_TARGET_INSTRUCTIONS } = require('./publication/reference');
 const { acknowledgmentCommand } = require('./acknowledgment');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -89,7 +89,7 @@ function eventValues(event) {
   return { content, messageId, nativeId, generation, attachments };
 }
 
-function monitorEvent({ content, messageId, nativeId, generation, attachments = [], publicationReference, stateDir, dbPath, cliPath, textFile }) {
+function monitorEvent({ content, messageId, nativeId, generation, attachments = [], publicationReference, publicationReferenceTarget, stateDir, dbPath, cliPath, textFile }) {
   const event = {
     type: 'discord-surface/claude-monitor',
     content,
@@ -125,6 +125,9 @@ function monitorEvent({ content, messageId, nativeId, generation, attachments = 
   if (publicationReference) {
     event.publicationReference = publicationReference;
     event.instructions += ' ' + REFERENCE_INSTRUCTIONS;
+  } else if (publicationReferenceTarget) {
+    event.publicationReferenceTarget = publicationReferenceTarget;
+    event.instructions += ' ' + REFERENCE_TARGET_INSTRUCTIONS;
   }
   return event;
 }
@@ -164,6 +167,7 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
           content: message.content,
           attachments: message.attachments,
           publicationReference: message.publicationReference,
+          publicationReferenceTarget: message.publicationReferenceTarget,
           stateDir: path.resolve(stateDir),
           dbPath: path.resolve(dbPath),
           cliPath: path.resolve(cliPath),

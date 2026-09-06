@@ -46,7 +46,11 @@ def field(record, key, kind):
 
 def snapshot(binding, registry, ladder_dir, now):
     sys.path.insert(0, str(ladder_dir))
-    from lane_progress_ladder import PCT, canonical
+    ladder_path = pathlib.Path(ladder_dir) / "lane_progress_ladder.py"
+    ladder = {"__file__": str(ladder_path), "__name__": "lane_progress_ladder"}
+    # Timestamp-based bytecode can miss equal-size edits within one second.
+    exec(compile(ladder_path.read_bytes(), str(ladder_path), "exec"), ladder)
+    PCT, canonical = ladder["PCT"], ladder["canonical"]
 
     source = pathlib.Path(registry)
     with source.open("rb") as stream:

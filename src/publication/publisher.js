@@ -42,7 +42,8 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
       let nextWake = Infinity;
       for (const binding of bindings()) {
         if (closed) break;
-        let snapshot = await read(binding, { registry, ladderDir, now: clock() / 1000, signal: controller.signal });
+        const readStartedAt = clock();
+        let snapshot = await read(binding, { registry, ladderDir, now: readStartedAt / 1000, signal: controller.signal });
         if (closed || !store.current(binding)) continue;
         if (snapshot.unavailable) {
           logger(`publication source unavailable for ${binding.channelId}: ${snapshot.unavailable}`);
@@ -53,10 +54,10 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
         store.stage(binding, snapshot, renderSnapshot(snapshot));
         context.observe(binding, snapshot);
         const expiresAt = Number(snapshot.expiresAt) * 1000;
-        if (Number.isFinite(expiresAt)) {
+        if (snapshot.expiresAt != null && Number.isFinite(expiresAt)) {
           const afterRead = clock();
           if (expiresAt > afterRead) nextWake = Math.min(nextWake, expiresAt);
-          else if (snapshot.context?.freshness === 'current') nextWake = Math.min(nextWake, afterRead);
+          else if (expiresAt > readStartedAt) nextWake = Math.min(nextWake, afterRead);
         }
         const post = store.pending(binding);
         if (!post) continue;

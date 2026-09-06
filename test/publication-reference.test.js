@@ -53,7 +53,7 @@ test('exact reference survives duplicate intake, source replacement, restart and
     const message = f.state.getMessage('200');
     assert.deepEqual(message.publicationReference, reference);
     const plan = f.state.db.prepare('EXPLAIN QUERY PLAN SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id LIMIT 1').all('200', REFERENCE_RECEIPT);
-    assert.ok(plan.some(row => row.detail.includes('SEARCH receipts USING INDEX publication_reference_message')));
+    assert.ok(plan.some(row => row.detail.includes('SEARCH receipts USING INDEX')));
     for (const text of [codexPrompt(message), claudeEvent(message).content]) {
       assert.ok(text.includes(JSON.stringify(reference)));
       assert.ok(text.includes(human().content));
@@ -204,4 +204,80 @@ test('reference and accepted input roll back together when reference persistence
   f.state.receipt = original;
   assert.equal((await accept(f)).accepted, true);
   assert.equal(f.state.listReceipts().filter(row => row.kind === REFERENCE_RECEIPT).length, 1);
+});
+
+test('unavailable reply targets survive native prompts and Monitor pickup without invented content', async t => {
+  for (const status of ['unresolved', 'pending']) {
+    for (const provider of ['codex', 'claude']) {
+      const f = fixture(t, provider);
+      const target = 'requested-target-' + status;
+      if (status === 'pending') f.state.db.prepare("UPDATE publication_posts SET status='unknown', message_id=?").run(target);
+      await accept(f, { ...human(), reference: { messageId: target } });
+      f.reopen();
+      const message = f.state.getMessage('200');
+      const expected = { messageId: target, status };
+      for (const text of [codexPrompt(message), claudeEvent(message).content]) {
+        assert.ok(text.includes(JSON.stringify(expected)));
+        assert.ok(text.includes(human().content));
+        assert.ok(!text.includes(f.post.content));
+      }
+      if (provider !== 'claude') continue;
+      let line = '';
+      const stdout = new Writable({ write(chunk, _encoding, done) { line += chunk; done(); } });
+      const monitor = createMonitorMcp({ state: f.state, stateDir: f.dir, dbPath: f.db, stdout });
+      t.after(async () => { await monitor.close(); stdout.destroy(); });
+      await monitor.notification({ method: 'notifications/claude/channel', params: {
+        content: 'untrusted upstream content', meta: { messageId: '200', nativeId: NATIVE, generation: '1' } } });
+      const payload = JSON.parse(fs.readFileSync(JSON.parse(line).payloadPath, 'utf8'));
+      assert.deepEqual(payload.publicationReferenceTarget, expected);
+      assert.equal(payload.publicationReference, undefined);
+      assert.equal(payload.content, human().content);
+    }
+  }
+});
+
+test('receipt lookups use indexes on fresh and upgraded databases without losing pending acknowledgments', async t => {
+  const { pendingAcknowledgments, ACK } = require('../src/acknowledgment');
+  const f = fixture(t);
+  await accept(f, { ...human(), reference: { messageId: 'unavailable-target' } });
+  const insert = f.state.db.prepare(`INSERT INTO messages(discord_id,guild_id,channel_id,author_id,content,provider,native_id,workspace,generation,state,created_at,updated_at)
+    VALUES(?, 'guild', 'channel', 'operator', 'history', 'claude', ?, ?, 1, 'replied', '2026-09-06', '2026-09-06')`);
+  f.state.transaction(() => {
+    for (let i = 0; i < 3000; i++) {
+      insert.run('history-' + i, NATIVE, f.dir);
+      f.state.receipt(null, 'unrelated-history', { i });
+      f.state.receipt('history-' + i, ACK.RECEIVED, {});
+      f.state.receipt('history-' + i, ACK.OUTCOME, {});
+    }
+    f.state.receipt('200', ACK.RECEIVED, {});
+  });
+  function checkQueries() {
+    const prepare = f.state.db.prepare.bind(f.state.db);
+    const plans = [];
+    f.state.db.prepare = sql => {
+      const stmt = prepare(sql);
+      if (sql.startsWith('SELECT kind, detail FROM receipts') || sql.includes('SELECT r.discord_id FROM receipts r')) {
+        for (const method of ['get', 'all']) {
+          const execute = stmt[method].bind(stmt);
+          stmt[method] = (...args) => { plans.push(prepare('EXPLAIN QUERY PLAN ' + sql).all(...args)); return execute(...args); };
+        }
+      }
+      return stmt;
+    };
+    try {
+      assert.equal(f.state.getMessage('200').publicationReferenceTarget.messageId, 'unavailable-target');
+      assert.deepEqual(pendingAcknowledgments(f.state), ['200']);
+    } finally { f.state.db.prepare = prepare; }
+    assert.equal(plans.length, 2);
+    const missing = [];
+    if (!plans[0].some(row => /SEARCH receipts/.test(row.detail))) missing.push({ query: 'target', plan: plans[0] });
+    for (const alias of ['r', 'done']) {
+      if (!plans[1].some(row => new RegExp('SEARCH ' + alias + ' USING').test(row.detail))) missing.push({ query: alias, plan: plans[1] });
+    }
+    assert.deepEqual(missing, []);
+  }
+  checkQueries();
+  f.state.db.exec('DROP INDEX IF EXISTS receipts_kind_message');
+  f.reopen();
+  checkQueries();
 });

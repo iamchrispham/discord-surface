@@ -355,6 +355,7 @@ class SurfaceState {
         this.assertSchema();
       }
       createPublicationSchema(this.db);
+      this.db.exec('CREATE INDEX IF NOT EXISTS receipts_kind_message ON receipts(kind, discord_id)');
       this.db.exec(`CREATE INDEX IF NOT EXISTS publication_reference_message ON receipts(discord_id) WHERE kind='${REFERENCE_RECEIPT}'`);
       this.db.exec(`CREATE INDEX IF NOT EXISTS direct_post_receipts_idx ON receipts(id) WHERE discord_id IS NULL AND kind IN ('${DIRECT_POST_ATTEMPT}', '${DIRECT_POST_OUTCOME}')`);
       fs.chmodSync(dbPath, 0o600);
