@@ -1,0 +1,42 @@
+{
+  "sourceHead": "68f7fae60b246058224b9f11f7b417b8f515d447",
+  "scope": "Synthetic unchanged transcript; three observations, accelerated 1 ms intervals. Existing observer called directly. Wrapper records returned read bytes and memory immediately after allocation. Does not reproduce or explain live 1.1G peak; no cross-language comparison.",
+  "samples": [
+    {
+      "fileMiB": 4,
+      "reads": 3,
+      "bytesRead": 12582912,
+      "newlyAppendedBytes": 0,
+      "stopped": true,
+      "cpuMicroseconds": {
+        "user": 2687,
+        "system": 1884
+      },
+      "peakMemoryBytes": {
+        "rss": 55312384,
+        "heapTotal": 6963200,
+        "heapUsed": 5172984,
+        "external": 11373161,
+        "arrayBuffers": 9454111
+      }
+    },
+    {
+      "fileMiB": 32,
+      "reads": 3,
+      "bytesRead": 100663296,
+      "newlyAppendedBytes": 0,
+      "stopped": true,
+      "cpuMicroseconds": {
+        "user": 6959,
+        "system": 13621
+      },
+      "peakMemoryBytes": {
+        "rss": 148389888,
+        "heapTotal": 7487488,
+        "heapUsed": 5104584,
+        "external": 70093417,
+        "arrayBuffers": 68174367
+      }
+    }
+  ]
+}

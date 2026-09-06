@@ -1,5 +1,7 @@
 # Spark sidecar roadmap
 
+Runtime constraint: [runtime research and finite Rust-first checklist](runtime-language-research.md). This adds a measured migration trial, not completed implementation or permission to replace the live service. Existing sidecar acceptance remains open.
+
 Status: final stress test reconciled. Implementation in progress. Goal active in Codex task `01a0701c-5714-7671-a455-db7d67f9fa78`.
 
 ## Outcome

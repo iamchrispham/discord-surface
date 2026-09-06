@@ -1,5 +1,7 @@
 # Runtime memory baseline and language direction
 
+Research update: [completed adversarial decision](runtime-language-research.md) supersedes the provisional ordering below. Rust is the first bounded compiled trial. Node improvements, comparative measurements and deployment proof remain pending.
+
 The operator identified memory and CPU pressure from concurrent conductors as a design constraint. Do not perform a TypeScript migration as a memory optimization. Type annotations do not remove the JavaScript runtime.
 
 ## Observed baseline
