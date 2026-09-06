@@ -357,6 +357,8 @@ class SurfaceState {
       createPublicationSchema(this.db);
       this.db.exec('CREATE INDEX IF NOT EXISTS receipts_kind_message ON receipts(kind, discord_id)');
       this.db.exec(`CREATE INDEX IF NOT EXISTS publication_reference_message ON receipts(discord_id) WHERE kind='${REFERENCE_RECEIPT}'`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS publication_reference_pending_message ON receipts(discord_id, kind) WHERE kind IN ('${PENDING_REFERENCE_RECEIPT}', '${UNRESOLVED_REFERENCE_RECEIPT}')`);
+      this.db.exec("CREATE INDEX IF NOT EXISTS acknowledgment_receipts_message ON receipts(kind, discord_id) WHERE kind IN ('native-ack', 'native-ack-reaction')");
       this.db.exec(`CREATE INDEX IF NOT EXISTS direct_post_receipts_idx ON receipts(id) WHERE discord_id IS NULL AND kind IN ('${DIRECT_POST_ATTEMPT}', '${DIRECT_POST_OUTCOME}')`);
       fs.chmodSync(dbPath, 0o600);
     } catch (error) {

@@ -3,7 +3,12 @@ const path = require('node:path');
 const { MESSAGE_STATES, validateNativeId } = require('./state');
 
 const ACK = Object.freeze({ RECEIVED: 'native-ack', OUTCOME: 'native-ack-reaction' });
+const ACK_OUTCOMES = Object.freeze({ SENT: 'sent', STALE: 'stale', UNKNOWN: 'unknown' });
 const REACTION = Object.freeze({ SAVED: '📥', ACKNOWLEDGED: '👀' });
+
+function retryableOutcomePattern(outcome) {
+  return `%"outcome":${JSON.stringify(outcome)}%`;
+}
 
 function acknowledgmentCommand(message, dbPath, cliPath = path.join(__dirname, 'cli.js')) {
   return [process.execPath, cliPath, 'native-ack', '--db', dbPath,
@@ -26,7 +31,7 @@ function recordNativeAcknowledgment(state, { provider, messageId, nativeId, gene
     if (duplicate) return { recorded: false, duplicate: true, messageId };
     if (![MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY,
       MESSAGE_STATES.REPLYING, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
-      MESSAGE_STATES.REPLIED].includes(message.state)) {
+      MESSAGE_STATES.REPLIED, MESSAGE_STATES.UNCERTAIN].includes(message.state)) {
       throw new Error(`native acknowledgment is not accepted in state ${message.state}`);
     }
     state.receipt(messageId, ACK.RECEIVED, { provider, nativeId, generation });
@@ -37,8 +42,10 @@ function recordNativeAcknowledgment(state, { provider, messageId, nativeId, gene
 function pendingAcknowledgments(state) {
   return state.db.prepare(`SELECT r.discord_id FROM receipts r
     WHERE r.kind=? AND NOT EXISTS
-    (SELECT 1 FROM receipts done WHERE done.discord_id=r.discord_id AND done.kind=?)
-    ORDER BY r.id`).all(ACK.RECEIVED, ACK.OUTCOME).map(row => row.discord_id);
+    (SELECT 1 FROM receipts done WHERE done.discord_id=r.discord_id AND done.kind=?
+      AND done.detail NOT LIKE ?)
+    ORDER BY r.id`).all(ACK.RECEIVED, ACK.OUTCOME,
+    retryableOutcomePattern(ACK_OUTCOMES.UNKNOWN)).map(row => row.discord_id);
 }
 
 function acknowledgedMessage(state, messageId) {
@@ -66,12 +73,12 @@ function watchAcknowledgments({ state, send, logger = () => {}, watchFactory = f
         if (closed) return;
         let message;
         try { message = acknowledgedMessage(state, id); }
-        catch { outcome(id, 'stale'); continue; }
+        catch { outcome(id, ACK_OUTCOMES.STALE); continue; }
         try {
           await send(message, REACTION.ACKNOWLEDGED);
-          outcome(id, 'sent', { reaction: REACTION.ACKNOWLEDGED, targetMessageId: id });
+          outcome(id, ACK_OUTCOMES.SENT, { reaction: REACTION.ACKNOWLEDGED, targetMessageId: id });
         } catch (error) {
-          outcome(id, 'unknown', { error: String(error.message || error).slice(0, 200) });
+          outcome(id, ACK_OUTCOMES.UNKNOWN, { error: String(error.message || error).slice(0, 200) });
         }
       }
     })().catch(error => logger(`native acknowledgment drain failed: ${error.message}`));
