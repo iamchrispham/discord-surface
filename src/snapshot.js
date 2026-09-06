@@ -36,6 +36,7 @@ function renderSnapshot(snapshot) {
   const lines = [`**Automatic artifact snapshot · ${discordText(snapshot.identity.provider)}**`,
     `Recorded context: ${context.freshness === 'current' ? 'as of source' : context.freshness} · ${stamp}`];
   const renderField = (label, field, list = false, limit = 400) => {
+    if (field.state === 'invalid') return `${label}: invalid.`;
     if (field.state !== 'recorded') return `${label}: not recorded.`;
     if (list && !field.value.length) return `${label}: none recorded${context.freshness === 'stale' ? ' (stale source)' : ''}.`;
     const prefix = `${label}: `;

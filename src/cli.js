@@ -812,10 +812,15 @@ async function snapshotPreview(args) {
   try {
     const binding = state.getBinding(required(args, 'channel-id'));
     if (!binding?.active) throw new Error('snapshot requires an active binding');
-    let snapshot = await readSnapshot(binding, { registry: args.registry, signal: controller.signal });
+    const snapshotOptions = {
+      registry: args.registry,
+      ladderDir: args['ladder-dir'],
+      signal: controller.signal
+    };
+    let snapshot = await readSnapshot(binding, snapshotOptions);
     let context = args.interpret ? await interpretSnapshot(snapshot, { signal: controller.signal }) : undefined;
     if (context) {
-      const latest = await readSnapshot(binding, { registry: args.registry, signal: controller.signal });
+      const latest = await readSnapshot(binding, snapshotOptions);
       if (context.status === 'ready' && latest.id !== snapshot.id) context = { status: 'unavailable', reason: 'snapshot-changed', interpretation: null };
       snapshot = latest;
     }

@@ -65,7 +65,8 @@ function claudeEvent(message) {
     const base = content.join('\n');
     const separator = '\n\n';
     const available = 20000 - base.length - separator.length;
-    if (available > 0) content.push('', reference.slice(0, available));
+    if (reference.length <= available) content.push('', reference);
+    else if (available >= 'Publication reference omitted.'.length) content.push('', 'Publication reference omitted.');
   }
   const event = {
     nativeId: message.nativeId,
