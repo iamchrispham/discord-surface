@@ -193,3 +193,15 @@ npm test
 ```
 
 The tests use injected native providers and fake Discord events. They do not contact Discord, start Codex, Claude, or Spark, or prove a live round trip. Live two-provider delivery, native channel opt-in, permissions, approvals, billing, quota, and Discord category setup remain conductor-owned gates until directly verified.
+
+
+## Development status
+
+The private repository preserves the existing transport history. The sidecar feature branch adds quiet saved reactions, native acknowledgments and a read-only contextual snapshot prototype. These additions are not installed in the live Gateway yet.
+
+- [Sidecar roadmap and remaining acceptance](docs/spark-sidecar-roadmap.md)
+- [Research and decisions](docs/spark-sidecar-research.md)
+- [Final roadmap stress test](docs/spark-sidecar-roadmap-pro-verbatim.md)
+- [Acknowledgment slice local proof](docs/spark-sidecar-ack-proof.json)
+
+The snapshot reads existing conductor records and the shared progress ladder without invoking a native conductor or `/cs`. Automatic publication, model experiments and end-to-end context exclusion remain under development. No hosted CI or portable dependency installation is configured yet. Run the local owning suite before pushing a feature update.

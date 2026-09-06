@@ -1,0 +1,41 @@
+{
+  "slice": "S2 quiet acknowledgments",
+  "sourceHead": "d5d75f3dcb40653f0c87ce754388bf30043231bb",
+  "installed": false,
+  "liveNativeRecognition": "unverified",
+  "localTests": {
+    "command": "node --test test/surface.test.js",
+    "file": "test/surface.test.js",
+    "tests": 121,
+    "pass": 121,
+    "fail": 0,
+    "log": "/Users/cphamballer/Documents/Codex/2026-09-04/is-there-a-discord-mcp/work/spark-sidecar-roadmap/ack-suite.log"
+  },
+  "negativeControl": {
+    "mutation": "Restore unnecessary client.channels.fetch before sending acknowledgment",
+    "result": "FAIL: 1 !== 0 in acknowledgment bypasses lifecycle test",
+    "restored": true,
+    "log": "/Users/cphamballer/Documents/Codex/2026-09-04/is-there-a-discord-mcp/work/spark-sidecar-roadmap/ack-red-proof.log"
+  },
+  "independentReview": {
+    "reviewer": "ack_review",
+    "initialFinding": "P1 unbounded channel fetch blocks Gateway stop",
+    "fix": "Remove unnecessary lookup, use committed channelId in abortable REST PUT",
+    "finalVerdict": "No further concrete findings",
+    "focusedTests": 5
+  },
+  "observedBehavior": [
+    "Saved reaction sends idempotent PUT with no extra saved-text message",
+    "Native command requires exact provider/native/message/generation and dispatched custody",
+    "Actual CLI subprocess produces watched acknowledgment event",
+    "Duplicate acknowledgment and watcher restart do not repeat sent reaction",
+    "Monitor emitted exact acknowledgment command and the test executed it before final reply",
+    "Blocked REST aborts on Gateway stop, preserves native message state and records unknown UI outcome"
+  ],
+  "remaining": [
+    "Live genuine Codex and Claude acknowledgment actions plus reaction readbacks",
+    "Installed-path behavior",
+    "Snapshot publication and Spark/Luna experiments"
+  ],
+  "processes": "Test children and temporary probe processes exited. Existing production services were not reloaded."
+}

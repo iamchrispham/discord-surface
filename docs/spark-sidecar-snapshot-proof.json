@@ -1,0 +1,32 @@
+{
+  "slice": "S1 read-only snapshot prototype",
+  "installed": false,
+  "automaticPublisher": false,
+  "localTests": {
+    "file": "test/surface.test.js",
+    "tests": 123,
+    "pass": 123,
+    "fail": 0
+  },
+  "sourceHashes": {
+    "src/snapshot.py": "b562bad75e616a4809dd37b6a0e5874e0918614cdc81d446046b7536745ec8e6",
+    "src/snapshot.js": "9a556345b9bce4df1c23ab3517a95a6dadfb3a9f8dcb5082c51b6a85d4597273",
+    "src/cli.js": "3648a6df00af24384a00346ce4eea1b581d854be3f1443974e785517254b6d2d",
+    "test/surface.test.js": "f60bd11ecfb28d449ec0bb9c5516a3a263cdb93acb877e7b46c3539dd0aa0d3a"
+  },
+  "independentReview": {
+    "finding": "Repositoryless lanes could leak through rejected conductor metadata",
+    "fix": "Require matching exact conductor metadata for repositoryless lane rows",
+    "finalVerdict": "No remaining findings in the snapshot delta"
+  },
+  "negativeControl": {
+    "mutation": "Remove repositoryless lane scope gate",
+    "result": "FAIL true !== false in wrong-owner test",
+    "sourceRestored": true
+  },
+  "proofBoundary": [
+    "Tests execute the real Python source reader and Node renderer against isolated registry files",
+    "Live producer metadata and automatic Discord publication not proved",
+    "No native sessions, runtime services or registry producer data changed by this prototype"
+  ]
+}

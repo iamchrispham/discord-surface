@@ -10,6 +10,7 @@ const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
 const { runLiaisonDraft } = require('./liaison');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
+const { readSnapshot, renderSnapshot } = require('./snapshot');
 const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
 
 function parseArgs(argv) {
@@ -752,6 +753,16 @@ function claudeReply(args) {
   } finally { state.close(); }
 }
 
+async function snapshotPreview(args) {
+  const { state } = openState(args);
+  try {
+    const binding = state.getBinding(required(args, 'channel-id'));
+    if (!binding?.active) throw new Error('snapshot requires an active binding');
+    const snapshot = await readSnapshot(binding, { registry: args.registry });
+    print({ snapshot, preview: renderSnapshot(snapshot) });
+  } finally { state.close(); }
+}
+
 function readProcessCommand(pid) {
   return execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
 }
@@ -855,6 +866,7 @@ async function main() {
     case 'stop': return stop(args);
     case 'claude-channel': return claudeChannel(args);
     case 'claude-monitor': return claudeMonitor(args);
+    case 'snapshot': return snapshotPreview(args);
     case 'native-ack': {
       const { state } = openState(args);
       try { return print(recordNativeAcknowledgment(state, { provider: required(args, 'provider'),
@@ -865,7 +877,7 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, liaison draft');
+    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, snapshot, liaison draft');
   }
 }
 

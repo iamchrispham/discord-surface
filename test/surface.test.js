@@ -26,6 +26,78 @@ const SUCCESSOR_ID = '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b';
 const LOCKF = '/usr/bin/lockf';
 const CONDUCTOR_LOCK = '/Users/cphamballer/.claude/skills/conductor-handoff/scripts/conductor-lock.sh';
 const CLI_PATH = path.resolve(__dirname, '../src/cli.js');
+const { readSnapshot, renderSnapshot } = require('../src/snapshot');
+
+test('simulated: snapshot selects exact owner, preserves owed direction, and does not refresh old facts', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-snapshot-'));
+  try {
+    const registry = path.join(dir, 'pr-lanes.json');
+    const now = Date.parse('2026-09-06T06:00:00Z') / 1000;
+    const binding = { conductorId: 'tm.md', repoKey: 'repo:tm', provider: 'claude', nativeId: CLAUDE_ID, generation: 2, channelId: 'tm' };
+    const context = { repository: 'repo:tm', vendor: 'claude', nativeId: CLAUDE_ID, generation: 2,
+      updated: '2026-09-06T05:45:00Z', intent: 'Prove offline cold start',
+      owed_by_operator: [{ id: 'device', text: 'Provide the test device', since: '2026-09-06T05:00:00Z' }],
+      owed_to_operator: [{ id: 'proof', text: 'Return cold-start evidence', since: '2026-09-06T05:00:00Z' }], next: ['Run the device check'] };
+    const lane = { vendor: 'claude', conductor: `session-claude-${CLAUDE_ID.slice(0, 8)}`, pr: 3,
+      phase: 'review-wait', next: 'Wait for review', state_note: 'Review pending', head: 'abc' };
+    const data = { _conductors: { 'tm.md': context }, mine: lane,
+      foreign: { ...lane, conductor: 'another-owner' }, wrongRepo: { ...lane, repository: 'repo:elsewhere' },
+      otherVendor: { ...lane, vendor: 'codex' }, unknownPhase: { ...lane, phase: 'work happened', next: undefined } };
+    fs.writeFileSync(registry, JSON.stringify(data));
+    const fresh = await readSnapshot(binding, { registry, now });
+    assert.equal(fresh.unavailable, undefined);
+    assert.deepEqual(fresh.lanes.map(item => item.id), ['mine', 'unknownPhase']);
+    assert.equal(fresh.lanes[0].percent, 30);
+    assert.equal(fresh.lanes[1].percent, null);
+    assert.equal(fresh.lanes[1].next, null);
+    assert.equal(fresh.context.owedByOperator.value[0].id, 'device');
+    assert.equal(fresh.context.owedToOperator.value[0].id, 'proof');
+    assert.equal(fresh.expiresAt, now + 900);
+    const stale = await readSnapshot(binding, { registry, now: now + 901 });
+    assert.equal(stale.context.freshness, 'stale');
+    assert.equal(stale.context.updated, fresh.context.updated);
+    assert.equal(stale.context.owedByOperator.value[0].id, 'device');
+    for (const override of [{ repoKey: 'repo:wrong' }, { provider: 'codex' }, { nativeId: SUCCESSOR_ID }, { generation: 3 }]) {
+      const wrong = await readSnapshot({ ...binding, ...override }, { registry, now });
+      assert.equal(wrong.context.state, 'wrong-owner');
+      assert.equal(wrong.context.owedByOperator.state, 'missing');
+      assert.equal(wrong.lanes.some(lane => lane.id === 'mine' || lane.id === 'unknownPhase'), false);
+    }
+    const rendered = renderSnapshot(fresh);
+    assert.match(rendered, /Owed by you: Provide the test device/);
+    assert.match(rendered, /Owed to you: Return cold-start evidence/);
+    assert.ok(rendered.length <= 2000);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('simulated: snapshot distinguishes missing owed facts from explicit none and ignores unrelated churn', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-snapshot-'));
+  try {
+    const registry = path.join(dir, 'pr-lanes.json');
+    const now = Date.parse('2026-09-06T06:00:00Z') / 1000;
+    const binding = { conductorId: 'surface.md', repoKey: 'projectless:surface', provider: 'codex', nativeId: CODEX_ID, generation: 1, channelId: 'surface' };
+    fs.writeFileSync(registry, '{}');
+    const missing = await readSnapshot(binding, { registry, now });
+    assert.equal(missing.context.owedByOperator.state, 'missing');
+    assert.match(renderSnapshot(missing), /Owed by you: not recorded/);
+    const data = { _conductors: { 'surface.md': { repository: binding.repoKey, vendor: 'codex', nativeId: CODEX_ID, generation: 1,
+      updated: '2026-09-06T05:59:00Z', owed_by_operator: [], owed_to_operator: [] } } };
+    fs.writeFileSync(registry, JSON.stringify(data));
+    const none = await readSnapshot(binding, { registry, now });
+    assert.equal(none.context.owedByOperator.state, 'recorded');
+    assert.deepEqual(none.context.owedByOperator.value, []);
+    data.unrelated = { vendor: 'claude', conductor: 'other', phase: 'building' };
+    fs.writeFileSync(registry, JSON.stringify(data));
+    const churn = await readSnapshot(binding, { registry, now });
+    assert.equal(churn.id, none.id);
+    assert.notEqual(churn.source.revision, none.source.revision);
+    data._conductors['surface.md'].owed_by_operator = null;
+    fs.writeFileSync(registry, JSON.stringify(data));
+    const invalid = await readSnapshot(binding, { registry, now });
+    assert.equal(invalid.context.owedByOperator.state, 'invalid');
+    assert.equal(invalid.context.owedByOperator.value, null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('simulated: native acknowledgment requires exact dispatched owner and never completes custody', () => {
   const { dir, state } = fixture();
