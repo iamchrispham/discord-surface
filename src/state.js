@@ -1735,6 +1735,7 @@ class SurfaceState {
       const outcomes = new Map(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId).map(row => [row.detail.attemptId, row]));
       const latest = attempts.at(-1);
       if (latest) {
+        if (latest.detail.partHash !== meta.partHash) throw new BindingError('direct post part hash conflicts with existing custody');
         const outcome = outcomes.get(latest.detail.attemptId);
         if (!outcome) return { claimed: false, status: 'in_flight', attemptId: latest.detail.attemptId, nonce: latest.detail.nonce };
         const status = outcome.detail.outcome;

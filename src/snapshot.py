@@ -110,7 +110,12 @@ def snapshot(binding, registry, ladder_dir, now):
     result["source"] = {"path": str(source.resolve()), "revision": hashlib.sha256(raw).hexdigest(),
                         "observedAt": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(),
                         "contextUpdated": record.get("updated")}
-    result["expiresAt"] = updated + STALE_SECONDS if freshness == "current" else None
+    if freshness == "current":
+        result["expiresAt"] = updated + STALE_SECONDS
+    elif freshness == "unknown" and updated is not None and updated > now:
+        result["expiresAt"] = updated
+    else:
+        result["expiresAt"] = None
     return result
 
 
@@ -123,7 +128,7 @@ if __name__ == "__main__":
     try:
         binding = json.loads(sys.stdin.read(16000))
         now = args.now if args.now is not None else datetime.datetime.now(datetime.timezone.utc).timestamp()
-        print(json.dumps(snapshot(binding, args.registry, args.ladder_dir, now)))
+        print(json.dumps(snapshot(binding, args.registry, args.ladder_dir, now), ensure_ascii=False, separators=(',', ':')))
     except (OSError, ValueError, KeyError, ImportError) as error:
         print(json.dumps({"unavailable": str(error)}))
         sys.exit(1)

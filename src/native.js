@@ -61,7 +61,12 @@ function claudeEvent(message) {
   const attachments = attachmentPrompt(message);
   if (attachments) content.push('', attachments);
   const reference = referencePrompt(message);
-  if (reference) content.push('', reference);
+  if (reference) {
+    const base = content.join('\n');
+    const separator = '\n\n';
+    const available = 20000 - base.length - separator.length;
+    if (available > 0) content.push('', reference.slice(0, available));
+  }
   const event = {
     nativeId: message.nativeId,
     messageId: message.id,

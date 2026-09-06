@@ -132,6 +132,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       const outcome = outcomeFor(error);
       const recorded = state.recordDirectPostOutcome(requestId, claim.attemptId, outcome, { status: error.status || null, error: String(error.message || error).slice(0, 300) });
       parts.push({ index: partIndex, status: recorded.outcome, messageId: recorded.messageId || null });
+      if (recorded.outcome === 'sent') continue;
       break;
     }
   }

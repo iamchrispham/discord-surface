@@ -97,8 +97,9 @@ class PublicationStore extends EventEmitter {
       this.db.prepare(`INSERT INTO publication_heads(owner_key, binding, processed_id, snapshot, sequence) VALUES(?,?,?,?,?)
         ON CONFLICT(owner_key) DO UPDATE SET processed_id=excluded.processed_id, snapshot=excluded.snapshot, sequence=excluded.sequence`)
         .run(key, JSON.stringify(binding), snapshot.id, JSON.stringify(snapshot), (old?.sequence || 0) + 1);
-      this.db.prepare('UPDATE publication_posts SET status=? WHERE owner_key=? AND status=?')
-        .run(STATUS.SUPERSEDED, key, STATUS.PENDING);
+      this.db.prepare(`UPDATE publication_posts SET status=?
+        WHERE owner_key=? AND status=? AND kind IN (?,?)`)
+        .run(STATUS.SUPERSEDED, key, STATUS.PENDING, POST_KIND.BOARD, POST_KIND.CONTEXT);
       const id = hash([key, snapshot.id, (old?.sequence || 0) + 1]);
       this.db.prepare(`INSERT OR IGNORE INTO publication_posts(id,owner_key,channel_id,guild_id,snapshot_id,content,nonce,status)
         VALUES(?,?,?,?,?,?,?,?)`).run(id, key, binding.channelId, binding.guildId, snapshot.id, content, `sp-${id.slice(0, 22)}`, STATUS.PENDING);

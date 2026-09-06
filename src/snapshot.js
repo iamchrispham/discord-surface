@@ -7,7 +7,7 @@ function readSnapshot(binding, { registry = path.join(os.homedir(), '.agents/wor
   const args = [path.join(__dirname, 'snapshot.py'), '--registry', registry, '--ladder-dir', ladderDir];
   if (now !== undefined) args.push('--now', String(now));
   return new Promise(resolve => {
-    const child = execFile('/usr/bin/python3', args, { timeout: 3000, maxBuffer: 128 * 1024, signal }, (error, stdout) => {
+    const child = execFile('/usr/bin/python3', args, { timeout: 3000, maxBuffer: 2 * 1024 * 1024, signal }, (error, stdout) => {
       try {
         const result = JSON.parse(stdout);
         resolve(error ? { unavailable: result.unavailable || 'snapshot reader failed' } : result);

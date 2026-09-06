@@ -6,7 +6,7 @@ const { createRequire } = require('node:module');
 const { MESSAGE_STATES, normalizeAttachments, validateNativeId } = require('./state');
 
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
-const MAX_EVENT_BODY_BYTES = 256 * 1024;
+const MAX_EVENT_BODY_BYTES = 2 * 1024 * 1024;
 
 function parseBody(request) {
   return new Promise((resolve, reject) => {

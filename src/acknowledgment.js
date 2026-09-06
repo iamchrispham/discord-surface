@@ -41,6 +41,17 @@ function pendingAcknowledgments(state) {
     ORDER BY r.id`).all(ACK.RECEIVED, ACK.OUTCOME).map(row => row.discord_id);
 }
 
+function acknowledgedMessage(state, messageId) {
+  const receipt = state.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id DESC LIMIT 1')
+    .get(messageId, ACK.RECEIVED);
+  let identity;
+  try { identity = receipt && (typeof receipt.detail === 'string' ? JSON.parse(receipt.detail) : receipt.detail); } catch { identity = null; }
+  const message = state.getMessage(messageId);
+  if (!message || !identity || message.provider !== identity.provider || message.nativeId !== identity.nativeId ||
+    message.generation !== identity.generation) throw new Error('native acknowledgment owner or generation is stale');
+  return message;
+}
+
 function watchAcknowledgments({ state, send, logger = () => {} }) {
   let closed = false;
   let timer = null;
@@ -54,7 +65,7 @@ function watchAcknowledgments({ state, send, logger = () => {} }) {
       for (const id of pendingAcknowledgments(state)) {
         if (closed) return;
         let message;
-        try { message = state.assertMessageCurrent(id, 'native-ack-reaction'); }
+        try { message = acknowledgedMessage(state, id); }
         catch { outcome(id, 'stale'); continue; }
         try {
           await send(message, REACTION.ACKNOWLEDGED);
