@@ -65,7 +65,7 @@ node src/cli.js provision --state-dir "$HOME/.config/discord-surface" \
 
 A definite Discord response records migration success or rejection. A lost response stays unresolved and blocks migration, rebind, handoff, and readiness until the existing evidence-based reconciliation command proves its outcome. Migration never recreates a channel, retries a request, or restores execution readiness by itself.
 
-A successor native session keeps the same channel only through an explicit drained or reconciled handoff. Account rotation does not change the binding. The handoff requires a caller-supplied handoff ID from the existing authority mechanism, records it, and increases the generation:
+A successor native session keeps the same channel only through an explicit drained or reconciled handoff. Account rotation does not change the binding. The manual handoff path below retains caller-supplied channel, predecessor UUID, generation, and handoff ID values:
 
 ```sh
 node src/cli.js handoff --state-dir "$HOME/.config/discord-surface" \
@@ -75,6 +75,18 @@ node src/cli.js handoff --state-dir "$HOME/.config/discord-surface" \
   --native-id NEW_SESSION_UUID --workspace /absolute/workspace \
   --handoff-id AUTHORITY_HANDOFF_ID
 ```
+
+Canonical conductor pickup can derive those values from the active binding and lock history. Supply the authoritative remote, vendor, stable conductor ID, exact successor UUID, workspace, transcript, and worker manifest:
+
+```sh
+node src/cli.js handoff --state-dir "$HOME/.config/discord-surface" \
+  --from-lock --repo FULL_AUTHORITATIVE_REMOTE --provider VENDOR \
+  --conductor-id STABLE_ID --repo-key CANONICAL_KEY \
+  --native-id SUCCESSOR_UUID --workspace FULL_WORKSPACE \
+  --session-file EXACT_TRANSCRIPT --worker-file EXACT_MANIFEST
+```
+
+For Claude, also pass `--endpoint FULL_ENDPOINT`. Normal pickup requires the canonical lock to show the predecessor release followed by the successor claim, with no intervening owner-changing verb. Forced takeover or missing history fails closed. The exact transcript and worker manifest must identify the full successor UUID and live process generation. Unresolved intake or publication custody still blocks the handoff and remains unchanged on refusal.
 
 Handoff changes the local native binding and generation after explicit authority and drained or reconciled custody. It does not edit the topic. Legacy topic publication custody, when present, must be explicitly reconciled before migration or handoff. A late legacy publication settles only its own audit record and cannot change local readiness or history coverage.
 
