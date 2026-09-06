@@ -1,0 +1,28 @@
+{
+  "observedAt": "2026-09-06T07:10:58.584315+00:00",
+  "sourceHead": "5a8b64460aeba67f5f89b5fe7897ff2df101d0f6",
+  "sourceRevision": "2a00184d1143aa7beebd68de011444ddb25326496cf8423821389fa0896a7e0d",
+  "sourceUpdated": "2026-09-05T23:35-07:00",
+  "contextState": "recorded",
+  "freshness": "stale",
+  "owedByOperator": "recorded-empty",
+  "owedToOperator": "recorded-empty",
+  "intent": "recorded",
+  "next": "recorded",
+  "selectedLaneCount": 4,
+  "oldGlobalKeyAbsent": true,
+  "checks": [
+    "live scoped record accepted",
+    "empty obligations retained as explicit none",
+    "wrong generation rejected by adapter",
+    "wrong vendor and native ID rejected by board",
+    "missing obligations remain not recorded",
+    "stale empty obligations marked stale"
+  ],
+  "limitations": [
+    "Read-only source and parser proof only",
+    "No automatic publication or producer future-write proof",
+    "No full audit of other shared readers",
+    "No runtime restart or Discord message sent"
+  ]
+}

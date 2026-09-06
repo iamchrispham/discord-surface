@@ -25,6 +25,18 @@ Rust removes mandatory tracing GC and offers checked ownership and exhaustive pr
 - [ ] R5 Run matched idle, burst, growing-transcript and recovery workloads plus a bounded soak on the same Mac. Record process topology, physical footprint, separately labeled aggregate RSS, CPU, latency, bytes read and retained-resource growth. Include concurrent build pressure. Do not invent an approved resource budget.
 - [ ] R6 Publish the slice report. Continue Rust parity only if measured benefits and integration costs support it. Both-provider parity, sleep/wake recovery and exclusive rollback-safe cutover remain later deployment requirements.
 
+## Binding-count resource comparison
+
+Operator addition: measure the incremental cost of multiple Discord bindings. A binding is persistent routing metadata, not necessarily another Gateway process. The existing architecture shares one Gateway while Claude Monitor listeners belong to individual native owners and submitted replies add observers. Compare topology explicitly before attributing costs to language.
+
+- [ ] B1 Use isolated state for 1, 4 and 8 bindings under one Gateway. Compare Codex-only, Claude-only and mixed ownership with native executors represented by controlled fixtures. Do not provision real channels merely to benchmark metadata.
+- [ ] B2 Measure idle metadata with no active work, idle attached Claude listeners, then active reply observers. Count Gateway, listener, launcher, transient CLI and native-fixture processes separately. Keep actual model execution outside adapter totals and report it separately if observed.
+- [ ] B3 Run both fixed total message traffic and fixed traffic per binding. The former isolates routing overhead; the latter exposes workload growth. Use identical transcript histories, append sizes, SQLite history, attachment metadata and enabled SDK caches across candidates.
+- [ ] B4 Report each additional binding's observed physical-footprint and CPU cost, total footprint, separately labeled process-tree RSS, wakeups, latency and retained-resource slope. Repeat paired runs rather than deriving a linear cost from one sample. Measure cold builds and warm tests outside the resident-runtime figures.
+- [ ] B5 Compare Rust against the improved Node baseline using the same topology. If Rust also consolidates listeners or removes launcher processes, label that as a topology improvement and include a matched-process comparison where feasible. Do not present combined architecture and language savings as a pure language result.
+
+No per-binding memory price or Rust savings has been measured yet. The existing 16.4M Claude listener footprint is a single process observation, not a validated multiplier for every binding. A persistent listener can make runtime choice matter more than a metadata-only binding. No numerical success threshold is inferred from these sample binding counts.
+
 Accepted cost: one small Node repair and one Rust slice before committing to a full migration. Reopen the Rust preference if its contracts require substantial scope expansion or a permanent Node bridge that removes the intended benefit, or if repeated matched runs show no persistent-footprint advantage while CPU, build contention or actual maintenance effort worsens. A repairable defect is a fix requirement, not automatic evidence against a language. Mixed results need a concrete trade-off decision. A Rust failure does not establish Go as the winner.
 
 The sidecar goal remains active and incomplete. Its publisher, model experiments, source-producer adoption and installed two-provider proof are not replaced by this runtime investigation. No production service was restarted during research.
