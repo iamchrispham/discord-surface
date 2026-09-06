@@ -89,8 +89,11 @@ def snapshot(binding, registry, ladder_dir, now):
         repo = lane.get("repository", lane.get("repoKey"))
         lane_native_id = lane.get("nativeId", lane.get("native_id"))
         lane_generation = lane.get("generation")
+        lane_identity_present = any(key in lane for key in ("nativeId", "native_id", "generation"))
         lane_proves_binding = (lane_native_id == native_id and type(lane_generation) is int
                                and lane_generation == binding["generation"])
+        if lane_identity_present and not lane_proves_binding:
+            continue
         if status != "recorded" and not lane_proves_binding:
             continue
         if repo is not None and repo != binding["repoKey"]:

@@ -36,6 +36,19 @@ async function fixture(t) {
   return { directory, ladderDir, registry, original, snapshot, binding };
 }
 
+test('snapshot rejects stale lane identity when its conductor record matches', async t => {
+  const { directory, ladderDir, registry, original, binding } = await fixture(t);
+  const data = JSON.parse(original);
+  data.stale = { conductor: binding.conductorId, vendor: binding.provider, repository: binding.repoKey,
+    nativeId: binding.nativeId, generation: binding.generation - 1, phase: 'building' };
+  data.current = { conductor: binding.conductorId, vendor: binding.provider, repository: binding.repoKey,
+    nativeId: binding.nativeId, generation: binding.generation, phase: 'building' };
+  fs.writeFileSync(registry, JSON.stringify(data));
+  const snapshot = await readSnapshot(binding, { registry, ladderDir, now: Date.parse('2026-09-06T06:05:00Z') / 1000 });
+  assert.equal(snapshot.lanes.some(lane => lane.id === 'stale'), false);
+  assert.equal(snapshot.lanes.some(lane => lane.id === 'current'), true);
+});
+
 function childCommand(directory, mode = 'valid') {
   return ({ cwd, answerPath }) => {
     fs.writeFileSync(path.join(directory, 'child-directory'), cwd);
