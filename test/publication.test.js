@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
 const { SurfaceState } = require('../src/state');
 const { readSnapshot } = require('../src/snapshot');
 const { watchPublications } = require('../src/publication/publisher');
@@ -60,7 +61,7 @@ function start(f, options = {}) {
   const read = requestedRead
     ? (binding, readOptions) => requestedRead(binding, { ...readOptions, ladderDir: f.ladderDir })
     : (binding, readOptions) => f.readSnapshot(binding, readOptions);
-  const p = watchPublications({ state: f.state, registry: f.registry, interpret: async () => ({ status: 'unavailable', reason: 'fixture' }),
+  const p = watchPublications({ state: f.state, registry: f.registry, ladderDir: f.ladderDir, interpret: async () => ({ status: 'unavailable', reason: 'fixture' }),
     cadence: { burstMs: 15, publicationMs: 150, retryMs: 150 }, ...options, read });
   f.publishers.push(p);
   return p;
@@ -233,7 +234,7 @@ test('Gateway startup owns one publisher and stop leaves no file-triggered sends
   const client = { on() {}, off() {}, login: async () => { logins++; }, destroy: async () => {},
     channels: { fetch: async () => ({ send: async () => ({ id: String(700 + ++sends) }) }) } };
   const gateway = new DiscordGateway({ state: f.state, client, providers: {},
-    publicationOptions: { registry: f.registry, interpret: async () => ({ status: 'unavailable', reason: 'fixture' }), cadence: { burstMs: 10, publicationMs: 50, retryMs: 50 } } });
+    publicationOptions: { registry: f.registry, ladderDir: f.ladderDir, interpret: async () => ({ status: 'unavailable', reason: 'fixture' }), cadence: { burstMs: 10, publicationMs: 50, retryMs: 50 } } });
   gateway.recoverInbound = async () => ({ ready: true, state: 'ready' });
   await gateway.start(secret);
   const publisher = gateway.publications;
@@ -338,24 +339,26 @@ test('old-generation unknown custody stays visible after a handoff', async t => 
 test('watch failure rearms the subscription and reads missed changes without source polling', async t => {
   const f = fixture(t);
   const watchers = [];
+  const callbacks = [];
   const sent = [];
   let reads = 0;
   const p = start(f, { rearmMs: 30, send: async (_binding, post) => { sent.push(post); return { id: String(1100 + sent.length) }; },
     read: async (...args) => { reads++; return f.readSnapshot(...args); },
-    watchFactory: (...args) => { const watcher = fs.watch(...args); watchers.push(watcher); return watcher; } });
+    watchFactory: (_directory, callback) => { const watcher = new EventEmitter(); watcher.close = () => {}; callbacks.push(callback); watchers.push(watcher); return watcher; } });
   await until(() => sent.length === 1);
   watchers[0].emit('error', new Error('fixture watcher failure'));
   f.data._conductors['owner.md'].next = ['Changed while subscription was down']; f.write();
+  callbacks[0]('rename', 'registry.json');
   await until(() => sent.length === 2, 'rearm reads missed change');
   assert.match(sent[1].content, /Changed while subscription was down/);
-  assert.equal(watchers.length, 3, 'one replacement subscription');
+  assert.equal(watchers.length, 4, 'one replacement subscription');
   const count = reads;
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(reads, count, 'successful rearm has no repeating source read');
   watchers[2].emit('error', new Error('stop while rearm pending'));
   await p.stop();
   await new Promise(resolve => setTimeout(resolve, 60));
-  assert.equal(watchers.length, 3, 'stop cancels pending rearm');
+  assert.equal(watchers.length, 4, 'stop cancels pending rearm');
 });
 
 test('shutdown aborts the real bounded Python reader while its source FIFO is blocked', async t => {

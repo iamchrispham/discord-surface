@@ -355,6 +355,7 @@ class SurfaceState {
       }
       createPublicationSchema(this.db);
       this.db.exec(`CREATE INDEX IF NOT EXISTS publication_reference_message ON receipts(discord_id) WHERE kind='${REFERENCE_RECEIPT}'`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS direct_post_receipts_idx ON receipts(id) WHERE discord_id IS NULL AND kind IN ('${DIRECT_POST_ATTEMPT}', '${DIRECT_POST_OUTCOME}')`);
       fs.chmodSync(dbPath, 0o600);
     } catch (error) {
       try { this.db?.close(); } catch {}
@@ -1263,7 +1264,7 @@ class SurfaceState {
       }
       return this.reject('invalid-event');
     }
-    const automaticPost = this.publications.excludeEvent(event, botUserId) || this.excludeDirectPost(event);
+    const automaticPost = this.publications.excludeEvent(event, botUserId) || this.excludeDirectPost(event, botUserId);
     return this.transaction(() => {
       const binding = this.getBinding(event.channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
@@ -1672,7 +1673,7 @@ class SurfaceState {
   directPostRows(requestId = null) {
     if (requestId !== null) assertText(requestId, 'requestId', 256);
     const rows = this.db.prepare(`SELECT id, kind, detail, created_at FROM receipts
-      WHERE discord_id IS NULL AND kind IN (?, ?) ORDER BY id`).all(DIRECT_POST_ATTEMPT, DIRECT_POST_OUTCOME);
+      WHERE discord_id IS NULL AND kind IN ('${DIRECT_POST_ATTEMPT}', '${DIRECT_POST_OUTCOME}') ORDER BY id`).all();
     return rows.map(row => ({
       id: Number(row.id),
       kind: row.kind,
@@ -1767,8 +1768,9 @@ class SurfaceState {
     });
   }
 
-  reconcileDirectPostEcho(event) {
-    if (!event?.isBot || typeof event.id !== 'string' || !event.id || typeof event.channelId !== 'string' ||
+  reconcileDirectPostEcho(event, botUserId = null) {
+    if (!event?.isBot || typeof botUserId !== 'string' || event.authorId !== botUserId ||
+      typeof event.id !== 'string' || !event.id || typeof event.channelId !== 'string' ||
       typeof event.guildId !== 'string' || typeof event.nonce !== 'string' || !event.nonce) return false;
     return this.transaction(() => {
       const rows = this.directPostRows();
@@ -1791,13 +1793,13 @@ class SurfaceState {
     });
   }
 
-  excludeDirectPost(event) {
+  excludeDirectPost(event, botUserId = null) {
     if (!event || typeof event.id !== 'string' || typeof event.channelId !== 'string' || typeof event.guildId !== 'string') return false;
-    const reconciled = this.reconcileDirectPostEcho(event);
+    const reconciled = this.reconcileDirectPostEcho(event, botUserId);
     const rows = this.directPostRows();
     return reconciled || rows.some(row => row.kind === DIRECT_POST_OUTCOME && row.detail.outcome === 'sent' &&
       row.detail.channelId === event.channelId && row.detail.guildId === event.guildId &&
-      (row.detail.messageId === event.id || (event.isBot && typeof event.nonce === 'string' && row.detail.nonce === event.nonce)));
+      (row.detail.messageId === event.id || (event.isBot && event.authorId === botUserId && typeof event.nonce === 'string' && row.detail.nonce === event.nonce)));
   }
 
   recoveryCandidates(before = null) {

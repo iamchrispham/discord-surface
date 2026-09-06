@@ -135,7 +135,7 @@ test('deadline terminates actual child and removes the packet directory', async 
 });
 
 test('public snapshot command consumes interpreter while preserving deterministic preview', async t => {
-  const { directory, snapshot, registry, binding } = await fixture(t);
+  const { directory, ladderDir, snapshot, registry, binding } = await fixture(t);
   const { SurfaceState } = require('../src/state');
   const state = new SurfaceState(path.join(directory, 'surface.sqlite'));
   state.setConfig({ guildId: 'guild', operatorId: 'operator', secretFile: path.join(directory, 'unused') });
@@ -145,7 +145,7 @@ test('public snapshot command consumes interpreter while preserving deterministi
   const processModule = require.resolve('../src/liaison-process');
   fs.writeFileSync(preload, `const fs = require('node:fs'); const path = require('node:path'); require(${JSON.stringify(processModule)}).buildContextCommand = ${childCommand.toString()}(${JSON.stringify(directory)});`);
   const result = spawnSync(process.execPath, ['--require', preload, require.resolve('../src/cli'),
-    'snapshot', '--state-dir', directory, '--registry', registry, '--channel-id', 'ours', '--interpret'], { encoding: 'utf8' });
+    'snapshot', '--state-dir', directory, '--registry', registry, '--ladder-dir', ladderDir, '--channel-id', 'ours', '--interpret'], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   const output = JSON.parse(result.stdout);
   assert.match(output.preview, /Owed by you: Provide test device/);
@@ -168,7 +168,7 @@ test('public snapshot command consumes interpreter while preserving deterministi
       return build(options);
     };`);
   const changed = spawnSync(process.execPath, ['--require', preload, require.resolve('../src/cli'),
-    'snapshot', '--state-dir', directory, '--registry', registry, '--channel-id', 'ours', '--interpret'], { encoding: 'utf8' });
+    'snapshot', '--state-dir', directory, '--registry', registry, '--ladder-dir', ladderDir, '--channel-id', 'ours', '--interpret'], { encoding: 'utf8' });
   assert.equal(changed.status, 0, changed.stderr);
   const newer = JSON.parse(changed.stdout);
   assert.equal(newer.context.reason, 'snapshot-changed');
@@ -178,7 +178,7 @@ test('public snapshot command consumes interpreter while preserving deterministi
     .replace('return build(options);', "return { command: process.execPath, args: ['-e', 'process.stdin.resume(); process.stdin.on(\"end\", () => process.exit(1));'] };");
   fs.writeFileSync(preload, failurePreload);
   const failed = spawnSync(process.execPath, ['--require', preload, require.resolve('../src/cli'),
-    'snapshot', '--state-dir', directory, '--registry', registry, '--channel-id', 'ours', '--interpret'], { encoding: 'utf8' });
+    'snapshot', '--state-dir', directory, '--registry', registry, '--ladder-dir', ladderDir, '--channel-id', 'ours', '--interpret'], { encoding: 'utf8' });
   assert.equal(failed.status, 0, failed.stderr);
   const fallback = JSON.parse(failed.stdout);
   assert.equal(fallback.context.reason, 'provider-failed');

@@ -108,12 +108,10 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
   watch(path.dirname(registry), (_event, name) => {
     if (!name || String(name) === registryName) schedule();
   });
-  if (configuredLadderDir) {
-    const ladderName = 'lane_progress_ladder.py';
-    watch(ladderDir, (_event, name) => {
-      if (!name || String(name) === ladderName) schedule();
-    });
-  }
+  const ladderName = 'lane_progress_ladder.py';
+  watch(ladderDir, (_event, name) => {
+    if (!name || String(name) === ladderName) schedule();
+  });
   const dbName = path.basename(state.dbPath);
   function changedBindings() {
     const signature = JSON.stringify(bindings().map(binding => [ownerKey(binding), binding.readiness, store.contextEnabled(binding)]).sort());

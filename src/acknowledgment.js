@@ -52,7 +52,7 @@ function acknowledgedMessage(state, messageId) {
   return message;
 }
 
-function watchAcknowledgments({ state, send, logger = () => {} }) {
+function watchAcknowledgments({ state, send, logger = () => {}, watchFactory = fs.watch, rearmMs = 1000 }) {
   let closed = false;
   let timer = null;
   let running = null;
@@ -87,22 +87,45 @@ function watchAcknowledgments({ state, send, logger = () => {} }) {
   }
   const basename = path.basename(state.dbPath);
   let watcher = null;
-  try {
-    watcher = fs.watch(path.dirname(state.dbPath), (_event, name) => {
-      if (!name || String(name).startsWith(basename)) schedule();
-    });
-    watcher.on('error', error => logger(`native acknowledgment watch failed: ${error.message}`));
-  } catch (error) {
-    watcher?.close();
-    watcher = null;
-    logger(`native acknowledgment watch failed: ${error.message}`);
+  let retry = null;
+  let retryDelay = rearmMs;
+  function arm() {
+    if (closed) return;
+    try {
+      const next = watchFactory(path.dirname(state.dbPath), (_event, name) => {
+        if (!name || String(name).startsWith(basename)) schedule();
+      });
+      watcher = next;
+      retryDelay = rearmMs;
+      next.on('error', error => {
+        if (watcher !== next) return;
+        watcher = null;
+        try { next.close(); } catch {}
+        logger(`native acknowledgment watch failed: ${error.message}`);
+        if (!closed && !retry) {
+          retry = setTimeout(() => { retry = null; arm(); }, retryDelay);
+          retryDelay = Math.min(retryDelay * 2, 60000);
+        }
+      });
+      schedule();
+    } catch (error) {
+      logger(`native acknowledgment watch failed: ${error.message}`);
+      if (!closed && !retry) {
+        retry = setTimeout(() => { retry = null; arm(); }, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 60000);
+      }
+    }
   }
+  arm();
   schedule();
   return {
     drain,
     async stop() {
       closed = true;
       watcher?.close();
+      watcher = null;
+      clearTimeout(retry);
+      retry = null;
       clearTimeout(timer);
       timer = null;
       await running;

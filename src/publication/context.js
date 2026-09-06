@@ -14,6 +14,7 @@ function contextualPublications({ store, interpret = interpretSnapshot, schedule
     if (!store.current(binding) || !store.contextEnabled(binding)) return null;
     const snapshot = JSON.parse(head.snapshot);
     if (snapshot.expiresAt && snapshot.expiresAt * 1000 <= clock()) return null;
+    if (snapshot.context?.freshness !== 'current') return null;
     return contextPacket(snapshot) ? snapshot : null;
   }
   function pump() {

@@ -136,7 +136,10 @@ test('direct post bot echo is excluded from native intake by message ID or bot n
   const byId = f.state.acceptDiscordMessage({ id: 'direct-1', guildId: 'guild', channelId: 'channel', authorId: 'operator', content: body.content, isBot: false, nonce: null });
   assert.equal(byId.accepted, false);
   assert.equal(byId.reason, 'automatic-publication');
-  const byNonce = f.state.acceptDiscordMessage({ id: 'foreign-id', guildId: 'guild', channelId: 'channel', authorId: 'operator', content: body.content, isBot: true, nonce: detail.nonce });
+  const foreignBot = f.state.acceptDiscordMessage({ id: 'foreign-bot-id', guildId: 'guild', channelId: 'channel', authorId: 'other-bot', content: body.content, isBot: true, nonce: detail.nonce }, { botUserId: 'operator' });
+  assert.equal(foreignBot.accepted, false);
+  assert.equal(foreignBot.reason, 'bot-source');
+  const byNonce = f.state.acceptDiscordMessage({ id: 'foreign-id', guildId: 'guild', channelId: 'channel', authorId: 'operator', content: body.content, isBot: true, nonce: detail.nonce }, { botUserId: 'operator' });
   assert.equal(byNonce.accepted, false);
   assert.equal(byNonce.reason, 'automatic-publication');
   let nativeCalls = 0;
