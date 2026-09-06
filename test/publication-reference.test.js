@@ -119,28 +119,80 @@ test('unresolved publication reply targets settle when the bot echo arrives', as
   const accepted = await accept(f, { ...human(), reference: { messageId: '201' } });
   assert.equal(accepted.accepted, true);
   assert.equal(accepted.message.publicationReference, undefined);
+  assert.deepEqual(accepted.message.publicationReferenceTarget, { messageId: '201', status: 'unresolved' });
   f.state.publications.sent(f.post.id, '201', 3000);
   const message = f.state.getMessage('200');
   assert.equal(message.publicationReference.messageId, '201');
+  assert.equal(message.publicationReferenceTarget, undefined);
   assert.equal(message.publicationReference.snapshotId, 'snapshot-original');
 });
 
-test('pending publication reply targets hold dispatch until settlement', async t => {
+test('publication reference custody never gates dispatch and mismatched settlement stays unresolved', async t => {
   const f = fixture(t);
   f.state.db.prepare("UPDATE publication_posts SET status='unknown', message_id=NULL").run();
-  const accepted = await accept(f, { ...human(), reference: { messageId: '201' } });
+  const accepted = await accept(f, { ...human(), reference: { messageId: 'ordinary-earlier-message' } });
   assert.equal(accepted.accepted, true);
+  assert.deepEqual(accepted.message.publicationReferenceTarget, { messageId: 'ordinary-earlier-message', status: 'unresolved' });
   f.state.setBindingReadiness('channel', 'ready');
 
-  const held = f.state.claimDispatch('200');
-  assert.equal(held.claimed, false);
-  assert.equal(held.reason, 'publication-reference-pending');
-  assert.equal(held.message.state, 'accepted');
-
-  f.state.publications.sent(f.post.id, '201', 3000);
   const claimed = f.state.claimDispatch('200');
   assert.equal(claimed.claimed, true);
-  assert.equal(claimed.message.publicationReference.messageId, '201');
+  assert.equal(claimed.message.state, 'dispatching');
+
+  f.state.publications.sent(f.post.id, '201', 3000);
+  const message = f.state.getMessage('200');
+  assert.equal(message.publicationReference, undefined);
+  assert.deepEqual(message.publicationReferenceTarget, { messageId: 'ordinary-earlier-message', status: 'unresolved' });
+  f.reopen();
+  assert.deepEqual(f.state.getMessage('200').publicationReferenceTarget, { messageId: 'ordinary-earlier-message', status: 'unresolved' });
+});
+
+test('unresolved reply uses the existing native dispatch path exactly once', async t => {
+  const f = fixture(t);
+  f.state.db.prepare("UPDATE publication_posts SET status='unknown', message_id=NULL").run();
+  let dispatches = 0;
+  const consumer = createSurfaceConsumer({
+    state: f.state,
+    providers: { claude: { async dispatch() { dispatches += 1; return { status: 'not_submitted', error: new Error('fixture rejection') }; } } },
+    sendTransportReceipt: async () => ({ id: 'receipt' })
+  });
+  const result = await consumer.handleMessage({ ...human(), reference: { messageId: 'ordinary-earlier-message' } });
+  await consumer.waitForReceipts();
+  assert.equal(result.message.state, 'accepted');
+  assert.equal(dispatches, 1);
+  f.state.publications.sent(f.post.id, '201', 3000);
+  assert.equal(dispatches, 1);
+});
+
+test('publication custody mismatch or failure leaves the exact target unresolved', async t => {
+  const f = fixture(t);
+  f.state.db.prepare("UPDATE publication_posts SET status='unknown', message_id='202'").run();
+  const accepted = await accept(f, { ...human(), reference: { messageId: '202' } });
+  assert.deepEqual(accepted.message.publicationReferenceTarget, { messageId: '202', status: 'pending' });
+  f.state.publications.sent(f.post.id, '201', 3000);
+  assert.equal(f.state.getMessage('200').publicationReference, undefined);
+  assert.deepEqual(f.state.getMessage('200').publicationReferenceTarget, { messageId: '202', status: 'unresolved' });
+
+  const retry = fixture(t);
+  retry.state.db.prepare("UPDATE publication_posts SET status='unknown', message_id='202'").run();
+  const retryAccepted = await accept(retry, { ...human(), reference: { messageId: '202' } });
+  assert.deepEqual(retryAccepted.message.publicationReferenceTarget, { messageId: '202', status: 'pending' });
+  retry.state.clearPendingPublicationReferences(retry.post.id);
+  assert.deepEqual(retry.state.getMessage('200').publicationReferenceTarget, { messageId: '202', status: 'unresolved' });
+});
+
+test('exact target correlation settles a pending publication reference without redispatch', async t => {
+  const f = fixture(t);
+  f.state.db.prepare("UPDATE publication_posts SET status='unknown', message_id='201'").run();
+  const accepted = await accept(f, { ...human(), reference: { messageId: '201' } });
+  assert.deepEqual(accepted.message.publicationReferenceTarget, { messageId: '201', status: 'pending' });
+  f.state.setBindingReadiness('channel', 'ready');
+  const claimed = f.state.claimDispatch('200');
+  assert.equal(claimed.claimed, true);
+  f.state.publications.sent(f.post.id, '201', 3000);
+  const message = f.state.getMessage('200');
+  assert.equal(message.publicationReference.messageId, '201');
+  assert.equal(message.publicationReferenceTarget, undefined);
 });
 
 test('reference and accepted input roll back together when reference persistence fails', async t => {

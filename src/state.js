@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createPublicationSchema, PublicationStore } = require('./publication/store');
-const { REFERENCE_RECEIPT, PENDING_REFERENCE_RECEIPT, referenceForReply, pendingReferenceForReply } = require('./publication/reference');
+const { REFERENCE_RECEIPT, PENDING_REFERENCE_RECEIPT, UNRESOLVED_REFERENCE_RECEIPT,
+  referenceForReply, pendingReferenceForReply, unresolvedReferenceForReply } = require('./publication/reference');
 
 const SCHEMA_VERSION = '1.5';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -1296,6 +1297,10 @@ class SurfaceState {
       else {
         const pendingReference = pendingReferenceForReply(this.db, binding, event.referencedMessageId);
         if (pendingReference) this.receipt(event.id, PENDING_REFERENCE_RECEIPT, pendingReference);
+        else {
+          const unresolvedReference = unresolvedReferenceForReply(event.referencedMessageId);
+          if (unresolvedReference) this.receipt(event.id, UNRESOLVED_REFERENCE_RECEIPT, unresolvedReference);
+        }
       }
       const watermark = this.getIntakeWatermark(event.channelId);
       if (!watermark?.last_accepted_id || compareDiscordIds(watermark.last_accepted_id, event.id) < 0) {
@@ -1420,12 +1425,6 @@ class SurfaceState {
         if (check.binding.readiness !== READINESS.READY) {
           this.receipt(messageId, 'dispatch-held-not-ready', { readiness: check.binding.readiness, generation: message.generation });
           return { claimed: false, message, reason: 'binding-not-ready' };
-        }
-        const pendingReference = this.db.prepare('SELECT 1 FROM receipts WHERE discord_id=? AND kind=? LIMIT 1')
-          .get(messageId, PENDING_REFERENCE_RECEIPT);
-        if (pendingReference) {
-          this.receipt(messageId, 'dispatch-held-publication-reference', { generation: message.generation });
-          return { claimed: false, message, reason: 'publication-reference-pending' };
         }
         this.db.prepare('UPDATE messages SET state=?, updated_at=? WHERE discord_id=? AND state=?')
           .run(MESSAGE_STATES.DISPATCHING, now(), messageId, MESSAGE_STATES.ACCEPTED);
@@ -1897,17 +1896,35 @@ class SurfaceState {
       message.replyParts = this.listReplyParts(messageId);
       const reference = this.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id LIMIT 1').get(messageId, REFERENCE_RECEIPT);
       if (reference) message.publicationReference = JSON.parse(reference.detail);
+      else {
+        const unresolved = this.db.prepare('SELECT kind, detail FROM receipts WHERE discord_id=? AND kind IN (?, ?) ORDER BY id LIMIT 1')
+          .get(messageId, PENDING_REFERENCE_RECEIPT, UNRESOLVED_REFERENCE_RECEIPT);
+        if (unresolved) {
+          const detail = parseJson(unresolved.detail, {});
+          message.publicationReferenceTarget = {
+            messageId: detail.referencedMessageId,
+            status: detail.status || (unresolved.kind === PENDING_REFERENCE_RECEIPT ? 'pending' : 'unresolved')
+          };
+        }
+      }
     }
     return message;
   }
 
   settlePublicationReference(publicationId, messageId) {
     return this.transaction(() => {
-      const rows = this.db.prepare('SELECT id, discord_id, detail FROM receipts WHERE kind=? ORDER BY id').all(PENDING_REFERENCE_RECEIPT);
+      const rows = this.db.prepare('SELECT id, discord_id, kind, detail FROM receipts WHERE kind IN (?, ?) ORDER BY id')
+        .all(PENDING_REFERENCE_RECEIPT, UNRESOLVED_REFERENCE_RECEIPT);
       let settled = 0;
       for (const row of rows) {
         const pending = parseJson(row.detail, null);
-        if (pending?.publicationId !== publicationId || pending.referencedMessageId !== messageId) continue;
+        if (row.kind === PENDING_REFERENCE_RECEIPT && pending?.publicationId === publicationId && pending.referencedMessageId !== messageId) {
+          this.db.prepare('UPDATE receipts SET kind=?, detail=? WHERE id=?')
+            .run(UNRESOLVED_REFERENCE_RECEIPT, safeDetail({ referencedMessageId: pending.referencedMessageId, status: 'unresolved' }), row.id);
+          continue;
+        }
+        if (pending?.referencedMessageId !== messageId) continue;
+        if (row.kind === PENDING_REFERENCE_RECEIPT && pending.publicationId !== publicationId) continue;
         const message = this.db.prepare('SELECT channel_id FROM messages WHERE discord_id=?').get(row.discord_id);
         const binding = message && this.getBinding(message.channel_id);
         const reference = binding && referenceForReply(this.db, binding, messageId);
@@ -1926,7 +1943,13 @@ class SurfaceState {
       let cleared = 0;
       for (const row of rows) {
         if (parseJson(row.detail, null)?.publicationId !== publicationId) continue;
-        cleared += this.db.prepare('DELETE FROM receipts WHERE id=?').run(row.id).changes;
+        const pending = parseJson(row.detail, null);
+        if (pending?.referencedMessageId) {
+          cleared += this.db.prepare('UPDATE receipts SET kind=?, detail=? WHERE id=?')
+            .run(UNRESOLVED_REFERENCE_RECEIPT, safeDetail({ referencedMessageId: pending.referencedMessageId, status: 'unresolved' }), row.id).changes;
+        } else {
+          cleared += this.db.prepare('DELETE FROM receipts WHERE id=?').run(row.id).changes;
+        }
       }
       return cleared;
     });
