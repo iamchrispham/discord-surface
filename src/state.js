@@ -495,15 +495,21 @@ class SurfaceState {
       );
       CREATE INDEX IF NOT EXISTS topic_publications_channel_idx ON topic_publications(channel_id, updated_at);
       CREATE INDEX IF NOT EXISTS topic_publications_unresolved_idx ON topic_publications(channel_id) WHERE status IN ('in_flight', 'unknown');
+    `);
+    this.ensureDirectPostIndexes();
+  }
+
+  tableColumns(table) {
+    return new Map(this.db.prepare(`PRAGMA table_info(${table})`).all().map(row => [row.name, row]));
+  }
+
+  ensureDirectPostIndexes() {
+    this.db.exec(`
       CREATE INDEX IF NOT EXISTS direct_post_outcome_message_idx
         ON receipts(json_extract(detail, '$.messageId')) WHERE kind='direct-post-outcome';
       CREATE INDEX IF NOT EXISTS direct_post_outcome_nonce_idx
         ON receipts(json_extract(detail, '$.nonce')) WHERE kind='direct-post-outcome';
     `);
-  }
-
-  tableColumns(table) {
-    return new Map(this.db.prepare(`PRAGMA table_info(${table})`).all().map(row => [row.name, row]));
   }
 
   migrateSchema() {
@@ -512,12 +518,6 @@ class SurfaceState {
     if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== SCHEMA_VERSION) {
       throw new StateCorruptError(`unsupported state schema ${version.value}`);
     }
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS direct_post_outcome_message_idx
-        ON receipts(json_extract(detail, '$.messageId')) WHERE kind='direct-post-outcome';
-      CREATE INDEX IF NOT EXISTS direct_post_outcome_nonce_idx
-        ON receipts(json_extract(detail, '$.nonce')) WHERE kind='direct-post-outcome';
-    `);
     if (version.value === SCHEMA_VERSION) {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_publications (
@@ -548,6 +548,7 @@ class SurfaceState {
       if (!topicColumns.has('operation_ended_at')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN operation_ended_at TEXT');
       if (!topicColumns.has('readback_at')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN readback_at TEXT');
       if (!topicColumns.has('readback_topic')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN readback_topic TEXT');
+      this.ensureDirectPostIndexes();
       return;
     }
     if (version.value === '1.1') {
@@ -679,6 +680,7 @@ class SurfaceState {
       try { this.db.exec('ROLLBACK'); } catch {}
       throw error;
     }
+    this.ensureDirectPostIndexes();
   }
 
   assertColumns(table, required) {
