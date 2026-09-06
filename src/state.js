@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createPublicationSchema, PublicationStore } = require('./publication/store');
+const { REFERENCE_RECEIPT, referenceForReply } = require('./publication/reference');
 
 const SCHEMA_VERSION = '1.5';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -321,6 +322,7 @@ class SurfaceState {
         this.assertSchema();
       }
       createPublicationSchema(this.db);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS publication_reference_message ON receipts(discord_id) WHERE kind='${REFERENCE_RECEIPT}'`);
       fs.chmodSync(dbPath, 0o600);
     } catch (error) {
       try { this.db?.close(); } catch {}
@@ -1256,6 +1258,8 @@ class SurfaceState {
         event.id, event.guildId, event.channelId, event.authorId, event.content, JSON.stringify(attachments), binding.provider, binding.nativeId,
         binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
       );
+      const reference = referenceForReply(this.db, binding, event.referencedMessageId);
+      if (reference) this.receipt(event.id, REFERENCE_RECEIPT, reference);
       const watermark = this.getIntakeWatermark(event.channelId);
       if (!watermark?.last_accepted_id || compareDiscordIds(watermark.last_accepted_id, event.id) < 0) {
         this.db.prepare('UPDATE intake_watermarks SET last_accepted_id=?, updated_at=? WHERE channel_id=?')
@@ -1820,7 +1824,11 @@ class SurfaceState {
 
   getMessage(messageId) {
     const message = rowMessage(this.db.prepare('SELECT * FROM messages WHERE discord_id=?').get(messageId));
-    if (message) message.replyParts = this.listReplyParts(messageId);
+    if (message) {
+      message.replyParts = this.listReplyParts(messageId);
+      const reference = this.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id LIMIT 1').get(messageId, REFERENCE_RECEIPT);
+      if (reference) message.publicationReference = JSON.parse(reference.detail);
+    }
     return message;
   }
 

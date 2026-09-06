@@ -1,4 +1,5 @@
 const fs = require('node:fs');
+const { referencePrompt } = require('./publication/reference');
 const http = require('node:http');
 const { execFile } = require('node:child_process');
 const os = require('node:os');
@@ -44,6 +45,8 @@ function codexPrompt(message, acknowledgment = null) {
   if (acknowledgment) prompt.splice(3, 0, `At pickup, acknowledge this exact message by running this command once, preserving argument boundaries: ${JSON.stringify(acknowledgment)}. Then handle the request normally. Acknowledgment means received, not completed.`);
   const attachments = attachmentPrompt(message);
   if (attachments) prompt.push('', attachments);
+  const reference = referencePrompt(message);
+  if (reference) prompt.push('', reference);
   return prompt.join('\n');
 }
 
@@ -57,6 +60,8 @@ function claudeEvent(message) {
   ];
   const attachments = attachmentPrompt(message);
   if (attachments) content.push('', attachments);
+  const reference = referencePrompt(message);
+  if (reference) content.push('', reference);
   const event = {
     nativeId: message.nativeId,
     messageId: message.id,

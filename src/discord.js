@@ -104,6 +104,7 @@ function eventToInput(message) {
     authorId: message.author?.id,
     isBot: Boolean(message.author?.bot),
     content: message.content,
+    referencedMessageId: message.reference?.messageId,
     attachments,
     nonce: message.nonce == null ? null : String(message.nonce)
   };
