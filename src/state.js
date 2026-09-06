@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createPublicationSchema, PublicationStore } = require('./publication/store');
-const { REFERENCE_RECEIPT, referenceForReply } = require('./publication/reference');
+const { REFERENCE_RECEIPT, PENDING_REFERENCE_RECEIPT, referenceForReply, pendingReferenceForReply } = require('./publication/reference');
 
 const SCHEMA_VERSION = '1.5';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -1293,6 +1293,10 @@ class SurfaceState {
       );
       const reference = referenceForReply(this.db, binding, event.referencedMessageId);
       if (reference) this.receipt(event.id, REFERENCE_RECEIPT, reference);
+      else {
+        const pendingReference = pendingReferenceForReply(this.db, binding, event.referencedMessageId);
+        if (pendingReference) this.receipt(event.id, PENDING_REFERENCE_RECEIPT, pendingReference);
+      }
       const watermark = this.getIntakeWatermark(event.channelId);
       if (!watermark?.last_accepted_id || compareDiscordIds(watermark.last_accepted_id, event.id) < 0) {
         this.db.prepare('UPDATE intake_watermarks SET last_accepted_id=?, updated_at=? WHERE channel_id=?')
@@ -1889,6 +1893,37 @@ class SurfaceState {
       if (reference) message.publicationReference = JSON.parse(reference.detail);
     }
     return message;
+  }
+
+  settlePublicationReference(publicationId, messageId) {
+    return this.transaction(() => {
+      const rows = this.db.prepare('SELECT id, discord_id, detail FROM receipts WHERE kind=? ORDER BY id').all(PENDING_REFERENCE_RECEIPT);
+      let settled = 0;
+      for (const row of rows) {
+        const pending = parseJson(row.detail, null);
+        if (pending?.publicationId !== publicationId || pending.referencedMessageId !== messageId) continue;
+        const message = this.db.prepare('SELECT channel_id FROM messages WHERE discord_id=?').get(row.discord_id);
+        const binding = message && this.getBinding(message.channel_id);
+        const reference = binding && referenceForReply(this.db, binding, messageId);
+        if (!reference) continue;
+        this.db.prepare('UPDATE receipts SET kind=?, detail=? WHERE id=?')
+          .run(REFERENCE_RECEIPT, safeDetail(reference), row.id);
+        settled += 1;
+      }
+      return settled;
+    });
+  }
+
+  clearPendingPublicationReferences(publicationId) {
+    return this.transaction(() => {
+      const rows = this.db.prepare('SELECT id, detail FROM receipts WHERE kind=?').all(PENDING_REFERENCE_RECEIPT);
+      let cleared = 0;
+      for (const row of rows) {
+        if (parseJson(row.detail, null)?.publicationId !== publicationId) continue;
+        cleared += this.db.prepare('DELETE FROM receipts WHERE id=?').run(row.id).changes;
+      }
+      return cleared;
+    });
   }
 
   listMessages() {

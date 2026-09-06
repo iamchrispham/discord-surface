@@ -134,6 +134,24 @@ test('distant expiration does not spin publication wake timer', async t => {
   await p.stop();
 });
 
+test('expiry crossed during a snapshot read triggers one immediate reread', async t => {
+  const f = fixture(t);
+  let clock = 100000;
+  const current = await f.readSnapshot(f.binding, { registry: f.registry, now: clock / 1000 });
+  current.expiresAt = (clock + 10) / 1000;
+  current.context.freshness = 'current';
+  let reads = 0;
+  const p = start(f, { clock: () => clock, ready: () => false, read: async () => {
+    reads += 1;
+    if (reads === 1) clock += 20;
+    return reads === 1 ? current : { ...current, context: { ...current.context, freshness: 'stale' } };
+  } });
+  await until(() => reads === 2, 'post-read expiry reread');
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(reads, 2);
+  await p.stop();
+});
+
 test('failed send preserves successful cursor and newest pending snapshot across reopen', async t => {
   const f = fixture(t);
   let clock = Date.now();

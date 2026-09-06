@@ -52,7 +52,12 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
         if (!snapshot.unavailable && snapshot.context.state !== 'recorded' && !store.head(binding)) continue;
         store.stage(binding, snapshot, renderSnapshot(snapshot));
         context.observe(binding, snapshot);
-        if (snapshot.expiresAt * 1000 > clock()) nextWake = Math.min(nextWake, snapshot.expiresAt * 1000);
+        const expiresAt = Number(snapshot.expiresAt) * 1000;
+        if (Number.isFinite(expiresAt)) {
+          const afterRead = clock();
+          if (expiresAt > afterRead) nextWake = Math.min(nextWake, expiresAt);
+          else if (snapshot.context?.freshness === 'current') nextWake = Math.min(nextWake, afterRead);
+        }
         const post = store.pending(binding);
         if (!post) continue;
         const head = store.head(binding);

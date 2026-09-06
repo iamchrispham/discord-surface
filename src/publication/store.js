@@ -129,16 +129,21 @@ class PublicationStore extends EventEmitter {
   }
   sent(id, messageId, now) {
     if (typeof messageId !== 'string' || !messageId) throw new Error('publication response lacks message id');
-    return this.state.transaction(() => {
+    let settled = false;
+    const result = this.state.transaction(() => {
       const post = this.db.prepare('SELECT * FROM publication_posts WHERE id=?').get(id);
       if (!post || post.status === STATUS.SENT) return;
       this.db.prepare('UPDATE publication_posts SET status=?, message_id=?, sent_at=?, error=NULL WHERE id=?')
         .run(STATUS.SENT, messageId, now, id);
       this.db.prepare('UPDATE publication_heads SET successful_at=?, retry_at=0 WHERE owner_key=?').run(now, post.owner_key);
+      settled = true;
     });
+    if (settled) this.state.settlePublicationReference(id, messageId);
+    return result;
   }
   failed(id, error, now, retryMs) {
     const definite = error?.outcome === 'not_sent';
+    let cleared = false;
     this.state.transaction(() => {
       // A Gateway echo may have already established that the request succeeded.
       const post = this.db.prepare('SELECT * FROM publication_posts WHERE id=?').get(id);
@@ -148,7 +153,9 @@ class PublicationStore extends EventEmitter {
       this.db.prepare('UPDATE publication_posts SET status=?, error=? WHERE id=?')
         .run(status, String(error?.message || error).slice(0, 300), id);
       if (definite) this.db.prepare('UPDATE publication_heads SET retry_at=? WHERE owner_key=?').run(now + retryMs, post.owner_key);
+      cleared = definite;
     });
+    if (cleared) this.state.clearPendingPublicationReferences(id);
   }
   queueContext(binding, snapshot) {
     const head = this.head(binding);

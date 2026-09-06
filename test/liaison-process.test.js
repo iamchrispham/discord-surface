@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { buildSparkCommand } = require('../src/liaison-process');
+const { buildSparkCommand, runBoundedSpark } = require('../src/liaison-process');
 
 test('sidecar disables metadata names, including symlinked skills, without changing source files', t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'sidecar-skills-'));
@@ -24,4 +24,12 @@ test('sidecar disables metadata names, including symlinked skills, without chang
   assert.equal(args.find(value => value.startsWith('skills.config=')),
     'skills.config=[{name="actual-name",enabled=false},{name="linked-name",enabled=false}]');
   assert.equal(fs.readFileSync(path.join(normal, 'SKILL.md'), 'utf8'), metadata);
+});
+
+test('bounded spark contains an early child exit while writing a large prompt', async () => {
+  const result = await runBoundedSpark({ command: process.execPath,
+    args: ['-e', 'require("node:fs").closeSync(0); setTimeout(() => process.exit(0), 100)'], cwd: os.tmpdir(),
+    prompt: 'x'.repeat(1048576), timeoutMs: 1000, terminationGraceMs: 100 });
+  assert.equal(result.ok, false);
+  assert.ok(['stdin-failed', 'provider-failed'].includes(result.reason));
 });

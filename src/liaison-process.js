@@ -112,6 +112,9 @@ async function runBoundedSpark({ command, args, cwd, prompt, signal, timeoutMs, 
   } catch (error) {
     return { ok: false, reason: 'spawn-failed', error };
   }
+  const stdinFailure = new Promise(resolve => {
+    child.stdin?.once?.('error', error => resolve({ reason: 'stdin-failed', error }));
+  });
   const waiter = exitWaiter(child);
   try {
     onSpawn?.(child);
@@ -134,10 +137,10 @@ async function runBoundedSpark({ command, args, cwd, prompt, signal, timeoutMs, 
       await terminateChild(child, waiter, terminationGraceMs);
       return { ok: false, reason: 'stdin-failed', error };
     }
-    const first = await Promise.race([waiter.promise, timeout, aborted]);
+    const first = await Promise.race([waiter.promise, stdinFailure, timeout, aborted]);
     if (first?.reason) {
       await terminateChild(child, waiter, terminationGraceMs);
-      return { ok: false, reason: first.reason };
+      return { ok: false, reason: first.reason, error: first.error };
     }
     if (first?.error || first?.code !== 0) return { ok: false, reason: 'provider-failed' };
     return { ok: true };

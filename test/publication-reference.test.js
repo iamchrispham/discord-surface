@@ -113,6 +113,18 @@ test('foreign roles, unknown IDs and oversized references never replace or block
   assert.equal(f.state.getMessage('202'), null);
 });
 
+test('unresolved publication reply targets settle when the bot echo arrives', async t => {
+  const f = fixture(t);
+  f.state.db.prepare("UPDATE publication_posts SET status='unknown', message_id=NULL").run();
+  const accepted = await accept(f, { ...human(), reference: { messageId: '201' } });
+  assert.equal(accepted.accepted, true);
+  assert.equal(accepted.message.publicationReference, undefined);
+  f.state.publications.sent(f.post.id, '201', 3000);
+  const message = f.state.getMessage('200');
+  assert.equal(message.publicationReference.messageId, '201');
+  assert.equal(message.publicationReference.snapshotId, 'snapshot-original');
+});
+
 test('reference and accepted input roll back together when reference persistence fails', async t => {
   const f = fixture(t);
   const original = f.state.receipt.bind(f.state);
