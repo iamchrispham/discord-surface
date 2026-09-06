@@ -1,0 +1,63 @@
+{
+  "exitCode": 0,
+  "elapsedSeconds": 13.36,
+  "samples": 109,
+  "sampledPeakTreeRssMiB": 352.0,
+  "peakProcesses": [
+    {
+      "pid": 11047,
+      "parent": 10898,
+      "rssMiB": 53.7,
+      "command": "/Users/cphamballer/.nvm/versions/node/v22.23.2/bin/node"
+    },
+    {
+      "pid": 11077,
+      "parent": 11047,
+      "rssMiB": 119.9,
+      "command": "/Users/cphamballer/.nvm/versions/node/v22.23.2/bin/node"
+    },
+    {
+      "pid": 17421,
+      "parent": 11077,
+      "rssMiB": 38.5,
+      "command": "/Users/cphamballer/.nvm/versions/node/v22.23.2/bin/node"
+    },
+    {
+      "pid": 18092,
+      "parent": 11077,
+      "rssMiB": 49.7,
+      "command": "/Users/cphamballer/.nvm/versions/node/v22.23.2/bin/node"
+    },
+    {
+      "pid": 18126,
+      "parent": 18092,
+      "rssMiB": 1.2,
+      "command": "lockf"
+    },
+    {
+      "pid": 18127,
+      "parent": 18126,
+      "rssMiB": 52.4,
+      "command": "/Users/cphamballer/.nvm/versions/node/v22.23.2/bin/node"
+    },
+    {
+      "pid": 18180,
+      "parent": 18127,
+      "rssMiB": 14.6,
+      "command": "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python"
+    },
+    {
+      "pid": 18466,
+      "parent": 18180,
+      "rssMiB": 2.7,
+      "command": "(bash)"
+    },
+    {
+      "pid": 18479,
+      "parent": 18466,
+      "rssMiB": 19.2,
+      "command": "(Python)"
+    }
+  ],
+  "scope": "One local full-suite run. Sampled aggregate RSS, shared pages may be counted multiple times and peaks between samples may be missed. Excludes production and native agent processes."
+}
