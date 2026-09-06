@@ -6,6 +6,7 @@ const { createRequire } = require('node:module');
 const { MESSAGE_STATES, normalizeAttachments, validateNativeId } = require('./state');
 
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
+const MAX_EVENT_BODY_BYTES = 256 * 1024;
 
 function parseBody(request) {
   return new Promise((resolve, reject) => {
@@ -13,7 +14,7 @@ function parseBody(request) {
     request.setEncoding('utf8');
     request.on('data', chunk => {
       body += chunk;
-      if (body.length > 20000) request.destroy(new Error('request too large'));
+      if (Buffer.byteLength(body, 'utf8') > MAX_EVENT_BODY_BYTES) request.destroy(new Error('request too large'));
     });
     request.on('end', () => {
       try { resolve(JSON.parse(body)); } catch { reject(new Error('invalid JSON')); }

@@ -10,7 +10,9 @@ const CADENCE = Object.freeze({ burstMs: 500, publicationMs: 60000, retryMs: 600
 
 function watchPublications({ state, send, ready = () => true, logger = () => {},
   registry = path.join(os.homedir(), '.agents/work-control/pr-lanes.json'),
+  ladderDir: configuredLadderDir,
   read = readSnapshot, interpret, cadence = CADENCE, clock = Date.now, watchFactory = fs.watch, rearmMs = 1000 } = {}) {
+  const ladderDir = configuredLadderDir || path.join(os.homedir(), '.claude/skills/conduct-status/scripts');
   const store = state.publications;
   const controller = new AbortController();
   let closed = false;
@@ -39,7 +41,7 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
       let nextWake = Infinity;
       for (const binding of bindings()) {
         if (closed) break;
-        let snapshot = await read(binding, { registry, now: clock() / 1000, signal: controller.signal });
+        let snapshot = await read(binding, { registry, ladderDir, now: clock() / 1000, signal: controller.signal });
         if (closed || !store.current(binding)) continue;
         if (snapshot.unavailable) {
           logger(`publication source unavailable for ${binding.channelId}: ${snapshot.unavailable}`);
@@ -78,7 +80,7 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
       if (dirty) { dirty = false; schedule(); }
     }
   }
-  function watch(directory, callback) {
+  function watch(directory, callback, factory = watchFactory) {
     const entry = { watcher: null, retry: null, delay: rearmMs };
     watchers.push(entry);
     function retry(error) {
@@ -92,7 +94,7 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
     function arm() {
       if (closed) return;
       try {
-        const watcher = watchFactory(directory, (...args) => { entry.delay = rearmMs; callback(...args); });
+        const watcher = factory(directory, (...args) => { entry.delay = rearmMs; callback(...args); });
         entry.watcher = watcher;
         watcher.on('error', error => { if (entry.watcher === watcher) retry(error); });
         schedule();
@@ -104,6 +106,12 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
   watch(path.dirname(registry), (_event, name) => {
     if (!name || String(name) === registryName) schedule();
   });
+  if (configuredLadderDir) {
+    const ladderName = 'lane_progress_ladder.py';
+    watch(ladderDir, (_event, name) => {
+      if (!name || String(name) === ladderName) schedule();
+    });
+  }
   const dbName = path.basename(state.dbPath);
   function changedBindings() {
     const signature = JSON.stringify(bindings().map(binding => [ownerKey(binding), binding.readiness, store.contextEnabled(binding)]).sort());

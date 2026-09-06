@@ -75,16 +75,23 @@ function watchAcknowledgments({ state, send, logger = () => {} }) {
     timer = setTimeout(() => { timer = null; drain(); }, 50);
   }
   const basename = path.basename(state.dbPath);
-  const watcher = fs.watch(path.dirname(state.dbPath), (_event, name) => {
-    if (!name || String(name).startsWith(basename)) schedule();
-  });
-  watcher.on('error', error => logger(`native acknowledgment watch failed: ${error.message}`));
+  let watcher = null;
+  try {
+    watcher = fs.watch(path.dirname(state.dbPath), (_event, name) => {
+      if (!name || String(name).startsWith(basename)) schedule();
+    });
+    watcher.on('error', error => logger(`native acknowledgment watch failed: ${error.message}`));
+  } catch (error) {
+    watcher?.close();
+    watcher = null;
+    logger(`native acknowledgment watch failed: ${error.message}`);
+  }
   schedule();
   return {
     drain,
     async stop() {
       closed = true;
-      watcher.close();
+      watcher?.close();
       clearTimeout(timer);
       timer = null;
       await running;

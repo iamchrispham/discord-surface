@@ -87,7 +87,11 @@ def snapshot(binding, registry, ladder_dir, now):
         if lane.get("conductor") not in owner_tokens:
             continue
         repo = lane.get("repository", lane.get("repoKey"))
-        if repo is None and status != "recorded":
+        lane_native_id = lane.get("nativeId", lane.get("native_id"))
+        lane_generation = lane.get("generation")
+        lane_proves_binding = (lane_native_id == native_id and type(lane_generation) is int
+                               and lane_generation == binding["generation"])
+        if status != "recorded" and not lane_proves_binding:
             continue
         if repo is not None and repo != binding["repoKey"]:
             continue

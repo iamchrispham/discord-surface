@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
@@ -41,6 +42,7 @@ const TRANSPORT_RECEIPT_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected'
 const DIRECT_POST_ATTEMPT = 'direct-post-attempt';
 const DIRECT_POST_OUTCOME = 'direct-post-outcome';
 const DIRECT_POST_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
+const PROCESS_START_TOKEN = crypto.randomUUID();
 
 const ACTIVE_STATES = new Set([
   MESSAGE_STATES.ACCEPTED,
@@ -60,6 +62,36 @@ class BindingError extends Error {}
 class AuthorizationError extends Error {}
 class StaleGenerationError extends Error {}
 class UnresolvedWorkError extends Error {}
+
+function processIdentity(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const commandEnd = stat.lastIndexOf(')');
+    const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
+    const startTicks = Number(fields[19]);
+    const boot = Number(fs.readFileSync('/proc/stat', 'utf8').match(/^btime\s+(\d+)/m)?.[1]);
+    if (Number.isSafeInteger(startTicks) && Number.isSafeInteger(boot)) {
+      return { token: `proc:${startTicks}`, seconds: boot + Math.floor(startTicks / 100) };
+    }
+  } catch {}
+  try {
+    const output = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8' }).trim();
+    const timestamp = Date.parse(output);
+    return Number.isFinite(timestamp) ? { token: `ps:${timestamp}`, seconds: Math.floor(timestamp / 1000) } : null;
+  } catch { return null; }
+}
+
+function directPostOwnerAlive(pid, detail = {}) {
+  if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
+  try { process.kill(Number(pid), 0); } catch { return false; }
+  if (Number(pid) === process.pid && detail.ownerProcessToken) return detail.ownerProcessToken === PROCESS_START_TOKEN;
+  const current = processIdentity(pid);
+  if (!current) return false;
+  if (detail.ownerStartIdentity && current.token === detail.ownerStartIdentity) return true;
+  const expectedStart = Number(detail.ownerStartTime ?? detail.ownerStartedAt);
+  if (Number.isSafeInteger(expectedStart) && expectedStart >= 0 && current.seconds === expectedStart) return true;
+  return Boolean(detail.ownerStartToken && current.token === detail.ownerStartToken);
+}
 
 function assertText(value, name, max = 512) {
   if (typeof value !== 'string' || value.length === 0 || value.length > max) {
@@ -1652,23 +1684,17 @@ class SurfaceState {
     });
   }
 
-  recoverDirectPostReceipts(ownerAlive = pid => {
-    if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
-    try { process.kill(Number(pid), 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
-  }) {
+  recoverDirectPostReceipts(ownerAlive = directPostOwnerAlive) {
     return this.transaction(() => this.recoverDirectPostReceiptsInternal(ownerAlive));
   }
 
-  recoverDirectPostReceiptsInternal(ownerAlive = pid => {
-    if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
-    try { process.kill(Number(pid), 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
-  }) {
+  recoverDirectPostReceiptsInternal(ownerAlive = directPostOwnerAlive) {
     const rows = this.directPostRows();
     const outcomes = new Set(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail?.attemptId).map(row => row.detail.attemptId));
     let recovered = 0;
     for (const row of rows.filter(item => item.kind === DIRECT_POST_ATTEMPT)) {
       if (outcomes.has(row.detail.attemptId)) continue;
-      if (ownerAlive(row.detail.ownerPid)) continue;
+      if (ownerAlive(row.detail.ownerPid, row.detail)) continue;
       this.receipt(null, DIRECT_POST_OUTCOME, {
         ...row.detail,
         outcome: 'unknown',
@@ -1700,6 +1726,9 @@ class SurfaceState {
         for (const key of identityKeys) {
           if (row.detail[key] !== meta[key]) throw new BindingError('direct post request identity conflicts with existing custody');
         }
+        if (row.detail.partIndex === meta.partIndex && row.detail.partHash !== meta.partHash) {
+          throw new BindingError('direct post part hash conflicts with existing custody');
+        }
       }
       if (!this.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
       const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
@@ -1712,8 +1741,10 @@ class SurfaceState {
         if (status === 'sent' || status === 'unknown') return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
         if (!['not_sent', 'rejected', 'rate_limited'].includes(status)) return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
       }
+      const identity = processIdentity(process.pid);
       this.receipt(null, DIRECT_POST_ATTEMPT, {
-        journal: 'direct-post-v1', ...meta, ownerPid: process.pid, status: 'attempted'
+        journal: 'direct-post-v1', ...meta, ownerPid: process.pid, ownerStartTime: identity?.seconds ?? null,
+        ownerProcessToken: PROCESS_START_TOKEN, ownerStartToken: identity?.token || null, status: 'attempted'
       });
       return { claimed: true, status: 'claimed', attemptId: meta.attemptId, nonce: meta.nonce };
     });
@@ -1727,7 +1758,7 @@ class SurfaceState {
       const rows = this.directPostRows(requestId);
       const attempt = rows.find(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.attemptId === attemptId);
       if (!attempt) throw new BindingError('direct post attempt is unknown');
-      const existing = rows.find(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId === attemptId);
+      const existing = rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId === attemptId).at(-1);
       if (existing) return existing.detail;
       const next = { ...attempt.detail, ...detail, outcome };
       this.receipt(null, DIRECT_POST_OUTCOME, next);
@@ -1735,10 +1766,35 @@ class SurfaceState {
     });
   }
 
+  reconcileDirectPostEcho(event) {
+    if (!event?.isBot || typeof event.id !== 'string' || !event.id || typeof event.channelId !== 'string' ||
+      typeof event.guildId !== 'string' || typeof event.nonce !== 'string' || !event.nonce) return false;
+    return this.transaction(() => {
+      const rows = this.directPostRows();
+      const outcomes = new Map(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId)
+        .map(row => [row.detail.attemptId, row]));
+      for (const attempt of rows.filter(row => row.kind === DIRECT_POST_ATTEMPT).reverse()) {
+        const detail = attempt.detail;
+        if (detail.channelId !== event.channelId || detail.guildId !== event.guildId || detail.nonce !== event.nonce) continue;
+        const outcome = outcomes.get(detail.attemptId);
+        if (outcome?.detail.outcome === 'sent') return true;
+        if (outcome && outcome.detail.outcome !== 'unknown') continue;
+        this.receipt(null, DIRECT_POST_OUTCOME, {
+          ...detail,
+          ...(outcome?.detail || {}),
+          outcome: 'sent', messageId: event.id, status: 200, reason: 'gateway-echo'
+        });
+        return true;
+      }
+      return false;
+    });
+  }
+
   excludeDirectPost(event) {
     if (!event || typeof event.id !== 'string' || typeof event.channelId !== 'string' || typeof event.guildId !== 'string') return false;
+    const reconciled = this.reconcileDirectPostEcho(event);
     const rows = this.directPostRows();
-    return rows.some(row => row.kind === DIRECT_POST_OUTCOME && row.detail.outcome === 'sent' &&
+    return reconciled || rows.some(row => row.kind === DIRECT_POST_OUTCOME && row.detail.outcome === 'sent' &&
       row.detail.channelId === event.channelId && row.detail.guildId === event.guildId &&
       (row.detail.messageId === event.id || (event.isBot && typeof event.nonce === 'string' && row.detail.nonce === event.nonce)));
   }

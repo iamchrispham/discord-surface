@@ -10,7 +10,7 @@ Provide useful automatic progress and owed-item context in the existing conducto
 
 Replace repetitive routine receipt text with distinct signals for durable save and actual native acknowledgment. Completion of this goal means the accepted behavior is implemented, locally validated, installed and exercised through the existing two-provider pilot. A roadmap, passing fixture or generated preview alone is not completion.
 
-Basis: [research and operator refinements](spark-sidecar-research.md), [verbatim independent opinions](spark-sidecar-pro-verbatim.md). Local source starts at clean `main` `0c6bbe54a77a34c5d59d4994a364a57d0a74d106`. The implementation worktree was created from that verified local trunk before a remote existed. The operator subsequently authorized the private repository https://github.com/iamchrispham/discord-surface. Main preserves that transport base, and sidecar work is published through a draft PR.
+Basis: [research and operator refinements](spark-sidecar-research.md), plus the retained [context trial assessment](spark-context-trial-assessment.md). Local source starts at clean `main` `0c6bbe54a77a34c5d59d4994a364a57d0a74d106`. The implementation worktree was created from that verified local trunk before a remote existed. The operator subsequently authorized the private repository https://github.com/iamchrispham/discord-surface. Main preserves that transport base, and sidecar work is published through a draft PR.
 
 ## Invariants
 
@@ -31,7 +31,7 @@ Basis: [research and operator refinements](spark-sidecar-research.md), [verbatim
 
 ## Final stress-test ruling
 
-Pro returned READY TO BUILD with five contract corrections. Exact response: [final review](spark-sidecar-roadmap-pro-verbatim.md). Accepted: durable publication identity and exclusion through reload/backfill, field-level producer contracts, real normal-processing acknowledgment, bounded coalescing/restart/failure behavior, and conditional model activation. No new design panel or approval step. Local source review confirms each gap. The implementation worktree is `work/spark-sidecar-build`, branch `cpham/spark-sidecar`, based on 0c6bbe5. The first slice is quiet acknowledgments with its enumerated router plan in `work/spark-sidecar-roadmap/ack-router-plan.md`.
+Pro returned READY TO BUILD with five contract corrections. The retained [context trial assessment](spark-context-trial-assessment.md) records the resulting decision and its limits. Accepted: durable publication identity and exclusion through reload/backfill, field-level producer contracts, real normal-processing acknowledgment, bounded coalescing/restart/failure behavior, and conditional model activation. No new design panel or approval step. Local source review confirms each gap. The implementation worktree is `work/spark-sidecar-build`, branch `cpham/spark-sidecar`, based on 0c6bbe5. The first slice is quiet acknowledgments with its enumerated router plan in `work/spark-sidecar-roadmap/ack-router-plan.md`.
 
 ## Source-contract consultation
 
