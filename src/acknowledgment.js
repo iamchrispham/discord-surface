@@ -106,6 +106,7 @@ function acknowledgedMessage(state, messageId) {
 function watchAcknowledgments({ state, send, logger = () => {}, watchFactory = fs.watch, rearmMs = 1000 }) {
   let closed = false;
   let timer = null;
+  let timerDueAt = null;
   let running = null;
   let dirty = false;
   const outcome = (id, result, detail = {}) => state.transaction(() => state.receipt(id, ACK.OUTCOME, { outcome: result, ...detail }));
@@ -150,8 +151,17 @@ function watchAcknowledgments({ state, send, logger = () => {}, watchFactory = f
     }
   }
   function schedule(delay = 50) {
-    if (closed || timer) return;
-    timer = setTimeout(() => { timer = null; drain(); }, delay);
+    if (closed) return;
+    const wait = Math.max(0, delay);
+    const dueAt = Date.now() + wait;
+    if (timer !== null && timerDueAt !== null && timerDueAt <= dueAt) return;
+    if (timer !== null) clearTimeout(timer);
+    timerDueAt = dueAt;
+    timer = setTimeout(() => {
+      timer = null;
+      timerDueAt = null;
+      drain();
+    }, wait);
   }
   const basename = path.basename(state.dbPath);
   let watcher = null;
@@ -196,6 +206,7 @@ function watchAcknowledgments({ state, send, logger = () => {}, watchFactory = f
       retry = null;
       clearTimeout(timer);
       timer = null;
+      timerDueAt = null;
       await running;
     }
   };

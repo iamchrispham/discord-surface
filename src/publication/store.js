@@ -1,10 +1,55 @@
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
+const { REFERENCE_RECEIPT, PENDING_REFERENCE_RECEIPT, UNRESOLVED_REFERENCE_RECEIPT, referenceForReply } = require('./reference');
 
 const POST_KIND = Object.freeze({ BOARD: 'board', CONTEXT: 'context' });
 const CONTEXT_STATUS = Object.freeze({ QUEUED: 'queued', RUNNING: 'running', READY: 'ready', QUIET: 'quiet', UNAVAILABLE: 'unavailable' });
 const STATUS = Object.freeze({ PENDING: 'pending', SENDING: 'sending', SENT: 'sent', UNKNOWN: 'unknown', SUPERSEDED: 'superseded' });
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+function parseJson(value, fallback = null) {
+  if (!value) return fallback;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+function safeDetail(value) {
+  if (value === undefined) return '{}';
+  try { return JSON.stringify(value); } catch { return JSON.stringify({ error: 'unserializable detail' }); }
+}
+
+function settlePublicationReferences(state, db, publicationId, messageId) {
+  const rows = db.prepare('SELECT id, discord_id, kind, detail FROM receipts WHERE kind IN (?, ?) ORDER BY id')
+    .all(PENDING_REFERENCE_RECEIPT, UNRESOLVED_REFERENCE_RECEIPT);
+  for (const row of rows) {
+    const pending = parseJson(row.detail, null);
+    if (row.kind === PENDING_REFERENCE_RECEIPT && pending?.publicationId === publicationId && pending.referencedMessageId !== messageId) {
+      db.prepare('UPDATE receipts SET kind=?, detail=? WHERE id=?')
+        .run(UNRESOLVED_REFERENCE_RECEIPT, safeDetail({ referencedMessageId: pending.referencedMessageId, status: 'unresolved' }), row.id);
+      continue;
+    }
+    if (pending?.referencedMessageId !== messageId) continue;
+    if (row.kind === PENDING_REFERENCE_RECEIPT && pending.publicationId !== publicationId) continue;
+    const message = db.prepare('SELECT channel_id FROM messages WHERE discord_id=?').get(row.discord_id);
+    const binding = message && state.getBinding(message.channel_id);
+    const reference = binding && referenceForReply(db, binding, messageId);
+    if (!reference) continue;
+    db.prepare('UPDATE receipts SET kind=?, detail=? WHERE id=?')
+      .run(REFERENCE_RECEIPT, safeDetail(reference), row.id);
+  }
+}
+
+function clearPendingPublicationReferences(db, publicationId) {
+  const rows = db.prepare('SELECT id, detail FROM receipts WHERE kind=?').all(PENDING_REFERENCE_RECEIPT);
+  for (const row of rows) {
+    const pending = parseJson(row.detail, null);
+    if (pending?.publicationId !== publicationId) continue;
+    if (pending?.referencedMessageId) {
+      db.prepare('UPDATE receipts SET kind=?, detail=? WHERE id=?')
+        .run(UNRESOLVED_REFERENCE_RECEIPT, safeDetail({ referencedMessageId: pending.referencedMessageId, status: 'unresolved' }), row.id);
+    } else {
+      db.prepare('DELETE FROM receipts WHERE id=?').run(row.id);
+    }
+  }
+}
+
 function ownerKey(binding) {
   return hash(['publication-v1', ...['channelId', 'guildId', 'provider', 'nativeId', 'conductorId', 'repoKey', 'generation'].map(key => binding[key])]);
 }
@@ -129,21 +174,18 @@ class PublicationStore extends EventEmitter {
   }
   sent(id, messageId, now) {
     if (typeof messageId !== 'string' || !messageId) throw new Error('publication response lacks message id');
-    let settled = false;
     const result = this.state.transaction(() => {
       const post = this.db.prepare('SELECT * FROM publication_posts WHERE id=?').get(id);
       if (!post || post.status === STATUS.SENT) return;
       this.db.prepare('UPDATE publication_posts SET status=?, message_id=?, sent_at=?, error=NULL WHERE id=?')
         .run(STATUS.SENT, messageId, now, id);
       this.db.prepare('UPDATE publication_heads SET successful_at=?, retry_at=0 WHERE owner_key=?').run(now, post.owner_key);
-      settled = true;
+      settlePublicationReferences(this.state, this.db, id, messageId);
     });
-    if (settled) this.state.settlePublicationReference(id, messageId);
     return result;
   }
   failed(id, error, now, retryMs) {
     const definite = error?.outcome === 'not_sent';
-    let cleared = false;
     this.state.transaction(() => {
       // A Gateway echo may have already established that the request succeeded.
       const post = this.db.prepare('SELECT * FROM publication_posts WHERE id=?').get(id);
@@ -153,9 +195,8 @@ class PublicationStore extends EventEmitter {
       this.db.prepare('UPDATE publication_posts SET status=?, error=? WHERE id=?')
         .run(status, String(error?.message || error).slice(0, 300), id);
       if (definite) this.db.prepare('UPDATE publication_heads SET retry_at=? WHERE owner_key=?').run(now + retryMs, post.owner_key);
-      cleared = definite;
+      if (definite) clearPendingPublicationReferences(this.db, id);
     });
-    if (cleared) this.state.clearPendingPublicationReferences(id);
   }
   queueContext(binding, snapshot) {
     const head = this.head(binding);
