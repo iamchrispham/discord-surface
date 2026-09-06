@@ -193,3 +193,21 @@ npm test
 ```
 
 The tests use injected native providers and fake Discord events. They do not contact Discord, start Codex, Claude, or Spark, or prove a live round trip. Live two-provider delivery, native channel opt-in, permissions, approvals, billing, quota, and Discord category setup remain conductor-owned gates until directly verified.
+
+## Conductor milestone announcements
+
+`post` sends an explicit milestone from an existing bound conductor without an inbound message, a running Gateway, or sidecar inference. `claude-post` is the Claude-only alias. Use it for a landing, a blocker, or a ruling the operator may want to override. Keep round-by-round detail in beacons and PR bodies. Human-grade events retain the existing phone path. This command sends no Telegram copy.
+
+```sh
+node src/cli.js claude-post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --db "$HOME/.config/discord-surface/surface.sqlite" \
+  --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
+  --text-file /absolute/path/to/milestone.txt
+```
+
+The native ID must resolve to exactly one active conductor binding. Use `--channel-id` if it is ambiguous. The command refuses a stale generation and checks authority again before every split part. The same `splitReply` implementation and 10,000-character text limit apply to native replies and announcements. Mentions are suppressed.
+
+Repeat the same command and unchanged file to inspect or resume the same milestone, not create a duplicate. Use `--request-id` to name a distinct milestone explicitly. Reusing an explicit ID with changed text is refused. Confirmed parts are skipped on retry. A request interrupted after its durable attempt stays uncertain and is never blindly resent. Definite unsent failures can be retried explicitly. Each part's attempt and delivery result are recorded in the existing receipts table.
+
+No native session, channel binding, automatic publication selection or phone configuration is changed. A successful receipt means Discord accepted the returned message IDs, not that the operator read them.

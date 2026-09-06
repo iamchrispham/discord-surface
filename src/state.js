@@ -37,6 +37,10 @@ const TRANSPORT_RECEIPT_ATTEMPT = 'transport-receipt-attempt';
 const TRANSPORT_RECEIPT_OUTCOME = 'transport-receipt-outcome';
 const TRANSPORT_RECEIPT_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
 
+const DIRECT_POST_ATTEMPT = 'direct-post-attempt';
+const DIRECT_POST_OUTCOME = 'direct-post-outcome';
+const DIRECT_POST_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
+
 const ACTIVE_STATES = new Set([
   MESSAGE_STATES.ACCEPTED,
   MESSAGE_STATES.DISPATCHING,
@@ -155,16 +159,41 @@ function transportReceiptNonce(messageId) {
   return discordNonce(`transport:${messageId}`, 0);
 }
 
-function splitReply(text) {
+function replyBoundary(text, offset) {
+  let end = Math.min(text.length, offset + REPLY_LIMIT);
+  if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
+  return end;
+}
+
+function partitionReply(text, preferNewlines) {
   const parts = [];
   let offset = 0;
   while (offset < text.length) {
-    let end = Math.min(text.length, offset + REPLY_LIMIT);
-    if (end < text.length && end > offset && /[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
+    let end = replyBoundary(text, offset);
+    if (preferNewlines && end < text.length) {
+      const newline = text.lastIndexOf('\n', end - 1);
+      if (newline >= offset) end = newline + 1;
+    }
     parts.push(text.slice(offset, end));
     offset = end;
   }
   return parts.length ? parts : [''];
+}
+
+function splitReply(text) {
+  let parts = partitionReply(text, true);
+  if (!parts.some(part => !part.trim())) return parts;
+  parts = partitionReply(text, false);
+  const tail = parts.at(-1);
+  if (parts.length > 1 && !tail.trim()) {
+    const previous = parts.at(-2);
+    const boundary = previous.search(/\S\s*$/u);
+    if (boundary > 0 && previous.length - boundary + tail.length <= REPLY_LIMIT) {
+      parts[parts.length - 2] = previous.slice(0, boundary);
+      parts[parts.length - 1] = previous.slice(boundary) + tail;
+    }
+  }
+  return parts;
 }
 
 function rowReplyPart(row) {
@@ -1198,12 +1227,14 @@ class SurfaceState {
       }
       return this.reject('invalid-event');
     }
+    const directPost = this.excludeDirectPost(event);
     return this.transaction(() => {
       const binding = this.getBinding(event.channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
       this.upsertIntakeWatermark(event, ready, coverageId);
       let reason = null;
       if (typeof event.content !== 'string' || event.content.length > 10000 || attachments === null || (event.content.length === 0 && attachments?.length === 0)) reason = 'invalid-event';
+      else if (directPost) reason = 'automatic-publication';
       else if (event.isBot) reason = 'bot-source';
       else if (event.guildId !== config.guildId || event.authorId !== config.operatorId) reason = 'unauthorized-sender';
       if (!reason && (!binding || !binding.active || binding.guildId !== event.guildId)) reason = 'unknown-binding';
@@ -1554,6 +1585,7 @@ class SurfaceState {
 
   recoverAfterRestart() {
     return this.transaction(() => {
+      this.recoverDirectPostReceiptsInternal();
       const topicPublications = this.db.prepare('SELECT * FROM topic_publications WHERE status=?').all(TOPIC_PUBLICATION_STATES.IN_FLIGHT);
       for (const row of topicPublications) {
         this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, error=?, updated_at=? WHERE request_id=? AND status=?')
@@ -1597,6 +1629,112 @@ class SurfaceState {
       const candidates = this.recoveryCandidates();
       return { dispatching: dispatching.length, replying: replying.length, candidates: candidates.map(row => row.id) };
     });
+  }
+
+  directPostRows(requestId = null) {
+    if (requestId !== null) assertText(requestId, 'requestId', 256);
+    const rows = this.db.prepare(`SELECT id, kind, detail, created_at FROM receipts
+      WHERE discord_id IS NULL AND kind IN (?, ?) ORDER BY id`).all(DIRECT_POST_ATTEMPT, DIRECT_POST_OUTCOME);
+    return rows.map(row => ({
+      id: Number(row.id),
+      kind: row.kind,
+      detail: parseJson(row.detail, null),
+      createdAt: row.created_at
+    })).filter(row => {
+      if (!row.detail || row.detail.journal !== 'direct-post-v1') throw new StateCorruptError('direct post receipt is malformed');
+      return requestId === null || row.detail.requestId === requestId;
+    });
+  }
+
+  recoverDirectPostReceipts(ownerAlive = pid => {
+    if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
+    try { process.kill(Number(pid), 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
+  }) {
+    return this.transaction(() => this.recoverDirectPostReceiptsInternal(ownerAlive));
+  }
+
+  recoverDirectPostReceiptsInternal(ownerAlive = pid => {
+    if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
+    try { process.kill(Number(pid), 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
+  }) {
+    const rows = this.directPostRows();
+    const outcomes = new Set(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail?.attemptId).map(row => row.detail.attemptId));
+    let recovered = 0;
+    for (const row of rows.filter(item => item.kind === DIRECT_POST_ATTEMPT)) {
+      if (outcomes.has(row.detail.attemptId)) continue;
+      if (ownerAlive(row.detail.ownerPid)) continue;
+      this.receipt(null, DIRECT_POST_OUTCOME, {
+        ...row.detail,
+        outcome: 'unknown',
+        reason: 'process stopped before direct post outcome'
+      });
+      recovered += 1;
+    }
+    return recovered;
+  }
+
+  directPostBindingCurrent(binding, operatorId = null) {
+    const config = this.requireConfig();
+    const current = this.getBinding(binding?.channelId);
+    return Boolean(binding && current && bindingMatchesExpected(current, binding) && current.guildId === config.guildId &&
+      (operatorId === null || config.operatorId === operatorId));
+  }
+
+  beginDirectPostPart(meta) {
+    if (!meta || typeof meta !== 'object') throw new BindingError('direct post metadata is required');
+    assertText(meta.requestId, 'requestId', 256);
+    assertText(meta.attemptId, 'attemptId', 128);
+    if (!Number.isInteger(meta.partIndex) || meta.partIndex < 0 || !Number.isInteger(meta.partCount) || meta.partCount < 1 || meta.partIndex >= meta.partCount) {
+      throw new BindingError('direct post part index is invalid');
+    }
+    return this.transaction(() => {
+      const rows = this.directPostRows(meta.requestId);
+      const identityKeys = ['sourcePath', 'textHash', 'operatorId', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount'];
+      for (const row of rows) {
+        for (const key of identityKeys) {
+          if (row.detail[key] !== meta[key]) throw new BindingError('direct post request identity conflicts with existing custody');
+        }
+      }
+      if (!this.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
+      const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
+      const outcomes = new Map(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId).map(row => [row.detail.attemptId, row]));
+      const latest = attempts.at(-1);
+      if (latest) {
+        const outcome = outcomes.get(latest.detail.attemptId);
+        if (!outcome) return { claimed: false, status: 'in_flight', attemptId: latest.detail.attemptId, nonce: latest.detail.nonce };
+        const status = outcome.detail.outcome;
+        if (status === 'sent' || status === 'unknown') return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
+        if (!['not_sent', 'rejected', 'rate_limited'].includes(status)) return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
+      }
+      this.receipt(null, DIRECT_POST_ATTEMPT, {
+        journal: 'direct-post-v1', ...meta, ownerPid: process.pid, status: 'attempted'
+      });
+      return { claimed: true, status: 'claimed', attemptId: meta.attemptId, nonce: meta.nonce };
+    });
+  }
+
+  recordDirectPostOutcome(requestId, attemptId, outcome, detail = {}) {
+    assertText(requestId, 'requestId', 256);
+    assertText(attemptId, 'attemptId', 128);
+    if (!DIRECT_POST_OUTCOMES.includes(outcome)) throw new BindingError('invalid direct post outcome');
+    return this.transaction(() => {
+      const rows = this.directPostRows(requestId);
+      const attempt = rows.find(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.attemptId === attemptId);
+      if (!attempt) throw new BindingError('direct post attempt is unknown');
+      const existing = rows.find(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId === attemptId);
+      if (existing) return existing.detail;
+      const next = { ...attempt.detail, ...detail, outcome };
+      this.receipt(null, DIRECT_POST_OUTCOME, next);
+      return next;
+    });
+  }
+
+  excludeDirectPost(event) {
+    if (!event || typeof event.id !== 'string' || typeof event.channelId !== 'string' || typeof event.guildId !== 'string') return false;
+    const rows = this.directPostRows();
+    return rows.some(row => row.kind === DIRECT_POST_OUTCOME && row.detail.outcome === 'sent' &&
+      row.detail.channelId === event.channelId && row.detail.guildId === event.guildId &&
+      (row.detail.messageId === event.id || (event.isBot && typeof event.nonce === 'string' && row.detail.nonce === event.nonce)));
   }
 
   recoveryCandidates(before = null) {
@@ -1765,6 +1903,9 @@ module.exports = {
   TRANSPORT_RECEIPT_ATTEMPT,
   TRANSPORT_RECEIPT_OUTCOME,
   TRANSPORT_RECEIPT_OUTCOMES,
+  DIRECT_POST_ATTEMPT,
+  DIRECT_POST_OUTCOME,
+  DIRECT_POST_OUTCOMES,
   TOPIC_PUBLICATION_STATES,
   UnresolvedWorkError,
   UUID,

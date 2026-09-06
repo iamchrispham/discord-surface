@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require('node:fs');
+const { runDirectPost } = require('./direct-post');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
@@ -751,6 +752,41 @@ function claudeReply(args) {
   } finally { state.close(); }
 }
 
+async function directPost(args, provider = null) {
+  const { state } = openState(args);
+  const controller = new AbortController();
+  let receivedSignal = null;
+  const handleSignal = signal => {
+    if (receivedSignal) return;
+    receivedSignal = signal;
+    controller.abort();
+  };
+  process.once('SIGINT', handleSignal);
+  process.once('SIGTERM', handleSignal);
+  try {
+    const config = state.requireConfig();
+    const result = await runDirectPost({
+      state,
+      token: readSecret(config.secretFile),
+      nativeId: required(args, 'native-id'),
+      generation: required(args, 'generation'),
+      channelId: args['channel-id'] || null,
+      provider,
+      textFile: required(args, 'text-file'),
+      requestId: args['request-id'],
+      signal: controller.signal
+    });
+    print(result);
+    if (result.status !== 'sent') process.exitCode = 1;
+    if (receivedSignal) process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
+    return result;
+  } finally {
+    process.removeListener('SIGINT', handleSignal);
+    process.removeListener('SIGTERM', handleSignal);
+    state.close();
+  }
+}
+
 function readProcessCommand(pid) {
   return execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
 }
@@ -855,10 +891,12 @@ async function main() {
     case 'claude-channel': return claudeChannel(args);
     case 'claude-monitor': return claudeMonitor(args);
     case 'claude-reply': return claudeReply(args);
+    case 'post': return directPost(args);
+    case 'claude-post': return directPost(args, 'claude');
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, claude-reply, liaison draft');
+    default: throw new Error('usage: configure, bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, claude-reply, post, claude-post, liaison draft');
   }
 }
 
@@ -869,4 +907,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, directPost, ensureProvisionedChannel, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, parseArgs, pathsFor, provisionMarker };
