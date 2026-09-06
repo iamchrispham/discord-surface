@@ -468,6 +468,12 @@ class SurfaceState {
     if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== SCHEMA_VERSION) {
       throw new StateCorruptError(`unsupported state schema ${version.value}`);
     }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS direct_post_outcome_message_idx
+        ON receipts(json_extract(detail, '$.messageId')) WHERE kind='direct-post-outcome';
+      CREATE INDEX IF NOT EXISTS direct_post_outcome_nonce_idx
+        ON receipts(json_extract(detail, '$.nonce')) WHERE kind='direct-post-outcome';
+    `);
     if (version.value === SCHEMA_VERSION) {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_publications (
@@ -1653,16 +1659,6 @@ class SurfaceState {
   directPostOwnerIdentity(pid) {
     if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return null;
     const normalizedPid = Number(pid);
-    if (normalizedPid === process.pid) {
-      if (!this.constructor.directPostProcessIdentity) {
-        this.constructor.directPostProcessIdentity = {
-          ownerPid: process.pid,
-          ownerStartTime: `local:${Date.now()}:${process.uptime()}`,
-          ownerCommand: process.argv.join('\0') || null
-        };
-      }
-      return this.constructor.directPostProcessIdentity;
-    }
     let ownerStartTime = null;
     let ownerCommand = null;
     try {
@@ -1743,7 +1739,7 @@ class SurfaceState {
     }
     return this.transaction(() => {
       const rows = this.directPostRows(meta.requestId);
-      const identityKeys = ['sourcePath', 'textHash', 'operatorId', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount'];
+      const identityKeys = ['textHash', 'operatorId', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount'];
       for (const row of rows) {
         for (const key of identityKeys) {
           if (row.detail[key] !== meta[key]) throw new BindingError('direct post request identity conflicts with existing custody');

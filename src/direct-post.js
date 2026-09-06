@@ -60,9 +60,9 @@ function resolveDirectBinding(state, { nativeId, generation, channelId = null, p
   return candidates[0];
 }
 
-function requestIdFor(binding, operatorId, sourcePath, textHash, explicitRequestId) {
+function requestIdFor(binding, _operatorId, sourcePath, textHash, explicitRequestId) {
   if (explicitRequestId !== undefined) return requiredString(explicitRequestId, 'request-id', 256);
-  return hash(['direct-post-v1', operatorId, binding.channelId, binding.guildId, binding.provider, binding.nativeId, binding.generation,
+  return hash(['direct-post-v1', binding.channelId, binding.guildId, binding.provider, binding.nativeId, binding.generation,
     binding.conductorId, binding.repoKey, sourcePath, textHash]);
 }
 
