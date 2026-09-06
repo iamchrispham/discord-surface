@@ -7,6 +7,7 @@ const { ownerKey } = require('./store');
 const { contextualPublications } = require('./context');
 
 const CADENCE = Object.freeze({ burstMs: 500, publicationMs: 60000, retryMs: 60000 });
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 function watchPublications({ state, send, ready = () => true, logger = () => {},
   registry = path.join(os.homedir(), '.agents/work-control/pr-lanes.json'),
@@ -71,7 +72,8 @@ function watchPublications({ state, send, ready = () => true, logger = () => {},
       }
       context.pump();
       if (!closed && Number.isFinite(nextWake)) {
-        wake = setTimeout(() => { wake = null; drain(); }, Math.max(1, nextWake - clock()));
+        const delay = Math.min(MAX_TIMER_DELAY_MS, Math.max(1, nextWake - clock()));
+        wake = setTimeout(() => { wake = null; drain(); }, delay);
       }
     })().catch(error => logger(`publication drain failed: ${error.message}`));
     try { await running; }

@@ -117,6 +117,22 @@ test('expiry and unreadable source replace freshness instead of flushing old dra
   await until(() => sent.length === 4, 'valid source resumes');
 });
 
+test('distant expiration does not spin publication wake timer', async t => {
+  const f = fixture(t);
+  const clock = Date.now();
+  f.data._conductors['owner.md'].updated = new Date(clock + 30 * 24 * 60 * 60 * 1000).toISOString();
+  f.write();
+  const future = await f.readSnapshot(f.binding, { registry: f.registry, now: clock / 1000 });
+  assert.ok(future.expiresAt * 1000 - clock > 2_147_483_647);
+  let reads = 0;
+  const p = start(f, { clock: () => clock, ready: () => false,
+    read: async () => { reads++; return future; } });
+  await until(() => reads === 1, 'distant snapshot read');
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(reads, 1, 'distant wake must not rearm a 1 ms loop');
+  await p.stop();
+});
+
 test('failed send preserves successful cursor and newest pending snapshot across reopen', async t => {
   const f = fixture(t);
   let clock = Date.now();
