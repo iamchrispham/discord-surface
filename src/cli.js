@@ -16,6 +16,7 @@ const GATEWAY_CAPABILITIES = Object.freeze({
   ordinaryBindWake: 'ordinary-bind-wake-v1'
 });
 const { runLiaisonDraft } = require('./liaison');
+const { recordNativeAcknowledgment } = require('./acknowledgment');
 const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
 
 function parseArgs(argv) {
@@ -1246,6 +1247,17 @@ async function main() {
     case 'stop': return stop(args);
     case 'claude-channel': return claudeChannel(args);
     case 'claude-monitor': return claudeMonitor(args);
+    case 'native-ack': {
+      const { state } = openState(args);
+      try {
+        return print(recordNativeAcknowledgment(state, {
+          provider: required(args, 'provider'),
+          messageId: required(args, 'message-id'),
+          nativeId: required(args, 'native-id'),
+          generation: Number(required(args, 'generation'))
+        }));
+      } finally { state.close(); }
+    }
     case 'claude-reply': return claudeReply(args);
     case 'post': return directPost(args);
     case 'ordinary-post': return directPost(args, 'codex', true);
@@ -1253,7 +1265,7 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, claude-reply, post, ordinary-post, claude-post, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, post, ordinary-post, claude-post, liaison draft');
   }
 }
 

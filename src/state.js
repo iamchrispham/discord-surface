@@ -37,6 +37,7 @@ const TOPIC_DEFINITE_NOT_PUBLISHED = new Set(['rate_limited', 'rejected', 'stopp
 const TRANSPORT_RECEIPT_ATTEMPT = 'transport-receipt-attempt';
 const TRANSPORT_RECEIPT_OUTCOME = 'transport-receipt-outcome';
 const TRANSPORT_RECEIPT_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
+const NATIVE_ACK_RECEIPT = 'native-ack';
 
 const DIRECT_POST_ATTEMPT = 'direct-post-attempt';
 const DIRECT_POST_OUTCOME = 'direct-post-outcome';
@@ -493,6 +494,8 @@ class SurfaceState {
         ON receipts(json_extract(detail, '$.messageId')) WHERE kind='direct-post-outcome';
       CREATE INDEX IF NOT EXISTS direct_post_outcome_nonce_idx
         ON receipts(json_extract(detail, '$.nonce')) WHERE kind='direct-post-outcome';
+      CREATE INDEX IF NOT EXISTS acknowledgment_receipt_idx
+        ON receipts(kind, discord_id, id);
     `);
   }
 
@@ -1737,6 +1740,37 @@ class SurfaceState {
     return { config, binding, identity, current };
   }
 
+  hasNativeAcknowledgment(message) {
+    const row = this.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id DESC LIMIT 1')
+      .get(message.id, NATIVE_ACK_RECEIPT);
+    const identity = parseJson(row?.detail, null);
+    return Boolean(identity && identity.provider === message.provider && identity.nativeId === message.nativeId && identity.generation === message.generation);
+  }
+
+  recoverNativeReplyAcknowledgment(messageId) {
+    return this.transaction(() => {
+      const message = this.getMessage(messageId);
+      if (!message || message.state !== MESSAGE_STATES.REPLY_READY) return { recovered: false, reason: 'not-reply-ready' };
+      const check = this.currentMessageBinding(message);
+      if (!check.current) return { recovered: false, reason: check.identity ? 'authorization-revoked' : 'stale-generation' };
+      if (this.hasNativeAcknowledgment(message)) return { recovered: false, duplicate: true };
+      const receiptRows = this.db.prepare(`SELECT detail FROM receipts
+        WHERE discord_id=? AND kind IN (?, ?) ORDER BY id DESC`).all(messageId, 'native-reply', 'native-reply-before-submit');
+      const partCount = Number(this.db.prepare('SELECT COUNT(*) AS count FROM reply_parts WHERE discord_id=?').get(messageId).count);
+      const provenance = receiptRows
+        .map(row => parseJson(row.detail, null))
+        .find(detail => detail && detail.generation === message.generation && Number.isInteger(detail.parts) && detail.parts > 0 && detail.parts === partCount);
+      if (!provenance) return { recovered: false, reason: 'native-reply-provenance-missing' };
+      this.receipt(messageId, NATIVE_ACK_RECEIPT, {
+        provider: message.provider,
+        nativeId: message.nativeId,
+        generation: message.generation,
+        source: 'native-reply'
+      });
+      return { recovered: true, message: this.getMessage(messageId) };
+    });
+  }
+
   assertMessageCurrent(messageId, phase) {
     try {
       return this.transaction(() => {
@@ -1766,6 +1800,12 @@ class SurfaceState {
           this.receipt(messageId, 'dispatch-rejected-auth', { generation: message.generation });
           return { claimed: false, message, reason: 'authorization-revoked' };
         }
+        if (this.hasNativeAcknowledgment(message)) {
+          this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.SUBMITTED, now(), messageId, MESSAGE_STATES.ACCEPTED);
+          this.receipt(messageId, 'dispatch-already-acknowledged', { generation: message.generation });
+          return { claimed: false, message: this.getMessage(messageId), reason: 'native-already-acknowledged' };
+        }
         if (check.binding.readiness !== READINESS.READY) {
           this.receipt(messageId, 'dispatch-held-not-ready', { readiness: check.binding.readiness, generation: message.generation });
           return { claimed: false, message, reason: 'binding-not-ready' };
@@ -1785,9 +1825,17 @@ class SurfaceState {
     return this.transaction(() => {
       const message = this.getMessage(messageId);
       if (!message) throw new BindingError('message is unknown');
+      const serializedCursor = cursor === null || cursor === undefined ? null : safeDetail(cursor);
+      const submittedMarker = marker === undefined ? null : marker;
+      if (message.state === MESSAGE_STATES.SUBMITTED) {
+        if (serializedCursor === null && submittedMarker === null) return message;
+        this.db.prepare('UPDATE messages SET observer_cursor=COALESCE(observer_cursor, ?), observer_marker=COALESCE(observer_marker, ?), updated_at=? WHERE discord_id=? AND state=?')
+          .run(serializedCursor, submittedMarker, now(), messageId, MESSAGE_STATES.SUBMITTED);
+        return this.getMessage(messageId);
+      }
       if (message.state !== MESSAGE_STATES.DISPATCHING) return message;
       this.db.prepare('UPDATE messages SET state=?, observer_cursor=?, observer_marker=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
-        .run(MESSAGE_STATES.SUBMITTED, cursor ? safeDetail(cursor) : null, marker, now(), messageId, MESSAGE_STATES.DISPATCHING);
+        .run(MESSAGE_STATES.SUBMITTED, serializedCursor, submittedMarker, now(), messageId, MESSAGE_STATES.DISPATCHING);
       this.receipt(messageId, 'submitted', { marker: marker || undefined });
       return this.getMessage(messageId);
     });
@@ -1796,7 +1844,7 @@ class SurfaceState {
   setObserverCursor(messageId, cursor, marker = null) {
     return this.transaction(() => {
       const message = this.getMessage(messageId);
-      if (!message || ![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED].includes(message.state)) return message;
+      if (!message || ![MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED].includes(message.state)) return message;
       this.db.prepare('UPDATE messages SET observer_cursor=?, observer_marker=COALESCE(?, observer_marker), updated_at=? WHERE discord_id=?')
         .run(safeDetail(cursor), marker, now(), messageId);
       return this.getMessage(messageId);
@@ -1827,6 +1875,12 @@ class SurfaceState {
       const message = this.getMessage(messageId);
       if (!message) throw new BindingError('message is unknown');
       if (message.state !== expected) return message;
+      if ([MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.UNCERTAIN].includes(next) && this.hasNativeAcknowledgment(message)) {
+        this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+          .run(MESSAGE_STATES.SUBMITTED, now(), messageId, expected);
+        this.receipt(messageId, 'dispatch-already-acknowledged', { generation: message.generation });
+        return this.getMessage(messageId);
+      }
       this.db.prepare('UPDATE messages SET state=?, error=?, updated_at=? WHERE discord_id=? AND state=?')
         .run(next, error ? String(error.message || error).slice(0, 1000) : null, now(), messageId, expected);
       this.receipt(messageId, kind, { error: error ? String(error.message || error).slice(0, 200) : undefined });
@@ -1842,7 +1896,7 @@ class SurfaceState {
     assertText(text, 'reply text', 10000);
     try {
       return this.transaction(() => {
-        const message = this.getMessage(messageId);
+        let message = this.getMessage(messageId);
         if (!message) throw new StaleGenerationError('native reply is stale');
         const check = this.currentMessageBinding(message);
         if (message.provider !== provider || !check.binding || message.nativeId !== nativeId || message.generation !== generation ||
@@ -1850,7 +1904,20 @@ class SurfaceState {
           throw new StaleGenerationError('native reply is stale');
         }
         if (!check.current) throw new AuthorizationError('native reply authorization is no longer valid');
-        if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) return { duplicate: true, message };
+        const ensureNativeReplyAcknowledgment = () => {
+          const existing = this.db.prepare('SELECT 1 FROM receipts WHERE discord_id=? AND kind=? LIMIT 1')
+            .get(messageId, NATIVE_ACK_RECEIPT);
+          if (!existing) this.receipt(messageId, NATIVE_ACK_RECEIPT, { provider, nativeId, generation, source: 'native-reply' });
+        };
+        ensureNativeReplyAcknowledgment();
+        if (message.state === MESSAGE_STATES.UNCERTAIN) {
+          this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.SUBMITTED, now(), messageId, MESSAGE_STATES.UNCERTAIN);
+          message = this.getMessage(messageId);
+        }
+        if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) {
+          return { duplicate: true, message };
+        }
         if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.DISPATCHING].includes(message.state)) throw new BindingError(`reply is not accepted in state ${message.state}`);
         const timestamp = now();
         const parts = splitReply(text);
@@ -2007,6 +2074,13 @@ class SurfaceState {
       }
       const dispatching = this.db.prepare('SELECT discord_id FROM messages WHERE state=?').all(MESSAGE_STATES.DISPATCHING);
       for (const row of dispatching) {
+        const message = this.getMessage(row.discord_id);
+        if (this.hasNativeAcknowledgment(message)) {
+          this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.SUBMITTED, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
+          this.receipt(row.discord_id, 'dispatch-already-acknowledged', { generation: message.generation, afterRestart: true });
+          continue;
+        }
         this.db.prepare('UPDATE messages SET state=?, error=?, updated_at=? WHERE discord_id=?')
           .run(MESSAGE_STATES.UNCERTAIN, 'process stopped at dispatch boundary', now(), row.discord_id);
         this.receipt(row.discord_id, 'dispatch-uncertain-after-restart', {});
@@ -2194,7 +2268,11 @@ class SurfaceState {
     if (!['submitted', 'not_submitted'].includes(resolution)) throw new BindingError('resolution must be submitted or not_submitted');
     return this.transaction(() => {
       const message = this.getMessage(messageId);
-      if (!message || message.state !== MESSAGE_STATES.UNCERTAIN) throw new BindingError('message is not uncertain');
+      if (!message) throw new BindingError('message is not uncertain');
+      if (resolution === 'not_submitted' && this.hasNativeAcknowledgment(message)) {
+        throw new BindingError('native acknowledgment prevents retrying delivery');
+      }
+      if (message.state !== MESSAGE_STATES.UNCERTAIN) throw new BindingError('message is not uncertain');
       const next = resolution === 'submitted' ? MESSAGE_STATES.SUBMITTED : MESSAGE_STATES.ACCEPTED;
       this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
         .run(next, now(), messageId, MESSAGE_STATES.UNCERTAIN);
@@ -2348,6 +2426,7 @@ module.exports = {
   TRANSPORT_RECEIPT_ATTEMPT,
   TRANSPORT_RECEIPT_OUTCOME,
   TRANSPORT_RECEIPT_OUTCOMES,
+  NATIVE_ACK_RECEIPT,
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
   DIRECT_POST_OUTCOMES,

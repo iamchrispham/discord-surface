@@ -1,8 +1,11 @@
 const crypto = require('node:crypto');
+const { acknowledgmentCommand } = require('./acknowledgment');
 const fs = require('node:fs');
 const path = require('node:path');
 const { ClaudeChannel } = require('./claude-channel');
 const { normalizeAttachments } = require('./state');
+
+const PAYLOAD_SCHEMA_VERSION = 2;
 
 function replyFileFor(directory, messageId, generation) {
   const key = crypto.createHash('sha256')
@@ -14,7 +17,7 @@ function replyFileFor(directory, messageId, generation) {
 function payloadFileFor(directory, messageId, nativeId, generation, dbPath) {
   const scope = dbPath ? path.resolve(dbPath) : path.resolve(directory);
   const key = crypto.createHash('sha256')
-    .update(`${scope}\0${messageId}\0${nativeId}\0${generation}`)
+    .update(`${PAYLOAD_SCHEMA_VERSION}\0${scope}\0${messageId}\0${nativeId}\0${generation}`)
     .digest('hex')
     .slice(0, 32);
   return path.join(path.resolve(directory), '.cm-e', `${key}.json`);
@@ -90,9 +93,11 @@ function eventValues(event) {
 function monitorEvent({ content, messageId, nativeId, generation, attachments = [], stateDir, dbPath, cliPath, textFile }) {
   const event = {
     type: 'discord-surface/claude-monitor',
+    version: PAYLOAD_SCHEMA_VERSION,
     content,
     meta: { messageId, nativeId, generation: String(generation) },
-    instructions: 'Create reply.directory owner-only if needed. Write final answer to reply.textFile, then run every argument in reply.command.',
+    instructions: 'At pickup run acknowledgment.command once with argument boundaries preserved. Then create reply.directory owner-only if needed, write the final answer to reply.textFile, and run reply.command. Acknowledgment means received, not completed.',
+    acknowledgment: { command: acknowledgmentCommand({ id: messageId, nativeId, generation, provider: 'claude' }, dbPath, cliPath) },
     reply: {
       messageId,
       nativeId,
@@ -127,7 +132,7 @@ function monitorPointer({ messageId, nativeId, generation, payloadPath }) {
     type: 'discord-surface/claude-monitor',
     payloadPath: path.resolve(payloadPath),
     meta: { messageId, nativeId, generation: String(generation) },
-    instructions: 'Read the payload with Read, then run reply.command.'
+    instructions: 'Read the payload at payloadPath with Read. Run acknowledgment.command, then answer through reply.command.'
   };
 }
 
