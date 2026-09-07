@@ -305,6 +305,64 @@ test('ordinary Claude Monitor startup preserves an existing recovery-unavailable
   observed.close();
 });
 
+for (const terminalState of [READINESS.UNAVAILABLE, READINESS.GAP]) {
+  test(`ordinary Claude recovery restores durable ${terminalState} readiness`, async t => {
+    const f = fixture(t);
+    const detail = `prior ${terminalState} recovery failure`;
+    f.state.markIntakeBoundary(f.binding.channelId, terminalState, detail, null, null, f.binding);
+    const gateway = new DiscordGateway({
+      state: f.state,
+      client: { user: { id: 'bot' }, on() {}, off() {}, async destroy() {} },
+      providers: { claude: { async dispatch() { throw new Error('must stay held'); } } }
+    });
+    const result = await gateway.recoverTransport(`terminal-${terminalState}`, 0);
+    assert.deepEqual(result, { ready: false, state: terminalState });
+    assert.equal(f.state.getBinding(f.binding.channelId).readiness, terminalState);
+    assert.equal(f.state.getIntakeWatermark(f.binding.channelId).state, terminalState);
+    assert.equal(f.state.getIntakeWatermark(f.binding.channelId).detail, detail);
+    assert.equal(gateway.recoveryPromise, null);
+    assert.equal(gateway.recoveryController, null);
+    const accepted = f.state.acceptDiscordMessage({
+      id: `held-${terminalState}`, guildId: 'guild', channelId: f.binding.channelId,
+      authorId: 'operator', isBot: false, content: `hold during ${terminalState}`
+    }, { ready: false });
+    assert.equal(accepted.accepted, true);
+    assert.equal(f.state.claimDispatch(accepted.message.id).reason, 'binding-not-ready');
+    await gateway.stop();
+  });
+}
+
+test('ordinary Claude recovery cannot restore a stale terminal binding', async t => {
+  const f = fixture(t);
+  f.state.markIntakeBoundary(f.binding.channelId, READINESS.UNAVAILABLE, 'prior unavailable recovery failure', null, null, f.binding);
+  const originalGetIntakeWatermark = f.state.getIntakeWatermark.bind(f.state);
+  let successor = null;
+  f.state.getIntakeWatermark = channelId => {
+    const watermark = originalGetIntakeWatermark(channelId);
+    if (!successor && channelId === f.binding.channelId) {
+      f.state.unbind(f.binding.channelId);
+      successor = f.state.rebindOrdinaryClaude({
+        channelId: f.binding.channelId, guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
+        workspace: f.dir, endpoint: f.socketPath
+      }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' });
+    }
+    return watermark;
+  };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, on() {}, off() {}, async destroy() {} },
+    providers: { claude: { async dispatch() { throw new Error('must stay held'); } } }
+  });
+  const result = await gateway.recoverTransport('stale-terminal', 0);
+  f.state.getIntakeWatermark = originalGetIntakeWatermark;
+  assert.deepEqual(result, { ready: false, state: READINESS.UNAVAILABLE });
+  assert.equal(successor.generation, 2);
+  assert.equal(f.state.getBinding(f.binding.channelId).generation, 2);
+  assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.PENDING);
+  assert.equal(f.state.getIntakeWatermark(f.binding.channelId).state, READINESS.UNAVAILABLE);
+  await gateway.stop();
+});
+
 test('ordinary Claude pre-write endpoint loss demotes only matching binding and holds later intake', async t => {
   const f = fixture(t);
   const channel = {

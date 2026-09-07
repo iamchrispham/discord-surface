@@ -1010,6 +1010,9 @@ class DiscordGateway {
       }
       let watermark = this.state.getIntakeWatermark(binding.channelId);
       if (watermark && ['gap', 'unavailable'].includes(watermark.state)) {
+        const terminalReadiness = watermark.state === READINESS.GAP ? READINESS.GAP : READINESS.UNAVAILABLE;
+        this.state.setBindingReadiness(binding.channelId, terminalReadiness,
+          watermark.detail || `${reason} intake ${watermark.state}`, binding);
         failure ||= { ready: false, state: watermark.state };
         continue;
       }
