@@ -34,6 +34,7 @@ function isolatedEnvironment(home) {
   delete env.DISCORD_TOKEN;
   delete env.NPM_TOKEN;
   delete env.NODE_AUTH_TOKEN;
+  delete env.NODE_OPTIONS;
   return env;
 }
 
@@ -58,8 +59,14 @@ function runInstalledSmoke(installedRoot, env) {
     assert.equal(typeof discord.requireInstalled('zod').object, 'function');
     const mcp = claude.createDefaultMcp({ nativeId: '79e3da8e-94b4-4aff-8f88-b45b3a451dd1', state: {} });
     assert.equal(typeof mcp.setRequestHandler, 'function');
-    assert.equal(facade.parseTopic, emitted.parseTopic);
-    assert.equal(facade.renderTopic, emitted.renderTopic);
+    for (const name of ['topicPresentation', 'conductorMarkerMatches', 'parseLegacyConductorMarker', 'staticConductorMarker', 'topicWithReadiness']) {
+      assert.equal(typeof facade[name], 'function');
+      assert.equal(facade[name], emitted[name]);
+    }
+    const marker = emitted.staticConductorMarker({ provider: 'codex', conductorId: 'smoke-conductor', repoKey: 'repo:smoke' });
+    assert.equal(emitted.conductorMarkerMatches(marker, { provider: 'codex', conductorId: 'smoke-conductor', repoKey: 'repo:smoke' }), true);
+    assert.equal(emitted.topicPresentation(marker).base, marker);
+    assert.match(emitted.topicWithReadiness(marker, 'ready', '2026-09-07T00:00:00.000Z'), /readiness=ready/);
     assert.equal(attachmentFacade.normalizeAttachments, attachmentEmitted.normalizeAttachments);
     process.stdout.write(JSON.stringify({ cli: true, discordSdk: true, mcpSdk: true, zod: true, emitted: true }));
   `;
@@ -81,10 +88,15 @@ function main() {
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(install, { recursive: true });
   const env = isolatedEnvironment(home);
+  const distPath = path.join(root, 'dist');
   try {
     run(npm, ['run', 'build'], { env });
-    const packJson = run(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', scratch], { env });
-    const pack = JSON.parse(packJson)[0];
+    fs.rmSync(distPath, { recursive: true, force: true });
+    const packOutput = run(npm, ['pack', '--json', '--pack-destination', scratch], { env });
+    const packJsonStart = packOutput.indexOf('[\n');
+    if (packJsonStart < 0) throw new Error('npm pack did not return JSON metadata');
+    const pack = JSON.parse(packOutput.slice(packJsonStart))[0];
+    assert(fs.existsSync(distPath), 'prepack did not restore dist');
     const packagePath = path.join(scratch, pack.filename);
     const files = new Set(pack.files.map(file => file.path));
     for (const required of ['package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts', 'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts']) {
@@ -95,6 +107,7 @@ function main() {
     process.stdout.write(JSON.stringify({ package: packageJson.name, version: packageJson.version, files: pack.files.length }));
     process.stdout.write('\n');
   } finally {
+    run(npm, ['run', 'build'], { env });
     fs.rmSync(scratch, { recursive: true, force: true });
   }
 }
