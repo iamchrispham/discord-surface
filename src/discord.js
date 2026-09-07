@@ -262,9 +262,15 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return `${durable.provider}:${durable.nativeId}`;
   }
 
+  function hasCurrentNativeAcknowledgment(message) {
+    if (!message || !state.hasNativeAcknowledgment(message)) return false;
+    return state.currentMessageBinding(message).current;
+  }
+
   function ownerCanAdvance(messageId) {
     const message = state.getMessage(messageId);
-    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state);
+    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state) ||
+      (message.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(message));
   }
 
   function ownerQueueFor(key) {
@@ -281,7 +287,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const currentIndex = messages.findIndex(candidate => candidate.id === message.id);
     if (currentIndex < 0) return null;
     return messages.slice(0, currentIndex).find(candidate => nativeOwnerKey(candidate) === nativeOwnerKey(message) &&
-      [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLYING].includes(candidate.state)) || null;
+      [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLYING].includes(candidate.state) &&
+      !(candidate.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(candidate))) || null;
   }
 
   function removeAbortHandler(entry) {
@@ -299,6 +306,22 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     queue.blockedMessageId = null;
     queue.active = null;
     pumpOwner(entry.ownerKey);
+  }
+
+  function releaseAcknowledged(messageId) {
+    const message = state.getMessage(messageId);
+    if (!message || !hasCurrentNativeAcknowledgment(message) || !ownerCanAdvance(messageId)) return false;
+    const queue = ownerQueues.get(nativeOwnerKey(message));
+    if (!queue) return false;
+    if (queue.active?.message.id === messageId) {
+      const active = queue.active;
+      finishOwner(active);
+      return queue.active !== active;
+    }
+    if (queue.blockedMessageId !== messageId) return false;
+    queue.blockedMessageId = null;
+    pumpOwner(nativeOwnerKey(message));
+    return true;
   }
 
   function cancelQueuedEntry(entry) {
@@ -325,6 +348,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       finishOwner(entry);
       entry.reject(error);
       return;
+    }
+    const startedMessage = state.getMessage(entry.message.id);
+    if (startedMessage?.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(startedMessage)) {
+      releaseAcknowledged(entry.message.id);
     }
     Promise.resolve(result).then(entry.resolve, entry.reject);
   }
@@ -562,8 +589,11 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false } = {}) {
     launchTransportReceipt(message);
     const existing = existingNativeWork(message, awaitExisting);
-    if (existing) return existing;
-    return enqueueOwnerWork(message, signal, onNativeSettled => {
+    if (existing) {
+      releaseAcknowledged(message.id);
+      return existing;
+    }
+    const work = enqueueOwnerWork(message, signal, onNativeSettled => {
       let nativeSettled = false;
       const settleNative = () => {
         if (nativeSettled) return;
@@ -583,13 +613,15 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       if (continueUntilFinal) return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
       return work;
     }, awaitExisting, continueUntilFinal);
+    releaseAcknowledged(message.id);
+    return work;
   }
 
   async function waitForReceipts() {
     await Promise.allSettled([...receiptWork]);
   }
 
-  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, resumeSubmitted, waitForNativeWork, waitForReceipts };
+  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, releaseAcknowledged, resumeSubmitted, waitForNativeWork, waitForReceipts };
 }
 
 class DiscordGateway {
@@ -840,6 +872,7 @@ class DiscordGateway {
           if (this.stopping) return null;
           const message = this.state.getMessage(messageId);
           if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY].includes(message?.state)) return null;
+          this.consumer?.releaseAcknowledged?.(messageId);
           return this.consumer?.resumeSubmitted(message, undefined, { awaitExisting: false, continueUntilFinal: true });
         },
         logger: this.logger
