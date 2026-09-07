@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const http = require('node:http');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -41,7 +42,7 @@ function transcript(t, workspace, nativeId = CLAUDE, cwd = workspace) {
   return { root, file };
 }
 
-function fixture(t, { bind = true, endpoint = null } = {}) {
+function fixture(t, { bind = true, endpoint = null, preflight = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-claude-'));
   const db = path.join(dir, 'surface.sqlite');
   const state = new SurfaceState(db);
@@ -52,7 +53,7 @@ function fixture(t, { bind = true, endpoint = null } = {}) {
   if (bind) {
     binding = state.bindOrdinaryClaude({ channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId: CLAUDE, workspace: dir, endpoint: socketPath },
       { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' });
-    state.recordOrdinaryPreflight(binding, {
+    if (preflight) state.recordOrdinaryPreflight(binding, {
       file: session.file, sessionId: CLAUDE, threadId: CLAUDE, workspace: dir, endpoint: socketPath, harness: 'claude-code'
     });
   }
@@ -177,7 +178,28 @@ test('ordinary Claude Monitor readiness is unavailable without a live socket and
   await gateway.stop();
 });
 
-test('ordinary Claude Monitor process promotes readiness and revokes it on stop', async t => {
+test('ordinary Claude preflight rejects an unrelated accepting listener', async t => {
+  const f = fixture(t, { preflight: false });
+  const listener = http.createServer((_request, response) => {
+    response.writeHead(202);
+    response.end('accepted');
+  });
+  await new Promise((resolve, reject) => {
+    listener.once('error', reject);
+    listener.listen(f.socketPath, resolve);
+  });
+  t.after(() => listener.close());
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, on() {}, off() {}, async destroy() {} },
+    providers: { claude: { async dispatch() { throw new Error('must not dispatch'); } } }
+  });
+  await assert.rejects(() => gateway.verifyOrdinaryNative(f.binding), /identity|status|Claude channel/);
+  assert.equal(f.state.hasOrdinaryPreflight(f.binding), false);
+  await gateway.stop();
+});
+
+test('old ordinary Claude Monitor stop cannot revoke a successor generation', async t => {
   const f = fixture(t);
   f.state.close();
   const child = spawn(process.execPath, [CLI_PATH, 'claude-monitor', '--state-dir', f.dir, '--db', f.db, '--native-id', CLAUDE, '--socket', f.socketPath], {
@@ -187,8 +209,103 @@ test('ordinary Claude Monitor process promotes readiness and revokes it on stop'
     if (child.exitCode === null) child.kill('SIGTERM');
   });
   const observed = new SurfaceState(f.db);
-  await waitFor(() => fs.existsSync(f.socketPath) && observed.getBinding(f.binding.channelId)?.readiness === READINESS.READY);
-  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.READY);
+  await waitFor(() => fs.existsSync(f.socketPath));
+  const before = observed.getBinding(f.binding.channelId);
+  assert.equal(before.readiness, READINESS.PENDING);
+  const successorState = new SurfaceState(f.db);
+  successorState.unbind(f.binding.channelId);
+  const successor = successorState.rebindOrdinaryClaude({
+    channelId: f.binding.channelId, guildId: 'guild', provider: 'claude', nativeId: CLAUDE, workspace: f.dir, endpoint: f.socketPath
+  }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' });
+  successorState.close();
+  assert.equal(successor.generation, 2);
+  assert.equal(successor.readiness, READINESS.PENDING);
+  child.kill('SIGTERM');
+  await new Promise((resolve, reject) => {
+    child.once('close', resolve);
+    child.once('error', reject);
+  });
+  await waitFor(() => observed.getBinding(f.binding.channelId)?.generation === 2);
+  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.PENDING);
+  observed.close();
+});
+
+test('ordinary Claude Monitor startup preserves an existing recovery-unavailable state', async t => {
+  const f = fixture(t);
+  f.state.markIntakeBoundary(f.binding.channelId, 'unavailable', 'prior recovery failure', null, null, f.binding);
+  f.state.close();
+  const child = spawn(process.execPath, [CLI_PATH, 'claude-monitor', '--state-dir', f.dir, '--db', f.db, '--native-id', CLAUDE, '--socket', f.socketPath], {
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  t.after(async () => {
+    if (child.exitCode === null) child.kill('SIGTERM');
+  });
+  const observed = new SurfaceState(f.db);
+  await waitFor(() => fs.existsSync(f.socketPath) && observed.getBinding(f.binding.channelId)?.readiness !== READINESS.PENDING);
+  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.equal(observed.getIntakeWatermark(f.binding.channelId).state, 'unavailable');
+  child.kill('SIGTERM');
+  await new Promise((resolve, reject) => {
+    child.once('close', resolve);
+    child.once('error', reject);
+  });
+  observed.close();
+});
+
+test('ordinary Claude pre-write endpoint loss demotes only matching binding and holds later intake', async t => {
+  const f = fixture(t);
+  const channel = {
+    id: f.binding.channelId,
+    guildId: 'guild',
+    permissionsFor: () => ({ has: () => true }),
+    async send() { return { id: 'receipt' }; }
+  };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
+    fetchHistory: async () => [],
+    providers: { claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(f.state, id, options) }) }
+  });
+  gateway.historyPermission = () => ({ known: true, allowed: true });
+  const monitor = createClaudeMonitor({ state: f.state, nativeId: CLAUDE, socketPath: f.socketPath, stateDir: f.dir, dbPath: f.db });
+  await monitor.start();
+  const recovery = await gateway.recoverTransport('monitor-ready', 0);
+  assert.equal(recovery.ready, true);
+  assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.READY);
+  await new Promise((resolve, reject) => monitor.server.close(error => error ? reject(error) : resolve()));
+  try { fs.unlinkSync(f.socketPath); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const result = await gateway.consumer.handleMessage({
+    id: 'endpoint-loss', guildId: 'guild', channelId: f.binding.channelId, content: 'lost endpoint',
+    author: { id: 'operator', bot: false }, channel
+  });
+  assert.equal(result.status, 'not_submitted');
+  assert.equal(f.state.getMessage('endpoint-loss').state, MESSAGE_STATES.ACCEPTED);
+  await waitFor(() => f.state.getBinding(f.binding.channelId)?.readiness === READINESS.UNAVAILABLE);
+  const held = await gateway.consumer.intakeMessage({
+    id: 'endpoint-loss-held', guildId: 'guild', channelId: f.binding.channelId, content: 'hold after loss',
+    author: { id: 'operator', bot: false }, channel
+  }, false, null, null, true);
+  assert.equal(held.accepted, true);
+  assert.equal(f.state.claimDispatch('endpoint-loss-held').reason, 'binding-not-ready');
+  assert.equal(f.state.getMessage('endpoint-loss-held').state, MESSAGE_STATES.ACCEPTED);
+  await gateway.stop();
+  try { await monitor.stop(); } catch {}
+});
+
+test('ordinary Claude Monitor leaves readiness promotion to Gateway and revokes it on stop', async t => {
+  const f = fixture(t);
+  f.state.close();
+  const child = spawn(process.execPath, [CLI_PATH, 'claude-monitor', '--state-dir', f.dir, '--db', f.db, '--native-id', CLAUDE, '--socket', f.socketPath], {
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  t.after(async () => {
+    if (child.exitCode === null) child.kill('SIGTERM');
+  });
+  const observed = new SurfaceState(f.db);
+  await waitFor(() => fs.existsSync(f.socketPath));
+  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.PENDING);
   child.kill('SIGTERM');
   await new Promise((resolve, reject) => {
     child.once('close', resolve);

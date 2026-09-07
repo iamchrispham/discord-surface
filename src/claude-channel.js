@@ -92,6 +92,15 @@ class ClaudeChannel {
     if (!binding || !binding.active || binding.provider !== 'claude' || binding.endpoint !== socketPath) {
       throw new Error('Claude channel requires a pre-bound, opted-in native session');
     }
+    this.bindingIdentity = {
+      channelId: binding.channelId,
+      guildId: binding.guildId,
+      provider: binding.provider,
+      nativeId: binding.nativeId,
+      workspace: binding.workspace,
+      endpoint: binding.endpoint,
+      generation: binding.generation
+    };
     this.state = state;
     this.nativeId = nativeId;
     this.socketPath = socketPath;
@@ -152,6 +161,28 @@ class ClaudeChannel {
     try {
       if (typeof this.mcp.connect === 'function') await this.mcp.connect(this.mcp.transportFactory());
       this.server = http.createServer(async (request, response) => {
+        if (request.method === 'GET' && request.url === '/identity') {
+          const current = this.state.getBinding(this.bindingIdentity.channelId);
+          const currentIdentity = current && current.active && current.channelId === this.bindingIdentity.channelId &&
+            current.guildId === this.bindingIdentity.guildId && current.provider === this.bindingIdentity.provider &&
+            current.nativeId === this.bindingIdentity.nativeId && current.workspace === this.bindingIdentity.workspace &&
+            current.endpoint === this.bindingIdentity.endpoint && current.generation === this.bindingIdentity.generation;
+          if (!this.ready || !currentIdentity) {
+            response.writeHead(currentIdentity ? 503 : 409, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({ provider: 'claude', nativeId: this.nativeId, generation: this.bindingIdentity.generation, endpoint: this.socketPath, channelReady: false }));
+            return;
+          }
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({
+            provider: 'claude',
+            nativeId: this.nativeId,
+            generation: this.bindingIdentity.generation,
+            endpoint: this.socketPath,
+            workspace: this.bindingIdentity.workspace,
+            channelReady: true
+          }));
+          return;
+        }
         if (request.method !== 'POST' || request.url !== '/event') {
           response.writeHead(404);
           response.end();

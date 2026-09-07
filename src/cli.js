@@ -1135,12 +1135,16 @@ async function claudeMonitor(args) {
   const { paths, state } = openState(args);
   const nativeId = required(args, 'native-id');
   const socketPath = path.resolve(required(args, 'socket'));
+  const startupBinding = state.findNativeBinding(nativeId, PROVIDERS.CLAUDE);
+  const ordinaryStartupBinding = startupBinding?.active && state.isOrdinaryBinding(startupBinding) ? startupBinding : null;
   let monitor;
   let stopPromise;
   const revokeOrdinaryReadiness = () => {
-    const binding = state.findNativeBinding(nativeId, PROVIDERS.CLAUDE);
-    if (!binding?.active || !state.isOrdinaryBinding(binding)) return;
-    state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, 'Claude Monitor unavailable', binding);
+    if (!ordinaryStartupBinding) return;
+    const current = state.getBinding(ordinaryStartupBinding.channelId);
+    if (!current || !current.active || current.provider !== PROVIDERS.CLAUDE || current.nativeId !== ordinaryStartupBinding.nativeId ||
+      current.workspace !== ordinaryStartupBinding.workspace || current.endpoint !== ordinaryStartupBinding.endpoint) return;
+    state.setBindingReadiness(ordinaryStartupBinding.channelId, READINESS.UNAVAILABLE, 'Claude Monitor unavailable', ordinaryStartupBinding);
   };
   const stop = async () => {
     if (stopPromise) return stopPromise;
@@ -1173,11 +1177,7 @@ async function claudeMonitor(args) {
       onTransportClose: stop
     });
     await monitor.start();
-    const binding = state.findNativeBinding(nativeId, PROVIDERS.CLAUDE);
-    if (binding?.active && state.isOrdinaryBinding(binding)) {
-      state.setBindingReadiness(binding.channelId, READINESS.READY, 'Claude Monitor ready', binding);
-      requestGatewayRecovery(paths);
-    }
+    if (ordinaryStartupBinding) requestGatewayRecovery(paths);
   } catch (error) {
     await stop();
     throw error;

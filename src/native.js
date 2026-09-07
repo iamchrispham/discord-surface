@@ -348,6 +348,69 @@ function probeUnixSocket(socketPath, { timeoutMs = 1000 } = {}) {
   });
 }
 
+function probeClaudeChannel(socketPath, expected, { timeoutMs = 1000, maxBytes = 16384 } = {}) {
+  if (typeof socketPath !== 'string' || !path.isAbsolute(socketPath)) throw new Error('Claude channel endpoint must be absolute');
+  if (!expected || typeof expected !== 'object' || typeof expected.nativeId !== 'string' ||
+    !Number.isInteger(expected.generation) || expected.generation < 1 || expected.endpoint !== socketPath ||
+    typeof expected.workspace !== 'string' || !path.isAbsolute(expected.workspace)) {
+    throw new Error('Claude channel identity probe requires the expected binding');
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let request;
+    const finish = (error, proof = null) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(proof);
+    };
+    try {
+      request = http.request({ agent: false, socketPath, path: '/identity', method: 'GET', timeout: timeoutMs,
+        headers: { accept: 'application/json' } }, response => {
+        let output = '';
+        response.setEncoding('utf8');
+        response.on('data', chunk => {
+          output += chunk;
+          if (Buffer.byteLength(output, 'utf8') > maxBytes) {
+            request.destroy(new Error('Claude channel identity response is too large'));
+          }
+        });
+        response.on('error', finish);
+        response.on('end', () => {
+          if (response.statusCode !== 200) {
+            finish(new Error(`Claude channel identity endpoint returned HTTP ${response.statusCode}`));
+            return;
+          }
+          let identity;
+          try { identity = JSON.parse(output); }
+          catch { finish(new Error('Claude channel identity response is invalid JSON')); return; }
+          if (identity?.provider !== 'claude' || identity.nativeId !== expected.nativeId ||
+            identity.generation !== expected.generation || identity.endpoint !== expected.endpoint ||
+            identity.workspace !== expected.workspace || identity.channelReady !== true) {
+            finish(new Error('Claude channel identity does not match the ordinary binding'));
+            return;
+          }
+          finish(null, {
+            file: socketPath,
+            sessionId: expected.nativeId,
+            threadId: expected.nativeId,
+            workspace: expected.workspace,
+            endpoint: socketPath,
+            harness: 'claude-code',
+            generation: expected.generation,
+            channelReady: true
+          });
+        });
+      });
+      request.setTimeout(timeoutMs, () => request.destroy(new Error('Claude channel identity probe timed out')));
+      request.once('error', finish);
+      request.end();
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
 function readTranscriptTail(fd, size) {
   const parts = [];
   for (let end = size; end > 0;) {
@@ -535,7 +598,7 @@ function postUnixJson(socketPath, body, { timeoutMs = 10000 } = {}) {
   return new Promise((resolve, reject) => {
     const encoded = Buffer.from(JSON.stringify(body));
     let wrote = false;
-    const request = http.request({ socketPath, path: '/event', method: 'POST', timeout: timeoutMs,
+    const request = http.request({ agent: false, socketPath, path: '/event', method: 'POST', timeout: timeoutMs,
       headers: { 'content-type': 'application/json', 'content-length': encoded.length } }, response => {
       let output = '';
       response.setEncoding('utf8');
@@ -559,14 +622,14 @@ class ClaudeProvider {
     try { validateNativeId(message.nativeId); } catch (error) {
       return { status: 'not_submitted', error };
     }
-    if (!message.endpoint) return { status: 'not_submitted', error: new Error('Claude binding has no native channel endpoint') };
+    if (!message.endpoint) return { status: 'not_submitted', endpointUnavailable: true, error: new Error('Claude binding has no native channel endpoint') };
     try {
       const result = await this.post(message.endpoint, claudeEvent(message));
       if (result.statusCode === 202) return { status: 'submitted' };
       if (result.statusCode >= 400 && result.statusCode < 500) return { status: 'not_submitted', error: new Error(`Claude channel rejected event: ${result.statusCode}`) };
       return { status: 'uncertain', error: new Error(`Claude channel returned ${result.statusCode}`) };
     } catch (error) {
-      return { status: error.wrote ? 'uncertain' : 'not_submitted', error };
+      return { status: error.wrote ? 'uncertain' : 'not_submitted', endpointUnavailable: !error.wrote, error };
     }
   }
 
@@ -682,6 +745,7 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
     return { status: 'uncertain', message: state.getMessage(message.id), error };
   }
   if (outcome.status === 'not_submitted') {
+    try { options.onNativeUnavailable?.(message, outcome.error, outcome); } catch {}
     state.markNotSubmitted(message.id, outcome.error);
     return { status: 'not_submitted', message: state.getMessage(message.id), error: outcome.error };
   }
@@ -707,6 +771,7 @@ module.exports = {
   observeCodexReply,
   observeSubmitted,
   postUnixJson,
+  probeClaudeChannel,
   probeUnixSocket,
   readClaudeSessionIdentity,
   readCodexSessionIdentity,

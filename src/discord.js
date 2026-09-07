@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
-const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeUnixSocket, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
+const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
 
@@ -663,25 +663,29 @@ class DiscordGateway {
     this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (async binding => {
       if (binding.provider === 'codex') return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot);
       if (binding.provider === 'claude') {
-        await probeUnixSocket(binding.endpoint);
-        return {
-          file: binding.endpoint,
-          sessionId: binding.nativeId,
-          threadId: binding.nativeId,
+        return probeClaudeChannel(binding.endpoint, {
+          nativeId: binding.nativeId,
+          generation: binding.generation,
           workspace: binding.workspace,
-          endpoint: binding.endpoint,
-          harness: 'claude-code'
-        };
+          endpoint: binding.endpoint
+        });
       }
       throw new Error(`unsupported ordinary provider: ${binding.provider}`);
     });
+    const onNativeUnavailable = observeOptions.onNativeUnavailable;
     this.consumer = createSurfaceConsumer({
       state,
       providers: this.providers,
       sendReply: (message, reply) => this.sendReply(message, reply),
       prepareReply: (messageId, signal) => this.prepareReply(messageId, signal),
       sendTransportReceipt: (message, receipt) => this.sendTransportReceipt(message, receipt),
-      observeOptions
+      observeOptions: {
+        ...observeOptions,
+        onNativeUnavailable: (message, error, outcome) => {
+          try { onNativeUnavailable?.(message, error, outcome); } catch {}
+          this.handleNativeUnavailable(message, error, outcome);
+        }
+      }
     });
     this.boundMessage = message => {
       if (this.stopping) return;
@@ -959,6 +963,20 @@ class DiscordGateway {
 
   isCurrentBinding(binding) {
     return bindingIdentityMatches(binding, this.state.getBinding(binding.channelId));
+  }
+
+  handleNativeUnavailable(message, error, outcome) {
+    if (message?.provider !== 'claude' || outcome?.endpointUnavailable !== true || this.stopping) return;
+    const binding = this.state.getBinding(message.channelId);
+    if (!binding || !binding.active || binding.provider !== 'claude' || binding.nativeId !== message.nativeId ||
+      binding.generation !== message.generation || binding.workspace !== message.workspace || binding.endpoint !== message.endpoint ||
+      !this.state.isOrdinaryBinding(binding)) return;
+    const detail = `Claude endpoint unavailable before event write: ${String(error?.message || error || 'unknown error').slice(0, 900)}`;
+    const demoted = this.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, detail, binding);
+    if (!demoted || this.stopping) return;
+    this.recoverTransport('Claude endpoint unavailable', this.lifecycleEpoch).catch(recoveryError => {
+      this.logger(`Claude endpoint recovery failed: ${recoveryError.message}`);
+    });
   }
 
   async verifyOrdinaryNative(binding) {
