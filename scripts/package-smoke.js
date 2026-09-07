@@ -67,6 +67,10 @@ function runInstalledSmoke(installedRoot, env) {
     assert.equal(emitted.conductorMarkerMatches(marker, { provider: 'codex', conductorId: 'smoke-conductor', repoKey: 'repo:smoke' }), true);
     assert.equal(emitted.topicPresentation(marker).base, marker);
     assert.match(emitted.topicWithReadiness(marker, 'ready', '2026-09-07T00:00:00.000Z'), /readiness=ready/);
+    assert.equal(typeof attachmentFacade.normalizeAttachments, 'function');
+    assert.equal(typeof attachmentEmitted.normalizeAttachments, 'function');
+    const attachment = { url: 'https://example.test/file.txt', filename: 'file.txt', size: 3 };
+    assert.deepEqual(attachmentFacade.normalizeAttachments([attachment]), [{ ...attachment, contentType: null }]);
     assert.equal(attachmentFacade.normalizeAttachments, attachmentEmitted.normalizeAttachments);
     process.stdout.write(JSON.stringify({ cli: true, discordSdk: true, mcpSdk: true, zod: true, emitted: true }));
   `;
@@ -88,15 +92,18 @@ function main() {
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(install, { recursive: true });
   const env = isolatedEnvironment(home);
-  const distPath = path.join(root, 'dist');
+  const packRoot = path.join(scratch, 'pack');
+  fs.mkdirSync(packRoot, { recursive: true });
+  for (const entry of ['README.md', 'package.json', 'package-lock.json', 'src', 'tsconfig.json', 'tsconfig.typecheck.json']) {
+    fs.cpSync(path.join(root, entry), path.join(packRoot, entry), { recursive: true });
+  }
+  fs.symlinkSync(path.join(root, 'node_modules'), path.join(packRoot, 'node_modules'), 'dir');
   try {
-    run(npm, ['run', 'build'], { env });
-    fs.rmSync(distPath, { recursive: true, force: true });
-    const packOutput = run(npm, ['pack', '--json', '--pack-destination', scratch], { env });
+    const packOutput = run(npm, ['pack', '--json', '--pack-destination', scratch], { cwd: packRoot, env });
     const packJsonStart = packOutput.indexOf('[\n');
     if (packJsonStart < 0) throw new Error('npm pack did not return JSON metadata');
     const pack = JSON.parse(packOutput.slice(packJsonStart))[0];
-    assert(fs.existsSync(distPath), 'prepack did not restore dist');
+    assert(fs.existsSync(path.join(packRoot, 'dist')), 'prepack did not restore scratch dist');
     const packagePath = path.join(scratch, pack.filename);
     const files = new Set(pack.files.map(file => file.path));
     for (const required of ['package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts', 'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts']) {
@@ -107,7 +114,6 @@ function main() {
     process.stdout.write(JSON.stringify({ package: packageJson.name, version: packageJson.version, files: pack.files.length }));
     process.stdout.write('\n');
   } finally {
-    run(npm, ['run', 'build'], { env });
     fs.rmSync(scratch, { recursive: true, force: true });
   }
 }
