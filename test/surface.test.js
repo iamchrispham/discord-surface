@@ -537,7 +537,7 @@ test('simulated: native ACK fences rollback, claim, uncertain reconciliation, an
   first.state.markUncertain('ack-uncertain-fence', new Error('delivery uncertain'));
   recordNativeAcknowledgment(first.state, { provider: 'codex', messageId: 'ack-uncertain-fence', nativeId: CODEX_ID, generation: 1 });
   assert.throws(() => first.state.reconcileUncertain('ack-uncertain-fence', 'not_submitted'), /native acknowledgment prevents retrying delivery/);
-  assert.equal(first.state.getMessage('ack-uncertain-fence').state, MESSAGE_STATES.UNCERTAIN);
+  assert.equal(first.state.getMessage('ack-uncertain-fence').state, MESSAGE_STATES.SUBMITTED);
 
   accept('ack-restart-fence');
   first.state.close();
@@ -770,6 +770,26 @@ test('simulated: unknown ACK reaction reaches a terminal outcome after bounded r
     assert.equal(isAcknowledgmentPending(state, 'ack-retry-bound', clock), false);
   } finally {
     Date.now = realNow;
+    state.close();
+  }
+});
+
+test('simulated: ACK rate limits use Discord retry-after timing', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'ack-rate-limit', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('ack-rate-limit');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-rate-limit', nativeId: CODEX_ID, generation: 1 });
+  try {
+    const before = Date.now();
+    const deliver = createAcknowledgmentDelivery({ state, send: async () => {
+      throw Object.assign(new Error('Discord rate limit'), { status: 429, retryAfterMs: 45000 });
+    } });
+    await deliver('ack-rate-limit');
+    const outcome = JSON.parse(state.listReceipts().filter(row => row.discord_id === 'ack-rate-limit' && row.kind === ACK.OUTCOME).at(-1).detail);
+    assert.ok(outcome.retryAt >= before + 45000);
+    assert.ok(outcome.retryAt <= Date.now() + 45000);
+  } finally {
     state.close();
   }
 });
@@ -1201,6 +1221,38 @@ test('simulated: rejected receipt response cancels its body before dropping the 
     assert.equal(fetchCalls, 1);
     assert.equal(bodyCancelled, true);
     assert.equal(state.getTransportReceipt('receipt-body-input').outcome.outcome, 'unknown');
+  } finally {
+    globalThis.fetch = originalFetch;
+    await gateway.stop();
+    state.close();
+  }
+});
+
+test('simulated: native ACK reaction preserves Discord retry-after metadata', async () => {
+  const { state } = fixture();
+  const originalFetch = globalThis.fetch;
+  let bodyCancelled = false;
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 429,
+    headers: { get(name) { return name.toLowerCase() === 'retry-after' ? '4.5' : null; } },
+    body: { cancel() { bodyCancelled = true; return Promise.resolve(); } }
+  });
+  const gateway = new DiscordGateway({
+    state,
+    client: { rest: {}, on() {}, off() {}, async destroy() {} }
+  });
+  gateway.discordToken = 'fake-token';
+  try {
+    await assert.rejects(
+      () => gateway.sendTransportReceipt({ id: 'ack-rate-limit-http', channelId: 'channel-codex' }, { reaction: '👀' }),
+      error => {
+        assert.equal(error.status, 429);
+        assert.equal(error.retryAfterMs, 4500);
+        return true;
+      }
+    );
+    assert.equal(bodyCancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
     await gateway.stop();

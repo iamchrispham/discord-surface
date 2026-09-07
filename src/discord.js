@@ -128,6 +128,24 @@ async function cancelResponseBody(response) {
   } catch {}
 }
 
+async function readRetryAfter(response) {
+  const headerValue = typeof response?.headers?.get === 'function'
+    ? response.headers.get('retry-after') ?? response.headers.get('Retry-After')
+    : response?.headers?.['retry-after'] ?? response?.headers?.['Retry-After'];
+  const headerSeconds = Number(headerValue);
+  if (Number.isFinite(headerSeconds) && headerSeconds >= 0) {
+    return { raw: headerValue, milliseconds: Math.ceil(headerSeconds * 1000) };
+  }
+  try {
+    const body = await response?.json?.();
+    const bodySeconds = Number(body?.retry_after);
+    if (Number.isFinite(bodySeconds) && bodySeconds >= 0) {
+      return { raw: body.retry_after, milliseconds: Math.ceil(bodySeconds * 1000) };
+    }
+  } catch {}
+  return null;
+}
+
 async function sendDiscordMessage({ token, channelId, content, nonce, signal, timeoutMs = RECOVERY_LIMITS.timeoutMs,
   fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] } }) {
   if (typeof fetchImpl !== 'function') throw Object.assign(new Error('Discord message fetch is unavailable'), { outcome: 'not_sent' });
@@ -692,9 +710,14 @@ class DiscordGateway {
               signal: controller.signal
             }).then(async response => {
               if (!response?.ok) {
+                const retryAfter = response?.status === 429 ? await readRetryAfter(response) : null;
                 await cancelResponseBody(response);
                 const error = new Error('Discord acknowledgment request rejected');
                 error.status = response?.status;
+                if (retryAfter) {
+                  error.retryAfter = retryAfter.raw;
+                  error.retryAfterMs = retryAfter.milliseconds;
+                }
                 throw error;
               }
               await cancelResponseBody(response);

@@ -491,6 +491,8 @@ class SurfaceState {
         ON receipts(json_extract(detail, '$.messageId')) WHERE kind='direct-post-outcome';
       CREATE INDEX IF NOT EXISTS direct_post_outcome_nonce_idx
         ON receipts(json_extract(detail, '$.nonce')) WHERE kind='direct-post-outcome';
+      CREATE INDEX IF NOT EXISTS acknowledgment_receipt_idx
+        ON receipts(kind, discord_id, id);
     `);
   }
 
@@ -1866,10 +1868,11 @@ class SurfaceState {
     if (!['submitted', 'not_submitted'].includes(resolution)) throw new BindingError('resolution must be submitted or not_submitted');
     return this.transaction(() => {
       const message = this.getMessage(messageId);
-      if (!message || message.state !== MESSAGE_STATES.UNCERTAIN) throw new BindingError('message is not uncertain');
+      if (!message) throw new BindingError('message is not uncertain');
       if (resolution === 'not_submitted' && this.hasNativeAcknowledgment(message)) {
         throw new BindingError('native acknowledgment prevents retrying delivery');
       }
+      if (message.state !== MESSAGE_STATES.UNCERTAIN) throw new BindingError('message is not uncertain');
       const next = resolution === 'submitted' ? MESSAGE_STATES.SUBMITTED : MESSAGE_STATES.ACCEPTED;
       this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
         .run(next, now(), messageId, MESSAGE_STATES.UNCERTAIN);

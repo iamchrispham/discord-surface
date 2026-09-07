@@ -63,6 +63,14 @@ function recordNativeAcknowledgment(state, { provider, messageId, nativeId, gene
       throw new Error(`native acknowledgment is not accepted in state ${message.state}`);
     }
     state.receipt(messageId, ACK.RECEIVED, { provider, nativeId, generation });
+    if ([MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN].includes(message.state)) {
+      state.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+        .run(MESSAGE_STATES.SUBMITTED, Date.now(), messageId, message.state);
+      state.receipt(messageId, 'dispatch-already-acknowledged', {
+        generation,
+        fromState: message.state
+      });
+    }
     return { recorded: true, duplicate: false, messageId };
   });
 }
@@ -169,13 +177,28 @@ function createAcknowledgmentDelivery({ state, send }) {
           outcome(id, ACK_OUTCOMES.UNKNOWN, { ...retry, terminal: true });
           return;
         }
-        const retryDelay = Math.min(ACK_RETRY.BASE_MS * (2 ** (attempt - 1)), ACK_RETRY.MAX_MS);
-        outcome(id, ACK_OUTCOMES.UNKNOWN, { ...retry, retryAt: Date.now() + retryDelay });
+        const retryAfterMs = status === 429 ? acknowledgmentRetryAfterMs(error) : null;
+        const retryDelay = retryAfterMs === null
+          ? Math.min(ACK_RETRY.BASE_MS * (2 ** (attempt - 1)), ACK_RETRY.MAX_MS)
+          : retryAfterMs;
+        outcome(id, ACK_OUTCOMES.UNKNOWN, {
+          ...retry,
+          ...(retryAfterMs === null ? {} : { retryAfterMs }),
+          retryAt: Date.now() + retryDelay
+        });
       }
     })().finally(() => inFlight.delete(id));
     inFlight.set(id, work);
     return work;
   };
+}
+
+function acknowledgmentRetryAfterMs(error) {
+  const milliseconds = Number(error?.retryAfterMs);
+  if (Number.isFinite(milliseconds) && milliseconds >= 0) return Math.ceil(milliseconds);
+  const seconds = Number(error?.retry_after);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  return null;
 }
 
 function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDelivery({ state, send }), logger = () => {}, watchFactory = fs.watch, rearmMs = 1000 }) {
