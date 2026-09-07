@@ -1,5 +1,5 @@
 const fs = require('node:fs');
-const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, validateCodexSessionIdentity, waitForReply } = require('./native');
+const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
 
@@ -565,7 +565,7 @@ class DiscordGateway {
       codex: new CodexProvider(),
       claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(state, id, options) })
     };
-    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (binding => validateCodexSessionIdentity(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot));
+    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (binding => validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot));
     this.consumer = createSurfaceConsumer({
       state,
       providers: this.providers,

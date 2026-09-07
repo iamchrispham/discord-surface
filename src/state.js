@@ -973,6 +973,28 @@ class SurfaceState {
     if (existing.active && sessionRootMatches) {
       throw new BindingError('ordinary binding tombstone is unavailable for reuse');
     }
+    if (existing.active && !sessionRootMatches && this.hasUnresolved(binding.channelId)) {
+      const input = this.bindingInput({
+        ...binding,
+        channelId: binding.channelId,
+        provider: PROVIDERS.CODEX,
+        conductorId: null,
+        repoKey: null,
+        readiness: READINESS.PENDING,
+        ordinaryIdentity: identity
+      }, existing);
+      return this.transaction(() => {
+        const current = this.getBinding(binding.channelId);
+        if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary root relocation source identity is stale');
+        this.assertLegacyMigrationSafe(binding.channelId);
+        this.db.prepare('UPDATE bindings SET session_root=?, readiness=?, updated_at=? WHERE channel_id=?')
+          .run(input.sessionRoot, READINESS.PENDING, now(), binding.channelId);
+        this.receipt(null, 'ordinary-root-relocated', {
+          channelId: binding.channelId, generation: existing.generation, sessionRoot: input.sessionRoot
+        });
+        return this.getBinding(binding.channelId);
+      });
+    }
     return this.rebind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
   }
 
@@ -1246,6 +1268,34 @@ class SurfaceState {
           .run(channelId, binding.guildId, lastSeenId, lastSeenId, 'pending', String(detail || '').slice(0, 1000) || null, now());
       }
       this.receipt(null, 'intake-baseline', { channelId, lastSeenId, detail });
+      return this.getIntakeWatermark(channelId);
+    });
+  }
+
+  setIntakeCutoff(channelId, guildId, lastSeenId, detail) {
+    assertText(channelId, 'channelId', 128);
+    assertText(guildId, 'guildId', 128);
+    assertText(lastSeenId, 'lastSeenId', 128);
+    return this.transaction(() => {
+      const binding = this.getBinding(channelId);
+      const existing = this.getIntakeWatermark(channelId);
+      const knownGuildId = existing?.guild_id || binding?.guildId;
+      if (knownGuildId && knownGuildId !== guildId) throw new BindingError('intake channel belongs to another guild');
+      const retainedLastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
+        ? existing.last_seen_id
+        : lastSeenId;
+      const retainedRecoveredThrough = existing?.recovered_through_id && compareDiscordIds(existing.recovered_through_id, lastSeenId) > 0
+        ? existing.recovered_through_id
+        : lastSeenId;
+      const cutoffDetail = String(detail || '').slice(0, 1000) || null;
+      if (existing) {
+        this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
+          .run(guildId, retainedLastSeen, retainedRecoveredThrough, 'pending', cutoffDetail, now(), channelId);
+      } else {
+        this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, recovered_through_id, state, detail, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
+          .run(channelId, guildId, retainedLastSeen, retainedRecoveredThrough, 'pending', cutoffDetail, now());
+      }
+      this.receipt(null, 'intake-baseline', { channelId, lastSeenId: retainedLastSeen, detail: cutoffDetail });
       return this.getIntakeWatermark(channelId);
     });
   }

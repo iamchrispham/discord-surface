@@ -8,7 +8,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
 const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('./ordinary-codex');
-const { validateCodexSessionIdentity } = require('./native');
+const { validateCodexSessionIdentityAsync } = require('./native');
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
 
@@ -100,6 +100,17 @@ function ordinaryBindingArgs(args, environment = process.env, channelId = null, 
   });
 }
 
+async function latestChannelMessageId(channel) {
+  const cached = typeof channel?.lastMessageId === 'string' && channel.lastMessageId.length > 0 ? channel.lastMessageId : null;
+  if (typeof channel?.messages?.fetch !== 'function') return cached;
+  const fetched = await channel.messages.fetch({ limit: 1 });
+  let message = null;
+  if (Array.isArray(fetched)) message = fetched[0];
+  else if (typeof fetched?.first === 'function') message = fetched.first();
+  else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
+  return typeof message?.id === 'string' && message.id.length > 0 ? message.id : cached;
+}
+
 function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill } = {}) {
   const runtime = status(paths);
   if (runtime?.state !== 'running' || !runtime.pid) {
@@ -127,7 +138,7 @@ async function ordinaryBind(args, dependencies = {}) {
   const environment = dependencies.environment || process.env;
   const install = dependencies.requireInstalled || requireInstalled;
   const read = dependencies.readSecret || readSecret;
-  const validate = dependencies.validateCodexSessionIdentity || validateCodexSessionIdentity;
+  const validate = dependencies.validateCodexSessionIdentity || validateCodexSessionIdentityAsync;
   const output = dependencies.print || print;
   let client;
   try {
@@ -140,7 +151,7 @@ async function ordinaryBind(args, dependencies = {}) {
     let nativeProofDetail = null;
     let nativeProofError = null;
     try {
-      nativeProofDetail = validate(invocation.sessionId, undefined, sessionRoot);
+      nativeProofDetail = await validate(invocation.sessionId, undefined, sessionRoot);
       if (!nativeProofDetail || typeof nativeProofDetail.workspace !== 'string' || !path.isAbsolute(nativeProofDetail.workspace)) {
         throw new Error('Codex transcript workspace is unavailable');
       }
@@ -174,6 +185,10 @@ async function ordinaryBind(args, dependencies = {}) {
     const existing = state.getBinding(request.channelId);
     const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
+    if (decision !== 'reuse' && !existing?.active) {
+      const cutoff = await latestChannelMessageId(channel);
+      if (cutoff) state.setIntakeCutoff(request.channelId, request.guildId, cutoff, 'ordinary binding adoption cutoff');
+    }
     let binding;
     if (decision === 'reuse') binding = existing;
     else if (decision === 'rebind') binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);

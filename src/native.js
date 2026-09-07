@@ -83,6 +83,65 @@ function walk(dir, result = [], depth = 0) {
   return result;
 }
 
+async function readSessionHeaderAsync(file) {
+  const handle = await fs.promises.open(file, 'r');
+  try {
+    const { size } = await handle.stat();
+    const parts = [];
+    for (let position = 0; position < size;) {
+      const length = Math.min(TRANSCRIPT_BLOCK_BYTES, size - position);
+      const bytes = Buffer.allocUnsafe(length);
+      let read = 0;
+      while (read < length) {
+        const result = await handle.read(bytes, read, length - read, position + read);
+        if (!result.bytesRead) throw new Error('transcript shortened during read');
+        read += result.bytesRead;
+      }
+      const newline = bytes.indexOf(0x0a);
+      parts.push(newline < 0 ? bytes : bytes.subarray(0, newline));
+      if (newline >= 0) break;
+      position += bytes.length;
+    }
+    return Buffer.concat(parts).toString('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+async function* walkAsync(dir, depth = 0) {
+  if (depth > 5) return;
+  let entries;
+  try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) yield* walkAsync(full, depth + 1);
+    else if (entry.isFile() && entry.name.endsWith('.jsonl')) yield full;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
+  validateNativeId(nativeId);
+  const matches = [];
+  for await (const file of walkAsync(root)) {
+    if (!file.includes(nativeId)) continue;
+    try {
+      const row = JSON.parse(await readSessionHeaderAsync(file));
+      const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
+      const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
+      const threadId = typeof payload?.id === 'string' ? payload.id : null;
+      if (sessionId !== nativeId && threadId !== nativeId) continue;
+      matches.push({
+        file, sessionId, threadId,
+        workspace: typeof payload.cwd === 'string' ? payload.cwd : null
+      });
+    } catch {}
+  }
+  if (matches.length === 0) return null;
+  if (matches.length > 1) return { ambiguous: true, files: matches.map(match => match.file) };
+  return matches[0];
+}
+
 function findCodexSessionFile(nativeId, root = sessionRoot()) {
   for (const file of walk(root)) {
     if (!file.includes(nativeId)) continue;
@@ -185,6 +244,19 @@ function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot())
   validateNativeId(nativeId);
   if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
   const identity = readCodexSessionIdentity(nativeId, root);
+  if (!identity) throw new Error('Codex transcript identity is unavailable');
+  if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
+  if (identity.sessionId !== nativeId || identity.threadId !== nativeId) {
+    throw new Error('Codex transcript identity does not match the supplied native UUID');
+  }
+  if (workspace !== undefined && identity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
+  return identity;
+}
+
+async function validateCodexSessionIdentityAsync(nativeId, workspace, root = sessionRoot()) {
+  validateNativeId(nativeId);
+  if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
+  const identity = await readCodexSessionIdentityAsync(nativeId, root);
   if (!identity) throw new Error('Codex transcript identity is unavailable');
   if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
   if (identity.sessionId !== nativeId || identity.threadId !== nativeId) {
@@ -507,10 +579,13 @@ module.exports = {
   observeSubmitted,
   postUnixJson,
   readCodexSessionIdentity,
+  readCodexSessionIdentityAsync,
   readInitialCursor,
   runCodex,
   sessionRoot,
   validateCodexSessionIdentity,
+  validateCodexSessionIdentityAsync,
   waitForReply,
-  walk
+  walk,
+  walkAsync
 };
