@@ -102,6 +102,32 @@ test('channel resolution accepts exact ID, mention, and one name only in the con
   assert.throws(() => resolveExistingChannel('dev', 'guild', [{ ...channels[1], messageCapable: false }]), /message-capable/);
 });
 
+test('ordinary bind rejects ownership loss while recording native proof', async t => {
+  const f = fixture(t);
+  const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  let printed = false;
+  class Client {
+    constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => [channel] } }) }; }
+    async login() {}
+    async destroy() {}
+  }
+  t.mock.method(SurfaceState.prototype, 'recordOrdinaryPreflight', function(binding) {
+    this.unbind(binding.channelId);
+    return null;
+  });
+  await assert.rejects(() => ordinaryBind({ 'state-dir': f.dir, channel: '#dev', workspace: f.dir }, {
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: f.dir },
+    requireInstalled: () => ({ Client, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity: () => ({ file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir }),
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => { printed = true; }
+  }), /binding changed before native proof/);
+  assert.equal(printed, false);
+  assert.equal(f.state.getBinding(channel.id).active, false);
+  assert.equal(f.state.listReceipts().some(row => row.kind === 'ordinary-native-preflight'), false);
+});
+
 test('ordinary bind reuses the exact owner and wakes an already-running Gateway', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-cli-'));
   const db = path.join(dir, 'surface.sqlite');

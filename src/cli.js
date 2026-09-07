@@ -261,8 +261,9 @@ async function ordinaryBind(args, dependencies = {}) {
     } else if (state.hasOrdinaryPreflight(binding)) {
       nativeProof = { status: 'verified', reason: 'Codex transcript proof already recorded' };
     } else if (nativeProofDetail) {
+      let recorded;
       try {
-        state.recordOrdinaryPreflight(binding, {
+        recorded = state.recordOrdinaryPreflight(binding, {
           file: nativeProofDetail.file,
           sessionId: nativeProofDetail.sessionId,
           threadId: nativeProofDetail.threadId,
@@ -272,6 +273,7 @@ async function ordinaryBind(args, dependencies = {}) {
       } catch (error) {
         nativeProof = { status: 'pending', reason: error.message };
       }
+      if (recorded === null) throw new Error('ordinary binding changed before native proof was recorded');
     } else {
       nativeProof = { status: 'pending', reason: nativeProofError?.message || 'Codex transcript proof is pending' };
     }
@@ -320,7 +322,6 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     const config = state.requireConfig();
     const channelSelection = args.channel || args['channel-id'];
     if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
-    if (args.channel && args['channel-id'] && args.channel !== args['channel-id']) throw new Error('--channel and --channel-id must identify the same channel');
     const endpoint = required(args, args.endpoint ? 'endpoint' : 'socket');
     const transcript = required(args, 'transcript');
     if (!path.isAbsolute(endpoint)) throw new Error('Claude endpoint must be an absolute Unix socket path');
@@ -371,7 +372,7 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const boundRequest = { ...request, channelId: channel.id };
     const existing = state.getBinding(channel.id);
-    const decision = ordinaryBindingDecision(existing, boundRequest, existing ? state.isOrdinaryBindingRecord(existing) : false);
+    let decision = ordinaryBindingDecision(existing, boundRequest, existing ? state.isOrdinaryBindingRecord(existing) : false);
     let adoptionCutoff = null;
     if (decision !== 'reuse' && !existing?.active) {
       const cutoff = await latestChannelMessageId(discordChannel);
@@ -408,7 +409,7 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     if (state.hasOrdinaryPreflight(binding)) {
       nativeProof = { status: 'verified', reason: 'Claude transcript proof already recorded' };
     } else {
-      state.recordOrdinaryPreflight(binding, {
+      const recorded = state.recordOrdinaryPreflight(binding, {
         file: identityProof.file,
         sessionId: identityProof.sessionId,
         threadId: identityProof.threadId,
@@ -416,6 +417,7 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
         endpoint,
         harness: 'claude-code'
       });
+      if (!recorded) throw new Error('ordinary Claude binding changed before native proof was recorded');
       nativeProof = { status: 'verified', file: identityProof.file, workspace: identityProof.workspace };
     }
     if (decision === 'reuse' && nativeProof.status === 'verified') {

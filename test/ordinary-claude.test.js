@@ -159,6 +159,26 @@ test('generic rebind cannot mutate ordinary Claude owner or endpoint, while tomb
   assert.equal(rebound.endpoint, f.socketPath);
 });
 
+test('ordinary Claude bind compares resolved channel selectors before mutation', async t => {
+  const f = fixture(t, { bind: false });
+  const channel = { id: '123456789012345678', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const deps = {
+    resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code' }),
+    requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  };
+  const args = { 'state-dir': f.dir, channel: '#dev', 'channel-id': channel.id,
+    transcript: f.session.file, socket: f.socketPath };
+  await assert.rejects(() => ordinaryClaudeBind({ ...args, 'channel-id': '223456789012345678' }, deps));
+  assert.equal(f.state.getBinding(channel.id), null);
+  const bound = await ordinaryClaudeBind(args, deps);
+  assert.equal(bound.binding.channelId, channel.id);
+  assert.equal(bound.binding.nativeId, CLAUDE);
+  assert.equal(bound.nativeProof.status, 'verified');
+});
+
 test('ordinary Claude bind uses exact caller and transcript, reuses and rebinds only same owner', async t => {
   const f = fixture(t, { bind: false });
   const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
