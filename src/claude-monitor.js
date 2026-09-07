@@ -13,10 +13,11 @@ function replyFileFor(directory, messageId, generation) {
   return path.join(path.resolve(directory), '.claude-monitor-replies', `${key}.txt`);
 }
 
-function payloadFileFor(directory, messageId, nativeId, generation, dbPath) {
+function payloadFileFor(directory, messageId, nativeId, generation, dbPath, payloadText = null) {
   const scope = dbPath ? path.resolve(dbPath) : path.resolve(directory);
   const key = crypto.createHash('sha256')
     .update(`${scope}\0${messageId}\0${nativeId}\0${generation}`)
+    .update(payloadText === null ? '' : `\0${crypto.createHash('sha256').update(payloadText).digest('hex')}`)
     .digest('hex')
     .slice(0, 32);
   return path.join(path.resolve(directory), '.cm-e', `${key}.json`);
@@ -160,7 +161,6 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
         throw new Error('Claude Monitor event has no accepted custody');
       }
       const textFile = replyFileFor(stateDir, values.messageId, values.generation);
-      const payloadPath = payloadFileFor(stateDir, values.messageId, values.nativeId, values.generation, dbPath);
       const operation = (async () => {
         const payload = monitorEvent({
           ...values,
@@ -173,7 +173,9 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
           cliPath: path.resolve(cliPath),
           textFile
         });
-        writePayloadFile(payloadPath, JSON.stringify(payload));
+        const payloadText = JSON.stringify(payload);
+        const payloadPath = payloadFileFor(stateDir, values.messageId, values.nativeId, values.generation, dbPath, payloadText);
+        writePayloadFile(payloadPath, payloadText);
         try { await writeStdoutLine(stdout, JSON.stringify(monitorPointer({ ...values, payloadPath }))); }
         catch (error) {
           error.potentiallyDelivered = true;

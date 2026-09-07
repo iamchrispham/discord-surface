@@ -15,6 +15,7 @@ const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/di
 const { deriveLiaisonFacts, rawReceiptFor, runLiaisonDraft, validateLiaisonSelection } = require('../src/liaison');
 const { bindingArgs, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, migrateLegacyTopic, pathsFor, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
+const { payloadFileFor } = require('../src/claude-monitor');
 const { conductorMarkerMatches, topicWithReadiness } = require('../src/topic');
 const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
 const { NotificationSchema } = requireInstalled('@modelcontextprotocol/sdk/types.js');
@@ -28,11 +29,29 @@ const CONDUCTOR_LOCK = '/Users/cphamballer/.claude/skills/conductor-handoff/scri
 const CLI_PATH = path.resolve(__dirname, '../src/cli.js');
 const { readSnapshot, renderSnapshot } = require('../src/snapshot');
 
+function snapshotLadderDir(dir) {
+  const ladderDir = path.join(dir, 'ladder');
+  fs.mkdirSync(ladderDir);
+  fs.writeFileSync(path.join(ladderDir, 'lane_progress_ladder.py'), 'PCT = {"review-wait": 30}\ndef canonical(value):\n    return value\n');
+  return ladderDir;
+}
+
+test('Claude Monitor payload paths change with reply provenance', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-monitor-payload-'));
+  try {
+    const args = [dir, 'message-1', CLAUDE_ID, 1, path.join(dir, 'surface.sqlite')];
+    const target = JSON.stringify({ publicationReferenceTarget: { id: 'target' } });
+    const settled = JSON.stringify({ publicationReference: { id: 'settled' } });
+    assert.equal(payloadFileFor(...args, target), payloadFileFor(...args, target));
+    assert.notEqual(payloadFileFor(...args, target), payloadFileFor(...args, settled));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('simulated: snapshot selects exact owner, preserves owed direction, and does not refresh old facts', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-snapshot-'));
   try {
     const registry = path.join(dir, 'pr-lanes.json');
-    fs.writeFileSync(path.join(dir, 'lane_progress_ladder.py'), 'PCT = {"review-wait": 30}\ndef canonical(value):\n    return value\n');
+    const ladderDir = snapshotLadderDir(dir);
     const now = Date.parse('2026-09-06T06:00:00Z') / 1000;
     const binding = { conductorId: 'tm.md', repoKey: 'repo:tm', provider: 'claude', nativeId: CLAUDE_ID, generation: 2, channelId: 'tm' };
     const context = { repository: 'repo:tm', vendor: 'claude', nativeId: CLAUDE_ID, generation: 2,
@@ -45,7 +64,7 @@ test('simulated: snapshot selects exact owner, preserves owed direction, and doe
       foreign: { ...lane, conductor: 'another-owner' }, wrongRepo: { ...lane, repository: 'repo:elsewhere' },
       otherVendor: { ...lane, vendor: 'codex' }, unknownPhase: { ...lane, phase: 'work happened', next: undefined } };
     fs.writeFileSync(registry, JSON.stringify(data));
-    const fresh = await readSnapshot(binding, { registry, ladderDir: dir, now });
+    const fresh = await readSnapshot(binding, { registry, ladderDir, now });
     assert.equal(fresh.unavailable, undefined);
     assert.deepEqual(fresh.lanes.map(item => item.id), ['mine', 'unknownPhase']);
     assert.equal(fresh.lanes[0].percent, 30);
@@ -54,12 +73,12 @@ test('simulated: snapshot selects exact owner, preserves owed direction, and doe
     assert.equal(fresh.context.owedByOperator.value[0].id, 'device');
     assert.equal(fresh.context.owedToOperator.value[0].id, 'proof');
     assert.equal(fresh.expiresAt, now + 900);
-    const stale = await readSnapshot(binding, { registry, ladderDir: dir, now: now + 901 });
+    const stale = await readSnapshot(binding, { registry, ladderDir, now: now + 901 });
     assert.equal(stale.context.freshness, 'stale');
     assert.equal(stale.context.updated, fresh.context.updated);
     assert.equal(stale.context.owedByOperator.value[0].id, 'device');
     for (const override of [{ repoKey: 'repo:wrong' }, { provider: 'codex' }, { nativeId: SUCCESSOR_ID }, { generation: 3 }]) {
-      const wrong = await readSnapshot({ ...binding, ...override }, { registry, ladderDir: dir, now });
+      const wrong = await readSnapshot({ ...binding, ...override }, { registry, ladderDir, now });
       assert.equal(wrong.context.state, 'wrong-owner');
       assert.equal(wrong.context.owedByOperator.state, 'missing');
       assert.equal(wrong.lanes.some(lane => lane.id === 'mine' || lane.id === 'unknownPhase'), false);
@@ -75,29 +94,45 @@ test('simulated: snapshot distinguishes missing owed facts from explicit none an
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-snapshot-'));
   try {
     const registry = path.join(dir, 'pr-lanes.json');
-    fs.writeFileSync(path.join(dir, 'lane_progress_ladder.py'), 'PCT = {"review-wait": 30}\ndef canonical(value):\n    return value\n');
+    const ladderDir = snapshotLadderDir(dir);
     const now = Date.parse('2026-09-06T06:00:00Z') / 1000;
     const binding = { conductorId: 'surface.md', repoKey: 'projectless:surface', provider: 'codex', nativeId: CODEX_ID, generation: 1, channelId: 'surface' };
     fs.writeFileSync(registry, '{}');
-    const missing = await readSnapshot(binding, { registry, ladderDir: dir, now });
+    const missing = await readSnapshot(binding, { registry, ladderDir, now });
     assert.equal(missing.context.owedByOperator.state, 'missing');
     assert.match(renderSnapshot(missing), /Owed by you: not recorded/);
     const data = { _conductors: { 'surface.md': { repository: binding.repoKey, vendor: 'codex', nativeId: CODEX_ID, generation: 1,
       updated: '2026-09-06T05:59:00Z', owed_by_operator: [], owed_to_operator: [] } } };
     fs.writeFileSync(registry, JSON.stringify(data));
-    const none = await readSnapshot(binding, { registry, ladderDir: dir, now });
+    const none = await readSnapshot(binding, { registry, ladderDir, now });
     assert.equal(none.context.owedByOperator.state, 'recorded');
     assert.deepEqual(none.context.owedByOperator.value, []);
     data.unrelated = { vendor: 'claude', conductor: 'other', phase: 'building' };
     fs.writeFileSync(registry, JSON.stringify(data));
-    const churn = await readSnapshot(binding, { registry, ladderDir: dir, now });
+    const churn = await readSnapshot(binding, { registry, ladderDir, now });
     assert.equal(churn.id, none.id);
     assert.notEqual(churn.source.revision, none.source.revision);
     data._conductors['surface.md'].owed_by_operator = null;
     fs.writeFileSync(registry, JSON.stringify(data));
-    const invalid = await readSnapshot(binding, { registry, ladderDir: dir, now });
+    const invalid = await readSnapshot(binding, { registry, ladderDir, now });
     assert.equal(invalid.context.owedByOperator.state, 'invalid');
     assert.equal(invalid.context.owedByOperator.value, null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('native pickup promotes an ambiguous dispatch to submitted custody', () => {
+  const { dir, state } = fixture();
+  try {
+    bindBoth(state, dir);
+    const messageId = 'acknowledged-uncertain';
+    state.acceptDiscordMessage({ id: messageId, guildId: 'guild-1', channelId: 'channel-codex',
+      authorId: 'operator-1', isBot: false, content: 'work' });
+    assert.equal(state.claimDispatch(messageId).claimed, true);
+    recordNativeAcknowledgment(state, { provider: 'codex', messageId, nativeId: CODEX_ID, generation: 1 });
+    assert.equal(state.markUncertain(messageId, 'late provider result').state, MESSAGE_STATES.SUBMITTED);
+    assert.equal(state.claimDispatch(messageId).claimed, false);
+    state.recordNativeReply({ provider: 'codex', messageId, nativeId: CODEX_ID, generation: 1, text: 'answer' });
+    assert.equal(state.getMessage(messageId).state, MESSAGE_STATES.REPLY_READY);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -111,14 +146,16 @@ test('recognized native input cannot become dispatchable through either retry pa
         state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: `channel-${provider}`,
           authorId: 'operator-1', isBot: false, content: 'work' });
         assert.equal(state.claimDispatch(id).claimed, true);
-        recordNativeAcknowledgment(state, { provider, messageId: id,
-          nativeId: provider === 'codex' ? CODEX_ID : CLAUDE_ID, generation: 1 });
         if (route === 'uncertain') {
           state.markUncertain(id, 'lost queue result');
+          recordNativeAcknowledgment(state, { provider, messageId: id,
+            nativeId: provider === 'codex' ? CODEX_ID : CLAUDE_ID, generation: 1 });
           assert.throws(() => state.reconcileUncertain(id, 'not_submitted'), /acknowledg/);
           assert.equal(state.getMessage(id).state, MESSAGE_STATES.UNCERTAIN);
           state.reconcileUncertain(id, 'submitted');
         } else {
+          recordNativeAcknowledgment(state, { provider, messageId: id,
+            nativeId: provider === 'codex' ? CODEX_ID : CLAUDE_ID, generation: 1 });
           state.markNotSubmitted(id, 'late rejection');
           assert.equal(state.getMessage(id).state, MESSAGE_STATES.SUBMITTED);
         }

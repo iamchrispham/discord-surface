@@ -1503,7 +1503,7 @@ class SurfaceState {
       const message = this.getMessage(messageId);
       if (!message) throw new BindingError('message is unknown');
       if (message.state !== expected) return message;
-      if (next === MESSAGE_STATES.ACCEPTED && this.hasNativeAcknowledgment(message)) {
+      if ([MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.UNCERTAIN].includes(next) && this.hasNativeAcknowledgment(message)) {
         next = MESSAGE_STATES.SUBMITTED;
         kind = 'dispatch-already-acknowledged';
         error = null;
