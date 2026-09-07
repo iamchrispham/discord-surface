@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
-const { createBindingWakeController, GATEWAY_CAPABILITIES, ordinaryBind } = require('../src/cli');
+const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordinaryBind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
 const { validateCodexSessionIdentity } = require('../src/native');
 const { SurfaceState, READINESS, StaleGenerationError } = require('../src/state');
@@ -152,6 +152,10 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
       channelId: channel.id, guildId: 'guild', provider: 'codex', nativeId: OTHER, workspace: dir
     }, { sessionId: OTHER, threadId: OTHER }), /owner changed/);
   } finally { tombstone.close(); }
+  await assert.rejects(() => ordinaryBind({ ...args }, {
+    ...dependencies,
+    environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: dir }
+  }), /already bound to another owner/);
   const rebound = await ordinaryBind(args, dependencies);
   assert.equal(rebound.reused, false);
   assert.equal(rebound.binding.generation, 2);
@@ -507,13 +511,14 @@ test('ordinary root relocation reopens a drained terminal intake watermark', t =
   assert.equal(watermark.gap_to, null);
 });
 
-test('ordinary bind reclaims a drained tombstone for a verified successor', t => {
+test('ordinary bind rejects a successor and explicit tombstone handoff transfers custody', t => {
   const f = fixture(t);
   const originalRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-original-root-'));
   const binding = f.state.bindOrdinary({
     channelId: 'ordinary-channel', guildId: 'guild', provider: 'codex', nativeId: CODEX,
     workspace: f.dir, sessionRoot: originalRoot
   }, f.identity);
+  f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary handoff baseline');
   f.state.unbind(binding.channelId);
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-workspace-'));
   const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-root-'));
@@ -529,17 +534,214 @@ test('ordinary bind reclaims a drained tombstone for a verified successor', t =>
   };
   const proof = {
     file: path.join(successorRoot, `${OTHER}.jsonl`), sessionId: OTHER, threadId: OTHER,
-    workspace: successorWorkspace, sessionRoot: undefined
+    workspace: successorWorkspace, sessionRoot: successorRoot
   };
   const tombstone = f.state.getBinding(binding.channelId);
   assert.throws(() => ordinaryBindingDecision(tombstone, request, true), /already bound/);
-  assert.equal(ordinaryBindingDecision(tombstone, request, true, proof), 'rebind');
-  const rebound = f.state.rebindOrdinary(request, request.identity, proof);
+  assert.throws(() => f.state.rebindOrdinary(request, request.identity, proof), /owner changed/);
+  const rebound = f.state.handoffOrdinary({
+    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-tombstone-handoff', identity: request.identity, nativeProof: proof
+  });
   assert.equal(rebound.active, true);
   assert.equal(rebound.nativeId, OTHER);
   assert.equal(rebound.workspace, successorWorkspace);
-  assert.equal(rebound.sessionRoot, null);
+  assert.equal(rebound.sessionRoot, successorRoot);
   assert.equal(rebound.generation, 2);
+  assert.equal(rebound.readiness, READINESS.PENDING);
+  assert.equal(rebound.conductorId, null);
+  assert.equal(rebound.repoKey, null);
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).last_seen_id, '100');
+  const retry = f.state.handoffOrdinary({
+    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-tombstone-handoff', identity: request.identity, nativeProof: proof
+  });
+  assert.equal(retry.handoffReconciled, true);
+  assert.equal(retry.generation, 2);
+  assert.equal(f.state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff').length, 1);
+  assert.equal(f.state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff-retry').length, 1);
+});
+
+test('ordinary handoff transfers an active drained source and holds stale, unresolved, and collision cases', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary active handoff baseline');
+  const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-active-successor-workspace-'));
+  const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-active-successor-root-'));
+  t.after(() => {
+    fs.rmSync(successorWorkspace, { recursive: true, force: true });
+    fs.rmSync(successorRoot, { recursive: true, force: true });
+  });
+  const proof = {
+    file: path.join(successorRoot, `${OTHER}.jsonl`), sessionId: OTHER, threadId: OTHER,
+    workspace: successorWorkspace, sessionRoot: successorRoot
+  };
+  assert.throws(() => f.state.handoffOrdinary({
+    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 2,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-stale-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
+  }), /stale/);
+  assert.equal(f.state.getBinding(binding.channelId).nativeId, CODEX);
+  assert.throws(() => f.state.handoffOrdinary({
+    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-proof-handoff', identity: { sessionId: OTHER, threadId: OTHER },
+    nativeProof: { ...proof, workspace: f.dir }
+  }), /transcript proof/);
+  assert.equal(f.state.getBinding(binding.channelId).generation, 1);
+  const transferred = f.state.handoffOrdinary({
+    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-active-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
+  });
+  assert.equal(transferred.active, true);
+  assert.equal(transferred.nativeId, OTHER);
+  assert.equal(transferred.generation, 2);
+  assert.equal(transferred.readiness, READINESS.PENDING);
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).last_seen_id, '100');
+  const retry = f.state.handoffOrdinary({
+    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-active-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
+  });
+  assert.equal(retry.handoffReconciled, true);
+  assert.equal(retry.generation, 2);
+
+  const unresolvedFixture = fixture(t);
+  const unresolvedBinding = ordinary(unresolvedFixture, 'ordinary-unresolved-source');
+  const accepted = unresolvedFixture.state.acceptDiscordMessage({
+    id: 'ordinary-handoff-pending', guildId: 'guild', channelId: unresolvedBinding.channelId,
+    authorId: 'operator', isBot: false, content: 'held'
+  }, { ready: true });
+  assert.equal(accepted.accepted, true);
+  assert.throws(() => unresolvedFixture.state.handoffOrdinary({
+    channelId: unresolvedBinding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-unresolved-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
+  }), /unresolved/);
+  assert.equal(unresolvedFixture.state.getBinding(unresolvedBinding.channelId).nativeId, CODEX);
+  const collisionFixture = fixture(t);
+  const collisionBinding = ordinary(collisionFixture, 'ordinary-collision-source');
+  const second = collisionFixture.state.bindOrdinary({
+    channelId: 'ordinary-collision-channel', guildId: 'guild', provider: 'codex', nativeId: OTHER,
+    workspace: successorWorkspace, sessionRoot: successorRoot
+  }, { sessionId: OTHER, threadId: OTHER });
+  assert.equal(second.active, true);
+  assert.throws(() => collisionFixture.state.handoffOrdinary({
+    channelId: collisionBinding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-collision-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
+  }), /already owned/);
+  assert.equal(collisionFixture.state.getBinding(collisionBinding.channelId).generation, 1);
+
+  const missingReceiptFixture = fixture(t);
+  const missingReceiptBinding = ordinary(missingReceiptFixture, 'ordinary-missing-unbound');
+  missingReceiptFixture.state.db.prepare('UPDATE bindings SET active=0 WHERE channel_id=?').run(missingReceiptBinding.channelId);
+  assert.throws(() => missingReceiptFixture.state.handoffOrdinary({
+    channelId: missingReceiptBinding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-missing-unbound-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
+  }), /no matching unbind receipt/);
+  assert.equal(missingReceiptFixture.state.getBinding(missingReceiptBinding.channelId).active, false);
+  assert.equal(missingReceiptFixture.state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff').length, 0);
+});
+
+test('explicit ordinary handoff validates the CLI proof and wakes generation-specific Gateway recovery', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-handoff-cli-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-handoff-cli-workspace-'));
+  const session = transcript(t, successorWorkspace, OTHER);
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  const original = setup.bindOrdinary({
+    channelId: '123456789012345678', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    workspace: dir
+  }, { sessionId: CODEX, threadId: CODEX });
+  setup.setIntakeCutoff(original.channelId, 'guild', '100', 'ordinary CLI handoff baseline');
+  setup.unbind(original.channelId);
+  setup.close();
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(successorWorkspace, { recursive: true, force: true });
+  });
+
+  const channel = { id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true };
+  const wakeSignals = [];
+  const output = [];
+  let proofArguments;
+  class FakeClient {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: { fetch: async () => channel } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  const result = await handoffInternal({
+    ordinary: true, 'state-dir': dir, provider: 'codex', 'channel-id': original.channelId,
+    'from-native-id': CODEX, 'from-generation': '1', 'native-id': OTHER,
+    workspace: successorWorkspace, 'session-root': session.root, 'handoff-id': 'ordinary-cli-handoff'
+  }, {
+    environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: successorWorkspace },
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity: async (...args) => {
+      proofArguments = args;
+      return { file: session.file, sessionId: OTHER, threadId: OTHER, workspace: successorWorkspace };
+    },
+    requestGatewayRecovery: (_paths, options) => {
+      const runtime = options.status(_paths);
+      options.kill(runtime.pid, 'SIGUSR2');
+      return { requested: true, pid: runtime.pid, signal: 'SIGUSR2' };
+    },
+    gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] }),
+    killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
+    print: value => output.push(value)
+  });
+  assert.equal(result.binding.generation, 2);
+  assert.equal(result.binding.nativeId, OTHER);
+  assert.equal(result.binding.readiness, READINESS.PENDING);
+  assert.deepEqual(proofArguments, [OTHER, successorWorkspace, session.root]);
+  assert.deepEqual(wakeSignals, [{ pid: 4242, signal: 'SIGUSR2' }]);
+  assert.equal(output[0].ordinary, true);
+
+  const recoveredState = new SurfaceState(db);
+  const recoveredBinding = recoveredState.getBinding(original.channelId);
+  assert.equal(recoveredBinding.generation, 2);
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).last_seen_id, '100');
+  let preflights = 0;
+  const gatewayChannel = {
+    id: original.channelId, guildId: 'guild', topic: null,
+    permissionsFor: () => ({ has: () => true })
+  };
+  const gatewayClient = {
+    user: { id: 'bot' },
+    channels: { fetch: async () => gatewayChannel },
+    on() {}, off() {}, async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state: recoveredState,
+    client: gatewayClient,
+    fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { return { status: 'submitted' }; } } },
+    recoveryOptions: {
+      codexSessionRoot: session.root,
+      ordinaryNativePreflight: async current => {
+        preflights += 1;
+        assert.equal(current.generation, 2);
+        return validateCodexSessionIdentity(current.nativeId, current.workspace, session.root);
+      }
+    }
+  });
+  const recovery = await gateway.recoverTransport('ordinary-handoff', 0);
+  assert.equal(recovery.ready, true);
+  assert.equal(preflights, 1);
+  assert.equal(recoveredState.getBinding(original.channelId).readiness, READINESS.READY);
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).state, 'ready');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '100');
+  await gateway.stop();
+  recoveredState.close();
 });
 
 test('native preflight requires exact session metadata and workspace', t => {

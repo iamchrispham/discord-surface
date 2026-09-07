@@ -966,15 +966,10 @@ class SurfaceState {
       typeof nativeProof.file === 'string' && path.isAbsolute(nativeProof.file) &&
       nativeProof.sessionId === existing.nativeId && nativeProof.threadId === existing.nativeId &&
       nativeProof.workspace === existing.workspace && nativeProof.sessionRoot === requestedSessionRoot);
-    const verifiedSuccessor = !existing.active && Boolean(nativeProof &&
-      typeof nativeProof.file === 'string' && path.isAbsolute(nativeProof.file) &&
-      nativeProof.sessionId === binding.nativeId && nativeProof.threadId === binding.nativeId &&
-      nativeProof.workspace === binding.workspace && (nativeProof.sessionRoot || null) === (requestedSessionRoot || null) &&
-      identity.sessionId === binding.nativeId && identity.threadId === binding.nativeId);
     const sameOwner = existing.nativeId === binding.nativeId && existing.workspace === binding.workspace &&
       identity.sessionId === existing.nativeId && identity.threadId === existing.nativeId && verifiedRootRelocation;
     if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CODEX ||
-      (!sameOwner && !verifiedSuccessor)) {
+      !sameOwner) {
       throw new BindingError('ordinary binding owner changed; use explicit handoff');
     }
     if (existing.active && sessionRootMatches) {
@@ -1011,8 +1006,7 @@ class SurfaceState {
       provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity
     };
     return this.rebind(rebound, {
-      resetIntake: !sessionRootMatches || verifiedSuccessor,
-      ordinarySuccessorProof: verifiedSuccessor ? nativeProof : null,
+      resetIntake: !sessionRootMatches,
       sessionRootOverride: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : undefined
     });
   }
@@ -1063,7 +1057,7 @@ class SurfaceState {
     });
   }
 
-  rebind(binding, { resetIntake = false, ordinarySuccessorProof = null, sessionRootOverride = undefined } = {}) {
+  rebind(binding, { resetIntake = false, sessionRootOverride = undefined } = {}) {
     const channelId = assertText(binding.channelId, 'channelId', 128);
     const existing = this.getBinding(channelId);
     if (!existing) throw new BindingError('channel is not bound');
@@ -1081,15 +1075,10 @@ class SurfaceState {
     const input = this.bindingInput({ ...binding, channelId }, existing);
     if (sessionRootOverride !== undefined) input.sessionRoot = sessionRootOverride;
     const ordinary = this.isOrdinaryBindingRecord(existing);
-    const verifiedOrdinarySuccessor = ordinary && !existing.active && ordinarySuccessorProof &&
-      typeof ordinarySuccessorProof.file === 'string' && path.isAbsolute(ordinarySuccessorProof.file) &&
-      ordinarySuccessorProof.sessionId === input.nativeId && ordinarySuccessorProof.threadId === input.nativeId &&
-      ordinarySuccessorProof.workspace === input.workspace &&
-      (ordinarySuccessorProof.sessionRoot || null) === (input.sessionRoot || null) &&
-      ordinaryIdentity?.sessionId === input.nativeId && ordinaryIdentity?.threadId === input.nativeId;
+    const ordinaryIdentityMatches = input.nativeId === existing.nativeId &&
+      ordinaryIdentity?.sessionId === existing.nativeId && ordinaryIdentity?.threadId === existing.nativeId;
     if (ordinary && (!ordinaryIdentity || input.provider !== PROVIDERS.CODEX || input.conductorId || input.repoKey ||
-      (!verifiedOrdinarySuccessor && (input.nativeId !== existing.nativeId || ordinaryIdentity.sessionId !== existing.nativeId ||
-      ordinaryIdentity.threadId !== existing.nativeId)))) {
+      !ordinaryIdentityMatches)) {
       throw new BindingError('ordinary bindings require matching invocation identity');
     }
     this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
@@ -1184,6 +1173,112 @@ class SurfaceState {
       if (detail.handoffId === handoffId) return detail;
     }
     return null;
+  }
+
+  findOrdinaryHandoff(handoffId) {
+    assertText(handoffId, 'handoffId', 256);
+    const rows = this.db.prepare("SELECT detail FROM receipts WHERE kind='ordinary-handoff' ORDER BY id DESC").all();
+    for (const row of rows) {
+      const detail = parseJson(row.detail, {});
+      if (detail.handoffId === handoffId) return detail;
+    }
+    return null;
+  }
+
+  hasUnboundReceipt(channelId, generation) {
+    const rows = this.db.prepare("SELECT detail FROM receipts WHERE kind='unbound' ORDER BY id DESC").all();
+    return rows.some(row => {
+      const detail = parseJson(row.detail, {});
+      return detail.channelId === channelId && detail.generation === generation;
+    });
+  }
+
+  handoffOrdinary({ channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof }) {
+    if (provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff requires the Codex provider');
+    assertUuid(fromNativeId, 'fromNativeId');
+    assertUuid(nativeId, 'nativeId');
+    if (!Number.isInteger(fromGeneration) || fromGeneration < 1) throw new BindingError('fromGeneration must be a positive integer');
+    assertText(handoffId, 'handoffId', 256);
+    if (!identity || identity.sessionId !== nativeId || identity.threadId !== nativeId) {
+      throw new BindingError('ordinary handoff identity does not match the successor native session');
+    }
+    assertUuid(identity.sessionId, 'sessionId');
+    assertUuid(identity.threadId, 'threadId');
+    assertText(workspace, 'workspace', 4096);
+    if (!path.isAbsolute(workspace)) throw new BindingError('workspace must be absolute');
+    const existing = this.getBinding(channelId);
+    if (!existing || !this.isOrdinaryBindingRecord(existing)) throw new BindingError('ordinary handoff source is unavailable');
+    const requestedSessionRoot = sessionRoot === undefined ? existing.sessionRoot : sessionRoot;
+    if (requestedSessionRoot !== null && requestedSessionRoot !== undefined) {
+      assertText(requestedSessionRoot, 'sessionRoot', 4096);
+      if (!path.isAbsolute(requestedSessionRoot)) throw new BindingError('sessionRoot must be absolute');
+    }
+    const input = this.bindingInput({
+      channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId, workspace,
+      sessionRoot: requestedSessionRoot, conductorId: null, repoKey: null, readiness: READINESS.PENDING
+    }, existing);
+    if (!nativeProof || typeof nativeProof.file !== 'string' || !path.isAbsolute(nativeProof.file) ||
+      nativeProof.sessionId !== nativeId || nativeProof.threadId !== nativeId || nativeProof.workspace !== workspace ||
+      (nativeProof.sessionRoot || null) !== (input.sessionRoot || null)) {
+      throw new BindingError('ordinary handoff requires a matching Codex transcript proof');
+    }
+    const previous = this.findOrdinaryHandoff(handoffId);
+    if (previous) {
+      const sameRequest = previous.channelId === channelId && previous.provider === PROVIDERS.CODEX &&
+        previous.fromNativeId === fromNativeId && previous.fromGeneration === fromGeneration &&
+        previous.nativeId === nativeId &&
+        previous.generation === existing.generation && existing.active && existing.nativeId === nativeId &&
+        existing.generation === fromGeneration + 1 && existing.workspace === input.workspace &&
+        (existing.sessionRoot || null) === (input.sessionRoot || null);
+      if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
+      return this.transaction(() => {
+        this.receipt(null, 'ordinary-handoff-retry', {
+          channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: existing.generation
+        });
+        return { ...existing, handoffReconciled: true };
+      });
+    }
+    if (existing.provider !== PROVIDERS.CODEX || existing.conductorId || existing.repoKey ||
+      existing.nativeId !== fromNativeId || existing.generation !== fromGeneration) {
+      throw new StaleGenerationError('ordinary handoff source identity is stale');
+    }
+    if (nativeId === fromNativeId) throw new BindingError('successor handoff requires a different native session UUID');
+    if (!existing.active && !this.hasUnboundReceipt(channelId, fromGeneration)) {
+      throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
+    }
+    if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+    this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+    return this.transaction(() => {
+      const current = this.getBinding(channelId);
+      if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary handoff source identity is stale');
+      if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
+        current.nativeId !== fromNativeId || current.generation !== fromGeneration) {
+        throw new StaleGenerationError('ordinary handoff source identity is stale');
+      }
+      if (!current.active && !this.hasUnboundReceipt(channelId, fromGeneration)) {
+        throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
+      }
+      if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+      this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+      this.assertLegacyMigrationSafe(channelId);
+      const generation = existing.generation + 1;
+      this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
+        WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
+        .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, now(), channelId,
+          PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
+      this.receipt(null, 'ordinary-handoff', {
+        channelId, provider: PROVIDERS.CODEX, handoffId,
+        fromNativeId, fromGeneration, fromActive: existing.active,
+        nativeId: input.nativeId, generation, workspace: input.workspace, sessionRoot: input.sessionRoot,
+        sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
+      });
+      this.receipt(null, 'ordinary-bound', {
+        channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId: input.nativeId,
+        workspace: input.workspace, generation, sessionRoot: input.sessionRoot,
+        sessionId: identity.sessionId, threadId: identity.threadId
+      });
+      return this.getBinding(channelId);
+    });
   }
 
   handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId }) {

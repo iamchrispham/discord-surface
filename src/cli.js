@@ -8,7 +8,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
 const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('./ordinary-codex');
-const { validateCodexSessionIdentityAsync } = require('./native');
+const { sessionRoot: codexSessionRoot, validateCodexSessionIdentityAsync } = require('./native');
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
 
@@ -196,9 +196,10 @@ async function ordinaryBind(args, dependencies = {}) {
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const existing = state.getBinding(channel.id);
-    const ordinarySuccessor = existing && !existing.active && existing.provider === PROVIDERS.CODEX &&
-      !existing.conductorId && !existing.repoKey && invocation.sessionId !== existing.nativeId;
-    const validationRoot = sessionRoot || (ordinarySuccessor ? undefined : existing?.sessionRoot);
+    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
+      throw new Error('channel is already bound to another owner; use explicit handoff');
+    }
+    const validationRoot = sessionRoot || existing?.sessionRoot;
     if (!sessionRoot) {
       const proof = await validateNativeProof(validationRoot);
       nativeProofDetail = proof.detail;
@@ -646,8 +647,78 @@ function provision(args) {
   process.exitCode = result.status ?? 1;
 }
 
-async function handoffInternal(args) {
-  if (fromLockRequested(args)) return handoffFromLockInternal(args);
+async function ordinaryHandoffInternal(args, dependencies = {}) {
+  const environment = dependencies.environment || process.env;
+  const install = dependencies.requireInstalled || requireInstalled;
+  const read = dependencies.readSecret || readSecret;
+  const validate = dependencies.validateCodexSessionIdentity || validateCodexSessionIdentityAsync;
+  const wake = dependencies.requestGatewayRecovery || requestGatewayRecovery;
+  const output = dependencies.print || print;
+  const provider = required(args, 'provider');
+  if (provider !== PROVIDERS.CODEX) throw new Error('ordinary handoff requires --provider codex');
+  const fromNativeId = required(args, 'from-native-id');
+  const nativeId = required(args, 'native-id');
+  validateNativeId(fromNativeId);
+  validateNativeId(nativeId);
+  const fromGeneration = Number(required(args, 'from-generation'));
+  if (!Number.isInteger(fromGeneration) || fromGeneration < 1) throw new Error('from-generation must be a positive integer');
+  const workspace = path.resolve(required(args, 'workspace'));
+  const channelId = required(args, 'channel-id');
+  const handoffId = required(args, 'handoff-id');
+  const requestedSessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
+  const validationRoot = requestedSessionRoot || (dependencies.codexSessionRoot || codexSessionRoot)();
+  const { paths, state } = openState(args);
+  let client;
+  try {
+    const config = state.requireConfig();
+    const current = state.getBinding(channelId);
+    if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey) {
+      throw new Error('ordinary handoff source is unavailable');
+    }
+    const invocation = resolveInvocationIdentity(environment, workspace);
+    if (invocation.sessionId !== nativeId || invocation.threadId !== nativeId) {
+      throw new Error('ordinary handoff successor identity does not match the native UUID');
+    }
+    const nativeProof = await validate(nativeId, workspace, validationRoot);
+    const { Client, GatewayIntentBits } = install('discord.js');
+    client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    await client.login(read(config.secretFile));
+    const guild = await client.guilds.fetch(config.guildId);
+    const channel = await guild.channels.fetch(channelId);
+    const channelInfo = resolveExistingChannel(channelId, config.guildId, [{
+      id: channel?.id || channelId,
+      guildId: channel?.guildId || config.guildId,
+      name: channel?.name || null,
+      messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
+    }]);
+    if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
+    const binding = state.handoffOrdinary({
+      channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
+      sessionRoot: validationRoot, handoffId,
+      identity: { sessionId: nativeProof.sessionId, threadId: nativeProof.threadId },
+      nativeProof: { ...nativeProof, sessionRoot: validationRoot }
+    });
+    const gatewayWake = wake(paths, {
+      status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+      kill: dependencies.killProcess || process.kill
+    });
+    output({ handedOff: true, ordinary: true, channelId, handoffId,
+      url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding,
+      readiness: binding.readiness, gatewayWake });
+    return { binding, gatewayWake, handoffReconciled: Boolean(binding.handoffReconciled) };
+  } finally {
+    await client?.destroy();
+    state.close();
+  }
+}
+
+async function handoffInternal(args, dependencies = {}) {
+  const ordinaryRequested = args.ordinary === true || args.ordinary === 'true';
+  if (fromLockRequested(args)) {
+    if (ordinaryRequested) throw new Error('ordinary handoff cannot use --from-lock');
+    return handoffFromLockInternal(args);
+  }
+  if (ordinaryRequested) return ordinaryHandoffInternal(args, dependencies);
   const provider = required(args, 'provider');
   const conductorId = required(args, 'conductor-id');
   const repoKey = required(args, 'repo-key');
@@ -1172,4 +1243,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, ordinaryHandoffInternal, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery };
