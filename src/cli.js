@@ -725,7 +725,6 @@ async function runRuntime(args) {
   const config = state.requireConfig();
   const recoveryCutoff = new Date().toISOString();
   state.recoverAfterRestart();
-  writePid(paths.pid, config.guildId, paths.stateDir);
   let gateway;
   let gatewayReady = false;
   let stopping = false;
@@ -753,8 +752,8 @@ async function runRuntime(args) {
     const pendingBindingWake = bindingWakePromise;
     try { await gateway?.stop(); } finally {
       await pendingBindingWake;
-      process.removeListener('SIGUSR2', wakeBinding);
       try { fs.unlinkSync(paths.pid); } catch {}
+      process.removeListener('SIGUSR2', wakeBinding);
       state.close();
     }
   };
@@ -762,6 +761,7 @@ async function runRuntime(args) {
   process.once('SIGTERM', () => stop().then(() => process.exit(0)));
   process.on('SIGUSR2', wakeBinding);
   try {
+    writePid(paths.pid, config.guildId, paths.stateDir);
     gateway = new DiscordGateway({ state, observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) } });
     await gateway.start(config.secretFile);
     await gateway.reconcilePending(recoveryCutoff);

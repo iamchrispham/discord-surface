@@ -1495,6 +1495,7 @@ require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
   } finally {
     matching.kill('SIGTERM');
     await waitForProcessGone(matching.pid);
+    assert.equal(fs.existsSync(paths.pid), false);
   }
 
   fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
