@@ -67,14 +67,19 @@ function recordNativeAcknowledgment(state, { provider, messageId, nativeId, gene
   });
 }
 
-function pendingAcknowledgments(state, now = Date.now()) {
+function pendingAcknowledgments(state, now = Date.now(), throughId = null) {
   const outcomes = new Map(latestAcknowledgmentOutcomes(state).map(row => [row.discord_id, parseReceiptDetail(row.detail)]));
   const seen = new Set();
-  return state.db.prepare(`SELECT r.discord_id FROM receipts r
+  const cutoff = throughId === null ? '' : ' AND r.id<=?';
+  const statement = state.db.prepare(`SELECT r.discord_id FROM receipts r
     WHERE r.kind=? AND NOT EXISTS
     (SELECT 1 FROM receipts done WHERE done.discord_id=r.discord_id AND done.kind=?
       AND done.detail NOT LIKE ?)
-    ORDER BY r.id`).all(ACK.RECEIVED, ACK.OUTCOME, '%"outcome":"unknown"%')
+    ${cutoff} ORDER BY r.id`);
+  const rows = throughId === null
+    ? statement.all(ACK.RECEIVED, ACK.OUTCOME, '%"outcome":"unknown"%')
+    : statement.all(ACK.RECEIVED, ACK.OUTCOME, '%"outcome":"unknown"%', throughId);
+  return rows
     .filter(row => {
       if (seen.has(row.discord_id)) return false;
       seen.add(row.discord_id);
@@ -197,12 +202,13 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
   }
 
   function initialPending(now) {
-    const ids = pendingAcknowledgments(state, now);
+    const watermark = latestReceiptId(state);
+    const ids = pendingAcknowledgments(state, now, watermark);
     for (const row of latestAcknowledgmentOutcomes(state)) {
       const detail = parseReceiptDetail(row.detail);
       if (retryableUnknown(detail)) retryAtByMessage.set(row.discord_id, detail.retryAt);
     }
-    receiptCursor = latestReceiptId(state);
+    receiptCursor = watermark;
     return ids;
   }
 
