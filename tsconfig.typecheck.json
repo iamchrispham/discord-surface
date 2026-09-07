@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/topic.ts", "src/attachments.ts", "test/topic-types.ts", "test/types/attachments.ts"]
+}
