@@ -82,13 +82,9 @@ def snapshot(binding, registry, ladder_dir, now):
     }
     native_id = binding["nativeId"]
     owner_tokens = {owner, native_id, "session-" + binding["provider"] + "-" + native_id}
-    if binding["provider"] == "claude":
-        owner_tokens.add("session-claude-" + native_id[:8])
     lanes = []
     for key, lane in data.items():
         if key.startswith("_") or not isinstance(lane, dict) or lane.get("vendor") != binding["provider"]:
-            continue
-        if lane.get("conductor") not in owner_tokens:
             continue
         repo = lane.get("repository", lane.get("repoKey"))
         lane_native_id = lane.get("nativeId", lane.get("native_id"))
@@ -96,6 +92,10 @@ def snapshot(binding, registry, ladder_dir, now):
         lane_identity_present = any(key in lane for key in ("nativeId", "native_id", "generation"))
         lane_proves_binding = (lane_native_id == native_id and type(lane_generation) is int
                                and lane_generation == binding["generation"])
+        abbreviated_owner = (binding["provider"] == "claude" and
+                             lane.get("conductor") == "session-claude-" + native_id[:8])
+        if lane.get("conductor") not in owner_tokens and not (abbreviated_owner and lane_proves_binding):
+            continue
         if lane_identity_present and not lane_proves_binding:
             continue
         if status != "recorded" and not lane_proves_binding:

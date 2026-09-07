@@ -58,8 +58,6 @@ function claudeEvent(message) {
     '',
     message.content
   ];
-  const attachments = attachmentPrompt(message);
-  if (attachments) content.push('', attachments);
   const reference = referencePrompt(message);
   if (reference) {
     const base = content.join('\n');
@@ -68,6 +66,8 @@ function claudeEvent(message) {
     if (reference.length <= available) content.push('', reference);
     else if (available >= 'Publication reference omitted.'.length) content.push('', 'Publication reference omitted.');
   }
+  const attachments = attachmentPrompt(message);
+  if (attachments) content.push('', attachments);
   const event = {
     nativeId: message.nativeId,
     messageId: message.id,
@@ -306,7 +306,8 @@ class CodexProvider {
   }
 
   observe(message, outcome, options) {
-    return observeCodexReply(message.nativeId, outcome.cursor || message.observerCursor, {
+    const cursor = outcome.cursor || message.observerCursor || { offset: 0, since: Date.parse(message.createdAt), tail: '' };
+    return observeCodexReply(message.nativeId, cursor, {
       ...options,
       marker: `[[discord-surface:${message.id}]]`,
       root: this.root
@@ -425,7 +426,13 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
   } catch (error) {
     return { status: 'rejected', message: state.getMessage(messageId), error };
   }
-  if (!claimed.claimed) return { status: claimed.reason || claimed.message?.state || 'ignored', message: claimed.message };
+  if (!claimed.claimed) {
+    if (claimed.reason === 'native-already-acknowledged') {
+      try { options.onSubmitted?.(claimed.message); } catch {}
+      return observeSubmitted(state, claimed.message, providers[claimed.message.provider], options);
+    }
+    return { status: claimed.reason || claimed.message?.state || 'ignored', message: claimed.message };
+  }
   const message = claimed.message;
   const provider = providers[message.provider];
   if (!provider) {
@@ -446,7 +453,12 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
     return { status: 'uncertain', message: state.getMessage(message.id), error };
   }
   if (outcome.status === 'not_submitted') {
-    state.markNotSubmitted(message.id, outcome.error);
+    const settled = state.markNotSubmitted(message.id, outcome.error);
+    if (settled.state === MESSAGE_STATES.SUBMITTED) {
+      if (outcome.cursor) state.setObserverCursor(message.id, outcome.cursor);
+      try { options.onSubmitted?.(settled); } catch {}
+      return observeSubmitted(state, state.getMessage(message.id), provider, options);
+    }
     return { status: 'not_submitted', message: state.getMessage(message.id), error: outcome.error };
   }
   if (outcome.status === 'uncertain') {

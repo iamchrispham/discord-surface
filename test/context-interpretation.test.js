@@ -36,6 +36,23 @@ async function fixture(t) {
   return { directory, ladderDir, registry, original, snapshot, binding };
 }
 
+test('snapshot does not share an abbreviated Claude owner across full native identities', async t => {
+  const { ladderDir, registry } = await fixture(t);
+  const ids = ['12345678-1111-4111-8111-111111111111', '12345678-2222-4222-8222-222222222222'];
+  const bindings = ids.map((nativeId, index) => ({ conductorId: `owner-${index}.md`, repoKey: 'repo:ours',
+    provider: 'claude', nativeId, generation: 1, channelId: `channel-${index}` }));
+  const data = { _conductors: Object.fromEntries(bindings.map(binding => [binding.conductorId,
+    { repository: binding.repoKey, vendor: binding.provider, nativeId: binding.nativeId, generation: 1 }])),
+    ambiguous: { conductor: 'session-claude-12345678', repository: 'repo:ours', vendor: 'claude', phase: 'building' } };
+  data.exact = { ...data.ambiguous, nativeId: ids[0], generation: 1 };
+  fs.writeFileSync(registry, JSON.stringify(data));
+  for (const [index, binding] of bindings.entries()) {
+    const result = await readSnapshot(binding, { registry, ladderDir });
+    assert.equal(result.unavailable, undefined);
+    assert.deepEqual(result.lanes.map(lane => lane.id), index === 0 ? ['exact'] : []);
+  }
+});
+
 test('snapshot rejects stale lane identity when its conductor record matches', async t => {
   const { directory, ladderDir, registry, original, binding } = await fixture(t);
   const data = JSON.parse(original);

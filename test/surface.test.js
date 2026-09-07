@@ -32,19 +32,20 @@ test('simulated: snapshot selects exact owner, preserves owed direction, and doe
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-snapshot-'));
   try {
     const registry = path.join(dir, 'pr-lanes.json');
+    fs.writeFileSync(path.join(dir, 'lane_progress_ladder.py'), 'PCT = {"review-wait": 30}\ndef canonical(value):\n    return value\n');
     const now = Date.parse('2026-09-06T06:00:00Z') / 1000;
     const binding = { conductorId: 'tm.md', repoKey: 'repo:tm', provider: 'claude', nativeId: CLAUDE_ID, generation: 2, channelId: 'tm' };
     const context = { repository: 'repo:tm', vendor: 'claude', nativeId: CLAUDE_ID, generation: 2,
       updated: '2026-09-06T05:45:00Z', intent: 'Prove offline cold start',
       owed_by_operator: [{ id: 'device', text: 'Provide the test device', since: '2026-09-06T05:00:00Z' }],
       owed_to_operator: [{ id: 'proof', text: 'Return cold-start evidence', since: '2026-09-06T05:00:00Z' }], next: ['Run the device check'] };
-    const lane = { vendor: 'claude', conductor: `session-claude-${CLAUDE_ID.slice(0, 8)}`, pr: 3,
+    const lane = { vendor: 'claude', repository: 'repo:tm', nativeId: CLAUDE_ID, generation: 2, conductor: `session-claude-${CLAUDE_ID.slice(0, 8)}`, pr: 3,
       phase: 'review-wait', next: 'Wait for review', state_note: 'Review pending', head: 'abc' };
     const data = { _conductors: { 'tm.md': context }, mine: lane,
       foreign: { ...lane, conductor: 'another-owner' }, wrongRepo: { ...lane, repository: 'repo:elsewhere' },
       otherVendor: { ...lane, vendor: 'codex' }, unknownPhase: { ...lane, phase: 'work happened', next: undefined } };
     fs.writeFileSync(registry, JSON.stringify(data));
-    const fresh = await readSnapshot(binding, { registry, now });
+    const fresh = await readSnapshot(binding, { registry, ladderDir: dir, now });
     assert.equal(fresh.unavailable, undefined);
     assert.deepEqual(fresh.lanes.map(item => item.id), ['mine', 'unknownPhase']);
     assert.equal(fresh.lanes[0].percent, 30);
@@ -53,12 +54,12 @@ test('simulated: snapshot selects exact owner, preserves owed direction, and doe
     assert.equal(fresh.context.owedByOperator.value[0].id, 'device');
     assert.equal(fresh.context.owedToOperator.value[0].id, 'proof');
     assert.equal(fresh.expiresAt, now + 900);
-    const stale = await readSnapshot(binding, { registry, now: now + 901 });
+    const stale = await readSnapshot(binding, { registry, ladderDir: dir, now: now + 901 });
     assert.equal(stale.context.freshness, 'stale');
     assert.equal(stale.context.updated, fresh.context.updated);
     assert.equal(stale.context.owedByOperator.value[0].id, 'device');
     for (const override of [{ repoKey: 'repo:wrong' }, { provider: 'codex' }, { nativeId: SUCCESSOR_ID }, { generation: 3 }]) {
-      const wrong = await readSnapshot({ ...binding, ...override }, { registry, now });
+      const wrong = await readSnapshot({ ...binding, ...override }, { registry, ladderDir: dir, now });
       assert.equal(wrong.context.state, 'wrong-owner');
       assert.equal(wrong.context.owedByOperator.state, 'missing');
       assert.equal(wrong.lanes.some(lane => lane.id === 'mine' || lane.id === 'unknownPhase'), false);
@@ -74,29 +75,139 @@ test('simulated: snapshot distinguishes missing owed facts from explicit none an
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-snapshot-'));
   try {
     const registry = path.join(dir, 'pr-lanes.json');
+    fs.writeFileSync(path.join(dir, 'lane_progress_ladder.py'), 'PCT = {"review-wait": 30}\ndef canonical(value):\n    return value\n');
     const now = Date.parse('2026-09-06T06:00:00Z') / 1000;
     const binding = { conductorId: 'surface.md', repoKey: 'projectless:surface', provider: 'codex', nativeId: CODEX_ID, generation: 1, channelId: 'surface' };
     fs.writeFileSync(registry, '{}');
-    const missing = await readSnapshot(binding, { registry, now });
+    const missing = await readSnapshot(binding, { registry, ladderDir: dir, now });
     assert.equal(missing.context.owedByOperator.state, 'missing');
     assert.match(renderSnapshot(missing), /Owed by you: not recorded/);
     const data = { _conductors: { 'surface.md': { repository: binding.repoKey, vendor: 'codex', nativeId: CODEX_ID, generation: 1,
       updated: '2026-09-06T05:59:00Z', owed_by_operator: [], owed_to_operator: [] } } };
     fs.writeFileSync(registry, JSON.stringify(data));
-    const none = await readSnapshot(binding, { registry, now });
+    const none = await readSnapshot(binding, { registry, ladderDir: dir, now });
     assert.equal(none.context.owedByOperator.state, 'recorded');
     assert.deepEqual(none.context.owedByOperator.value, []);
     data.unrelated = { vendor: 'claude', conductor: 'other', phase: 'building' };
     fs.writeFileSync(registry, JSON.stringify(data));
-    const churn = await readSnapshot(binding, { registry, now });
+    const churn = await readSnapshot(binding, { registry, ladderDir: dir, now });
     assert.equal(churn.id, none.id);
     assert.notEqual(churn.source.revision, none.source.revision);
     data._conductors['surface.md'].owed_by_operator = null;
     fs.writeFileSync(registry, JSON.stringify(data));
-    const invalid = await readSnapshot(binding, { registry, now });
+    const invalid = await readSnapshot(binding, { registry, ladderDir: dir, now });
     assert.equal(invalid.context.owedByOperator.state, 'invalid');
     assert.equal(invalid.context.owedByOperator.value, null);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('recognized native input cannot become dispatchable through either retry path', () => {
+  const { dir, state } = fixture();
+  try {
+    bindBoth(state, dir);
+    for (const provider of ['codex', 'claude']) {
+      for (const route of ['uncertain', 'not-submitted']) {
+        const id = `recognized-${provider}-${route}`;
+        state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: `channel-${provider}`,
+          authorId: 'operator-1', isBot: false, content: 'work' });
+        assert.equal(state.claimDispatch(id).claimed, true);
+        recordNativeAcknowledgment(state, { provider, messageId: id,
+          nativeId: provider === 'codex' ? CODEX_ID : CLAUDE_ID, generation: 1 });
+        if (route === 'uncertain') {
+          state.markUncertain(id, 'lost queue result');
+          assert.throws(() => state.reconcileUncertain(id, 'not_submitted'), /acknowledg/);
+          assert.equal(state.getMessage(id).state, MESSAGE_STATES.UNCERTAIN);
+          state.reconcileUncertain(id, 'submitted');
+        } else {
+          state.markNotSubmitted(id, 'late rejection');
+          assert.equal(state.getMessage(id).state, MESSAGE_STATES.SUBMITTED);
+        }
+        assert.equal(state.claimDispatch(id).claimed, false);
+        state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.ACCEPTED, id);
+        assert.equal(state.claimDispatch(id).claimed, false, 'old accepted rows must not replay after upgrade');
+        assert.equal(state.getMessage(id).state, MESSAGE_STATES.SUBMITTED);
+      }
+    }
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('late provider rejection and persisted recognition resume observation without redispatch', async () => {
+  const { dir, state } = fixture();
+  try {
+    bindBoth(state, dir);
+    for (const provider of ['codex', 'claude']) {
+      let dispatches = 0;
+      let observations = 0;
+      let submissions = 0;
+      const nativeId = provider === 'codex' ? CODEX_ID : CLAUDE_ID;
+      const native = {
+        async dispatch(message) {
+          dispatches++;
+          recordNativeAcknowledgment(state, { provider, messageId: message.id, nativeId, generation: 1 });
+          return { status: 'not_submitted', error: new Error('late provider rejection') };
+        },
+        async observe() { observations++; return { text: 'completed original work' }; }
+      };
+      for (const recovered of [false, true]) {
+        const id = `ack-observe-${provider}-${recovered}`;
+        state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: `channel-${provider}`,
+          authorId: 'operator-1', isBot: false, content: 'work' });
+        if (recovered) {
+          state.claimDispatch(id);
+          recordNativeAcknowledgment(state, { provider, messageId: id, nativeId, generation: 1 });
+          state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.ACCEPTED, id);
+        }
+        const reopened = new SurfaceState(state.dbPath);
+        try {
+          const result = await dispatchAndObserve(reopened, id, { [provider]: native }, { onSubmitted: () => { submissions++; } });
+          assert.equal(result.status, MESSAGE_STATES.REPLY_READY);
+          assert.equal(result.message.replyText, 'completed original work');
+        } finally { reopened.close(); }
+      }
+      assert.equal(dispatches, 1);
+      assert.equal(observations, 2);
+      assert.equal(submissions, 2);
+    }
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('recognized Codex delivery recovers an already-written final using its original time boundary', async () => {
+  const { dir, state } = fixture();
+  try {
+    bindBoth(state, dir);
+    const file = path.join(dir, `${CODEX_ID}.jsonl`);
+    const header = JSON.stringify({ type: 'session_meta', payload: { id: CODEX_ID } }) + '\n';
+    const final = (id, text, stamp) => JSON.stringify({ type: 'response_item', timestamp: new Date(stamp).toISOString(),
+      payload: { type: 'message', phase: 'final_answer', content: [{ type: 'output_text', text: `[[discord-surface:${id}]]\n${text}` }] } }) + '\n';
+    for (const recovered of [false, true]) {
+      const id = `ack-transcript-${recovered}`;
+      state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'work' });
+      const acceptedAt = Date.now() - 5000;
+      state.db.prepare('UPDATE messages SET created_at=? WHERE discord_id=?').run(new Date(acceptedAt).toISOString(), id);
+      fs.writeFileSync(file, header + final(id, 'before acceptance', acceptedAt - 1000) + final('other-message', 'wrong message', acceptedAt + 1000));
+      let dispatches = 0;
+      const provider = new CodexProvider({ root: dir, run: async () => {
+        dispatches++;
+        recordNativeAcknowledgment(state, { provider: 'codex', messageId: id, nativeId: CODEX_ID, generation: 1 });
+        fs.appendFileSync(file, final(id, 'original completed work', Date.now()));
+        await new Promise(resolve => setTimeout(resolve, 20));
+        return { status: 'not_submitted' };
+      } });
+      if (recovered) {
+        state.claimDispatch(id);
+        recordNativeAcknowledgment(state, { provider: 'codex', messageId: id, nativeId: CODEX_ID, generation: 1 });
+        state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.ACCEPTED, id);
+        fs.appendFileSync(file, final(id, 'original completed work', acceptedAt + 2000));
+      }
+      const reopened = new SurfaceState(state.dbPath);
+      try {
+        const result = await dispatchAndObserve(reopened, id, { codex: provider }, { timeoutMs: 500, pollMs: 1 });
+        assert.equal(result.status, MESSAGE_STATES.REPLY_READY);
+        assert.equal(result.message.replyText, 'original completed work');
+        assert.equal(dispatches, recovered ? 0 : 1);
+      } finally { reopened.close(); }
+    }
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('simulated: native acknowledgment requires exact dispatched owner and never completes custody', () => {

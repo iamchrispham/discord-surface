@@ -76,6 +76,30 @@ test('exact reference survives duplicate intake, source replacement, restart and
   }
 });
 
+test('large Claude attachment input retains reply provenance through channel delivery', async t => {
+  const { ClaudeChannel } = require('../src/claude-channel');
+  for (const target of ['100', 'unconfirmed-target']) {
+    const f = fixture(t);
+    const attachments = Array.from({ length: 10 }, (_, index) => ({
+      url: 'https://example.invalid/' + 'a'.repeat(1450) + index,
+      filename: `image-${index}.png`, contentType: 'image/png', size: 1
+    }));
+    const input = { id: 'large', guildId: 'guild', channelId: 'channel', authorId: 'operator',
+      isBot: false, content: 'q'.repeat(9999), attachments, referencedMessageId: target };
+    assert.equal(f.state.acceptDiscordMessage(input).accepted, true);
+    f.state.claimDispatch(input.id);
+    let params;
+    const channel = new ClaudeChannel({ state: f.state, nativeId: NATIVE, socketPath: f.binding.endpoint,
+      mcp: { notification: async event => { params = event.params; } } });
+    channel.ready = true;
+    await channel.handleEvent(claudeEvent(f.state.getMessage(input.id)));
+    assert.ok(params.content.includes(input.content));
+    assert.equal(params.attachments.length, 10);
+    assert.ok(params.content.includes(target) || params.content.includes('Publication reference omitted.'));
+    if (target === '100') assert.ok(params.content.includes(f.post.content));
+  }
+});
+
 test('same-role successor receives explicitly referenced history with original provenance', async t => {
   const f = fixture(t);
   f.state.db.prepare('UPDATE bindings SET native_id=?,generation=2 WHERE channel_id=?').run(SUCCESSOR, 'channel');
