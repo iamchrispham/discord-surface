@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const { createRequire } = require('node:module');
-const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
+const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, validateCodexSessionIdentity, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
 
@@ -560,11 +560,13 @@ class DiscordGateway {
     this.historyMaxPages = Math.min(RECOVERY_LIMITS.maxPages, Math.max(1, Number(recoveryOptions.maxPages || RECOVERY_LIMITS.maxPages)));
     this.historyMaxMessages = Math.min(RECOVERY_LIMITS.maxMessages, Math.max(1, Number(recoveryOptions.maxMessages || RECOVERY_LIMITS.maxMessages)));
     this.recoveryTimeoutMs = Math.min(RECOVERY_LIMITS.timeoutMs, Math.max(1000, Number(recoveryOptions.timeoutMs || RECOVERY_LIMITS.timeoutMs)));
+    this.codexSessionRoot = recoveryOptions.codexSessionRoot;
     this.ready = false;
     this.providers = providers || {
       codex: new CodexProvider(),
       claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(state, id, options) })
     };
+    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (binding => validateCodexSessionIdentity(binding.nativeId, binding.workspace, this.codexSessionRoot));
     this.consumer = createSurfaceConsumer({
       state,
       providers: this.providers,
@@ -773,6 +775,19 @@ class DiscordGateway {
     return bindingIdentityMatches(binding, this.state.getBinding(binding.channelId));
   }
 
+  async verifyOrdinaryNative(binding) {
+    if (!this.state.isOrdinaryBinding?.(binding)) return null;
+    if (!this.providers.codex || typeof this.providers.codex.dispatch !== 'function') {
+      throw new Error('Codex delivery provider is unavailable for ordinary binding');
+    }
+    const proof = await this.ordinaryNativePreflight(binding);
+    if (!proof || typeof proof !== 'object') throw new Error('Codex native preflight returned no proof');
+    if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'ordinary Codex binding changed during native preflight');
+    const recorded = this.state.recordOrdinaryPreflight(binding, proof);
+    if (!recorded) throw recoveryError('stale', 'ordinary Codex binding changed before native preflight was recorded');
+    return proof;
+  }
+
   async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const bindings = this.state.listBindings().filter(binding => binding.active);
@@ -808,6 +823,28 @@ class DiscordGateway {
       if (!this.isCurrentBinding(binding)) {
         failure ||= { ready: false, state: 'unavailable' };
         continue;
+      }
+      const ordinary = this.state.isOrdinaryBinding?.(binding);
+      if (ordinary && channel.guildId && channel.guildId !== binding.guildId) {
+        const error = new Error('Discord channel is outside the configured guild');
+        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+        failure ||= { ready: false, state: 'unavailable', error };
+        continue;
+      }
+      if (ordinary) {
+        try {
+          await waitForRecoveryOperation(() => this.verifyOrdinaryNative(binding), signal, deadline);
+        } catch (error) {
+          const kind = recoveryKind(error);
+          if (kind === 'stopped') return { ready: false, state: 'stopped' };
+          if (kind === 'stale') {
+            failure ||= { ready: false, state: 'unavailable', error };
+            continue;
+          }
+          await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+          failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+          continue;
+        }
       }
       if (!conductorMarkerMatchesTopic(channel.topic, binding)) {
         const error = new Error('Discord channel topic does not identify the current conductor and native generation');

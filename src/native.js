@@ -159,6 +159,41 @@ function readSessionHeader(file) {
   }
 }
 
+function readCodexSessionIdentity(nativeId, root = sessionRoot()) {
+  validateNativeId(nativeId);
+  const matches = [];
+  for (const file of walk(root)) {
+    if (!file.includes(nativeId)) continue;
+    try {
+      const row = JSON.parse(readSessionHeader(file));
+      const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
+      const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
+      const threadId = typeof payload?.id === 'string' ? payload.id : null;
+      if (sessionId !== nativeId && threadId !== nativeId) continue;
+      matches.push({
+        file, sessionId, threadId,
+        workspace: typeof payload.cwd === 'string' ? payload.cwd : null
+      });
+    } catch {}
+  }
+  if (matches.length === 0) return null;
+  if (matches.length > 1) return { ambiguous: true, files: matches.map(match => match.file) };
+  return matches[0];
+}
+
+function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot()) {
+  validateNativeId(nativeId);
+  if (typeof workspace !== 'string' || !path.isAbsolute(workspace)) throw new Error('Codex workspace must be absolute');
+  const identity = readCodexSessionIdentity(nativeId, root);
+  if (!identity) throw new Error('Codex transcript identity is unavailable');
+  if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
+  if (identity.sessionId !== nativeId || identity.threadId !== nativeId) {
+    throw new Error('Codex transcript identity does not match the supplied native UUID');
+  }
+  if (identity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
+  return identity;
+}
+
 function readTranscriptTail(fd, size) {
   const parts = [];
   for (let end = size; end > 0;) {
@@ -459,9 +494,11 @@ module.exports = {
   observeCodexReply,
   observeSubmitted,
   postUnixJson,
+  readCodexSessionIdentity,
   readInitialCursor,
   runCodex,
   sessionRoot,
+  validateCodexSessionIdentity,
   waitForReply,
   walk
 };
