@@ -196,10 +196,10 @@ async function ordinaryBind(args, dependencies = {}) {
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const existing = state.getBinding(channel.id);
-    if (existing && state.isOrdinaryBindingRecord(existing) && existing.active && invocation.sessionId !== existing.nativeId) {
+    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
       throw new Error('channel is already bound to another owner; use explicit handoff');
     }
-    const validationRoot = sessionRoot || (existing?.active ? existing.sessionRoot : undefined);
+    const validationRoot = sessionRoot || existing?.sessionRoot;
     if (!sessionRoot) {
       const proof = await validateNativeProof(validationRoot);
       nativeProofDetail = proof.detail;
@@ -222,26 +222,7 @@ async function ordinaryBind(args, dependencies = {}) {
     if (decision === 'reuse') binding = existing;
     else if (decision === 'rebind') {
       try {
-        const successor = Boolean(existing && !existing.active && request.nativeId !== existing.nativeId);
-        if (successor) {
-          const successorSessionRoot = request.sessionRoot === undefined
-            ? (nativeProofEvidence?.sessionRoot || null)
-            : request.sessionRoot;
-          binding = state.handoffOrdinary({
-            channelId: request.channelId,
-            provider: request.provider,
-            fromNativeId: existing.nativeId,
-            fromGeneration: existing.generation,
-            nativeId: request.nativeId,
-            workspace: request.workspace,
-            sessionRoot: successorSessionRoot,
-            handoffId: `ordinary-bind:${request.channelId}:${existing.generation}:${request.nativeId}`,
-            identity: request.identity,
-            nativeProof: { ...nativeProofEvidence, sessionRoot: successorSessionRoot }
-          });
-        } else {
-          binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);
-        }
+        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);
       } catch (error) {
         const raced = state.getBinding(request.channelId);
         const racedDecision = raced

@@ -874,7 +874,10 @@ class SurfaceState {
     const nativeId = assertUuid(binding.nativeId);
     const workspace = assertText(binding.workspace, 'workspace', 4096);
     if (!path.isAbsolute(workspace)) throw new BindingError('workspace must be absolute');
-    const sessionRoot = binding.sessionRoot == null ? (existing?.sessionRoot || null) : assertText(binding.sessionRoot, 'sessionRoot', 4096);
+    let sessionRoot;
+    if (binding.sessionRoot === undefined) sessionRoot = existing?.sessionRoot || null;
+    else if (binding.sessionRoot === null) sessionRoot = null;
+    else sessionRoot = assertText(binding.sessionRoot, 'sessionRoot', 4096);
     if (sessionRoot !== null && !path.isAbsolute(sessionRoot)) throw new BindingError('sessionRoot must be absolute');
     const endpoint = binding.endpoint == null ? null : assertEndpoint(binding.endpoint);
     if (provider === PROVIDERS.CLAUDE && !endpoint) throw new BindingError('Claude bindings require a channel endpoint');

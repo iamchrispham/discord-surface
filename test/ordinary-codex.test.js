@@ -382,7 +382,7 @@ test('ordinary bind timestamps an empty-channel cutoff before history fetch', as
   } finally { state.close(); }
 });
 
-test('ordinary successor bind performs a verified handoff and captures a fresh cutoff', async t => {
+test('ordinary bind rejects an inactive different owner without mutation', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-bind-'));
   const db = path.join(dir, 'surface.sqlite');
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-bind-workspace-'));
@@ -393,8 +393,6 @@ test('ordinary successor bind performs a verified handoff and captures a fresh c
     channelId: 'ordinary-successor-channel', guildId: 'guild', provider: 'codex', nativeId: CODEX,
     workspace: dir
   }, { sessionId: CODEX, threadId: CODEX });
-  setup.setIntakeCutoff(original.channelId, 'guild', '100', 'ordinary successor baseline');
-  setup.markIntakeBoundary(original.channelId, 'gap', 'ordinary successor previous gap', 'gap-from', 'gap-to');
   setup.unbind(original.channelId);
   setup.close();
   t.after(() => {
@@ -415,7 +413,92 @@ test('ordinary successor bind performs a verified handoff and captures a fresh c
     async login() {}
     async destroy() {}
   }
-  const result = await ordinaryBind({ 'state-dir': dir, channel: '#dev', 'session-root': successorSession.root }, {
+  await assert.rejects(() => ordinaryBind({ 'state-dir': dir, channel: '#dev', 'session-root': successorSession.root }, {
+    environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: successorWorkspace },
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity,
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  }), /already bound to another owner; use explicit handoff/);
+
+  const state = new SurfaceState(db);
+  try {
+    const binding = state.getBinding(original.channelId);
+    assert.equal(binding.nativeId, CODEX);
+    assert.equal(binding.generation, 1);
+    assert.equal(binding.active, false);
+    assert.equal(state.getIntakeWatermark(original.channelId), null);
+    assert.equal(state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff').length, 0);
+  } finally { state.close(); }
+});
+
+test('ordinary handoff clears an explicit default transcript root', t => {
+  const f = fixture(t);
+  const predecessorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-null-predecessor-root-'));
+  const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-null-successor-root-'));
+  const binding = f.state.bindOrdinary({
+    channelId: 'ordinary-null-root-channel', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    workspace: f.dir, sessionRoot: predecessorRoot
+  }, f.identity);
+  f.state.unbind(binding.channelId);
+  const transcriptFile = path.join(successorRoot, OTHER + '.jsonl');
+  fs.writeFileSync(transcriptFile, '');
+  t.after(() => {
+    fs.rmSync(predecessorRoot, { recursive: true, force: true });
+    fs.rmSync(successorRoot, { recursive: true, force: true });
+  });
+  const rebound = f.state.handoffOrdinary({
+    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: f.dir, sessionRoot: null, handoffId: 'ordinary-null-root-handoff',
+    identity: { sessionId: OTHER, threadId: OTHER },
+    nativeProof: { file: transcriptFile, sessionId: OTHER, threadId: OTHER, workspace: f.dir, sessionRoot: null }
+  });
+  assert.equal(rebound.sessionRoot, null);
+  assert.equal(rebound.nativeId, OTHER);
+  assert.equal(rebound.generation, 2);
+});
+
+test('ordinary CLI handoff changes a custom root to its default root', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-cli-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-workspace-'));
+  const predecessorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-predecessor-'));
+  const defaultRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-default-'));
+  const transcriptFile = path.join(defaultRoot, OTHER + '.jsonl');
+  fs.writeFileSync(transcriptFile, `${JSON.stringify({ type: 'session_meta', payload: {
+    session_id: OTHER, id: OTHER, cwd: successorWorkspace
+  } })}\n`);
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  const original = setup.bindOrdinary({
+    channelId: '123456789012345679', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    workspace: dir, sessionRoot: predecessorRoot
+  }, { sessionId: CODEX, threadId: CODEX });
+  setup.unbind(original.channelId);
+  setup.close();
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(successorWorkspace, { recursive: true, force: true });
+    fs.rmSync(predecessorRoot, { recursive: true, force: true });
+    fs.rmSync(defaultRoot, { recursive: true, force: true });
+  });
+
+  const channel = {
+    id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
+    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) }
+  };
+  class FakeClient {
+    constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => channel } }) }; }
+    async login() {}
+    async destroy() {}
+  }
+  const result = await handoffInternal({
+    ordinary: true, 'state-dir': dir, provider: 'codex', 'channel-id': original.channelId,
+    'from-native-id': CODEX, 'from-generation': '1', 'native-id': OTHER,
+    workspace: successorWorkspace, 'handoff-id': 'ordinary-default-root-cli-handoff'
+  }, {
+    codexSessionRoot: () => defaultRoot,
     environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: successorWorkspace },
     requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
     readSecret: () => 'fixture-token',
@@ -423,20 +506,8 @@ test('ordinary successor bind performs a verified handoff and captures a fresh c
     gatewayProcessStatus: () => ({ state: 'stopped' }),
     print: () => {}
   });
-  assert.equal(result.reused, false);
-  assert.equal(result.binding.nativeId, OTHER);
+  assert.equal(result.binding.sessionRoot, defaultRoot);
   assert.equal(result.binding.generation, 2);
-  assert.equal(result.binding.readiness, READINESS.PENDING);
-  assert.equal(result.nativeProof.status, 'verified');
-
-  const state = new SurfaceState(db);
-  try {
-    const watermark = state.getIntakeWatermark(original.channelId);
-    assert.equal(watermark.last_seen_id, '200');
-    assert.equal(watermark.recovered_through_id, '200');
-    assert.equal(watermark.state, 'pending');
-    assert.equal(state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff').length, 1);
-  } finally { state.close(); }
 });
 
 test('binding wake replays after joining an in-flight recovery', async () => {
