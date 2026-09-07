@@ -59,20 +59,11 @@ function absoluteWorkspace(value: unknown): string {
   return workspace;
 }
 
-function normalizedWorkspace(value: string): string {
-  if (value === '/') return value;
-  return value.replace(/\/+$/, '');
-}
-
-export function resolveInvocationIdentity(environment: InvocationEnvironment, workspace?: string): OrdinaryCodexIdentity & { workspace: string } {
+export function resolveInvocationIdentity(environment: InvocationEnvironment, workspace?: string): OrdinaryCodexIdentity & { workspace?: string } {
   const sessionId = uuid(environment.CODEX_SESSION_ID, 'CODEX_SESSION_ID');
   const threadId = uuid(environment.CODEX_THREAD_ID, 'CODEX_THREAD_ID');
   if (sessionId !== threadId) throw new Error('CODEX_SESSION_ID and CODEX_THREAD_ID conflict');
-  const suppliedWorkspace = absoluteWorkspace(workspace ?? environment.PWD);
-  if (environment.PWD && normalizedWorkspace(suppliedWorkspace) !== normalizedWorkspace(absoluteWorkspace(environment.PWD))) {
-    throw new Error('workspace conflicts with PWD');
-  }
-  return { sessionId, threadId, workspace: suppliedWorkspace };
+  return { sessionId, threadId, workspace: workspace === undefined ? undefined : absoluteWorkspace(workspace) };
 }
 
 export function resolveExistingChannel(selection: unknown, guildId: unknown, channels: readonly ExistingDiscordChannel[]): ExistingDiscordChannel {
@@ -102,13 +93,13 @@ export function resolveExistingChannel(selection: unknown, guildId: unknown, cha
   throw new Error('channel selection is unknown');
 }
 
-export function ordinaryBindingDecision(existing: ExistingOrdinaryBinding | null, request: OrdinaryCodexRequest, ordinaryMarker = false): 'bind' | 'reuse' {
+export function ordinaryBindingDecision(existing: ExistingOrdinaryBinding | null, request: OrdinaryCodexRequest, ordinaryMarker = false): 'bind' | 'reuse' | 'rebind' {
   if (!existing) return 'bind';
-  const sameOwner = existing.active && ordinaryMarker && existing.provider === request.provider &&
+  const sameOwner = ordinaryMarker && existing.provider === request.provider &&
     existing.channelId === request.channelId && existing.guildId === request.guildId &&
     existing.nativeId === request.nativeId && existing.workspace === request.workspace &&
     !existing.conductorId && !existing.repoKey;
-  if (sameOwner) return 'reuse';
+  if (sameOwner) return existing.active ? 'reuse' : 'rebind';
   throw new Error('channel is already bound to another owner; use explicit handoff');
 }
 
@@ -144,5 +135,7 @@ export function createOrdinaryCodexRequestFromEnvironment(input: {
   environment: InvocationEnvironment;
 }): OrdinaryCodexRequest {
   const identity = resolveInvocationIdentity(input.environment, input.workspace as string | undefined);
-  return createOrdinaryCodexRequest({ ...input, workspace: identity.workspace, identity });
+  const workspace = input.workspace ?? identity.workspace;
+  if (workspace === undefined) throw new Error('workspace must come from exact Codex session metadata');
+  return createOrdinaryCodexRequest({ ...input, workspace, identity });
 }

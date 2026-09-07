@@ -932,8 +932,27 @@ class SurfaceState {
     return this.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
   }
 
-  isOrdinaryBinding(binding) {
-    if (!binding?.active || binding.provider !== PROVIDERS.CODEX || binding.conductorId || binding.repoKey) return false;
+  rebindOrdinary(binding, identity) {
+    if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
+    if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {
+      throw new BindingError('ordinary Codex identity is missing or conflicting');
+    }
+    assertUuid(identity.sessionId, 'sessionId');
+    assertUuid(identity.threadId, 'threadId');
+    const existing = this.getBinding(binding.channelId);
+    if (!existing || existing.active || !this.isOrdinaryBindingRecord(existing)) {
+      throw new BindingError('ordinary binding tombstone is unavailable for reuse');
+    }
+    if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CODEX ||
+      existing.nativeId !== binding.nativeId || existing.workspace !== binding.workspace ||
+      identity.sessionId !== existing.nativeId || identity.threadId !== existing.nativeId) {
+      throw new BindingError('ordinary binding owner changed; use explicit handoff');
+    }
+    return this.rebind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
+  }
+
+  isOrdinaryBindingRecord(binding) {
+    if (!binding || binding.provider !== PROVIDERS.CODEX || binding.conductorId || binding.repoKey) return false;
     return Boolean(this.db.prepare(`SELECT 1 FROM receipts
       WHERE kind='ordinary-bound'
         AND json_extract(detail, '$.channelId')=?
@@ -941,6 +960,10 @@ class SurfaceState {
         AND json_extract(detail, '$.workspace')=?
         AND json_extract(detail, '$.generation')=?
       LIMIT 1`).get(binding.channelId, binding.nativeId, binding.workspace, binding.generation));
+  }
+
+  isOrdinaryBinding(binding) {
+    return Boolean(binding?.active) && this.isOrdinaryBindingRecord(binding);
   }
 
   hasOrdinaryPreflight(binding) {
@@ -979,8 +1002,18 @@ class SurfaceState {
     const existing = this.getBinding(channelId);
     if (!existing) throw new BindingError('channel is not bound');
     if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
+    const ordinaryIdentity = binding.ordinaryIdentity || null;
+    if (ordinaryIdentity) {
+      if (binding.provider !== PROVIDERS.CODEX || binding.conductorId || binding.repoKey ||
+        typeof ordinaryIdentity.sessionId !== 'string' || typeof ordinaryIdentity.threadId !== 'string' ||
+        ordinaryIdentity.sessionId !== ordinaryIdentity.threadId) {
+        throw new BindingError('ordinary Codex identity is missing or conflicting');
+      }
+      assertUuid(ordinaryIdentity.sessionId, 'sessionId');
+      assertUuid(ordinaryIdentity.threadId, 'threadId');
+    }
     const input = this.bindingInput({ ...binding, channelId }, existing);
-    const ordinary = this.isOrdinaryBinding(existing);
+    const ordinary = this.isOrdinaryBindingRecord(existing);
     this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
     if (existing.conductorId !== input.conductorId || existing.repoKey !== input.repoKey) throw new BindingError('conductor identity changes require an explicit handoff');
     if (existing.conductorId && existing.provider !== input.provider) throw new BindingError('conductor provider changes require an explicit handoff');
@@ -995,7 +1028,9 @@ class SurfaceState {
       if (ordinary && input.provider === PROVIDERS.CODEX && !input.conductorId && !input.repoKey) {
         this.receipt(null, 'ordinary-bound', {
           channelId, guildId: input.guildId, provider: input.provider, nativeId: input.nativeId,
-          workspace: input.workspace, generation
+          workspace: input.workspace, generation,
+          sessionId: ordinaryIdentity?.sessionId || input.nativeId,
+          threadId: ordinaryIdentity?.threadId || input.nativeId
         });
       }
       return this.getBinding(channelId);

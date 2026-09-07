@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
-const { GATEWAY_CAPABILITIES, ordinaryBind } = require('../src/cli');
+const { createBindingWakeController, GATEWAY_CAPABILITIES, ordinaryBind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
 const { validateCodexSessionIdentity } = require('../src/native');
 const { SurfaceState, READINESS, StaleGenerationError } = require('../src/state');
@@ -59,6 +59,12 @@ test('typed ordinary request rejects missing or conflicting invocation identity'
   assert.deepEqual(request.identity, { sessionId: CODEX, threadId: CODEX });
   assert.equal(request.nativeId, CODEX);
   assert.equal(resolveInvocationIdentity({ CODEX_SESSION_ID: CODEX_V7, CODEX_THREAD_ID: CODEX_V7, PWD: '/tmp/workspace' }).sessionId, CODEX_V7);
+  assert.equal(resolveInvocationIdentity({ CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: '/checkout' }, '/session-workspace').workspace, '/session-workspace');
+  assert.equal(resolveInvocationIdentity({ CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: '/checkout' }).workspace, undefined);
+  assert.throws(() => createOrdinaryCodexRequestFromEnvironment({
+    channelId: 'channel', guildId: 'guild',
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: '/checkout' }
+  }), /workspace must come from exact Codex session metadata/);
 });
 
 test('ordinary CommonJS facade exposes emitted code and fails closed when output is absent', () => {
@@ -134,6 +140,19 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   assert.equal(second.nativeProof.status, 'verified');
   assert.deepEqual(wakeSignals, [{ pid: 4242, signal: 'SIGUSR2' }, { pid: 4242, signal: 'SIGUSR2' }]);
 
+  const tombstone = new SurfaceState(db);
+  try {
+    assert.equal(tombstone.unbind(channel.id), true);
+    assert.throws(() => tombstone.rebindOrdinary({
+      channelId: channel.id, guildId: 'guild', provider: 'codex', nativeId: OTHER, workspace: dir
+    }, { sessionId: OTHER, threadId: OTHER }), /owner changed/);
+  } finally { tombstone.close(); }
+  const rebound = await ordinaryBind(args, dependencies);
+  assert.equal(rebound.reused, false);
+  assert.equal(rebound.binding.generation, 2);
+  assert.equal(rebound.binding.readiness, READINESS.PENDING);
+  assert.equal(rebound.nativeProof.status, 'verified');
+
   await assert.rejects(() => ordinaryBind({ ...args, channel: '#category' }, dependencies), /message-capable/);
 
   await assert.rejects(() => ordinaryBind(args, {
@@ -144,9 +163,164 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   const state = new SurfaceState(db);
   try {
     const receipts = state.listReceipts();
-    assert.equal(receipts.filter(receipt => receipt.kind === 'ordinary-bound').length, 1);
-    assert.equal(receipts.filter(receipt => receipt.kind === 'ordinary-native-preflight').length, 1);
+    assert.equal(receipts.filter(receipt => receipt.kind === 'ordinary-bound').length, 2);
+    assert.equal(receipts.filter(receipt => receipt.kind === 'ordinary-native-preflight').length, 2);
   } finally { state.close(); }
+});
+
+test('ordinary bind derives workspace from exact transcript metadata across checkouts', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-workspace-'));
+  const invocationWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-invocation-'));
+  const sessionWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-session-workspace-'));
+  const session = transcript(t, sessionWorkspace);
+  const db = path.join(dir, 'surface.sqlite');
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  setup.close();
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(invocationWorkspace, { recursive: true, force: true });
+    fs.rmSync(sessionWorkspace, { recursive: true, force: true });
+  });
+
+  const channel = { id: 'workspace-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  let logins = 0;
+  class FakeClient {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection ? channel : new Map([[channel.id, channel]])
+      } }) };
+    }
+    async login() { logins += 1; }
+    async destroy() {}
+  }
+  const dependencies = {
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: invocationWorkspace },
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity,
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  };
+  const args = { 'state-dir': dir, channel: '#dev', 'session-root': session.root };
+  const result = await ordinaryBind(args, dependencies);
+  assert.equal(logins, 1);
+  assert.equal(result.binding.workspace, sessionWorkspace);
+  assert.equal(result.nativeProof.status, 'verified');
+  await assert.rejects(() => ordinaryBind({ ...args, workspace: invocationWorkspace }, dependencies), /does not match the supplied workspace/);
+  assert.equal(logins, 1);
+});
+
+test('ordinary bind after Gateway start wakes real recovery and dispatches held intake', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-gateway-bind-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const secretFile = path.join(dir, 'discord.env');
+  fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  fs.chmodSync(secretFile, 0o600);
+  const session = transcript(t, dir);
+  const state = new SurfaceState(db);
+  state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile });
+  let releaseHistory;
+  const historyGate = new Promise(resolve => { releaseHistory = resolve; });
+  let firstHistoryStarted;
+  const firstHistory = new Promise(resolve => { firstHistoryStarted = resolve; });
+  const channel = {
+    id: 'gateway-channel',
+    guildId: 'guild',
+    name: 'gateway-channel',
+    topic: null,
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    async send() { return { id: `reply-${Date.now()}` }; }
+  };
+  const client = {
+    user: { id: 'bot' },
+    channels: { fetch: async () => channel },
+    on() {},
+    off() {},
+    async login() {},
+    async destroy() {}
+  };
+  let historyCalls = 0;
+  let dispatches = 0;
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    fetchHistory: async () => {
+      historyCalls += 1;
+      if (historyCalls === 1) {
+        firstHistoryStarted();
+        await historyGate;
+      }
+      return [];
+    },
+    providers: {
+      codex: {
+        async dispatch() { dispatches += 1; return { status: 'submitted' }; },
+        async observe() { return { text: 'answer' }; }
+      }
+    },
+    recoveryOptions: {
+      codexSessionRoot: session.root,
+      ordinaryNativePreflight: current => validateCodexSessionIdentity(current.nativeId, current.workspace, session.root)
+    }
+  });
+  gateway.historyPermission = () => ({ known: true, allowed: true });
+  let stopping = false;
+  const wakeErrors = [];
+  const wake = createBindingWakeController({
+    getGateway: () => gateway,
+    isReady: () => gateway.ready,
+    isStopping: () => stopping,
+    logger: error => wakeErrors.push(error)
+  });
+  t.after(async () => {
+    stopping = true;
+    releaseHistory?.();
+    await wake.wait();
+    await gateway.stop();
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await gateway.start(secretFile);
+  assert.equal(gateway.ready, true);
+  const bindClient = class {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection ? channel : new Map([[channel.id, channel]])
+      } }) };
+    }
+    async login() {}
+    async destroy() {}
+  };
+  const dependencies = {
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: dir },
+    requireInstalled: () => ({ Client: bindClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity,
+    gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] }),
+    killProcess: () => wake.request(),
+    print: () => {}
+  };
+  const args = { 'state-dir': dir, channel: '#gateway-channel', 'session-root': session.root };
+  const first = await ordinaryBind(args, dependencies);
+  await firstHistory;
+  const accepted = state.acceptDiscordMessage({
+    id: 'gateway-held-input', guildId: 'guild', channelId: channel.id,
+    authorId: 'operator', isBot: false, content: 'held until Gateway recovery'
+  }, { ready: false });
+  assert.equal(accepted.accepted, true);
+  const second = await ordinaryBind(args, dependencies);
+  assert.equal(first.reused, false);
+  assert.equal(second.reused, true);
+  releaseHistory();
+  await wake.wait();
+  assert.deepEqual(wakeErrors, []);
+  assert.ok(historyCalls >= 2);
+  assert.equal(state.getBinding(channel.id).readiness, READINESS.READY);
+  assert.equal(dispatches, 1);
+  assert.equal(state.getMessage('gateway-held-input').state, 'replied');
 });
 
 test('ordinary binding decision refuses a non-ordinary or inactive existing owner', () => {
@@ -156,7 +330,7 @@ test('ordinary binding decision refuses a non-ordinary or inactive existing owne
   };
   assert.equal(ordinaryBindingDecision(null, request), 'bind');
   assert.equal(ordinaryBindingDecision({ ...request, active: true }, request, true), 'reuse');
-  assert.throws(() => ordinaryBindingDecision({ ...request, active: false }, request, true), /already bound/);
+  assert.equal(ordinaryBindingDecision({ ...request, active: false }, request, true), 'rebind');
   assert.throws(() => ordinaryBindingDecision({ ...request, active: true, conductorId: 'conductor' }, request, false), /already bound/);
 });
 
@@ -187,6 +361,7 @@ test('native preflight requires exact session metadata and workspace', t => {
   const matching = transcript(t, f.dir);
   const proof = validateCodexSessionIdentity(CODEX, f.dir, matching.root);
   assert.equal(proof.file, matching.file);
+  assert.equal(validateCodexSessionIdentity(CODEX, undefined, matching.root).workspace, f.dir);
   const wrongWorkspace = transcript(t, '/tmp/other-workspace');
   assert.throws(() => validateCodexSessionIdentity(CODEX, f.dir, wrongWorkspace.root), /workspace/);
   const wrongIdentity = transcript(t, f.dir, CODEX, { id: OTHER });

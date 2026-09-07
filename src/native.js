@@ -183,14 +183,14 @@ function readCodexSessionIdentity(nativeId, root = sessionRoot()) {
 
 function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot()) {
   validateNativeId(nativeId);
-  if (typeof workspace !== 'string' || !path.isAbsolute(workspace)) throw new Error('Codex workspace must be absolute');
+  if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
   const identity = readCodexSessionIdentity(nativeId, root);
   if (!identity) throw new Error('Codex transcript identity is unavailable');
   if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
   if (identity.sessionId !== nativeId || identity.threadId !== nativeId) {
     throw new Error('Codex transcript identity does not match the supplied native UUID');
   }
-  if (identity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
+  if (workspace !== undefined && identity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
   return identity;
 }
 

@@ -89,12 +89,12 @@ function bind(args, rebind = false) {
   finally { state.close(); }
 }
 
-function ordinaryBindingArgs(args, environment = process.env, channelId = null, guildId = null) {
+function ordinaryBindingArgs(args, environment = process.env, channelId = null, guildId = null, workspace = undefined) {
   return createOrdinaryCodexRequestFromEnvironment({
     channelId: channelId || required(args, 'channel-id'),
     guildId: guildId || required(args, 'guild-id'),
     nativeId: args['native-id'],
-    workspace: args.workspace ? path.resolve(args.workspace) : undefined,
+    workspace: workspace ?? (args.workspace ? path.resolve(args.workspace) : undefined),
     environment
   });
 }
@@ -134,7 +134,23 @@ async function ordinaryBind(args, dependencies = {}) {
     const channelSelection = args.channel || args['channel-id'];
     if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
     if (args.channel && args['channel-id'] && args.channel !== args['channel-id']) throw new Error('--channel and --channel-id must identify the same channel');
-    resolveInvocationIdentity(environment, args.workspace ? path.resolve(args.workspace) : undefined);
+    const invocation = resolveInvocationIdentity(environment, args.workspace ? path.resolve(args.workspace) : undefined);
+    const sessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
+    let nativeProofDetail = null;
+    let nativeProofError = null;
+    try {
+      nativeProofDetail = validate(invocation.sessionId, undefined, sessionRoot);
+      if (!nativeProofDetail || typeof nativeProofDetail.workspace !== 'string' || !path.isAbsolute(nativeProofDetail.workspace)) {
+        throw new Error('Codex transcript workspace is unavailable');
+      }
+    } catch (error) {
+      nativeProofError = error;
+      if (!invocation.workspace) throw new Error(`Codex transcript workspace is required: ${error.message}`);
+    }
+    if (nativeProofDetail && invocation.workspace && path.resolve(nativeProofDetail.workspace) !== invocation.workspace) {
+      throw new Error('Codex transcript workspace does not match the supplied workspace');
+    }
+    const resolvedWorkspace = nativeProofDetail?.workspace || invocation.workspace;
     const { Client, GatewayIntentBits } = install('discord.js');
     client = new Client({ intents: [GatewayIntentBits.Guilds] });
     await client.login(read(config.secretFile));
@@ -152,22 +168,31 @@ async function ordinaryBind(args, dependencies = {}) {
         messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
     }
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
-    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId);
+    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
     const existing = state.getBinding(request.channelId);
-    const decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBinding(existing) : false);
-    const binding = decision === 'reuse' ? existing : state.bindOrdinary(request, request.identity);
+    const decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false);
+    let binding;
+    if (decision === 'reuse') binding = existing;
+    else if (decision === 'rebind') binding = state.rebindOrdinary(request, request.identity);
+    else binding = state.bindOrdinary(request, request.identity);
     let nativeProof = { status: 'pending', reason: 'Codex transcript proof is pending' };
     if (state.hasOrdinaryPreflight(binding)) {
       nativeProof = { status: 'verified', reason: 'Codex transcript proof already recorded' };
-    } else {
+    } else if (nativeProofDetail) {
       try {
-        const proof = validate(request.nativeId, request.workspace, args['session-root'] ? path.resolve(args['session-root']) : undefined);
-        state.recordOrdinaryPreflight(binding, { file: proof.file, sessionId: proof.sessionId, threadId: proof.threadId, workspace: proof.workspace });
-        nativeProof = { status: 'verified', file: proof.file, workspace: proof.workspace };
+        state.recordOrdinaryPreflight(binding, {
+          file: nativeProofDetail.file,
+          sessionId: nativeProofDetail.sessionId,
+          threadId: nativeProofDetail.threadId,
+          workspace: nativeProofDetail.workspace
+        });
+        nativeProof = { status: 'verified', file: nativeProofDetail.file, workspace: nativeProofDetail.workspace };
       } catch (error) {
         nativeProof = { status: 'pending', reason: error.message };
       }
+    } else {
+      nativeProof = { status: 'pending', reason: nativeProofError?.message || 'Codex transcript proof is pending' };
     }
     const gatewayWake = requestGatewayRecovery(paths, {
       status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
@@ -720,6 +745,38 @@ function writePid(pidFile, guildId, stateDir) {
   fs.chmodSync(pidFile, 0o600);
 }
 
+function createBindingWakeController({ getGateway, isReady, isStopping, logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
+  let wakePromise = null;
+  let wakeRequested = false;
+  const request = () => {
+    wakeRequested = true;
+    const gateway = getGateway?.();
+    if (isStopping?.() || !gateway || !isReady?.() || wakePromise) return;
+    wakePromise = (async () => {
+      while (wakeRequested && !isStopping?.()) {
+        wakeRequested = false;
+        const currentGateway = getGateway?.();
+        if (!currentGateway || !isReady?.()) return;
+        const recovery = await currentGateway.recoverTransport('ordinary-bind');
+        if (recovery.ready && !isStopping?.() && isReady?.()) await currentGateway.reconcilePending();
+      }
+    })().catch(logger).finally(() => {
+      wakePromise = null;
+      if (wakeRequested && !isStopping?.()) request();
+    });
+  };
+  const start = () => {
+    if (wakeRequested) request();
+  };
+  const wait = async () => {
+    while (wakePromise) {
+      const current = wakePromise;
+      await current;
+    }
+  };
+  return { request, start, wait };
+}
+
 async function runRuntime(args) {
   const { paths, state } = openState(args);
   const config = state.requireConfig();
@@ -728,45 +785,32 @@ async function runRuntime(args) {
   let gateway;
   let gatewayReady = false;
   let stopping = false;
-  let bindingWakePromise = null;
-  let bindingWakeRequested = false;
-  const wakeBinding = () => {
-    bindingWakeRequested = true;
-    if (stopping || !gateway || !gatewayReady || bindingWakePromise) return;
-    bindingWakePromise = (async () => {
-      while (bindingWakeRequested && !stopping) {
-        bindingWakeRequested = false;
-        const recovery = await gateway.recoverTransport('ordinary-bind');
-        if (recovery.ready && !stopping) await gateway.reconcilePending();
-      }
-    })().catch(error => {
-      process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`);
-    }).finally(() => {
-      bindingWakePromise = null;
-      if (bindingWakeRequested && !stopping) wakeBinding();
-    });
-  };
+  const bindingWake = createBindingWakeController({
+    getGateway: () => gateway,
+    isReady: () => gatewayReady,
+    isStopping: () => stopping
+  });
   const stop = async () => {
     if (stopping) return;
     stopping = true;
-    const pendingBindingWake = bindingWakePromise;
+    const pendingBindingWake = bindingWake.wait();
     try { await gateway?.stop(); } finally {
       await pendingBindingWake;
+      process.removeListener('SIGUSR2', bindingWake.request);
       try { fs.unlinkSync(paths.pid); } catch {}
-      process.removeListener('SIGUSR2', wakeBinding);
       state.close();
     }
   };
   process.once('SIGINT', () => stop().then(() => process.exit(0)));
   process.once('SIGTERM', () => stop().then(() => process.exit(0)));
-  process.on('SIGUSR2', wakeBinding);
+  process.on('SIGUSR2', bindingWake.request);
   try {
     writePid(paths.pid, config.guildId, paths.stateDir);
     gateway = new DiscordGateway({ state, observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) } });
     await gateway.start(config.secretFile);
     await gateway.reconcilePending(recoveryCutoff);
     gatewayReady = true;
-    if (bindingWakeRequested) wakeBinding();
+    bindingWake.start();
   } catch (error) {
     await stop();
     throw error;
@@ -1042,4 +1086,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery };
