@@ -47,6 +47,8 @@ function runInstalledSmoke(installedRoot, env) {
     const claude = require(path.join(root, 'src/claude-channel.js'));
     const facade = require(path.join(root, 'src/topic.js'));
     const emitted = require(path.join(root, 'dist/topic.js'));
+    const attachmentFacade = require(path.join(root, 'src/attachments.js'));
+    const attachmentEmitted = require(path.join(root, 'dist/attachments.js'));
     assert.equal(typeof cli.main, 'function');
     assert.equal(typeof discord.DiscordGateway, 'function');
     assert.equal(typeof claude.ClaudeChannel, 'function');
@@ -58,6 +60,7 @@ function runInstalledSmoke(installedRoot, env) {
     assert.equal(typeof mcp.setRequestHandler, 'function');
     assert.equal(facade.parseTopic, emitted.parseTopic);
     assert.equal(facade.renderTopic, emitted.renderTopic);
+    assert.equal(attachmentFacade.normalizeAttachments, attachmentEmitted.normalizeAttachments);
     process.stdout.write(JSON.stringify({ cli: true, discordSdk: true, mcpSdk: true, zod: true, emitted: true }));
   `;
   run(process.execPath, ['-e', script, installedRoot], { env });
@@ -84,7 +87,7 @@ function main() {
     const pack = JSON.parse(packJson)[0];
     const packagePath = path.join(scratch, pack.filename);
     const files = new Set(pack.files.map(file => file.path));
-    for (const required of ['package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts']) {
+    for (const required of ['package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts', 'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts']) {
       assert(files.has(required), `packed artifact is missing ${required}`);
     }
     run(npm, ['install', '--ignore-scripts', '--prefix', install, packagePath], { env });
