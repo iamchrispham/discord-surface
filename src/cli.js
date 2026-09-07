@@ -796,8 +796,8 @@ async function runRuntime(args) {
     const pendingBindingWake = bindingWake.wait();
     try { await gateway?.stop(); } finally {
       await pendingBindingWake;
-      process.removeListener('SIGUSR2', bindingWake.request);
       try { fs.unlinkSync(paths.pid); } catch {}
+      process.removeListener('SIGUSR2', bindingWake.request);
       state.close();
     }
   };
