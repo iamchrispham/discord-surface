@@ -123,7 +123,15 @@ export function ordinaryBindingDecision(
     existing.nativeId === request.nativeId && existing.workspace === request.workspace &&
     (sessionRootMatches || verifiedRootRelocation) &&
     !existing.conductorId && !existing.repoKey;
+  const verifiedSuccessor = ordinaryMarker && !existing.active && existing.provider === request.provider &&
+    existing.channelId === request.channelId && existing.guildId === request.guildId &&
+    !existing.conductorId && !existing.repoKey &&
+    typeof nativeProof?.file === 'string' && nativeProof.file.startsWith('/') &&
+    nativeProof.sessionId === request.nativeId && nativeProof.threadId === request.nativeId &&
+    nativeProof.workspace === request.workspace &&
+    (nativeProof.sessionRoot || null) === (request.sessionRoot || null);
   if (sameOwner) return existing.active && sessionRootMatches ? 'reuse' : 'rebind';
+  if (verifiedSuccessor) return 'rebind';
   throw new Error('channel is already bound to another owner; use explicit handoff');
 }
 

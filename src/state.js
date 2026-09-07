@@ -958,16 +958,23 @@ class SurfaceState {
     if (!existing || !this.isOrdinaryBindingRecord(existing)) {
       throw new BindingError('ordinary binding tombstone is unavailable for reuse');
     }
-    const requestedSessionRoot = binding.sessionRoot === undefined ? existing.sessionRoot : binding.sessionRoot;
+    const requestedSessionRoot = binding.sessionRoot === undefined
+      ? (!existing.active && nativeProof ? nativeProof.sessionRoot || null : existing.sessionRoot)
+      : binding.sessionRoot;
     const sessionRootMatches = (existing.sessionRoot || null) === (requestedSessionRoot || null);
     const verifiedRootRelocation = sessionRootMatches || Boolean(nativeProof &&
       typeof nativeProof.file === 'string' && path.isAbsolute(nativeProof.file) &&
       nativeProof.sessionId === existing.nativeId && nativeProof.threadId === existing.nativeId &&
       nativeProof.workspace === existing.workspace && nativeProof.sessionRoot === requestedSessionRoot);
+    const verifiedSuccessor = !existing.active && Boolean(nativeProof &&
+      typeof nativeProof.file === 'string' && path.isAbsolute(nativeProof.file) &&
+      nativeProof.sessionId === binding.nativeId && nativeProof.threadId === binding.nativeId &&
+      nativeProof.workspace === binding.workspace && (nativeProof.sessionRoot || null) === (requestedSessionRoot || null) &&
+      identity.sessionId === binding.nativeId && identity.threadId === binding.nativeId);
+    const sameOwner = existing.nativeId === binding.nativeId && existing.workspace === binding.workspace &&
+      identity.sessionId === existing.nativeId && identity.threadId === existing.nativeId && verifiedRootRelocation;
     if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CODEX ||
-      existing.nativeId !== binding.nativeId || existing.workspace !== binding.workspace ||
-      !verifiedRootRelocation ||
-      identity.sessionId !== existing.nativeId || identity.threadId !== existing.nativeId) {
+      (!sameOwner && !verifiedSuccessor)) {
       throw new BindingError('ordinary binding owner changed; use explicit handoff');
     }
     if (existing.active && sessionRootMatches) {
@@ -998,7 +1005,16 @@ class SurfaceState {
         return this.getBinding(binding.channelId);
       });
     }
-    return this.rebind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
+    const rebound = {
+      ...binding,
+      sessionRoot: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : binding.sessionRoot,
+      provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity
+    };
+    return this.rebind(rebound, {
+      resetIntake: !sessionRootMatches || verifiedSuccessor,
+      ordinarySuccessorProof: verifiedSuccessor ? nativeProof : null,
+      sessionRootOverride: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : undefined
+    });
   }
 
   isOrdinaryBindingRecord(binding) {
@@ -1047,7 +1063,7 @@ class SurfaceState {
     });
   }
 
-  rebind(binding) {
+  rebind(binding, { resetIntake = false, ordinarySuccessorProof = null, sessionRootOverride = undefined } = {}) {
     const channelId = assertText(binding.channelId, 'channelId', 128);
     const existing = this.getBinding(channelId);
     if (!existing) throw new BindingError('channel is not bound');
@@ -1063,10 +1079,17 @@ class SurfaceState {
       assertUuid(ordinaryIdentity.threadId, 'threadId');
     }
     const input = this.bindingInput({ ...binding, channelId }, existing);
+    if (sessionRootOverride !== undefined) input.sessionRoot = sessionRootOverride;
     const ordinary = this.isOrdinaryBindingRecord(existing);
+    const verifiedOrdinarySuccessor = ordinary && !existing.active && ordinarySuccessorProof &&
+      typeof ordinarySuccessorProof.file === 'string' && path.isAbsolute(ordinarySuccessorProof.file) &&
+      ordinarySuccessorProof.sessionId === input.nativeId && ordinarySuccessorProof.threadId === input.nativeId &&
+      ordinarySuccessorProof.workspace === input.workspace &&
+      (ordinarySuccessorProof.sessionRoot || null) === (input.sessionRoot || null) &&
+      ordinaryIdentity?.sessionId === input.nativeId && ordinaryIdentity?.threadId === input.nativeId;
     if (ordinary && (!ordinaryIdentity || input.provider !== PROVIDERS.CODEX || input.conductorId || input.repoKey ||
-      input.nativeId !== existing.nativeId || ordinaryIdentity.sessionId !== existing.nativeId ||
-      ordinaryIdentity.threadId !== existing.nativeId)) {
+      (!verifiedOrdinarySuccessor && (input.nativeId !== existing.nativeId || ordinaryIdentity.sessionId !== existing.nativeId ||
+      ordinaryIdentity.threadId !== existing.nativeId)))) {
       throw new BindingError('ordinary bindings require matching invocation identity');
     }
     this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
@@ -1088,6 +1111,10 @@ class SurfaceState {
           sessionId: ordinaryIdentity?.sessionId || input.nativeId,
           threadId: ordinaryIdentity?.threadId || input.nativeId
         });
+      }
+      if (resetIntake) {
+        this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
+          .run('binding generation changed; intake recovery reopened', now(), channelId);
       }
       return this.getBinding(channelId);
     });

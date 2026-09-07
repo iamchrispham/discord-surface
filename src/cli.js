@@ -196,7 +196,9 @@ async function ordinaryBind(args, dependencies = {}) {
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const existing = state.getBinding(channel.id);
-    const validationRoot = sessionRoot || existing?.sessionRoot;
+    const ordinarySuccessor = existing && !existing.active && existing.provider === PROVIDERS.CODEX &&
+      !existing.conductorId && !existing.repoKey && invocation.sessionId !== existing.nativeId;
+    const validationRoot = sessionRoot || (ordinarySuccessor ? undefined : existing?.sessionRoot);
     if (!sessionRoot) {
       const proof = await validateNativeProof(validationRoot);
       nativeProofDetail = proof.detail;
@@ -208,9 +210,10 @@ async function ordinaryBind(args, dependencies = {}) {
     const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: validationRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     if (decision !== 'reuse' && !existing?.active) {
+      const cutoffTimestamp = Date.now();
       const cutoff = await latestChannelMessageId(discordChannel);
       const adoptionCutoff = cutoff || (typeof discordChannel?.messages?.fetch === 'function'
-        ? (BigInt(Date.now() - 1420070400000) << 22n).toString()
+        ? (BigInt(cutoffTimestamp - 1420070400000) << 22n).toString()
         : null);
       if (adoptionCutoff) state.setIntakeCutoff(request.channelId, request.guildId, adoptionCutoff, 'ordinary binding adoption cutoff', existing);
     }

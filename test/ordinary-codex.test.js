@@ -332,6 +332,52 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
   assert.equal(state.getMessage('gateway-held-input').state, 'replied');
 });
 
+test('ordinary bind timestamps an empty-channel cutoff before history fetch', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-empty-cutoff-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  setup.close();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  let fetchStartedAt = 0;
+  let fetchCompletedAt = 0;
+  const channel = {
+    id: 'empty-cutoff-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    messages: { fetch: async () => {
+      fetchStartedAt = Date.now();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      fetchCompletedAt = Date.now();
+      return new Map();
+    } }
+  };
+  class FakeClient {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection ? channel : new Map([[channel.id, channel]])
+      } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  await ordinaryBind({ 'state-dir': dir, channel: '#dev' }, {
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: dir },
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity: () => ({ file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir }),
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  });
+
+  const state = new SurfaceState(db);
+  try {
+    const watermark = state.getIntakeWatermark(channel.id);
+    const cutoffTimestamp = Number(BigInt(watermark.last_seen_id) >> 22n) + 1420070400000;
+    assert.ok(fetchCompletedAt - cutoffTimestamp >= 20);
+    assert.ok(cutoffTimestamp <= fetchStartedAt);
+  } finally { state.close(); }
+});
+
 test('binding wake replays after joining an in-flight recovery', async () => {
   let releaseShared;
   const shared = new Promise(resolve => { releaseShared = resolve; });
@@ -437,6 +483,63 @@ test('ordinary binding permits a verified transcript-root relocation', t => {
   const relocated = f.state.rebindOrdinary(request, request.identity, proof);
   assert.equal(relocated.sessionRoot, sessionRoot);
   assert.equal(relocated.generation, 2);
+});
+
+test('ordinary root relocation reopens a drained terminal intake watermark', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.markIntakeBoundary(binding.channelId, 'gap', 'previous recovery gap', 'gap-from', 'gap-to');
+  const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-relocated-terminal-root-'));
+  t.after(() => fs.rmSync(sessionRoot, { recursive: true, force: true }));
+  const request = {
+    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
+    workspace: f.dir, sessionRoot, identity: { sessionId: CODEX, threadId: CODEX }
+  };
+  const proof = {
+    file: path.join(sessionRoot, `${CODEX}.jsonl`), sessionId: CODEX, threadId: CODEX,
+    workspace: f.dir, sessionRoot
+  };
+  const relocated = f.state.rebindOrdinary(request, request.identity, proof);
+  assert.equal(relocated.generation, 2);
+  const watermark = f.state.getIntakeWatermark(binding.channelId);
+  assert.equal(watermark.state, 'pending');
+  assert.equal(watermark.gap_from, null);
+  assert.equal(watermark.gap_to, null);
+});
+
+test('ordinary bind reclaims a drained tombstone for a verified successor', t => {
+  const f = fixture(t);
+  const originalRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-original-root-'));
+  const binding = f.state.bindOrdinary({
+    channelId: 'ordinary-channel', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    workspace: f.dir, sessionRoot: originalRoot
+  }, f.identity);
+  f.state.unbind(binding.channelId);
+  const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-workspace-'));
+  const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-root-'));
+  t.after(() => {
+    fs.rmSync(originalRoot, { recursive: true, force: true });
+    fs.rmSync(successorWorkspace, { recursive: true, force: true });
+    fs.rmSync(successorRoot, { recursive: true, force: true });
+  });
+  const request = {
+    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: OTHER,
+    workspace: successorWorkspace,
+    identity: { sessionId: OTHER, threadId: OTHER }
+  };
+  const proof = {
+    file: path.join(successorRoot, `${OTHER}.jsonl`), sessionId: OTHER, threadId: OTHER,
+    workspace: successorWorkspace, sessionRoot: undefined
+  };
+  const tombstone = f.state.getBinding(binding.channelId);
+  assert.throws(() => ordinaryBindingDecision(tombstone, request, true), /already bound/);
+  assert.equal(ordinaryBindingDecision(tombstone, request, true, proof), 'rebind');
+  const rebound = f.state.rebindOrdinary(request, request.identity, proof);
+  assert.equal(rebound.active, true);
+  assert.equal(rebound.nativeId, OTHER);
+  assert.equal(rebound.workspace, successorWorkspace);
+  assert.equal(rebound.sessionRoot, null);
+  assert.equal(rebound.generation, 2);
 });
 
 test('native preflight requires exact session metadata and workspace', t => {
