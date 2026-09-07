@@ -1124,6 +1124,11 @@ class SurfaceState {
       !ordinaryIdentityMatches)) {
       throw new BindingError('ordinary bindings require matching invocation identity');
     }
+    if (ordinary && existing.provider === PROVIDERS.CLAUDE && (!ordinaryIdentity || input.provider !== PROVIDERS.CLAUDE || input.conductorId || input.repoKey ||
+      input.nativeId !== existing.nativeId || input.workspace !== existing.workspace || input.endpoint !== existing.endpoint ||
+      ordinaryIdentity.sessionId !== existing.nativeId || ordinaryIdentity.threadId !== existing.nativeId)) {
+      throw new BindingError('ordinary Claude bindings require matching owner and endpoint');
+    }
     this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
     if (existing.conductorId !== input.conductorId || existing.repoKey !== input.repoKey) throw new BindingError('conductor identity changes require an explicit handoff');
     if (existing.conductorId && existing.provider !== input.provider) throw new BindingError('conductor provider changes require an explicit handoff');

@@ -118,6 +118,41 @@ test('ordinary Claude selection and same-owner decision preserve channel custody
   assert.throws(() => ordinaryBindingDecision({ ...request, conductorId: 'owner', active: true }, request, false), /already bound/);
 });
 
+test('ordinary Claude state bind rejects an identity that differs from nativeId before persistence', t => {
+  const f = fixture(t, { bind: false });
+  assert.throws(() => f.state.bindOrdinaryClaude({
+    channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
+    workspace: f.dir, endpoint: f.socketPath
+  }, { sessionId: OTHER, threadId: OTHER, harness: 'claude-code' }), /does not match the native session/);
+  assert.equal(f.state.getBinding('claude-channel'), null);
+  assert.equal(f.state.listReceipts().some(receipt => receipt.kind === 'ordinary-bound'), false);
+});
+
+test('generic rebind cannot mutate ordinary Claude owner or endpoint, while tombstone rebind remains valid', t => {
+  const f = fixture(t);
+  const alternateEndpoint = path.join(f.dir, 'alternate.sock');
+  assert.throws(() => f.state.rebind({
+    channelId: f.binding.channelId, guildId: 'guild', provider: 'claude', nativeId: OTHER,
+    workspace: f.dir, endpoint: alternateEndpoint,
+    ordinaryIdentity: { sessionId: OTHER, threadId: OTHER, harness: 'claude-code' }
+  }), /ordinary Claude bindings require matching owner and endpoint/);
+  assert.throws(() => f.state.rebind({
+    channelId: f.binding.channelId, guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
+    workspace: f.dir, endpoint: alternateEndpoint,
+    ordinaryIdentity: { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }
+  }), /ordinary Claude bindings require matching owner and endpoint/);
+  assert.deepEqual(f.state.getBinding(f.binding.channelId), f.binding);
+
+  f.state.unbind(f.binding.channelId);
+  const rebound = f.state.rebindOrdinaryClaude({
+    channelId: f.binding.channelId, guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
+    workspace: f.dir, endpoint: f.socketPath
+  }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' });
+  assert.equal(rebound.generation, 2);
+  assert.equal(rebound.nativeId, CLAUDE);
+  assert.equal(rebound.endpoint, f.socketPath);
+});
+
 test('ordinary Claude bind uses exact caller and transcript, reuses and rebinds only same owner', async t => {
   const f = fixture(t, { bind: false });
   const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
