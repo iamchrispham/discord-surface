@@ -150,19 +150,30 @@ async function ordinaryBind(args, dependencies = {}) {
     const sessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
     let nativeProofDetail = null;
     let nativeProofError = null;
-    try {
-      nativeProofDetail = await validate(invocation.sessionId, undefined, sessionRoot);
-      if (!nativeProofDetail || typeof nativeProofDetail.workspace !== 'string' || !path.isAbsolute(nativeProofDetail.workspace)) {
-        throw new Error('Codex transcript workspace is unavailable');
+    let resolvedWorkspace = invocation.workspace;
+    const validateNativeProof = async root => {
+      let detail = null;
+      let error = null;
+      try {
+        detail = await validate(invocation.sessionId, undefined, root);
+        if (!detail || typeof detail.workspace !== 'string' || !path.isAbsolute(detail.workspace)) {
+          throw new Error('Codex transcript workspace is unavailable');
+        }
+      } catch (caught) {
+        error = caught;
+        if (!invocation.workspace) throw new Error(`Codex transcript workspace is required: ${caught.message}`);
       }
-    } catch (error) {
-      nativeProofError = error;
-      if (!invocation.workspace) throw new Error(`Codex transcript workspace is required: ${error.message}`);
+      if (detail && invocation.workspace && path.resolve(detail.workspace) !== invocation.workspace) {
+        throw new Error('Codex transcript workspace does not match the supplied workspace');
+      }
+      return { detail, error, workspace: detail?.workspace || invocation.workspace };
+    };
+    if (sessionRoot) {
+      const proof = await validateNativeProof(sessionRoot);
+      nativeProofDetail = proof.detail;
+      nativeProofError = proof.error;
+      resolvedWorkspace = proof.workspace;
     }
-    if (nativeProofDetail && invocation.workspace && path.resolve(nativeProofDetail.workspace) !== invocation.workspace) {
-      throw new Error('Codex transcript workspace does not match the supplied workspace');
-    }
-    const resolvedWorkspace = nativeProofDetail?.workspace || invocation.workspace;
     const { Client, GatewayIntentBits } = install('discord.js');
     client = new Client({ intents: [GatewayIntentBits.Guilds] });
     await client.login(read(config.secretFile));
@@ -184,18 +195,40 @@ async function ordinaryBind(args, dependencies = {}) {
     }
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
+    const existing = state.getBinding(channel.id);
+    const validationRoot = sessionRoot || existing?.sessionRoot;
+    if (!sessionRoot) {
+      const proof = await validateNativeProof(validationRoot);
+      nativeProofDetail = proof.detail;
+      nativeProofError = proof.error;
+      resolvedWorkspace = proof.workspace;
+    }
     const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, sessionRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
-    const existing = state.getBinding(request.channelId);
-    const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot } : null;
+    const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: validationRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     if (decision !== 'reuse' && !existing?.active) {
       const cutoff = await latestChannelMessageId(discordChannel);
-      if (cutoff) state.setIntakeCutoff(request.channelId, request.guildId, cutoff, 'ordinary binding adoption cutoff', existing);
+      const adoptionCutoff = cutoff || (typeof discordChannel?.messages?.fetch === 'function'
+        ? (BigInt(Date.now() - 1420070400000) << 22n).toString()
+        : null);
+      if (adoptionCutoff) state.setIntakeCutoff(request.channelId, request.guildId, adoptionCutoff, 'ordinary binding adoption cutoff', existing);
     }
     let binding;
     if (decision === 'reuse') binding = existing;
-    else if (decision === 'rebind') binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);
+    else if (decision === 'rebind') {
+      try {
+        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);
+      } catch (error) {
+        const raced = state.getBinding(request.channelId);
+        const racedDecision = raced
+          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
+          : null;
+        if (racedDecision !== 'reuse') throw error;
+        decision = 'reuse';
+        binding = raced;
+      }
+    }
     else {
       try {
         binding = state.bindOrdinary(request, request.identity);

@@ -987,8 +987,11 @@ class SurfaceState {
         const current = this.getBinding(binding.channelId);
         if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary root relocation source identity is stale');
         this.assertLegacyMigrationSafe(binding.channelId);
+        const updatedAt = now();
         this.db.prepare('UPDATE bindings SET session_root=?, readiness=?, updated_at=? WHERE channel_id=?')
-          .run(input.sessionRoot, READINESS.PENDING, now(), binding.channelId);
+          .run(input.sessionRoot, READINESS.PENDING, updatedAt, binding.channelId);
+        this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
+          .run('ordinary transcript root relocated; intake recovery reopened', updatedAt, binding.channelId);
         this.receipt(null, 'ordinary-root-relocated', {
           channelId: binding.channelId, generation: existing.generation, sessionRoot: input.sessionRoot
         });
