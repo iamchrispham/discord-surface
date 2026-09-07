@@ -629,13 +629,15 @@ test('simulated: invalid native target is rejected before invoking Codex', async
 
 test('simulated: native pickup ACK is explicit, idempotent, and included in the Codex prompt', async () => {
   const { dir, state } = fixture();
+  const sessionRoot = path.join(dir, 'sessions');
+  fs.mkdirSync(sessionRoot);
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
   state.acceptDiscordMessage({ id: 'ack-prompt', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'ack me' });
   state.claimDispatch('ack-prompt');
   const message = state.getMessage('ack-prompt');
   const command = acknowledgmentCommand(message, state.dbPath);
   let codexArgs;
-  const provider = new CodexProvider({ root: dir, acknowledgmentFor: item => acknowledgmentCommand(item, state.dbPath), run: async (_command, args) => {
+  const provider = new CodexProvider({ root: sessionRoot, acknowledgmentFor: item => acknowledgmentCommand(item, state.dbPath), run: async (_command, args) => {
     codexArgs = args;
     return { status: 'submitted' };
   } });
