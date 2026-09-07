@@ -5,7 +5,7 @@
 - Objective: let an existing conductor announce a milestone without an inbound message or sidecar inference.
 - Domain or lane: explicit conductor outbound delivery.
 - Scope: `post` and `claude-post`, existing binding lookup, receipt custody, shared Discord transport and splitting.
-- Likely files: `src/conductor-post.js`, `src/cli.js`, `src/discord.js`, `src/state.js`, a focused companion test and README usage.
+- Likely files: `src/direct-post.js`, `src/cli.js`, `src/discord.js`, `src/state.js`, a focused companion test and README usage.
 - Architectural pattern: Workflow Coordinator with Gateway reuse.
 - Pattern rationale: the command resolves authority and claims delivery in the existing SQLite transaction boundary. The shared transport owns the HTTP request. The receipt journal owns durable outcomes. Automatic board coalescing does not own explicit milestones.
 - Blast radius: both CLI aliases are gated by native ID, generation, configured guild and the active conductor binding. Every split part rechecks the same authority. Live intake and recovered history enter `SurfaceState.acceptDiscordMessage`, whose own-post predicate must exclude durable sent identities. Gateway auxiliary sends keep their public contract when transport is extracted. Native dispatch, native replies, Monitor listeners, sidecar selection and Telegram delivery remain deferred because this command neither invokes nor reconfigures them.
@@ -31,7 +31,7 @@ Direct-post output includes `recorded`, `duplicate`, and `state`, while retainin
 
 ## Proof status
 
-Issue5 candidate implementation is complete on the existing isolated branch. No sidecar tables or activation are included. Live delivery remains pending until the TM conductor records the follow-up and unsolicited duplicate readbacks on its own channel.
+Issue5 live acceptance was exercised at f259c65061188d4f267459014baf6a0bbd3873a7. The TM conductor recorded follow-up and unsolicited sends, exact-repeat suppression and stale-generation refusal in [PR3 acceptance](https://github.com/iamchrispham/discord-surface/pull/3#issuecomment-5565511695), with [raw command results](https://github.com/iamchrispham/discord-surface/pull/3#issuecomment-5565563347). Independent Discord readback confirmed the bound channel, bot author, follow-up reference, absent unsolicited reference and exclusion from native intake. These plain-content messages do not prove a live mention-bearing case or general installation portability. No sidecar activation is included.
 
 
 ## Local validation and independent review
