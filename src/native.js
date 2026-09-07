@@ -396,7 +396,7 @@ function readInitialCursor(nativeId, root = sessionRoot()) {
 function runCodex(command, args, options = {}) {
   return new Promise(resolve => {
     let spawned = false;
-    const child = execFile(command, args, { cwd: options.cwd, env: process.env, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+    const child = execFile(command, args, { cwd: options.cwd, env: options.env || process.env, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
       if (!error) return resolve({ status: 'submitted', stdout, stderr });
       const text = `${error.message} ${stderr || ''}`;
       if (!spawned || error.code === 'ENOENT') return resolve({ status: 'not_submitted', error: new Error(text) });
@@ -427,7 +427,10 @@ class CodexProvider {
     const root = message.sessionRoot || this.root;
     const cursor = readInitialCursor(message.nativeId, root);
     const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message), '--cd', message.workspace];
-    const result = await this.run(this.command, args, { cwd: message.workspace });
+    const result = await this.run(this.command, args, {
+      cwd: message.workspace,
+      env: { ...process.env, CODEX_HOME: path.dirname(root) }
+    });
     return { ...result, cursor };
   }
 

@@ -145,7 +145,6 @@ async function ordinaryBind(args, dependencies = {}) {
     const config = state.requireConfig();
     const channelSelection = args.channel || args['channel-id'];
     if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
-    if (args.channel && args['channel-id'] && args.channel !== args['channel-id']) throw new Error('--channel and --channel-id must identify the same channel');
     const invocation = resolveInvocationIdentity(environment, args.workspace ? path.resolve(args.workspace) : undefined);
     const sessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
     let nativeProofDetail = null;
@@ -194,9 +193,14 @@ async function ordinaryBind(args, dependencies = {}) {
         messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
     }
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
+    if (args.channel && args['channel-id']) {
+      const namedChannel = resolveExistingChannel(args.channel, config.guildId, fetchedChannels);
+      const idChannel = resolveExistingChannel(args['channel-id'], config.guildId, fetchedChannels);
+      if (namedChannel.id !== idChannel.id) throw new Error('--channel and --channel-id must identify the same channel');
+    }
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const existing = state.getBinding(channel.id);
-    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
+    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId && existing.active) {
       throw new Error('channel is already bound to another owner; use explicit handoff');
     }
     const validationRoot = sessionRoot ?? existing?.sessionRoot ?? undefined;
@@ -236,6 +240,30 @@ async function ordinaryBind(args, dependencies = {}) {
         binding = raced;
       }
     }
+    else if (decision === 'handoff') {
+      try {
+        binding = state.handoffOrdinary({
+          channelId: request.channelId,
+          provider: request.provider,
+          fromNativeId: existing.nativeId,
+          fromGeneration: existing.generation,
+          nativeId: request.nativeId,
+          workspace: request.workspace,
+          sessionRoot: request.sessionRoot,
+          handoffId: `ordinary-bind:${existing.channelId}:${existing.generation}:${request.nativeId}`,
+          identity: request.identity,
+          nativeProof: nativeProofEvidence
+        });
+      } catch (error) {
+        const raced = state.getBinding(request.channelId);
+        const racedDecision = raced
+          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
+          : null;
+        if (racedDecision !== 'reuse') throw error;
+        decision = 'reuse';
+        binding = raced;
+      }
+    }
     else {
       try {
         binding = state.bindOrdinary(request, request.identity, adoptionCutoff);
@@ -250,7 +278,11 @@ async function ordinaryBind(args, dependencies = {}) {
       }
     }
     let nativeProof = { status: 'pending', reason: 'Codex transcript proof is pending' };
-    if (state.hasOrdinaryPreflight(binding)) {
+    if (nativeProofError) {
+      const unavailable = state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, nativeProofError.message, binding);
+      if (unavailable) binding = unavailable;
+      nativeProof = { status: 'pending', reason: nativeProofError.message };
+    } else if (state.hasOrdinaryPreflight(binding)) {
       nativeProof = { status: 'verified', reason: 'Codex transcript proof already recorded' };
     } else if (nativeProofDetail) {
       try {

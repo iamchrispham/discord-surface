@@ -392,7 +392,7 @@ test('ordinary bind timestamps an empty-channel cutoff before history fetch', as
   } finally { state.close(); }
 });
 
-test('ordinary bind rejects an inactive different owner without mutation', async t => {
+test('ordinary bind hands off an inactive different owner through verified custody', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-bind-'));
   const db = path.join(dir, 'surface.sqlite');
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-bind-workspace-'));
@@ -423,23 +423,22 @@ test('ordinary bind rejects an inactive different owner without mutation', async
     async login() {}
     async destroy() {}
   }
-  await assert.rejects(() => ordinaryBind({ 'state-dir': dir, channel: '#dev', 'session-root': successorSession.root }, {
+  await ordinaryBind({ 'state-dir': dir, channel: '#dev', 'session-root': successorSession.root }, {
     environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: successorWorkspace },
     requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
     readSecret: () => 'fixture-token',
     validateCodexSessionIdentity,
     gatewayProcessStatus: () => ({ state: 'stopped' }),
     print: () => {}
-  }), /already bound to another owner; use explicit handoff/);
+  });
 
   const state = new SurfaceState(db);
   try {
     const binding = state.getBinding(original.channelId);
-    assert.equal(binding.nativeId, CODEX);
-    assert.equal(binding.generation, 1);
-    assert.equal(binding.active, false);
-    assert.equal(state.getIntakeWatermark(original.channelId), null);
-    assert.equal(state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff').length, 0);
+    assert.equal(binding.nativeId, OTHER);
+    assert.equal(binding.generation, 2);
+    assert.equal(binding.active, true);
+    assert.equal(state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff').length, 1);
   } finally { state.close(); }
 });
 
