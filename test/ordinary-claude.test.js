@@ -445,7 +445,7 @@ test('old ordinary Claude Monitor stop cannot revoke a successor generation', as
   observed.close();
 });
 
-test('ordinary Claude Monitor startup preserves an existing recovery-unavailable state', async t => {
+test('ordinary Claude Monitor startup reopens an existing recovery-unavailable state', async t => {
   const f = fixture(t);
   f.state.markIntakeBoundary(f.binding.channelId, 'unavailable', 'prior recovery failure', null, null, f.binding);
   f.state.close();
@@ -456,9 +456,9 @@ test('ordinary Claude Monitor startup preserves an existing recovery-unavailable
     if (child.exitCode === null) child.kill('SIGTERM');
   });
   const observed = new SurfaceState(f.db);
-  await waitFor(() => fs.existsSync(f.socketPath) && observed.getBinding(f.binding.channelId)?.readiness !== READINESS.PENDING);
-  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
-  assert.equal(observed.getIntakeWatermark(f.binding.channelId).state, 'unavailable');
+  await waitFor(() => fs.existsSync(f.socketPath) && observed.getIntakeWatermark(f.binding.channelId)?.state === READINESS.PENDING);
+  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.PENDING);
+  assert.equal(observed.getIntakeWatermark(f.binding.channelId).state, READINESS.PENDING);
   child.kill('SIGTERM');
   await new Promise((resolve, reject) => {
     child.once('close', resolve);

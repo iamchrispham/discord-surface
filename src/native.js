@@ -249,6 +249,22 @@ function codexHomeForSessionRoot(root) {
   return path.dirname(root);
 }
 
+function normalizeCodexSessionIdentity(identity, nativeId) {
+  const sessionId = identity.sessionId ?? null;
+  const threadId = identity.threadId ?? null;
+  if (sessionId !== null && threadId !== null && sessionId !== threadId) {
+    throw new Error('Codex transcript identity does not match the supplied native UUID');
+  }
+  if ((sessionId ?? threadId) !== nativeId) {
+    throw new Error('Codex transcript identity does not match the supplied native UUID');
+  }
+  return {
+    ...identity,
+    sessionId: sessionId ?? threadId,
+    threadId: threadId ?? sessionId
+  };
+}
+
 function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot()) {
   validateNativeId(nativeId);
   if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
@@ -256,11 +272,9 @@ function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot())
   const identity = readCodexSessionIdentity(nativeId, root);
   if (!identity) throw new Error('Codex transcript identity is unavailable');
   if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
-  if (identity.sessionId !== nativeId || identity.threadId !== nativeId) {
-    throw new Error('Codex transcript identity does not match the supplied native UUID');
-  }
-  if (workspace !== undefined && identity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
-  return identity;
+  const normalizedIdentity = normalizeCodexSessionIdentity(identity, nativeId);
+  if (workspace !== undefined && normalizedIdentity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
+  return normalizedIdentity;
 }
 
 async function validateCodexSessionIdentityAsync(nativeId, workspace, root = sessionRoot()) {
@@ -270,11 +284,9 @@ async function validateCodexSessionIdentityAsync(nativeId, workspace, root = ses
   const identity = await readCodexSessionIdentityAsync(nativeId, root);
   if (!identity) throw new Error('Codex transcript identity is unavailable');
   if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
-  if (identity.sessionId !== nativeId || identity.threadId !== nativeId) {
-    throw new Error('Codex transcript identity does not match the supplied native UUID');
-  }
-  if (workspace !== undefined && identity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
-  return identity;
+  const normalizedIdentity = normalizeCodexSessionIdentity(identity, nativeId);
+  if (workspace !== undefined && normalizedIdentity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
+  return normalizedIdentity;
 }
 
 const CLAUDE_METADATA_BYTES = 256 * 1024;

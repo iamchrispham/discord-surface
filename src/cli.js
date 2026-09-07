@@ -256,6 +256,7 @@ async function ordinaryBind(args, dependencies = {}) {
     let nativeProof = { status: 'pending', reason: 'Codex transcript proof is pending' };
     if (nativeProofError) {
       const unavailable = state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, nativeProofError.message, binding);
+      if (unavailable === null) throw new Error('ordinary binding changed before native proof was recorded');
       if (unavailable) binding = unavailable;
       nativeProof = { status: 'pending', reason: nativeProofError.message };
     } else if (state.hasOrdinaryPreflight(binding)) {
@@ -1224,7 +1225,13 @@ async function claudeMonitor(args) {
       onTransportClose: stop
     });
     await monitor.start();
-    if (ordinaryStartupBinding) requestGatewayRecovery(paths);
+    if (ordinaryStartupBinding) {
+      const watermark = state.getIntakeWatermark(ordinaryStartupBinding.channelId);
+      if (watermark?.state === READINESS.UNAVAILABLE) {
+        state.reconcileIntake(ordinaryStartupBinding.channelId, ordinaryStartupBinding);
+      }
+      requestGatewayRecovery(paths);
+    }
   } catch (error) {
     await stop();
     throw error;
