@@ -1,5 +1,5 @@
 const fs = require('node:fs');
-const { acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
+const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
@@ -459,7 +459,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     if (prepareReply) {
       try {
         const preparation = prepareReply(result.message.id, signal);
-        if (preparation) await preparation;
+        const prepared = preparation ? await preparation : preparation;
+        if (prepared === ACK_WAITING) return { ...result, message: state.getMessage(result.message.id) };
       }
       catch (error) { return { ...result, message: state.getMessage(result.message.id), error }; }
       if (signal?.aborted) return { ...result, message: state.getMessage(result.message.id) };

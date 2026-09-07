@@ -1525,7 +1525,15 @@ class SurfaceState {
           throw new StaleGenerationError('native reply is stale');
         }
         if (!check.current) throw new AuthorizationError('native reply authorization is no longer valid');
-        if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) return { duplicate: true, message };
+        const ensureNativeReplyAcknowledgment = () => {
+          const existing = this.db.prepare('SELECT 1 FROM receipts WHERE discord_id=? AND kind=? LIMIT 1')
+            .get(messageId, NATIVE_ACK_RECEIPT);
+          if (!existing) this.receipt(messageId, NATIVE_ACK_RECEIPT, { provider, nativeId, generation, source: 'native-reply' });
+        };
+        ensureNativeReplyAcknowledgment();
+        if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) {
+          return { duplicate: true, message };
+        }
         if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.DISPATCHING].includes(message.state)) throw new BindingError(`reply is not accepted in state ${message.state}`);
         const timestamp = now();
         const parts = splitReply(text);

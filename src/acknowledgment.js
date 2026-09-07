@@ -4,6 +4,7 @@ const { AuthorizationError, MESSAGE_STATES, NATIVE_ACK_RECEIPT, StaleGenerationE
 
 const ACK = Object.freeze({ RECEIVED: NATIVE_ACK_RECEIPT, OUTCOME: 'native-ack-reaction' });
 const ACK_OUTCOMES = Object.freeze({ SENT: 'sent', STALE: 'stale', FAILED: 'failed', UNKNOWN: 'unknown' });
+const ACK_WAITING = Symbol('native-acknowledgment-waiting');
 const REACTION = Object.freeze({ SAVED: '📥', ACKNOWLEDGED: '👀' });
 const ACK_RETRY = Object.freeze({ BASE_MS: 250, MAX_MS: 60000, MAX_ATTEMPTS: 8 });
 
@@ -67,7 +68,7 @@ function recordNativeAcknowledgment(state, { provider, messageId, nativeId, gene
       MESSAGE_STATES.REPLIED, MESSAGE_STATES.UNCERTAIN].includes(message.state)) {
       throw new Error(`native acknowledgment is not accepted in state ${message.state}`);
     }
-    state.receipt(messageId, ACK.RECEIVED, { provider, nativeId, generation });
+    state.receipt(messageId, ACK.RECEIVED, { provider, nativeId, generation, source: 'explicit-native-ack' });
     if ([MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN].includes(message.state)) {
       state.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
         .run(MESSAGE_STATES.SUBMITTED, Date.now(), messageId, message.state);
@@ -199,7 +200,7 @@ function createAcknowledgmentDelivery({ state, send }) {
 }
 
 function waitForAcknowledgment(state, deliver, messageId, signal) {
-  if (!hasAcknowledgmentReceipt(state, messageId)) return deliver(messageId);
+  if (!hasAcknowledgmentReceipt(state, messageId)) return ACK_WAITING;
   const current = latestAcknowledgmentOutcome(state, messageId);
   if (current && (current.outcome !== ACK_OUTCOMES.UNKNOWN || current.terminal)) return null;
   return (async () => {
@@ -391,6 +392,7 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
 
 module.exports = {
   ACK,
+  ACK_WAITING,
   REACTION,
   acknowledgmentCommand,
   createAcknowledgmentDelivery,

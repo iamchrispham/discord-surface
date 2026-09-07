@@ -635,7 +635,9 @@ test('simulated: native pickup ACK is explicit, idempotent, and included in the 
   assert.deepEqual(recordNativeAcknowledgment(state, {
     provider: 'codex', messageId: message.id, nativeId: CODEX_ID, generation: 1
   }), { recorded: false, duplicate: true, messageId: message.id });
-  assert.equal(state.listReceipts().filter(row => row.discord_id === message.id && row.kind === ACK.RECEIVED).length, 1);
+  const acknowledgments = state.listReceipts().filter(row => row.discord_id === message.id && row.kind === ACK.RECEIVED);
+  assert.equal(acknowledgments.length, 1);
+  assert.equal(JSON.parse(acknowledgments[0].detail).source, 'explicit-native-ack');
   state.close();
 });
 
@@ -975,14 +977,14 @@ test('simulated: ACK watcher keeps a concurrent receipt append after its snapsho
   }
 });
 
-test('simulated: reply ACK wait survives restart without entering reply custody', async () => {
+test('simulated: explicit native ACK survives restart without entering reply custody', async () => {
   const { dir, db, state } = fixture('ack-reply-boundary.sqlite');
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
   state.acceptDiscordMessage({ id: 'ack-reply-boundary', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'answer' });
   state.claimDispatch('ack-reply-boundary');
   state.markSubmitted('ack-reply-boundary');
-  state.recordNativeReply({ provider: 'codex', messageId: 'ack-reply-boundary', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
   recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-reply-boundary', nativeId: CODEX_ID, generation: 1 });
+  state.recordNativeReply({ provider: 'codex', messageId: 'ack-reply-boundary', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
   let started = false;
   let release;
   const reactionPending = new Promise(resolve => { release = resolve; });
@@ -1007,6 +1009,121 @@ test('simulated: reply ACK wait survives restart without entering reply custody'
   const result = await delivery;
   assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
   assert.equal(sends, 1);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: authenticated Codex reply supplies omitted native acknowledgment', async () => {
+  const { dir, state } = fixture('ack-reply-missing.sqlite');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'ack-reply-missing', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'answer' });
+  state.claimDispatch('ack-reply-missing');
+  state.markSubmitted('ack-reply-missing');
+  state.recordNativeReply({ provider: 'codex', messageId: 'ack-reply-missing', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
+  const acknowledgments = state.listReceipts().filter(row => row.discord_id === 'ack-reply-missing' && row.kind === ACK.RECEIVED);
+  assert.equal(acknowledgments.length, 1);
+  assert.equal(JSON.parse(acknowledgments[0].detail).source, 'native-reply');
+  const events = [];
+  const channel = {
+    messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
+    async send() { events.push('reply'); return { id: 'reply-after-ack' }; }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+  });
+  const source = { id: 'ack-reply-missing', guildId: 'guild-1', channelId: 'channel-codex', channel };
+  const delivery = gateway.consumer.deliverReply(source, {
+    status: 'reply_ready', message: state.getMessage('ack-reply-missing')
+  });
+  const result = await delivery;
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(events, ['👀', 'reply']);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: authenticated Claude reply supplies omitted native acknowledgment', async () => {
+  const { dir, state } = fixture('claude-reply-missing.sqlite');
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
+  state.acceptDiscordMessage({ id: 'claude-reply-missing', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: 'answer' });
+  state.claimDispatch('claude-reply-missing');
+  state.markSubmitted('claude-reply-missing');
+  state.recordNativeReply({ provider: 'claude', messageId: 'claude-reply-missing', nativeId: CLAUDE_ID, generation: 1, text: 'native answer' });
+  const acknowledgments = state.listReceipts().filter(row => row.discord_id === 'claude-reply-missing' && row.kind === ACK.RECEIVED);
+  assert.equal(acknowledgments.length, 1);
+  assert.equal(JSON.parse(acknowledgments[0].detail).source, 'native-reply');
+  const events = [];
+  const channel = {
+    messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
+    async send() { events.push('reply'); return { id: 'claude-reply' }; }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+  });
+  const result = await gateway.consumer.deliverReply({ id: 'claude-reply-missing', guildId: 'guild-1', channelId: 'channel-claude', channel }, {
+    status: 'reply_ready', message: state.getMessage('claude-reply-missing')
+  });
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(events, ['👀', 'reply']);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: native reply ACK is idempotent and rejects stale ownership', () => {
+  const { dir, state } = fixture('native-reply-ack-fence.sqlite');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'native-reply-ack-fence', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'answer' });
+  state.claimDispatch('native-reply-ack-fence');
+  state.markSubmitted('native-reply-ack-fence');
+  const first = state.recordNativeReply({ provider: 'codex', messageId: 'native-reply-ack-fence', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
+  assert.equal(first.duplicate, false);
+  const duplicate = state.recordNativeReply({ provider: 'codex', messageId: 'native-reply-ack-fence', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
+  assert.equal(duplicate.duplicate, true);
+  const acknowledgments = () => state.listReceipts().filter(row => row.discord_id === 'native-reply-ack-fence' && row.kind === ACK.RECEIVED);
+  assert.equal(acknowledgments().length, 1);
+  assert.throws(() => state.recordNativeReply({ provider: 'codex', messageId: 'native-reply-ack-fence', nativeId: CODEX_ID, generation: 2, text: 'stale generation' }), StaleGenerationError);
+  assert.equal(acknowledgments().length, 1);
+  state.close();
+});
+
+test('simulated: omitted native ACK survives restart with one reply and no redispatch', async () => {
+  const first = fixture('native-reply-ack-restart.sqlite');
+  first.state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: first.dir });
+  first.state.acceptDiscordMessage({ id: 'native-reply-ack-restart', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'answer' });
+  first.state.claimDispatch('native-reply-ack-restart');
+  first.state.markSubmitted('native-reply-ack-restart');
+  first.state.recordNativeReply({ provider: 'codex', messageId: 'native-reply-ack-restart', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
+  assert.equal(first.state.listReceipts().filter(row => row.discord_id === 'native-reply-ack-restart' && row.kind === ACK.RECEIVED).length, 1);
+  first.state.close();
+
+  const state = new SurfaceState(first.db);
+  state.recoverAfterRestart();
+  let dispatches = 0;
+  let observations = 0;
+  const events = [];
+  const channel = {
+    messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
+    async send() { events.push('reply'); return { id: 'restart-reply' }; }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    providers: {
+      codex: {
+        async dispatch() { dispatches += 1; return { status: 'submitted' }; },
+        async observe() { observations += 1; return { text: 'unexpected redispatch' }; }
+      }
+    },
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+  });
+  gateway.ready = true;
+  await gateway.reconcilePending();
+  assert.equal(state.getMessage('native-reply-ack-restart').state, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(events, ['👀', 'reply']);
+  assert.equal(dispatches, 0);
+  assert.equal(observations, 0);
+  assert.equal(state.listReceipts().filter(row => row.discord_id === 'native-reply-ack-restart' && row.kind === ACK.RECEIVED).length, 1);
   await gateway.stop();
   state.close();
 });
@@ -1130,12 +1247,17 @@ test('simulated: real-client receipt uses one abortable request without SDK send
   state.markIntakeBoundary('receipt-http', 'ready');
   const listeners = new Map();
   let fetchCalls = 0;
+  let acknowledgmentFetches = 0;
   let capturedUrl;
   let capturedOptions;
   let capturedSignal;
   let channelSendCalls = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (url, options) => {
+    if (String(url).includes('/reactions/')) {
+      acknowledgmentFetches += 1;
+      return Promise.resolve({ ok: true, status: 204 });
+    }
     fetchCalls += 1;
     capturedUrl = url;
     capturedOptions = options;
@@ -1177,6 +1299,7 @@ test('simulated: real-client receipt uses one abortable request without SDK send
     assert.equal(capturedSignal.aborted, true);
     assert.equal(channelSendCalls, 1);
     assert.equal(state.getTransportReceipt('receipt-http-input').outcome.outcome, 'unknown');
+    assert.equal(acknowledgmentFetches, 1);
   } finally {
     globalThis.fetch = originalFetch;
     if (!gateway.stopping) await gateway.stop();
@@ -1192,7 +1315,8 @@ test('simulated: rejected receipt response cancels its body before dropping the 
   let fetchCalls = 0;
   let bodyCancelled = false;
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
+  globalThis.fetch = async url => {
+    if (String(url).includes('/reactions/')) return { ok: true, status: 204 };
     fetchCalls += 1;
     return {
       ok: false,
@@ -1564,7 +1688,12 @@ test('simulated: long replies use durable Discord-sized parts and bounded enforc
   state.markSubmitted('long-reply');
   state.recordNativeReply({ provider: 'codex', messageId: 'long-reply', nativeId: CODEX_ID, generation: 1, text: 'x'.repeat(4500) });
   const payloads = [];
-  const client = { on() {}, off() {}, async destroy() {} };
+  const client = {
+    on() {},
+    off() {},
+    channels: { fetch: async () => ({ messages: { fetch: async () => ({ react: async () => {} }) } }) },
+    async destroy() {}
+  };
   const gateway = new DiscordGateway({ state, client });
   const source = discordMessage({ id: 'long-reply', channelId: 'channel-codex', sends: payloads });
   const result = await gateway.consumer.deliverReply(source, { status: 'reply_ready', message: state.getMessage('long-reply') });
@@ -1777,6 +1906,7 @@ test('simulated: reconnect recovery reuses the live observer without starting a 
   state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
   state.markIntakeBoundary('channel-codex', 'ready');
   const channel = {
+    messages: { fetch: async () => ({ react: async () => {} }) },
     id: 'channel-codex',
     guildId: 'guild-1',
     topic: '',
@@ -2178,13 +2308,14 @@ test('simulated: login-time input is durably held and backfill closes before dis
     guildId: 'guild-1',
     topic: '',
     permissionsFor: () => historyPermissions(),
+    messages: { fetch: async () => ({ react: async () => {} }) },
     async send() { return { id: 'reply-login-input' }; }
   };
   const client = {
     user: { id: 'bot-1' },
     on(name, fn) { listeners.set(name, fn); },
     off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
-    async login() { await listeners.get('messageCreate')(discordMessage({ id: '101', channelId: 'channel-codex' })); },
+    async login() { await listeners.get('messageCreate')({ ...discordMessage({ id: '101', channelId: 'channel-codex' }), channel }); },
     channels: { fetch: async () => channel },
     async destroy() {}
   };
@@ -2209,6 +2340,7 @@ test('simulated: login-time input is durably held and backfill closes before dis
   assert.equal(state.getIntakeWatermark('channel-codex').last_seen_id, '101');
   assert.equal(channel.topic, '');
   await gateway.reconcilePending();
+  await waitForCondition(() => state.getMessage('101').state === MESSAGE_STATES.REPLIED);
   assert.equal(state.getMessage('101').state, MESSAGE_STATES.REPLIED);
   await listeners.get('resume')();
   assert.equal(state.getBinding('channel-codex').readiness, READINESS.READY);
@@ -2384,6 +2516,7 @@ test('simulated: submitted recovery transfers custody to one live observer witho
   let observations = 0;
   let release;
   const channel = {
+    messages: { fetch: async () => ({ react: async () => {} }) },
     async send() {
       sends += 1;
       return { id: 'reply-submitted-recovery' };
@@ -2446,6 +2579,7 @@ test('simulated: accepted recovery transfers submitted custody without blocking 
   let observations = 0;
   let release;
   const channel = {
+    messages: { fetch: async () => ({ react: async () => {} }) },
     async send(payload) {
       sends.push(payload);
       return { id: `sent-${sends.length}` };
@@ -2503,6 +2637,7 @@ test('simulated: recovered observer drains next accepted message for same native
   const observations = [];
   const releases = [];
   const channel = {
+    messages: { fetch: async () => ({ react: async () => {} }) },
     async send(payload) {
       sends.push(payload);
       return { id: `sent-${sends.length}` };
@@ -2560,6 +2695,7 @@ test('simulated: recovered queue tail stays held after native owner change', asy
   let release;
   const sends = [];
   const channel = {
+    messages: { fetch: async () => ({ react: async () => {} }) },
     async send(payload) {
       sends.push(payload);
       return { id: `sent-${sends.length}` };
@@ -2616,6 +2752,7 @@ test('simulated: gateway owner queue orders recovered and live inputs during rec
   let releaseSecondFetch;
   const secondFetch = new Promise(resolve => { releaseSecondFetch = resolve; });
   const channel = {
+    messages: { fetch: async () => ({ react: async () => {} }) },
     async send(payload) {
       sends.push(payload);
       return { id: `sent-${sends.length}` };
@@ -2679,7 +2816,7 @@ test('simulated: live same-owner inputs keep durable FIFO order', async () => {
   const releases = new Map();
   const client = new EventEmitter();
   client.destroy = async () => {};
-  client.channels = { fetch: async () => ({ async send() { return { id: 'unused' }; } }) };
+  client.channels = { fetch: async () => ({ messages: { fetch: async () => ({ react: async () => {} }) }, async send() { return { id: 'unused' }; } }) };
   const gateway = new DiscordGateway({
     state,
     client,
