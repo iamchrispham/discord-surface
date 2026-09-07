@@ -900,7 +900,7 @@ async function main() {
           provider: required(args, 'provider'),
           messageId: required(args, 'message-id'),
           nativeId: required(args, 'native-id'),
-          generation: Number(args.generation)
+          generation: Number(required(args, 'generation'))
         }));
       } finally { state.close(); }
     }

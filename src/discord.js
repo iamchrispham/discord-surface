@@ -673,6 +673,7 @@ class DiscordGateway {
     if (typeof reply.replyNonce !== 'string' || reply.replyNonce.length > 25) throw new Error('Discord reply nonce must be at most 25 characters');
     const channel = message.channel || await this.client.channels?.fetch?.(message.channelId);
     if (!channel?.send) throw new Error('Discord reply channel is unavailable');
+    this.state.assertMessageCurrent(reply.id, 'reply-send');
     try {
       return await channel.send({
         content: reply.replyText,
