@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const { readSnapshot } = require('../src/snapshot');
+const { readSnapshot, renderSnapshot } = require('../src/snapshot');
 const { buildContextCommand, buildSparkCommand } = require('../src/liaison-process');
 const { contextPacket, interpretSnapshot, validateAnswer } = require('../src/context-interpretation');
 
@@ -35,6 +35,60 @@ async function fixture(t) {
   assert.equal(snapshot.unavailable, undefined);
   return { directory, ladderDir, registry, original, snapshot, binding };
 }
+
+async function owedSnapshot(t, fields) {
+  const { registry, ladderDir, original, binding } = await fixture(t);
+  const data = JSON.parse(original);
+  const record = data._conductors[binding.conductorId];
+  delete record.owed_by_operator;
+  delete record.owed_to_operator;
+  Object.assign(record, { owed: 'LEGACY VALUE MUST NOT ENTER CONTEXT' }, fields);
+  const bytes = JSON.stringify(data);
+  fs.writeFileSync(registry, bytes);
+  const snapshot = await readSnapshot(binding, { registry, ladderDir, now: Date.parse('2026-09-06T06:05:00Z') / 1000 });
+  assert.equal(snapshot.unavailable, undefined);
+  assert.equal(fs.readFileSync(registry, 'utf8'), bytes);
+  const packet = contextPacket(snapshot);
+  assert.ok(packet);
+  assert.equal(JSON.stringify(packet).includes('LEGACY VALUE'), false);
+  return { snapshot, source: id => packet.sources.find(row => row.id === `context.${id}`) };
+}
+
+test('string owed items retain text and direction through context and preview', async t => {
+  const by = ['Choose release scope', 'Supply test device'];
+  const to = ['Return device evidence'];
+  const { snapshot, source } = await owedSnapshot(t, { owed_by_operator: by, owed_to_operator: to });
+  assert.equal(source('owedByOperator').state, 'recorded');
+  assert.deepEqual(source('owedByOperator').value, by);
+  assert.deepEqual(source('owedToOperator').value, to);
+  assert.ok(renderSnapshot(snapshot).includes('Owed by you: Choose release scope / Supply test device'));
+  assert.ok(renderSnapshot(snapshot).includes('Owed to you: Return device evidence'));
+});
+
+test('mixed owed shapes preserve supplied provenance without inventing it', async t => {
+  const items = ['Choose release scope', { id: 'device', text: 'Supply test device', since: '2026-09-06T05:00:00Z' }];
+  const { source } = await owedSnapshot(t, { owed_by_operator: items, owed_to_operator: [] });
+  assert.deepEqual(source('owedByOperator').value, items);
+  assert.deepEqual(source('owedToOperator').value, []);
+});
+
+test('missing and empty owed fields stay distinct without legacy fallback', async t => {
+  const { source } = await owedSnapshot(t, { owed_by_operator: [] });
+  assert.equal(source('owedByOperator').state, 'recorded');
+  assert.deepEqual(source('owedByOperator').value, []);
+  assert.equal(source('owedToOperator').state, 'missing');
+  assert.equal(source('owedToOperator').value, null);
+});
+
+test('malformed and oversized owed entries remain invalid', async t => {
+  const item = { id: 'proof', text: 'Return evidence', since: '2026-09-06T05:00:00Z' };
+  for (const value of [[false], [''], ['x'.repeat(601)], Array(31).fill('Choose scope'),
+    [{ id: 'proof', text: 'Return evidence' }], [item, 'Choose scope', item]]) {
+    const { source } = await owedSnapshot(t, { owed_by_operator: value });
+    assert.equal(source('owedByOperator').state, 'invalid');
+    assert.equal(source('owedByOperator').value, null);
+  }
+});
 
 test('snapshot does not share an abbreviated Claude owner across full native identities', async t => {
   const { ladderDir, registry } = await fixture(t);

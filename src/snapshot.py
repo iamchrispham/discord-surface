@@ -36,11 +36,14 @@ def field(record, key, kind):
     else:
         valid = isinstance(value, list) and len(value) <= 30
         if valid:
-            valid = all(isinstance(v, dict) and text(v.get("id"), 128) and text(v.get("text"))
-                        and epoch(v.get("since")) is not None for v in value)
+            valid = all((isinstance(v, str) and text(v)) or
+                        (isinstance(v, dict) and text(v.get("id"), 128) and text(v.get("text"))
+                         and epoch(v.get("since")) is not None) for v in value)
         if valid:
-            valid = len({v["id"] for v in value}) == len(value)
-            value = [{k: v[k] for k in ("id", "text", "since")} for v in value]
+            identified = [v for v in value if isinstance(v, dict)]
+            valid = len({v["id"] for v in identified}) == len(identified)
+            value = [v if isinstance(v, str) else {k: v[k] for k in ("id", "text", "since")}
+                     for v in value]
     return {"state": "recorded" if valid else "invalid", "value": value if valid else None}
 
 
