@@ -415,7 +415,7 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
         sessionId: identityProof.sessionId,
         threadId: identityProof.threadId,
         workspace: identityProof.workspace,
-        endpoint,
+        endpoint: resolvedEndpoint,
         harness: 'claude-code'
       });
       if (!recorded) throw new Error('ordinary Claude binding changed before native proof was recorded');
