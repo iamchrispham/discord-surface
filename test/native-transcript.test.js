@@ -305,3 +305,15 @@ test('abort and generation invalidation stop before reads and close mid-read des
     });
   }
 });
+
+
+test('missing cursor file retains cutoff while reading a replacement transcript', async t => {
+  const { root, file } = fixture(t);
+  const since = Date.now() - 10000;
+  const cursor = { file: path.join(root, 'missing.jsonl'), offset: 500, since, tail: '' };
+  fs.appendFileSync(file, finalRow('too old', { timestamp: new Date(since - 1000).toISOString() }));
+  fs.appendFileSync(file, finalRow('recovered', { timestamp: new Date(since + 1000).toISOString() }));
+  const result = await observe(file, cursor, { timeoutMs: 100 });
+  assert.equal(result.text, 'recovered');
+  assert.equal(result.cursor.since, since);
+});

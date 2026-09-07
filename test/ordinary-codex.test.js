@@ -7,7 +7,7 @@ const path = require('node:path');
 const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
 const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordinaryBind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
-const { validateCodexSessionIdentity } = require('../src/native');
+const { CodexProvider, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
 const { SurfaceState, READINESS, StaleGenerationError } = require('../src/state');
 const { runDirectPost } = require('../src/direct-post');
 const facade = require('../src/ordinary-codex');
@@ -36,12 +36,14 @@ function ordinary(fixtureState, channelId = 'ordinary-channel', nativeId = CODEX
 }
 
 function transcript(t, workspace, id = CODEX, overrides = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-transcript-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-transcript-'));
+  const root = path.join(home, 'sessions');
+  fs.mkdirSync(root);
   const file = path.join(root, `${id}.jsonl`);
   fs.writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: {
     session_id: id, id, cwd: workspace, ...overrides
   } })}\n`);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   return { root, file };
 }
 
@@ -442,7 +444,7 @@ test('ordinary bind timestamps an empty-channel cutoff before history fetch', as
   } finally { state.close(); }
 });
 
-test('ordinary bind hands off an inactive different owner through verified custody', async t => {
+test('ordinary bind rejects an inactive different owner despite verified proof', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-bind-'));
   const db = path.join(dir, 'surface.sqlite');
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-bind-workspace-'));
@@ -473,22 +475,22 @@ test('ordinary bind hands off an inactive different owner through verified custo
     async login() {}
     async destroy() {}
   }
-  await ordinaryBind({ 'state-dir': dir, channel: '#dev', 'session-root': successorSession.root }, {
+  await assert.rejects(() => ordinaryBind({ 'state-dir': dir, channel: '#dev', 'session-root': successorSession.root }, {
     environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: successorWorkspace },
     requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
     readSecret: () => 'fixture-token',
     validateCodexSessionIdentity,
     gatewayProcessStatus: () => ({ state: 'stopped' }),
     print: () => {}
-  });
+  }), /already bound/);
 
   const state = new SurfaceState(db);
   try {
     const binding = state.getBinding(original.channelId);
-    assert.equal(binding.nativeId, OTHER);
-    assert.equal(binding.generation, 2);
-    assert.equal(binding.active, true);
-    assert.equal(state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff').length, 1);
+    assert.equal(binding.nativeId, CODEX);
+    assert.equal(binding.generation, 1);
+    assert.equal(binding.active, false);
+    assert.equal(state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff').length, 0);
   } finally { state.close(); }
 });
 
@@ -523,7 +525,8 @@ test('ordinary CLI handoff changes a custom root to its default root', async t =
   const db = path.join(dir, 'surface.sqlite');
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-workspace-'));
   const predecessorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-predecessor-'));
-  const defaultRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-default-'));
+  const defaultRoot = path.join(dir, 'sessions');
+  fs.mkdirSync(defaultRoot);
   const transcriptFile = path.join(defaultRoot, OTHER + '.jsonl');
   fs.writeFileSync(transcriptFile, `${JSON.stringify({ type: 'session_meta', payload: {
     session_id: OTHER, id: OTHER, cwd: successorWorkspace
@@ -725,6 +728,7 @@ test('ordinary bind rejects a successor and explicit tombstone handoff transfers
   };
   const tombstone = f.state.getBinding(binding.channelId);
   assert.throws(() => ordinaryBindingDecision(tombstone, request, true), /already bound/);
+  assert.throws(() => ordinaryBindingDecision(tombstone, { ...request, sessionRoot: successorRoot }, true, proof), /already bound/);
   assert.throws(() => f.state.rebindOrdinary(request, request.identity, proof), /owner changed/);
   const rebound = f.state.handoffOrdinary({
     channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
@@ -1074,4 +1078,19 @@ test('ordinary post uses explicit binding custody and suppresses duplicate and u
   await assert.rejects(() => runDirectPost({ state: f.state, token: 'fixture', nativeId: CODEX, generation: binding.generation,
     channelId: binding.channelId, provider: 'codex', ordinary: true, textFile, dedupeKey: 'ordinary-stale', fetchImpl: sentFetch }),
   error => error instanceof StaleGenerationError);
+});
+
+test('unsupported direct transcript store cannot validate or invoke queue', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-direct-store-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, `${CODEX}.jsonl`), `${JSON.stringify({ type: 'session_meta', payload: { id: CODEX, session_id: CODEX, cwd: root } })}\n`);
+  assert.throws(() => validateCodexSessionIdentity(CODEX, root, root), /Unsupported Codex session root/);
+  await assert.rejects(() => validateCodexSessionIdentityAsync(CODEX, root, root), /Unsupported Codex session root/);
+  let calls = 0;
+  const provider = new CodexProvider({ root, run: async () => { calls++; return { status: 'submitted' }; } });
+  const result = await provider.dispatch({ nativeId: CODEX, workspace: root });
+  assert.equal(result.status, 'not_submitted');
+  assert.equal(calls, 0);
+  assert.equal(fs.existsSync(path.join(root, `${CODEX}.jsonl`)), true);
+  assert.equal(fs.existsSync(path.join(root, 'sessions')), false);
 });

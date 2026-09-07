@@ -113,7 +113,7 @@ export function ordinaryBindingDecision(
   request: OrdinaryCodexRequest,
   ordinaryMarker = false,
   nativeProof: OrdinaryCodexNativeProof | null = null
-): 'bind' | 'reuse' | 'rebind' | 'handoff' {
+): 'bind' | 'reuse' | 'rebind' {
   if (!existing) return 'bind';
   const sessionRootMatches = request.sessionRoot === undefined || (existing.sessionRoot || null) === request.sessionRoot;
   const verifiedRootRelocation = !sessionRootMatches && typeof nativeProof?.file === 'string' && nativeProof.file.startsWith('/') &&
@@ -125,16 +125,6 @@ export function ordinaryBindingDecision(
     (sessionRootMatches || verifiedRootRelocation) &&
     !existing.conductorId && !existing.repoKey;
   if (sameOwner) return existing.active && sessionRootMatches ? 'reuse' : 'rebind';
-  const successorProof = nativeProof &&
-    typeof nativeProof.file === 'string' && nativeProof.file.startsWith('/') &&
-    nativeProof.sessionId === request.nativeId && nativeProof.threadId === request.nativeId &&
-    nativeProof.workspace === request.workspace &&
-    (nativeProof.sessionRoot || null) === (request.sessionRoot === undefined ? (existing.sessionRoot || null) : (request.sessionRoot || null));
-  if (ordinaryMarker && !existing.active && existing.provider === request.provider &&
-    existing.channelId === request.channelId && existing.guildId === request.guildId &&
-    existing.nativeId !== request.nativeId && !existing.conductorId && !existing.repoKey && successorProof) {
-    return 'handoff';
-  }
   throw new Error('channel is already bound to another owner; use explicit handoff');
 }
 

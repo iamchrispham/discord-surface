@@ -292,7 +292,7 @@ test('simulated: attachment metadata survives intake, reopen, and native payload
 
   let codexArgs;
   let codexEnv;
-  const provider = new CodexProvider({ root: dir, run: async (_command, args, options) => {
+  const provider = new CodexProvider({ root: path.join(dir, 'sessions'), run: async (_command, args, options) => {
     codexArgs = args;
     codexEnv = options.env;
     return { status: 'not_submitted', error: new Error('fixture') };

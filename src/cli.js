@@ -200,7 +200,7 @@ async function ordinaryBind(args, dependencies = {}) {
     }
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const existing = state.getBinding(channel.id);
-    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId && existing.active) {
+    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
       throw new Error('channel is already bound to another owner; use explicit handoff');
     }
     const validationRoot = sessionRoot ?? existing?.sessionRoot ?? undefined;
@@ -230,30 +230,6 @@ async function ordinaryBind(args, dependencies = {}) {
     else if (decision === 'rebind') {
       try {
         binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);
-      } catch (error) {
-        const raced = state.getBinding(request.channelId);
-        const racedDecision = raced
-          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
-          : null;
-        if (racedDecision !== 'reuse') throw error;
-        decision = 'reuse';
-        binding = raced;
-      }
-    }
-    else if (decision === 'handoff') {
-      try {
-        binding = state.handoffOrdinary({
-          channelId: request.channelId,
-          provider: request.provider,
-          fromNativeId: existing.nativeId,
-          fromGeneration: existing.generation,
-          nativeId: request.nativeId,
-          workspace: request.workspace,
-          sessionRoot: request.sessionRoot,
-          handoffId: `ordinary-bind:${existing.channelId}:${existing.generation}:${request.nativeId}`,
-          identity: request.identity,
-          nativeProof: nativeProofEvidence
-        });
       } catch (error) {
         const raced = state.getBinding(request.channelId);
         const racedDecision = raced

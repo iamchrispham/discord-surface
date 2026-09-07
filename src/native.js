@@ -240,9 +240,17 @@ function readCodexSessionIdentity(nativeId, root = sessionRoot()) {
   return matches[0];
 }
 
+function codexHomeForSessionRoot(root) {
+  if (!path.isAbsolute(root) || path.basename(root) !== 'sessions') {
+    throw new Error('Unsupported Codex session root: queue requires <CODEX_HOME>/sessions');
+  }
+  return path.dirname(root);
+}
+
 function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot()) {
   validateNativeId(nativeId);
   if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
+  codexHomeForSessionRoot(root);
   const identity = readCodexSessionIdentity(nativeId, root);
   if (!identity) throw new Error('Codex transcript identity is unavailable');
   if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
@@ -256,6 +264,7 @@ function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot())
 async function validateCodexSessionIdentityAsync(nativeId, workspace, root = sessionRoot()) {
   validateNativeId(nativeId);
   if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
+  codexHomeForSessionRoot(root);
   const identity = await readCodexSessionIdentityAsync(nativeId, root);
   if (!identity) throw new Error('Codex transcript identity is unavailable');
   if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
@@ -365,7 +374,6 @@ async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000,
           file = null;
           offset = 0;
           tailBytes = Buffer.alloc(0);
-          since = startedAt;
         }
         onCursor?.(currentCursor());
       }
@@ -425,7 +433,10 @@ class CodexProvider {
       return { status: 'not_submitted', error };
     }
     const root = message.sessionRoot || this.root;
-    const codexHome = path.basename(root) === 'sessions' ? path.dirname(root) : root;
+    let codexHome;
+    try { codexHome = codexHomeForSessionRoot(root); } catch (error) {
+      return { status: 'not_submitted', error };
+    }
     const cursor = readInitialCursor(message.nativeId, root);
     const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message), '--cd', message.workspace];
     const result = await this.run(this.command, args, {
