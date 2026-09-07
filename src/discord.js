@@ -521,7 +521,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
           if (promoted?.state === MESSAGE_STATES.REPLY_READY && result.message?.state !== MESSAGE_STATES.REPLY_READY) {
             result = { ...result, message: promoted };
           }
-          if (result.status === 'uncertain' && promoted?.state === MESSAGE_STATES.SUBMITTED) {
+          if (['uncertain', 'not_submitted'].includes(result.status) && promoted?.state === MESSAGE_STATES.SUBMITTED) {
             result = await observeSubmitted(state, promoted, providers[promoted.provider], {
               ...observeOptions,
               signal: taskSignal,
@@ -836,7 +836,7 @@ class DiscordGateway {
         onAcknowledged: messageId => {
           if (this.stopping) return null;
           const message = this.state.getMessage(messageId);
-          if (message?.state !== MESSAGE_STATES.SUBMITTED) return null;
+          if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY].includes(message?.state)) return null;
           return this.consumer?.resumeSubmitted(message, undefined, { awaitExisting: false, continueUntilFinal: true });
         },
         logger: this.logger

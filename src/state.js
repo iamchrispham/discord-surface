@@ -1465,7 +1465,7 @@ class SurfaceState {
   setObserverCursor(messageId, cursor, marker = null) {
     return this.transaction(() => {
       const message = this.getMessage(messageId);
-      if (!message || ![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED].includes(message.state)) return message;
+      if (!message || ![MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED].includes(message.state)) return message;
       this.db.prepare('UPDATE messages SET observer_cursor=?, observer_marker=COALESCE(?, observer_marker), updated_at=? WHERE discord_id=?')
         .run(safeDetail(cursor), marker, now(), messageId);
       return this.getMessage(messageId);

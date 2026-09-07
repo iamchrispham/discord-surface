@@ -284,11 +284,12 @@ class CodexProvider {
     this.acknowledgmentFor = acknowledgmentFor;
   }
 
-  async dispatch(message) {
+  async dispatch(message, { onCursor } = {}) {
     try { validateNativeId(message.nativeId); } catch (error) {
       return { status: 'not_submitted', error };
     }
     const cursor = readInitialCursor(message.nativeId, this.root);
+    onCursor?.(cursor);
     const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message, this.acknowledgmentFor?.(message)), '--cd', message.workspace];
     const result = await this.run(this.command, args, { cwd: message.workspace });
     return { ...result, cursor };
@@ -422,9 +423,12 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
     state.markUncertain(message.id, error);
     return { status: 'uncertain', message: state.getMessage(message.id), error };
   }
+  const marker = `[[discord-surface:${message.id}]]`;
   let outcome;
   try {
-    outcome = await provider.dispatch(message);
+    outcome = await provider.dispatch(message, {
+      onCursor: cursor => state.setObserverCursor(message.id, cursor, marker)
+    });
   } catch (error) {
     state.markUncertain(message.id, error);
     return { status: 'uncertain', message: state.getMessage(message.id), error };
@@ -442,7 +446,6 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
     state.markUncertain(message.id, outcome.error);
     return { status: 'uncertain', message: state.getMessage(message.id), error: outcome.error };
   }
-  const marker = `[[discord-surface:${message.id}]]`;
   state.markSubmitted(message.id, outcome.cursor || null, marker);
   try { options.onSubmitted?.(state.getMessage(message.id)); } catch {}
   const observation = await observeSubmitted(state, state.getMessage(message.id), provider, options);
