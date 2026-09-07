@@ -71,7 +71,7 @@ function recordNativeAcknowledgment(state, { provider, messageId, nativeId, gene
     state.receipt(messageId, ACK.RECEIVED, { provider, nativeId, generation, source: 'explicit-native-ack' });
     if ([MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN].includes(message.state)) {
       state.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
-        .run(MESSAGE_STATES.SUBMITTED, Date.now(), messageId, message.state);
+        .run(MESSAGE_STATES.SUBMITTED, new Date().toISOString(), messageId, message.state);
       state.receipt(messageId, 'dispatch-already-acknowledged', {
         generation,
         fromState: message.state
@@ -255,7 +255,12 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
   function notifyAcknowledged(messageId) {
     if (!onAcknowledged || notified.has(messageId) || !hasAcknowledgmentReceipt(state, messageId)) return;
     notified.add(messageId);
-    Promise.resolve().then(() => onAcknowledged(messageId)).catch(error => logger(`native acknowledgment resume failed: ${error.message}`));
+    Promise.resolve().then(() => onAcknowledged(messageId))
+      .catch(error => logger(`native acknowledgment resume failed: ${error.message}`))
+      .finally(() => {
+        const detail = latestAcknowledgmentOutcome(state, messageId);
+        if (detail && (detail.outcome !== ACK_OUTCOMES.UNKNOWN || detail.terminal)) notified.delete(messageId);
+      });
   }
 
   function rememberRetryAt(messageId) {
@@ -313,6 +318,8 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
         if (closed) return;
         notifyAcknowledged(id);
         await deliver(id);
+        const detail = latestAcknowledgmentOutcome(state, id);
+        if (detail && (detail.outcome !== ACK_OUTCOMES.UNKNOWN || detail.terminal)) notified.delete(id);
         rememberRetryAt(id);
       }
     })().catch(error => logger(`native acknowledgment drain failed: ${error.message}`));
@@ -385,6 +392,7 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
       clearTimeout(timer);
       timer = null;
       timerDueAt = null;
+      notified.clear();
       await running;
     }
   };
