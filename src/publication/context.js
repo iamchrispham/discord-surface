@@ -18,7 +18,8 @@ function contextualPublications({ store, interpret = interpretSnapshot, schedule
     const snapshot = JSON.parse(head.snapshot);
     if (snapshot.expiresAt && snapshot.expiresAt * 1000 <= clock()) return null;
     if (snapshot.context?.freshness !== 'current') return null;
-    return contextPacket(snapshot) ? snapshot : null;
+    const history = store.sentHistory(binding);
+    return contextPacket(snapshot, history) ? { snapshot, history } : null;
   }
   function pump() {
     if (closed) return;
@@ -28,16 +29,16 @@ function contextualPublications({ store, interpret = interpretSnapshot, schedule
       return;
     }
     for (const work of store.contextWork()) {
-      const snapshot = sourceFor(work);
-      if (snapshot === CONTEXT_DISABLED) continue;
-      if (!snapshot) { store.finishContext(work, { reason: 'source-unavailable' }, clock()); continue; }
+      const source = sourceFor(work);
+      if (source === CONTEXT_DISABLED) continue;
+      if (!source) { store.finishContext(work, { reason: 'source-unavailable' }, clock()); continue; }
       const claimed = store.db.prepare('UPDATE publication_context SET status=?,started_at=? WHERE owner_key=? AND sequence=? AND status=?')
         .run(CONTEXT_STATUS.RUNNING, clock(), work.owner_key, work.sequence, CONTEXT_STATUS.QUEUED).changes;
       if (!claimed) continue;
       const controller = new AbortController();
       const task = { work, controller, promise: null };
       active = task;
-      task.promise = Promise.resolve().then(() => interpret(snapshot, { signal: controller.signal }))
+      task.promise = Promise.resolve().then(() => interpret(source.snapshot, { signal: controller.signal, history: source.history }))
         .catch(() => ({ status: 'unavailable', reason: 'interpretation-failed' }))
         .then(result => {
           store.finishContext(work, closed || controller.signal.aborted ? { reason: 'cancelled' } : result, clock());

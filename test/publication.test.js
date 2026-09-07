@@ -7,7 +7,7 @@ const { EventEmitter } = require('node:events');
 const { SurfaceState } = require('../src/state');
 const { readSnapshot } = require('../src/snapshot');
 const { watchPublications } = require('../src/publication/publisher');
-const { STATUS } = require('../src/publication/store');
+const { STATUS, POST_KIND, ownerKey } = require('../src/publication/store');
 const { DiscordGateway, createSurfaceConsumer } = require('../src/discord');
 
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
@@ -463,12 +463,13 @@ test('bot echo releases newer pending publication through events and preserves c
 
 function heldInterpreter() {
   const calls = [];
-  const interpret = (snapshot, { signal }) => new Promise(resolve => {
+  const interpret = (snapshot, options) => new Promise(resolve => {
+    const { signal } = options;
     let timer;
     const finish = result => { clearTimeout(timer); signal.removeEventListener('abort', abort); resolve(result); };
     const abort = () => { timer = setTimeout(() => finish({ status: 'unavailable', reason: 'cancelled' }), 50); };
     signal.addEventListener('abort', abort, { once: true });
-    calls.push({ snapshot, finish, signal });
+    calls.push({ snapshot, options, finish, signal });
   });
   return { calls, interpret };
 }
@@ -476,6 +477,28 @@ function usefulContext(snapshot) {
   return { status: 'ready', snapshotId: snapshot.id, preview: '**Possible connection · Luna**\nDevice evidence supports the recorded proof obligation.',
     interpretation: { decision: 'context' } };
 }
+
+test('sent history selects newest board and context for the exact owner only', t => {
+  const f = fixture(t);
+  const insert = ({ owner = f.binding, id, kind, status = STATUS.SENT, snapshotId = `${id}-snapshot`, sentAt, content = id }) => {
+    f.state.db.prepare(`INSERT INTO publication_posts
+      (id,owner_key,channel_id,guild_id,snapshot_id,content,nonce,kind,status,message_id,sent_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id, ownerKey(owner), owner.channelId, owner.guildId,
+      snapshotId, content, `nonce-${id}`, kind, status, `message-${id}`, sentAt);
+  };
+  insert({ id: 'board-old', kind: POST_KIND.BOARD, sentAt: 100, content: 'old board' });
+  insert({ id: 'board-new', kind: POST_KIND.BOARD, sentAt: 200, content: 'new board' });
+  insert({ id: 'context-old', kind: POST_KIND.CONTEXT, sentAt: 150, content: 'old context' });
+  insert({ id: 'context-new', kind: POST_KIND.CONTEXT, sentAt: 250, content: 'new context' });
+  insert({ id: 'pending-board', kind: POST_KIND.BOARD, status: STATUS.PENDING, sentAt: 400 });
+  insert({ id: 'failed-context', kind: POST_KIND.CONTEXT, status: STATUS.UNKNOWN, sentAt: 500 });
+  insert({ owner: { ...f.binding, repoKey: 'repo:foreign' }, id: 'foreign-board', kind: POST_KIND.BOARD, sentAt: 600 });
+  insert({ owner: { ...f.binding, generation: 0 }, id: 'old-generation-context', kind: POST_KIND.CONTEXT, sentAt: 700 });
+  assert.deepEqual(f.state.publications.sentHistory(f.binding), [
+    { id: 'board-new', messageId: 'message-board-new', snapshotId: 'board-new-snapshot', kind: 'board', sentAt: 200, content: 'new board' },
+    { id: 'context-new', messageId: 'message-context-new', snapshotId: 'context-new-snapshot', kind: 'context', sentAt: 250, content: 'new context' }
+  ]);
+});
 
 test('board-only default survives restart and CLI context opt-in starts one model', async t => {
   const { spawnSync } = require('node:child_process');
@@ -578,6 +601,9 @@ test('slow interpretation never delays board and current note wakes once without
   const p = start(f, { send, interpret: model.interpret });
   await until(() => sent.length === 1 && model.calls.length === 1);
   assert.equal(sent[0].kind, 'board');
+  assert.deepEqual(model.calls[0].options.history, f.state.publications.sentHistory(f.binding));
+  assert.equal(model.calls[0].options.history.length, 1);
+  assert.equal(model.calls[0].options.history[0].kind, POST_KIND.BOARD);
   model.calls[0].finish(usefulContext(model.calls[0].snapshot));
   await until(() => sent.length === 2, 'context completion wakes sender');
   assert.equal(sent[1].kind, 'context');

@@ -101,6 +101,9 @@ Operator requested September 6, 2026. Deferred until the Spark sidecar is delive
 - [ ] S6.3 Support directed requests, replies and handoffs in the shared conversation with durable recipient and correlation records. Distinguish a saved message from actual agent recognition. Keep collaborative messages distinct from execution authority.
 - [ ] S6.4 Prove a real cross-vendor exchange on two operating systems, followed by delivery across a conductor's binding change. Verify the intended recipient receives the message once, replies reach the shared channel, and native session history remains intact. A same-machine fixture does not close cross-OS proof.
 
+
+Observed integration gap (September 6): `claude-post` can publish, but current intake rejects every bot-authored message before native dispatch. S6 must support authenticated, explicitly addressed agent requests with correlation and loop prevention. A bot post alone is not recipient wakeup. Computer Use through the operator account is an authorized manual coordination path, not the cross-agent implementation. Session bindings are the proposed reusable primitive, with conductor ownership composed as an optional role. This direction is design work, not an implemented schema change.
+
 Routing syntax and host transport remain design work for this milestone. Start from existing coordination facilities, then implement the smallest missing boundary.
 
 ## Explicit exclusions

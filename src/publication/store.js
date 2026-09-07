@@ -207,6 +207,16 @@ class PublicationStore extends EventEmitter {
   contextWork() {
     return this.db.prepare('SELECT * FROM publication_context WHERE status=? ORDER BY rowid').all(CONTEXT_STATUS.QUEUED);
   }
+  sentHistory(binding) {
+    const key = ownerKey(binding);
+    return [POST_KIND.BOARD, POST_KIND.CONTEXT].flatMap(kind => {
+      const row = this.db.prepare(`SELECT id, message_id, snapshot_id, kind, sent_at, content
+        FROM publication_posts WHERE owner_key=? AND status=? AND kind=?
+        ORDER BY sent_at DESC, rowid DESC LIMIT 1`).get(key, STATUS.SENT, kind);
+      return row ? [{ id: row.id, messageId: row.message_id, snapshotId: row.snapshot_id,
+        kind: row.kind, sentAt: row.sent_at, content: row.content }] : [];
+    });
+  }
   finishContext(work, result, now) {
     return this.state.transaction(() => {
       const head = this.db.prepare('SELECT * FROM publication_heads WHERE owner_key=?').get(work.owner_key);

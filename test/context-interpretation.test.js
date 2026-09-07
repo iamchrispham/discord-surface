@@ -6,7 +6,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { readSnapshot, renderSnapshot } = require('../src/snapshot');
 const { buildContextCommand, buildSparkCommand } = require('../src/liaison-process');
-const { contextPacket, interpretSnapshot, validateAnswer } = require('../src/context-interpretation');
+const { LIMITS, contextPacket, interpretSnapshot, validateAnswer } = require('../src/context-interpretation');
 
 async function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'context-check-'));
@@ -90,6 +90,20 @@ test('malformed and oversized owed entries remain invalid', async t => {
   }
 });
 
+test('context packet carries bounded delivered history with provenance', async t => {
+  const { snapshot } = await fixture(t);
+  const history = [
+    { id: 'board-post', messageId: '100', snapshotId: 'board-snapshot', kind: 'board', sentAt: 100, content: 'Board content' },
+    { id: 'context-post', messageId: '101', snapshotId: 'context-snapshot', kind: 'context', sentAt: 101, content: 'Context content' }
+  ];
+  const packet = contextPacket(snapshot, history);
+  assert.deepEqual(packet.history, history);
+  assert.deepEqual(contextPacket(snapshot).history, []);
+  assert.ok(Buffer.byteLength(JSON.stringify(packet)) <= LIMITS.packetBytes);
+  const filtered = contextPacket(snapshot, [...history, { ...history[0], id: 'oversized', messageId: '102', content: 'x'.repeat(2001) }]);
+  assert.deepEqual(filtered.history, history);
+});
+
 test('snapshot does not share an abbreviated Claude owner across full native identities', async t => {
   const { ladderDir, registry } = await fixture(t);
   const ids = ['12345678-1111-4111-8111-111111111111', '12345678-2222-4222-8222-222222222222'];
@@ -146,17 +160,19 @@ function childCommand(directory, mode = 'valid') {
 test('actual snapshot feeds bounded Luna command and retains direction without touching source', async t => {
   const { directory, registry, original, snapshot } = await fixture(t);
   const options = { cwd: directory, answerPath: 'answer', schemaPath: 'schema' };
+  const history = [{ id: 'board-post', messageId: '100', snapshotId: 'old-board', kind: 'board', sentAt: 100, content: 'Earlier board' }];
   const luna = buildContextCommand(options);
   const spark = buildSparkCommand(options);
   assert.equal(luna.args[luna.args.indexOf('--model') + 1], 'gpt-5.6-luna');
   assert.equal(spark.args[spark.args.indexOf('--model') + 1], 'gpt-5.3-codex-spark');
   assert.ok(luna.args.includes('model_reasoning_effort="low"'));
-  const result = await interpretSnapshot(snapshot, { buildCommand: childCommand(directory) });
+  const result = await interpretSnapshot(snapshot, { history, buildCommand: childCommand(directory) });
   assert.equal(result.status, 'ready');
   assert.match(result.preview, /recorded device dependency/);
   const prompt = fs.readFileSync(path.join(directory, 'prompt'), 'utf8');
   const packet = JSON.parse(prompt.trim().split('\n').at(-1));
   assert.equal(packet.identity.nativeId, snapshot.identity.nativeId);
+  assert.deepEqual(packet.history, history);
   assert.equal(packet.sources.find(row => row.id === 'context.owedToOperator').value[0].id, 'proof');
   assert.equal(packet.sources.find(row => row.id === 'context.owedByOperator').value[0].id, 'device');
   assert.equal(prompt.includes('FOREIGN PRIVATE CONTEXT'), false);
