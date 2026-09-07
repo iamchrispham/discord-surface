@@ -513,6 +513,53 @@ test('simulated: restart preserves pending intake and fences dispatching as unce
   state.close();
 });
 
+test('simulated: native ACK fences rollback, claim, uncertain reconciliation, and restart recovery', () => {
+  const first = fixture('ack-replay-fence.sqlite');
+  first.state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: first.dir });
+  function accept(id) {
+    first.state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: id });
+    first.state.claimDispatch(id);
+    recordNativeAcknowledgment(first.state, { provider: 'codex', messageId: id, nativeId: CODEX_ID, generation: 1 });
+  }
+
+  accept('ack-rollback-fence');
+  assert.equal(first.state.markNotSubmitted('ack-rollback-fence', new Error('late fetch')).state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(first.state.getMessage('ack-rollback-fence').error, null);
+
+  accept('ack-claim-fence');
+  first.state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.ACCEPTED, 'ack-claim-fence');
+  const claim = first.state.claimDispatch('ack-claim-fence');
+  assert.equal(claim.claimed, false);
+  assert.equal(claim.reason, 'native-already-acknowledged');
+  assert.equal(claim.message.state, MESSAGE_STATES.SUBMITTED);
+
+  first.state.acceptDiscordMessage({ id: 'ack-uncertain-fence', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'ack-uncertain-fence' });
+  first.state.claimDispatch('ack-uncertain-fence');
+  first.state.markUncertain('ack-uncertain-fence', new Error('delivery uncertain'));
+  recordNativeAcknowledgment(first.state, { provider: 'codex', messageId: 'ack-uncertain-fence', nativeId: CODEX_ID, generation: 1 });
+  assert.throws(() => first.state.reconcileUncertain('ack-uncertain-fence', 'not_submitted'), /native acknowledgment prevents retrying delivery/);
+  assert.equal(first.state.getMessage('ack-uncertain-fence').state, MESSAGE_STATES.UNCERTAIN);
+
+  accept('ack-restart-fence');
+  first.state.close();
+  const recovered = new SurfaceState(first.db);
+  recovered.recoverAfterRestart();
+  assert.equal(recovered.getMessage('ack-restart-fence').state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(recovered.listReceipts().some(row => row.discord_id === 'ack-restart-fence' && row.kind === 'dispatch-uncertain-after-restart'), false);
+  recovered.close();
+});
+
+test('simulated: dispatch rollback without native ACK remains retryable', () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'no-ack-retry', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('no-ack-retry');
+  assert.equal(state.markNotSubmitted('no-ack-retry', new Error('not sent')).state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(state.claimDispatch('no-ack-retry').claimed, true);
+  state.markSubmitted('no-ack-retry');
+  state.close();
+});
+
 test('simulated: rebind is blocked by in-flight work and stale reply is rejected after a drained rebind', () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
@@ -658,6 +705,43 @@ test('simulated: ACK reaction refuses a generation handoff after channel fetch',
   state.close();
 });
 
+test('simulated: ACK reaction refuses a generation handoff after message fetch', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'ack-message-fetch-race', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('ack-message-fetch-race');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-message-fetch-race', nativeId: CODEX_ID, generation: 1 });
+  state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.REPLIED, 'ack-message-fetch-race');
+  let fetchStarted;
+  const started = new Promise(resolve => { fetchStarted = resolve; });
+  let releaseFetch;
+  const fetchGate = new Promise(resolve => { releaseFetch = resolve; });
+  let reacted = false;
+  const channel = {
+    messages: {
+      fetch: async () => {
+        fetchStarted();
+        await fetchGate;
+        return { react: async () => { reacted = true; } };
+      }
+    }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+  });
+  const delivery = gateway.deliverAcknowledgment('ack-message-fetch-race');
+  await fetchStarted;
+  state.rebind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir });
+  releaseFetch();
+  await delivery;
+  assert.equal(reacted, false);
+  const outcomes = state.listReceipts().filter(row => row.discord_id === 'ack-message-fetch-race' && row.kind === ACK.OUTCOME);
+  assert.equal(JSON.parse(outcomes.at(-1).detail).outcome, 'stale');
+  await gateway.stop();
+  state.close();
+});
+
 test('simulated: unknown ACK reaction reaches a terminal outcome after bounded retries', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
@@ -687,6 +771,67 @@ test('simulated: unknown ACK reaction reaches a terminal outcome after bounded r
     assert.equal(isAcknowledgmentPending(state, 'ack-retry-bound', clock), false);
   } finally {
     Date.now = realNow;
+    state.close();
+  }
+});
+
+test('simulated: ACK watcher backs off repeated errors and resets after a healthy event', async () => {
+  const { db, state } = fixture();
+  const realSetTimeout = global.setTimeout;
+  const realClearTimeout = global.clearTimeout;
+  const timers = [];
+  const retryDelays = [];
+  const callbacks = [];
+  const watchers = [];
+  let arms = 0;
+  let watcher;
+  global.setTimeout = (fn, delay = 0) => {
+    const timer = { fn, delay, active: true };
+    timers.push(timer);
+    if (delay < 50) retryDelays.push(delay);
+    return timer;
+  };
+  global.clearTimeout = timer => {
+    if (timer) timer.active = false;
+  };
+  function fire(delay) {
+    const timer = timers.find(item => item.active && item.delay === delay);
+    assert.ok(timer, `missing retry timer at ${delay}ms`);
+    timer.active = false;
+    timer.fn();
+  }
+  try {
+    watcher = watchAcknowledgments({
+      state,
+      send: async () => {},
+      rearmMs: 10,
+      watchFactory: (_directory, callback) => {
+        const next = new EventEmitter();
+        next.close = () => {};
+        arms += 1;
+        callbacks.push(callback);
+        watchers.push(next);
+        if (arms <= 3) queueMicrotask(() => next.emit('error', new Error('watch failed')));
+        return next;
+      }
+    });
+    await Promise.resolve();
+    assert.deepEqual(retryDelays, [10]);
+    fire(10);
+    await Promise.resolve();
+    assert.deepEqual(retryDelays, [10, 20]);
+    fire(20);
+    await Promise.resolve();
+    assert.deepEqual(retryDelays, [10, 20, 40]);
+    fire(40);
+    await Promise.resolve();
+    callbacks[3]('change', path.basename(db));
+    watchers[3].emit('error', new Error('watch failed again'));
+    assert.deepEqual(retryDelays, [10, 20, 40, 10]);
+  } finally {
+    await watcher?.stop();
+    global.setTimeout = realSetTimeout;
+    global.clearTimeout = realClearTimeout;
     state.close();
   }
 });

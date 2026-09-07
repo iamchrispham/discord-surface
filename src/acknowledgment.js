@@ -1,8 +1,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const { AuthorizationError, MESSAGE_STATES, StaleGenerationError, validateNativeId } = require('./state');
+const { AuthorizationError, MESSAGE_STATES, NATIVE_ACK_RECEIPT, StaleGenerationError, validateNativeId } = require('./state');
 
-const ACK = Object.freeze({ RECEIVED: 'native-ack', OUTCOME: 'native-ack-reaction' });
+const ACK = Object.freeze({ RECEIVED: NATIVE_ACK_RECEIPT, OUTCOME: 'native-ack-reaction' });
 const ACK_OUTCOMES = Object.freeze({ SENT: 'sent', STALE: 'stale', FAILED: 'failed', UNKNOWN: 'unknown' });
 const REACTION = Object.freeze({ SAVED: '📥', ACKNOWLEDGED: '👀' });
 const ACK_RETRY = Object.freeze({ BASE_MS: 250, MAX_MS: 60000, MAX_ATTEMPTS: 8 });
@@ -275,11 +275,12 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
   function arm() {
     if (closed) return;
     try {
-      const next = watchFactory(path.dirname(state.dbPath), (_event, name) => {
+      let next;
+      next = watchFactory(path.dirname(state.dbPath), (_event, name) => {
+        if (watcher === next) retryDelay = rearmMs;
         if (!name || String(name).startsWith(basename)) schedule();
       });
       watcher = next;
-      retryDelay = rearmMs;
       next.on('error', error => {
         if (watcher !== next) return;
         watcher = null;

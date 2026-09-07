@@ -712,10 +712,13 @@ class DiscordGateway {
         } else if (this.discordToken && this.client?.rest) {
           throw new Error('Discord transport receipt fetch is unavailable');
         } else {
+          const reactToFetchedMessage = async () => {
+            const source = await message.channel.messages.fetch(message.id);
+            this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
+            return source.react(receipt.reaction);
+          };
           sendPromise = receipt.reaction
-            ? Promise.resolve(message.react
-              ? message.react(receipt.reaction)
-              : message.channel.messages.fetch(message.id).then(source => source.react(receipt.reaction)))
+            ? Promise.resolve(message.react ? message.react(receipt.reaction) : reactToFetchedMessage())
               .then(() => ({ id: message.id, reaction: receipt.reaction }))
             : message.channel.send({
               content: receipt.content,
