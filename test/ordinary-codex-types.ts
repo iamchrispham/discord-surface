@@ -10,7 +10,7 @@ const identity: OrdinaryCodexIdentity = {
   sessionId: '9caa5d21-2169-429d-918b-5f08651b5dbd',
   threadId: '9caa5d21-2169-429d-918b-5f08651b5dbd'
 };
-const channel: ExistingDiscordChannel = { id: '123', guildId: 'guild', name: 'ops' };
+const channel: ExistingDiscordChannel = { id: '123', guildId: 'guild', name: 'ops', messageCapable: true };
 
 createOrdinaryCodexRequest({ channelId: channel.id, guildId: channel.guildId, workspace: '/tmp/workspace', identity });
 resolveExistingChannel('<#123>', 'guild', [channel]);

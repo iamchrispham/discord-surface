@@ -6,6 +6,7 @@ export interface ExistingDiscordChannel {
   id: string;
   guildId: string;
   name?: string | null;
+  messageCapable: boolean;
 }
 
 export interface OrdinaryCodexIdentity {
@@ -20,6 +21,17 @@ export interface OrdinaryCodexRequest {
   nativeId: string;
   workspace: string;
   identity: OrdinaryCodexIdentity;
+}
+
+export interface ExistingOrdinaryBinding {
+  active: boolean;
+  channelId: string;
+  guildId: string;
+  provider: string;
+  nativeId: string;
+  workspace: string;
+  conductorId?: string | null;
+  repoKey?: string | null;
 }
 
 export interface InvocationEnvironment {
@@ -73,15 +85,31 @@ export function resolveExistingChannel(selection: unknown, guildId: unknown, cha
   const inGuild = channels.filter(channel => channel?.guildId === configuredGuild);
   if (idSelection) {
     const match = inGuild.find(channel => channel.id === idSelection);
-    if (match) return match;
+    if (match) {
+      if (!match.messageCapable) throw new Error('channel selection is not message-capable');
+      return match;
+    }
     if (allIdMatches.length > 0) throw new Error('channel selection is outside the configured guild');
     throw new Error('channel selection is unknown');
   }
-  const matches = inGuild.filter(channel => channel.name === requested);
-  if (matches.length === 1) return matches[0];
+  const nameSelection = requested.startsWith('#') ? requested.slice(1) : requested;
+  if (!nameSelection) throw new Error('channel selection is empty');
+  const matches = inGuild.filter(channel => channel.name === nameSelection);
   if (matches.length > 1) throw new Error('channel name is ambiguous in the configured guild');
-  if (channels.some(channel => channel.name === requested)) throw new Error('channel selection is outside the configured guild');
+  if (matches.length === 1 && !matches[0].messageCapable) throw new Error('channel selection is not message-capable');
+  if (matches.length === 1) return matches[0];
+  if (channels.some(channel => channel.name === nameSelection)) throw new Error('channel selection is outside the configured guild');
   throw new Error('channel selection is unknown');
+}
+
+export function ordinaryBindingDecision(existing: ExistingOrdinaryBinding | null, request: OrdinaryCodexRequest, ordinaryMarker = false): 'bind' | 'reuse' {
+  if (!existing) return 'bind';
+  const sameOwner = existing.active && ordinaryMarker && existing.provider === request.provider &&
+    existing.channelId === request.channelId && existing.guildId === request.guildId &&
+    existing.nativeId === request.nativeId && existing.workspace === request.workspace &&
+    !existing.conductorId && !existing.repoKey;
+  if (sameOwner) return 'reuse';
+  throw new Error('channel is already bound to another owner; use explicit handoff');
 }
 
 export function createOrdinaryCodexRequest(input: {

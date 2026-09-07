@@ -7,10 +7,14 @@ const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
-const { createOrdinaryCodexRequestFromEnvironment, resolveExistingChannel, resolveInvocationIdentity } = require('./ordinary-codex');
+const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('./ordinary-codex');
 const { validateCodexSessionIdentity } = require('./native');
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
+
+const GATEWAY_CAPABILITIES = Object.freeze({
+  ordinaryBindWake: 'ordinary-bind-wake-v1'
+});
 const { runLiaisonDraft } = require('./liaison');
 const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
 
@@ -95,43 +99,82 @@ function ordinaryBindingArgs(args, environment = process.env, channelId = null, 
   });
 }
 
-async function ordinaryBind(args) {
-  const { state } = openState(args);
+function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill } = {}) {
+  const runtime = status(paths);
+  if (runtime?.state !== 'running' || !runtime.pid) {
+    return { requested: false, state: runtime?.state || 'unknown', reason: 'gateway-not-running' };
+  }
+  if (!runtime.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryBindWake)) {
+    return {
+      requested: false,
+      pid: runtime.pid,
+      state: runtime.state,
+      reason: 'gateway-wake-unsupported',
+      capability: GATEWAY_CAPABILITIES.ordinaryBindWake
+    };
+  }
+  try {
+    kill(runtime.pid, 'SIGUSR2');
+    return { requested: true, pid: runtime.pid, signal: 'SIGUSR2' };
+  } catch (error) {
+    return { requested: false, pid: runtime.pid, state: runtime.state, reason: 'gateway-wake-failed', error: error.message };
+  }
+}
+
+async function ordinaryBind(args, dependencies = {}) {
+  const { paths, state } = openState(args);
+  const environment = dependencies.environment || process.env;
+  const install = dependencies.requireInstalled || requireInstalled;
+  const read = dependencies.readSecret || readSecret;
+  const validate = dependencies.validateCodexSessionIdentity || validateCodexSessionIdentity;
+  const output = dependencies.print || print;
   let client;
   try {
     const config = state.requireConfig();
     const channelSelection = args.channel || args['channel-id'];
     if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
     if (args.channel && args['channel-id'] && args.channel !== args['channel-id']) throw new Error('--channel and --channel-id must identify the same channel');
-    resolveInvocationIdentity(process.env, args.workspace ? path.resolve(args.workspace) : undefined);
-    const { Client, GatewayIntentBits } = requireInstalled('discord.js');
+    resolveInvocationIdentity(environment, args.workspace ? path.resolve(args.workspace) : undefined);
+    const { Client, GatewayIntentBits } = install('discord.js');
     client = new Client({ intents: [GatewayIntentBits.Guilds] });
-    await client.login(readSecret(config.secretFile));
+    await client.login(read(config.secretFile));
     const guild = await client.guilds.fetch(config.guildId);
     const mentionId = channelSelection.match(/^<#([^>]+)>$/)?.[1] || (/^\d+$/.test(channelSelection) ? channelSelection : null);
     let fetchedChannels;
     if (mentionId) {
       const channel = await guild.channels.fetch(mentionId);
-      fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null }] : [];
+      fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
+        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];
     } else {
       const fetched = await guild.channels.fetch();
       const values = Array.isArray(fetched) ? fetched : typeof fetched?.values === 'function' ? [...fetched.values()] : [];
-      fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null }));
+      fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
+        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
     }
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
-    const request = ordinaryBindingArgs(args, process.env, channel.id, config.guildId);
+    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
-    const binding = state.bindOrdinary(request, request.identity);
+    const existing = state.getBinding(request.channelId);
+    const decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBinding(existing) : false);
+    const binding = decision === 'reuse' ? existing : state.bindOrdinary(request, request.identity);
     let nativeProof = { status: 'pending', reason: 'Codex transcript proof is pending' };
-    try {
-      const proof = validateCodexSessionIdentity(request.nativeId, request.workspace, args['session-root'] ? path.resolve(args['session-root']) : undefined);
-      state.recordOrdinaryPreflight(binding, { file: proof.file, sessionId: proof.sessionId, threadId: proof.threadId, workspace: proof.workspace });
-      nativeProof = { status: 'verified', file: proof.file, workspace: proof.workspace };
-    } catch (error) {
-      nativeProof = { status: 'pending', reason: error.message };
+    if (state.hasOrdinaryPreflight(binding)) {
+      nativeProof = { status: 'verified', reason: 'Codex transcript proof already recorded' };
+    } else {
+      try {
+        const proof = validate(request.nativeId, request.workspace, args['session-root'] ? path.resolve(args['session-root']) : undefined);
+        state.recordOrdinaryPreflight(binding, { file: proof.file, sessionId: proof.sessionId, threadId: proof.threadId, workspace: proof.workspace });
+        nativeProof = { status: 'verified', file: proof.file, workspace: proof.workspace };
+      } catch (error) {
+        nativeProof = { status: 'pending', reason: error.message };
+      }
     }
-    print({ bound: true, binding: state.getBinding(binding.channelId), nativeProof });
-    return { binding: state.getBinding(binding.channelId), nativeProof };
+    const gatewayWake = requestGatewayRecovery(paths, {
+      status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+      kill: dependencies.killProcess || process.kill
+    });
+    output({ bound: true, reused: decision === 'reuse', binding: state.getBinding(binding.channelId), nativeProof, gatewayWake });
+    return { binding: state.getBinding(binding.channelId), nativeProof, gatewayWake, reused: decision === 'reuse' };
   } finally {
     try { await client?.destroy(); } finally { state.close(); }
   }
@@ -666,7 +709,14 @@ async function handoffFromLockInternal(args) {
 
 function writePid(pidFile, guildId, stateDir) {
   fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(pidFile, JSON.stringify({ pid: process.pid, guildId, stateDir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
+  fs.writeFileSync(pidFile, JSON.stringify({
+    pid: process.pid,
+    guildId,
+    stateDir,
+    command: 'run',
+    startedAt: new Date().toISOString(),
+    capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake]
+  }), { mode: 0o600 });
   fs.chmodSync(pidFile, 0o600);
 }
 
@@ -677,21 +727,46 @@ async function runRuntime(args) {
   state.recoverAfterRestart();
   writePid(paths.pid, config.guildId, paths.stateDir);
   let gateway;
+  let gatewayReady = false;
   let stopping = false;
+  let bindingWakePromise = null;
+  let bindingWakeRequested = false;
+  const wakeBinding = () => {
+    bindingWakeRequested = true;
+    if (stopping || !gateway || !gatewayReady || bindingWakePromise) return;
+    bindingWakePromise = (async () => {
+      while (bindingWakeRequested && !stopping) {
+        bindingWakeRequested = false;
+        const recovery = await gateway.recoverTransport('ordinary-bind');
+        if (recovery.ready && !stopping) await gateway.reconcilePending();
+      }
+    })().catch(error => {
+      process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`);
+    }).finally(() => {
+      bindingWakePromise = null;
+      if (bindingWakeRequested && !stopping) wakeBinding();
+    });
+  };
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    const pendingBindingWake = bindingWakePromise;
     try { await gateway?.stop(); } finally {
+      await pendingBindingWake;
+      process.removeListener('SIGUSR2', wakeBinding);
       try { fs.unlinkSync(paths.pid); } catch {}
       state.close();
     }
   };
   process.once('SIGINT', () => stop().then(() => process.exit(0)));
   process.once('SIGTERM', () => stop().then(() => process.exit(0)));
+  process.on('SIGUSR2', wakeBinding);
   try {
     gateway = new DiscordGateway({ state, observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) } });
     await gateway.start(config.secretFile);
     await gateway.reconcilePending(recoveryCutoff);
+    gatewayReady = true;
+    if (bindingWakeRequested) wakeBinding();
   } catch (error) {
     await stop();
     throw error;
@@ -889,7 +964,8 @@ function gatewayProcessStatus(paths) {
     connection: 'unverified-live',
     guildId: value.guildId,
     stateDir: value.stateDir,
-    startedAt: value.startedAt
+    startedAt: value.startedAt,
+    capabilities: Array.isArray(value.capabilities) ? value.capabilities : []
   };
 }
 
@@ -966,4 +1042,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, directPost, ensureProvisionedChannel, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, parseArgs, pathsFor, provisionMarker };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery };

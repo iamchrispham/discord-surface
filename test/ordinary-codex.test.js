@@ -4,7 +4,8 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createOrdinaryCodexRequestFromEnvironment, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
+const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
+const { GATEWAY_CAPABILITIES, ordinaryBind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
 const { validateCodexSessionIdentity } = require('../src/native');
 const { SurfaceState, READINESS, StaleGenerationError } = require('../src/state');
@@ -76,17 +77,87 @@ test('ordinary CommonJS facade exposes emitted code and fails closed when output
 
 test('channel resolution accepts exact ID, mention, and one name only in the configured guild', () => {
   const channels = [
-    { id: '123', guildId: 'guild', name: 'ops' },
-    { id: '456', guildId: 'guild', name: 'dev' },
-    { id: '999', guildId: 'guild', name: 'ops' },
-    { id: '789', guildId: 'other-guild', name: 'ops' }
+    { id: '123', guildId: 'guild', name: 'ops', messageCapable: true },
+    { id: '456', guildId: 'guild', name: 'dev', messageCapable: true },
+    { id: '999', guildId: 'guild', name: 'ops', messageCapable: true },
+    { id: '789', guildId: 'other-guild', name: 'ops', messageCapable: true }
   ];
   assert.equal(resolveExistingChannel('123', 'guild', channels).name, 'ops');
   assert.equal(resolveExistingChannel('<#456>', 'guild', channels).name, 'dev');
   assert.equal(resolveExistingChannel('dev', 'guild', channels).id, '456');
+  assert.equal(resolveExistingChannel('#dev', 'guild', channels).id, '456');
   assert.throws(() => resolveExistingChannel('ops', 'guild', channels), /ambiguous/);
   assert.throws(() => resolveExistingChannel('<#789>', 'guild', channels), /outside/);
   assert.throws(() => resolveExistingChannel('missing', 'guild', channels), /unknown/);
+  assert.throws(() => resolveExistingChannel('123', 'guild', [{ ...channels[0], messageCapable: false }]), /message-capable/);
+  assert.throws(() => resolveExistingChannel('dev', 'guild', [{ ...channels[1], messageCapable: false }]), /message-capable/);
+});
+
+test('ordinary bind reuses the exact owner and wakes an already-running Gateway', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-cli-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  setup.close();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const category = { id: 'category-channel', guildId: 'guild', name: 'category', isTextBased: () => false };
+  const wakeSignals = [];
+  class FakeClient {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection === category.id ? category : selection ? channel : new Map([[channel.id, channel], [category.id, category]])
+      } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  const dependencies = {
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: dir },
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity: () => ({ file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir }),
+    gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] }),
+    killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
+    print: () => {}
+  };
+  const args = { 'state-dir': dir, channel: '#dev', workspace: dir };
+  const first = await ordinaryBind(args, dependencies);
+  const second = await ordinaryBind(args, dependencies);
+  assert.equal(first.reused, false);
+  assert.equal(second.reused, true);
+  assert.equal(first.binding.generation, 1);
+  assert.equal(second.binding.generation, 1);
+  assert.equal(second.binding.readiness, READINESS.PENDING);
+  assert.equal(first.nativeProof.status, 'verified');
+  assert.equal(second.nativeProof.status, 'verified');
+  assert.deepEqual(wakeSignals, [{ pid: 4242, signal: 'SIGUSR2' }, { pid: 4242, signal: 'SIGUSR2' }]);
+
+  await assert.rejects(() => ordinaryBind({ ...args, channel: '#category' }, dependencies), /message-capable/);
+
+  await assert.rejects(() => ordinaryBind(args, {
+    ...dependencies,
+    environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: dir }
+  }), /already bound to another owner/);
+
+  const state = new SurfaceState(db);
+  try {
+    const receipts = state.listReceipts();
+    assert.equal(receipts.filter(receipt => receipt.kind === 'ordinary-bound').length, 1);
+    assert.equal(receipts.filter(receipt => receipt.kind === 'ordinary-native-preflight').length, 1);
+  } finally { state.close(); }
+});
+
+test('ordinary binding decision refuses a non-ordinary or inactive existing owner', () => {
+  const request = {
+    provider: 'codex', channelId: 'channel', guildId: 'guild', nativeId: CODEX, workspace: '/tmp/workspace',
+    identity: { sessionId: CODEX, threadId: CODEX }
+  };
+  assert.equal(ordinaryBindingDecision(null, request), 'bind');
+  assert.equal(ordinaryBindingDecision({ ...request, active: true }, request, true), 'reuse');
+  assert.throws(() => ordinaryBindingDecision({ ...request, active: false }, request, true), /already bound/);
+  assert.throws(() => ordinaryBindingDecision({ ...request, active: true, conductorId: 'conductor' }, request, false), /already bound/);
 });
 
 test('ordinary bind starts pending with paired null conductor identity and holds intake', t => {
