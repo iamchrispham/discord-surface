@@ -398,7 +398,7 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
   assert.equal(state.getMessage('gateway-held-input').state, 'replied');
 });
 
-test('ordinary bind timestamps an empty-channel cutoff before history fetch', async t => {
+test('ordinary bind uses the empty channel snowflake as its cutoff', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-empty-cutoff-'));
   const db = path.join(dir, 'surface.sqlite');
   const setup = new SurfaceState(db);
@@ -409,7 +409,7 @@ test('ordinary bind timestamps an empty-channel cutoff before history fetch', as
   let fetchStartedAt = 0;
   let fetchCompletedAt = 0;
   const channel = {
-    id: 'empty-cutoff-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    id: '123456789012345678', guildId: 'guild', name: 'dev', isTextBased: () => true,
     messages: { fetch: async () => {
       fetchStartedAt = Date.now();
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -438,9 +438,8 @@ test('ordinary bind timestamps an empty-channel cutoff before history fetch', as
   const state = new SurfaceState(db);
   try {
     const watermark = state.getIntakeWatermark(channel.id);
-    const cutoffTimestamp = Number(BigInt(watermark.last_seen_id) >> 22n) + 1420070400000;
-    assert.ok(fetchCompletedAt - cutoffTimestamp >= 20);
-    assert.ok(cutoffTimestamp <= fetchStartedAt);
+    assert.equal(watermark.last_seen_id, channel.id);
+    assert.ok(fetchCompletedAt >= fetchStartedAt);
   } finally { state.close(); }
 });
 
@@ -975,6 +974,10 @@ test('ordinary readiness requires the applicable Discord reply permission', t =>
   const thread = { isThread: () => true, permissionsFor: channel.permissionsFor };
   permissions.add(PermissionFlagsBits.SendMessagesInThreads);
   assert.equal(gateway.historyPermission(thread, { requireSend: true }).allowed, true);
+  const archivedThread = { isThread: () => true, archived: true, locked: false, permissionsFor: channel.permissionsFor };
+  assert.equal(gateway.historyPermission(archivedThread, { requireSend: true }).allowed, true);
+  const lockedThread = { isThread: () => true, archived: true, locked: true, permissionsFor: channel.permissionsFor };
+  assert.equal(gateway.historyPermission(lockedThread, { requireSend: true }).allowed, false);
 });
 
 test('ordinary readiness requires native proof before the intake boundary can become ready', t => {

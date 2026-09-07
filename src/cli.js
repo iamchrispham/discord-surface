@@ -111,6 +111,10 @@ async function latestChannelMessageId(channel) {
   return typeof message?.id === 'string' && message.id.length > 0 ? message.id : cached;
 }
 
+function serverDerivedChannelCutoff(channel) {
+  return typeof channel?.id === 'string' && /^\d+$/.test(channel.id) ? channel.id : null;
+}
+
 function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill } = {}) {
   const runtime = status(paths);
   if (runtime?.state !== 'running' || !runtime.pid) {
@@ -216,11 +220,8 @@ async function ordinaryBind(args, dependencies = {}) {
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     let adoptionCutoff = null;
     if (decision !== 'reuse' && !existing?.active) {
-      const cutoffTimestamp = Date.now();
       const cutoff = await latestChannelMessageId(discordChannel);
-      adoptionCutoff = cutoff || (typeof discordChannel?.messages?.fetch === 'function'
-        ? (BigInt(cutoffTimestamp - 1420070400000) << 22n).toString()
-        : null);
+      adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
       if (adoptionCutoff && decision !== 'bind') {
         state.setIntakeCutoff(request.channelId, request.guildId, adoptionCutoff, 'ordinary binding adoption cutoff', existing);
       }
@@ -711,11 +712,8 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     }]);
     if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
     if (!current.active) {
-      const cutoffTimestamp = Date.now();
       const cutoff = await latestChannelMessageId(channel);
-      const adoptionCutoff = cutoff || (typeof channel?.messages?.fetch === 'function'
-        ? (BigInt(cutoffTimestamp - 1420070400000) << 22n).toString()
-        : null);
+      const adoptionCutoff = cutoff || serverDerivedChannelCutoff(channel);
       if (adoptionCutoff) state.setIntakeCutoff(channelId, config.guildId, adoptionCutoff, 'ordinary handoff adoption cutoff', current);
     }
     const binding = state.handoffOrdinary({

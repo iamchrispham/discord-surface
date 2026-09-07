@@ -751,7 +751,7 @@ class DiscordGateway {
         ? PermissionFlagsBits.SendMessagesInThreads
         : PermissionFlagsBits.SendMessages;
       const threadStateBlocksSend = typeof channel.isThread === 'function' && channel.isThread() &&
-        (channel.archived === true || channel.locked === true);
+        channel.locked === true;
       const sendAllowed = !requireSend || (replyPermission !== undefined && permissions.has(replyPermission) && !threadStateBlocksSend);
       return {
         known: true,

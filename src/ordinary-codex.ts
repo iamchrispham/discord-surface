@@ -125,7 +125,15 @@ export function ordinaryBindingDecision(
     (sessionRootMatches || verifiedRootRelocation) &&
     !existing.conductorId && !existing.repoKey;
   if (sameOwner) return existing.active && sessionRootMatches ? 'reuse' : 'rebind';
-  throw new Error('channel is already bound to another owner; use explicit handoff');
+  const handoffCommand = [
+    'handoff --ordinary --provider codex',
+    `--channel-id ${request.channelId}`,
+    `--from-native-id ${existing.nativeId}`,
+    `--from-generation ${existing.generation}`,
+    `--native-id ${request.nativeId}`,
+    `--workspace ${request.workspace}`
+  ].join(' ');
+  throw new Error(`channel is already bound to another owner; run ${handoffCommand} --handoff-id <unique-id>`);
 }
 
 export function createOrdinaryCodexRequest(input: {
