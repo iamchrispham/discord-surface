@@ -25,9 +25,9 @@ function latestAcknowledgmentOutcome(state, messageId) {
   return row ? parseReceiptDetail(row.detail) : null;
 }
 
-function receiptRowsAfter(state, receiptId) {
+function receiptRowsAfter(state, receiptId, throughId) {
   return state.db.prepare(`SELECT id, discord_id FROM receipts
-    WHERE id>? AND kind IN (?, ?) ORDER BY id`).all(receiptId, ACK.RECEIVED, ACK.OUTCOME);
+    WHERE id>? AND id<=? AND kind IN (?, ?) ORDER BY id`).all(receiptId, throughId, ACK.RECEIVED, ACK.OUTCOME);
 }
 
 function latestReceiptId(state) {
@@ -207,7 +207,8 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
   }
 
   function incrementalPending(now) {
-    const rows = receiptRowsAfter(state, receiptCursor);
+    const watermark = latestReceiptId(state);
+    const rows = receiptRowsAfter(state, receiptCursor, watermark);
     const ids = [];
     const seen = new Set();
     for (const row of rows) {
@@ -221,7 +222,7 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
       rememberRetryAt(messageId);
       if (isAcknowledgmentPending(state, messageId, now)) ids.push(messageId);
     }
-    if (rows.length) receiptCursor = Number(rows.at(-1).id);
+    receiptCursor = watermark;
     return ids;
   }
 

@@ -723,6 +723,94 @@ test('simulated: ACK watcher uses receipt watermark after its baseline scan', as
   state.close();
 });
 
+test('simulated: ACK watcher quiesces past unrelated receipts and delivers a later ACK', async () => {
+  const { dir, db, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const reactions = [];
+  const callbacks = [];
+  const watcher = watchAcknowledgments({
+    state,
+    send: async (message, reaction) => reactions.push([message.id, reaction]),
+    watchFactory: (_directory, callback) => {
+      callbacks.push(callback);
+      return { on() {}, close() {} };
+    }
+  });
+  try {
+    await watcher.drain();
+    await new Promise(resolve => setTimeout(resolve, 70));
+    const queries = [];
+    const prepare = state.db.prepare.bind(state.db);
+    state.db.prepare = sql => {
+      queries.push(String(sql));
+      return prepare(sql);
+    };
+    state.receipt(null, 'unrelated-test', { value: 1 });
+    await watcher.drain();
+    const afterUnrelated = queries.filter(sql => sql.includes('WHERE id>?')).length;
+    await new Promise(resolve => setTimeout(resolve, 260));
+    assert.equal(queries.filter(sql => sql.includes('WHERE id>?')).length, afterUnrelated);
+    state.acceptDiscordMessage({ id: 'ack-after-idle', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+    state.claimDispatch('ack-after-idle');
+    recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-after-idle', nativeId: CODEX_ID, generation: 1 });
+    callbacks[0]('change', path.basename(db));
+    await waitForCondition(() => reactions.length === 1, 1000);
+    assert.deepEqual(reactions, [['ack-after-idle', '👀']]);
+  } finally {
+    await watcher.stop();
+    state.close();
+  }
+});
+
+test('simulated: ACK watcher keeps a concurrent receipt append after its snapshot', async () => {
+  const { dir, db, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const callbacks = [];
+  const reactions = [];
+  let sendStarted;
+  const started = new Promise(resolve => { sendStarted = resolve; });
+  let releaseSend;
+  const sendGate = new Promise(resolve => { releaseSend = resolve; });
+  const watcher = watchAcknowledgments({
+    state,
+    send: async (message, reaction) => {
+      reactions.push([message.id, reaction]);
+      if (message.id === 'ack-concurrent-first') {
+        sendStarted();
+        await sendGate;
+      }
+    },
+    watchFactory: (_directory, callback) => {
+      callbacks.push(callback);
+      return { on() {}, close() {} };
+    }
+  });
+  try {
+    await watcher.drain();
+    await new Promise(resolve => setTimeout(resolve, 70));
+    function recordAck(id) {
+      state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: id });
+      state.claimDispatch(id);
+      recordNativeAcknowledgment(state, { provider: 'codex', messageId: id, nativeId: CODEX_ID, generation: 1 });
+    }
+    recordAck('ack-concurrent-first');
+    callbacks[0]('change', path.basename(db));
+    const firstDrain = watcher.drain();
+    await started;
+    recordAck('ack-concurrent-second');
+    callbacks[0]('change', path.basename(db));
+    watcher.drain();
+    releaseSend();
+    await firstDrain;
+    await waitForCondition(() => reactions.length === 2, 1000);
+    assert.deepEqual(reactions, [['ack-concurrent-first', '👀'], ['ack-concurrent-second', '👀']]);
+  } finally {
+    releaseSend();
+    await watcher.stop();
+    state.close();
+  }
+});
+
 test('simulated: reply ACK wait survives restart without entering reply custody', async () => {
   const { dir, db, state } = fixture('ack-reply-boundary.sqlite');
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
