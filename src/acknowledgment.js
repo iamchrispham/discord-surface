@@ -258,6 +258,7 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
     Promise.resolve().then(() => onAcknowledged(messageId))
       .catch(error => logger(`native acknowledgment resume failed: ${error.message}`))
       .finally(() => {
+        if (closed || !state.db) return;
         const detail = latestAcknowledgmentOutcome(state, messageId);
         if (detail && (detail.outcome !== ACK_OUTCOMES.UNKNOWN || detail.terminal)) notified.delete(messageId);
       });

@@ -857,6 +857,71 @@ test('simulated: ACK watcher backs off repeated errors and resets after a health
   }
 });
 
+test('simulated: ACK watcher cleanup survives stop and state close before deferred resume settles', () => {
+  const root = path.resolve(__dirname, '..');
+  const statePath = path.join(root, 'src/state.js');
+  const acknowledgmentPath = path.join(root, 'src/acknowledgment.js');
+  const childDir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-ack-stop-'));
+  const script = `
+const path = require('node:path');
+const { SurfaceState } = require(${JSON.stringify(statePath)});
+const { recordNativeAcknowledgment, watchAcknowledgments } = require(${JSON.stringify(acknowledgmentPath)});
+
+(async () => {
+  const dir = process.env.ACK_STOP_CLOSE_DIR;
+  const db = path.join(dir, 'surface.sqlite');
+  let state;
+  try {
+    state = new SurfaceState(db);
+    state.setConfig({ operatorId: 'operator-1', guildId: 'guild-1', secretFile: path.join(dir, 'discord.secret') });
+    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: '9caa5d21-2169-429d-918b-5f08651b5dbd', workspace: dir });
+    state.acceptDiscordMessage({ id: 'ack-stop-close', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+    state.claimDispatch('ack-stop-close');
+    recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-stop-close', nativeId: '9caa5d21-2169-429d-918b-5f08651b5dbd', generation: 1 });
+    let startCallback;
+    const callbackStarted = new Promise(resolve => { startCallback = resolve; });
+    let releaseCallback;
+    const callbackGate = new Promise(resolve => { releaseCallback = resolve; });
+    const watcher = watchAcknowledgments({
+      state,
+      send: async () => {},
+      deliver: async () => {},
+      onAcknowledged: async () => {
+        startCallback();
+        await callbackGate;
+      },
+      watchFactory: () => ({ on() {}, close() {} })
+    });
+    const drain = watcher.drain();
+    await callbackStarted;
+    await drain;
+    await watcher.stop();
+    state.close();
+    releaseCallback();
+    await new Promise(resolve => setImmediate(resolve));
+    process.stdout.write('clean deferred cleanup\\n');
+  } finally {
+    state?.close();
+  }
+})().catch(error => {
+  process.stderr.write(String(error.stack || error) + '\\n');
+  process.exitCode = 1;
+});
+`;
+  try {
+    const result = spawnSync(process.execPath, ['--unhandled-rejections=strict', '-e', script], {
+      cwd: root,
+      env: { ...process.env, ACK_STOP_CLOSE_DIR: childDir },
+      encoding: 'utf8',
+      timeout: 15000
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /clean deferred cleanup/);
+  } finally {
+    fs.rmSync(childDir, { recursive: true, force: true });
+  }
+});
+
 test('simulated: ACK watcher uses receipt watermark after its baseline scan', async () => {
   const { dir, db, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
