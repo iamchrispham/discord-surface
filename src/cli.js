@@ -199,7 +199,7 @@ async function ordinaryBind(args, dependencies = {}) {
     if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
       throw new Error('channel is already bound to another owner; use explicit handoff');
     }
-    const validationRoot = sessionRoot || existing?.sessionRoot;
+    const validationRoot = sessionRoot ?? existing?.sessionRoot ?? undefined;
     if (!sessionRoot) {
       const proof = await validateNativeProof(validationRoot);
       nativeProofDetail = proof.detail;
@@ -210,13 +210,16 @@ async function ordinaryBind(args, dependencies = {}) {
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
     const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: validationRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
+    let adoptionCutoff = null;
     if (decision !== 'reuse' && !existing?.active) {
       const cutoffTimestamp = Date.now();
       const cutoff = await latestChannelMessageId(discordChannel);
-      const adoptionCutoff = cutoff || (typeof discordChannel?.messages?.fetch === 'function'
+      adoptionCutoff = cutoff || (typeof discordChannel?.messages?.fetch === 'function'
         ? (BigInt(cutoffTimestamp - 1420070400000) << 22n).toString()
         : null);
-      if (adoptionCutoff) state.setIntakeCutoff(request.channelId, request.guildId, adoptionCutoff, 'ordinary binding adoption cutoff', existing);
+      if (adoptionCutoff && decision !== 'bind') {
+        state.setIntakeCutoff(request.channelId, request.guildId, adoptionCutoff, 'ordinary binding adoption cutoff', existing);
+      }
     }
     let binding;
     if (decision === 'reuse') binding = existing;
@@ -235,7 +238,7 @@ async function ordinaryBind(args, dependencies = {}) {
     }
     else {
       try {
-        binding = state.bindOrdinary(request, request.identity);
+        binding = state.bindOrdinary(request, request.identity, adoptionCutoff);
       } catch (error) {
         const raced = state.getBinding(request.channelId);
         const racedDecision = raced

@@ -109,6 +109,7 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
   let cutoffFetches = 0;
+  const validationRoots = [];
   const channel = {
     id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
     messages: { fetch: async () => { cutoffFetches += 1; return new Map([['latest', { id: `latest-${cutoffFetches}` }]]); } }
@@ -128,7 +129,10 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
     environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: dir },
     requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
     readSecret: () => 'fixture-token',
-    validateCodexSessionIdentity: () => ({ file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir }),
+    validateCodexSessionIdentity: (...args) => {
+      validationRoots.push(args[2]);
+      return { file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir };
+    },
     gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] }),
     killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
     print: () => {}
@@ -140,6 +144,7 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   assert.equal(second.reused, true);
   assert.equal(first.binding.generation, 1);
   assert.equal(second.binding.generation, 1);
+  assert.deepEqual(validationRoots, [undefined, undefined]);
   assert.equal(second.binding.readiness, READINESS.PENDING);
   assert.equal(first.nativeProof.status, 'verified');
   assert.equal(second.nativeProof.status, 'verified');
@@ -162,6 +167,11 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   assert.equal(rebound.binding.readiness, READINESS.PENDING);
   assert.equal(rebound.nativeProof.status, 'verified');
   assert.equal(cutoffFetches, 2);
+
+  const stateAfterRebind = new SurfaceState(db);
+  try {
+    assert.equal(stateAfterRebind.getIntakeWatermark(channel.id).last_seen_id, 'latest-2');
+  } finally { stateAfterRebind.close(); }
 
   await assert.rejects(() => ordinaryBind({ ...args, channel: '#category' }, dependencies), /message-capable/);
 

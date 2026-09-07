@@ -894,9 +894,12 @@ class SurfaceState {
     return { channelId, guildId, provider, nativeId, workspace, sessionRoot, endpoint, categoryId, conductorId, repoKey, readiness, generation };
   }
 
-  bind(binding) {
+  bind(binding, options = {}) {
     const ordinaryIdentity = binding.ordinaryIdentity || null;
+    const intakeCutoff = options.intakeCutoff ?? null;
+    const intakeCutoffDetail = options.intakeCutoffDetail || null;
     const input = this.bindingInput(binding);
+    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     if (ordinaryIdentity) {
       if (input.provider !== PROVIDERS.CODEX || input.conductorId || input.repoKey ||
         typeof ordinaryIdentity.sessionId !== 'string' || typeof ordinaryIdentity.threadId !== 'string' ||
@@ -933,11 +936,14 @@ class SurfaceState {
           sessionId: ordinaryIdentity.sessionId, threadId: ordinaryIdentity.threadId
         });
       }
+      if (intakeCutoff !== null) {
+        this.setIntakeCutoffInTransaction(input.channelId, input.guildId, intakeCutoff, intakeCutoffDetail);
+      }
       return this.getBinding(input.channelId);
     });
   }
 
-  bindOrdinary(binding, identity) {
+  bindOrdinary(binding, identity, adoptionCutoff = null) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {
       throw new BindingError('ordinary Codex identity is missing or conflicting');
@@ -947,7 +953,10 @@ class SurfaceState {
     if (identity.sessionId !== binding.nativeId || identity.threadId !== binding.nativeId) {
       throw new BindingError('ordinary Codex identity does not match the native session');
     }
-    return this.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
+    return this.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? undefined : {
+      intakeCutoff: adoptionCutoff,
+      intakeCutoffDetail: 'ordinary binding adoption cutoff'
+    });
   }
 
   rebindOrdinary(binding, identity, nativeProof = null) {
@@ -1407,31 +1416,33 @@ class SurfaceState {
     assertText(channelId, 'channelId', 128);
     assertText(guildId, 'guildId', 128);
     assertText(lastSeenId, 'lastSeenId', 128);
-    return this.transaction(() => {
-      const binding = this.getBinding(channelId);
-      if (expectedBinding !== undefined && (expectedBinding === null
-        ? binding !== null
-        : !bindingMatchesExpected(binding, expectedBinding))) return null;
-      const existing = this.getIntakeWatermark(channelId);
-      const knownGuildId = existing?.guild_id || binding?.guildId;
-      if (knownGuildId && knownGuildId !== guildId) throw new BindingError('intake channel belongs to another guild');
-      const retainedLastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
-        ? existing.last_seen_id
-        : lastSeenId;
-      const retainedRecoveredThrough = existing?.recovered_through_id && compareDiscordIds(existing.recovered_through_id, lastSeenId) > 0
-        ? existing.recovered_through_id
-        : lastSeenId;
-      const cutoffDetail = String(detail || '').slice(0, 1000) || null;
-      if (existing) {
-        this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
-          .run(guildId, retainedLastSeen, retainedRecoveredThrough, 'pending', cutoffDetail, now(), channelId);
-      } else {
-        this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, recovered_through_id, state, detail, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
-          .run(channelId, guildId, retainedLastSeen, retainedRecoveredThrough, 'pending', cutoffDetail, now());
-      }
-      this.receipt(null, 'intake-baseline', { channelId, lastSeenId: retainedLastSeen, detail: cutoffDetail });
-      return this.getIntakeWatermark(channelId);
-    });
+    return this.transaction(() => this.setIntakeCutoffInTransaction(channelId, guildId, lastSeenId, detail, expectedBinding));
+  }
+
+  setIntakeCutoffInTransaction(channelId, guildId, lastSeenId, detail, expectedBinding = undefined) {
+    const binding = this.getBinding(channelId);
+    if (expectedBinding !== undefined && (expectedBinding === null
+      ? binding !== null
+      : !bindingMatchesExpected(binding, expectedBinding))) return null;
+    const existing = this.getIntakeWatermark(channelId);
+    const knownGuildId = existing?.guild_id || binding?.guildId;
+    if (knownGuildId && knownGuildId !== guildId) throw new BindingError('intake channel belongs to another guild');
+    const retainedLastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
+      ? existing.last_seen_id
+      : lastSeenId;
+    const retainedRecoveredThrough = existing?.recovered_through_id && compareDiscordIds(existing.recovered_through_id, lastSeenId) > 0
+      ? existing.recovered_through_id
+      : lastSeenId;
+    const cutoffDetail = String(detail || '').slice(0, 1000) || null;
+    if (existing) {
+      this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
+        .run(guildId, retainedLastSeen, retainedRecoveredThrough, 'pending', cutoffDetail, now(), channelId);
+    } else {
+      this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, recovered_through_id, state, detail, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
+        .run(channelId, guildId, retainedLastSeen, retainedRecoveredThrough, 'pending', cutoffDetail, now());
+    }
+    this.receipt(null, 'intake-baseline', { channelId, lastSeenId: retainedLastSeen, detail: cutoffDetail });
+    return this.getIntakeWatermark(channelId);
   }
 
   listIntakeWatermarks() {
