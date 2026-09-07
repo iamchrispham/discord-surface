@@ -25,6 +25,11 @@ function latestAcknowledgmentOutcome(state, messageId) {
   return row ? parseReceiptDetail(row.detail) : null;
 }
 
+function hasAcknowledgmentReceipt(state, messageId) {
+  return Boolean(state.db.prepare('SELECT 1 FROM receipts WHERE discord_id=? AND kind=? LIMIT 1')
+    .get(messageId, ACK.RECEIVED));
+}
+
 function receiptRowsAfter(state, receiptId, throughId) {
   return state.db.prepare(`SELECT id, discord_id FROM receipts
     WHERE id>? AND id<=? AND kind IN (?, ?) ORDER BY id`).all(receiptId, throughId, ACK.RECEIVED, ACK.OUTCOME);
@@ -193,6 +198,40 @@ function createAcknowledgmentDelivery({ state, send }) {
   };
 }
 
+function waitForAcknowledgment(state, deliver, messageId, signal) {
+  if (!hasAcknowledgmentReceipt(state, messageId)) return deliver(messageId);
+  const current = latestAcknowledgmentOutcome(state, messageId);
+  if (current && (current.outcome !== ACK_OUTCOMES.UNKNOWN || current.terminal)) return null;
+  return (async () => {
+    while (true) {
+      if (signal?.aborted) return { outcome: 'stopped' };
+      const current = latestAcknowledgmentOutcome(state, messageId);
+      if (current && (current.outcome !== ACK_OUTCOMES.UNKNOWN || current.terminal)) return null;
+      const work = deliver(messageId);
+      if (work) await work;
+      const outcome = latestAcknowledgmentOutcome(state, messageId);
+      if (outcome && (outcome.outcome !== ACK_OUTCOMES.UNKNOWN || outcome.terminal)) return null;
+      if (!outcome || !retryableUnknown(outcome)) return outcome;
+      const delay = Math.max(0, outcome.retryAt - Date.now());
+      if (!delay) continue;
+      await new Promise(resolve => {
+        let timer;
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', finish);
+          resolve();
+        };
+        timer = setTimeout(finish, delay);
+        signal?.addEventListener('abort', finish, { once: true });
+        if (signal?.aborted) finish();
+      });
+    }
+  })();
+}
+
 function acknowledgmentRetryAfterMs(error) {
   const milliseconds = Number(error?.retryAfterMs);
   if (Number.isFinite(milliseconds) && milliseconds >= 0) return Math.ceil(milliseconds);
@@ -201,7 +240,8 @@ function acknowledgmentRetryAfterMs(error) {
   return null;
 }
 
-function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDelivery({ state, send }), logger = () => {}, watchFactory = fs.watch, rearmMs = 1000 }) {
+function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDelivery({ state, send }), onAcknowledged = null,
+  logger = () => {}, watchFactory = fs.watch, rearmMs = 1000 }) {
   let closed = false;
   let timer = null;
   let timerDueAt = null;
@@ -209,6 +249,13 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
   let dirty = false;
   let receiptCursor = null;
   const retryAtByMessage = new Map();
+  const notified = new Set();
+
+  function notifyAcknowledged(messageId) {
+    if (!onAcknowledged || notified.has(messageId) || !hasAcknowledgmentReceipt(state, messageId)) return;
+    notified.add(messageId);
+    Promise.resolve().then(() => onAcknowledged(messageId)).catch(error => logger(`native acknowledgment resume failed: ${error.message}`));
+  }
 
   function rememberRetryAt(messageId) {
     const detail = latestAcknowledgmentOutcome(state, messageId);
@@ -263,6 +310,7 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
       const ids = receiptCursor === null ? initialPending(now) : incrementalPending(now);
       for (const id of ids) {
         if (closed) return;
+        notifyAcknowledged(id);
         await deliver(id);
         rememberRetryAt(id);
       }
@@ -349,5 +397,6 @@ module.exports = {
   isAcknowledgmentPending,
   pendingAcknowledgments,
   recordNativeAcknowledgment,
+  waitForAcknowledgment,
   watchAcknowledgments
 };

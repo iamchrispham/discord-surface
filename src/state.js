@@ -1446,9 +1446,17 @@ class SurfaceState {
     return this.transaction(() => {
       const message = this.getMessage(messageId);
       if (!message) throw new BindingError('message is unknown');
+      const serializedCursor = cursor === null || cursor === undefined ? null : safeDetail(cursor);
+      const submittedMarker = marker === undefined ? null : marker;
+      if (message.state === MESSAGE_STATES.SUBMITTED) {
+        if (serializedCursor === null && submittedMarker === null) return message;
+        this.db.prepare('UPDATE messages SET observer_cursor=COALESCE(observer_cursor, ?), observer_marker=COALESCE(observer_marker, ?), updated_at=? WHERE discord_id=? AND state=?')
+          .run(serializedCursor, submittedMarker, now(), messageId, MESSAGE_STATES.SUBMITTED);
+        return this.getMessage(messageId);
+      }
       if (message.state !== MESSAGE_STATES.DISPATCHING) return message;
       this.db.prepare('UPDATE messages SET state=?, observer_cursor=?, observer_marker=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
-        .run(MESSAGE_STATES.SUBMITTED, cursor ? safeDetail(cursor) : null, marker, now(), messageId, MESSAGE_STATES.DISPATCHING);
+        .run(MESSAGE_STATES.SUBMITTED, serializedCursor, submittedMarker, now(), messageId, MESSAGE_STATES.DISPATCHING);
       this.receipt(messageId, 'submitted', { marker: marker || undefined });
       return this.getMessage(messageId);
     });

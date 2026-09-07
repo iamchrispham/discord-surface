@@ -1,5 +1,5 @@
 const fs = require('node:fs');
-const { acknowledgmentCommand, createAcknowledgmentDelivery, watchAcknowledgments } = require('./acknowledgment');
+const { acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
@@ -517,6 +517,17 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
             continueUntilFinal,
             onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
           });
+          const promoted = state.getMessage(message.id);
+          if (promoted?.state === MESSAGE_STATES.REPLY_READY && result.message?.state !== MESSAGE_STATES.REPLY_READY) {
+            result = { ...result, message: promoted };
+          }
+          if (result.status === 'uncertain' && promoted?.state === MESSAGE_STATES.SUBMITTED) {
+            result = await observeSubmitted(state, promoted, providers[promoted.provider], {
+              ...observeOptions,
+              signal: taskSignal,
+              continueUntilFinal
+            });
+          }
         } finally {
           settleNative();
         }
@@ -658,8 +669,10 @@ class DiscordGateway {
     this.state.assertMessageCurrent(reply.id, 'reply-send');
     if (typeof reply.replyText !== 'string' || reply.replyText.length > 2000) throw new Error('Discord reply must be at most 2000 characters per message');
     if (typeof reply.replyNonce !== 'string' || reply.replyNonce.length > 25) throw new Error('Discord reply nonce must be at most 25 characters');
+    const channel = message.channel || await this.client.channels?.fetch?.(message.channelId);
+    if (!channel?.send) throw new Error('Discord reply channel is unavailable');
     try {
-      return await message.channel.send({
+      return await channel.send({
         content: reply.replyText,
         nonce: reply.replyNonce,
         enforceNonce: true,
@@ -673,7 +686,7 @@ class DiscordGateway {
 
   prepareReply(messageId, signal) {
     if (signal?.aborted || this.stopping) return;
-    return this.deliverAcknowledgment(messageId);
+    return waitForAcknowledgment(this.state, this.deliverAcknowledgment, messageId, signal);
   }
 
   async sendAcknowledgment(message, reaction) {
@@ -820,6 +833,12 @@ class DiscordGateway {
         state: this.state,
         send: (message, reaction) => this.sendAcknowledgment(message, reaction),
         deliver: this.deliverAcknowledgment,
+        onAcknowledged: messageId => {
+          if (this.stopping) return null;
+          const message = this.state.getMessage(messageId);
+          if (message?.state !== MESSAGE_STATES.SUBMITTED) return null;
+          return this.consumer?.resumeSubmitted(message, undefined, { awaitExisting: false, continueUntilFinal: true });
+        },
         logger: this.logger
       });
     })();
