@@ -358,14 +358,22 @@ function probeClaudeChannel(socketPath, expected, { timeoutMs = 1000, maxBytes =
   return new Promise((resolve, reject) => {
     let settled = false;
     let request;
+    const deadlineMs = Math.max(1, Number(timeoutMs));
+    let deadlineTimer;
     const finish = (error, proof = null) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadlineTimer);
       if (error) reject(error);
       else resolve(proof);
     };
+    deadlineTimer = setTimeout(() => {
+      const error = new Error('Claude channel identity probe timed out');
+      request?.destroy(error);
+      finish(error);
+    }, deadlineMs);
     try {
-      request = http.request({ agent: false, socketPath, path: '/identity', method: 'GET', timeout: timeoutMs,
+      request = http.request({ agent: false, socketPath, path: '/identity', method: 'GET',
         headers: { accept: 'application/json' } }, response => {
         let output = '';
         response.setEncoding('utf8');
@@ -402,7 +410,6 @@ function probeClaudeChannel(socketPath, expected, { timeoutMs = 1000, maxBytes =
           });
         });
       });
-      request.setTimeout(timeoutMs, () => request.destroy(new Error('Claude channel identity probe timed out')));
       request.once('error', finish);
       request.end();
     } catch (error) {

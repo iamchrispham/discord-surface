@@ -10,7 +10,7 @@ const { createOrdinaryClaudeRequest, ordinaryBindingDecision, resolveExistingCha
 const { createClaudeMonitor } = require('../src/claude-monitor');
 const { ordinaryClaudeBind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
-const { ClaudeProvider, dispatchAndObserve, postUnixJson, probeUnixSocket, validateClaudeSessionIdentity, waitForReply } = require('../src/native');
+const { ClaudeProvider, dispatchAndObserve, postUnixJson, probeClaudeChannel, probeUnixSocket, validateClaudeSessionIdentity, waitForReply } = require('../src/native');
 const { MESSAGE_STATES, READINESS, SurfaceState, StaleGenerationError } = require('../src/state');
 const { runDirectPost } = require('../src/direct-post');
 
@@ -197,6 +197,59 @@ test('ordinary Claude preflight rejects an unrelated accepting listener', async 
   await assert.rejects(() => gateway.verifyOrdinaryNative(f.binding), /identity|status|Claude channel/);
   assert.equal(f.state.hasOrdinaryPreflight(f.binding), false);
   await gateway.stop();
+});
+
+test('Claude identity probe enforces an absolute deadline despite response progress', async t => {
+  const f = fixture(t, { preflight: false });
+  const listener = http.createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    let writes = 0;
+    const interval = setInterval(() => {
+      response.write(' ');
+      writes += 1;
+      if (writes >= 20) {
+        clearInterval(interval);
+        response.end();
+      }
+    }, 10);
+    _request.on('close', () => clearInterval(interval));
+  });
+  await new Promise((resolve, reject) => {
+    listener.once('error', reject);
+    listener.listen(f.socketPath, resolve);
+  });
+  t.after(() => listener.close());
+  const startedAt = Date.now();
+  await assert.rejects(() => probeClaudeChannel(f.socketPath, {
+    nativeId: CLAUDE, generation: f.binding.generation, workspace: f.dir, endpoint: f.socketPath
+  }, { timeoutMs: 30 }), /timed out/);
+  assert.ok(Date.now() - startedAt < 120, 'probe deadline must be absolute, not inactivity based');
+});
+
+test('Claude identity probe settles success, no-response, and transport-error paths', async t => {
+  const f = fixture(t, { preflight: false });
+  const expected = { nativeId: CLAUDE, generation: f.binding.generation, workspace: f.dir, endpoint: f.socketPath };
+  const successListener = http.createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ provider: 'claude', ...expected, channelReady: true }));
+  });
+  await new Promise((resolve, reject) => {
+    successListener.once('error', reject);
+    successListener.listen(f.socketPath, resolve);
+  });
+  const proof = await probeClaudeChannel(f.socketPath, expected, { timeoutMs: 100 });
+  assert.equal(proof.channelReady, true);
+  await new Promise((resolve, reject) => successListener.close(error => error ? reject(error) : resolve()));
+
+  const noResponseListener = http.createServer(() => {});
+  await new Promise((resolve, reject) => {
+    noResponseListener.once('error', reject);
+    noResponseListener.listen(f.socketPath, resolve);
+  });
+  await assert.rejects(() => probeClaudeChannel(f.socketPath, expected, { timeoutMs: 30 }), /timed out/);
+  await new Promise((resolve, reject) => noResponseListener.close(error => error ? reject(error) : resolve()));
+
+  await assert.rejects(() => probeClaudeChannel(f.socketPath, expected, { timeoutMs: 100 }), /ENOENT|connect|socket/i);
 });
 
 test('old ordinary Claude Monitor stop cannot revoke a successor generation', async t => {
