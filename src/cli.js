@@ -222,15 +222,12 @@ async function ordinaryBind(args, dependencies = {}) {
     if (decision !== 'reuse' && !existing?.active) {
       const cutoff = await latestChannelMessageId(discordChannel);
       adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
-      if (adoptionCutoff && decision !== 'bind') {
-        state.setIntakeCutoff(request.channelId, request.guildId, adoptionCutoff, 'ordinary binding adoption cutoff', existing);
-      }
     }
     let binding;
     if (decision === 'reuse') binding = existing;
     else if (decision === 'rebind') {
       try {
-        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);
+        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence, adoptionCutoff);
       } catch (error) {
         const raced = state.getBinding(request.channelId);
         const racedDecision = raced
@@ -711,14 +708,14 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
     }]);
     if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
+    let adoptionCutoff = null;
     if (!current.active) {
       const cutoff = await latestChannelMessageId(channel);
-      const adoptionCutoff = cutoff || serverDerivedChannelCutoff(channel);
-      if (adoptionCutoff) state.setIntakeCutoff(channelId, config.guildId, adoptionCutoff, 'ordinary handoff adoption cutoff', current);
+      adoptionCutoff = cutoff || serverDerivedChannelCutoff(channel);
     }
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
-      sessionRoot: validationRoot, handoffId,
+      sessionRoot: validationRoot, handoffId, intakeCutoff: adoptionCutoff,
       identity: { sessionId: nativeProof.sessionId, threadId: nativeProof.threadId },
       nativeProof: { ...nativeProof, sessionRoot: validationRoot }
     });

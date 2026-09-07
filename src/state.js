@@ -959,7 +959,7 @@ class SurfaceState {
     });
   }
 
-  rebindOrdinary(binding, identity, nativeProof = null) {
+  rebindOrdinary(binding, identity, nativeProof = null, intakeCutoff = null) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {
       throw new BindingError('ordinary Codex identity is missing or conflicting');
@@ -1018,6 +1018,7 @@ class SurfaceState {
       provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity
     };
     return this.rebind(rebound, {
+      intakeCutoff,
       resetIntake: !sessionRootMatches,
       sessionRootOverride: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : undefined
     });
@@ -1069,7 +1070,8 @@ class SurfaceState {
     });
   }
 
-  rebind(binding, { resetIntake = false, sessionRootOverride = undefined } = {}) {
+  rebind(binding, { resetIntake = false, sessionRootOverride = undefined, intakeCutoff = null } = {}) {
+    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     const channelId = assertText(binding.channelId, 'channelId', 128);
     const existing = this.getBinding(channelId);
     if (!existing) throw new BindingError('channel is not bound');
@@ -1102,6 +1104,10 @@ class SurfaceState {
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
       this.assertLegacyMigrationSafe(channelId);
+      this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
+      if (intakeCutoff !== null) {
+        this.setIntakeCutoffInTransaction(channelId, input.guildId, intakeCutoff, 'ordinary binding adoption cutoff', current);
+      }
       this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, session_root=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
         .run(input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
       this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
@@ -1206,7 +1212,8 @@ class SurfaceState {
     });
   }
 
-  handoffOrdinary({ channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof }) {
+  handoffOrdinary({ channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null }) {
+    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     if (provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff requires the Codex provider');
     assertUuid(fromNativeId, 'fromNativeId');
     assertUuid(nativeId, 'nativeId');
@@ -1274,6 +1281,9 @@ class SurfaceState {
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
       this.assertLegacyMigrationSafe(channelId);
+      if (intakeCutoff !== null) {
+        this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
+      }
       const generation = existing.generation + 1;
       const updatedAt = now();
       this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?

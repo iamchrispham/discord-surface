@@ -1097,3 +1097,59 @@ test('unsupported direct transcript store cannot validate or invoke queue', asyn
   assert.equal(fs.existsSync(path.join(root, `${CODEX}.jsonl`)), true);
   assert.equal(fs.existsSync(path.join(root, 'sessions')), false);
 });
+
+for (const action of ['rebind', 'handoff']) {
+  for (const collision of [true, false]) {
+    test(`inactive ${action} ${collision ? 'refusal preserves' : 'success commits'} intake custody`, async t => {
+      const f = fixture(t);
+      const channelId = '123456789012345678';
+      const successor = action === 'handoff' ? OTHER : CODEX;
+      const native = transcript(t, f.dir, successor);
+      ordinary(f, channelId);
+      f.state.setIntakeCutoff(channelId, 'guild', '100', 'seed');
+      f.state.markIntakeBoundary(channelId, 'unavailable', 'seed gap', '100', '150');
+      f.state.unbind(channelId);
+      if (collision) ordinary(f, '223456789012345678', successor);
+      const before = {
+        binding: f.state.getBinding(channelId), watermark: f.state.getIntakeWatermark(channelId),
+        receipts: f.state.listReceipts()
+      };
+      const channel = {
+        id: channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
+        messages: { fetch: async () => new Map([['latest', { id: '200' }]]) }
+      };
+      class FakeClient {
+        constructor() { this.guilds = { fetch: async () => ({ channels: {
+          fetch: async selection => selection ? channel : new Map([[channelId, channel]])
+        } }) }; }
+        async login() {}
+        async destroy() {}
+      }
+      const dependencies = {
+        environment: { CODEX_SESSION_ID: successor, CODEX_THREAD_ID: successor, PWD: f.dir },
+        codexSessionRoot: () => native.root,
+        requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+        readSecret: () => 'fixture-token',
+        validateCodexSessionIdentity: async () => ({ file: native.file, sessionId: successor, threadId: successor, workspace: f.dir }),
+        gatewayProcessStatus: () => ({ state: 'stopped' }), print: () => {}
+      };
+      const invoke = () => action === 'rebind'
+        ? ordinaryBind({ 'state-dir': f.dir, channel: '#dev', 'session-root': native.root }, dependencies)
+        : handoffInternal({ ordinary: true, 'state-dir': f.dir, provider: 'codex',
+          'channel-id': channelId, 'from-native-id': CODEX, 'from-generation': '1',
+          'native-id': successor, workspace: f.dir, 'session-root': native.root,
+          'handoff-id': 'cutoff-atomicity' }, dependencies);
+      if (collision) {
+        await assert.rejects(invoke, /already owned/);
+        assert.deepEqual(f.state.getBinding(channelId), before.binding);
+        assert.deepEqual(f.state.getIntakeWatermark(channelId), before.watermark);
+        assert.deepEqual(f.state.listReceipts(), before.receipts);
+      } else {
+        await invoke();
+        assert.equal(f.state.getBinding(channelId).generation, 2);
+        assert.equal(f.state.getBinding(channelId).nativeId, successor);
+        assert.equal(f.state.getIntakeWatermark(channelId).last_seen_id, '200');
+      }
+    });
+  }
+}
