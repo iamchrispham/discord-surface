@@ -102,7 +102,8 @@ function eventToInput(message) {
     authorId: message.author?.id,
     isBot: Boolean(message.author?.bot),
     content: message.content,
-    attachments
+    attachments,
+    nonce: message.nonce == null ? null : String(message.nonce)
   };
 }
 
@@ -125,6 +126,68 @@ async function cancelResponseBody(response) {
   try {
     await response?.body?.cancel?.();
   } catch {}
+}
+
+async function sendDiscordMessage({ token, channelId, content, nonce, signal, timeoutMs = RECOVERY_LIMITS.timeoutMs,
+  fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] } }) {
+  if (typeof fetchImpl !== 'function') throw Object.assign(new Error('Discord message fetch is unavailable'), { outcome: 'not_sent' });
+  if (signal?.aborted) throw Object.assign(new Error('Discord message send stopped before request'), { outcome: 'not_sent' });
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  let timer;
+  let started = false;
+  const operation = (async () => {
+    started = true;
+    let response;
+    try {
+      response = await fetchImpl(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bot ${token}`,
+          'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          content, nonce, enforce_nonce: true, allowed_mentions: allowedMentions,
+          ...(messageReference ? { message_reference: messageReference } : {})
+        }),
+        signal: controller.signal
+      });
+    } catch (error) {
+      if (!error.outcome) error.outcome = started ? 'unknown' : 'not_sent';
+      throw error;
+    }
+    if (!response?.ok) {
+      await cancelResponseBody(response);
+      const error = new Error('Discord direct post request rejected');
+      error.status = response?.status;
+      error.outcome = response?.status === 429 ? 'rate_limited' : [400, 401, 403, 404].includes(response?.status) ? 'not_sent' : 'unknown';
+      throw error;
+    }
+    let body;
+    try { body = await response.json(); }
+    catch (error) { await cancelResponseBody(response); error.outcome = 'unknown'; throw error; }
+    if (!body?.id) {
+      await cancelResponseBody(response);
+      throw Object.assign(new Error('Discord direct post response lacks message id'), { outcome: 'unknown' });
+    }
+    return body;
+  })();
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(Object.assign(new Error('Discord direct post deadline exceeded'), { outcome: 'unknown' }));
+    }, Math.max(1, Number(timeoutMs)));
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+    controller.abort();
+    operation.catch(() => {});
+  }
 }
 
 function transportReceiptText(message, attempt) {
@@ -566,40 +629,11 @@ class DiscordGateway {
       try {
         // discord.js channel.send drops the signal and uses the shared REST retry queue.
         if (this.discordToken && this.client?.rest && typeof globalThis.fetch === 'function') {
-          const url = `https://discord.com/api/v10/channels/${encodeURIComponent(message.channel.id)}/messages`;
-          sendPromise = globalThis.fetch(url, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bot ${this.discordToken}`,
-              'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              content: receipt.content,
-              nonce: receipt.nonce,
-              enforce_nonce: true,
-              allowed_mentions: { parse: [], replied_user: false },
-              message_reference: {
-                message_id: message.id,
-                fail_if_not_exists: false
-              }
-            }),
-            signal: controller.signal
-          }).then(async response => {
-            if (!response.ok) {
-              await cancelResponseBody(response);
-              const error = new Error('Discord transport receipt request rejected');
-              error.status = response.status;
-              throw error;
-            }
-            let body;
-            try { body = await response.json(); }
-            catch (error) {
-              await cancelResponseBody(response);
-              throw error;
-            }
-            if (!body?.id) throw new Error('Discord did not return a transport receipt message id');
-            return body;
+          sendPromise = sendDiscordMessage({
+            token: this.discordToken, channelId: message.channelId || message.channel.id,
+            content: receipt.content, nonce: receipt.nonce, signal: controller.signal,
+            timeoutMs: this.recoveryTimeoutMs, allowedMentions: { parse: [], replied_user: false },
+            messageReference: { message_id: message.id, fail_if_not_exists: false }
           });
         } else if (this.discordToken && this.client?.rest) {
           throw new Error('Discord transport receipt fetch is unavailable');
@@ -1041,4 +1075,5 @@ module.exports = {
   eventToInput,
   readSecret,
   requireInstalled,
+  sendDiscordMessage,
 };
