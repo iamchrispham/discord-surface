@@ -635,7 +635,6 @@ function writePid(pidFile, guildId, stateDir) {
 async function runRuntime(args) {
   const { paths, state } = openState(args);
   const config = state.requireConfig();
-  const recoveryCutoff = new Date().toISOString();
   state.recoverAfterRestart();
   writePid(paths.pid, config.guildId, paths.stateDir);
   let gateway;
@@ -653,7 +652,7 @@ async function runRuntime(args) {
   try {
     gateway = new DiscordGateway({ state, observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) } });
     await gateway.start(config.secretFile);
-    await gateway.reconcilePending(recoveryCutoff);
+    await gateway.reconcilePending();
   } catch (error) {
     await stop();
     throw error;

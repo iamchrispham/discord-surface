@@ -2177,6 +2177,101 @@ test('simulated: login-time input is durably held and backfill closes before dis
   state.close();
 });
 
+test('public CLI startup reconciles login-time custody after the history baseline', async () => {
+  for (const baselineMode of ['older', 'equal']) {
+    const { dir, db, state } = fixture(`startup-${baselineMode}.sqlite`);
+    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+    const secret = path.join(dir, 'discord.secret');
+    const preload = path.join(dir, 'startup-preload.cjs');
+    const dispatchProbe = path.join(dir, 'dispatches.log');
+    const replyProbe = path.join(dir, 'reply.done');
+    fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+    fs.writeFileSync(preload, `
+const fs = require('node:fs');
+const discordPath = require.resolve(${JSON.stringify(path.resolve(__dirname, '../src/discord.js'))});
+const loaded = require(discordPath);
+const baselineMode = process.env.DISCORD_SURFACE_STARTUP_BASELINE;
+const dispatchProbe = process.env.DISCORD_SURFACE_STARTUP_DISPATCH_PROBE;
+const replyProbe = process.env.DISCORD_SURFACE_STARTUP_REPLY_PROBE;
+const source = (id, content) => ({ id, guildId: 'guild-1', channelId: 'channel-codex', content,
+  author: { id: 'operator-1', bot: false } });
+const channel = {
+  id: 'channel-codex', guildId: 'guild-1', topic: '',
+  permissionsFor: () => ({ has: () => true }),
+  messages: { fetch: async () => ({ react: async () => {} }) },
+  async send(payload) {
+    if (payload?.content === 'startup answer') fs.writeFileSync(replyProbe, 'replied\\n', { mode: 0o600 });
+    return { id: 'sent-' + Date.now() };
+  }
+};
+const listeners = new Map();
+const client = {
+  user: { id: 'bot-1' },
+  on(name, fn) { listeners.set(name, fn); },
+  off(name, fn) { if (listeners.get(name) === fn) listeners.delete(name); },
+  async login() {
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await listeners.get('messageCreate')({ ...source('101', 'login input'), channel });
+  },
+  channels: { fetch: async () => channel },
+  async destroy() {}
+};
+const fetchHistory = async (_channel, options) => {
+  if (options.limit === 1) return [source(baselineMode === 'equal' ? '101' : '100', 'history baseline')];
+  if (baselineMode === 'older' && options.after === '100') return [source('101', 'history copy')];
+  if (options.after === '101') return [];
+  throw new Error('unexpected history cursor ' + options.after);
+};
+const providers = { codex: {
+  async dispatch(message) {
+    fs.appendFileSync(dispatchProbe, message.id + '\\n', { mode: 0o600 });
+    return { status: 'submitted' };
+  },
+  async observe() { return { text: 'startup answer' }; }
+} };
+class FixtureGateway extends loaded.DiscordGateway {
+  constructor(options) { super({ ...options, client, fetchHistory, providers }); }
+}
+require.cache[discordPath].exports = { ...loaded, DiscordGateway: FixtureGateway };
+`, { mode: 0o600 });
+    state.close();
+    const child = spawn(process.execPath, [CLI_PATH, 'run', '--state-dir', dir, '--db', db], {
+      cwd: path.dirname(CLI_PATH),
+      env: {
+        ...process.env,
+        NODE_OPTIONS: `--require=${preload}`,
+        DISCORD_SURFACE_LOCK_HELD: '1',
+        DISCORD_SURFACE_STARTUP_BASELINE: baselineMode,
+        DISCORD_SURFACE_STARTUP_DISPATCH_PROBE: dispatchProbe,
+        DISCORD_SURFACE_STARTUP_REPLY_PROBE: replyProbe
+      },
+      stdio: ['ignore', 'ignore', 'pipe']
+    });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+    try {
+      await waitForFile(replyProbe, 1500).catch(() => {});
+      await new Promise(resolve => setImmediate(resolve));
+      if (child.exitCode === null) child.kill('SIGTERM');
+      await waitForProcessGone(child.pid, 2000).catch(() => {});
+      const dispatches = fs.existsSync(dispatchProbe)
+        ? fs.readFileSync(dispatchProbe, 'utf8').trim().split('\n').filter(Boolean)
+        : [];
+      const reopened = new SurfaceState(db);
+      try {
+        assert.deepEqual(dispatches, ['101'], `${baselineMode} startup dispatches exactly once\nstderr: ${stderr}`);
+        assert.equal(reopened.getMessage('101')?.state, MESSAGE_STATES.REPLIED, `${baselineMode} login input final state`);
+        assert.equal(reopened.getMessage('100'), null, `${baselineMode} pre-adoption baseline was not admitted`);
+        assert.equal(reopened.getIntakeWatermark('channel-codex').recovered_through_id, '101');
+      } finally { reopened.close(); }
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await waitForProcessGone(child.pid, 2000).catch(() => {});
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 test('simulated: bounded intake recovery records a visible gap and requires explicit reconciliation', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
