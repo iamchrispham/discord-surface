@@ -301,7 +301,6 @@ async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000,
       file = null;
       offset = 0;
       tailBytes = Buffer.alloc(0);
-      since = startedAt;
     }
   }
   if (!file) file = findCodexSessionFile(nativeId, activeRoot);
