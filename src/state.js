@@ -1120,7 +1120,7 @@ class SurfaceState {
     const ordinary = this.isOrdinaryBindingRecord(existing);
     const ordinaryIdentityMatches = input.nativeId === existing.nativeId &&
       ordinaryIdentity?.sessionId === existing.nativeId && ordinaryIdentity?.threadId === existing.nativeId;
-    if (ordinary && (!ordinaryIdentity || input.provider !== PROVIDERS.CODEX || input.conductorId || input.repoKey ||
+    if (ordinary && existing.provider === PROVIDERS.CODEX && (!ordinaryIdentity || input.provider !== PROVIDERS.CODEX || input.conductorId || input.repoKey ||
       !ordinaryIdentityMatches)) {
       throw new BindingError('ordinary bindings require matching invocation identity');
     }

@@ -140,8 +140,8 @@ export function ordinaryBindingDecision(
   nativeProof: OrdinaryCodexNativeProof | null = null
 ): 'bind' | 'reuse' | 'rebind' {
   if (!existing) return 'bind';
-  const sessionRootMatches = request.sessionRoot === undefined || (existing.sessionRoot || null) === request.sessionRoot;
-  const verifiedRootRelocation = !sessionRootMatches && typeof nativeProof?.file === 'string' && nativeProof.file.startsWith('/') &&
+  const sessionRootMatches = request.provider !== 'codex' || request.sessionRoot === undefined || (existing.sessionRoot || null) === request.sessionRoot;
+  const verifiedRootRelocation = request.provider === 'codex' && !sessionRootMatches && typeof nativeProof?.file === 'string' && nativeProof.file.startsWith('/') &&
     nativeProof.sessionId === request.nativeId && nativeProof.threadId === request.nativeId &&
     nativeProof.workspace === request.workspace && nativeProof.sessionRoot === request.sessionRoot;
   const sameOwner = ordinaryMarker && existing.provider === request.provider &&

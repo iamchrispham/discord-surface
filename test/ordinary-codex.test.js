@@ -994,6 +994,8 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
   const f = fixture(t);
   const session = transcript(t, f.dir);
   const binding = ordinary(f);
+  const secretFile = path.join(f.dir, 'discord.env');
+  fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
   const held = f.state.acceptDiscordMessage({
     id: 'held-input', guildId: 'guild', channelId: binding.channelId,
     authorId: 'operator', isBot: false, content: 'held until native proof'
@@ -1007,12 +1009,13 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
     guildId: 'guild',
     topic: null,
     permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => ({ react: async () => {} }) },
     async send() { replies += 1; return { id: `reply-${replies}` }; }
   };
   const client = {
     user: { id: 'bot' },
     channels: { fetch: async () => channel },
-    on() {}, off() {}, async destroy() {}
+    on() {}, off() {}, async login() {}, async destroy() {}
   };
   const gateway = new DiscordGateway({
     state: f.state,
@@ -1030,18 +1033,18 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
       }
     }
   });
-  const first = await gateway.recoverTransport('startup', 0);
-  assert.equal(first.ready, true);
+  await gateway.start(secretFile);
   assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.READY);
   assert.equal(preflights, 1);
-  const reconciled = await gateway.reconcilePending();
-  assert.deepEqual(reconciled, []);
+  await gateway.reconcilePending();
+  await gateway.consumer.waitForNativeWork();
+  assert.deepEqual(f.state.recoveryCandidates(), []);
   assert.equal(dispatches, 1);
   assert.ok(replies >= 1);
   assert.equal(f.state.getMessage('held-input').state, 'replied');
   gateway.pauseConnection('reconnect');
   assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.RECOVERING);
-  const second = await gateway.recoverTransport('reconnect', 0);
+  const second = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
   assert.equal(second.ready, true);
   assert.equal(preflights, 2);
   assert.equal(f.state.getMessage('held-input').state, 'replied');
