@@ -283,10 +283,20 @@ function readTranscriptTail(fd, size) {
 async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), pollMs = 250, signal, onCursor, continueUntilFinal = false, isCurrent } = {}) {
   if (!marker) throw new Error('Codex observer requires a unique response marker');
   const startedAt = Date.now();
-  let file = cursor?.file || findCodexSessionFile(nativeId, root);
   let offset = Number(cursor?.offset || 0);
   let tailBytes = cursorTailBytes(cursor);
   let since = Number(cursor?.since || startedAt);
+  let file = cursor?.file || null;
+  if (file && root) {
+    const relative = path.relative(path.resolve(root), path.resolve(file));
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      file = null;
+      offset = 0;
+      tailBytes = Buffer.alloc(0);
+      since = startedAt;
+    }
+  }
+  if (!file) file = findCodexSessionFile(nativeId, root);
   const currentCursor = () => ({ file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') });
   const stopped = () => signal?.aborted || (isCurrent && !isCurrent());
   while (continueUntilFinal || Date.now() - startedAt < timeoutMs) {
@@ -335,7 +345,13 @@ async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000,
         }
         if (text) return { text, cursor: currentCursor() };
         onCursor?.(currentCursor());
-      } catch {
+      } catch (error) {
+        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+          file = null;
+          offset = 0;
+          tailBytes = Buffer.alloc(0);
+          since = startedAt;
+        }
         onCursor?.(currentCursor());
       }
     }

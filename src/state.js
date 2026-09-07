@@ -1272,12 +1272,15 @@ class SurfaceState {
     });
   }
 
-  setIntakeCutoff(channelId, guildId, lastSeenId, detail) {
+  setIntakeCutoff(channelId, guildId, lastSeenId, detail, expectedBinding = undefined) {
     assertText(channelId, 'channelId', 128);
     assertText(guildId, 'guildId', 128);
     assertText(lastSeenId, 'lastSeenId', 128);
     return this.transaction(() => {
       const binding = this.getBinding(channelId);
+      if (expectedBinding !== undefined && (expectedBinding === null
+        ? binding !== null
+        : !bindingMatchesExpected(binding, expectedBinding))) return null;
       const existing = this.getIntakeWatermark(channelId);
       const knownGuildId = existing?.guild_id || binding?.guildId;
       if (knownGuildId && knownGuildId !== guildId) throw new BindingError('intake channel belongs to another guild');

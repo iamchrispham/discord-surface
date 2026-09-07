@@ -187,7 +187,7 @@ async function ordinaryBind(args, dependencies = {}) {
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     if (decision !== 'reuse' && !existing?.active) {
       const cutoff = await latestChannelMessageId(channel);
-      if (cutoff) state.setIntakeCutoff(request.channelId, request.guildId, cutoff, 'ordinary binding adoption cutoff');
+      if (cutoff) state.setIntakeCutoff(request.channelId, request.guildId, cutoff, 'ordinary binding adoption cutoff', existing);
     }
     let binding;
     if (decision === 'reuse') binding = existing;
@@ -973,12 +973,24 @@ async function directPost(args, provider = null, ordinary = false) {
   try {
     const config = state.requireConfig();
     const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: true });
+    const nativeId = required(args, 'native-id');
+    const generation = required(args, 'generation');
+    const channelId = ordinary ? required(args, 'channel-id') : (args['channel-id'] || null);
+    if (ordinary) {
+      const invocation = resolveInvocationIdentity(process.env);
+      const binding = state.getBinding(channelId);
+      if (nativeId !== invocation.sessionId || invocation.threadId !== invocation.sessionId ||
+        !binding?.active || !state.isOrdinaryBindingRecord(binding) || binding.nativeId !== invocation.sessionId ||
+        Number(binding.generation) !== Number(generation)) {
+        throw new Error('ordinary post identity does not match the active Codex binding');
+      }
+    }
     const result = await runDirectPost({
       state,
       token: readSecret(config.secretFile),
-      nativeId: required(args, 'native-id'),
-      generation: required(args, 'generation'),
-      channelId: ordinary ? required(args, 'channel-id') : (args['channel-id'] || null),
+      nativeId,
+      generation,
+      channelId,
       provider,
       textFile: required(args, 'text-file'),
       dedupeKey,
