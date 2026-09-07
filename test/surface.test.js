@@ -356,6 +356,102 @@ test('simulated: Gateway reaction uses idempotent PUT after save without an extr
   } finally { globalThis.fetch = originalFetch; await gateway?.stop(); state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('simulated: reply waits for its real native acknowledgment attempt, including recovery before the watcher starts', async () => {
+  for (const mode of ['pending', 'watcher-in-flight', 'forbidden', 'unavailable', 'stop']) {
+    const { dir, state } = fixture();
+    const originalFetch = globalThis.fetch;
+    let gateway;
+    let release;
+    let work;
+    try {
+      bindBoth(state, dir);
+      const id = `ordering-${mode}`;
+      state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: '/cs' });
+      state.claimDispatch(id);
+      recordNativeAcknowledgment(state, { provider: 'claude', messageId: id, nativeId: CLAUDE_ID, generation: 1 });
+      state.recordNativeReply({ provider: 'claude', messageId: id, nativeId: CLAUDE_ID, generation: 1, text: 'board' });
+      const calls = [];
+      const client = new EventEmitter();
+      client.rest = {};
+      client.destroy = async () => {};
+      globalThis.fetch = async (_url, options) => {
+        calls.push('eyes-start');
+        await new Promise((resolve, reject) => {
+          release = resolve;
+          options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        });
+        if (mode === 'unavailable') throw new Error('connection reset');
+        calls.push('eyes-finished');
+        return { ok: mode !== 'forbidden', status: mode === 'forbidden' ? 403 : 204, body: null };
+      };
+      gateway = new DiscordGateway({ state, client });
+      gateway.discordToken = 'fixture-token';
+      if (mode === 'watcher-in-flight') {
+        gateway.acknowledgments = watchAcknowledgments({ state, deliver: gateway.deliverAcknowledgment });
+        void gateway.acknowledgments.drain();
+      }
+      const message = { channel: { async send() { calls.push('reply'); return { id: 'sent-board' }; } } };
+      work = gateway.consumer.deliverReply(message, { message: state.getMessage(id) });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(calls, ['eyes-start'], `${mode}: reply must wait while the real eyes request is unresolved`);
+      if (mode === 'stop') await gateway.stop();
+      else release();
+      await work;
+      const outcome = JSON.parse(state.listReceipts().find(row => row.kind === ACK.OUTCOME).detail).outcome;
+      if (mode === 'stop') {
+        assert.deepEqual(calls, ['eyes-start']);
+        assert.notEqual(state.getMessage(id).state, MESSAGE_STATES.REPLIED);
+      } else {
+        assert.equal(calls.at(-1), 'reply');
+        assert.equal(calls.filter(call => call === 'eyes-start').length, 1);
+        assert.equal(state.getMessage(id).state, MESSAGE_STATES.REPLIED);
+      }
+      assert.equal(outcome, mode === 'forbidden' ? 'failed' : ['unavailable', 'stop'].includes(mode) ? 'unknown' : 'sent');
+    } finally {
+      release?.();
+      await work;
+      await gateway?.stop();
+      globalThis.fetch = originalFetch;
+      state.close(); fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('simulated: acknowledgment ordering never invents native pickup or waits behind another channel', async () => {
+  const { dir, state } = fixture();
+  const originalFetch = globalThis.fetch;
+  let gateway;
+  let release;
+  let other;
+  try {
+    bindBoth(state, dir);
+    for (const [id, channelId] of [['slow', 'channel-claude'], ['own', 'channel-codex'], ['no-ack', 'channel-codex']]) {
+      state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId, authorId: 'operator-1', isBot: false, content: 'work' });
+      state.claimDispatch(id);
+      if (id !== 'no-ack') recordNativeAcknowledgment(state, { provider: id === 'slow' ? 'claude' : 'codex', messageId: id, nativeId: id === 'slow' ? CLAUDE_ID : CODEX_ID, generation: 1 });
+    }
+    const calls = [];
+    const client = new EventEmitter(); client.rest = {}; client.destroy = async () => {};
+    globalThis.fetch = async url => {
+      calls.push(url.includes('/slow/') ? 'slow-eyes' : 'own-eyes');
+      if (url.includes('/slow/')) await new Promise(resolve => { release = resolve; });
+      return { ok: true, status: 204, body: null };
+    };
+    gateway = new DiscordGateway({ state, client }); gateway.discordToken = 'fixture-token';
+    other = gateway.deliverAcknowledgment('slow');
+    for (const id of ['own', 'no-ack']) {
+      state.recordNativeReply({ provider: 'codex', messageId: id, nativeId: CODEX_ID, generation: 1, text: 'answer' });
+      await gateway.consumer.deliverReply({ channel: { send: async () => { calls.push(id); return { id: `sent-${id}` }; } } }, { message: state.getMessage(id) });
+    }
+    assert.deepEqual(calls, ['slow-eyes', 'own-eyes', 'own', 'no-ack']);
+    assert.equal(state.listReceipts().some(row => row.discord_id === 'no-ack' && [ACK.RECEIVED, ACK.OUTCOME].includes(row.kind)), false);
+    assert.equal(state.getMessage('no-ack').state, MESSAGE_STATES.REPLIED);
+  } finally {
+    release?.(); await other; await gateway?.stop(); globalThis.fetch = originalFetch;
+    state.close(); fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('simulated: acknowledgment bypasses channel lookup and Gateway stop aborts its REST request', async () => {
   const { dir, state } = fixture();
   const originalFetch = globalThis.fetch;

@@ -103,41 +103,54 @@ function acknowledgedMessage(state, messageId) {
   return message;
 }
 
-function watchAcknowledgments({ state, send, logger = () => {}, watchFactory = fs.watch, rearmMs = 1000 }) {
+function createAcknowledgmentDelivery({ state, send }) {
+  const inFlight = new Map();
+  const outcome = (id, result, detail = {}) => state.transaction(() => state.receipt(id, ACK.OUTCOME, { outcome: result, ...detail }));
+  return function deliver(id) {
+    if (inFlight.has(id)) return inFlight.get(id);
+    if (!pendingAcknowledgments(state).includes(id)) return null;
+    const work = (async () => {
+      let message;
+      try { message = acknowledgedMessage(state, id); }
+      catch { outcome(id, ACK_OUTCOMES.STALE); return; }
+      try {
+        await send(message, REACTION.ACKNOWLEDGED);
+        outcome(id, ACK_OUTCOMES.SENT, { reaction: REACTION.ACKNOWLEDGED, targetMessageId: id });
+      } catch (error) {
+        const status = acknowledgmentFailureStatus(error);
+        const detail = { error: String(error.message || error).slice(0, 200) };
+        if (status !== null) detail.status = status;
+        if (status !== null && status >= 400 && status < 500 && status !== 429) {
+          outcome(id, ACK_OUTCOMES.FAILED, detail);
+          return;
+        }
+        const attempts = unknownAcknowledgmentAttempts(state, id);
+        const retryDelay = Math.min(ACK_RETRY.BASE_MS * (2 ** attempts), ACK_RETRY.MAX_MS);
+        outcome(id, ACK_OUTCOMES.UNKNOWN, {
+          ...detail,
+          attempt: attempts + 1,
+          retryAt: Date.now() + retryDelay,
+        });
+      }
+    })().finally(() => inFlight.delete(id));
+    inFlight.set(id, work);
+    return work;
+  };
+}
+
+function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDelivery({ state, send }), logger = () => {}, watchFactory = fs.watch, rearmMs = 1000 }) {
   let closed = false;
   let timer = null;
   let timerDueAt = null;
   let running = null;
   let dirty = false;
-  const outcome = (id, result, detail = {}) => state.transaction(() => state.receipt(id, ACK.OUTCOME, { outcome: result, ...detail }));
   async function drain() {
     if (closed) return;
     if (running) { dirty = true; return running; }
     running = (async () => {
       for (const id of pendingAcknowledgments(state)) {
         if (closed) return;
-        let message;
-        try { message = acknowledgedMessage(state, id); }
-        catch { outcome(id, ACK_OUTCOMES.STALE); continue; }
-        try {
-          await send(message, REACTION.ACKNOWLEDGED);
-          outcome(id, ACK_OUTCOMES.SENT, { reaction: REACTION.ACKNOWLEDGED, targetMessageId: id });
-        } catch (error) {
-          const status = acknowledgmentFailureStatus(error);
-          const detail = { error: String(error.message || error).slice(0, 200) };
-          if (status !== null) detail.status = status;
-          if (status !== null && status >= 400 && status < 500 && status !== 429) {
-            outcome(id, ACK_OUTCOMES.FAILED, detail);
-            continue;
-          }
-          const attempts = unknownAcknowledgmentAttempts(state, id);
-          const retryDelay = Math.min(ACK_RETRY.BASE_MS * (2 ** attempts), ACK_RETRY.MAX_MS);
-          outcome(id, ACK_OUTCOMES.UNKNOWN, {
-            ...detail,
-            attempt: attempts + 1,
-            retryAt: Date.now() + retryDelay,
-          });
-        }
+        await deliver(id);
       }
     })().catch(error => logger(`native acknowledgment drain failed: ${error.message}`));
     try { await running; }
@@ -212,4 +225,4 @@ function watchAcknowledgments({ state, send, logger = () => {}, watchFactory = f
   };
 }
 
-module.exports = { ACK, REACTION, acknowledgmentCommand, pendingAcknowledgments, recordNativeAcknowledgment, watchAcknowledgments };
+module.exports = { ACK, REACTION, createAcknowledgmentDelivery, acknowledgmentCommand, pendingAcknowledgments, recordNativeAcknowledgment, watchAcknowledgments };

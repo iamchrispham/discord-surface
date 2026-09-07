@@ -1,6 +1,6 @@
 const { watchPublications } = require('./publication/publisher');
 const fs = require('node:fs');
-const { REACTION, acknowledgmentCommand, watchAcknowledgments } = require('./acknowledgment');
+const { REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, watchAcknowledgments } = require('./acknowledgment');
 const { createRequire } = require('node:module');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
@@ -548,6 +548,7 @@ class DiscordGateway {
     this.client = client || this.createClient();
     this.discordToken = null;
     this.acknowledgments = null;
+    this.deliverAcknowledgment = createAcknowledgmentDelivery({ state, send: (message, reaction) => this.sendAcknowledgment(message, reaction) });
     this.publications = null;
     this.publicationOptions = publicationOptions;
     this.controllers = new Set();
@@ -615,6 +616,10 @@ class DiscordGateway {
   }
 
   async sendReply(message, reply) {
+    this.state.assertMessageCurrent(reply.id, 'reply-send');
+    const acknowledgment = this.deliverAcknowledgment(reply.id);
+    if (acknowledgment) await acknowledgment;
+    if (this.stopping) throw Object.assign(new Error('reply delivery stopped'), { outcome: 'not_sent' });
     this.state.assertMessageCurrent(reply.id, 'reply-send');
     if (typeof reply.replyText !== 'string' || reply.replyText.length > 2000) throw new Error('Discord reply must be at most 2000 characters per message');
     if (typeof reply.replyNonce !== 'string' || reply.replyNonce.length > 25) throw new Error('Discord reply nonce must be at most 25 characters');
@@ -793,7 +798,7 @@ class DiscordGateway {
       if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
       this.started = true;
       this.acknowledgments = watchAcknowledgments({ state: this.state,
-        send: (message, reaction) => this.sendAcknowledgment(message, reaction), logger: this.logger });
+        deliver: this.deliverAcknowledgment, logger: this.logger });
       this.publications = watchPublications({ ...this.publicationOptions, state: this.state,
         send: (binding, post, signal) => this.sendPublication(binding, post, signal),
         ready: () => this.ready && !this.stopping, logger: this.logger });
