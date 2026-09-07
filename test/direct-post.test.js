@@ -53,7 +53,45 @@ test('post sends multipart text in order and records durable per-part outcomes',
   assert.ok(recorder.calls.every(call => call.body.content.length <= 2000));
   assert.ok(recorder.calls.every(call => call.body.allowed_mentions.parse.length === 0));
   assert.ok(recorder.calls.every(call => !('message_reference' in call.body)));
+  assert.equal(result.recorded, true);
+  assert.equal(result.duplicate, false);
+  assert.equal(result.state, 'sent');
   assert.equal(f.state.listReceipts().filter(row => row.kind === 'direct-post-outcome').length, recorder.calls.length);
+});
+
+test('reply target uses the bound channel and participates in explicit identity', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'reply milestone');
+  const recorder = fetchRecorder();
+  const first = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile,
+    dedupeKey: 'reply-key', inReplyTo: 'predecessor-message', fetchImpl: recorder.fetchImpl });
+  assert.deepEqual(recorder.calls[0].body.message_reference, {
+    message_id: 'predecessor-message', channel_id: 'channel', fail_if_not_exists: true
+  });
+  assert.equal(first.recorded, true);
+  assert.equal(first.duplicate, false);
+  const repeated = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile,
+    dedupeKey: 'reply-key', inReplyTo: 'predecessor-message', fetchImpl: recorder.fetchImpl });
+  assert.equal(repeated.recorded, false);
+  assert.equal(repeated.duplicate, true);
+  assert.equal(repeated.state, 'sent');
+  await assert.rejects(runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile,
+    dedupeKey: 'reply-key', inReplyTo: 'different-message', fetchImpl: recorder.fetchImpl }), /identity conflicts/);
+  assert.equal(recorder.calls.length, 1);
+});
+
+test('derived JavaScript fallback identity separates reply targets', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'derived reply milestone');
+  const recorder = fetchRecorder();
+  const first = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile,
+    inReplyTo: 'first-target', fetchImpl: recorder.fetchImpl });
+  const second = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile,
+    inReplyTo: 'second-target', fetchImpl: recorder.fetchImpl });
+  assert.notEqual(first.requestId, second.requestId);
+  assert.equal(first.recorded, true);
+  assert.equal(second.recorded, true);
+  assert.equal(recorder.calls.length, 2);
 });
 
 test('claude-post selection rejects codex and generic post rejects ambiguous native owners', async t => {
@@ -85,12 +123,19 @@ test('same request claims one sender, abort records unknown, and rerun never bli
   while (recorder.calls.length === 0) await new Promise(resolve => setTimeout(resolve, 2));
   const second = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl });
   assert.equal(second.parts[0].status, 'in_flight');
+  assert.equal(second.recorded, false);
+  assert.equal(second.duplicate, false);
+  assert.equal(second.state, 'in_flight');
   assert.equal(recorder.calls.length, 1);
   controller.abort();
   const uncertain = await first;
   assert.equal(uncertain.status, 'unknown');
+  assert.equal(uncertain.recorded, false);
+  assert.equal(uncertain.duplicate, false);
   const rerun = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl });
   assert.equal(rerun.parts[0].status, 'unknown');
+  assert.equal(rerun.recorded, false);
+  assert.equal(rerun.duplicate, false);
   assert.equal(recorder.calls.length, 1);
 });
 
@@ -100,8 +145,12 @@ test('not-sent parts retry on explicit command rerun and changing explicit reque
   const recorder = fetchRecorder({ responses: [response('bad', 400), response('good')] });
   const first = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl, requestId: 'explicit-request' });
   assert.equal(first.parts[0].status, 'not_sent');
+  assert.equal(first.recorded, false);
+  assert.equal(first.duplicate, false);
   const retry = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl, requestId: 'explicit-request' });
   assert.equal(retry.parts[0].status, 'sent');
+  assert.equal(retry.recorded, true);
+  assert.equal(retry.duplicate, false);
   fs.writeFileSync(f.textFile, 'changed');
   await assert.rejects(runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl, requestId: 'explicit-request' }), /identity conflicts/);
   assert.equal(recorder.calls.length, 2);
@@ -114,10 +163,43 @@ test('CLI --db and claude-post use the bound channel without native work', async
   const originalFetch = globalThis.fetch;
   const originalArgv = process.argv;
   globalThis.fetch = recorder.fetchImpl;
-  process.argv = ['node', 'src/cli.js', 'claude-post', '--db', path.join(f.dir, 'surface.sqlite'), '--native-id', f.nativeId, '--generation', '1', '--text-file', f.textFile];
+  process.argv = ['node', 'src/cli.js', 'claude-post', '--db', path.join(f.dir, 'surface.sqlite'), '--native-id', f.nativeId, '--generation', '1', '--text-file', f.textFile,
+    '--dedupe-key', 'cli-key', '--in-reply-to', 'prior-cli-message'];
   try {
     const result = await main();
     assert.equal(result.parts[0].status, 'sent');
+    assert.equal(result.recorded, true);
+    assert.equal(result.duplicate, false);
+    assert.deepEqual(recorder.calls[0].body.message_reference, {
+      message_id: 'prior-cli-message', channel_id: 'channel', fail_if_not_exists: true
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.argv = originalArgv;
+  }
+  assert.equal(recorder.calls.length, 1);
+});
+
+test('CLI requires one dedupe key and rejects conflicting aliases before network', async t => {
+  const f = fixture(t, 'claude');
+  fs.writeFileSync(f.textFile, 'CLI key validation');
+  const recorder = fetchRecorder();
+  const originalFetch = globalThis.fetch;
+  const originalArgv = process.argv;
+  globalThis.fetch = recorder.fetchImpl;
+  const base = ['node', 'src/cli.js', 'claude-post', '--db', path.join(f.dir, 'surface.sqlite'), '--native-id', f.nativeId,
+    '--generation', '1', '--text-file', f.textFile];
+  const invoke = async argv => {
+    process.argv = argv;
+    try { return await main(); }
+    finally { process.argv = originalArgv; }
+  };
+  try {
+    await assert.rejects(invoke(base), /dedupe-key or request-id is required/);
+    await assert.rejects(invoke([...base, '--dedupe-key', 'canonical', '--request-id', 'legacy']), /must match/);
+    const legacy = await invoke([...base, '--request-id', 'legacy-key']);
+    assert.equal(legacy.requestId, 'legacy-key');
+    assert.equal(legacy.recorded, true);
   } finally {
     globalThis.fetch = originalFetch;
     process.argv = originalArgv;
@@ -181,13 +263,37 @@ test('a confirmed direct post survives SQLite reopen without a duplicate send', 
   const recorder = fetchRecorder();
   const first = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl, requestId: 'confirmed-request' });
   assert.equal(first.status, 'sent');
+  assert.equal(first.recorded, true);
+  assert.equal(first.duplicate, false);
   f.state.close();
   const reopened = new (require('../src/state').SurfaceState)(path.join(f.dir, 'surface.sqlite'));
   t.after(() => reopened.close());
   const second = await runDirectPost({ state: reopened, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl, requestId: 'confirmed-request' });
   assert.equal(second.status, 'sent');
+  assert.equal(second.recorded, false);
+  assert.equal(second.duplicate, true);
   assert.equal(recorder.calls.length, 1);
   assert.deepEqual(second.messageIds, first.messageIds);
+});
+
+test('historic receipts without reply metadata normalize to null', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'historic receipt');
+  const recorder = fetchRecorder();
+  const first = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile,
+    requestId: 'historic-request', fetchImpl: recorder.fetchImpl });
+  assert.equal(first.status, 'sent');
+  const rows = f.state.db.prepare("SELECT id, detail FROM receipts WHERE discord_id IS NULL AND kind IN ('direct-post-attempt', 'direct-post-outcome')").all();
+  for (const row of rows) {
+    const detail = JSON.parse(row.detail);
+    delete detail.inReplyTo;
+    f.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(JSON.stringify(detail), row.id);
+  }
+  const second = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile,
+    requestId: 'historic-request', fetchImpl: recorder.fetchImpl });
+  assert.equal(second.duplicate, true);
+  assert.equal(recorder.calls.length, 1);
+  assert.ok(f.state.directPostRows('historic-request').every(row => row.detail.inReplyTo === null));
 });
 
 test('rebind and operator revocation stop before the next multipart network request', async t => {
@@ -252,7 +358,8 @@ test('actual CLI repeats safely, refuses stale owners and exits nonzero for unce
   `);
   const cli = path.resolve(__dirname, '../src/cli.js');
   const args = ['--require', preload, cli, 'claude-post', '--state-dir', f.dir, '--db', path.join(f.dir, 'surface.sqlite'),
-    '--native-id', f.nativeId, '--generation', '1', '--text-file', f.textFile];
+    '--native-id', f.nativeId, '--generation', '1', '--text-file', f.textFile, '--dedupe-key', 'cli-executable-key',
+    '--in-reply-to', 'prior-executable-message'];
   const run = (argv = args, status = 200) => spawnSync(process.execPath, argv, {
     encoding: 'utf8', timeout: 5000, env: { ...process.env, POST_FIXTURE_STATUS: String(status) }
   });
@@ -260,12 +367,20 @@ test('actual CLI repeats safely, refuses stale owners and exits nonzero for unce
   const second = run(); assert.equal(second.status, 0, second.stderr);
   assert.equal(fs.readFileSync(calls, 'utf8').trim().split('\n').length, 1);
   assert.deepEqual(JSON.parse(second.stdout).messageIds, JSON.parse(first.stdout).messageIds);
+  assert.equal(JSON.parse(first.stdout).recorded, true);
+  assert.equal(JSON.parse(first.stdout).duplicate, false);
+  assert.equal(JSON.parse(second.stdout).recorded, false);
+  assert.equal(JSON.parse(second.stdout).duplicate, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(calls, 'utf8').trim()).message_reference, {
+    message_id: 'prior-executable-message', channel_id: 'channel', fail_if_not_exists: true
+  });
   const stale = args.slice(); stale[stale.indexOf('--generation') + 1] = '2';
   assert.equal(run(stale).status, 1);
   assert.equal(fs.readFileSync(calls, 'utf8').trim().split('\n').length, 1);
   fs.writeFileSync(f.textFile, 'another milestone');
-  const unknown = run(args, 500); assert.equal(unknown.status, 1, unknown.stderr);
-  const retry = run(); assert.equal(retry.status, 1, retry.stderr);
+  const unknownArgs = args.slice(); unknownArgs[unknownArgs.indexOf('--dedupe-key') + 1] = 'cli-unknown-key';
+  const unknown = run(unknownArgs, 500); assert.equal(unknown.status, 1, unknown.stderr);
+  const retry = run(unknownArgs); assert.equal(retry.status, 1, retry.stderr);
   assert.equal(fs.readFileSync(calls, 'utf8').trim().split('\n').length, 2);
   assert.equal(JSON.parse(unknown.stdout).status, 'unknown');
   assert.equal(JSON.parse(retry.stdout).status, 'unknown');

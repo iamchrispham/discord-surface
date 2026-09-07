@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require('node:fs');
-const { runDirectPost } = require('./direct-post');
+const { resolveDedupeKey, runDirectPost } = require('./direct-post');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
@@ -765,6 +765,7 @@ async function directPost(args, provider = null) {
   process.once('SIGTERM', handleSignal);
   try {
     const config = state.requireConfig();
+    const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: true });
     const result = await runDirectPost({
       state,
       token: readSecret(config.secretFile),
@@ -773,7 +774,8 @@ async function directPost(args, provider = null) {
       channelId: args['channel-id'] || null,
       provider,
       textFile: required(args, 'text-file'),
-      requestId: args['request-id'],
+      dedupeKey,
+      inReplyTo: args['in-reply-to'] === undefined ? null : args['in-reply-to'],
       signal: controller.signal
     });
     print(result);

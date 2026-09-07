@@ -23,18 +23,20 @@ Telegram retirement is a separate staged task. This change sends no Telegram cop
 
 ## Command contract
 
-Required options: `--native-id`, `--generation`, `--text-file`. `--state-dir` and `--db` preserve the existing CLI defaults and overrides. `claude-post` requires a Claude binding. Generic `post` works for the selected bound vendor. If a native session has multiple matching channels, require `--channel-id` rather than guessing. Use the existing `splitReply` function and native reply text limit.
+Required options: `--native-id`, `--generation`, `--text-file`, and either `--dedupe-key` or legacy `--request-id`. `--state-dir` and `--db` preserve the existing CLI defaults and overrides. If both key forms are supplied they must match. `claude-post` requires a Claude binding. Generic `post` works for the selected bound vendor. If a native session has multiple matching channels, require `--channel-id` rather than guessing. Use the existing `splitReply` function and native reply text limit.
 
-The same invocation identifies the same milestone for retry. An explicit request ID may identify a distinct event with identical text. Reusing an explicit ID with different content must be rejected. Sending state without a confirmed result is uncertain, never an automatic retry license.
+`--in-reply-to` is optional. When present, every part uses the resolved binding channel and Discord's `message_reference` validation with `fail_if_not_exists: true`. The target does not authorize the sender and may be from a predecessor generation or a bot. The same invocation identifies the same milestone for retry, including its target. An explicit dedupe key may identify a distinct event with identical text. Reusing an explicit key with different content or a different target must be rejected. Direct JavaScript callers may retain the derived fallback identity when no key is supplied. Sending state without a confirmed result is uncertain, never an automatic retry license.
+
+Direct-post output includes `recorded`, `duplicate`, and `state`, while retaining `status`, `requestId`, `messageIds`, and `parts`. New confirmed sends report `recorded: true`. Repeated confirmed sends report `duplicate: true` without another network request. Unknown, in-flight, partial, and stale outcomes remain explicit.
 
 ## Proof status
 
-Implementation complete in isolated branch from main `0c6bbe5`. No sidecar tables or activation are included. Live delivery remains pending until the command receipt and Discord readback are recorded.
+Issue5 candidate implementation is complete on the existing isolated branch. No sidecar tables or activation are included. Live delivery remains pending until the TM conductor records the follow-up and unsolicited duplicate readbacks on its own channel.
 
 
 ## Local validation and independent review
 
-The final owning command explicitly ran `test/surface.test.js` and `test/direct-post.test.js`, serially on Node 22.23.2: 131 passed, 0 failed, 0 skipped, 9,613.307584 ms. The direct suite includes real executable invocations against fixture SQLite with bounded fake HTTP, and rejects any native child-process work. Network simulation is not live delivery proof.
+The final owning command explicitly ran `test/surface.test.js`, `test/native-transcript.test.js`, and `test/direct-post.test.js`, serially on Node 22.23.2: 160 passed, 0 failed, 0 skipped, 14,555.661875 ms. The direct suite includes real executable invocations against fixture SQLite with bounded fake HTTP, and rejects any native child-process work. Network simulation is not live delivery proof.
 
 Independent review of the isolated tracked and untracked diff found a trailing-newline split defect. Corrected by rebalancing a final blank suffix with a preceding visible character when the size limit permits exact preservation. Direct posting rejects remaining blank layouts before creating custody or sending anything. The two transport regressions and separate boundary/surrogate probes passed, and the reviewer closed the finding with no further concrete defect.
 

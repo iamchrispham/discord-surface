@@ -203,11 +203,14 @@ node src/cli.js claude-post \
   --state-dir "$HOME/.config/discord-surface" \
   --db "$HOME/.config/discord-surface/surface.sqlite" \
   --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
-  --text-file /absolute/path/to/milestone.txt
+  --text-file /absolute/path/to/milestone.txt \
+  --dedupe-key MILESTONE_KEY
 ```
 
 The native ID must resolve to exactly one active conductor binding. Use `--channel-id` if it is ambiguous. The command refuses a stale generation and checks authority again before every split part. The same `splitReply` implementation and 10,000-character text limit apply to native replies and announcements. Mentions are suppressed.
 
-Repeat the same command and unchanged file to inspect or resume the same milestone, not create a duplicate. Use `--request-id` to name a distinct milestone explicitly. Reusing an explicit ID with changed text is refused. Confirmed parts are skipped on retry. A request interrupted after its durable attempt stays uncertain and is never blindly resent. Definite unsent failures can be retried explicitly. Each part's attempt and delivery result are recorded in the existing receipts table.
+The CLI requires `--dedupe-key`. Existing callers may use `--request-id` as a legacy alias. If both are supplied they must match. Direct JavaScript callers may omit both and retain the derived fallback identity. Add `--in-reply-to DISCORD_MESSAGE_ID` to attach each part to an existing message in the bound channel. Discord validates that reference with `fail_if_not_exists`; the reference can predate the current conductor generation or be bot-authored. A different target with the same explicit key is rejected by durable custody.
+
+Repeat the same key, target and unchanged file to inspect or resume the same milestone, not create a duplicate. A new successful send returns `recorded: true, duplicate: false, state: "sent"`. A repeated confirmed send returns `recorded: false, duplicate: true, state: "sent"`. Partial, unknown, in-flight and stale results retain their existing `status`, `requestId`, `messageIds` and `parts` fields and expose the same value as `state`. Confirmed parts are skipped on retry. A request interrupted after its durable attempt stays uncertain and is never blindly resent. Definite unsent failures can be retried explicitly. Each part's attempt and delivery result are recorded in the existing receipts table.
 
 No native session, channel binding, automatic publication selection or phone configuration is changed. A successful receipt means Discord accepted the returned message IDs, not that the operator read them.

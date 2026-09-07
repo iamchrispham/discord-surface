@@ -60,15 +60,34 @@ function resolveDirectBinding(state, { nativeId, generation, channelId = null, p
   return candidates[0];
 }
 
-function requestIdFor(binding, _operatorId, sourcePath, textHash, explicitRequestId) {
-  if (explicitRequestId !== undefined) return requiredString(explicitRequestId, 'request-id', 256);
-  return hash(['direct-post-v1', binding.channelId, binding.guildId, binding.provider, binding.nativeId, binding.generation,
-    binding.conductorId, binding.repoKey, sourcePath, textHash]);
+function resolveDedupeKey({ dedupeKey, requestId } = {}, { required = false } = {}) {
+  const canonical = dedupeKey === undefined ? undefined : requiredString(dedupeKey, 'dedupe-key', 256);
+  const legacy = requestId === undefined ? undefined : requiredString(requestId, 'request-id', 256);
+  if (canonical !== undefined && legacy !== undefined && canonical !== legacy) {
+    throw new BindingError('dedupe-key and request-id must match');
+  }
+  const resolved = canonical ?? legacy;
+  if (required && resolved === undefined) throw new BindingError('dedupe-key or request-id is required');
+  return resolved;
 }
 
-function partMeta(binding, operatorId, requestId, sourcePath, textHash, parts, partIndex) {
+function inReplyToValue(value) {
+  if (value === undefined || value === null) return null;
+  return requiredString(value, 'in-reply-to', 128);
+}
+
+function requestIdFor(binding, _operatorId, sourcePath, textHash, explicitRequestId, inReplyTo = null) {
+  if (explicitRequestId !== undefined) return requiredString(explicitRequestId, 'request-id', 256);
+  const identity = ['direct-post-v1', binding.channelId, binding.guildId, binding.provider, binding.nativeId, binding.generation,
+    binding.conductorId, binding.repoKey, sourcePath, textHash];
+  if (inReplyTo !== null) return hash(['direct-post-v2', ...identity, inReplyTo]);
+  return hash(identity);
+}
+
+function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHash, parts, partIndex) {
   return {
     requestId,
+    inReplyTo,
     attemptId: crypto.randomUUID(),
     sourcePath,
     textHash,
@@ -93,19 +112,23 @@ function outcomeFor(error) {
 }
 
 async function runDirectPost({ state, token, nativeId, generation, channelId = null, provider = null, textFile,
-  requestId: explicitRequestId, signal, fetchImpl, timeoutMs }) {
+  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs }) {
   const binding = resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider });
   const operatorId = state.requireConfig().operatorId;
   const source = readTextFile(textFile);
-  const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId);
+  const replyTarget = inReplyToValue(inReplyTo);
+  const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId });
+  const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, replyTarget);
   state.recoverDirectPostReceipts();
   const parts = [];
+  let claimedAny = false;
+  let recorded = false;
   for (let partIndex = 0; partIndex < source.parts.length; partIndex += 1) {
     if (signal?.aborted) {
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
       break;
     }
-    const meta = partMeta(binding, operatorId, requestId, source.sourcePath, source.textHash, source.parts, partIndex);
+    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex);
     let claim;
     try { claim = state.beginDirectPostPart(meta); }
     catch (error) {
@@ -118,6 +141,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       if (claim.status !== 'sent') break;
       continue;
     }
+    claimedAny = true;
     if (!state.directPostBindingCurrent(binding, operatorId)) {
       const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before network' });
       parts.push({ index: partIndex, status: stale.outcome });
@@ -125,9 +149,11 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     }
     try {
       const sent = await sendDiscordMessage({ token, channelId: binding.channelId, content: source.parts[partIndex], nonce: claim.nonce,
+        messageReference: replyTarget === null ? null : { message_id: replyTarget, channel_id: binding.channelId, fail_if_not_exists: true },
         signal, fetchImpl, timeoutMs });
       const outcome = state.recordDirectPostOutcome(requestId, claim.attemptId, 'sent', { messageId: String(sent.id), status: 200 });
       parts.push({ index: partIndex, status: outcome.outcome, messageId: outcome.messageId });
+      recorded = true;
     } catch (error) {
       const outcome = outcomeFor(error);
       const recorded = state.recordDirectPostOutcome(requestId, claim.attemptId, outcome, { status: error.status || null, error: String(error.message || error).slice(0, 300) });
@@ -136,8 +162,10 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     }
   }
   const status = parts.every(part => part.status === 'sent') ? 'sent' : parts.find(part => part.status !== 'sent')?.status || 'not_sent';
-  return { requestId, channelId: binding.channelId, provider: binding.provider, nativeId: binding.nativeId, generation: binding.generation, status,
+  const duplicate = !claimedAny && parts.length > 0 && parts.every(part => part.status === 'sent');
+  return { requestId, dedupeKey: requestId, inReplyTo: replyTarget, channelId: binding.channelId, provider: binding.provider,
+    nativeId: binding.nativeId, generation: binding.generation, status, state: status, recorded, duplicate,
     messageIds: parts.filter(part => part.messageId).map(part => part.messageId), parts };
 }
 
-module.exports = { readTextFile, resolveDirectBinding, requestIdFor, runDirectPost };
+module.exports = { readTextFile, resolveDedupeKey, resolveDirectBinding, requestIdFor, runDirectPost };

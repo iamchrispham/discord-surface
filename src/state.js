@@ -1691,15 +1691,12 @@ class SurfaceState {
     if (requestId !== null) assertText(requestId, 'requestId', 256);
     const rows = this.db.prepare(`SELECT id, kind, detail, created_at FROM receipts
       WHERE discord_id IS NULL AND kind IN (?, ?) ORDER BY id`).all(DIRECT_POST_ATTEMPT, DIRECT_POST_OUTCOME);
-    return rows.map(row => ({
-      id: Number(row.id),
-      kind: row.kind,
-      detail: parseJson(row.detail, null),
-      createdAt: row.created_at
-    })).filter(row => {
-      if (!row.detail || row.detail.journal !== 'direct-post-v1') throw new StateCorruptError('direct post receipt is malformed');
-      return requestId === null || row.detail.requestId === requestId;
-    });
+    return rows.map(row => {
+      const detail = parseJson(row.detail, null);
+      if (!detail || detail.journal !== 'direct-post-v1') throw new StateCorruptError('direct post receipt is malformed');
+      if (detail.inReplyTo === undefined) detail.inReplyTo = null;
+      return { id: Number(row.id), kind: row.kind, detail, createdAt: row.created_at };
+    }).filter(row => requestId === null || row.detail.requestId === requestId);
   }
 
   directPostOwnerIdentity(pid) {
@@ -1785,7 +1782,7 @@ class SurfaceState {
     }
     return this.transaction(() => {
       const rows = this.directPostRows(meta.requestId);
-      const identityKeys = ['textHash', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount'];
+      const identityKeys = ['textHash', 'inReplyTo', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount'];
       for (const row of rows) {
         for (const key of identityKeys) {
           if (row.detail[key] !== meta[key]) throw new BindingError('direct post request identity conflicts with existing custody');
