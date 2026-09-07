@@ -1,10 +1,9 @@
 const fs = require('node:fs');
-const { createRequire } = require('node:module');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, validateCodexSessionIdentity, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
 
-const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
+const requireInstalled = require;
 
 function recoveryError(kind, detail) {
   const error = new Error(detail);
