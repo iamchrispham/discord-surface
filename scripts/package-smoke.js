@@ -98,7 +98,7 @@ function main() {
     for (const entry of ['README.md', 'package.json', 'package-lock.json', 'src', 'tsconfig.json', 'tsconfig.typecheck.json']) {
       fs.cpSync(path.join(root, entry), path.join(packRoot, entry), { recursive: true });
     }
-    fs.symlinkSync(path.join(root, 'node_modules'), path.join(packRoot, 'node_modules'), 'dir');
+    fs.symlinkSync(path.join(root, 'node_modules'), path.join(packRoot, 'node_modules'), 'junction');
     const packOutput = run(npm, ['pack', '--json', '--pack-destination', scratch], { cwd: packRoot, env });
     const packJsonStart = packOutput.indexOf('[\n');
     if (packJsonStart < 0) throw new Error('npm pack did not return JSON metadata');
