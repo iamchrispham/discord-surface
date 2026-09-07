@@ -374,6 +374,7 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
     } catch (error) {
       logger(`native acknowledgment watch failed: ${error.message}`);
       if (!closed && !retry) {
+        schedule(retryDelay);
         retry = setTimeout(() => { retry = null; arm(); }, retryDelay);
         retryDelay = Math.min(retryDelay * 2, 60000);
       }

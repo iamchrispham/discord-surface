@@ -280,7 +280,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const currentIndex = messages.findIndex(candidate => candidate.id === message.id);
     if (currentIndex < 0) return null;
     return messages.slice(0, currentIndex).find(candidate => nativeOwnerKey(candidate) === nativeOwnerKey(message) &&
-      [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLYING].includes(candidate.state)) || null;
+      [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLYING].includes(candidate.state)) || null;
   }
 
   function removeAbortHandler(entry) {
