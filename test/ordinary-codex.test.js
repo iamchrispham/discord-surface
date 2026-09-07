@@ -108,7 +108,11 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   setup.close();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-  const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  let cutoffFetches = 0;
+  const channel = {
+    id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    messages: { fetch: async () => { cutoffFetches += 1; return new Map([['latest', { id: `latest-${cutoffFetches}` }]]); } }
+  };
   const category = { id: 'category-channel', guildId: 'guild', name: 'category', isTextBased: () => false };
   const wakeSignals = [];
   class FakeClient {
@@ -153,6 +157,7 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   assert.equal(rebound.binding.generation, 2);
   assert.equal(rebound.binding.readiness, READINESS.PENDING);
   assert.equal(rebound.nativeProof.status, 'verified');
+  assert.equal(cutoffFetches, 2);
 
   await assert.rejects(() => ordinaryBind({ ...args, channel: '#category' }, dependencies), /message-capable/);
 

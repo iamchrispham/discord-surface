@@ -169,24 +169,28 @@ async function ordinaryBind(args, dependencies = {}) {
     const guild = await client.guilds.fetch(config.guildId);
     const mentionId = channelSelection.match(/^<#([^>]+)>$/)?.[1] || (/^\d+$/.test(channelSelection) ? channelSelection : null);
     let fetchedChannels;
+    let fetchedChannelObjects;
     if (mentionId) {
       const channel = await guild.channels.fetch(mentionId);
+      fetchedChannelObjects = channel ? [channel] : [];
       fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
         messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];
     } else {
       const fetched = await guild.channels.fetch();
       const values = Array.isArray(fetched) ? fetched : typeof fetched?.values === 'function' ? [...fetched.values()] : [];
+      fetchedChannelObjects = values;
       fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
         messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
     }
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
+    const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, sessionRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
     const existing = state.getBinding(request.channelId);
     const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     if (decision !== 'reuse' && !existing?.active) {
-      const cutoff = await latestChannelMessageId(channel);
+      const cutoff = await latestChannelMessageId(discordChannel);
       if (cutoff) state.setIntakeCutoff(request.channelId, request.guildId, cutoff, 'ordinary binding adoption cutoff', existing);
     }
     let binding;

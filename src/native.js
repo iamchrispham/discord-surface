@@ -280,15 +280,23 @@ function readTranscriptTail(fd, size) {
   return Buffer.concat(parts.reverse());
 }
 
-async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), pollMs = 250, signal, onCursor, continueUntilFinal = false, isCurrent } = {}) {
+async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), resolveRoot, pollMs = 250, signal, onCursor, continueUntilFinal = false, isCurrent } = {}) {
   if (!marker) throw new Error('Codex observer requires a unique response marker');
   const startedAt = Date.now();
   let offset = Number(cursor?.offset || 0);
   let tailBytes = cursorTailBytes(cursor);
   let since = Number(cursor?.since || startedAt);
+  const initialSince = since;
+  const normalizeRoot = value => typeof value === 'string' && value.length > 0 ? path.resolve(value) : null;
+  const staticRoot = normalizeRoot(root);
+  const currentRoot = () => {
+    if (typeof resolveRoot !== 'function') return staticRoot;
+    try { return normalizeRoot(resolveRoot()) || staticRoot; } catch { return staticRoot; }
+  };
+  let activeRoot = currentRoot();
   let file = cursor?.file || null;
-  if (file && root) {
-    const relative = path.relative(path.resolve(root), path.resolve(file));
+  if (file && activeRoot) {
+    const relative = path.relative(activeRoot, path.resolve(file));
     if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       file = null;
       offset = 0;
@@ -296,12 +304,20 @@ async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000,
       since = startedAt;
     }
   }
-  if (!file) file = findCodexSessionFile(nativeId, root);
+  if (!file) file = findCodexSessionFile(nativeId, activeRoot);
   const currentCursor = () => ({ file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') });
   const stopped = () => signal?.aborted || (isCurrent && !isCurrent());
   while (continueUntilFinal || Date.now() - startedAt < timeoutMs) {
     if (stopped()) return { stopped: true, cursor: currentCursor() };
-    if (!file) file = findCodexSessionFile(nativeId, root);
+    const nextRoot = currentRoot();
+    if (nextRoot !== activeRoot) {
+      activeRoot = nextRoot;
+      file = null;
+      offset = 0;
+      tailBytes = Buffer.alloc(0);
+      since = initialSince;
+    }
+    if (!file) file = findCodexSessionFile(nativeId, activeRoot);
     if (file) {
       try {
         const fd = fs.openSync(file, 'r');
@@ -420,7 +436,8 @@ class CodexProvider {
     return observeCodexReply(message.nativeId, outcome.cursor || message.observerCursor, {
       ...options,
       marker: `[[discord-surface:${message.id}]]`,
-      root: message.sessionRoot || this.root
+      root: message.sessionRoot || this.root,
+      resolveRoot: typeof options.resolveRoot === 'function' ? () => options.resolveRoot() || this.root : undefined
     });
   }
 }
@@ -507,6 +524,11 @@ async function observeSubmitted(state, message, provider, options = {}) {
     reply = await provider.observe(providerMessageForBinding(state, message), outcome, {
       ...options,
       isCurrent,
+      resolveRoot: () => {
+        const currentMessage = state.getMessage(message.id);
+        if (!currentMessage) return undefined;
+        return state.currentMessageBinding(currentMessage)?.binding?.sessionRoot || undefined;
+      },
       onCursor: cursor => { observedCursor = cursor; }
     });
   } catch (error) {
