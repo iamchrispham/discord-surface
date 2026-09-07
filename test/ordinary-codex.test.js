@@ -382,6 +382,63 @@ test('ordinary bind timestamps an empty-channel cutoff before history fetch', as
   } finally { state.close(); }
 });
 
+test('ordinary successor bind performs a verified handoff and captures a fresh cutoff', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-bind-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-bind-workspace-'));
+  const successorSession = transcript(t, successorWorkspace, OTHER);
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  const original = setup.bindOrdinary({
+    channelId: 'ordinary-successor-channel', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    workspace: dir
+  }, { sessionId: CODEX, threadId: CODEX });
+  setup.setIntakeCutoff(original.channelId, 'guild', '100', 'ordinary successor baseline');
+  setup.markIntakeBoundary(original.channelId, 'gap', 'ordinary successor previous gap', 'gap-from', 'gap-to');
+  setup.unbind(original.channelId);
+  setup.close();
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(successorWorkspace, { recursive: true, force: true });
+  });
+
+  const channel = {
+    id: original.channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
+    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) }
+  };
+  class FakeClient {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection ? channel : new Map([[channel.id, channel]])
+      } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  const result = await ordinaryBind({ 'state-dir': dir, channel: '#dev', 'session-root': successorSession.root }, {
+    environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: successorWorkspace },
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity,
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  });
+  assert.equal(result.reused, false);
+  assert.equal(result.binding.nativeId, OTHER);
+  assert.equal(result.binding.generation, 2);
+  assert.equal(result.binding.readiness, READINESS.PENDING);
+  assert.equal(result.nativeProof.status, 'verified');
+
+  const state = new SurfaceState(db);
+  try {
+    const watermark = state.getIntakeWatermark(original.channelId);
+    assert.equal(watermark.last_seen_id, '200');
+    assert.equal(watermark.recovered_through_id, '200');
+    assert.equal(watermark.state, 'pending');
+    assert.equal(state.listReceipts().filter(receipt => receipt.kind === 'ordinary-handoff').length, 1);
+  } finally { state.close(); }
+});
+
 test('binding wake replays after joining an in-flight recovery', async () => {
   let releaseShared;
   const shared = new Promise(resolve => { releaseShared = resolve; });
@@ -568,6 +625,7 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
   const f = fixture(t);
   const binding = ordinary(f);
   f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary active handoff baseline');
+  f.state.markIntakeBoundary(binding.channelId, 'gap', 'ordinary active handoff previous gap', 'gap-from', 'gap-to');
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-active-successor-workspace-'));
   const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-active-successor-root-'));
   t.after(() => {
@@ -601,6 +659,9 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
   assert.equal(transferred.generation, 2);
   assert.equal(transferred.readiness, READINESS.PENDING);
   assert.equal(f.state.getIntakeWatermark(binding.channelId).last_seen_id, '100');
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).state, 'pending');
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).gap_from, null);
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).gap_to, null);
   const retry = f.state.handoffOrdinary({
     channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
@@ -660,6 +721,7 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
     workspace: dir
   }, { sessionId: CODEX, threadId: CODEX });
   setup.setIntakeCutoff(original.channelId, 'guild', '100', 'ordinary CLI handoff baseline');
+  setup.markIntakeBoundary(original.channelId, 'unavailable', 'ordinary CLI handoff previous terminal');
   setup.unbind(original.channelId);
   setup.close();
   t.after(() => {
@@ -667,7 +729,10 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
     fs.rmSync(successorWorkspace, { recursive: true, force: true });
   });
 
-  const channel = { id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true };
+  const channel = {
+    id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
+    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) }
+  };
   const wakeSignals = [];
   const output = [];
   let proofArguments;
@@ -709,7 +774,11 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   const recoveredState = new SurfaceState(db);
   const recoveredBinding = recoveredState.getBinding(original.channelId);
   assert.equal(recoveredBinding.generation, 2);
-  assert.equal(recoveredState.getIntakeWatermark(original.channelId).last_seen_id, '100');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).last_seen_id, '200');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '200');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).state, 'pending');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).gap_from, null);
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).gap_to, null);
   let preflights = 0;
   const gatewayChannel = {
     id: original.channelId, guildId: 'guild', topic: null,
@@ -739,7 +808,7 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   assert.equal(preflights, 1);
   assert.equal(recoveredState.getBinding(original.channelId).readiness, READINESS.READY);
   assert.equal(recoveredState.getIntakeWatermark(original.channelId).state, 'ready');
-  assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '100');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '200');
   await gateway.stop();
   recoveredState.close();
 });

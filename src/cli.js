@@ -196,10 +196,10 @@ async function ordinaryBind(args, dependencies = {}) {
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const existing = state.getBinding(channel.id);
-    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
+    if (existing && state.isOrdinaryBindingRecord(existing) && existing.active && invocation.sessionId !== existing.nativeId) {
       throw new Error('channel is already bound to another owner; use explicit handoff');
     }
-    const validationRoot = sessionRoot || existing?.sessionRoot;
+    const validationRoot = sessionRoot || (existing?.active ? existing.sessionRoot : undefined);
     if (!sessionRoot) {
       const proof = await validateNativeProof(validationRoot);
       nativeProofDetail = proof.detail;
@@ -222,7 +222,26 @@ async function ordinaryBind(args, dependencies = {}) {
     if (decision === 'reuse') binding = existing;
     else if (decision === 'rebind') {
       try {
-        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);
+        const successor = Boolean(existing && !existing.active && request.nativeId !== existing.nativeId);
+        if (successor) {
+          const successorSessionRoot = request.sessionRoot === undefined
+            ? (nativeProofEvidence?.sessionRoot || null)
+            : request.sessionRoot;
+          binding = state.handoffOrdinary({
+            channelId: request.channelId,
+            provider: request.provider,
+            fromNativeId: existing.nativeId,
+            fromGeneration: existing.generation,
+            nativeId: request.nativeId,
+            workspace: request.workspace,
+            sessionRoot: successorSessionRoot,
+            handoffId: `ordinary-bind:${request.channelId}:${existing.generation}:${request.nativeId}`,
+            identity: request.identity,
+            nativeProof: { ...nativeProofEvidence, sessionRoot: successorSessionRoot }
+          });
+        } else {
+          binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);
+        }
       } catch (error) {
         const raced = state.getBinding(request.channelId);
         const racedDecision = raced
@@ -692,6 +711,14 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
     }]);
     if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
+    if (!current.active) {
+      const cutoffTimestamp = Date.now();
+      const cutoff = await latestChannelMessageId(channel);
+      const adoptionCutoff = cutoff || (typeof channel?.messages?.fetch === 'function'
+        ? (BigInt(cutoffTimestamp - 1420070400000) << 22n).toString()
+        : null);
+      if (adoptionCutoff) state.setIntakeCutoff(channelId, config.guildId, adoptionCutoff, 'ordinary handoff adoption cutoff', current);
+    }
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
       sessionRoot: validationRoot, handoffId,

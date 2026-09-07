@@ -1262,10 +1262,13 @@ class SurfaceState {
       this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
       this.assertLegacyMigrationSafe(channelId);
       const generation = existing.generation + 1;
+      const updatedAt = now();
       this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
         WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
-        .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, now(), channelId,
+        .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,
           PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
+      this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
+        .run('ordinary handoff; intake recovery reopened', updatedAt, channelId);
       this.receipt(null, 'ordinary-handoff', {
         channelId, provider: PROVIDERS.CODEX, handoffId,
         fromNativeId, fromGeneration, fromActive: existing.active,
