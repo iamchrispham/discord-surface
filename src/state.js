@@ -326,6 +326,26 @@ function bindingMatchesExpected(binding, expected) {
     binding.conductorId === expected.conductorId && binding.repoKey === expected.repoKey;
 }
 
+function assertOrdinaryIdentity(provider, identity) {
+  if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' ||
+    identity.sessionId !== identity.threadId) {
+    throw new BindingError(`ordinary ${provider} identity is missing or conflicting`);
+  }
+  assertUuid(identity.sessionId, 'sessionId');
+  assertUuid(identity.threadId, 'threadId');
+  if (provider === PROVIDERS.CLAUDE && identity.harness !== 'claude-code') {
+    throw new BindingError('ordinary Claude identity requires the claude-code harness');
+  }
+  return identity;
+}
+
+function assertOrdinaryNativeIdentity(provider, nativeId, identity) {
+  if (identity.sessionId !== nativeId || identity.threadId !== nativeId) {
+    const label = provider === PROVIDERS.CLAUDE ? 'Claude' : 'Codex';
+    throw new BindingError(`ordinary ${label} identity does not match the native session`);
+  }
+}
+
 function bindingIdentityMatchesTopicPublication(binding, publication) {
   return Boolean(binding?.active) && binding.channelId === publication.channelId && binding.guildId === publication.guildId &&
     binding.provider === publication.provider && binding.nativeId === publication.nativeId &&
@@ -904,16 +924,9 @@ class SurfaceState {
     const input = this.bindingInput(binding);
     if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     if (ordinaryIdentity) {
-      if (input.provider !== PROVIDERS.CODEX || input.conductorId || input.repoKey ||
-        typeof ordinaryIdentity.sessionId !== 'string' || typeof ordinaryIdentity.threadId !== 'string' ||
-        ordinaryIdentity.sessionId !== ordinaryIdentity.threadId) {
-        throw new BindingError('ordinary Codex identity is missing or conflicting');
-      }
-      assertUuid(ordinaryIdentity.sessionId, 'sessionId');
-      assertUuid(ordinaryIdentity.threadId, 'threadId');
-      if (ordinaryIdentity.sessionId !== input.nativeId || ordinaryIdentity.threadId !== input.nativeId) {
-        throw new BindingError('ordinary Codex identity does not match the native session');
-      }
+      if (input.conductorId || input.repoKey) throw new BindingError(`ordinary ${input.provider} bindings cannot carry conductor identity`);
+      assertOrdinaryIdentity(input.provider, ordinaryIdentity);
+      assertOrdinaryNativeIdentity(input.provider, input.nativeId, ordinaryIdentity);
     }
     const existing = this.getBinding(input.channelId);
     if (existing) throw new BindingError('channel is already bound; use rebind after work drains');
@@ -936,7 +949,8 @@ class SurfaceState {
           channelId: input.channelId, guildId: input.guildId, provider: input.provider,
           nativeId: input.nativeId, workspace: input.workspace, generation,
           sessionRoot: input.sessionRoot,
-          sessionId: ordinaryIdentity.sessionId, threadId: ordinaryIdentity.threadId
+          sessionId: ordinaryIdentity.sessionId, threadId: ordinaryIdentity.threadId,
+          harness: ordinaryIdentity.harness || undefined, endpoint: input.endpoint || undefined
         });
       }
       if (intakeCutoff !== null) {
@@ -948,27 +962,24 @@ class SurfaceState {
 
   bindOrdinary(binding, identity, adoptionCutoff = null) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
-    if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {
-      throw new BindingError('ordinary Codex identity is missing or conflicting');
-    }
-    assertUuid(identity.sessionId, 'sessionId');
-    assertUuid(identity.threadId, 'threadId');
-    if (identity.sessionId !== binding.nativeId || identity.threadId !== binding.nativeId) {
-      throw new BindingError('ordinary Codex identity does not match the native session');
-    }
+    assertOrdinaryIdentity(PROVIDERS.CODEX, identity);
+    assertOrdinaryNativeIdentity(PROVIDERS.CODEX, binding.nativeId, identity);
     return this.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? undefined : {
       intakeCutoff: adoptionCutoff,
       intakeCutoffDetail: 'ordinary binding adoption cutoff'
     });
   }
 
+  bindOrdinaryClaude(binding, identity) {
+    if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
+    assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
+    assertOrdinaryNativeIdentity(PROVIDERS.CLAUDE, binding.nativeId, identity);
+    return this.bind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
+  }
+
   rebindOrdinary(binding, identity, nativeProof = null, intakeCutoff = null) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
-    if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {
-      throw new BindingError('ordinary Codex identity is missing or conflicting');
-    }
-    assertUuid(identity.sessionId, 'sessionId');
-    assertUuid(identity.threadId, 'threadId');
+    assertOrdinaryIdentity(PROVIDERS.CODEX, identity);
     const existing = this.getBinding(binding.channelId);
     if (!existing || !this.isOrdinaryBindingRecord(existing)) {
       throw new BindingError('ordinary binding tombstone is unavailable for reuse');
@@ -1027,15 +1038,31 @@ class SurfaceState {
     });
   }
 
+  rebindOrdinaryClaude(binding, identity) {
+    if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
+    assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
+    const existing = this.getBinding(binding.channelId);
+    if (!existing || existing.active || !this.isOrdinaryBindingRecord(existing)) {
+      throw new BindingError('ordinary binding tombstone is unavailable for reuse');
+    }
+    if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CLAUDE ||
+      existing.nativeId !== binding.nativeId || existing.workspace !== binding.workspace || existing.endpoint !== binding.endpoint ||
+      identity.sessionId !== existing.nativeId || identity.threadId !== existing.nativeId) {
+      throw new BindingError('ordinary binding owner changed; use explicit handoff');
+    }
+    return this.rebind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
+  }
+
   isOrdinaryBindingRecord(binding) {
-    if (!binding || binding.provider !== PROVIDERS.CODEX || binding.conductorId || binding.repoKey) return false;
+    if (!binding || !Object.values(PROVIDERS).includes(binding.provider) || binding.conductorId || binding.repoKey) return false;
     return Boolean(this.db.prepare(`SELECT 1 FROM receipts
       WHERE kind='ordinary-bound'
         AND json_extract(detail, '$.channelId')=?
+        AND json_extract(detail, '$.provider')=?
         AND json_extract(detail, '$.nativeId')=?
         AND json_extract(detail, '$.workspace')=?
         AND json_extract(detail, '$.generation')=?
-      LIMIT 1`).get(binding.channelId, binding.nativeId, binding.workspace, binding.generation));
+      LIMIT 1`).get(binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation));
   }
 
   isOrdinaryBinding(binding) {
@@ -1047,21 +1074,25 @@ class SurfaceState {
     return Boolean(this.db.prepare(`SELECT 1 FROM receipts
       WHERE kind='ordinary-native-preflight'
         AND json_extract(detail, '$.channelId')=?
+        AND json_extract(detail, '$.provider')=?
         AND json_extract(detail, '$.nativeId')=?
         AND json_extract(detail, '$.workspace')=?
         AND json_extract(detail, '$.generation')=?
         AND json_extract(detail, '$.outcome')='verified'
-      LIMIT 1`).get(binding.channelId, binding.nativeId, binding.workspace, binding.generation));
+      LIMIT 1`).get(binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation));
   }
 
   recordOrdinaryPreflight(binding, detail = {}) {
     return this.transaction(() => {
       const current = this.getBinding(binding?.channelId);
       if (!bindingMatchesExpected(current, binding)) return null;
-      if (!this.isOrdinaryBinding(current)) throw new BindingError('binding is not an ordinary Codex binding');
+      if (!this.isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${current?.provider || 'native'} binding`);
       if (!detail || typeof detail !== 'object' || typeof detail.file !== 'string' || !path.isAbsolute(detail.file) ||
         detail.sessionId !== current.nativeId || detail.threadId !== current.nativeId || detail.workspace !== current.workspace) {
-        throw new BindingError('ordinary Codex native preflight proof does not match the binding');
+        throw new BindingError(`ordinary ${current.provider} native preflight proof does not match the binding`);
+      }
+      if (current.provider === PROVIDERS.CLAUDE && (detail.harness !== 'claude-code' || detail.endpoint !== current.endpoint)) {
+        throw new BindingError('ordinary Claude native preflight proof does not match the binding');
       }
       this.receipt(null, 'ordinary-native-preflight', {
         ...detail,
@@ -1081,13 +1112,8 @@ class SurfaceState {
     if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
     const ordinaryIdentity = binding.ordinaryIdentity || null;
     if (ordinaryIdentity) {
-      if (binding.provider !== PROVIDERS.CODEX || binding.conductorId || binding.repoKey ||
-        typeof ordinaryIdentity.sessionId !== 'string' || typeof ordinaryIdentity.threadId !== 'string' ||
-        ordinaryIdentity.sessionId !== ordinaryIdentity.threadId) {
-        throw new BindingError('ordinary Codex identity is missing or conflicting');
-      }
-      assertUuid(ordinaryIdentity.sessionId, 'sessionId');
-      assertUuid(ordinaryIdentity.threadId, 'threadId');
+      if (binding.conductorId || binding.repoKey) throw new BindingError(`ordinary ${binding.provider} bindings cannot carry conductor identity`);
+      assertOrdinaryIdentity(binding.provider, ordinaryIdentity);
     }
     const input = this.bindingInput({ ...binding, channelId }, existing);
     if (sessionRootOverride !== undefined) input.sessionRoot = sessionRootOverride;
@@ -1114,13 +1140,14 @@ class SurfaceState {
       this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, session_root=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
         .run(input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
       this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
-      if (ordinary && input.provider === PROVIDERS.CODEX && !input.conductorId && !input.repoKey) {
+      if (ordinary && !input.conductorId && !input.repoKey) {
         this.receipt(null, 'ordinary-bound', {
           channelId, guildId: input.guildId, provider: input.provider, nativeId: input.nativeId,
           workspace: input.workspace, generation,
           sessionRoot: input.sessionRoot,
           sessionId: ordinaryIdentity?.sessionId || input.nativeId,
-          threadId: ordinaryIdentity?.threadId || input.nativeId
+          threadId: ordinaryIdentity?.threadId || input.nativeId,
+          harness: ordinaryIdentity?.harness || undefined, endpoint: input.endpoint || undefined
         });
       }
       if (resetIntake) {
@@ -1178,7 +1205,7 @@ class SurfaceState {
       if (!binding) throw new BindingError('channel is not bound');
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       if (readiness === READINESS.READY && this.isOrdinaryBinding(binding) && !this.hasOrdinaryPreflight(binding)) {
-        throw new BindingError('ordinary Codex native preflight is required before READY');
+        throw new BindingError(`ordinary ${binding.provider} native preflight is required before READY`);
       }
       if (readiness === READINESS.READY) this.assertLegacyMigrationSafe(channelId);
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
@@ -1472,7 +1499,7 @@ class SurfaceState {
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       if (!existing && !binding) throw new BindingError('intake channel is unknown');
       if (state === 'ready' && this.isOrdinaryBinding(binding) && !this.hasOrdinaryPreflight(binding)) {
-        throw new BindingError('ordinary Codex native preflight is required before READY');
+        throw new BindingError(`ordinary ${binding.provider} native preflight is required before READY`);
       }
       if (state === 'ready') this.assertLegacyMigrationSafe(channelId);
       const guildId = existing?.guild_id || binding.guildId;

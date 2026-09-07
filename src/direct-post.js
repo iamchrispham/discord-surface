@@ -56,12 +56,12 @@ function bindingMatchesRequest(binding, { nativeId, generation, channelId, provi
 
 function resolveDirectBinding(state, { nativeId, generation, channelId = null, provider = null, ordinary = false }) {
   validateNativeId(nativeId);
-  if (ordinary && provider && provider !== 'codex') throw new BindingError('ordinary post supports Codex bindings only');
+  if (ordinary && provider && !['codex', 'claude'].includes(provider)) throw new BindingError(`ordinary post does not support provider: ${provider}`);
   const config = state.requireConfig();
   const candidates = state.listBindings().filter(binding => binding.guildId === config.guildId &&
     bindingMatchesRequest(binding, { nativeId, generation, channelId, provider, ordinary }) &&
     (!ordinary || state.isOrdinaryBinding(binding)));
-  if (candidates.length === 0) throw new StaleGenerationError(`no active ${ordinary ? 'ordinary Codex' : 'conductor'} binding matches the requested native owner`);
+  if (candidates.length === 0) throw new StaleGenerationError(`no active ${ordinary ? `ordinary ${provider || 'native'}` : 'conductor'} binding matches the requested native owner`);
   if (candidates.length !== 1) throw new BindingError(`${ordinary ? 'ordinary post' : 'direct post'} requires --channel-id when the native owner is ambiguous`);
   return candidates[0];
 }

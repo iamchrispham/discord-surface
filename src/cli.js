@@ -5,10 +5,11 @@ const { resolveDedupeKey, runDirectPost } = require('./direct-post');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
+const { pathToFileURL } = require('node:url');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
-const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('./ordinary-codex');
-const { sessionRoot: codexSessionRoot, validateCodexSessionIdentityAsync } = require('./native');
+const { createOrdinaryClaudeRequest, createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('./ordinary-codex');
+const { sessionRoot: codexSessionRoot, validateClaudeSessionIdentity, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('./native');
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
 
@@ -287,6 +288,105 @@ async function ordinaryBind(args, dependencies = {}) {
     });
     output({ bound: true, reused: decision === 'reuse', binding: state.getBinding(binding.channelId), nativeProof, gatewayWake });
     return { binding: state.getBinding(binding.channelId), nativeProof, gatewayWake, reused: decision === 'reuse' };
+  } finally {
+    try { await client?.destroy(); } finally { state.close(); }
+  }
+}
+
+async function resolveCurrentClaudeCaller(dependencies = {}) {
+  if (typeof dependencies.resolveClaudeCaller === 'function') return dependencies.resolveClaudeCaller();
+  const resolverPath = path.join(os.homedir(), '.claude', 'hooks', 'session-chat-binding.mjs');
+  let resolver;
+  try {
+    resolver = await import(pathToFileURL(resolverPath).href);
+  } catch (error) {
+    throw new Error(`Claude caller resolver is unavailable: ${error.message}`);
+  }
+  if (typeof resolver.resolveCurrentCallerSessionChatBinding !== 'function') {
+    throw new Error('Claude caller resolver does not expose resolveCurrentCallerSessionChatBinding');
+  }
+  return resolver.resolveCurrentCallerSessionChatBinding();
+}
+
+async function ordinaryClaudeBind(args, dependencies = {}) {
+  const { paths, state } = openState(args);
+  const install = dependencies.requireInstalled || requireInstalled;
+  const read = dependencies.readSecret || readSecret;
+  const resolveCaller = dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies));
+  const validate = dependencies.validateClaudeSessionIdentity || validateClaudeSessionIdentity;
+  const output = dependencies.print || print;
+  let client;
+  try {
+    const config = state.requireConfig();
+    const channelSelection = args.channel || args['channel-id'];
+    if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
+    if (args.channel && args['channel-id'] && args.channel !== args['channel-id']) throw new Error('--channel and --channel-id must identify the same channel');
+    const endpoint = required(args, args.endpoint ? 'endpoint' : 'socket');
+    const transcript = required(args, 'transcript');
+    if (!path.isAbsolute(endpoint)) throw new Error('Claude endpoint must be an absolute Unix socket path');
+    if (!path.isAbsolute(transcript)) throw new Error('Claude transcript path must be absolute');
+    const caller = await resolveCaller();
+    if (!caller || caller.harness !== 'claude-code' || typeof caller.sessionId !== 'string') {
+      throw new Error('ordinary Claude caller identity is unavailable or uses the wrong harness');
+    }
+    const sessionId = caller.sessionId;
+    const requestedWorkspace = args.workspace === undefined ? undefined : required(args, 'workspace');
+    if (requestedWorkspace !== undefined && !path.isAbsolute(requestedWorkspace)) {
+      throw new Error('Claude workspace must be absolute');
+    }
+    const identityProof = validate(sessionId, transcript, requestedWorkspace);
+    const request = createOrdinaryClaudeRequest({
+      channelId: channelSelection,
+      guildId: config.guildId,
+      nativeId: args['native-id'],
+      workspace: identityProof.workspace,
+      endpoint,
+      identity: { sessionId, threadId: sessionId, harness: 'claude-code' }
+    });
+    const { Client, GatewayIntentBits } = install('discord.js');
+    client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    await client.login(read(config.secretFile));
+    const guild = await client.guilds.fetch(config.guildId);
+    const mentionId = channelSelection.match(/^<#([^>]+)>$/)?.[1] || (/^\d+$/.test(channelSelection) ? channelSelection : null);
+    let fetchedChannels;
+    if (mentionId) {
+      const channel = await guild.channels.fetch(mentionId);
+      fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
+        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];
+    } else {
+      const fetched = await guild.channels.fetch();
+      const values = Array.isArray(fetched) ? fetched : typeof fetched?.values === 'function' ? [...fetched.values()] : [];
+      fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
+        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
+    }
+    const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
+    const boundRequest = { ...request, channelId: channel.id };
+    const existing = state.getBinding(channel.id);
+    const decision = ordinaryBindingDecision(existing, boundRequest, existing ? state.isOrdinaryBindingRecord(existing) : false);
+    let binding;
+    if (decision === 'reuse') binding = existing;
+    else if (decision === 'rebind') binding = state.rebindOrdinaryClaude(boundRequest, boundRequest.identity);
+    else binding = state.bindOrdinaryClaude(boundRequest, boundRequest.identity);
+    let nativeProof = { status: 'pending', reason: 'Claude Monitor capability is pending' };
+    if (state.hasOrdinaryPreflight(binding)) {
+      nativeProof = { status: 'verified', reason: 'Claude transcript proof already recorded' };
+    } else {
+      state.recordOrdinaryPreflight(binding, {
+        file: identityProof.file,
+        sessionId: identityProof.sessionId,
+        threadId: identityProof.threadId,
+        workspace: identityProof.workspace,
+        endpoint,
+        harness: 'claude-code'
+      });
+      nativeProof = { status: 'verified', file: identityProof.file, workspace: identityProof.workspace };
+    }
+    const gatewayWake = requestGatewayRecovery(paths, {
+      status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+      kill: dependencies.killProcess || process.kill
+    });
+    output({ bound: true, reused: decision === 'reuse', binding: state.getBinding(binding.channelId), nativeProof, monitor: { status: 'pending' }, gatewayWake });
+    return { binding: state.getBinding(binding.channelId), nativeProof, monitor: { status: 'pending' }, gatewayWake, reused: decision === 'reuse' };
   } finally {
     try { await client?.destroy(); } finally { state.close(); }
   }
@@ -1033,12 +1133,22 @@ async function claudeChannel(args) {
 
 async function claudeMonitor(args) {
   const { paths, state } = openState(args);
+  const nativeId = required(args, 'native-id');
+  const socketPath = path.resolve(required(args, 'socket'));
   let monitor;
   let stopPromise;
+  const revokeOrdinaryReadiness = () => {
+    const binding = state.findNativeBinding(nativeId, PROVIDERS.CLAUDE);
+    if (!binding?.active || !state.isOrdinaryBinding(binding)) return;
+    state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, 'Claude Monitor unavailable', binding);
+  };
   const stop = async () => {
     if (stopPromise) return stopPromise;
     stopPromise = (async () => {
-      try { await monitor?.stop(); } finally { state.close(); }
+      try {
+        revokeOrdinaryReadiness();
+        await monitor?.stop();
+      } finally { state.close(); }
     })();
     return stopPromise;
   };
@@ -1055,13 +1165,19 @@ async function claudeMonitor(args) {
   try {
     monitor = createClaudeMonitor({
       state,
-      nativeId: required(args, 'native-id'),
-      socketPath: path.resolve(required(args, 'socket')),
+      nativeId,
+      socketPath,
       stateDir: paths.stateDir,
       dbPath: paths.db,
-      cliPath: __filename
+      cliPath: __filename,
+      onTransportClose: stop
     });
     await monitor.start();
+    const binding = state.findNativeBinding(nativeId, PROVIDERS.CLAUDE);
+    if (binding?.active && state.isOrdinaryBinding(binding)) {
+      state.setBindingReadiness(binding.channelId, READINESS.READY, 'Claude Monitor ready', binding);
+      requestGatewayRecovery(paths);
+    }
   } catch (error) {
     await stop();
     throw error;
@@ -1227,6 +1343,7 @@ async function main() {
     case 'configure': return configure(args);
     case 'bind': return bind(args);
     case 'ordinary-bind': return ordinaryBind(args);
+    case 'ordinary-claude-bind': return ordinaryClaudeBind(args);
     case 'rebind': return bind(args, true);
     case 'unbind': return unbind(args);
     case 'status': return status(args);
@@ -1261,11 +1378,12 @@ async function main() {
     case 'claude-reply': return claudeReply(args);
     case 'post': return directPost(args);
     case 'ordinary-post': return directPost(args, 'codex', true);
+    case 'ordinary-claude-post': return directPost(args, 'claude', true);
     case 'claude-post': return directPost(args, 'claude');
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, post, ordinary-post, claude-post, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
   }
 }
 
@@ -1276,4 +1394,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, ordinaryHandoffInternal, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller };

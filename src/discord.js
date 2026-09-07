@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
-const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
+const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeUnixSocket, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
 
@@ -660,7 +660,21 @@ class DiscordGateway {
       codex: new CodexProvider({ acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath) }),
       claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(state, id, options) })
     };
-    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (binding => validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot));
+    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (async binding => {
+      if (binding.provider === 'codex') return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot);
+      if (binding.provider === 'claude') {
+        await probeUnixSocket(binding.endpoint);
+        return {
+          file: binding.endpoint,
+          sessionId: binding.nativeId,
+          threadId: binding.nativeId,
+          workspace: binding.workspace,
+          endpoint: binding.endpoint,
+          harness: 'claude-code'
+        };
+      }
+      throw new Error(`unsupported ordinary provider: ${binding.provider}`);
+    });
     this.consumer = createSurfaceConsumer({
       state,
       providers: this.providers,
@@ -949,14 +963,14 @@ class DiscordGateway {
 
   async verifyOrdinaryNative(binding) {
     if (!this.state.isOrdinaryBinding?.(binding)) return null;
-    if (!this.providers.codex || typeof this.providers.codex.dispatch !== 'function') {
-      throw new Error('Codex delivery provider is unavailable for ordinary binding');
+    if (!this.providers[binding.provider] || typeof this.providers[binding.provider].dispatch !== 'function') {
+      throw new Error(`${binding.provider} delivery provider is unavailable for ordinary binding`);
     }
     const proof = await this.ordinaryNativePreflight(binding);
-    if (!proof || typeof proof !== 'object') throw new Error('Codex native preflight returned no proof');
-    if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'ordinary Codex binding changed during native preflight');
+    if (!proof || typeof proof !== 'object') throw new Error(`${binding.provider} native preflight returned no proof`);
+    if (!this.isCurrentBinding(binding)) throw recoveryError('stale', `ordinary ${binding.provider} binding changed during native preflight`);
     const recorded = this.state.recordOrdinaryPreflight(binding, proof);
-    if (!recorded) throw recoveryError('stale', 'ordinary Codex binding changed before native preflight was recorded');
+    if (!recorded) throw recoveryError('stale', `ordinary ${binding.provider} binding changed before native preflight was recorded`);
     return proof;
   }
 

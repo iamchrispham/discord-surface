@@ -4,5 +4,5 @@
     "noEmit": true,
     "rootDir": "."
   },
-  "include": ["src/topic.ts", "src/attachments.ts", "src/ordinary-codex.ts", "test/topic-types.ts", "test/types/attachments.ts", "test/ordinary-codex-types.ts"]
+  "include": ["src/topic.ts", "src/attachments.ts", "src/ordinary-codex.ts", "test/topic-types.ts", "test/types/attachments.ts", "test/ordinary-codex-types.ts", "test/ordinary-claude-types.ts"]
 }

@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const http = require('node:http');
+const net = require('node:net');
 const { execFile } = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
@@ -274,6 +275,77 @@ async function validateCodexSessionIdentityAsync(nativeId, workspace, root = ses
   }
   if (workspace !== undefined && identity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
   return identity;
+}
+
+const CLAUDE_METADATA_BYTES = 256 * 1024;
+
+function readClaudeSessionMetadata(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = Math.min(fs.fstatSync(fd).size, CLAUDE_METADATA_BYTES);
+    if (!size) throw new Error('Claude transcript metadata is empty');
+    const bytes = Buffer.allocUnsafe(size);
+    let offset = 0;
+    while (offset < size) {
+      const count = fs.readSync(fd, bytes, offset, size - offset, offset);
+      if (!count) break;
+      offset += count;
+    }
+    return bytes.subarray(0, offset).toString('utf8').split('\n').flatMap(line => {
+      if (!line.trim()) return [];
+      try { return [JSON.parse(line)]; } catch { return []; }
+    });
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readClaudeSessionIdentity(nativeId, transcriptFile) {
+  validateNativeId(nativeId);
+  if (typeof transcriptFile !== 'string' || !path.isAbsolute(transcriptFile)) {
+    throw new Error('Claude transcript path must be absolute');
+  }
+  const stat = fs.statSync(transcriptFile);
+  if (!stat.isFile()) throw new Error('Claude transcript path must be a regular file');
+  const matches = readClaudeSessionMetadata(transcriptFile).filter(row => {
+    const sessionId = row?.sessionId || row?.payload?.session_id;
+    return sessionId === nativeId && row?.entrypoint === 'cli' && typeof row?.version === 'string' &&
+      typeof row?.cwd === 'string' && path.isAbsolute(row.cwd);
+  });
+  if (!matches.length) throw new Error('Claude transcript identity or workspace is unavailable');
+  const workspaces = [...new Set(matches.map(row => path.resolve(row.cwd)))];
+  if (workspaces.length !== 1) throw new Error('Claude transcript workspace is ambiguous');
+  return { file: transcriptFile, sessionId: nativeId, threadId: nativeId, workspace: workspaces[0] };
+}
+
+function validateClaudeSessionIdentity(nativeId, transcriptFile, workspace) {
+  if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) {
+    throw new Error('Claude workspace must be absolute');
+  }
+  const identity = readClaudeSessionIdentity(nativeId, transcriptFile);
+  if (workspace !== undefined && path.resolve(identity.workspace) !== path.resolve(workspace)) {
+    throw new Error('Claude transcript workspace does not match the supplied workspace');
+  }
+  return identity;
+}
+
+function probeUnixSocket(socketPath, { timeoutMs = 1000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ path: socketPath });
+    const timer = setTimeout(() => socket.destroy(new Error('native channel probe timed out')), timeoutMs);
+    const finish = (error) => {
+      clearTimeout(timer);
+      socket.removeListener('connect', onConnect);
+      socket.removeListener('error', onError);
+      socket.destroy();
+      if (error) reject(error);
+      else resolve({ socketPath });
+    };
+    const onConnect = () => finish();
+    const onError = error => finish(error);
+    socket.once('connect', onConnect);
+    socket.once('error', onError);
+  });
 }
 
 function readTranscriptTail(fd, size) {
@@ -635,11 +707,14 @@ module.exports = {
   observeCodexReply,
   observeSubmitted,
   postUnixJson,
+  probeUnixSocket,
+  readClaudeSessionIdentity,
   readCodexSessionIdentity,
   readCodexSessionIdentityAsync,
   readInitialCursor,
   runCodex,
   sessionRoot,
+  validateClaudeSessionIdentity,
   validateCodexSessionIdentity,
   validateCodexSessionIdentityAsync,
   waitForReply,

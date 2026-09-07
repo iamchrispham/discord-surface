@@ -1,6 +1,6 @@
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export type OrdinaryProvider = 'codex';
+export type OrdinaryProvider = 'codex' | 'claude';
 
 export interface ExistingDiscordChannel {
   id: string;
@@ -15,7 +15,7 @@ export interface OrdinaryCodexIdentity {
 }
 
 export interface OrdinaryCodexRequest {
-  provider: OrdinaryProvider;
+  provider: 'codex';
   channelId: string;
   guildId: string;
   nativeId: string;
@@ -23,6 +23,24 @@ export interface OrdinaryCodexRequest {
   sessionRoot?: string;
   identity: OrdinaryCodexIdentity;
 }
+
+export interface OrdinaryClaudeIdentity {
+  sessionId: string;
+  threadId: string;
+  harness: 'claude-code';
+}
+
+export interface OrdinaryClaudeRequest {
+  provider: 'claude';
+  channelId: string;
+  guildId: string;
+  nativeId: string;
+  workspace: string;
+  endpoint: string;
+  identity: OrdinaryClaudeIdentity;
+}
+
+export type OrdinaryBindingRequest = OrdinaryCodexRequest | OrdinaryClaudeRequest;
 
 export interface ExistingOrdinaryBinding {
   active: boolean;
@@ -33,6 +51,7 @@ export interface ExistingOrdinaryBinding {
   nativeId: string;
   workspace: string;
   sessionRoot?: string | null;
+  endpoint?: string | null;
   conductorId?: string | null;
   repoKey?: string | null;
 }
@@ -74,6 +93,12 @@ function absoluteWorkspace(value: unknown): string {
   return absolutePath(value, 'workspace');
 }
 
+function absoluteEndpoint(value: unknown): string {
+  const endpoint = requiredText(value, 'endpoint', 180);
+  if (!endpoint.startsWith('/') || endpoint.length > 90) throw new Error('endpoint must be a short absolute Unix socket path');
+  return endpoint;
+}
+
 export function resolveInvocationIdentity(environment: InvocationEnvironment, workspace?: string): OrdinaryCodexIdentity & { workspace?: string } {
   const sessionId = uuid(environment.CODEX_SESSION_ID || environment.CODEX_THREAD_ID, 'CODEX_SESSION_ID');
   const threadId = uuid(environment.CODEX_THREAD_ID, 'CODEX_THREAD_ID');
@@ -110,7 +135,7 @@ export function resolveExistingChannel(selection: unknown, guildId: unknown, cha
 
 export function ordinaryBindingDecision(
   existing: ExistingOrdinaryBinding | null,
-  request: OrdinaryCodexRequest,
+  request: OrdinaryBindingRequest,
   ordinaryMarker = false,
   nativeProof: OrdinaryCodexNativeProof | null = null
 ): 'bind' | 'reuse' | 'rebind' {
@@ -122,6 +147,7 @@ export function ordinaryBindingDecision(
   const sameOwner = ordinaryMarker && existing.provider === request.provider &&
     existing.channelId === request.channelId && existing.guildId === request.guildId &&
     existing.nativeId === request.nativeId && existing.workspace === request.workspace &&
+    (request.provider !== 'claude' || existing.endpoint === request.endpoint) &&
     (sessionRootMatches || verifiedRootRelocation) &&
     !existing.conductorId && !existing.repoKey;
   if (sameOwner) return existing.active && sessionRootMatches ? 'reuse' : 'rebind';
@@ -175,4 +201,31 @@ export function createOrdinaryCodexRequestFromEnvironment(input: {
   const workspace = input.workspace ?? identity.workspace;
   if (workspace === undefined) throw new Error('workspace must come from exact Codex session metadata');
   return createOrdinaryCodexRequest({ ...input, workspace, identity });
+}
+
+export function createOrdinaryClaudeRequest(input: {
+  channelId: unknown;
+  guildId: unknown;
+  nativeId?: unknown;
+  workspace: unknown;
+  endpoint: unknown;
+  identity: OrdinaryClaudeIdentity;
+}): OrdinaryClaudeRequest {
+  const channelId = requiredText(input.channelId, 'channelId', 128);
+  const guildId = requiredText(input.guildId, 'guildId', 128);
+  const sessionId = uuid(input.identity?.sessionId, 'sessionId');
+  const threadId = uuid(input.identity?.threadId, 'threadId');
+  if (sessionId !== threadId) throw new Error('sessionId and threadId conflict');
+  if (input.identity?.harness !== 'claude-code') throw new Error('ordinary Claude identity requires the claude-code harness');
+  const nativeId = uuid(input.nativeId ?? sessionId, 'nativeId');
+  if (nativeId !== sessionId) throw new Error('nativeId conflicts with the Claude invocation identity');
+  return {
+    provider: 'claude',
+    channelId,
+    guildId,
+    nativeId,
+    workspace: absoluteWorkspace(input.workspace),
+    endpoint: absoluteEndpoint(input.endpoint),
+    identity: { sessionId, threadId, harness: 'claude-code' }
+  };
 }
