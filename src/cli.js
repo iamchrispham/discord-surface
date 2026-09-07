@@ -349,24 +349,33 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     const guild = await client.guilds.fetch(config.guildId);
     const mentionId = channelSelection.match(/^<#([^>]+)>$/)?.[1] || (/^\d+$/.test(channelSelection) ? channelSelection : null);
     let fetchedChannels;
+    let fetchedChannelObjects;
     if (mentionId) {
       const channel = await guild.channels.fetch(mentionId);
+      fetchedChannelObjects = channel ? [channel] : [];
       fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
         messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];
     } else {
       const fetched = await guild.channels.fetch();
       const values = Array.isArray(fetched) ? fetched : typeof fetched?.values === 'function' ? [...fetched.values()] : [];
+      fetchedChannelObjects = values;
       fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
         messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
     }
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
+    const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const boundRequest = { ...request, channelId: channel.id };
     const existing = state.getBinding(channel.id);
     const decision = ordinaryBindingDecision(existing, boundRequest, existing ? state.isOrdinaryBindingRecord(existing) : false);
+    let adoptionCutoff = null;
+    if (decision !== 'reuse' && !existing?.active) {
+      const cutoff = await latestChannelMessageId(discordChannel);
+      adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
+    }
     let binding;
     if (decision === 'reuse') binding = existing;
-    else if (decision === 'rebind') binding = state.rebindOrdinaryClaude(boundRequest, boundRequest.identity);
-    else binding = state.bindOrdinaryClaude(boundRequest, boundRequest.identity);
+    else if (decision === 'rebind') binding = state.rebindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff);
+    else binding = state.bindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff);
     let nativeProof = { status: 'pending', reason: 'Claude Monitor capability is pending' };
     if (state.hasOrdinaryPreflight(binding)) {
       nativeProof = { status: 'verified', reason: 'Claude transcript proof already recorded' };

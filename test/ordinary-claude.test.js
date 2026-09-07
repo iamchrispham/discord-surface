@@ -116,6 +116,12 @@ test('ordinary Claude selection and same-owner decision preserve channel custody
   assert.equal(ordinaryBindingDecision({ ...request, active: false }, request, true), 'rebind');
   assert.throws(() => ordinaryBindingDecision({ ...request, endpoint: '/tmp/other.sock', active: true }, request, true), /already bound/);
   assert.throws(() => ordinaryBindingDecision({ ...request, conductorId: 'owner', active: true }, request, false), /already bound/);
+  const foreign = { ...request, nativeId: OTHER, identity: { sessionId: OTHER, threadId: OTHER, harness: 'claude-code' } };
+  assert.throws(() => ordinaryBindingDecision({ ...request, active: true }, foreign, true), error => {
+    assert.match(error.message, /Claude owner replacement requires an explicit supported handoff/);
+    assert.doesNotMatch(error.message, /provider codex/);
+    return true;
+  });
 });
 
 test('ordinary Claude state bind rejects an identity that differs from nativeId before persistence', t => {
@@ -183,6 +189,107 @@ test('ordinary Claude bind uses exact caller and transcript, reuses and rebinds 
     ...deps,
     resolveClaudeCaller: () => ({ sessionId: OTHER, harness: 'claude-code', caller: { pid: 12, processStartTime: 34 } })
   }), /already bound/);
+});
+
+test('ordinary Claude first adoption commits a latest cutoff before intake', async t => {
+  const f = fixture(t, { bind: false });
+  let fetches = 0;
+  const channel = {
+    id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    messages: { fetch: async () => { fetches += 1; return new Map([['latest', { id: '200' }]]); } }
+  };
+  const deps = {
+    resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code', caller: { pid: 12, processStartTime: 34 } }),
+    requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  };
+  const result = await ordinaryClaudeBind({ 'state-dir': f.dir, channel: '#dev', transcript: f.session.file, socket: f.socketPath }, deps);
+  assert.equal(result.binding.generation, 1);
+  assert.equal(fetches, 1);
+  const watermark = f.state.getIntakeWatermark(channel.id);
+  assert.equal(watermark.last_seen_id, '200');
+  assert.equal(watermark.recovered_through_id, '200');
+  assert.equal(watermark.state, READINESS.PENDING);
+});
+
+test('ordinary Claude inactive adoption commits a latest cutoff while active reuse does not fetch', async t => {
+  const f = fixture(t);
+  f.state.setIntakeCutoff(f.binding.channelId, 'guild', '100', 'seed');
+  let fetches = 0;
+  const channel = {
+    id: f.binding.channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
+    messages: { fetch: async () => { fetches += 1; return new Map([['latest', { id: '200' }]]); } }
+  };
+  const deps = {
+    resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code', caller: { pid: 12, processStartTime: 34 } }),
+    requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  };
+  const args = { 'state-dir': f.dir, channel: '#dev', transcript: f.session.file, socket: f.socketPath };
+  const reused = await ordinaryClaudeBind(args, deps);
+  assert.equal(reused.reused, true);
+  assert.equal(fetches, 0);
+  f.state.unbind(f.binding.channelId);
+  const rebound = await ordinaryClaudeBind(args, deps);
+  assert.equal(rebound.reused, false);
+  assert.equal(rebound.binding.generation, 2);
+  assert.equal(fetches, 1);
+  const watermark = f.state.getIntakeWatermark(f.binding.channelId);
+  assert.equal(watermark.last_seen_id, '200');
+  assert.equal(watermark.recovered_through_id, '200');
+  assert.equal(watermark.state, READINESS.PENDING);
+});
+
+test('ordinary Claude inactive adoption uses the empty numeric channel cutoff', async t => {
+  const f = fixture(t, { bind: false });
+  const channelId = '123456789012345678';
+  const binding = f.state.bindOrdinaryClaude({
+    channelId, guildId: 'guild', provider: 'claude', nativeId: CLAUDE, workspace: f.dir, endpoint: f.socketPath
+  }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' });
+  f.state.unbind(channelId);
+  const channel = {
+    id: channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
+    messages: { fetch: async () => new Map() }
+  };
+  const deps = {
+    resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code', caller: { pid: 12, processStartTime: 34 } }),
+    requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  };
+  const result = await ordinaryClaudeBind({ 'state-dir': f.dir, channel: channelId, transcript: f.session.file, socket: f.socketPath }, deps);
+  assert.equal(result.binding.generation, binding.generation + 1);
+  const watermark = f.state.getIntakeWatermark(channelId);
+  assert.equal(watermark.last_seen_id, channelId);
+  assert.equal(watermark.recovered_through_id, channelId);
+  assert.equal(watermark.state, READINESS.PENDING);
+});
+
+test('ordinary Claude cutoff fetch failure preserves the tombstone and watermark', async t => {
+  const f = fixture(t);
+  f.state.setIntakeCutoff(f.binding.channelId, 'guild', '100', 'seed');
+  f.state.unbind(f.binding.channelId);
+  const beforeBinding = f.state.getBinding(f.binding.channelId);
+  const beforeWatermark = f.state.getIntakeWatermark(f.binding.channelId);
+  const channel = {
+    id: f.binding.channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
+    messages: { fetch: async () => { throw new Error('history unavailable'); } }
+  };
+  const deps = {
+    resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code', caller: { pid: 12, processStartTime: 34 } }),
+    requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  };
+  await assert.rejects(() => ordinaryClaudeBind({ 'state-dir': f.dir, channel: '#dev', transcript: f.session.file, socket: f.socketPath }, deps), /history unavailable/);
+  assert.deepEqual(f.state.getBinding(f.binding.channelId), beforeBinding);
+  assert.deepEqual(f.state.getIntakeWatermark(f.binding.channelId), beforeWatermark);
 });
 
 test('ordinary Claude Monitor readiness is unavailable without a live socket and holds intake', async t => {

@@ -151,6 +151,9 @@ export function ordinaryBindingDecision(
     (sessionRootMatches || verifiedRootRelocation) &&
     !existing.conductorId && !existing.repoKey;
   if (sameOwner) return existing.active && sessionRootMatches ? 'reuse' : 'rebind';
+  if (request.provider === 'claude') {
+    throw new Error('channel is already bound to another owner; Claude owner replacement requires an explicit supported handoff');
+  }
   const handoffCommand = [
     'handoff --ordinary --provider codex',
     `--channel-id ${request.channelId}`,

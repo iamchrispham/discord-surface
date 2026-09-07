@@ -970,11 +970,14 @@ class SurfaceState {
     });
   }
 
-  bindOrdinaryClaude(binding, identity) {
+  bindOrdinaryClaude(binding, identity, adoptionCutoff = null) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
     assertOrdinaryNativeIdentity(PROVIDERS.CLAUDE, binding.nativeId, identity);
-    return this.bind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
+    return this.bind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? undefined : {
+      intakeCutoff: adoptionCutoff,
+      intakeCutoffDetail: 'ordinary binding adoption cutoff'
+    });
   }
 
   rebindOrdinary(binding, identity, nativeProof = null, intakeCutoff = null) {
@@ -1038,7 +1041,7 @@ class SurfaceState {
     });
   }
 
-  rebindOrdinaryClaude(binding, identity) {
+  rebindOrdinaryClaude(binding, identity, intakeCutoff = null) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
     const existing = this.getBinding(binding.channelId);
@@ -1050,7 +1053,7 @@ class SurfaceState {
       identity.sessionId !== existing.nativeId || identity.threadId !== existing.nativeId) {
       throw new BindingError('ordinary binding owner changed; use explicit handoff');
     }
-    return this.rebind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
+    return this.rebind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, { intakeCutoff });
   }
 
   isOrdinaryBindingRecord(binding) {
