@@ -1100,6 +1100,7 @@ class SurfaceState {
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
+      if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
       this.assertLegacyMigrationSafe(channelId);
       this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, session_root=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
         .run(input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
@@ -1573,12 +1574,13 @@ class SurfaceState {
     });
   }
 
-  reconcileIntake(channelId) {
+  reconcileIntake(channelId, expectedBinding = null) {
     assertText(channelId, 'channelId', 128);
     return this.transaction(() => {
       const binding = this.getBinding(channelId);
       const watermark = this.getIntakeWatermark(channelId);
       if (!binding || !binding.active || !watermark) throw new BindingError('intake boundary is unknown');
+      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
         .run('explicit intake reconciliation requested', now(), channelId);
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(READINESS.PENDING, now(), channelId);

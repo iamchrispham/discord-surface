@@ -188,6 +188,56 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   } finally { state.close(); }
 });
 
+test('ordinary bind reopens terminal intake after native proof recovers', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-recovery-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const session = transcript(t, dir);
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  setup.close();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const channel = { id: 'ordinary-recovery-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  class FakeClient {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection ? channel : new Map([[channel.id, channel]])
+      } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  const dependencies = {
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: dir },
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity: () => { throw new Error('transcript is not available yet'); },
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  };
+  const args = { 'state-dir': dir, channel: '#dev', workspace: dir };
+  const first = await ordinaryBind(args, dependencies);
+  assert.equal(first.reused, false);
+  assert.equal(first.nativeProof.status, 'pending');
+
+  const unavailable = new SurfaceState(db);
+  unavailable.markIntakeBoundary('ordinary-recovery-channel', READINESS.UNAVAILABLE, 'Gateway intake unavailable');
+  unavailable.close();
+
+  const recovered = await ordinaryBind(args, {
+    ...dependencies,
+    validateCodexSessionIdentity: () => ({ file: session.file, sessionId: CODEX, threadId: CODEX, workspace: dir })
+  });
+  assert.equal(recovered.reused, true);
+  assert.equal(recovered.nativeProof.status, 'verified');
+
+  const state = new SurfaceState(db);
+  try {
+    assert.equal(state.getBinding('ordinary-recovery-channel').readiness, READINESS.PENDING);
+    assert.equal(state.getIntakeWatermark('ordinary-recovery-channel').state, READINESS.PENDING);
+  } finally { state.close(); }
+});
+
 test('ordinary bind derives workspace from exact transcript metadata across checkouts', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-workspace-'));
   const invocationWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-invocation-'));

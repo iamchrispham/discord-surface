@@ -291,12 +291,15 @@ test('simulated: attachment metadata survives intake, reopen, and native payload
   assert.deepEqual(event.attachments, [attachment]);
 
   let codexArgs;
-  const provider = new CodexProvider({ root: dir, run: async (_command, args) => {
+  let codexEnv;
+  const provider = new CodexProvider({ root: dir, run: async (_command, args, options) => {
     codexArgs = args;
+    codexEnv = options.env;
     return { status: 'not_submitted', error: new Error('fixture') };
   } });
   const outcome = await provider.dispatch(textMessage);
   assert.equal(outcome.status, 'not_submitted');
+  assert.equal(codexEnv.CODEX_HOME, dir);
   const messageIndex = codexArgs.indexOf('--message');
   assert.ok(messageIndex >= 0);
   assert.match(codexArgs[messageIndex + 1], /image\.png/);
@@ -525,6 +528,18 @@ test('simulated: rebind is blocked by in-flight work and stale reply is rejected
   assert.equal(rebound.generation, 2);
   assert.throws(() => state.recordNativeReply({ provider: 'codex', messageId: 'in-flight', nativeId: CODEX_ID, generation: 1, text: 'stale' }), StaleGenerationError);
   state.close();
+});
+
+test('simulated: rebind rechecks unresolved custody inside the generation transaction', () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'rebind-transaction-guard', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  let checks = 0;
+  state.hasUnresolved = () => checks++ > 0;
+  assert.throws(() => state.rebind({
+    channelId: 'rebind-transaction-guard', guildId: 'guild-1', provider: 'codex', nativeId: CLAUDE_ID, workspace: dir
+  }), UnresolvedWorkError);
+  assert.equal(checks, 2);
+  assert.equal(state.getBinding('rebind-transaction-guard').generation, 1);
 });
 
 test('simulated: reply delivery failure keeps custody and records the failure', async () => {

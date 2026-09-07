@@ -425,11 +425,12 @@ class CodexProvider {
       return { status: 'not_submitted', error };
     }
     const root = message.sessionRoot || this.root;
+    const codexHome = path.basename(root) === 'sessions' ? path.dirname(root) : root;
     const cursor = readInitialCursor(message.nativeId, root);
     const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message), '--cd', message.workspace];
     const result = await this.run(this.command, args, {
       cwd: message.workspace,
-      env: { ...process.env, CODEX_HOME: path.dirname(root) }
+      env: { ...process.env, CODEX_HOME: codexHome }
     });
     return { ...result, cursor };
   }

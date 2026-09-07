@@ -299,6 +299,13 @@ async function ordinaryBind(args, dependencies = {}) {
     } else {
       nativeProof = { status: 'pending', reason: nativeProofError?.message || 'Codex transcript proof is pending' };
     }
+    if (decision === 'reuse' && nativeProof.status === 'verified' && nativeProofDetail && !nativeProofError) {
+      const watermark = state.getIntakeWatermark(binding.channelId);
+      if (watermark && [READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark.state)) {
+        const reopened = state.reconcileIntake(binding.channelId, binding);
+        if (reopened) binding = state.getBinding(binding.channelId);
+      }
+    }
     const gatewayWake = requestGatewayRecovery(paths, {
       status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
       kill: dependencies.killProcess || process.kill
