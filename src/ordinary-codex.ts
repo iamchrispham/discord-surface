@@ -36,6 +36,14 @@ export interface ExistingOrdinaryBinding {
   repoKey?: string | null;
 }
 
+export interface OrdinaryCodexNativeProof {
+  file: string;
+  sessionId: string;
+  threadId: string;
+  workspace: string;
+  sessionRoot: string;
+}
+
 export interface InvocationEnvironment {
   CODEX_SESSION_ID?: string;
   CODEX_THREAD_ID?: string;
@@ -99,15 +107,23 @@ export function resolveExistingChannel(selection: unknown, guildId: unknown, cha
   throw new Error('channel selection is unknown');
 }
 
-export function ordinaryBindingDecision(existing: ExistingOrdinaryBinding | null, request: OrdinaryCodexRequest, ordinaryMarker = false): 'bind' | 'reuse' | 'rebind' {
+export function ordinaryBindingDecision(
+  existing: ExistingOrdinaryBinding | null,
+  request: OrdinaryCodexRequest,
+  ordinaryMarker = false,
+  nativeProof: OrdinaryCodexNativeProof | null = null
+): 'bind' | 'reuse' | 'rebind' {
   if (!existing) return 'bind';
   const sessionRootMatches = request.sessionRoot === undefined || (existing.sessionRoot || null) === request.sessionRoot;
+  const verifiedRootRelocation = !sessionRootMatches && typeof nativeProof?.file === 'string' && nativeProof.file.startsWith('/') &&
+    nativeProof.sessionId === request.nativeId && nativeProof.threadId === request.nativeId &&
+    nativeProof.workspace === request.workspace && nativeProof.sessionRoot === request.sessionRoot;
   const sameOwner = ordinaryMarker && existing.provider === request.provider &&
     existing.channelId === request.channelId && existing.guildId === request.guildId &&
     existing.nativeId === request.nativeId && existing.workspace === request.workspace &&
-    sessionRootMatches &&
+    (sessionRootMatches || verifiedRootRelocation) &&
     !existing.conductorId && !existing.repoKey;
-  if (sameOwner) return existing.active ? 'reuse' : 'rebind';
+  if (sameOwner) return existing.active && sessionRootMatches ? 'reuse' : 'rebind';
   throw new Error('channel is already bound to another owner; use explicit handoff');
 }
 

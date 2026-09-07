@@ -902,6 +902,9 @@ class SurfaceState {
       }
       assertUuid(ordinaryIdentity.sessionId, 'sessionId');
       assertUuid(ordinaryIdentity.threadId, 'threadId');
+      if (ordinaryIdentity.sessionId !== input.nativeId || ordinaryIdentity.threadId !== input.nativeId) {
+        throw new BindingError('ordinary Codex identity does not match the native session');
+      }
     }
     const existing = this.getBinding(input.channelId);
     if (existing) throw new BindingError('channel is already bound; use rebind after work drains');
@@ -938,10 +941,13 @@ class SurfaceState {
     }
     assertUuid(identity.sessionId, 'sessionId');
     assertUuid(identity.threadId, 'threadId');
+    if (identity.sessionId !== binding.nativeId || identity.threadId !== binding.nativeId) {
+      throw new BindingError('ordinary Codex identity does not match the native session');
+    }
     return this.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
   }
 
-  rebindOrdinary(binding, identity) {
+  rebindOrdinary(binding, identity, nativeProof = null) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {
       throw new BindingError('ordinary Codex identity is missing or conflicting');
@@ -949,15 +955,23 @@ class SurfaceState {
     assertUuid(identity.sessionId, 'sessionId');
     assertUuid(identity.threadId, 'threadId');
     const existing = this.getBinding(binding.channelId);
-    if (!existing || existing.active || !this.isOrdinaryBindingRecord(existing)) {
+    if (!existing || !this.isOrdinaryBindingRecord(existing)) {
       throw new BindingError('ordinary binding tombstone is unavailable for reuse');
     }
     const requestedSessionRoot = binding.sessionRoot === undefined ? existing.sessionRoot : binding.sessionRoot;
+    const sessionRootMatches = (existing.sessionRoot || null) === (requestedSessionRoot || null);
+    const verifiedRootRelocation = sessionRootMatches || Boolean(nativeProof &&
+      typeof nativeProof.file === 'string' && path.isAbsolute(nativeProof.file) &&
+      nativeProof.sessionId === existing.nativeId && nativeProof.threadId === existing.nativeId &&
+      nativeProof.workspace === existing.workspace && nativeProof.sessionRoot === requestedSessionRoot);
     if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CODEX ||
       existing.nativeId !== binding.nativeId || existing.workspace !== binding.workspace ||
-      (existing.sessionRoot || null) !== (requestedSessionRoot || null) ||
+      !verifiedRootRelocation ||
       identity.sessionId !== existing.nativeId || identity.threadId !== existing.nativeId) {
       throw new BindingError('ordinary binding owner changed; use explicit handoff');
+    }
+    if (existing.active && sessionRootMatches) {
+      throw new BindingError('ordinary binding tombstone is unavailable for reuse');
     }
     return this.rebind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity });
   }
@@ -1025,6 +1039,11 @@ class SurfaceState {
     }
     const input = this.bindingInput({ ...binding, channelId }, existing);
     const ordinary = this.isOrdinaryBindingRecord(existing);
+    if (ordinary && (!ordinaryIdentity || input.provider !== PROVIDERS.CODEX || input.conductorId || input.repoKey ||
+      input.nativeId !== existing.nativeId || ordinaryIdentity.sessionId !== existing.nativeId ||
+      ordinaryIdentity.threadId !== existing.nativeId)) {
+      throw new BindingError('ordinary bindings require matching invocation identity');
+    }
     this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
     if (existing.conductorId !== input.conductorId || existing.repoKey !== input.repoKey) throw new BindingError('conductor identity changes require an explicit handoff');
     if (existing.conductorId && existing.provider !== input.provider) throw new BindingError('conductor provider changes require an explicit handoff');

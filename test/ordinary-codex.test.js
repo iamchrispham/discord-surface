@@ -355,6 +355,26 @@ test('binding wake replays after joining an in-flight recovery', async () => {
   assert.deepEqual(calls, ['recover:ordinary-bind', 'recover:ordinary-bind', 'reconcile']);
 });
 
+test('binding wake reconciles after a partial recovery leaves the Gateway ready', async () => {
+  const calls = [];
+  const gateway = {
+    ready: true,
+    async recoverTransport(reason) {
+      calls.push(`recover:${reason}`);
+      return { ready: false, state: 'unavailable' };
+    },
+    async reconcilePending() { calls.push('reconcile'); }
+  };
+  const wake = createBindingWakeController({
+    getGateway: () => gateway,
+    isReady: () => true,
+    isStopping: () => false
+  });
+  wake.request();
+  await wake.wait();
+  assert.deepEqual(calls, ['recover:ordinary-bind', 'reconcile']);
+});
+
 test('ordinary binding decision refuses a non-ordinary or inactive existing owner', () => {
   const request = {
     provider: 'codex', channelId: 'channel', guildId: 'guild', nativeId: CODEX, workspace: '/tmp/workspace',
@@ -373,6 +393,9 @@ test('ordinary bind starts pending with paired null conductor identity and holds
   assert.equal(binding.conductorId, null);
   assert.equal(binding.repoKey, null);
   assert.equal(f.state.isOrdinaryBinding(binding), true);
+  assert.throws(() => f.state.rebind({
+    channelId: binding.channelId, guildId: 'guild', provider: 'codex', nativeId: OTHER, workspace: f.dir
+  }), /matching invocation identity/);
   const accepted = f.state.acceptDiscordMessage({
     id: 'pending-input', guildId: 'guild', channelId: binding.channelId,
     authorId: 'operator', isBot: false, content: 'held'
@@ -386,6 +409,29 @@ test('ordinary bind starts pending with paired null conductor identity and holds
   assert.throws(() => f.state.bindOrdinary({
     channelId: binding.channelId, guildId: 'guild', provider: 'codex', nativeId: OTHER, workspace: f.dir
   }, { sessionId: OTHER, threadId: OTHER }), /already bound/);
+  assert.throws(() => f.state.bindOrdinary({
+    channelId: 'identity-mismatch', guildId: 'guild', provider: 'codex', nativeId: CODEX, workspace: f.dir
+  }, { sessionId: OTHER, threadId: OTHER }), /does not match the native session/);
+});
+
+test('ordinary binding permits a verified transcript-root relocation', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-relocated-root-'));
+  t.after(() => fs.rmSync(sessionRoot, { recursive: true, force: true }));
+  const request = {
+    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
+    workspace: f.dir, sessionRoot, identity: { sessionId: CODEX, threadId: CODEX }
+  };
+  const proof = {
+    file: path.join(sessionRoot, `${CODEX}.jsonl`), sessionId: CODEX, threadId: CODEX,
+    workspace: f.dir, sessionRoot
+  };
+  assert.throws(() => ordinaryBindingDecision(binding, request, true), /already bound/);
+  assert.equal(ordinaryBindingDecision(binding, request, true, proof), 'rebind');
+  const relocated = f.state.rebindOrdinary(request, request.identity, proof);
+  assert.equal(relocated.sessionRoot, sessionRoot);
+  assert.equal(relocated.generation, 2);
 });
 
 test('native preflight requires exact session metadata and workspace', t => {
@@ -514,7 +560,8 @@ test('ordinary post uses explicit binding custody and suppresses duplicate and u
   assert.equal(sent.status, 'sent');
   assert.equal(duplicate.duplicate, true);
   assert.equal(calls, 2);
-  f.state.rebind({ channelId: binding.channelId, guildId: 'guild', provider: 'codex', nativeId: OTHER, workspace: f.dir });
+  f.state.rebind({ channelId: binding.channelId, guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    workspace: f.dir, ordinaryIdentity: { sessionId: CODEX, threadId: CODEX } });
   await assert.rejects(() => runDirectPost({ state: f.state, token: 'fixture', nativeId: CODEX, generation: binding.generation,
     channelId: binding.channelId, provider: 'codex', ordinary: true, textFile, dedupeKey: 'ordinary-stale', fetchImpl: sentFetch }),
   error => error instanceof StaleGenerationError);

@@ -172,11 +172,24 @@ async function ordinaryBind(args, dependencies = {}) {
     const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, sessionRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
     const existing = state.getBinding(request.channelId);
-    const decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false);
+    const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot } : null;
+    let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     let binding;
     if (decision === 'reuse') binding = existing;
-    else if (decision === 'rebind') binding = state.rebindOrdinary(request, request.identity);
-    else binding = state.bindOrdinary(request, request.identity);
+    else if (decision === 'rebind') binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence);
+    else {
+      try {
+        binding = state.bindOrdinary(request, request.identity);
+      } catch (error) {
+        const raced = state.getBinding(request.channelId);
+        const racedDecision = raced
+          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
+          : null;
+        if (racedDecision !== 'reuse') throw error;
+        decision = 'reuse';
+        binding = raced;
+      }
+    }
     let nativeProof = { status: 'pending', reason: 'Codex transcript proof is pending' };
     if (state.hasOrdinaryPreflight(binding)) {
       nativeProof = { status: 'verified', reason: 'Codex transcript proof already recorded' };
@@ -764,7 +777,7 @@ function createBindingWakeController({ getGateway, isReady, isStopping, logger =
           wakeRequested = true;
           continue;
         }
-        if (recovery.ready && !isStopping?.() && isReady?.()) await currentGateway.reconcilePending();
+        if (!isStopping?.() && isReady?.()) await currentGateway.reconcilePending();
       }
     })().catch(logger).finally(() => {
       wakePromise = null;
