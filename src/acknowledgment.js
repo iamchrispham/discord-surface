@@ -1,11 +1,11 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const { MESSAGE_STATES, validateNativeId } = require('./state');
+const { AuthorizationError, MESSAGE_STATES, StaleGenerationError, validateNativeId } = require('./state');
 
 const ACK = Object.freeze({ RECEIVED: 'native-ack', OUTCOME: 'native-ack-reaction' });
 const ACK_OUTCOMES = Object.freeze({ SENT: 'sent', STALE: 'stale', FAILED: 'failed', UNKNOWN: 'unknown' });
 const REACTION = Object.freeze({ SAVED: '📥', ACKNOWLEDGED: '👀' });
-const ACK_RETRY = Object.freeze({ BASE_MS: 250, MAX_MS: 60000 });
+const ACK_RETRY = Object.freeze({ BASE_MS: 250, MAX_MS: 60000, MAX_ATTEMPTS: 8 });
 
 function parseReceiptDetail(detail) {
   if (typeof detail !== 'string') return detail && typeof detail === 'object' ? detail : null;
@@ -17,6 +17,25 @@ function latestAcknowledgmentOutcomes(state) {
     WHERE done.kind=? AND NOT EXISTS
     (SELECT 1 FROM receipts newer WHERE newer.discord_id=done.discord_id
       AND newer.kind=done.kind AND newer.id>done.id)`).all(ACK.OUTCOME);
+}
+
+function latestAcknowledgmentOutcome(state, messageId) {
+  const row = state.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id DESC LIMIT 1')
+    .get(messageId, ACK.OUTCOME);
+  return row ? parseReceiptDetail(row.detail) : null;
+}
+
+function receiptRowsAfter(state, receiptId) {
+  return state.db.prepare(`SELECT id, discord_id FROM receipts
+    WHERE id>? AND kind IN (?, ?) ORDER BY id`).all(receiptId, ACK.RECEIVED, ACK.OUTCOME);
+}
+
+function latestReceiptId(state) {
+  return Number(state.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM receipts').get().id);
+}
+
+function retryableUnknown(detail) {
+  return detail?.outcome === ACK_OUTCOMES.UNKNOWN && !detail.terminal && Number.isFinite(detail.retryAt);
 }
 
 function acknowledgmentCommand(message, dbPath, cliPath = path.join(__dirname, 'cli.js')) {
@@ -62,6 +81,7 @@ function pendingAcknowledgments(state, now = Date.now()) {
       const detail = outcomes.get(row.discord_id);
       if (!detail) return true;
       if (detail.outcome !== ACK_OUTCOMES.UNKNOWN) return false;
+      if (detail.terminal) return false;
       return !Number.isFinite(detail.retryAt) || detail.retryAt <= now;
     }).map(row => row.discord_id);
 }
@@ -80,17 +100,8 @@ function isAcknowledgmentPending(state, messageId, now = Date.now()) {
   if (row.outcome_detail === null || row.outcome_detail === undefined) return true;
   const detail = parseReceiptDetail(row.outcome_detail);
   if (!detail || detail.outcome !== ACK_OUTCOMES.UNKNOWN) return false;
+  if (detail.terminal) return false;
   return !Number.isFinite(detail.retryAt) || detail.retryAt <= now;
-}
-
-function nextAcknowledgmentRetryAt(state) {
-  let next = null;
-  for (const row of latestAcknowledgmentOutcomes(state)) {
-    const detail = parseReceiptDetail(row.detail);
-    if (detail?.outcome !== ACK_OUTCOMES.UNKNOWN || !Number.isFinite(detail.retryAt)) continue;
-    if (next === null || detail.retryAt < next) next = detail.retryAt;
-  }
-  return next;
 }
 
 function unknownAcknowledgmentAttempts(state, messageId) {
@@ -133,6 +144,10 @@ function createAcknowledgmentDelivery({ state, send }) {
         await send(message, REACTION.ACKNOWLEDGED);
         outcome(id, ACK_OUTCOMES.SENT, { reaction: REACTION.ACKNOWLEDGED, targetMessageId: id });
       } catch (error) {
+        if (error instanceof StaleGenerationError || error instanceof AuthorizationError) {
+          outcome(id, ACK_OUTCOMES.STALE, { error: String(error.message || error).slice(0, 200) });
+          return;
+        }
         const status = acknowledgmentFailureStatus(error);
         const detail = { error: String(error.message || error).slice(0, 200) };
         if (status !== null) detail.status = status;
@@ -140,13 +155,17 @@ function createAcknowledgmentDelivery({ state, send }) {
           outcome(id, ACK_OUTCOMES.FAILED, detail);
           return;
         }
-        const attempts = unknownAcknowledgmentAttempts(state, id);
-        const retryDelay = Math.min(ACK_RETRY.BASE_MS * (2 ** attempts), ACK_RETRY.MAX_MS);
-        outcome(id, ACK_OUTCOMES.UNKNOWN, {
+        const attempt = unknownAcknowledgmentAttempts(state, id) + 1;
+        const retry = {
           ...detail,
-          attempt: attempts + 1,
-          retryAt: Date.now() + retryDelay,
-        });
+          attempt,
+        };
+        if (attempt >= ACK_RETRY.MAX_ATTEMPTS) {
+          outcome(id, ACK_OUTCOMES.UNKNOWN, { ...retry, terminal: true });
+          return;
+        }
+        const retryDelay = Math.min(ACK_RETRY.BASE_MS * (2 ** (attempt - 1)), ACK_RETRY.MAX_MS);
+        outcome(id, ACK_OUTCOMES.UNKNOWN, { ...retry, retryAt: Date.now() + retryDelay });
       }
     })().finally(() => inFlight.delete(id));
     inFlight.set(id, work);
@@ -160,21 +179,71 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
   let timerDueAt = null;
   let running = null;
   let dirty = false;
+  let receiptCursor = null;
+  const retryAtByMessage = new Map();
+
+  function rememberRetryAt(messageId) {
+    const detail = latestAcknowledgmentOutcome(state, messageId);
+    if (retryableUnknown(detail)) retryAtByMessage.set(messageId, detail.retryAt);
+    else retryAtByMessage.delete(messageId);
+  }
+
+  function nextRetryAt() {
+    let next = null;
+    for (const retryAt of retryAtByMessage.values()) {
+      if (next === null || retryAt < next) next = retryAt;
+    }
+    return next;
+  }
+
+  function initialPending(now) {
+    const ids = pendingAcknowledgments(state, now);
+    for (const row of latestAcknowledgmentOutcomes(state)) {
+      const detail = parseReceiptDetail(row.detail);
+      if (retryableUnknown(detail)) retryAtByMessage.set(row.discord_id, detail.retryAt);
+    }
+    receiptCursor = latestReceiptId(state);
+    return ids;
+  }
+
+  function incrementalPending(now) {
+    const rows = receiptRowsAfter(state, receiptCursor);
+    const ids = [];
+    const seen = new Set();
+    for (const row of rows) {
+      if (!row.discord_id || seen.has(row.discord_id)) continue;
+      seen.add(row.discord_id);
+      rememberRetryAt(row.discord_id);
+      if (isAcknowledgmentPending(state, row.discord_id, now)) ids.push(row.discord_id);
+    }
+    for (const [messageId, retryAt] of retryAtByMessage) {
+      if (retryAt > now || seen.has(messageId)) continue;
+      rememberRetryAt(messageId);
+      if (isAcknowledgmentPending(state, messageId, now)) ids.push(messageId);
+    }
+    if (rows.length) receiptCursor = Number(rows.at(-1).id);
+    return ids;
+  }
+
   async function drain() {
     if (closed) return;
     if (running) { dirty = true; return running; }
     running = (async () => {
-      for (const id of pendingAcknowledgments(state)) {
+      const now = Date.now();
+      const ids = receiptCursor === null ? initialPending(now) : incrementalPending(now);
+      for (const id of ids) {
         if (closed) return;
         await deliver(id);
+        rememberRetryAt(id);
       }
     })().catch(error => logger(`native acknowledgment drain failed: ${error.message}`));
     try { await running; }
     finally {
       running = null;
+      if (receiptCursor !== null && latestReceiptId(state) > receiptCursor) dirty = true;
       if (dirty) { dirty = false; schedule(); }
       else {
-        const retryAt = nextAcknowledgmentRetryAt(state);
+        const retryAt = nextRetryAt();
         if (retryAt !== null) schedule(Math.max(0, retryAt - Date.now()));
       }
     }

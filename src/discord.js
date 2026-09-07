@@ -668,6 +668,7 @@ class DiscordGateway {
       if (!channel) throw new Error('Discord acknowledgment channel is unavailable');
       source = { ...message, channel };
     }
+    this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
     return this.sendTransportReceipt(source, { reaction });
   }
 

@@ -11,7 +11,7 @@ const { postUnixJson } = require('../src/native');
 const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
 const { CodexProvider, claudeEvent, codexPrompt, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
-const { ACK, acknowledgmentCommand, createAcknowledgmentDelivery, isAcknowledgmentPending, recordNativeAcknowledgment } = require('../src/acknowledgment');
+const { ACK, acknowledgmentCommand, createAcknowledgmentDelivery, isAcknowledgmentPending, recordNativeAcknowledgment, watchAcknowledgments } = require('../src/acknowledgment');
 const { deriveLiaisonFacts, rawReceiptFor, runLiaisonDraft, validateLiaisonSelection } = require('../src/liaison');
 const { bindingArgs, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, migrateLegacyTopic, pathsFor, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
@@ -623,6 +623,103 @@ test('simulated: acknowledgment delivery checks one message eligibility instead 
   assert.doesNotMatch(queries[beforeDelivery], /SELECT done\.discord_id/);
   assert.deepEqual(reactions, [[target, '👀']]);
   assert.equal(isAcknowledgmentPending(state, target), false);
+  state.close();
+});
+
+test('simulated: ACK reaction refuses a generation handoff after channel fetch', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'ack-generation-race', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('ack-generation-race');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-generation-race', nativeId: CODEX_ID, generation: 1 });
+  state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.REPLIED, 'ack-generation-race');
+  let fetchStarted;
+  const started = new Promise(resolve => { fetchStarted = resolve; });
+  let releaseFetch;
+  const fetchGate = new Promise(resolve => { releaseFetch = resolve; });
+  let reacted = false;
+  const channel = { messages: { fetch: async () => ({ react: async () => { reacted = true; } }) } };
+  const client = {
+    on() {},
+    off() {},
+    channels: { fetch: async () => { fetchStarted(); await fetchGate; return channel; } },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state, client });
+  const delivery = gateway.deliverAcknowledgment('ack-generation-race');
+  await started;
+  state.rebind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir });
+  releaseFetch();
+  await delivery;
+  assert.equal(reacted, false);
+  const outcomes = state.listReceipts().filter(row => row.discord_id === 'ack-generation-race' && row.kind === ACK.OUTCOME);
+  assert.equal(JSON.parse(outcomes.at(-1).detail).outcome, 'stale');
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: unknown ACK reaction reaches a terminal outcome after bounded retries', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'ack-retry-bound', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('ack-retry-bound');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-retry-bound', nativeId: CODEX_ID, generation: 1 });
+  const realNow = Date.now;
+  let clock = 0;
+  Date.now = () => clock;
+  try {
+    const deliver = createAcknowledgmentDelivery({ state, send: async () => {
+      const error = new Error('persistent network');
+      error.status = 503;
+      throw error;
+    } });
+    const outcomes = [];
+    for (let index = 0; index < 8; index += 1) {
+      await deliver('ack-retry-bound');
+      const rows = state.listReceipts().filter(row => row.discord_id === 'ack-retry-bound' && row.kind === ACK.OUTCOME);
+      outcomes.push(JSON.parse(rows.at(-1).detail));
+      if (Number.isFinite(outcomes.at(-1).retryAt)) clock = outcomes.at(-1).retryAt;
+    }
+    assert.equal(outcomes.length, 8);
+    assert.equal(outcomes.at(-1).attempt, 8);
+    assert.equal(outcomes.at(-1).terminal, true);
+    assert.equal('retryAt' in outcomes.at(-1), false);
+    assert.equal(isAcknowledgmentPending(state, 'ack-retry-bound', clock), false);
+  } finally {
+    Date.now = realNow;
+    state.close();
+  }
+});
+
+test('simulated: ACK watcher uses receipt watermark after its baseline scan', async () => {
+  const { dir, db, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const reactions = [];
+  const callbacks = [];
+  const watcher = watchAcknowledgments({
+    state,
+    send: async (_message, reaction) => reactions.push(reaction),
+    watchFactory: (_directory, callback) => {
+      callbacks.push(callback);
+      return { on() {}, close() {} };
+    }
+  });
+  await watcher.drain();
+  await new Promise(resolve => setTimeout(resolve, 70));
+  const queries = [];
+  const prepare = state.db.prepare.bind(state.db);
+  state.db.prepare = sql => {
+    queries.push(String(sql));
+    return prepare(sql);
+  };
+  state.acceptDiscordMessage({ id: 'ack-watcher-incremental', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('ack-watcher-incremental');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-watcher-incremental', nativeId: CODEX_ID, generation: 1 });
+  callbacks[0]('change', path.basename(db));
+  await waitForCondition(() => reactions.length === 1, 1000);
+  assert.equal(queries.some(sql => sql.includes('SELECT done.discord_id')), false);
+  assert.equal(queries.some(sql => sql.includes('WHERE id>?')), true);
+  await watcher.stop();
   state.close();
 });
 
