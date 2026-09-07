@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { acknowledgmentCommand } = require('./acknowledgment');
 const fs = require('node:fs');
 const path = require('node:path');
 const { ClaudeChannel } = require('./claude-channel');
@@ -92,7 +93,8 @@ function monitorEvent({ content, messageId, nativeId, generation, attachments = 
     type: 'discord-surface/claude-monitor',
     content,
     meta: { messageId, nativeId, generation: String(generation) },
-    instructions: 'Create reply.directory owner-only if needed. Write final answer to reply.textFile, then run every argument in reply.command.',
+    instructions: 'At pickup run acknowledgment.command once with argument boundaries preserved. Then create reply.directory owner-only if needed, write the final answer to reply.textFile, and run reply.command. Acknowledgment means received, not completed.',
+    acknowledgment: { command: acknowledgmentCommand({ id: messageId, nativeId, generation, provider: 'claude' }, dbPath, cliPath) },
     reply: {
       messageId,
       nativeId,
@@ -127,7 +129,7 @@ function monitorPointer({ messageId, nativeId, generation, payloadPath }) {
     type: 'discord-surface/claude-monitor',
     payloadPath: path.resolve(payloadPath),
     meta: { messageId, nativeId, generation: String(generation) },
-    instructions: 'Read the payload with Read, then run reply.command.'
+    instructions: 'Read the payload at payloadPath with Read. Run acknowledgment.command, then answer through reply.command.'
   };
 }
 

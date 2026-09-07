@@ -11,6 +11,7 @@ const { postUnixJson } = require('../src/native');
 const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkError, MESSAGE_STATES, READINESS } = require('../src/state');
 const { CodexProvider, claudeEvent, codexPrompt, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
+const { ACK, acknowledgmentCommand, createAcknowledgmentDelivery, isAcknowledgmentPending, recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { deriveLiaisonFacts, rawReceiptFor, runLiaisonDraft, validateLiaisonSelection } = require('../src/liaison');
 const { bindingArgs, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, migrateLegacyTopic, pathsFor, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
@@ -565,6 +566,146 @@ test('simulated: invalid native target is rejected before invoking Codex', async
   assert.equal(invoked, false);
 });
 
+test('simulated: native pickup ACK is explicit, idempotent, and included in the Codex prompt', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'ack-prompt', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'ack me' });
+  state.claimDispatch('ack-prompt');
+  const message = state.getMessage('ack-prompt');
+  const command = acknowledgmentCommand(message, state.dbPath);
+  let codexArgs;
+  const provider = new CodexProvider({ root: dir, acknowledgmentFor: item => acknowledgmentCommand(item, state.dbPath), run: async (_command, args) => {
+    codexArgs = args;
+    return { status: 'submitted' };
+  } });
+  const dispatched = await provider.dispatch(message);
+  assert.equal(dispatched.status, 'submitted');
+  const prompt = codexArgs[codexArgs.indexOf('--message') + 1];
+  assert.match(prompt, /At pickup, acknowledge this exact message/);
+  assert.match(prompt, new RegExp(command.map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*')));
+  assert.deepEqual(recordNativeAcknowledgment(state, {
+    provider: 'codex', messageId: message.id, nativeId: CODEX_ID, generation: 1
+  }), { recorded: true, duplicate: false, messageId: message.id });
+  assert.deepEqual(recordNativeAcknowledgment(state, {
+    provider: 'codex', messageId: message.id, nativeId: CODEX_ID, generation: 1
+  }), { recorded: false, duplicate: true, messageId: message.id });
+  assert.equal(state.listReceipts().filter(row => row.discord_id === message.id && row.kind === ACK.RECEIVED).length, 1);
+  state.close();
+});
+
+test('simulated: acknowledgment delivery checks one message eligibility instead of rescanning history', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  for (let index = 0; index < 40; index += 1) {
+    const id = `ack-history-${index}`;
+    state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: id });
+    state.claimDispatch(id);
+    recordNativeAcknowledgment(state, { provider: 'codex', messageId: id, nativeId: CODEX_ID, generation: 1 });
+    state.receipt(id, ACK.OUTCOME, { outcome: 'sent' });
+  }
+  const target = 'ack-target';
+  state.acceptDiscordMessage({ id: target, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: target });
+  state.claimDispatch(target);
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: target, nativeId: CODEX_ID, generation: 1 });
+
+  const queries = [];
+  const prepare = state.db.prepare.bind(state.db);
+  state.db.prepare = sql => {
+    queries.push(String(sql));
+    return prepare(sql);
+  };
+  const reactions = [];
+  const deliver = createAcknowledgmentDelivery({ state, send: async (message, reaction) => reactions.push([message.id, reaction]) });
+  assert.equal(isAcknowledgmentPending(state, target), true);
+  const beforeDelivery = queries.length;
+  await deliver(target);
+  assert.match(queries[beforeDelivery], /r\.discord_id=\?/);
+  assert.doesNotMatch(queries[beforeDelivery], /SELECT done\.discord_id/);
+  assert.deepEqual(reactions, [[target, '👀']]);
+  assert.equal(isAcknowledgmentPending(state, target), false);
+  state.close();
+});
+
+test('simulated: reply ACK wait survives restart without entering reply custody', async () => {
+  const { dir, db, state } = fixture('ack-reply-boundary.sqlite');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.acceptDiscordMessage({ id: 'ack-reply-boundary', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'answer' });
+  state.claimDispatch('ack-reply-boundary');
+  state.markSubmitted('ack-reply-boundary');
+  state.recordNativeReply({ provider: 'codex', messageId: 'ack-reply-boundary', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-reply-boundary', nativeId: CODEX_ID, generation: 1 });
+  let started = false;
+  let release;
+  const reactionPending = new Promise(resolve => { release = resolve; });
+  let sends = 0;
+  const channel = {
+    messages: { fetch: async () => ({ react: async () => { started = true; await reactionPending; } }) },
+    async send() { sends += 1; return { id: 'reply-after-ack' }; }
+  };
+  const gateway = new DiscordGateway({ state, client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} } });
+  const delivery = gateway.consumer.deliverReply({ id: 'ack-reply-boundary', guildId: 'guild-1', channelId: 'channel-codex', channel }, {
+    status: 'reply_ready', message: state.getMessage('ack-reply-boundary')
+  });
+  await waitForCondition(() => started);
+  assert.equal(state.getMessage('ack-reply-boundary').state, MESSAGE_STATES.REPLY_READY);
+  assert.equal(state.listReceipts().some(row => row.discord_id === 'ack-reply-boundary' && row.kind === 'reply-attempt'), false);
+  const recovered = new SurfaceState(db);
+  recovered.recoverAfterRestart();
+  assert.equal(recovered.getMessage('ack-reply-boundary').state, MESSAGE_STATES.REPLY_READY);
+  assert.equal(recovered.listReceipts().some(row => row.discord_id === 'ack-reply-boundary' && row.kind === 'reply-unknown-after-restart'), false);
+  recovered.close();
+  release();
+  const result = await delivery;
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(sends, 1);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: same native owner dispatches its next message while the prior ACK is pending', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  let ackStartedResolve;
+  const ackStarted = new Promise(resolve => { ackStartedResolve = resolve; });
+  let release;
+  const priorAck = new Promise(resolve => { release = resolve; });
+  const dispatches = [];
+  const sends = [];
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: {
+      codex: {
+        async dispatch(message) { dispatches.push(message.id); return { status: 'submitted' }; },
+        async observe(message) {
+          recordNativeAcknowledgment(state, { provider: 'codex', messageId: message.id, nativeId: CODEX_ID, generation: 1 });
+          return { text: `answer-${message.id}` };
+        }
+      }
+    },
+    prepareReply: messageId => {
+      if (messageId !== 'same-owner-first') return null;
+      ackStartedResolve();
+      return priorAck;
+    },
+    sendTransportReceipt: async () => ({ id: 'receipt' }),
+    sendReply: async (_message, reply) => { sends.push(reply.id); return { id: `sent-${reply.id}` }; }
+  });
+  const first = consumer.handleMessage(discordMessage({ id: 'same-owner-first', channelId: 'channel-codex' }));
+  await ackStarted;
+  const second = consumer.handleMessage(discordMessage({ id: 'same-owner-second', channelId: 'channel-codex' }));
+  await waitForCondition(() => dispatches.includes('same-owner-second'));
+  const secondResult = await second;
+  assert.equal(secondResult.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(state.getMessage('same-owner-first').state, MESSAGE_STATES.REPLY_READY);
+  assert.deepEqual(dispatches, ['same-owner-first', 'same-owner-second']);
+  release();
+  const firstResult = await first;
+  assert.equal(firstResult.message.state, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(sends, ['same-owner-second', 'same-owner-first']);
+  await consumer.waitForReceipts();
+  state.close();
+});
+
 test('simulated: corrupted state fails closed', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-corrupt-'));
   const db = path.join(dir, 'surface.sqlite');
@@ -907,6 +1048,16 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
     assert.deepEqual(event.reply.command.slice(2, 4), ['claude-reply', '--state-dir']);
     const dbIndex = event.reply.command.indexOf('--db');
     assert.equal(event.reply.command[dbIndex + 1], db);
+    assert.equal(event.acknowledgment.command[0], process.execPath);
+    assert.equal(event.acknowledgment.command[2], 'native-ack');
+    const ackDbIndex = event.acknowledgment.command.indexOf('--db');
+    assert.equal(event.acknowledgment.command[ackDbIndex + 1], db);
+    const acknowledged = spawnSync(event.acknowledgment.command[0], event.acknowledgment.command.slice(1), { encoding: 'utf8' });
+    assert.equal(acknowledged.status, 0, acknowledged.stderr);
+    const afterAck = new SurfaceState(db);
+    assert.equal(afterAck.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
+    assert.equal(afterAck.listReceipts().filter(row => row.discord_id === messageId && row.kind === ACK.RECEIVED).length, 1);
+    afterAck.close();
     assert.equal(fs.existsSync(event.reply.textFile), false);
     fs.mkdirSync(path.dirname(event.reply.textFile), { recursive: true, mode: 0o700 });
     foreignReplyFile = path.join(path.dirname(event.reply.textFile), 'foreign-conductor.txt');
