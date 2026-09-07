@@ -565,7 +565,7 @@ class DiscordGateway {
       codex: new CodexProvider(),
       claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(state, id, options) })
     };
-    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (binding => validateCodexSessionIdentity(binding.nativeId, binding.workspace, this.codexSessionRoot));
+    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (binding => validateCodexSessionIdentity(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot));
     this.consumer = createSurfaceConsumer({
       state,
       providers: this.providers,
@@ -740,15 +740,20 @@ class DiscordGateway {
     return [];
   }
 
-  historyPermission(channel) {
+  historyPermission(channel, { requireSend = false } = {}) {
     if (!this.client.user || typeof channel?.permissionsFor !== 'function') return { known: false, allowed: false };
     try {
       const { PermissionFlagsBits } = requireInstalled('discord.js');
       const permissions = channel.permissionsFor(this.client.user);
       if (!permissions || typeof permissions.has !== 'function') return { known: false, allowed: false };
+      const historyAllowed = permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory);
+      const replyPermission = typeof channel.isThread === 'function' && channel.isThread()
+        ? PermissionFlagsBits.SendMessagesInThreads
+        : PermissionFlagsBits.SendMessages;
+      const sendAllowed = !requireSend || (replyPermission !== undefined && permissions.has(replyPermission));
       return {
         known: true,
-        allowed: permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory)
+        allowed: historyAllowed && sendAllowed
       };
     } catch {
       return { known: false, allowed: false };
@@ -857,9 +862,12 @@ class DiscordGateway {
         failure ||= { ready: false, state: 'unavailable', error };
         continue;
       }
-      const permission = this.historyPermission(channel);
+      const permission = this.historyPermission(channel, { requireSend: ordinary });
       if (!permission.known || !permission.allowed) {
-        const error = new Error(permission.known ? 'Discord channel lacks ViewChannel or ReadMessageHistory' : 'Discord channel history permission is unknown');
+        let detail = 'Discord channel history permission is unknown';
+        if (permission.known && ordinary) detail = 'Discord channel lacks history or reply permission';
+        else if (permission.known) detail = 'Discord channel lacks ViewChannel or ReadMessageHistory';
+        const error = new Error(detail);
         await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
         failure ||= { ready: false, state: 'unavailable', error };
         continue;

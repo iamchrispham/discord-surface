@@ -1414,7 +1414,7 @@ test('simulated: v1.4 migration adds empty attachment metadata to legacy message
 
   const migrated = new SurfaceState(db);
   assert.deepEqual(migrated.getMessage('legacy-text').attachments, []);
-  assert.equal(migrated.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.5');
+  assert.equal(migrated.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.6');
   migrated.close();
 });
 

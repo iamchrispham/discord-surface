@@ -20,6 +20,7 @@ export interface OrdinaryCodexRequest {
   guildId: string;
   nativeId: string;
   workspace: string;
+  sessionRoot?: string;
   identity: OrdinaryCodexIdentity;
 }
 
@@ -30,6 +31,7 @@ export interface ExistingOrdinaryBinding {
   provider: string;
   nativeId: string;
   workspace: string;
+  sessionRoot?: string | null;
   conductorId?: string | null;
   repoKey?: string | null;
 }
@@ -53,14 +55,18 @@ function uuid(value: unknown, name: string): string {
   return result;
 }
 
+function absolutePath(value: unknown, name: string): string {
+  const result = requiredText(value, name);
+  if (!result.startsWith('/')) throw new Error(`${name} must be absolute`);
+  return result;
+}
+
 function absoluteWorkspace(value: unknown): string {
-  const workspace = requiredText(value, 'workspace');
-  if (!workspace.startsWith('/')) throw new Error('workspace must be absolute');
-  return workspace;
+  return absolutePath(value, 'workspace');
 }
 
 export function resolveInvocationIdentity(environment: InvocationEnvironment, workspace?: string): OrdinaryCodexIdentity & { workspace?: string } {
-  const sessionId = uuid(environment.CODEX_SESSION_ID, 'CODEX_SESSION_ID');
+  const sessionId = uuid(environment.CODEX_SESSION_ID || environment.CODEX_THREAD_ID, 'CODEX_SESSION_ID');
   const threadId = uuid(environment.CODEX_THREAD_ID, 'CODEX_THREAD_ID');
   if (sessionId !== threadId) throw new Error('CODEX_SESSION_ID and CODEX_THREAD_ID conflict');
   return { sessionId, threadId, workspace: workspace === undefined ? undefined : absoluteWorkspace(workspace) };
@@ -95,9 +101,11 @@ export function resolveExistingChannel(selection: unknown, guildId: unknown, cha
 
 export function ordinaryBindingDecision(existing: ExistingOrdinaryBinding | null, request: OrdinaryCodexRequest, ordinaryMarker = false): 'bind' | 'reuse' | 'rebind' {
   if (!existing) return 'bind';
+  const sessionRootMatches = request.sessionRoot === undefined || (existing.sessionRoot || null) === request.sessionRoot;
   const sameOwner = ordinaryMarker && existing.provider === request.provider &&
     existing.channelId === request.channelId && existing.guildId === request.guildId &&
     existing.nativeId === request.nativeId && existing.workspace === request.workspace &&
+    sessionRootMatches &&
     !existing.conductorId && !existing.repoKey;
   if (sameOwner) return existing.active ? 'reuse' : 'rebind';
   throw new Error('channel is already bound to another owner; use explicit handoff');
@@ -108,6 +116,7 @@ export function createOrdinaryCodexRequest(input: {
   guildId: unknown;
   nativeId?: unknown;
   workspace: unknown;
+  sessionRoot?: unknown;
   identity: OrdinaryCodexIdentity;
 }): OrdinaryCodexRequest {
   const channelId = requiredText(input.channelId, 'channelId', 128);
@@ -117,12 +126,14 @@ export function createOrdinaryCodexRequest(input: {
   if (sessionId !== threadId) throw new Error('sessionId and threadId conflict');
   const nativeId = uuid(input.nativeId ?? sessionId, 'nativeId');
   if (nativeId !== sessionId) throw new Error('nativeId conflicts with the Codex invocation identity');
+  const sessionRoot = input.sessionRoot == null ? undefined : absolutePath(input.sessionRoot, 'sessionRoot');
   return {
     provider: 'codex',
     channelId,
     guildId,
     nativeId,
     workspace: absoluteWorkspace(input.workspace),
+    ...(sessionRoot === undefined ? {} : { sessionRoot }),
     identity: { sessionId, threadId }
   };
 }
@@ -132,6 +143,7 @@ export function createOrdinaryCodexRequestFromEnvironment(input: {
   guildId: unknown;
   nativeId?: unknown;
   workspace?: unknown;
+  sessionRoot?: unknown;
   environment: InvocationEnvironment;
 }): OrdinaryCodexRequest {
   const identity = resolveInvocationIdentity(input.environment, input.workspace as string | undefined);

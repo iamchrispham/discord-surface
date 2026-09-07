@@ -47,6 +47,7 @@ function transcript(t, workspace, id = CODEX, overrides = {}) {
 
 test('typed ordinary request rejects missing or conflicting invocation identity', () => {
   assert.throws(() => resolveInvocationIdentity({ CODEX_SESSION_ID: CODEX, PWD: '/tmp/workspace' }), /CODEX_THREAD_ID/);
+  assert.equal(resolveInvocationIdentity({ CODEX_THREAD_ID: CODEX, PWD: '/tmp/workspace' }).sessionId, CODEX);
   assert.throws(() => resolveInvocationIdentity({ CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: OTHER, PWD: '/tmp/workspace' }), /conflict/);
   assert.throws(() => createOrdinaryCodexRequestFromEnvironment({
     channelId: 'channel', guildId: 'guild', workspace: '/tmp/workspace', nativeId: OTHER,
@@ -206,6 +207,7 @@ test('ordinary bind derives workspace from exact transcript metadata across chec
   const result = await ordinaryBind(args, dependencies);
   assert.equal(logins, 1);
   assert.equal(result.binding.workspace, sessionWorkspace);
+  assert.equal(result.binding.sessionRoot, session.root);
   assert.equal(result.nativeProof.status, 'verified');
   await assert.rejects(() => ordinaryBind({ ...args, workspace: invocationWorkspace }, dependencies), /does not match the supplied workspace/);
   assert.equal(logins, 1);
@@ -243,6 +245,7 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
   };
   let historyCalls = 0;
   let dispatches = 0;
+  let dispatchedSessionRoot;
   const gateway = new DiscordGateway({
     state,
     client,
@@ -256,7 +259,7 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
     },
     providers: {
       codex: {
-        async dispatch() { dispatches += 1; return { status: 'submitted' }; },
+        async dispatch(message) { dispatches += 1; dispatchedSessionRoot = message.sessionRoot; return { status: 'submitted' }; },
         async observe() { return { text: 'answer' }; }
       }
     },
@@ -320,7 +323,36 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
   assert.ok(historyCalls >= 2);
   assert.equal(state.getBinding(channel.id).readiness, READINESS.READY);
   assert.equal(dispatches, 1);
+  assert.equal(dispatchedSessionRoot, session.root);
   assert.equal(state.getMessage('gateway-held-input').state, 'replied');
+});
+
+test('binding wake replays after joining an in-flight recovery', async () => {
+  let releaseShared;
+  const shared = new Promise(resolve => { releaseShared = resolve; });
+  const calls = [];
+  const gateway = {
+    recoveryPromise: shared,
+    async recoverTransport(reason) {
+      calls.push(`recover:${reason}`);
+      if (calls.length === 1) {
+        this.recoveryPromise = null;
+        return shared;
+      }
+      this.recoveryPromise = null;
+      return { ready: true, state: 'ready' };
+    },
+    async reconcilePending() { calls.push('reconcile'); }
+  };
+  const wake = createBindingWakeController({
+    getGateway: () => gateway,
+    isReady: () => true,
+    isStopping: () => false
+  });
+  wake.request();
+  releaseShared({ ready: true, state: 'ready' });
+  await wake.wait();
+  assert.deepEqual(calls, ['recover:ordinary-bind', 'recover:ordinary-bind', 'reconcile']);
 });
 
 test('ordinary binding decision refuses a non-ordinary or inactive existing owner', () => {
@@ -366,6 +398,24 @@ test('native preflight requires exact session metadata and workspace', t => {
   assert.throws(() => validateCodexSessionIdentity(CODEX, f.dir, wrongWorkspace.root), /workspace/);
   const wrongIdentity = transcript(t, f.dir, CODEX, { id: OTHER });
   assert.throws(() => validateCodexSessionIdentity(CODEX, f.dir, wrongIdentity.root), /identity/);
+});
+
+test('ordinary readiness requires the applicable Discord reply permission', t => {
+  const f = fixture(t);
+  const permissions = new Set();
+  const client = { user: { id: 'bot' }, on() {}, off() {} };
+  const gateway = new DiscordGateway({ state: f.state, client, providers: {} });
+  const { PermissionFlagsBits } = require('discord.js');
+  const channel = { permissionsFor: () => ({ has: permission => permissions.has(permission) }) };
+  permissions.add(PermissionFlagsBits.ViewChannel);
+  permissions.add(PermissionFlagsBits.ReadMessageHistory);
+  assert.equal(gateway.historyPermission(channel, { requireSend: true }).allowed, false);
+  permissions.add(PermissionFlagsBits.SendMessages);
+  assert.equal(gateway.historyPermission(channel, { requireSend: true }).allowed, true);
+  permissions.delete(PermissionFlagsBits.SendMessages);
+  const thread = { isThread: () => true, permissionsFor: channel.permissionsFor };
+  permissions.add(PermissionFlagsBits.SendMessagesInThreads);
+  assert.equal(gateway.historyPermission(thread, { requireSend: true }).allowed, true);
 });
 
 test('ordinary readiness requires native proof before the intake boundary can become ready', t => {

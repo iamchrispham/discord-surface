@@ -4,7 +4,7 @@ const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { normalizeAttachments } = require('./attachments');
 
-const SCHEMA_VERSION = '1.5';
+const SCHEMA_VERSION = '1.6';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
 const READINESS = Object.freeze({
   PENDING: 'pending',
@@ -279,6 +279,7 @@ function rowBinding(row) {
     provider: row.provider,
     nativeId: row.native_id,
     workspace: row.workspace,
+    sessionRoot: row.session_root || null,
     endpoint: row.endpoint,
     categoryId: row.category_id || null,
     conductorId: row.conductor_id || null,
@@ -320,6 +321,7 @@ function bindingMatchesExpected(binding, expected) {
   return Boolean(binding) && binding.active === expected.active && binding.channelId === expected.channelId &&
     binding.guildId === expected.guildId && binding.provider === expected.provider &&
     binding.nativeId === expected.nativeId && binding.generation === expected.generation &&
+    (binding.sessionRoot || null) === (expected.sessionRoot || null) &&
     binding.conductorId === expected.conductorId && binding.repoKey === expected.repoKey;
 }
 
@@ -368,6 +370,7 @@ class SurfaceState {
         provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),
         native_id TEXT NOT NULL,
         workspace TEXT NOT NULL,
+        session_root TEXT,
         endpoint TEXT,
         category_id TEXT,
         conductor_id TEXT,
@@ -496,10 +499,12 @@ class SurfaceState {
   migrateSchema() {
     const version = this.db.prepare("SELECT value FROM meta WHERE key='schema'").get();
     if (!version) throw new StateCorruptError('state schema metadata is missing');
-    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== SCHEMA_VERSION) {
+    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== '1.5' && version.value !== SCHEMA_VERSION) {
       throw new StateCorruptError(`unsupported state schema ${version.value}`);
     }
     if (version.value === SCHEMA_VERSION) {
+      const bindings = this.tableColumns('bindings');
+      if (!bindings.has('session_root')) this.db.exec('ALTER TABLE bindings ADD COLUMN session_root TEXT');
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_publications (
           request_id TEXT PRIMARY KEY,
@@ -588,6 +593,7 @@ class SurfaceState {
       if (!bindings.has('conductor_id')) this.db.exec('ALTER TABLE bindings ADD COLUMN conductor_id TEXT');
       if (!bindings.has('repo_key')) this.db.exec('ALTER TABLE bindings ADD COLUMN repo_key TEXT');
       if (!bindings.has('readiness')) this.db.exec("ALTER TABLE bindings ADD COLUMN readiness TEXT NOT NULL DEFAULT 'pending'");
+      if (!bindings.has('session_root')) this.db.exec('ALTER TABLE bindings ADD COLUMN session_root TEXT');
       if (!messages.has('conductor_id')) this.db.exec('ALTER TABLE messages ADD COLUMN conductor_id TEXT');
       if (!messages.has('repo_key')) this.db.exec('ALTER TABLE messages ADD COLUMN repo_key TEXT');
       if (!messages.has('attachments')) this.db.exec("ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'");
@@ -692,7 +698,7 @@ class SurfaceState {
     this.assertColumns('bindings', {
       channel_id: { type: 'TEXT' }, guild_id: { type: 'TEXT', notnull: true },
       provider: { type: 'TEXT', notnull: true }, native_id: { type: 'TEXT', notnull: true },
-      workspace: { type: 'TEXT', notnull: true }, conductor_id: { type: 'TEXT' }, repo_key: { type: 'TEXT' },
+      workspace: { type: 'TEXT', notnull: true }, session_root: { type: 'TEXT' }, conductor_id: { type: 'TEXT' }, repo_key: { type: 'TEXT' },
       readiness: { type: 'TEXT', notnull: true }, generation: { type: 'INTEGER', notnull: true },
       active: { type: 'INTEGER', notnull: true }, updated_at: { type: 'TEXT', notnull: true }
     });
@@ -868,6 +874,8 @@ class SurfaceState {
     const nativeId = assertUuid(binding.nativeId);
     const workspace = assertText(binding.workspace, 'workspace', 4096);
     if (!path.isAbsolute(workspace)) throw new BindingError('workspace must be absolute');
+    const sessionRoot = binding.sessionRoot == null ? (existing?.sessionRoot || null) : assertText(binding.sessionRoot, 'sessionRoot', 4096);
+    if (sessionRoot !== null && !path.isAbsolute(sessionRoot)) throw new BindingError('sessionRoot must be absolute');
     const endpoint = binding.endpoint == null ? null : assertEndpoint(binding.endpoint);
     if (provider === PROVIDERS.CLAUDE && !endpoint) throw new BindingError('Claude bindings require a channel endpoint');
     const categoryId = binding.categoryId == null ? (existing?.categoryId || null) : assertText(binding.categoryId, 'categoryId', 128);
@@ -880,7 +888,7 @@ class SurfaceState {
     if (!Object.values(READINESS).includes(readiness)) throw new BindingError('invalid binding readiness');
     const config = this.requireConfig();
     if (guildId !== config.guildId) throw new BindingError('binding guild is not the configured guild');
-    return { channelId, guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey, readiness, generation };
+    return { channelId, guildId, provider, nativeId, workspace, sessionRoot, endpoint, categoryId, conductorId, repoKey, readiness, generation };
   }
 
   bind(binding) {
@@ -908,13 +916,14 @@ class SurfaceState {
       const nextGeneration = Number(generationRow.next);
       const generation = input.generation == null ? nextGeneration : input.generation;
       if (generation < nextGeneration) throw new BindingError('binding generation would move backwards');
-      this.db.prepare(`INSERT INTO bindings(channel_id, guild_id, provider, native_id, workspace, endpoint, category_id, conductor_id, repo_key, readiness, generation, active, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(input.channelId, input.guildId, input.provider, input.nativeId, input.workspace, input.endpoint, input.categoryId, input.conductorId, input.repoKey, input.readiness, generation, createdAt);
+      this.db.prepare(`INSERT INTO bindings(channel_id, guild_id, provider, native_id, workspace, session_root, endpoint, category_id, conductor_id, repo_key, readiness, generation, active, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(input.channelId, input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, input.conductorId, input.repoKey, input.readiness, generation, createdAt);
       this.receipt(null, 'bound', { channelId: input.channelId, provider: input.provider, conductorId: input.conductorId, generation });
       if (ordinaryIdentity) {
         this.receipt(null, 'ordinary-bound', {
           channelId: input.channelId, guildId: input.guildId, provider: input.provider,
           nativeId: input.nativeId, workspace: input.workspace, generation,
+          sessionRoot: input.sessionRoot,
           sessionId: ordinaryIdentity.sessionId, threadId: ordinaryIdentity.threadId
         });
       }
@@ -943,8 +952,10 @@ class SurfaceState {
     if (!existing || existing.active || !this.isOrdinaryBindingRecord(existing)) {
       throw new BindingError('ordinary binding tombstone is unavailable for reuse');
     }
+    const requestedSessionRoot = binding.sessionRoot === undefined ? existing.sessionRoot : binding.sessionRoot;
     if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CODEX ||
       existing.nativeId !== binding.nativeId || existing.workspace !== binding.workspace ||
+      (existing.sessionRoot || null) !== (requestedSessionRoot || null) ||
       identity.sessionId !== existing.nativeId || identity.threadId !== existing.nativeId) {
       throw new BindingError('ordinary binding owner changed; use explicit handoff');
     }
@@ -1022,13 +1033,14 @@ class SurfaceState {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
       this.assertLegacyMigrationSafe(channelId);
-      this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
-        .run(input.guildId, input.provider, input.nativeId, input.workspace, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
+      this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, session_root=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
+        .run(input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
       this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
       if (ordinary && input.provider === PROVIDERS.CODEX && !input.conductorId && !input.repoKey) {
         this.receipt(null, 'ordinary-bound', {
           channelId, guildId: input.guildId, provider: input.provider, nativeId: input.nativeId,
           workspace: input.workspace, generation,
+          sessionRoot: input.sessionRoot,
           sessionId: ordinaryIdentity?.sessionId || input.nativeId,
           threadId: ordinaryIdentity?.threadId || input.nativeId
         });
@@ -1135,8 +1147,8 @@ class SurfaceState {
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       this.assertLegacyMigrationSafe(channelId);
       const generation = existing.generation + 1;
-      this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
-        .run(input.nativeId, input.workspace, input.endpoint, READINESS.PENDING, generation, now(), channelId, provider, conductorId, fromGeneration, fromNativeId);
+      this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
+        .run(input.nativeId, input.workspace, input.sessionRoot, input.endpoint, READINESS.PENDING, generation, now(), channelId, provider, conductorId, fromGeneration, fromNativeId);
       this.receipt(null, 'conductor-handoff', {
         channelId, conductorId, repoKey, provider, handoffId,
         fromNativeId, fromGeneration, nativeId: input.nativeId, generation

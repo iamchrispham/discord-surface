@@ -321,7 +321,8 @@ class CodexProvider {
     try { validateNativeId(message.nativeId); } catch (error) {
       return { status: 'not_submitted', error };
     }
-    const cursor = readInitialCursor(message.nativeId, this.root);
+    const root = message.sessionRoot || this.root;
+    const cursor = readInitialCursor(message.nativeId, root);
     const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message), '--cd', message.workspace];
     const result = await this.run(this.command, args, { cwd: message.workspace });
     return { ...result, cursor };
@@ -331,7 +332,7 @@ class CodexProvider {
     return observeCodexReply(message.nativeId, outcome.cursor || message.observerCursor, {
       ...options,
       marker: `[[discord-surface:${message.id}]]`,
-      root: this.root
+      root: message.sessionRoot || this.root
     });
   }
 }
@@ -415,7 +416,7 @@ async function observeSubmitted(state, message, provider, options = {}) {
     }
   };
   try {
-    reply = await provider.observe(message, outcome, {
+    reply = await provider.observe(providerMessageForBinding(state, message), outcome, {
       ...options,
       isCurrent,
       onCursor: cursor => { observedCursor = cursor; }
@@ -440,6 +441,17 @@ async function observeSubmitted(state, message, provider, options = {}) {
   return { status: state.getMessage(message.id)?.state || message.state, message: state.getMessage(message.id) };
 }
 
+function providerMessageForBinding(state, message) {
+  if (typeof state?.currentMessageBinding !== 'function') return message;
+  try {
+    const binding = state.currentMessageBinding(message)?.binding;
+    if (!binding || binding.sessionRoot == null) return message;
+    return { ...message, sessionRoot: binding.sessionRoot };
+  } catch {
+    return message;
+  }
+}
+
 async function dispatchAndObserve(state, messageId, providers, options = {}) {
   let claimed;
   try {
@@ -457,7 +469,7 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
   }
   let outcome;
   try {
-    outcome = await provider.dispatch(message);
+    outcome = await provider.dispatch(providerMessageForBinding(state, message));
   } catch (error) {
     state.markUncertain(message.id, error);
     return { status: 'uncertain', message: state.getMessage(message.id), error };

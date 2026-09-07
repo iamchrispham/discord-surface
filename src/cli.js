@@ -89,12 +89,13 @@ function bind(args, rebind = false) {
   finally { state.close(); }
 }
 
-function ordinaryBindingArgs(args, environment = process.env, channelId = null, guildId = null, workspace = undefined) {
+function ordinaryBindingArgs(args, environment = process.env, channelId = null, guildId = null, workspace = undefined, sessionRoot = undefined) {
   return createOrdinaryCodexRequestFromEnvironment({
     channelId: channelId || required(args, 'channel-id'),
     guildId: guildId || required(args, 'guild-id'),
     nativeId: args['native-id'],
     workspace: workspace ?? (args.workspace ? path.resolve(args.workspace) : undefined),
+    sessionRoot,
     environment
   });
 }
@@ -168,7 +169,7 @@ async function ordinaryBind(args, dependencies = {}) {
         messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
     }
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
-    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace);
+    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, sessionRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
     const existing = state.getBinding(request.channelId);
     const decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false);
@@ -757,7 +758,12 @@ function createBindingWakeController({ getGateway, isReady, isStopping, logger =
         wakeRequested = false;
         const currentGateway = getGateway?.();
         if (!currentGateway || !isReady?.()) return;
+        const joinedRecovery = Boolean(currentGateway.recoveryPromise);
         const recovery = await currentGateway.recoverTransport('ordinary-bind');
+        if (joinedRecovery) {
+          wakeRequested = true;
+          continue;
+        }
         if (recovery.ready && !isStopping?.() && isReady?.()) await currentGateway.reconcilePending();
       }
     })().catch(logger).finally(() => {
