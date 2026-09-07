@@ -1306,43 +1306,68 @@ class SurfaceState {
     }
     if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
     this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
-    return this.transaction(() => {
-      const current = this.getBinding(channelId);
-      if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary handoff source identity is stale');
-      if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
-        current.nativeId !== fromNativeId || current.generation !== fromGeneration) {
-        throw new StaleGenerationError('ordinary handoff source identity is stale');
-      }
-      if (!current.active && !this.hasUnboundReceipt(channelId, fromGeneration)) {
-        throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
-      }
-      if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
-      this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
-      this.assertLegacyMigrationSafe(channelId);
-      if (intakeCutoff !== null) {
-        this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
-      }
-      const generation = existing.generation + 1;
-      const updatedAt = now();
-      this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
-        WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
-        .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,
-          PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
-      this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
-        .run('ordinary handoff; intake recovery reopened', updatedAt, channelId);
-      this.receipt(null, 'ordinary-handoff', {
-        channelId, provider: PROVIDERS.CODEX, handoffId,
-        fromNativeId, fromGeneration, fromActive: existing.active,
-        nativeId: input.nativeId, generation, workspace: input.workspace, sessionRoot: input.sessionRoot,
-        sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
+    try {
+      return this.transaction(() => {
+        const current = this.getBinding(channelId);
+        if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary handoff source identity is stale');
+        if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
+          current.nativeId !== fromNativeId || current.generation !== fromGeneration) {
+          throw new StaleGenerationError('ordinary handoff source identity is stale');
+        }
+        if (!current.active && !this.hasUnboundReceipt(channelId, fromGeneration)) {
+          throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
+        }
+        if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+        this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+        this.assertLegacyMigrationSafe(channelId);
+        if (intakeCutoff !== null) {
+          this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
+        }
+        const generation = existing.generation + 1;
+        const updatedAt = now();
+        this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
+          WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
+          .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,
+            PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
+        this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
+          .run('ordinary handoff; intake recovery reopened', updatedAt, channelId);
+        this.receipt(null, 'ordinary-handoff', {
+          channelId, provider: PROVIDERS.CODEX, handoffId,
+          fromNativeId, fromGeneration, fromActive: existing.active,
+          nativeId: input.nativeId, generation, workspace: input.workspace, sessionRoot: input.sessionRoot,
+          sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
+        });
+        this.receipt(null, 'ordinary-bound', {
+          channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId: input.nativeId,
+          workspace: input.workspace, generation, sessionRoot: input.sessionRoot,
+          sessionId: identity.sessionId, threadId: identity.threadId
+        });
+        return this.getBinding(channelId);
       });
-      this.receipt(null, 'ordinary-bound', {
-        channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId: input.nativeId,
-        workspace: input.workspace, generation, sessionRoot: input.sessionRoot,
-        sessionId: identity.sessionId, threadId: identity.threadId
+    } catch (error) {
+      if (!(error instanceof StaleGenerationError)) throw error;
+      const committed = this.findOrdinaryHandoff(handoffId);
+      const successor = this.getBinding(channelId);
+      const reconciled = committed && successor && successor.active && successor.provider === PROVIDERS.CODEX &&
+        !successor.conductorId && !successor.repoKey && successor.nativeId === nativeId &&
+        successor.generation === fromGeneration + 1 && successor.workspace === input.workspace &&
+        (successor.sessionRoot || null) === (input.sessionRoot || null) &&
+        committed.channelId === channelId && committed.provider === PROVIDERS.CODEX &&
+        committed.fromNativeId === fromNativeId && committed.fromGeneration === fromGeneration &&
+        committed.nativeId === nativeId && committed.generation === successor.generation &&
+        committed.workspace === input.workspace && (committed.sessionRoot || null) === (input.sessionRoot || null);
+      if (!reconciled) throw error;
+      return this.transaction(() => {
+        const current = this.getBinding(channelId);
+        const latest = this.findOrdinaryHandoff(handoffId);
+        if (!latest || !bindingMatchesExpected(current, successor) || latest.nativeId !== nativeId ||
+          latest.generation !== current.generation) throw error;
+        this.receipt(null, 'ordinary-handoff-retry', {
+          channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: current.generation
+        });
+        return { ...current, handoffReconciled: true };
       });
-      return this.getBinding(channelId);
-    });
+    }
   }
 
   handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId }) {

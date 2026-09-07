@@ -363,6 +363,11 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
         messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
     }
     const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
+    if (args.channel && args['channel-id']) {
+      const namedChannel = resolveExistingChannel(args.channel, config.guildId, fetchedChannels);
+      const idChannel = resolveExistingChannel(args['channel-id'], config.guildId, fetchedChannels);
+      if (namedChannel.id !== idChannel.id) throw new Error('--channel and --channel-id must identify the same channel');
+    }
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const boundRequest = { ...request, channelId: channel.id };
     const existing = state.getBinding(channel.id);
@@ -374,8 +379,31 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     }
     let binding;
     if (decision === 'reuse') binding = existing;
-    else if (decision === 'rebind') binding = state.rebindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff);
-    else binding = state.bindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff);
+    else if (decision === 'rebind') {
+      try {
+        binding = state.rebindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff);
+      } catch (error) {
+        const raced = state.getBinding(boundRequest.channelId);
+        const racedDecision = raced
+          ? ordinaryBindingDecision(raced, boundRequest, state.isOrdinaryBindingRecord(raced))
+          : null;
+        if (racedDecision !== 'reuse') throw error;
+        decision = 'reuse';
+        binding = raced;
+      }
+    } else {
+      try {
+        binding = state.bindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff);
+      } catch (error) {
+        const raced = state.getBinding(boundRequest.channelId);
+        const racedDecision = raced
+          ? ordinaryBindingDecision(raced, boundRequest, state.isOrdinaryBindingRecord(raced))
+          : null;
+        if (racedDecision !== 'reuse') throw error;
+        decision = 'reuse';
+        binding = raced;
+      }
+    }
     let nativeProof = { status: 'pending', reason: 'Claude Monitor capability is pending' };
     if (state.hasOrdinaryPreflight(binding)) {
       nativeProof = { status: 'verified', reason: 'Claude transcript proof already recorded' };
@@ -389,6 +417,13 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
         harness: 'claude-code'
       });
       nativeProof = { status: 'verified', file: identityProof.file, workspace: identityProof.workspace };
+    }
+    if (decision === 'reuse' && nativeProof.status === 'verified') {
+      const watermark = state.getIntakeWatermark(binding.channelId);
+      if (watermark && [READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark.state)) {
+        const reopened = state.reconcileIntake(binding.channelId, binding);
+        if (reopened) binding = state.getBinding(binding.channelId);
+      }
     }
     const gatewayWake = requestGatewayRecovery(paths, {
       status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
@@ -1235,12 +1270,20 @@ async function directPost(args, provider = null, ordinary = false) {
     const generation = required(args, 'generation');
     const channelId = ordinary ? required(args, 'channel-id') : (args['channel-id'] || null);
     if (ordinary) {
-      const invocation = resolveInvocationIdentity(process.env);
+      const invocation = provider === PROVIDERS.CLAUDE
+        ? await resolveCurrentClaudeCaller()
+        : resolveInvocationIdentity(process.env);
+      if (provider === PROVIDERS.CLAUDE &&
+        (!invocation || invocation.harness !== 'claude-code' || typeof invocation.sessionId !== 'string')) {
+        throw new Error('ordinary Claude caller identity is unavailable or uses the wrong harness');
+      }
+      const invocationSessionId = invocation.sessionId;
+      const invocationThreadId = provider === PROVIDERS.CLAUDE ? invocationSessionId : invocation.threadId;
       const binding = state.getBinding(channelId);
-      if (nativeId !== invocation.sessionId || invocation.threadId !== invocation.sessionId ||
-        !binding?.active || !state.isOrdinaryBindingRecord(binding) || binding.nativeId !== invocation.sessionId ||
+      if (nativeId !== invocationSessionId || invocationThreadId !== invocationSessionId ||
+        !binding?.active || binding.provider !== provider || !state.isOrdinaryBindingRecord(binding) || binding.nativeId !== invocationSessionId ||
         Number(binding.generation) !== Number(generation)) {
-        throw new Error('ordinary post identity does not match the active Codex binding');
+        throw new Error(`ordinary post identity does not match the active ${provider === PROVIDERS.CLAUDE ? 'Claude' : 'Codex'} binding`);
       }
     }
     const result = await runDirectPost({
