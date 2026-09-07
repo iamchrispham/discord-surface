@@ -2,7 +2,7 @@
 
 This local adapter keeps Discord transport custody in SQLite and sends accepted messages to an already-owned native Codex task or an explicitly channel-enabled Claude session. It does not start a model executor, resume a history file, change native approval settings, or switch providers.
 
-The runtime needs Node 22.5 or newer for `node:sqlite`. It resolves `discord.js` and the MCP SDK from `/Users/cphamballer/.codex/mcp/discord/node_modules`; no runtime package installation or bot-token export is required. The build-only TypeScript compiler is pinned in `package-lock.json`. Run `npm ci` and `npm run build` before starting from a clean checkout. The running adapter uses emitted JavaScript and does not need the compiler installed.
+The runtime needs Node 22.13.0 through Node 22.x for unflagged `node:sqlite`. Run `npm ci` from a clean checkout to install the pinned runtime dependencies locally, then run `npm run build` before starting. The package resolves `discord.js` and the MCP SDK from its local `node_modules`. The running adapter uses emitted JavaScript and does not need the compiler installed. Run `npm run package-smoke` to build, pack, install, and import the artifact in an isolated temporary prefix without starting the adapter.
 
 Use a private state directory and an owner-only dotenv file. The secret file must contain a `DISCORD_TOKEN=` assignment and have mode `0600`.
 

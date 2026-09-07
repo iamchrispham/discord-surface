@@ -2,10 +2,9 @@ const fs = require('node:fs');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
 const http = require('node:http');
 const path = require('node:path');
-const { createRequire } = require('node:module');
 const { MESSAGE_STATES, normalizeAttachments, validateNativeId } = require('./state');
 
-const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
+const requireInstalled = require;
 
 function parseBody(request) {
   return new Promise((resolve, reject) => {

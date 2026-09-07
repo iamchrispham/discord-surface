@@ -1,7 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { createRequire } = require('node:module');
 const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
@@ -16,7 +15,7 @@ const { deriveLiaisonFacts, rawReceiptFor, runLiaisonDraft, validateLiaisonSelec
 const { bindingArgs, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, migrateLegacyTopic, pathsFor, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
 const { conductorMarkerMatches, topicWithReadiness } = require('../src/topic');
-const requireInstalled = createRequire('/Users/cphamballer/.codex/mcp/discord/package.json');
+const requireInstalled = require;
 const { NotificationSchema } = requireInstalled('@modelcontextprotocol/sdk/types.js');
 const { z } = requireInstalled('zod');
 
