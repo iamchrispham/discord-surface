@@ -1128,6 +1128,129 @@ test('simulated: omitted native ACK survives restart with one reply and no redis
   state.close();
 });
 
+test('simulated: legacy REPLY_READY with native reply provenance recovers omitted ACK', async () => {
+  const first = fixture('native-reply-ack-legacy.sqlite');
+  first.state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: first.dir });
+  first.state.acceptDiscordMessage({ id: 'native-reply-ack-legacy', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'answer' });
+  first.state.claimDispatch('native-reply-ack-legacy');
+  first.state.markSubmitted('native-reply-ack-legacy');
+  first.state.recordNativeReply({ provider: 'codex', messageId: 'native-reply-ack-legacy', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
+  first.state.db.prepare('DELETE FROM receipts WHERE discord_id=? AND kind=?').run('native-reply-ack-legacy', ACK.RECEIVED);
+  first.state.close();
+
+  const state = new SurfaceState(first.db);
+  state.recoverAfterRestart();
+  const events = [];
+  const channel = {
+    messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
+    async send() { events.push('reply'); return { id: 'legacy-reply' }; }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+  });
+  gateway.ready = true;
+  await gateway.reconcilePending();
+  assert.equal(state.getMessage('native-reply-ack-legacy').state, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(events, ['👀', 'reply']);
+  const acknowledgments = state.listReceipts().filter(row => row.discord_id === 'native-reply-ack-legacy' && row.kind === ACK.RECEIVED);
+  assert.equal(acknowledgments.length, 1);
+  assert.equal(JSON.parse(acknowledgments[0].detail).source, 'native-reply');
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: legacy REPLY_READY with pre-submit reply provenance recovers omitted ACK', async () => {
+  const first = fixture('native-reply-ack-before-submit.sqlite');
+  first.state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: first.dir });
+  first.state.acceptDiscordMessage({ id: 'native-reply-ack-before-submit', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'answer' });
+  first.state.claimDispatch('native-reply-ack-before-submit');
+  first.state.recordNativeReply({ provider: 'codex', messageId: 'native-reply-ack-before-submit', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
+  assert.equal(first.state.listReceipts().filter(row => row.discord_id === 'native-reply-ack-before-submit' && row.kind === 'native-reply-before-submit').length, 1);
+  first.state.db.prepare('DELETE FROM receipts WHERE discord_id=? AND kind=?').run('native-reply-ack-before-submit', ACK.RECEIVED);
+  first.state.close();
+
+  const state = new SurfaceState(first.db);
+  state.recoverAfterRestart();
+  const events = [];
+  const channel = {
+    messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
+    async send() { events.push('reply'); return { id: 'before-submit-reply' }; }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+  });
+  gateway.ready = true;
+  await gateway.reconcilePending();
+  assert.equal(state.getMessage('native-reply-ack-before-submit').state, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(events, ['👀', 'reply']);
+  assert.equal(state.listReceipts().filter(row => row.discord_id === 'native-reply-ack-before-submit' && row.kind === ACK.RECEIVED).length, 1);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: legacy REPLY_READY without native reply provenance stays held', async () => {
+  const first = fixture('native-reply-ack-no-provenance.sqlite');
+  first.state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: first.dir });
+  first.state.acceptDiscordMessage({ id: 'native-reply-ack-no-provenance', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'answer' });
+  first.state.claimDispatch('native-reply-ack-no-provenance');
+  first.state.markSubmitted('native-reply-ack-no-provenance');
+  first.state.recordNativeReply({ provider: 'codex', messageId: 'native-reply-ack-no-provenance', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
+  first.state.db.prepare('DELETE FROM receipts WHERE discord_id=? AND kind IN (?, ?)').run('native-reply-ack-no-provenance', ACK.RECEIVED, 'native-reply');
+  first.state.close();
+
+  const state = new SurfaceState(first.db);
+  state.recoverAfterRestart();
+  const events = [];
+  const channel = {
+    messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
+    async send() { events.push('reply'); return { id: 'unexpected-reply' }; }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+  });
+  gateway.ready = true;
+  await gateway.reconcilePending();
+  assert.equal(state.getMessage('native-reply-ack-no-provenance').state, MESSAGE_STATES.REPLY_READY);
+  assert.equal(state.listReceipts().filter(row => row.discord_id === 'native-reply-ack-no-provenance' && row.kind === ACK.RECEIVED).length, 0);
+  assert.deepEqual(events, []);
+  await gateway.stop();
+  state.close();
+});
+
+test('simulated: legacy REPLY_READY with mismatched native reply provenance stays held', async () => {
+  const first = fixture('native-reply-ack-mismatched-provenance.sqlite');
+  first.state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: first.dir });
+  first.state.acceptDiscordMessage({ id: 'native-reply-ack-mismatched-provenance', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'answer' });
+  first.state.claimDispatch('native-reply-ack-mismatched-provenance');
+  first.state.markSubmitted('native-reply-ack-mismatched-provenance');
+  first.state.recordNativeReply({ provider: 'codex', messageId: 'native-reply-ack-mismatched-provenance', nativeId: CODEX_ID, generation: 1, text: 'native answer' });
+  first.state.db.prepare('DELETE FROM receipts WHERE discord_id=? AND kind IN (?, ?)').run('native-reply-ack-mismatched-provenance', ACK.RECEIVED, 'native-reply');
+  first.state.receipt('native-reply-ack-mismatched-provenance', 'native-reply', { generation: 2, parts: 1 });
+  first.state.close();
+
+  const state = new SurfaceState(first.db);
+  state.recoverAfterRestart();
+  const events = [];
+  const channel = {
+    messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
+    async send() { events.push('reply'); return { id: 'unexpected-reply' }; }
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+  });
+  gateway.ready = true;
+  await gateway.reconcilePending();
+  assert.equal(state.getMessage('native-reply-ack-mismatched-provenance').state, MESSAGE_STATES.REPLY_READY);
+  assert.equal(state.listReceipts().filter(row => row.discord_id === 'native-reply-ack-mismatched-provenance' && row.kind === ACK.RECEIVED).length, 0);
+  assert.deepEqual(events, []);
+  await gateway.stop();
+  state.close();
+});
+
 test('simulated: same native owner dispatches its next message while the prior ACK is pending', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });

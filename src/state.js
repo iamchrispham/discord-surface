@@ -1392,6 +1392,30 @@ class SurfaceState {
     return Boolean(identity && identity.provider === message.provider && identity.nativeId === message.nativeId && identity.generation === message.generation);
   }
 
+  recoverNativeReplyAcknowledgment(messageId) {
+    return this.transaction(() => {
+      const message = this.getMessage(messageId);
+      if (!message || message.state !== MESSAGE_STATES.REPLY_READY) return { recovered: false, reason: 'not-reply-ready' };
+      const check = this.currentMessageBinding(message);
+      if (!check.current) return { recovered: false, reason: check.identity ? 'authorization-revoked' : 'stale-generation' };
+      if (this.hasNativeAcknowledgment(message)) return { recovered: false, duplicate: true };
+      const receiptRows = this.db.prepare(`SELECT detail FROM receipts
+        WHERE discord_id=? AND kind IN (?, ?) ORDER BY id DESC`).all(messageId, 'native-reply', 'native-reply-before-submit');
+      const partCount = Number(this.db.prepare('SELECT COUNT(*) AS count FROM reply_parts WHERE discord_id=?').get(messageId).count);
+      const provenance = receiptRows
+        .map(row => parseJson(row.detail, null))
+        .find(detail => detail && detail.generation === message.generation && Number.isInteger(detail.parts) && detail.parts > 0 && detail.parts === partCount);
+      if (!provenance) return { recovered: false, reason: 'native-reply-provenance-missing' };
+      this.receipt(messageId, NATIVE_ACK_RECEIPT, {
+        provider: message.provider,
+        nativeId: message.nativeId,
+        generation: message.generation,
+        source: 'native-reply'
+      });
+      return { recovered: true, message: this.getMessage(messageId) };
+    });
+  }
+
   assertMessageCurrent(messageId, phase) {
     try {
       return this.transaction(() => {

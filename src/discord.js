@@ -1148,6 +1148,7 @@ class DiscordGateway {
             deadline
           );
         } else {
+          this.state.recoverNativeReplyAcknowledgment(message.id);
           result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
         }
       } catch (error) {
