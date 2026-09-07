@@ -1,5 +1,7 @@
 # Spark sidecar roadmap
 
+Operator status: model interpretation experiment shelved. Preserve this branch for possible fleet-overview extraction. See [shelving and proof limits](sidecar-shelved.md). Historical unchecked items below are not completed and are not an instruction to resume the experiment. Current delivery focus is conductor-authored milestone posts in the separate post change.
+
 Runtime constraint: [runtime research and finite Rust-first checklist](runtime-language-research.md). This adds a measured migration trial, not completed implementation or permission to replace the live service. Existing sidecar acceptance remains open.
 
 Status: final stress test reconciled. Implementation in progress. Goal active in Codex task `01a0701c-5714-7671-a455-db7d67f9fa78`.
