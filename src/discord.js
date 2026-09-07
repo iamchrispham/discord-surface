@@ -132,7 +132,8 @@ async function readRetryAfter(response) {
   const headerValue = typeof response?.headers?.get === 'function'
     ? response.headers.get('retry-after') ?? response.headers.get('Retry-After')
     : response?.headers?.['retry-after'] ?? response?.headers?.['Retry-After'];
-  const headerSeconds = Number(headerValue);
+  const hasHeaderValue = headerValue !== null && headerValue !== undefined && String(headerValue).trim() !== '';
+  const headerSeconds = hasHeaderValue ? Number(headerValue) : NaN;
   if (Number.isFinite(headerSeconds) && headerSeconds >= 0) {
     return { raw: headerValue, milliseconds: Math.ceil(headerSeconds * 1000) };
   }

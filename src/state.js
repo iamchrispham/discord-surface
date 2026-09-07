@@ -1541,7 +1541,7 @@ class SurfaceState {
     assertText(text, 'reply text', 10000);
     try {
       return this.transaction(() => {
-        const message = this.getMessage(messageId);
+        let message = this.getMessage(messageId);
         if (!message) throw new StaleGenerationError('native reply is stale');
         const check = this.currentMessageBinding(message);
         if (message.provider !== provider || !check.binding || message.nativeId !== nativeId || message.generation !== generation ||
@@ -1555,6 +1555,11 @@ class SurfaceState {
           if (!existing) this.receipt(messageId, NATIVE_ACK_RECEIPT, { provider, nativeId, generation, source: 'native-reply' });
         };
         ensureNativeReplyAcknowledgment();
+        if (message.state === MESSAGE_STATES.UNCERTAIN) {
+          this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.SUBMITTED, now(), messageId, MESSAGE_STATES.UNCERTAIN);
+          message = this.getMessage(messageId);
+        }
         if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) {
           return { duplicate: true, message };
         }
