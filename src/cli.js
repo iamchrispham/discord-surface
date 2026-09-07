@@ -326,6 +326,7 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     const transcript = required(args, 'transcript');
     if (!path.isAbsolute(endpoint)) throw new Error('Claude endpoint must be an absolute Unix socket path');
     if (!path.isAbsolute(transcript)) throw new Error('Claude transcript path must be absolute');
+    const resolvedEndpoint = path.resolve(endpoint);
     const caller = await resolveCaller();
     if (!caller || caller.harness !== 'claude-code' || typeof caller.sessionId !== 'string') {
       throw new Error('ordinary Claude caller identity is unavailable or uses the wrong harness');
@@ -341,7 +342,7 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
       guildId: config.guildId,
       nativeId: args['native-id'],
       workspace: identityProof.workspace,
-      endpoint,
+      endpoint: resolvedEndpoint,
       identity: { sessionId, threadId: sessionId, harness: 'claude-code' }
     });
     const { Client, GatewayIntentBits } = install('discord.js');
