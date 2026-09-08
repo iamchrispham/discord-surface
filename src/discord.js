@@ -856,7 +856,7 @@ class DiscordGateway {
           continue;
         }
       }
-      if (!conductorMarkerMatchesTopic(channel.topic, binding)) {
+      if (!ordinary && !conductorMarkerMatchesTopic(channel.topic, binding)) {
         const error = new Error('Discord channel topic does not identify the current conductor and native generation');
         await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
         failure ||= { ready: false, state: 'unavailable', error };

@@ -207,14 +207,15 @@ async function ordinaryBind(args, dependencies = {}) {
     if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
       throw new Error('channel is already bound to another owner; use explicit handoff');
     }
-    const validationRoot = sessionRoot ?? existing?.sessionRoot ?? undefined;
+    let validationRoot = sessionRoot ?? existing?.sessionRoot ?? undefined;
     if (!sessionRoot) {
       const proof = await validateNativeProof(validationRoot);
       nativeProofDetail = proof.detail;
       nativeProofError = proof.error;
       resolvedWorkspace = proof.workspace;
+      validationRoot = proof.sessionRoot ?? proof.detail?.sessionRoot ?? validationRoot;
     }
-    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, sessionRoot);
+    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, validationRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
     const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: validationRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);

@@ -987,7 +987,8 @@ class SurfaceState {
     if (existing.active && sessionRootMatches) {
       throw new BindingError('ordinary binding tombstone is unavailable for reuse');
     }
-    if (existing.active && !sessionRootMatches && this.hasUnresolved(binding.channelId)) {
+    if (existing.active && !sessionRootMatches &&
+      (this.hasUnresolved(binding.channelId) || this.hasUnresolvedOrdinaryPost(binding.channelId))) {
       const input = this.bindingInput({
         ...binding,
         channelId: binding.channelId,
@@ -2240,10 +2241,15 @@ class SurfaceState {
         reconciliationEvidence: evidence
       };
       if (resolution === 'sent') {
-        if (evidence.messageId !== undefined) next.messageId = assertText(evidence.messageId, 'messageId', 128);
-        if (evidence.nonce !== undefined) next.nonce = assertText(evidence.nonce, 'nonce', 256);
-        if (!next.messageId && !next.nonce) {
-          throw new BindingError('sent direct post reconciliation requires a messageId or nonce');
+        const messageId = evidence.messageId === undefined ? null : assertText(evidence.messageId, 'messageId', 128);
+        const nonce = evidence.nonce === undefined ? null : assertText(evidence.nonce, 'nonce', 256);
+        if (!messageId && !nonce) throw new BindingError('sent direct post reconciliation requires a messageId or nonce');
+        if (messageId) next.messageId = messageId;
+        if (nonce) {
+          if (attempt.detail.nonce !== undefined && nonce !== attempt.detail.nonce) {
+            throw new BindingError('sent direct post reconciliation nonce does not match the attempt');
+          }
+          next.nonce = nonce;
         }
       }
       this.receipt(null, DIRECT_POST_OUTCOME, next);
