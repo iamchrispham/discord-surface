@@ -848,8 +848,10 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   const requestedSessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
   const validationRoot = requestedSessionRoot || (dependencies.codexSessionRoot || codexSessionRoot)();
   const { paths, state } = openState(args);
+  const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
   let client;
   try {
+    assertGatewayWakeCompatible(paths, gatewayStatus);
     const config = state.requireConfig();
     const current = state.getBinding(channelId);
     if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey) {
@@ -884,7 +886,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       nativeProof: { ...nativeProof, sessionRoot: validationRoot }
     });
     const gatewayWake = wake(paths, {
-      status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+      status: gatewayStatus,
       kill: dependencies.killProcess || process.kill
     });
     output({ handedOff: true, ordinary: true, channelId, handoffId,

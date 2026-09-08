@@ -1005,7 +1005,8 @@ class SurfaceState {
     if (existing.active && sessionRootMatches) {
       throw new BindingError('ordinary binding tombstone is unavailable for reuse');
     }
-    if (existing.active && !sessionRootMatches && this.hasUnresolved(binding.channelId) && !this.hasDispatching(binding.channelId)) {
+    if (existing.active && !sessionRootMatches && this.hasUnresolved(binding.channelId) &&
+      !this.hasDispatching(binding.channelId) && !this.hasSubmitted(binding.channelId)) {
       const input = this.bindingInput({
         ...binding,
         channelId: binding.channelId,
@@ -1018,7 +1019,9 @@ class SurfaceState {
       return this.transaction(() => {
         const current = this.getBinding(binding.channelId);
         if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary root relocation source identity is stale');
-        if (this.hasDispatching(binding.channelId)) throw new UnresolvedWorkError('cannot relocate while dispatch is in flight');
+        if (this.hasDispatching(binding.channelId) || this.hasSubmitted(binding.channelId)) {
+          throw new UnresolvedWorkError('cannot relocate while dispatch or reply observation is in flight');
+        }
         this.assertLegacyMigrationSafe(binding.channelId);
         const updatedAt = now();
         this.db.prepare('UPDATE bindings SET session_root=?, readiness=?, updated_at=? WHERE channel_id=?')
@@ -1435,6 +1438,11 @@ class SurfaceState {
   hasDispatching(channelId) {
     return Boolean(this.db.prepare('SELECT 1 FROM messages WHERE channel_id=? AND state=? LIMIT 1')
       .get(channelId, MESSAGE_STATES.DISPATCHING));
+  }
+
+  hasSubmitted(channelId) {
+    return Boolean(this.db.prepare('SELECT 1 FROM messages WHERE channel_id=? AND state=? LIMIT 1')
+      .get(channelId, MESSAGE_STATES.SUBMITTED));
   }
 
   reject(reason) {

@@ -691,7 +691,10 @@ class DiscordGateway {
       if (this.stopping) return;
       const controller = new AbortController();
       this.controllers.add(controller);
-      const work = (this.ready ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false, null, null, true))
+      const binding = message?.channelId ? this.state.getBinding(message.channelId) : null;
+      const bindingReady = binding?.active === true && binding.readiness === READINESS.READY;
+      const dispatchReady = bindingReady && (this.ready || (this.started && !this.starting));
+      const work = (dispatchReady ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false, null, null, true))
         .catch(error => this.logger(`message handling failed: ${error.message}`))
         .finally(() => this.controllers.delete(controller));
       this.inFlight.add(work);
