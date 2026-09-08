@@ -1058,7 +1058,7 @@ class DiscordGateway {
             failure ||= { ready: false, state: 'unavailable', error };
             continue;
           }
-          const detail = binding.provider === 'claude' && ['Claude endpoint unavailable', 'ordinary-bind', 'reconnect'].includes(reason)
+          const detail = binding.provider === 'claude' && ['Claude endpoint unavailable', 'ordinary-bind', 'reconnect', 'startup'].includes(reason)
             ? `Claude endpoint unavailable before event write: ${error.message}`
             : error.message;
           await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', detail, watermark?.recovered_through_id, null, signal, deadline);
@@ -1066,7 +1066,7 @@ class DiscordGateway {
           continue;
         }
       }
-      if (!conductorMarkerMatchesTopic(channel.topic, binding)) {
+      if (!ordinary && !conductorMarkerMatchesTopic(channel.topic, binding)) {
         const error = new Error('Discord channel topic does not identify the current conductor and native generation');
         await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
         failure ||= { ready: false, state: 'unavailable', error };
