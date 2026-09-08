@@ -6,17 +6,13 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
+const { DiscordGateway, discordIdAfter, readSecret, requireInstalled } = require('./discord');
 const {
+  assertOrdinaryIntakeRange,
   createHandoffFence,
   deleteHandoffFence,
-  DiscordGateway,
-  assertOrdinaryIntakeRange,
-  discordIdAfter,
-  latestChannelMessageId,
-  readSecret,
-  requireInstalled,
   serverDerivedChannelCutoff
-} = require('./discord');
+} = require('./discord/handoff-fence');
 const {
   createOrdinaryCodexRequestFromEnvironment,
   ordinaryBindingDecision,
@@ -24,7 +20,7 @@ const {
   resolveExistingChannel,
   resolveInvocationIdentity
 } = require('./ordinary-codex');
-const { sessionRoot: codexSessionRoot, validateCodexSessionIdentityAsync } = require('./native');
+const { CODEX_VALIDATION_KINDS, sessionRoot: codexSessionRoot, validateCodexSessionIdentityAsync } = require('./native');
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
 
@@ -179,7 +175,7 @@ async function ordinaryBind(args, dependencies = {}) {
           throw new Error('Codex transcript workspace is unavailable');
         }
       } catch (caught) {
-        if (String(caught?.message || '').startsWith('Unsupported Codex session root')) throw caught;
+        if (caught?.recoveryKind === CODEX_VALIDATION_KINDS.UNSUPPORTED_ROOT) throw caught;
         error = caught;
         if (!invocation.workspace) throw new Error(`Codex transcript workspace is required: ${caught.message}`);
       }
@@ -230,7 +226,6 @@ async function ordinaryBind(args, dependencies = {}) {
       nativeProofDetail = proof.detail;
       nativeProofError = proof.error;
       resolvedWorkspace = proof.workspace;
-      validationRoot = proof.sessionRoot ?? proof.detail?.sessionRoot ?? validationRoot;
     }
     const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, validationRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
@@ -774,7 +769,6 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   const channelId = required(args, 'channel-id');
   const handoffId = required(args, 'handoff-id');
   const requestedSessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
-  const validationRoot = requestedSessionRoot || (dependencies.codexSessionRoot || codexSessionRoot)();
   const { paths, state } = openState(args);
   let client;
   let handoffFence;
@@ -784,6 +778,8 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey) {
       throw new Error('ordinary handoff source is unavailable');
     }
+    const validationRoot = requestedSessionRoot ?? current.sessionRoot ??
+      (dependencies.codexSessionRoot || codexSessionRoot)();
     const invocation = resolveInvocationIdentity(environment, workspace);
     if (invocation.sessionId !== nativeId || invocation.threadId !== nativeId) {
       throw new Error('ordinary handoff successor identity does not match the native UUID');
@@ -1049,7 +1045,7 @@ function writePid(pidFile, guildId, stateDir) {
 }
 
 function createBindingWakeController({ getGateway, isReady, isTransportReady = isReady, isStopping,
-  pauseLiveDispatch = () => {}, logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
+  logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
   let wakePromise = null;
   let wakeRequested = false;
   const request = () => {
@@ -1062,7 +1058,7 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
         const currentGateway = getGateway?.();
         if (!currentGateway || !isTransportReady?.()) return;
         const joinedRecovery = Boolean(currentGateway.recoveryPromise);
-        pauseLiveDispatch(currentGateway);
+        currentGateway.pauseLiveDispatch?.();
         const recovery = await currentGateway.recoverTransport('ordinary-bind');
         if (joinedRecovery) {
           wakeRequested = true;
@@ -1107,8 +1103,7 @@ async function runRuntime(args) {
     getGateway: () => gateway,
     isReady: () => gatewayReady && gateway?.ready === true,
     isTransportReady: () => gatewayReady && gateway?.transportReady === true,
-    isStopping: () => stopping,
-    pauseLiveDispatch: currentGateway => { currentGateway.ready = false; }
+    isStopping: () => stopping
   });
   const stop = async () => {
     if (stopping) return;

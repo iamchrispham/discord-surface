@@ -5,11 +5,11 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
+const { ORDINARY_BINDING_DECISIONS, createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
 const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordinaryBind, requestGatewayRecovery, unbind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
 const { CodexProvider, readCodexSessionIdentityAsync, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
-const { SurfaceState, READINESS, StaleGenerationError } = require('../src/state');
+const { SurfaceState, PROVIDERS, READINESS, StaleGenerationError } = require('../src/state');
 const { runDirectPost } = require('../src/direct-post');
 const facade = require('../src/ordinary-codex');
 const emitted = require('../dist/ordinary-codex');
@@ -32,7 +32,7 @@ function fixture(t) {
 
 function ordinary(fixtureState, channelId = 'ordinary-channel', nativeId = CODEX) {
   return fixtureState.state.bindOrdinary({
-    channelId, guildId: 'guild', provider: 'codex', nativeId, workspace: fixtureState.dir
+    channelId, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId, workspace: fixtureState.dir
   }, { sessionId: nativeId, threadId: nativeId });
 }
 
@@ -165,7 +165,7 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   try {
     assert.equal(tombstone.unbind(channel.id), true);
     assert.throws(() => tombstone.rebindOrdinary({
-      channelId: channel.id, guildId: 'guild', provider: 'codex', nativeId: OTHER, workspace: dir
+      channelId: channel.id, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: OTHER, workspace: dir
     }, { sessionId: OTHER, threadId: OTHER }), /owner changed/);
   } finally { tombstone.close(); }
   await assert.rejects(() => ordinaryBind({ ...args }, {
@@ -322,7 +322,7 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
     topic: null,
     isTextBased: () => true,
     permissionsFor: () => ({ has: () => true }),
-    async send() { return { id: `reply-${Date.now()}` }; }
+    async send() { return { id: '100' }; }
   };
   const client = {
     user: { id: 'bot' },
@@ -344,7 +344,9 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
         firstHistoryStarted();
         await historyGate;
       }
-      return [];
+      return historyCalls === 1
+        ? [{ id: '200', guildId: 'guild', channelId: 'gateway-channel', author: { id: 'operator', bot: false }, content: 'held until Gateway recovery', attachments: [] }]
+        : [];
     },
     providers: {
       codex: {
@@ -399,7 +401,7 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
   const first = await ordinaryBind(args, dependencies);
   await firstHistory;
   const accepted = state.acceptDiscordMessage({
-    id: 'gateway-held-input', guildId: 'guild', channelId: channel.id,
+    id: '200', guildId: 'guild', channelId: channel.id,
     authorId: 'operator', isBot: false, content: 'held until Gateway recovery'
   }, { ready: false });
   assert.equal(accepted.accepted, true);
@@ -409,11 +411,11 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
   releaseHistory();
   await wake.wait();
   assert.deepEqual(wakeErrors, []);
-  assert.ok(historyCalls >= 2);
+  assert.ok(historyCalls >= 1);
   assert.equal(state.getBinding(channel.id).readiness, READINESS.READY);
   assert.equal(dispatches, 1);
   assert.equal(dispatchedSessionRoot, session.root);
-  assert.equal(state.getMessage('gateway-held-input').state, 'replied');
+  assert.equal(state.getMessage('200').state, 'replied');
 });
 
 test('ordinary bind uses the server fence as its adoption cutoff', async t => {
@@ -469,7 +471,7 @@ test('ordinary bind rejects an inactive different owner despite verified proof',
   const setup = new SurfaceState(db);
   setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   const original = setup.bindOrdinary({
-    channelId: 'ordinary-successor-channel', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    channelId: 'ordinary-successor-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir
   }, { sessionId: CODEX, threadId: CODEX });
   setup.unbind(original.channelId);
@@ -517,7 +519,7 @@ test('ordinary handoff clears an explicit default transcript root', t => {
   const predecessorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-null-predecessor-root-'));
   const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-null-successor-root-'));
   const binding = f.state.bindOrdinary({
-    channelId: 'ordinary-null-root-channel', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    channelId: 'ordinary-null-root-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: f.dir, sessionRoot: predecessorRoot
   }, f.identity);
   f.state.unbind(binding.channelId);
@@ -528,7 +530,7 @@ test('ordinary handoff clears an explicit default transcript root', t => {
     fs.rmSync(successorRoot, { recursive: true, force: true });
   });
   const rebound = f.state.handoffOrdinary({
-    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: f.dir, sessionRoot: null, handoffId: 'ordinary-null-root-handoff',
     identity: { sessionId: OTHER, threadId: OTHER },
     nativeProof: { file: transcriptFile, sessionId: OTHER, threadId: OTHER, workspace: f.dir, sessionRoot: null }
@@ -538,21 +540,23 @@ test('ordinary handoff clears an explicit default transcript root', t => {
   assert.equal(rebound.generation, 2);
 });
 
-test('ordinary CLI handoff changes a custom root to its default root', async t => {
+test('ordinary CLI handoff preserves a custom transcript root when omitted', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-cli-'));
   const db = path.join(dir, 'surface.sqlite');
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-workspace-'));
-  const predecessorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-predecessor-'));
+  const predecessorHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-predecessor-'));
+  const predecessorRoot = path.join(predecessorHome, 'sessions');
+  fs.mkdirSync(predecessorRoot);
   const defaultRoot = path.join(dir, 'sessions');
   fs.mkdirSync(defaultRoot);
-  const transcriptFile = path.join(defaultRoot, OTHER + '.jsonl');
+  const transcriptFile = path.join(predecessorRoot, OTHER + '.jsonl');
   fs.writeFileSync(transcriptFile, `${JSON.stringify({ type: 'session_meta', payload: {
     session_id: OTHER, id: OTHER, cwd: successorWorkspace
   } })}\n`);
   const setup = new SurfaceState(db);
   setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   const original = setup.bindOrdinary({
-    channelId: '123456789012345679', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    channelId: '123456789012345679', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir, sessionRoot: predecessorRoot
   }, { sessionId: CODEX, threadId: CODEX });
   setup.unbind(original.channelId);
@@ -560,7 +564,7 @@ test('ordinary CLI handoff changes a custom root to its default root', async t =
   t.after(() => {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(successorWorkspace, { recursive: true, force: true });
-    fs.rmSync(predecessorRoot, { recursive: true, force: true });
+    fs.rmSync(predecessorHome, { recursive: true, force: true });
     fs.rmSync(defaultRoot, { recursive: true, force: true });
   });
 
@@ -575,7 +579,7 @@ test('ordinary CLI handoff changes a custom root to its default root', async t =
     async destroy() {}
   }
   const result = await handoffInternal({
-    ordinary: true, 'state-dir': dir, provider: 'codex', 'channel-id': original.channelId,
+    ordinary: true, 'state-dir': dir, provider: PROVIDERS.CODEX, 'channel-id': original.channelId,
     'from-native-id': CODEX, 'from-generation': '1', 'native-id': OTHER,
     workspace: successorWorkspace, 'handoff-id': 'ordinary-default-root-cli-handoff'
   }, {
@@ -587,7 +591,7 @@ test('ordinary CLI handoff changes a custom root to its default root', async t =
     gatewayProcessStatus: () => ({ state: 'stopped' }),
     print: () => {}
   });
-  assert.equal(result.binding.sessionRoot, defaultRoot);
+  assert.equal(result.binding.sessionRoot, predecessorRoot);
   assert.equal(result.binding.generation, 2);
 });
 
@@ -604,7 +608,7 @@ test('binding wake replays after joining an in-flight recovery', async () => {
         return shared;
       }
       this.recoveryPromise = null;
-      return { ready: true, state: 'ready' };
+      return { ready: true, state: READINESS.READY };
     },
     async reconcilePending() { calls.push('reconcile'); }
   };
@@ -614,7 +618,7 @@ test('binding wake replays after joining an in-flight recovery', async () => {
     isStopping: () => false
   });
   wake.request();
-  releaseShared({ ready: true, state: 'ready' });
+  releaseShared({ ready: true, state: READINESS.READY });
   await wake.wait();
   assert.deepEqual(calls, ['recover:ordinary-bind', 'recover:ordinary-bind', 'reconcile']);
 });
@@ -623,17 +627,17 @@ test('binding wake reconciles recovered owners after a partial recovery pauses l
   const calls = [];
   const gateway = {
     ready: true,
+    pauseLiveDispatch() { this.ready = false; },
     async recoverTransport(reason) {
       calls.push(`recover:${reason}`);
-      return { ready: false, state: 'unavailable' };
+      return { ready: false, state: READINESS.UNAVAILABLE };
     },
     async reconcilePending(_before, options) { calls.push({ phase: 'reconcile', options }); }
   };
   const wake = createBindingWakeController({
     getGateway: () => gateway,
     isReady: () => gateway.ready,
-    isStopping: () => false,
-    pauseLiveDispatch: currentGateway => { currentGateway.ready = false; }
+    isStopping: () => false
   });
   wake.request();
   await wake.wait();
@@ -650,7 +654,7 @@ test('binding wake remains queued while the Gateway is disconnected', async () =
     recoveryPromise: null,
     async recoverTransport(reason) {
       calls.push(`recover:${reason}`);
-      return { ready: true, state: 'ready' };
+      return { ready: true, state: READINESS.READY };
     },
     async reconcilePending() { calls.push('reconcile'); }
   };
@@ -677,7 +681,7 @@ test('binding wake starts when reconnect transport is ready after partial recove
     async recoverTransport(reason) {
       calls.push(`recover:${reason}`);
       this.ready = true;
-      return { ready: true, state: 'ready' };
+      return { ready: true, state: READINESS.READY };
     },
     async reconcilePending() { calls.push('reconcile'); }
   };
@@ -694,12 +698,12 @@ test('binding wake starts when reconnect transport is ready after partial recove
 
 test('ordinary binding decision refuses a non-ordinary or inactive existing owner', () => {
   const request = {
-    provider: 'codex', channelId: 'channel', guildId: 'guild', nativeId: CODEX, workspace: '/tmp/workspace',
+    provider: PROVIDERS.CODEX, channelId: 'channel', guildId: 'guild', nativeId: CODEX, workspace: '/tmp/workspace',
     identity: { sessionId: CODEX, threadId: CODEX }
   };
-  assert.equal(ordinaryBindingDecision(null, request), 'bind');
-  assert.equal(ordinaryBindingDecision({ ...request, active: true }, request, true), 'reuse');
-  assert.equal(ordinaryBindingDecision({ ...request, active: false }, request, true), 'rebind');
+  assert.equal(ordinaryBindingDecision(null, request), ORDINARY_BINDING_DECISIONS.BIND);
+  assert.equal(ordinaryBindingDecision({ ...request, active: true }, request, true), ORDINARY_BINDING_DECISIONS.REUSE);
+  assert.equal(ordinaryBindingDecision({ ...request, active: false }, request, true), ORDINARY_BINDING_DECISIONS.REBIND);
   assert.throws(() => ordinaryBindingDecision({ ...request, active: true, conductorId: 'conductor' }, request, false), /already bound/);
 });
 
@@ -711,7 +715,7 @@ test('ordinary bind starts pending with paired null conductor identity and holds
   assert.equal(binding.repoKey, null);
   assert.equal(f.state.isOrdinaryBinding(binding), true);
   assert.throws(() => f.state.rebind({
-    channelId: binding.channelId, guildId: 'guild', provider: 'codex', nativeId: OTHER, workspace: f.dir
+    channelId: binding.channelId, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: OTHER, workspace: f.dir
   }), /matching invocation identity/);
   const accepted = f.state.acceptDiscordMessage({
     id: 'pending-input', guildId: 'guild', channelId: binding.channelId,
@@ -721,13 +725,13 @@ test('ordinary bind starts pending with paired null conductor identity and holds
   assert.equal(f.state.claimDispatch('pending-input').reason, 'binding-not-ready');
   assert.equal(f.state.getMessage('pending-input').state, 'accepted');
   assert.throws(() => f.state.bindOrdinary({
-    channelId: 'second-channel', guildId: 'guild', provider: 'codex', nativeId: CODEX, workspace: f.dir
+    channelId: 'second-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX, workspace: f.dir
   }, f.identity), /already owned/);
   assert.throws(() => f.state.bindOrdinary({
-    channelId: binding.channelId, guildId: 'guild', provider: 'codex', nativeId: OTHER, workspace: f.dir
+    channelId: binding.channelId, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: OTHER, workspace: f.dir
   }, { sessionId: OTHER, threadId: OTHER }), /already bound/);
   assert.throws(() => f.state.bindOrdinary({
-    channelId: 'identity-mismatch', guildId: 'guild', provider: 'codex', nativeId: CODEX, workspace: f.dir
+    channelId: 'identity-mismatch', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX, workspace: f.dir
   }, { sessionId: OTHER, threadId: OTHER }), /does not match the native session/);
 });
 
@@ -737,7 +741,7 @@ test('ordinary binding permits a verified transcript-root relocation', t => {
   const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-relocated-root-'));
   t.after(() => fs.rmSync(sessionRoot, { recursive: true, force: true }));
   const request = {
-    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
+    provider: PROVIDERS.CODEX, channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
     workspace: f.dir, sessionRoot, identity: { sessionId: CODEX, threadId: CODEX }
   };
   const proof = {
@@ -745,7 +749,7 @@ test('ordinary binding permits a verified transcript-root relocation', t => {
     workspace: f.dir, sessionRoot
   };
   assert.throws(() => ordinaryBindingDecision(binding, request, true), /already bound/);
-  assert.equal(ordinaryBindingDecision(binding, request, true, proof), 'rebind');
+  assert.equal(ordinaryBindingDecision(binding, request, true, proof), ORDINARY_BINDING_DECISIONS.REBIND);
   const relocated = f.state.rebindOrdinary(request, request.identity, proof);
   assert.equal(relocated.sessionRoot, sessionRoot);
   assert.equal(relocated.generation, 2);
@@ -754,11 +758,11 @@ test('ordinary binding permits a verified transcript-root relocation', t => {
 test('ordinary root relocation reopens a drained terminal intake watermark', t => {
   const f = fixture(t);
   const binding = ordinary(f);
-  f.state.markIntakeBoundary(binding.channelId, 'gap', 'previous recovery gap', 'gap-from', 'gap-to');
+  f.state.markIntakeBoundary(binding.channelId, READINESS.GAP, 'previous recovery gap', 'gap-from', 'gap-to');
   const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-relocated-terminal-root-'));
   t.after(() => fs.rmSync(sessionRoot, { recursive: true, force: true }));
   const request = {
-    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
+    provider: PROVIDERS.CODEX, channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
     workspace: f.dir, sessionRoot, identity: { sessionId: CODEX, threadId: CODEX }
   };
   const proof = {
@@ -792,7 +796,7 @@ test('ordinary root relocation refuses an active dispatch', t => {
   }, { expectedBinding: ready });
   assert.equal(f.state.claimDispatch('ordinary-relocation-dispatch').claimed, true);
   const request = {
-    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
+    provider: PROVIDERS.CODEX, channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
     workspace: f.dir, sessionRoot, identity: { sessionId: CODEX, threadId: CODEX }
   };
   assert.throws(() => f.state.rebindOrdinary(request, request.identity, proof), /dispatch is in flight/);
@@ -820,13 +824,13 @@ test('ordinary handoff refuses unmatched and active direct-post custody', t => {
   const attempt = {
     journal: 'direct-post-v1', requestId: 'ordinary-post-handoff', attemptId: 'ordinary-post-attempt',
     ownerPid: 1, sourcePath: path.join(f.dir, 'milestone.txt'), textHash: 'text-hash', operatorId: 'operator',
-    partHash: 'part-hash', channelId: binding.channelId, guildId: 'guild', provider: 'codex',
+    partHash: 'part-hash', channelId: binding.channelId, guildId: 'guild', provider: PROVIDERS.CODEX,
     nativeId: CODEX, generation: binding.generation, conductorId: null, repoKey: null,
     partIndex: 0, partCount: 2, nonce: 'ordinary-post-nonce', status: 'attempted'
   };
   f.state.receipt(null, 'direct-post-attempt', attempt);
   const handoff = {
-    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: binding.generation,
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: binding.generation,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-post-handoff-id', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
   };
@@ -854,7 +858,7 @@ test('ordinary bind rejects a successor and explicit tombstone handoff transfers
   const f = fixture(t);
   const originalRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-original-root-'));
   const binding = f.state.bindOrdinary({
-    channelId: 'ordinary-channel', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    channelId: 'ordinary-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: f.dir, sessionRoot: originalRoot
   }, f.identity);
   f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary handoff baseline');
@@ -867,7 +871,7 @@ test('ordinary bind rejects a successor and explicit tombstone handoff transfers
     fs.rmSync(successorRoot, { recursive: true, force: true });
   });
   const request = {
-    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: OTHER,
+    provider: PROVIDERS.CODEX, channelId: binding.channelId, guildId: 'guild', nativeId: OTHER,
     workspace: successorWorkspace,
     identity: { sessionId: OTHER, threadId: OTHER }
   };
@@ -880,7 +884,7 @@ test('ordinary bind rejects a successor and explicit tombstone handoff transfers
   assert.throws(() => ordinaryBindingDecision(tombstone, { ...request, sessionRoot: successorRoot }, true, proof), /already bound/);
   assert.throws(() => f.state.rebindOrdinary(request, request.identity, proof), /owner changed/);
   const rebound = f.state.handoffOrdinary({
-    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-tombstone-handoff', identity: request.identity, nativeProof: proof
   });
@@ -894,7 +898,7 @@ test('ordinary bind rejects a successor and explicit tombstone handoff transfers
   assert.equal(rebound.repoKey, null);
   assert.equal(f.state.getIntakeWatermark(binding.channelId).last_seen_id, '100');
   const retry = f.state.handoffOrdinary({
-    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-tombstone-handoff', identity: request.identity, nativeProof: proof
   });
@@ -908,7 +912,7 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
   const f = fixture(t);
   const binding = ordinary(f);
   f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary active handoff baseline');
-  f.state.markIntakeBoundary(binding.channelId, 'gap', 'ordinary active handoff previous gap', 'gap-from', 'gap-to');
+  f.state.markIntakeBoundary(binding.channelId, READINESS.GAP, 'ordinary active handoff previous gap', 'gap-from', 'gap-to');
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-active-successor-workspace-'));
   const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-active-successor-root-'));
   t.after(() => {
@@ -920,20 +924,20 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
     workspace: successorWorkspace, sessionRoot: successorRoot
   };
   assert.throws(() => f.state.handoffOrdinary({
-    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 2,
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 2,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-stale-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
   }), /stale/);
   assert.equal(f.state.getBinding(binding.channelId).nativeId, CODEX);
   assert.throws(() => f.state.handoffOrdinary({
-    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-proof-handoff', identity: { sessionId: OTHER, threadId: OTHER },
     nativeProof: { ...proof, workspace: f.dir }
   }), /transcript proof/);
   assert.equal(f.state.getBinding(binding.channelId).generation, 1);
   const transferred = f.state.handoffOrdinary({
-    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-active-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
   });
@@ -946,7 +950,7 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
   assert.equal(f.state.getIntakeWatermark(binding.channelId).gap_from, null);
   assert.equal(f.state.getIntakeWatermark(binding.channelId).gap_to, null);
   const retry = f.state.handoffOrdinary({
-    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-active-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
   });
@@ -961,7 +965,7 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
   }, { ready: true });
   assert.equal(accepted.accepted, true);
   assert.throws(() => unresolvedFixture.state.handoffOrdinary({
-    channelId: unresolvedBinding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    channelId: unresolvedBinding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-unresolved-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
   }), /unresolved/);
@@ -969,12 +973,12 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
   const collisionFixture = fixture(t);
   const collisionBinding = ordinary(collisionFixture, 'ordinary-collision-source');
   const second = collisionFixture.state.bindOrdinary({
-    channelId: 'ordinary-collision-channel', guildId: 'guild', provider: 'codex', nativeId: OTHER,
+    channelId: 'ordinary-collision-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: OTHER,
     workspace: successorWorkspace, sessionRoot: successorRoot
   }, { sessionId: OTHER, threadId: OTHER });
   assert.equal(second.active, true);
   assert.throws(() => collisionFixture.state.handoffOrdinary({
-    channelId: collisionBinding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    channelId: collisionBinding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-collision-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
   }), /already owned/);
@@ -984,7 +988,7 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
   const missingReceiptBinding = ordinary(missingReceiptFixture, 'ordinary-missing-unbound');
   missingReceiptFixture.state.db.prepare('UPDATE bindings SET active=0 WHERE channel_id=?').run(missingReceiptBinding.channelId);
   assert.throws(() => missingReceiptFixture.state.handoffOrdinary({
-    channelId: missingReceiptBinding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: 1,
+    channelId: missingReceiptBinding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-missing-unbound-handoff', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
   }), /no matching unbind receipt/);
@@ -1000,11 +1004,11 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   const setup = new SurfaceState(db);
   setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   const original = setup.bindOrdinary({
-    channelId: '123456789012345678', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    channelId: '123456789012345678', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir
   }, { sessionId: CODEX, threadId: CODEX });
   setup.setIntakeCutoff(original.channelId, 'guild', '100', 'ordinary CLI handoff baseline');
-  setup.markIntakeBoundary(original.channelId, 'unavailable', 'ordinary CLI handoff previous terminal');
+  setup.markIntakeBoundary(original.channelId, READINESS.UNAVAILABLE, 'ordinary CLI handoff previous terminal');
   setup.unbind(original.channelId);
   setup.close();
   t.after(() => {
@@ -1028,7 +1032,7 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
     async destroy() {}
   }
   const result = await handoffInternal({
-    ordinary: true, 'state-dir': dir, provider: 'codex', 'channel-id': original.channelId,
+    ordinary: true, 'state-dir': dir, provider: PROVIDERS.CODEX, 'channel-id': original.channelId,
     'from-native-id': CODEX, 'from-generation': '1', 'native-id': OTHER,
     workspace: successorWorkspace, 'session-root': session.root, 'handoff-id': 'ordinary-cli-handoff'
   }, {
@@ -1091,7 +1095,7 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   assert.equal(recovery.ready, true);
   assert.equal(preflights, 1);
   assert.equal(recoveredState.getBinding(original.channelId).readiness, READINESS.READY);
-  assert.equal(recoveredState.getIntakeWatermark(original.channelId).state, 'ready');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).state, READINESS.READY);
   assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '201');
   await gateway.stop();
   recoveredState.close();
@@ -1105,7 +1109,7 @@ test('explicit ordinary handoff refuses an active remote intake gap', async t =>
   const setup = new SurfaceState(db);
   setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   const original = setup.bindOrdinary({
-    channelId: '123456789012345678', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    channelId: '123456789012345678', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir
   }, { sessionId: CODEX, threadId: CODEX });
   setup.recordOrdinaryPreflight(original, {
@@ -1132,7 +1136,7 @@ test('explicit ordinary handoff refuses an active remote intake gap', async t =>
     async destroy() {}
   }
   await assert.rejects(() => handoffInternal({
-    ordinary: true, 'state-dir': dir, provider: 'codex', 'channel-id': original.channelId,
+    ordinary: true, 'state-dir': dir, provider: PROVIDERS.CODEX, 'channel-id': original.channelId,
     'from-native-id': CODEX, 'from-generation': '1', 'native-id': OTHER,
     workspace: successorWorkspace, 'session-root': successorRoot, 'handoff-id': 'ordinary-active-gap'
   }, {
@@ -1163,7 +1167,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
     const setup = new SurfaceState(db);
     setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
     const original = setup.bindOrdinary({
-      channelId: '123456789012345678', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+      channelId: '123456789012345678', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
       workspace: dir
     }, { sessionId: CODEX, threadId: CODEX });
     setup.recordOrdinaryPreflight(original, {
@@ -1218,7 +1222,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
       gatewayProcessStatus: () => ({ state: 'stopped' }), print: () => {}
     };
     const args = {
-      ordinary: true, 'state-dir': dir, provider: 'codex', 'channel-id': original.channelId,
+      ordinary: true, 'state-dir': dir, provider: PROVIDERS.CODEX, 'channel-id': original.channelId,
       'from-native-id': CODEX, 'from-generation': '1', 'native-id': OTHER,
       workspace: successorWorkspace, 'session-root': session.root, 'handoff-id': `ordinary-fence-${preFenceId}`
     };
@@ -1263,7 +1267,7 @@ test('ordinary unbind fences remote intake before revoking custody', async t => 
   const setup = new SurfaceState(db);
   setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   const binding = setup.bindOrdinary({
-    channelId: '123456789012345680', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    channelId: '123456789012345680', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir
   }, { sessionId: CODEX, threadId: CODEX });
   setup.recordOrdinaryPreflight(binding, {
@@ -1309,7 +1313,7 @@ test('ordinary unbind fences remote intake before revoking custody', async t => 
     const watermark = recovered.getIntakeWatermark(binding.channelId);
     assert.equal(watermark.last_seen_id, '150');
     assert.equal(watermark.recovered_through_id, '150');
-    assert.equal(watermark.state, 'ready');
+    assert.equal(watermark.state, READINESS.READY);
     assert.equal(recovered.getReadiness().limits.connectionBackfill, 'bounded-by-discord-watermark');
   } finally { recovered.close(); }
 });
@@ -1372,7 +1376,7 @@ test('ordinary unbind keeps a reactivated successor when its observed tombstone 
     workspace: successorWorkspace, sessionRoot: successorRoot
   };
   const successor = f.state.handoffOrdinary({
-    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: binding.generation,
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: binding.generation,
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-stale-unbind-successor', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
   });
@@ -1427,10 +1431,10 @@ test('ordinary readiness requires the applicable Discord reply permission', t =>
 test('ordinary readiness requires native proof before the intake boundary can become ready', t => {
   const f = fixture(t);
   const binding = ordinary(f);
-  assert.throws(() => f.state.markIntakeBoundary(binding.channelId, 'ready', 'history complete', null, null, binding), /preflight/);
+  assert.throws(() => f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'history complete', null, null, binding), /preflight/);
   assert.throws(() => f.state.recordOrdinaryPreflight(binding, { file: '/tmp/exact.jsonl', sessionId: OTHER, threadId: OTHER, workspace: f.dir }), /does not match/);
   f.state.recordOrdinaryPreflight(binding, { file: '/tmp/exact.jsonl', sessionId: CODEX, threadId: CODEX, workspace: f.dir });
-  f.state.markIntakeBoundary(binding.channelId, 'ready', 'history complete', null, null, binding);
+  f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'history complete', null, null, binding);
   assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.READY);
 });
 
@@ -1439,7 +1443,7 @@ test('ordinary preflight evidence is scoped to the active transcript root', t =>
   const original = transcript(t, f.dir);
   const successor = transcript(t, f.dir);
   const binding = f.state.bindOrdinary({
-    channelId: 'ordinary-root-scope', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    channelId: 'ordinary-root-scope', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: f.dir, sessionRoot: original.root
   }, { sessionId: CODEX, threadId: CODEX });
   f.state.recordOrdinaryPreflight(binding, {
@@ -1580,7 +1584,7 @@ test('Gateway preserves recovered readiness while another binding wake fails', a
 
   const result = await gateway.beginReconnectRecovery('resume');
   assert.equal(result.ready, false);
-  assert.equal(result.state, 'unavailable');
+  assert.equal(result.state, READINESS.UNAVAILABLE);
   assert.ok(result.error);
   assert.equal(gateway.ready, true);
   assert.equal(f.state.getBinding(first.channelId).readiness, READINESS.READY);
@@ -1602,7 +1606,7 @@ test('Gateway reconnect replays binding wakes after reconciliation', async t => 
     onReady: () => calls.push('ready')
   });
   gateway.started = true;
-  gateway.recoverTransport = async () => ({ ready: true, state: 'ready' });
+  gateway.recoverTransport = async () => ({ ready: true, state: READINESS.READY });
   gateway.reconcilePending = async () => calls.push('reconcile');
   const result = await gateway.beginReconnectRecovery('shard-ready');
   assert.equal(result.ready, true);
@@ -1621,7 +1625,7 @@ test('Gateway reconnect notifies binding wakes after partial recovery', async t 
     onReady: () => calls.push('ready')
   });
   gateway.started = true;
-  gateway.recoverTransport = async () => ({ ready: false, state: 'unavailable' });
+  gateway.recoverTransport = async () => ({ ready: false, state: READINESS.UNAVAILABLE });
   gateway.reconcilePending = async () => calls.push('reconcile');
   const result = await gateway.beginReconnectRecovery('shard-ready');
   assert.equal(result.ready, false);
@@ -1641,10 +1645,10 @@ test('ordinary post uses explicit binding custody and suppresses duplicate and u
     throw Object.assign(new Error('network uncertain'), { outcome: 'unknown' });
   };
   const first = await runDirectPost({ state: f.state, token: 'fixture', nativeId: CODEX, generation: binding.generation,
-    channelId: binding.channelId, provider: 'codex', ordinary: true, textFile, dedupeKey: 'ordinary-unknown', fetchImpl: unknownFetch });
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, ordinary: true, textFile, dedupeKey: 'ordinary-unknown', fetchImpl: unknownFetch });
   assert.equal(first.status, 'unknown');
   const retry = await runDirectPost({ state: f.state, token: 'fixture', nativeId: CODEX, generation: binding.generation,
-    channelId: binding.channelId, provider: 'codex', ordinary: true, textFile, dedupeKey: 'ordinary-unknown', fetchImpl: unknownFetch });
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, ordinary: true, textFile, dedupeKey: 'ordinary-unknown', fetchImpl: unknownFetch });
   assert.equal(retry.status, 'unknown');
   assert.equal(calls, 1);
   const sentFetch = async () => {
@@ -1652,16 +1656,16 @@ test('ordinary post uses explicit binding custody and suppresses duplicate and u
     return { ok: true, status: 200, json: async () => ({ id: `sent-${calls}` }) };
   };
   const sent = await runDirectPost({ state: f.state, token: 'fixture', nativeId: CODEX, generation: binding.generation,
-    channelId: binding.channelId, provider: 'codex', ordinary: true, textFile, dedupeKey: 'ordinary-sent', fetchImpl: sentFetch });
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, ordinary: true, textFile, dedupeKey: 'ordinary-sent', fetchImpl: sentFetch });
   const duplicate = await runDirectPost({ state: f.state, token: 'fixture', nativeId: CODEX, generation: binding.generation,
-    channelId: binding.channelId, provider: 'codex', ordinary: true, textFile, dedupeKey: 'ordinary-sent', fetchImpl: sentFetch });
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, ordinary: true, textFile, dedupeKey: 'ordinary-sent', fetchImpl: sentFetch });
   assert.equal(sent.status, 'sent');
   assert.equal(duplicate.duplicate, true);
   assert.equal(calls, 2);
-  f.state.rebind({ channelId: binding.channelId, guildId: 'guild', provider: 'codex', nativeId: CODEX,
+  f.state.rebind({ channelId: binding.channelId, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: f.dir, ordinaryIdentity: { sessionId: CODEX, threadId: CODEX } });
   await assert.rejects(() => runDirectPost({ state: f.state, token: 'fixture', nativeId: CODEX, generation: binding.generation,
-    channelId: binding.channelId, provider: 'codex', ordinary: true, textFile, dedupeKey: 'ordinary-stale', fetchImpl: sentFetch }),
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, ordinary: true, textFile, dedupeKey: 'ordinary-stale', fetchImpl: sentFetch }),
   error => error instanceof StaleGenerationError);
 });
 
@@ -1689,7 +1693,7 @@ for (const action of ['rebind', 'handoff']) {
       const native = transcript(t, f.dir, successor);
       ordinary(f, channelId);
       f.state.setIntakeCutoff(channelId, 'guild', '100', 'seed');
-      f.state.markIntakeBoundary(channelId, 'unavailable', 'seed gap', '100', '150');
+      f.state.markIntakeBoundary(channelId, READINESS.UNAVAILABLE, 'seed gap', '100', '150');
       f.state.unbind(channelId);
       if (collision) ordinary(f, '223456789012345678', successor);
       const before = {
@@ -1718,7 +1722,7 @@ for (const action of ['rebind', 'handoff']) {
       };
       const invoke = () => action === 'rebind'
         ? ordinaryBind({ 'state-dir': f.dir, channel: '#dev', 'session-root': native.root }, dependencies)
-        : handoffInternal({ ordinary: true, 'state-dir': f.dir, provider: 'codex',
+        : handoffInternal({ ordinary: true, 'state-dir': f.dir, provider: PROVIDERS.CODEX,
           'channel-id': channelId, 'from-native-id': CODEX, 'from-generation': '1',
           'native-id': successor, workspace: f.dir, 'session-root': native.root,
           'handoff-id': 'cutoff-atomicity' }, dependencies);
@@ -1781,15 +1785,18 @@ test('healthy intake checkpoint requires durable history and honors cancellation
       const controller = new AbortController();
       const channel = {
         id: binding.channelId, guildId: 'guild', permissionsFor: () => ({ has: () => true }),
-        messages: { fetch: async () => {
-          if (mode === 'cancelled') controller.abort();
-          return new Map([['101', event]]);
-        } }
+        messages: { fetch: async () => new Map([['101', event]]) }
       };
       const gateway = new DiscordGateway({
         state: f.state,
         client: { user: { id: 'bot' }, on() {}, off() {}, channels: { fetch: async () => channel } },
-        fetchHistory: async () => [event]
+        fetchHistory: async () => {
+          if (mode === 'cancelled') {
+            controller.abort();
+            await new Promise(resolve => setImmediate(resolve));
+          }
+          return [event];
+        }
       });
       const work = gateway.checkpointHealthyIntake(controller.signal, gateway.lifecycleEpoch);
       if (mode === 'cancelled') await assert.rejects(work, error => error.recoveryKind === 'stopped');

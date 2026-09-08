@@ -3,6 +3,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { normalizeAttachments } = require('./attachments');
+const { queryDirectPostRows } = require('./state/direct-post');
+const { hasOrdinaryBindingReceipt, hasOrdinaryPreflightReceipt } = require('./state/ordinary-binding');
+const { intakeCutoffDecision, pauseOrdinaryHandoffIntake } = require('./state/intake');
 
 const SCHEMA_VERSION = '1.6';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -357,6 +360,7 @@ class SurfaceState {
     }
     this.dbPath = dbPath;
     this.failNextIntakeFlag = Boolean(options.failNextIntake);
+    this.ordinaryHandoffPauses = new Set();
   }
 
   createSchema() {
@@ -496,6 +500,24 @@ class SurfaceState {
         ON receipts(json_extract(detail, '$.messageId')) WHERE kind='direct-post-outcome';
       CREATE INDEX IF NOT EXISTS direct_post_outcome_nonce_idx
         ON receipts(json_extract(detail, '$.nonce')) WHERE kind='direct-post-outcome';
+      CREATE INDEX IF NOT EXISTS receipts_channel_kind_idx
+        ON receipts(json_extract(detail, '$.channelId'), kind);
+      CREATE INDEX IF NOT EXISTS ordinary_bound_identity_idx
+        ON receipts(
+          json_extract(detail, '$.channelId'),
+          json_extract(detail, '$.nativeId'),
+          json_extract(detail, '$.workspace'),
+          json_extract(detail, '$.generation')
+        ) WHERE kind='ordinary-bound';
+      CREATE INDEX IF NOT EXISTS ordinary_preflight_identity_idx
+        ON receipts(
+          json_extract(detail, '$.channelId'),
+          json_extract(detail, '$.nativeId'),
+          json_extract(detail, '$.workspace'),
+          json_extract(detail, '$.generation'),
+          json_extract(detail, '$.sessionRoot'),
+          json_extract(detail, '$.outcome')
+        ) WHERE kind='ordinary-native-preflight';
     `);
   }
 
@@ -1040,13 +1062,7 @@ class SurfaceState {
 
   isOrdinaryBindingRecord(binding) {
     if (!binding || binding.provider !== PROVIDERS.CODEX || binding.conductorId || binding.repoKey) return false;
-    return Boolean(this.db.prepare(`SELECT 1 FROM receipts
-      WHERE kind='ordinary-bound'
-        AND json_extract(detail, '$.channelId')=?
-        AND json_extract(detail, '$.nativeId')=?
-        AND json_extract(detail, '$.workspace')=?
-        AND json_extract(detail, '$.generation')=?
-      LIMIT 1`).get(binding.channelId, binding.nativeId, binding.workspace, binding.generation));
+    return hasOrdinaryBindingReceipt(this, binding);
   }
 
   isOrdinaryBinding(binding) {
@@ -1055,15 +1071,7 @@ class SurfaceState {
 
   hasOrdinaryPreflight(binding) {
     if (!this.isOrdinaryBinding(binding)) return false;
-    return Boolean(this.db.prepare(`SELECT 1 FROM receipts
-      WHERE kind='ordinary-native-preflight'
-        AND json_extract(detail, '$.channelId')=?
-        AND json_extract(detail, '$.nativeId')=?
-        AND json_extract(detail, '$.workspace')=?
-        AND json_extract(detail, '$.generation')=?
-        AND json_extract(detail, '$.sessionRoot') IS ?
-        AND json_extract(detail, '$.outcome')='verified'
-      LIMIT 1`).get(binding.channelId, binding.nativeId, binding.workspace, binding.generation, binding.sessionRoot || null));
+    return hasOrdinaryPreflightReceipt(this, binding);
   }
 
   recordOrdinaryPreflight(binding, detail = {}) {
@@ -1293,7 +1301,7 @@ class SurfaceState {
         existing.generation === fromGeneration + 1 && existing.workspace === input.workspace &&
         (existing.sessionRoot || null) === (input.sessionRoot || null);
       if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
-      return this.transaction(() => {
+      const retryResult = this.transaction(() => {
         const current = this.getBinding(channelId);
         if (!current || !bindingMatchesExpected(current, existing) || !current.active ||
           current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
@@ -1306,6 +1314,8 @@ class SurfaceState {
         });
         return { ...current, handoffReconciled: true };
       });
+      this.ordinaryHandoffPauses.delete(channelId);
+      return retryResult;
     }
     if (existing.provider !== PROVIDERS.CODEX || existing.conductorId || existing.repoKey ||
       existing.nativeId !== fromNativeId || existing.generation !== fromGeneration) {
@@ -1319,7 +1329,7 @@ class SurfaceState {
       throw new UnresolvedWorkError('cannot handoff while work is unresolved');
     }
     this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
-    return this.transaction(() => {
+    const handoffResult = this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary handoff source identity is stale');
       if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
@@ -1358,6 +1368,8 @@ class SurfaceState {
       });
       return this.getBinding(channelId);
     });
+    this.ordinaryHandoffPauses.delete(channelId);
+    return handoffResult;
   }
 
   handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId }) {
@@ -1421,7 +1433,7 @@ class SurfaceState {
   }
 
   hasUnresolvedOrdinaryPost(channelId) {
-    const rows = this.directPostRows();
+    const rows = this.directPostRows(null, channelId);
     const outcomes = new Map(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail?.attemptId)
       .map(row => [row.detail.attemptId, row]));
     const requests = new Map();
@@ -1604,13 +1616,12 @@ class SurfaceState {
   }
 
   pauseOrdinaryHandoffIntake(channelId, expectedBinding = null) {
-    return this.markIntakeBoundary(
+    return pauseOrdinaryHandoffIntake(
+      this,
       channelId,
+      expectedBinding,
       READINESS.PENDING,
-      INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF,
-      null,
-      null,
-      expectedBinding
+      INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF
     );
   }
 
@@ -1736,7 +1747,7 @@ class SurfaceState {
         const result = this.transaction(() => {
           const binding = this.getBinding(event.channelId);
           if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
-          if (this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+          if (this.ordinaryHandoffPauses.has(event.channelId) || this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
             this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
             return this.reject('handoff-intake-paused');
           }
@@ -1752,7 +1763,7 @@ class SurfaceState {
     return this.transaction(() => {
       const binding = this.getBinding(event.channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
-      if (this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+      if (this.ordinaryHandoffPauses.has(event.channelId) || this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
         this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
         return this.reject('handoff-intake-paused');
       }
@@ -1770,10 +1781,10 @@ class SurfaceState {
       }
       const committed = this.getMessage(event.id);
       if (committed) return { accepted: false, duplicate: true, reason: 'duplicate-message', message: committed };
-      const comparableIntakeCutoff = /^\d+$/.test(event.id) && /^\d+$/.test(intakeCutoff || '');
-      if (comparableIntakeCutoff && compareDiscordIds(event.id, intakeCutoff) <= 0) {
-        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'before-intake-cutoff', ready });
-        return this.reject('before-intake-cutoff');
+      const cutoffReason = intakeCutoffDecision(event.id, intakeCutoff, compareDiscordIds);
+      if (cutoffReason) {
+        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: cutoffReason, ready });
+        return this.reject(cutoffReason);
       }
       if (this.failNextIntakeFlag) {
         this.failNextIntakeFlag = false;
@@ -2162,16 +2173,15 @@ class SurfaceState {
     });
   }
 
-  directPostRows(requestId = null) {
-    if (requestId !== null) assertText(requestId, 'requestId', 256);
-    const rows = this.db.prepare(`SELECT id, kind, detail, created_at FROM receipts
-      WHERE discord_id IS NULL AND kind IN (?, ?) ORDER BY id`).all(DIRECT_POST_ATTEMPT, DIRECT_POST_OUTCOME);
-    return rows.map(row => {
-      const detail = parseJson(row.detail, null);
-      if (!detail || detail.journal !== 'direct-post-v1') throw new StateCorruptError('direct post receipt is malformed');
-      if (detail.inReplyTo === undefined) detail.inReplyTo = null;
-      return { id: Number(row.id), kind: row.kind, detail, createdAt: row.created_at };
-    }).filter(row => requestId === null || row.detail.requestId === requestId);
+  directPostRows(requestId = null, channelId = null) {
+    return queryDirectPostRows({
+      db: this.db,
+      assertText,
+      parseJson,
+      StateCorruptError,
+      attemptKind: DIRECT_POST_ATTEMPT,
+      outcomeKind: DIRECT_POST_OUTCOME
+    }, requestId, channelId);
   }
 
   directPostOwnerIdentity(pid) {
@@ -2518,6 +2528,7 @@ class SurfaceState {
 
   close() {
     if (!this.db) return;
+    this.ordinaryHandoffPauses.clear();
     this.db.close();
     this.db = null;
   }

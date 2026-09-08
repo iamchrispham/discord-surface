@@ -1,5 +1,5 @@
 const fs = require('node:fs');
-const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
+const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { conductorMarkerMatches } = require('./topic');
 
@@ -12,9 +12,9 @@ function recoveryError(kind, detail) {
 }
 
 function waitForRecoveryOperation(operation, signal, deadline, onDeadline = null) {
-  if (signal?.aborted) return Promise.reject(recoveryError('stopped', 'Discord recovery was stopped'));
+  if (signal?.aborted) return Promise.reject(recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord recovery was stopped'));
   const remaining = deadline - Date.now();
-  if (remaining <= 0) return Promise.reject(recoveryError('deadline', 'Discord recovery deadline exceeded'));
+  if (remaining <= 0) return Promise.reject(recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Discord recovery deadline exceeded'));
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer;
@@ -28,9 +28,9 @@ function waitForRecoveryOperation(operation, signal, deadline, onDeadline = null
       cleanup();
       callback(value);
     };
-    const onAbort = () => finish(reject, recoveryError('stopped', 'Discord recovery was stopped'));
+    const onAbort = () => finish(reject, recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord recovery was stopped'));
     timer = setTimeout(() => {
-      try { onDeadline?.(); } finally { finish(reject, recoveryError('deadline', 'Discord recovery deadline exceeded')); }
+      try { onDeadline?.(); } finally { finish(reject, recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Discord recovery deadline exceeded')); }
     }, remaining);
     signal?.addEventListener('abort', onAbort, { once: true });
     Promise.resolve().then(operation).then(
@@ -52,93 +52,6 @@ function compareDiscordIds(left, right) {
   } catch {
     return String(left).localeCompare(String(right));
   }
-}
-
-async function latestChannelMessageId(channel, options = {}) {
-  const cached = typeof channel?.lastMessageId === 'string' && channel.lastMessageId.length > 0 ? channel.lastMessageId : null;
-  if (typeof channel?.messages?.fetch !== 'function') return cached;
-  const scopedBefore = options != null && Object.prototype.hasOwnProperty.call(options, 'before');
-  const fetched = await channel.messages.fetch({ limit: 1, ...options });
-  let message = null;
-  if (Array.isArray(fetched)) message = fetched[0];
-  else if (typeof fetched?.first === 'function') message = fetched.first();
-  else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
-  if (typeof message?.id === 'string' && message.id.length > 0) return message.id;
-  if (scopedBefore) return null;
-  return cached;
-}
-
-async function createHandoffFence(channel, operation = 'ordinary handoff') {
-  if (typeof channel?.send !== 'function') throw new Error(`${operation} requires a Discord server fence`);
-  const message = await channel.send({
-    content: '\u200b',
-    allowedMentions: { parse: [] }
-  });
-  if (typeof message?.id !== 'string' || message.id.length === 0) {
-    throw new Error('Discord handoff fence has no stable ID');
-  }
-  return message;
-}
-
-async function deleteHandoffFence(message) {
-  if (typeof message?.delete !== 'function') return;
-  try { await message.delete(); } catch {}
-}
-
-function serverDerivedChannelCutoff(channel) {
-  return typeof channel?.id === 'string' && /^\d+$/.test(channel.id) ? channel.id : null;
-}
-
-function historyMessages(result) {
-  if (!result) return [];
-  if (Array.isArray(result)) return result;
-  if (typeof result.values === 'function') return [...result.values()];
-  if (typeof result[Symbol.iterator] === 'function') return [...result];
-  return [];
-}
-
-async function assertOrdinaryIntakeRange(channel, state, binding, recoveredThrough, fenceId, operation) {
-  if (!recoveredThrough) throw new Error(`${operation} requires a confirmed Discord intake boundary`);
-  if (typeof channel?.messages?.fetch !== 'function') throw new Error(`${operation} requires Discord history range access`);
-  let after = recoveredThrough;
-  let pages = 0;
-  let total = 0;
-  while (pages < RECOVERY_LIMITS.maxPages && total < RECOVERY_LIMITS.maxMessages) {
-    const page = historyMessages(await channel.messages.fetch({
-      limit: RECOVERY_LIMITS.pageSize,
-      after
-    }));
-    pages += 1;
-    if (!page.length) {
-      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
-      return;
-    }
-    if (page.some(message => typeof message?.id !== 'string' || message.id.length === 0)) {
-      throw new Error(`${operation} encountered a Discord message without a stable ID`);
-    }
-    page.sort((left, right) => compareDiscordIds(left.id, right.id));
-    const reachedFence = page.some(message => compareDiscordIds(message.id, fenceId) >= 0);
-    const fresh = page.filter(message => compareDiscordIds(message.id, after) > 0 && compareDiscordIds(message.id, fenceId) < 0);
-    if (!fresh.length) {
-      if (reachedFence || page.length < RECOVERY_LIMITS.pageSize) {
-        if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
-        return;
-      }
-      throw new Error(`${operation} requires Discord intake to be durably drained`);
-    }
-    for (const message of fresh) {
-      if (total >= RECOVERY_LIMITS.maxMessages || !state.hasIntakeEvidence(message.id)) {
-        throw new Error(`${operation} requires Discord intake to be durably drained`);
-      }
-      after = message.id;
-      total += 1;
-    }
-    if (reachedFence || page.length < RECOVERY_LIMITS.pageSize) {
-      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
-      return;
-    }
-  }
-  throw new Error(`${operation} requires Discord intake to be durably drained`);
 }
 
 function discordIdAfter(left, right) {
@@ -776,6 +689,11 @@ class DiscordGateway {
     return !this.stopping && this.lifecycleEpoch === epoch;
   }
 
+  pauseLiveDispatch() {
+    if (this.stopping) return;
+    this.ready = false;
+  }
+
   pauseConnection(detail) {
     if (this.stopping) return;
     this.ready = false;
@@ -829,9 +747,9 @@ class DiscordGateway {
       const token = readSecret(secretFile);
       this.discordToken = token;
       await this.client.login(token);
-      if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during login');
+      if (!this.isCurrentLifecycle(epoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord startup was stopped during login');
       const recovery = await this.recoverTransport('startup', epoch);
-      if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during recovery');
+      if (!this.isCurrentLifecycle(epoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord startup was stopped during recovery');
       if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
       this.transportReady = true;
       this.started = true;
@@ -921,7 +839,7 @@ class DiscordGateway {
         return result;
       })
       .catch(error => {
-        if (recoveryKind(error) !== 'stopped') this.logger(`Discord live intake checkpoint failed: ${error.message}`);
+        if (recoveryKind(error) !== CODEX_VALIDATION_KINDS.STOPPED) this.logger(`Discord live intake checkpoint failed: ${error.message}`);
       })
       .finally(() => {
         if (this.liveCheckpointPromise === checkpoint) this.liveCheckpointPromise = null;
@@ -955,7 +873,7 @@ class DiscordGateway {
     const bindings = this.state.listBindings().filter(binding => binding.active && binding.readiness === READINESS.READY);
     const advancedChannels = new Set();
     for (const binding of bindings) {
-      if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError('stopped', 'Discord live intake checkpoint was stopped');
+      if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord live intake checkpoint was stopped');
       const watermark = this.state.getIntakeWatermark(binding.channelId);
       if (!watermark?.recovered_through_id || typeof this.state.hasIntakeEvidence !== 'function') continue;
       if (typeof this.client?.channels?.fetch !== 'function') continue;
@@ -970,7 +888,7 @@ class DiscordGateway {
         let total = 0;
         let complete = false;
         while (pages < this.historyMaxPages && total < this.historyMaxMessages && Date.now() < deadline) {
-          if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError('stopped', 'Discord live intake checkpoint was stopped');
+          if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord live intake checkpoint was stopped');
           const page = this.historyMessages(await waitForRecoveryOperation(
             () => this.fetchHistory(channel, { limit: this.historyPageLimit, after, signal }),
             signal,
@@ -996,14 +914,12 @@ class DiscordGateway {
           if (page.length < this.historyPageLimit) { complete = true; break; }
         }
         if (!complete || !after) continue;
-        await waitForRecoveryOperation(() => latestChannelMessageId(channel), signal, deadline);
-        if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError('stopped', 'Discord live intake checkpoint was stopped');
         const checkpointed = this.state.checkpointIntake(binding.channelId, after, binding);
         if (checkpointed?.recovered_through_id && compareDiscordIds(checkpointed.recovered_through_id, watermark.recovered_through_id) > 0) {
           advancedChannels.add(binding.channelId);
         }
       } catch (error) {
-        if (recoveryKind(error) === 'stopped') throw error;
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) throw error;
       }
     }
     return advancedChannels;
@@ -1019,8 +935,8 @@ class DiscordGateway {
       throw new Error('Codex delivery provider is unavailable for ordinary binding');
     }
     const proof = await this.ordinaryNativePreflight(binding, options);
-    if (options.signal?.aborted) throw recoveryError('stopped', 'Codex native preflight was stopped');
-    if (options.deadline !== undefined && Date.now() >= options.deadline) throw recoveryError('deadline', 'Codex native preflight deadline exceeded');
+    if (options.signal?.aborted) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Codex native preflight was stopped');
+    if (options.deadline !== undefined && Date.now() >= options.deadline) throw recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Codex native preflight deadline exceeded');
     if (!proof || typeof proof !== 'object') throw new Error('Codex native preflight returned no proof');
     if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'ordinary Codex binding changed during native preflight');
     const recorded = this.state.recordOrdinaryPreflight(binding, proof);
@@ -1055,9 +971,9 @@ class DiscordGateway {
         if (!channel) throw new Error('Discord channel is unavailable');
       } catch (error) {
         const kind = recoveryKind(error);
-        if (kind === 'stopped') return { ready: false, state: 'stopped' };
-        await this.recordBoundary(binding, null, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-        failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+        if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
+        await this.recordBoundary(binding, null, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+        failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
         continue;
       }
       if (!this.isCurrentBinding(binding)) {
@@ -1084,13 +1000,13 @@ class DiscordGateway {
           );
         } catch (error) {
           const kind = recoveryKind(error);
-          if (kind === 'stopped') return { ready: false, state: 'stopped' };
+          if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
           if (kind === 'stale') {
             failure ||= { ready: false, state: 'unavailable', error };
             continue;
           }
-          await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-          failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+          await this.recordBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+          failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
           continue;
         } finally {
           signal?.removeEventListener('abort', relayAbort);
@@ -1124,9 +1040,9 @@ class DiscordGateway {
         try { baseline = this.historyMessages(await waitForRecoveryOperation(() => this.fetchHistory(channel, { limit: 1, signal }), signal, deadline)); }
         catch (error) {
           const kind = recoveryKind(error);
-          if (kind === 'stopped') return { ready: false, state: 'stopped' };
-          await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-          failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+          if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
+          await this.recordBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+          failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
           continue;
         }
         if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
@@ -1183,7 +1099,7 @@ class DiscordGateway {
           for (const message of fresh) {
             if (total >= this.historyMaxMessages) break;
             if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-            if (Date.now() >= deadline) throw recoveryError('deadline', 'Discord recovery deadline exceeded while admitting history');
+            if (Date.now() >= deadline) throw recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Discord recovery deadline exceeded while admitting history');
             attemptedId = message.id;
             const admitted = await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id, binding);
             if (admitted?.stale) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
@@ -1199,13 +1115,13 @@ class DiscordGateway {
         }
       } catch (error) {
         const kind = recoveryKind(error);
-        if (kind === 'stopped') return { ready: false, state: 'stopped' };
+        if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
         if (kind === 'stale') {
           failure ||= { ready: false, state: 'unavailable', error };
           continue;
         }
-        await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, attemptedId || after, signal, deadline);
-        failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+        await this.recordBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, attemptedId || after, signal, deadline);
+        failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
         continue;
       }
       if (!complete) {
@@ -1277,7 +1193,7 @@ class DiscordGateway {
       if (blockedOwners.has(key)) continue;
       let channel;
       try { channel = await waitForRecoveryOperation(() => this.client.channels.fetch(message.channelId), signal, deadline); } catch (error) {
-        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before).filter(allowed);
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
         continue;
@@ -1314,7 +1230,7 @@ class DiscordGateway {
           result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
         }
       } catch (error) {
-        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before).filter(allowed);
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
         continue;
@@ -1369,14 +1285,9 @@ module.exports = {
   DiscordGateway,
   classifyReplyError,
   createSurfaceConsumer,
-  createHandoffFence,
-  deleteHandoffFence,
   discordIdAfter,
   eventToInput,
-  latestChannelMessageId,
   readSecret,
   requireInstalled,
-  serverDerivedChannelCutoff,
-  assertOrdinaryIntakeRange,
   sendDiscordMessage,
 };

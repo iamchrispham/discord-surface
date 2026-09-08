@@ -1,3 +1,5 @@
+import * as path from 'node:path';
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type OrdinaryProvider = 'codex';
@@ -48,7 +50,6 @@ export interface OrdinaryCodexNativeProof {
 export interface InvocationEnvironment {
   CODEX_SESSION_ID?: string;
   CODEX_THREAD_ID?: string;
-  PWD?: string;
 }
 
 export const ORDINARY_BINDING_DECISIONS = {
@@ -69,12 +70,12 @@ function requiredText(value: unknown, name: string, max = 4096): string {
 function uuid(value: unknown, name: string): string {
   const result = requiredText(value, name, 128);
   if (!UUID_PATTERN.test(result)) throw new Error(`${name} must be a UUID`);
-  return result;
+  return result.toLowerCase();
 }
 
 function absolutePath(value: unknown, name: string): string {
   const result = requiredText(value, name);
-  if (!result.startsWith('/')) throw new Error(`${name} must be absolute`);
+  if (!path.isAbsolute(result)) throw new Error(`${name} must be absolute`);
   return result;
 }
 

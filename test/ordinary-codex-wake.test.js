@@ -119,30 +119,39 @@ setInterval(() => {}, 1000);
   fs.writeFileSync(preload, preloadSource, { mode: 0o600 });
 
   t.after(async () => {
+    const cleanupErrors = [];
     try {
       if (state) state.close();
-    } finally {
-      state = null;
-      try {
-        if (child && child.exitCode === null && child.signalCode === null) {
-          if (!fs.existsSync(releaseHistory)) fs.writeFileSync(releaseHistory, 'cleanup-release\n', { mode: 0o600 });
-          child.kill('SIGTERM');
-        }
-        try {
-          await waitForExit(child);
-        } catch (error) {
-          if (child && child.exitCode === null && child.signalCode === null) {
-            child.kill('SIGKILL');
-            await waitForExit(child);
-          }
-          throw error;
-        }
-        assert.ok(!child || child.exitCode !== null || child.signalCode !== null);
-      } finally {
-        fs.rmSync(fixtureDir, { recursive: true, force: true });
-        assert.equal(fs.existsSync(fixtureDir), false);
-      }
+    } catch (error) {
+      cleanupErrors.push(error);
     }
+    state = null;
+    try {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        if (!fs.existsSync(releaseHistory)) fs.writeFileSync(releaseHistory, 'cleanup-release\n', { mode: 0o600 });
+        try { child.kill('SIGTERM'); } catch (error) { cleanupErrors.push(error); }
+      }
+      try {
+        await waitForExit(child);
+      } catch (error) {
+        cleanupErrors.push(error);
+        if (child && child.exitCode === null && child.signalCode === null) {
+          try { child.kill('SIGKILL'); } catch (killError) { cleanupErrors.push(killError); }
+          try { await waitForExit(child); } catch (forcedError) { cleanupErrors.push(forcedError); }
+        }
+      }
+      try { assert.ok(!child || child.exitCode !== null || child.signalCode !== null); }
+      catch (error) { cleanupErrors.push(error); }
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      fs.rmSync(fixtureDir, { recursive: true, force: true });
+      assert.equal(fs.existsSync(fixtureDir), false);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'ordinary wake fixture cleanup failed');
   });
 
   state = new SurfaceState(db);

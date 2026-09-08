@@ -5,6 +5,14 @@ const os = require('node:os');
 const path = require('node:path');
 const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('./state');
 
+const CODEX_VALIDATION_KINDS = Object.freeze({
+  UNSUPPORTED_ROOT: 'unsupported-root',
+  STOPPED: 'stopped',
+  DEADLINE: 'deadline'
+});
+
+const VALIDATION_SCAN_BATCH_SIZE = 64;
+
 function sleep(ms, signal) {
   if (signal?.aborted) return Promise.resolve();
   return new Promise(resolve => {
@@ -86,12 +94,12 @@ function walk(dir, result = [], depth = 0) {
 function assertValidationActive(options = {}) {
   if (options.signal?.aborted) {
     const error = new Error('Codex transcript validation was stopped');
-    error.recoveryKind = 'stopped';
+    error.recoveryKind = CODEX_VALIDATION_KINDS.STOPPED;
     throw error;
   }
   if (options.deadline !== undefined && Date.now() >= options.deadline) {
     const error = new Error('Codex transcript validation deadline exceeded');
-    error.recoveryKind = 'deadline';
+    error.recoveryKind = CODEX_VALIDATION_KINDS.DEADLINE;
     throw error;
   }
 }
@@ -131,12 +139,18 @@ async function* walkAsync(dir, depth = 0, options = {}) {
   let entries;
   try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
   catch (error) { if (error?.recoveryKind) throw error; return; }
+  let scanned = 0;
   for (const entry of entries) {
     assertValidationActive(options);
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) yield* walkAsync(full, depth + 1, options);
     else if (entry.isFile() && entry.name.endsWith('.jsonl')) yield full;
-    await new Promise(resolve => setImmediate(resolve));
+    scanned += 1;
+    if (scanned >= VALIDATION_SCAN_BATCH_SIZE) {
+      scanned = 0;
+      await new Promise(resolve => setImmediate(resolve));
+      assertValidationActive(options);
+    }
   }
 }
 
@@ -268,7 +282,9 @@ function readCodexSessionIdentity(nativeId, root = sessionRoot()) {
 
 function codexHomeForSessionRoot(root) {
   if (!path.isAbsolute(root) || path.basename(root) !== 'sessions') {
-    throw new Error('Unsupported Codex session root: queue requires <CODEX_HOME>/sessions');
+    const error = new Error('Unsupported Codex session root: queue requires <CODEX_HOME>/sessions');
+    error.recoveryKind = CODEX_VALIDATION_KINDS.UNSUPPORTED_ROOT;
+    throw error;
   }
   return path.dirname(root);
 }
@@ -472,7 +488,7 @@ class CodexProvider {
     return { ...result, cursor };
   }
 
-  observe(message, outcome, options) {
+  observe(message, outcome, options = {}) {
     return observeCodexReply(message.nativeId, outcome.cursor || message.observerCursor, {
       ...options,
       marker: `[[discord-surface:${message.id}]]`,
@@ -646,6 +662,7 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
 
 module.exports = {
   attachmentPrompt,
+  CODEX_VALIDATION_KINDS,
   ClaudeProvider,
   CodexProvider,
   claudeEvent,
