@@ -123,15 +123,24 @@ function awaitWithDeadline(task, deadline) {
 
 async function* walkAsync(dir, depth = 0, options = undefined) {
   const limitReached = () => options && (Date.now() >= options.deadline || options.entries >= options.maxEntries);
-  if (depth > 5 || limitReached()) return;
+  if (depth > 5 || limitReached()) {
+    if (options) options.complete = false;
+    return;
+  }
   let entries;
   try {
     entries = options
       ? await awaitWithDeadline(() => fs.promises.readdir(dir, { withFileTypes: true }), options.deadline)
       : await fs.promises.readdir(dir, { withFileTypes: true });
-  } catch { return; }
+  } catch {
+    if (options) options.complete = false;
+    return;
+  }
   for (const entry of entries) {
-    if (limitReached()) return;
+    if (limitReached()) {
+      if (options) options.complete = false;
+      return;
+    }
     if (options) options.entries += 1;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) yield* walkAsync(full, depth + 1, options);
@@ -147,7 +156,7 @@ async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
   validateNativeId(nativeId);
   const matches = [];
   const deadline = Date.now() + CODEX_SESSION_DISCOVERY_TIMEOUT_MS;
-  const scan = { deadline, maxEntries: CODEX_SESSION_DISCOVERY_MAX_ENTRIES, entries: 0 };
+  const scan = { deadline, maxEntries: CODEX_SESSION_DISCOVERY_MAX_ENTRIES, entries: 0, complete: true };
   for await (const file of walkAsync(root, 0, scan)) {
     if (!file.includes(nativeId)) continue;
     try {
@@ -160,8 +169,11 @@ async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
         file, sessionId, threadId,
         workspace: typeof payload.cwd === 'string' ? payload.cwd : null
       });
-    } catch {}
+    } catch {
+      scan.complete = false;
+    }
   }
+  if (!scan.complete) return null;
   if (matches.length === 0) return null;
   if (matches.length > 1) return { ambiguous: true, files: matches.map(match => match.file) };
   return matches[0];
