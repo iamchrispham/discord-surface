@@ -790,10 +790,9 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
     }]);
     if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
-    let channelCutoff = null;
+    const channelCutoff = await latestChannelMessageId(channel);
     let recoveredThrough = null;
     if (current.active) {
-      channelCutoff = await latestChannelMessageId(channel);
       const watermark = state.getIntakeWatermark(channelId);
       recoveredThrough = watermark?.recovered_through_id || null;
       const liveCustodyAhead = recoveredThrough && watermark?.last_seen_id && discordIdAfter(watermark.last_seen_id, recoveredThrough);
@@ -802,20 +801,14 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
         throw new Error('ordinary handoff requires Discord intake to be durably drained');
       }
     }
-    const handoffCutoff = current.active ? (channelCutoff || recoveredThrough) : null;
+    const handoffCutoff = channelCutoff || (current.active ? recoveredThrough : null) ||
+      serverDerivedChannelCutoff(channel);
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
       sessionRoot: validationRoot, handoffId, intakeCutoff: handoffCutoff,
       identity: { sessionId: nativeProof.sessionId, threadId: nativeProof.threadId },
       nativeProof: { ...nativeProof, sessionRoot: validationRoot }
     });
-    const fencedCutoff = await latestChannelMessageId(channel);
-    const adoptionCutoff = fencedCutoff || handoffCutoff || serverDerivedChannelCutoff(channel);
-    if (adoptionCutoff) {
-      const fenced = state.setIntakeCutoff(channelId, binding.guildId, adoptionCutoff,
-        'ordinary handoff adoption cutoff', binding);
-      if (!fenced) throw new Error('ordinary handoff binding changed before intake cutoff was fenced');
-    }
     const gatewayWake = wake(paths, {
       status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
       kill: dependencies.killProcess || process.kill

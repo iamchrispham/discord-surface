@@ -1026,6 +1026,7 @@ class SurfaceState {
     };
     return this.rebind(rebound, {
       intakeCutoff,
+      rejectUnresolvedOrdinaryPost: existing.active && !sessionRootMatches,
       resetIntake: !sessionRootMatches,
       sessionRootOverride: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : undefined
     });
@@ -1077,7 +1078,12 @@ class SurfaceState {
     });
   }
 
-  rebind(binding, { resetIntake = false, sessionRootOverride = undefined, intakeCutoff = null } = {}) {
+  rebind(binding, {
+    resetIntake = false,
+    sessionRootOverride = undefined,
+    intakeCutoff = null,
+    rejectUnresolvedOrdinaryPost = false
+  } = {}) {
     if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     const channelId = assertText(binding.channelId, 'channelId', 128);
     const existing = this.getBinding(channelId);
@@ -1110,6 +1116,9 @@ class SurfaceState {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
+      if (rejectUnresolvedOrdinaryPost && ordinary && this.hasUnresolvedOrdinaryPost(channelId)) {
+        throw new UnresolvedWorkError('cannot rebind while an ordinary post is unresolved');
+      }
       this.assertLegacyMigrationSafe(channelId);
       this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
       if (intakeCutoff !== null) {
@@ -1264,10 +1273,17 @@ class SurfaceState {
         (existing.sessionRoot || null) === (input.sessionRoot || null);
       if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
       return this.transaction(() => {
+        const current = this.getBinding(channelId);
+        if (!current || !bindingMatchesExpected(current, existing) || !current.active ||
+          current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
+          current.nativeId !== nativeId || current.generation !== fromGeneration + 1 ||
+          current.workspace !== input.workspace || (current.sessionRoot || null) !== (input.sessionRoot || null)) {
+          throw new StaleGenerationError('ordinary handoff retry binding identity is stale');
+        }
         this.receipt(null, 'ordinary-handoff-retry', {
-          channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: existing.generation
+          channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: current.generation
         });
-        return { ...existing, handoffReconciled: true };
+        return { ...current, handoffReconciled: true };
       });
     }
     if (existing.provider !== PROVIDERS.CODEX || existing.conductorId || existing.repoKey ||
