@@ -373,8 +373,15 @@ function readClaudeSessionIdentity(nativeId, transcriptFile) {
   const stat = fs.statSync(transcriptFile);
   if (!stat.isFile()) throw new Error('Claude transcript path must be a regular file');
   const matches = readClaudeSessionMetadata(transcriptFile).filter(row => {
-    const sessionId = row?.sessionId || row?.payload?.session_id;
-    return sessionId === nativeId && row?.entrypoint === 'cli' && typeof row?.version === 'string' &&
+    const sessionId = row?.sessionId;
+    const payloadSessionId = row?.payload?.session_id;
+    const hasSessionId = sessionId !== undefined && sessionId !== null;
+    const hasPayloadSessionId = payloadSessionId !== undefined && payloadSessionId !== null;
+    if (hasSessionId && hasPayloadSessionId && sessionId !== payloadSessionId) return false;
+    let candidateSessionId = null;
+    if (hasSessionId) candidateSessionId = sessionId;
+    else if (hasPayloadSessionId) candidateSessionId = payloadSessionId;
+    return candidateSessionId === nativeId && row?.entrypoint === 'cli' && typeof row?.version === 'string' &&
       typeof row?.cwd === 'string' && path.isAbsolute(row.cwd);
   });
   if (!matches.length) throw new Error('Claude transcript identity or workspace is unavailable');

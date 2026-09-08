@@ -1296,6 +1296,12 @@ test('ordinary readiness requires the applicable Discord reply permission', t =>
   assert.equal(gateway.historyPermission(archivedThread, { requireSend: true }).allowed, true);
   const lockedThread = { isThread: () => true, archived: true, locked: true, permissionsFor: channel.permissionsFor };
   assert.equal(gateway.historyPermission(lockedThread, { requireSend: true }).allowed, false);
+  permissions.add(PermissionFlagsBits.ManageThreads);
+  assert.equal(gateway.historyPermission(lockedThread, { requireSend: true }).allowed, true);
+  permissions.delete(PermissionFlagsBits.ManageThreads);
+  permissions.add(PermissionFlagsBits.Administrator);
+  assert.equal(gateway.historyPermission(lockedThread, { requireSend: true }).allowed, true);
+  permissions.delete(PermissionFlagsBits.Administrator);
 });
 
 test('ordinary readiness requires native proof before the intake boundary can become ready', t => {

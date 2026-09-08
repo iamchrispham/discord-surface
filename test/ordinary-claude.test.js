@@ -95,6 +95,24 @@ test('ordinary Claude request requires exact harness, UUID, endpoint, and transc
   }), /harness/);
 });
 
+test('ordinary Claude accepts single or equal transcript IDs and rejects conflicts', t => {
+  const f = fixture(t, { bind: false });
+  const metadata = { cwd: f.dir, entrypoint: 'cli', version: '1.0.0' };
+  const write = (name, row) => {
+    const file = path.join(f.dir, name);
+    fs.writeFileSync(file, `${JSON.stringify(row)}\n`, { mode: 0o600 });
+    return file;
+  };
+  const topLevel = write('top-level.jsonl', { ...metadata, sessionId: CLAUDE });
+  const payloadOnly = write('payload-only.jsonl', { ...metadata, payload: { session_id: CLAUDE } });
+  const equalAliases = write('equal-aliases.jsonl', { ...metadata, sessionId: CLAUDE, payload: { session_id: CLAUDE } });
+  const conflicting = write('conflicting-aliases.jsonl', { ...metadata, sessionId: CLAUDE, payload: { session_id: OTHER } });
+  assert.equal(validateClaudeSessionIdentity(CLAUDE, topLevel).sessionId, CLAUDE);
+  assert.equal(validateClaudeSessionIdentity(CLAUDE, payloadOnly).sessionId, CLAUDE);
+  assert.equal(validateClaudeSessionIdentity(CLAUDE, equalAliases).sessionId, CLAUDE);
+  assert.throws(() => validateClaudeSessionIdentity(CLAUDE, conflicting), /identity or workspace is unavailable/);
+});
+
 test('ordinary Claude selection and same-owner decision preserve channel custody', () => {
   const channels = [
     { id: '123', guildId: 'guild', name: 'ops', messageCapable: true },

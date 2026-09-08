@@ -2339,8 +2339,8 @@ class SurfaceState {
   recoveryCandidates(before = null) {
     const states = [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY];
     const rows = before
-      ? this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) AND created_at<=? ORDER BY created_at`).all(...states, before)
-      : this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) ORDER BY created_at`).all(...states);
+      ? this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) AND created_at<=? ORDER BY created_at, rowid`).all(...states, before)
+      : this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) ORDER BY created_at, rowid`).all(...states);
     return rows.map(row => this.getMessage(row.discord_id));
   }
 
@@ -2426,7 +2426,7 @@ class SurfaceState {
   }
 
   listMessages() {
-    return this.db.prepare('SELECT discord_id FROM messages ORDER BY created_at').all().map(row => this.getMessage(row.discord_id));
+    return this.db.prepare('SELECT discord_id FROM messages ORDER BY created_at, rowid').all().map(row => this.getMessage(row.discord_id));
   }
 
   listReceipts() {

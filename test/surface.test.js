@@ -3588,6 +3588,33 @@ test('simulated: same-owner retry keeps equal-time admission order', async () =>
   state.close();
 });
 
+test('surface state keeps equal-time admission and recovery order under another query plan', () => {
+  const { dir, db, state: initialState } = fixture();
+  let state = initialState;
+  const ids = ['z-equal-time-first', 'a-equal-time-second', 'm-equal-time-third'];
+  try {
+    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+    state.markIntakeBoundary('channel-codex', 'ready');
+    for (const id of ids) {
+      const result = state.acceptDiscordMessage({
+        id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: id
+      }, { ready: true });
+      assert.equal(result.accepted, true);
+    }
+    state.db.prepare('UPDATE messages SET created_at=?, updated_at=?').run('2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    state.close();
+    state = new SurfaceState(db);
+    state.setConfig({ operatorId: 'operator-1', guildId: 'guild-1', secretFile: path.join(dir, 'discord.secret') });
+    state.db.exec('CREATE INDEX equal_time_desc ON messages(created_at DESC, discord_id DESC)');
+    state.db.exec('ANALYZE');
+    assert.deepEqual(state.listMessages().map(message => message.id), ids);
+    assert.deepEqual(state.recoveryCandidates().map(message => message.id), ids);
+  } finally {
+    try { state.close(); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('simulated: recovered observer stop cancels custody without native redispatch', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
