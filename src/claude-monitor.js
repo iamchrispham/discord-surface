@@ -136,7 +136,7 @@ function monitorPointer({ messageId, nativeId, generation, payloadPath }) {
   };
 }
 
-function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(stateDir || '.'), 'surface.sqlite'), stdout = process.stdout, cliPath = path.join(__dirname, 'cli.js') } = {}) {
+function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(stateDir || '.'), 'surface.sqlite'), stdout = process.stdout, cliPath = path.join(__dirname, 'cli.js'), onTransportClose } = {}) {
   if (!state) throw new TypeError('state is required');
   if (typeof stateDir !== 'string' || !stateDir) throw new TypeError('stateDir is required');
   if (!stdout || typeof stdout.write !== 'function') throw new TypeError('stdout must be writable');
@@ -144,16 +144,14 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
   let closed = false;
   let transportNotified = false;
   let mcp;
-  const onStdoutError = error => {
+  const notifyTransport = (handler, error) => {
     if (closed || transportNotified) return;
     transportNotified = true;
-    mcp?.onerror?.(error);
+    try { mcp?.[handler]?.(error); } catch {}
+    try { Promise.resolve(onTransportClose?.(error)).catch(() => {}); } catch {}
   };
-  const onStdoutClose = () => {
-    if (closed || transportNotified) return;
-    transportNotified = true;
-    mcp?.onclose?.();
-  };
+  const onStdoutError = error => notifyTransport('onerror', error);
+  const onStdoutClose = () => notifyTransport('onclose');
   const detachStdoutListeners = () => {
     stdout.removeListener?.('error', onStdoutError);
     stdout.removeListener?.('close', onStdoutClose);
@@ -192,10 +190,7 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
         try { await writeStdoutLine(stdout, JSON.stringify(monitorPointer({ ...values, payloadPath }))); }
         catch (error) {
           error.potentiallyDelivered = true;
-          if (!closed && !transportNotified) {
-            transportNotified = true;
-            mcp?.onerror?.(error);
-          }
+          notifyTransport('onerror', error);
           throw error;
         }
       })();
@@ -214,8 +209,16 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
 }
 
 function createClaudeMonitor(options) {
-  const mcp = createMonitorMcp(options);
-  return new ClaudeChannel({ ...options, mcp });
+  let transportCloseNotified = false;
+  const onTransportClose = typeof options?.onTransportClose === 'function'
+    ? (...args) => {
+      if (transportCloseNotified) return;
+      transportCloseNotified = true;
+      return options.onTransportClose(...args);
+    }
+    : undefined;
+  const mcp = createMonitorMcp({ ...options, onTransportClose });
+  return new ClaudeChannel({ ...options, mcp, onTransportClose });
 }
 
 module.exports = {

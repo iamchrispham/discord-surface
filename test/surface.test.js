@@ -3547,6 +3547,47 @@ test('simulated: live same-owner inputs keep durable FIFO order', async () => {
   state.close();
 });
 
+test('simulated: same-owner retry keeps equal-time admission order', async () => {
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const firstId = 'retry-order-first';
+  const secondId = 'retry-order-second';
+  const thirdId = 'retry-order-third';
+  for (const id of [firstId, secondId, thirdId]) {
+    state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: id });
+  }
+  const createdAt = '2026-01-01T00:00:00.000Z';
+  for (const id of [firstId, secondId, thirdId]) state.db.prepare('UPDATE messages SET created_at=? WHERE discord_id=?').run(createdAt, id);
+  const dispatches = [];
+  let firstAttempt = true;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: {
+      codex: {
+        async dispatch(message) {
+          dispatches.push(message.id);
+          if (message.id === firstId && firstAttempt) {
+            firstAttempt = false;
+            return { status: 'not_submitted', error: new Error('temporary native outage') };
+          }
+          return { status: 'submitted' };
+        },
+        async observe() { return { text: 'answer' }; }
+      }
+    },
+    sendReply: async () => ({ id: 'reply' })
+  });
+
+  await consumer.processAccepted(state.getMessage(firstId));
+  const second = consumer.processAccepted(state.getMessage(secondId));
+  const third = consumer.processAccepted(state.getMessage(thirdId));
+  const firstRetry = consumer.processAccepted(state.getMessage(firstId));
+  await Promise.all([firstRetry, second, third]);
+  assert.deepEqual(dispatches, [firstId, firstId, secondId, thirdId]);
+  await consumer.waitForReceipts();
+  state.close();
+});
+
 test('simulated: recovered observer stop cancels custody without native redispatch', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });

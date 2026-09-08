@@ -289,6 +289,19 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return queue;
   }
 
+  function ownerAdmissionOrder(messageId) {
+    const index = state.listMessages().findIndex(message => message.id === messageId);
+    return index >= 0 ? index : null;
+  }
+
+  function compareOwnerEntries(left, right) {
+    const createdAtOrder = left.queueMessage.createdAt.localeCompare(right.queueMessage.createdAt);
+    if (createdAtOrder) return createdAtOrder;
+    const leftAdmissionOrder = Number.isInteger(left.admissionOrder) ? left.admissionOrder : Number.MAX_SAFE_INTEGER;
+    const rightAdmissionOrder = Number.isInteger(right.admissionOrder) ? right.admissionOrder : Number.MAX_SAFE_INTEGER;
+    return leftAdmissionOrder - rightAdmissionOrder || left.sequence - right.sequence;
+  }
+
   function blockingEarlierOwnerMessage(message) {
     const messages = state.listMessages();
     const currentIndex = messages.findIndex(candidate => candidate.id === message.id);
@@ -430,6 +443,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       promise,
       resolve,
       reject,
+      admissionOrder: ownerAdmissionOrder(queueMessage.id),
       sequence: queueSequence++,
       started: false,
       cancelled: false,
@@ -457,7 +471,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       queue.blockedMessageId = earlier.id;
     }
     queue.entries.push(entry);
-    queue.entries.sort((left, right) => left.queueMessage.createdAt.localeCompare(right.queueMessage.createdAt) || left.sequence - right.sequence);
+    queue.entries.sort(compareOwnerEntries);
     queuedNativeWork.set(message.id, entry);
     if (signal) {
       entry.onAbort = () => cancelQueuedEntry(entry);
