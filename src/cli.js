@@ -356,9 +356,8 @@ async function unbind(args, dependencies = {}) {
     const channelCutoff = await latestChannelMessageId(channel);
     const watermark = state.getIntakeWatermark(channelId);
     const recoveredThrough = watermark?.recovered_through_id || null;
-    const liveCustodyAhead = recoveredThrough && watermark?.last_seen_id && discordIdAfter(watermark.last_seen_id, recoveredThrough);
-    const remoteCustodyAhead = recoveredThrough && channelCutoff && discordIdAfter(channelCutoff, recoveredThrough);
-    if (watermark?.state !== READINESS.READY || !recoveredThrough || liveCustodyAhead || remoteCustodyAhead) {
+    const remoteCustodyAhead = channelCutoff && (!watermark?.last_seen_id || discordIdAfter(channelCutoff, watermark.last_seen_id));
+    if (watermark?.state !== READINESS.READY || !recoveredThrough || remoteCustodyAhead) {
       throw new Error('ordinary unbind requires Discord intake to be durably drained');
     }
     fence = await createHandoffFence(channel, 'ordinary unbind');
@@ -836,9 +835,8 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     if (current.active) {
       const watermark = state.getIntakeWatermark(channelId);
       recoveredThrough = watermark?.recovered_through_id || null;
-      const liveCustodyAhead = recoveredThrough && watermark?.last_seen_id && discordIdAfter(watermark.last_seen_id, recoveredThrough);
-      const remoteCustodyAhead = recoveredThrough && channelCutoff && discordIdAfter(channelCutoff, recoveredThrough);
-      if (!handoffRetry && (watermark?.state !== READINESS.READY || !recoveredThrough || liveCustodyAhead || remoteCustodyAhead)) {
+      const remoteCustodyAhead = channelCutoff && (!watermark?.last_seen_id || discordIdAfter(channelCutoff, watermark.last_seen_id));
+      if (!handoffRetry && (watermark?.state !== READINESS.READY || !recoveredThrough || remoteCustodyAhead)) {
         throw new Error('ordinary handoff requires Discord intake to be durably drained');
       }
     }
@@ -1069,7 +1067,12 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
           wakeRequested = true;
           continue;
         }
-        if (!isStopping?.() && isReady?.()) await currentGateway.reconcilePending();
+        if (!isStopping?.()) {
+          if (isReady?.()) await currentGateway.reconcilePending();
+          else if (['gap', 'unavailable'].includes(recovery?.state)) {
+            await currentGateway.reconcilePending(undefined, { allowPaused: true });
+          }
+        }
       }
     })().catch(logger).finally(() => {
       wakePromise = null;

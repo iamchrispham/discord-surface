@@ -618,7 +618,7 @@ test('binding wake replays after joining an in-flight recovery', async () => {
   assert.deepEqual(calls, ['recover:ordinary-bind', 'recover:ordinary-bind', 'reconcile']);
 });
 
-test('binding wake reconciles after a partial recovery leaves the Gateway ready', async () => {
+test('binding wake reconciles recovered owners after a partial recovery pauses live dispatch', async () => {
   const calls = [];
   const gateway = {
     ready: true,
@@ -626,16 +626,20 @@ test('binding wake reconciles after a partial recovery leaves the Gateway ready'
       calls.push(`recover:${reason}`);
       return { ready: false, state: 'unavailable' };
     },
-    async reconcilePending() { calls.push('reconcile'); }
+    async reconcilePending(_before, options) { calls.push({ phase: 'reconcile', options }); }
   };
   const wake = createBindingWakeController({
     getGateway: () => gateway,
-    isReady: () => true,
-    isStopping: () => false
+    isReady: () => gateway.ready,
+    isStopping: () => false,
+    pauseLiveDispatch: currentGateway => { currentGateway.ready = false; }
   });
   wake.request();
   await wake.wait();
-  assert.deepEqual(calls, ['recover:ordinary-bind', 'reconcile']);
+  assert.deepEqual(calls, [
+    'recover:ordinary-bind',
+    { phase: 'reconcile', options: { allowPaused: true } }
+  ]);
 });
 
 test('binding wake remains queued while the Gateway is disconnected', async () => {
@@ -1238,16 +1242,19 @@ test('ordinary unbind fences remote intake before revoking custody', async t => 
   });
   setup.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary unbind baseline');
   setup.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary unbind drained', null, null, binding);
+  setup.acceptDiscordMessage({
+    id: '140', guildId: 'guild', channelId: binding.channelId, authorId: 'bot', isBot: true, content: 'receipt'
+  }, { ready: true });
   setup.close();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
   let deleted = false;
   const channel = {
     id: binding.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
-    lastMessageId: '100',
+    lastMessageId: '140',
     messages: { fetch: async options => {
       if (options?.before === '150') return new Map();
-      return new Map([['latest', { id: '100' }]]);
+      return new Map([['latest', { id: '140' }]]);
     } },
     send: async () => {
       channel.lastMessageId = '150';
@@ -1278,7 +1285,7 @@ test('ordinary unbind fences remote intake before revoking custody', async t => 
   } finally { recovered.close(); }
 });
 
-test('ordinary ready intake advances confirmed coverage for lifecycle drains', t => {
+test('ordinary ready intake records live observation without moving the recovery cutoff', t => {
   const f = fixture(t);
   const binding = ordinary(f);
   f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary live coverage baseline');
@@ -1292,9 +1299,13 @@ test('ordinary ready intake advances confirmed coverage for lifecycle drains', t
   }, { ready: true });
   assert.equal(intake.accepted, false);
   assert.equal(intake.reason, 'bot-source');
+  const delayed = f.state.acceptDiscordMessage({
+    id: '140', guildId: 'guild', channelId: binding.channelId, authorId: 'operator', isBot: false, content: 'delayed operator input'
+  }, { ready: true });
+  assert.equal(delayed.accepted, true);
   const watermark = f.state.getIntakeWatermark(binding.channelId);
   assert.equal(watermark.last_seen_id, '150');
-  assert.equal(watermark.recovered_through_id, '150');
+  assert.equal(watermark.recovered_through_id, '100');
 });
 
 test('ordinary paused intake rejects messages at or before the persisted cutoff', t => {

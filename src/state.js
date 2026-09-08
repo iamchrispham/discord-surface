@@ -1452,7 +1452,7 @@ class SurfaceState {
   upsertIntakeWatermark(event, ready, coverageId = null) {
     const existing = this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(event.channelId);
     const lastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, event.id) >= 0 ? existing.last_seen_id : event.id;
-    const confirmedCoverageId = coverageId || (ready ? event.id : null);
+    const confirmedCoverageId = coverageId;
     const recoveredThrough = confirmedCoverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, confirmedCoverageId) < 0)
       ? confirmedCoverageId
       : existing?.recovered_through_id || null;

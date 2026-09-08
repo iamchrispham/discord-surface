@@ -533,8 +533,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleMessage(message, signal) {
-    const coverageId = typeof message?.id === 'string' && message.id.length > 0 ? message.id : null;
-    const intake = state.acceptDiscordMessage(eventToInput(message), { coverageId });
+    const intake = state.acceptDiscordMessage(eventToInput(message));
     if (!intake.accepted) return intake;
     launchTransportReceipt(message);
     return processAccepted(message, signal);
@@ -1056,12 +1055,12 @@ class DiscordGateway {
     }
   }
 
-  async reconcilePending(before = new Date().toISOString()) {
-    if (!this.ready) throw new Error('Discord gateway is not ready for recovery');
+  async reconcilePending(before = new Date().toISOString(), { allowPaused = false } = {}) {
+    if (!this.ready && !allowPaused) throw new Error('Discord gateway is not ready for recovery');
     if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
-    this.recoveryPromise = this._reconcilePending(before, controller.signal);
+    this.recoveryPromise = this._reconcilePending(before, controller.signal, allowPaused);
     try { return await this.recoveryPromise; }
     finally {
       this.recoveryPromise = null;
@@ -1069,18 +1068,19 @@ class DiscordGateway {
     }
   }
 
-  async _reconcilePending(before, signal) {
+  async _reconcilePending(before, signal, readyOnly = false) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
-    const candidates = this.state.recoveryCandidates(before);
+    const allowed = message => !readyOnly || this.state.getBinding(message.channelId)?.readiness === READINESS.READY;
+    const candidates = this.state.recoveryCandidates(before).filter(allowed);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const blockedOwners = new Set();
     for (const message of ordered) {
-      if (signal?.aborted) return this.state.recoveryCandidates(before);
+      if (signal?.aborted) return this.state.recoveryCandidates(before).filter(allowed);
       const key = `${message.provider}:${message.nativeId}`;
       if (blockedOwners.has(key)) continue;
       let channel;
       try { channel = await waitForRecoveryOperation(() => this.client.channels.fetch(message.channelId), signal, deadline); } catch (error) {
-        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before);
+        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
         continue;
@@ -1117,13 +1117,13 @@ class DiscordGateway {
           result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
         }
       } catch (error) {
-        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before);
+        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
         continue;
       }
     }
-    return this.state.recoveryCandidates(before);
+    return this.state.recoveryCandidates(before).filter(allowed);
   }
 
   async stop() {
