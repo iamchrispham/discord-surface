@@ -520,15 +520,21 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return { ...result, message: state.getMessage(ready.message.id) };
   }
 
-  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false } = {}) {
+  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
     return enqueueOwnerWork(message, signal, onNativeSettled => {
       let settleHandoff;
       let rejectHandoff;
+      let settleDispatchOutcome;
+      let rejectDispatchOutcome;
       const handoffPromise = handoff ? new Promise((resolve, reject) => {
         settleHandoff = resolve;
         rejectHandoff = reject;
+      }) : null;
+      const dispatchOutcomePromise = awaitDispatchOutcome ? new Promise((resolve, reject) => {
+        settleDispatchOutcome = resolve;
+        rejectDispatchOutcome = reject;
       }) : null;
       handoffPromise?.catch(() => {});
       let nativeSettled = false;
@@ -544,6 +550,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
             ...observeOptions,
             signal: taskSignal,
             continueUntilFinal,
+            onDispatchOutcome: outcome => settleDispatchOutcome?.(outcome),
             onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
           });
           const promoted = state.getMessage(message.id);
@@ -562,8 +569,18 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
         }
         return deliverReply(message, result, taskSignal);
       }, settleNative);
+      work.then(
+        result => {
+          settleHandoff?.(result);
+          settleDispatchOutcome?.(result);
+        },
+        error => {
+          rejectHandoff?.(error);
+          rejectDispatchOutcome?.(error);
+        }
+      );
+      if (awaitDispatchOutcome) return dispatchOutcomePromise;
       if (!handoff) return work;
-      work.then(result => settleHandoff?.(result), error => rejectHandoff?.(error));
       return handoffPromise;
     }, awaitExisting, handoff);
   }
@@ -581,9 +598,9 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return intake;
   }
 
-  async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false } = {}) {
+  async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false, awaitDispatchOutcome = false } = {}) {
     launchTransportReceipt(message);
-    return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff });
+    return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff, awaitDispatchOutcome });
   }
 
   function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false } = {}) {
@@ -1278,7 +1295,7 @@ class DiscordGateway {
       try {
         if (message.state === 'accepted') {
           result = await waitForRecoveryOperation(
-            () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true }),
+            () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true, awaitDispatchOutcome: true }),
             signal,
             deadline
           );

@@ -787,19 +787,23 @@ function providerMessageForBinding(state, message) {
 }
 
 async function dispatchAndObserve(state, messageId, providers, options = {}) {
+  const reportOutcome = outcome => {
+    try { options.onDispatchOutcome?.(outcome); } catch {}
+    return outcome;
+  };
   let claimed;
   try {
     claimed = state.claimDispatch(messageId);
   } catch (error) {
-    return { status: 'rejected', message: state.getMessage(messageId), error };
+    return reportOutcome({ status: 'rejected', message: state.getMessage(messageId), error });
   }
-  if (!claimed.claimed) return { status: claimed.reason || claimed.message?.state || 'ignored', message: claimed.message };
+  if (!claimed.claimed) return reportOutcome({ status: claimed.reason || claimed.message?.state || 'ignored', message: claimed.message });
   const message = claimed.message;
   const provider = providers[message.provider];
   if (!provider) {
     const error = new Error(`provider is not configured: ${message.provider}`);
     state.markUncertain(message.id, error);
-    return { status: 'uncertain', message: state.getMessage(message.id), error };
+    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error });
   }
   const marker = `[[discord-surface:${message.id}]]`;
   let outcome;
@@ -809,23 +813,24 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
     });
   } catch (error) {
     state.markUncertain(message.id, error);
-    return { status: 'uncertain', message: state.getMessage(message.id), error };
+    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error });
   }
   if (!outcome || !['submitted', 'not_submitted', 'uncertain'].includes(outcome.status)) {
     const error = new Error('native dispatcher returned an invalid outcome');
     state.markUncertain(message.id, error);
-    return { status: 'uncertain', message: state.getMessage(message.id), error };
+    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error });
   }
   if (outcome.status === 'not_submitted') {
     try { options.onNativeUnavailable?.(message, outcome.error, outcome); } catch {}
     state.markNotSubmitted(message.id, outcome.error);
-    return { status: 'not_submitted', message: state.getMessage(message.id), error: outcome.error };
+    return reportOutcome({ status: 'not_submitted', message: state.getMessage(message.id), error: outcome.error });
   }
   if (outcome.status === 'uncertain') {
     state.markUncertain(message.id, outcome.error);
-    return { status: 'uncertain', message: state.getMessage(message.id), error: outcome.error };
+    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error: outcome.error });
   }
   state.markSubmitted(message.id, outcome.cursor || null, marker);
+  reportOutcome({ status: 'submitted', message: state.getMessage(message.id) });
   try { options.onSubmitted?.(state.getMessage(message.id)); } catch {}
   const observation = await observeSubmitted(state, state.getMessage(message.id), provider, options);
   return observation;
