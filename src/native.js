@@ -342,22 +342,35 @@ async function validateCodexSessionIdentityAsync(nativeId, workspace, root = ses
   return normalizedIdentity;
 }
 
-function readClaudeSessionMetadata(file) {
+function* readClaudeSessionMetadata(file) {
   const fd = fs.openSync(file, 'r');
   try {
     const size = fs.fstatSync(fd).size;
     if (!size) throw new Error('Claude transcript metadata is empty');
-    const bytes = Buffer.allocUnsafe(size);
-    let offset = 0;
-    while (offset < size) {
-      const count = fs.readSync(fd, bytes, offset, size - offset, offset);
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let remainder = Buffer.alloc(0);
+    let position = 0;
+    const parseLine = line => {
+      if (!line.trim()) return null;
+      try { return JSON.parse(line); } catch { return null; }
+    };
+    while (true) {
+      const count = fs.readSync(fd, chunk, 0, chunk.length, position);
       if (!count) break;
-      offset += count;
+      position += count;
+      const data = remainder.length ? Buffer.concat([remainder, chunk.subarray(0, count)]) : chunk.subarray(0, count);
+      let start = 0;
+      while (true) {
+        const newline = data.indexOf(0x0a, start);
+        if (newline < 0) break;
+        const row = parseLine(data.subarray(start, newline).toString('utf8'));
+        if (row !== null) yield row;
+        start = newline + 1;
+      }
+      remainder = Buffer.from(data.subarray(start));
     }
-    return bytes.subarray(0, offset).toString('utf8').split('\n').flatMap(line => {
-      if (!line.trim()) return [];
-      try { return [JSON.parse(line)]; } catch { return []; }
-    });
+    const row = parseLine(remainder.toString('utf8'));
+    if (row !== null) yield row;
   } finally {
     fs.closeSync(fd);
   }
@@ -370,26 +383,30 @@ function readClaudeSessionIdentity(nativeId, transcriptFile) {
   }
   const stat = fs.statSync(transcriptFile);
   if (!stat.isFile()) throw new Error('Claude transcript path must be a regular file');
-  const qualifyingMatches = readClaudeSessionMetadata(transcriptFile).flatMap(row => {
+  let hasMatch = false;
+  const sessionIds = new Set();
+  const workspaces = new Set();
+  for (const row of readClaudeSessionMetadata(transcriptFile)) {
     const sessionId = row?.sessionId;
     const payloadSessionId = row?.payload?.session_id;
     const hasSessionId = sessionId !== undefined && sessionId !== null;
     const hasPayloadSessionId = payloadSessionId !== undefined && payloadSessionId !== null;
-    if (hasSessionId && hasPayloadSessionId && sessionId !== payloadSessionId) return [];
+    if (hasSessionId && hasPayloadSessionId && sessionId !== payloadSessionId) continue;
     let candidateSessionId = null;
     if (hasSessionId) candidateSessionId = sessionId;
     else if (hasPayloadSessionId) candidateSessionId = payloadSessionId;
     if (candidateSessionId === null || row?.entrypoint !== 'cli' || typeof row?.version !== 'string' ||
-      typeof row?.cwd !== 'string' || !path.isAbsolute(row.cwd)) return [];
-    return [{ row, sessionId: candidateSessionId }];
-  });
-  const sessionIds = [...new Set(qualifyingMatches.map(match => match.sessionId))];
-  if (sessionIds.length > 1) throw new Error('Claude transcript identity is ambiguous');
-  const matches = qualifyingMatches.filter(match => match.sessionId === nativeId).map(match => match.row);
-  if (!matches.length) throw new Error('Claude transcript identity or workspace is unavailable');
-  const workspaces = [...new Set(matches.map(row => path.resolve(row.cwd)))];
-  if (workspaces.length !== 1) throw new Error('Claude transcript workspace is ambiguous');
-  return { file: transcriptFile, sessionId: nativeId, threadId: nativeId, workspace: workspaces[0] };
+      typeof row?.cwd !== 'string' || !path.isAbsolute(row.cwd)) continue;
+    sessionIds.add(candidateSessionId);
+    if (sessionIds.size > 1) throw new Error('Claude transcript identity is ambiguous');
+    if (candidateSessionId === nativeId) {
+      hasMatch = true;
+      workspaces.add(path.resolve(row.cwd));
+    }
+  }
+  if (!hasMatch) throw new Error('Claude transcript identity or workspace is unavailable');
+  if (workspaces.size !== 1) throw new Error('Claude transcript workspace is ambiguous');
+  return { file: transcriptFile, sessionId: nativeId, threadId: nativeId, workspace: [...workspaces][0] };
 }
 
 function validateClaudeSessionIdentity(nativeId, transcriptFile, workspace) {
