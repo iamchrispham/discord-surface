@@ -18,6 +18,7 @@ const GATEWAY_CAPABILITIES = Object.freeze({
   ordinaryBindWake: 'ordinary-bind-wake-v1',
   runtimeBindLock: 'runtime-bind-lock-v1'
 });
+const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID';
 const LOCK_CONTENTION_EXIT = 75;
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
 const { runLiaisonDraft } = require('./liaison');
@@ -325,13 +326,13 @@ async function ordinaryBind(args, dependencies = {}) {
   }
 }
 
-function runLockedOrdinaryCommand(args, { command, environmentKey, lockPath }) {
+function runLockedOrdinaryCommand(args, { command, environmentKey, lockPath, environment = {} }) {
   const paths = pathsFor(args);
   fs.mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 });
   const forwarded = Object.entries(args).flatMap(([key, value]) => value === true ? [`--${key}`] : [`--${key}`, String(value)]);
   const result = spawnSync('lockf', ['-t', '0', '-k', lockPath, process.execPath, __filename, command, ...forwarded], {
     stdio: 'inherit',
-    env: { ...process.env, [environmentKey]: '1' }
+    env: { ...process.env, ...environment, [environmentKey]: '1' }
   });
   if (result.error) throw result.error;
   process.exitCode = result.status ?? 1;
@@ -357,7 +358,8 @@ function ordinaryClaudeBindCommand(args) {
   runLockedOrdinaryCommand(args, {
     command: 'ordinary-claude-bind-run',
     environmentKey: 'DISCORD_SURFACE_ORDINARY_CLAUDE_BIND_LOCK_HELD',
-    lockPath
+    lockPath,
+    environment: supportsBindLock ? { [ORDINARY_CLAUDE_RUNTIME_PID_ENV]: String(runtime.pid) } : {}
   });
 }
 
@@ -378,6 +380,7 @@ async function resolveCurrentClaudeCaller(dependencies = {}) {
 
 async function ordinaryClaudeBind(args, dependencies = {}) {
   const { paths, state } = openState(args);
+  const environment = dependencies.environment || process.env;
   const install = dependencies.requireInstalled || requireInstalled;
   const read = dependencies.readSecret || readSecret;
   const resolveCaller = dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies));
@@ -443,7 +446,17 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const boundRequest = { ...request, channelId: channel.id };
     const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
-    const assertGatewayCompatible = () => assertGatewayWakeCompatible(paths, gatewayStatus);
+    const expectedRuntimePid = environment[ORDINARY_CLAUDE_RUNTIME_PID_ENV];
+    const assertGatewayCompatible = () => {
+      const runtime = gatewayStatus(paths);
+      if (expectedRuntimePid !== undefined &&
+        (runtime?.state !== 'running' || String(runtime.pid) !== expectedRuntimePid ||
+          !runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock))) {
+        throw new Error('running Gateway changed while binding ordinary Claude session');
+      }
+      if (runtime?.state !== 'running' || !runtime.pid || runtime.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryBindWake)) return;
+      throw new Error('running Gateway does not support ordinary binding wake; stop or restart it before binding');
+    };
     assertGatewayCompatible();
     const existing = state.getBinding(channel.id);
     let decision = ordinaryBindingDecision(existing, boundRequest, existing ? state.isOrdinaryBindingRecord(existing) : false);
@@ -487,6 +500,7 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     if (state.hasOrdinaryPreflight(binding)) {
       nativeProof = { status: 'verified', reason: 'Claude transcript proof already recorded' };
     } else {
+      assertGatewayCompatible();
       const recorded = state.recordOrdinaryPreflight(binding, {
         file: identityProof.file,
         sessionId: identityProof.sessionId,
@@ -1337,8 +1351,7 @@ async function claudeMonitor(args) {
   const { paths, state } = openState(args);
   const nativeId = required(args, 'native-id');
   const socketPath = path.resolve(required(args, 'socket'));
-  const startupBinding = state.findNativeBinding(nativeId, PROVIDERS.CLAUDE);
-  const ordinaryStartupBinding = startupBinding?.active && state.isOrdinaryBinding(startupBinding) ? startupBinding : null;
+  let ordinaryStartupBinding = null;
   let monitor;
   let monitorStarted = false;
   let stopPromise;
@@ -1392,6 +1405,13 @@ async function claudeMonitor(args) {
       cliPath: __filename,
       onTransportClose: stop
     });
+    const servedIdentity = monitor?.bindingIdentity;
+    const servedBinding = servedIdentity ? state.getBinding(servedIdentity.channelId) : null;
+    ordinaryStartupBinding = servedBinding?.active && state.isOrdinaryBinding(servedBinding) &&
+      servedBinding.channelId === servedIdentity.channelId && servedBinding.guildId === servedIdentity.guildId &&
+      servedBinding.provider === servedIdentity.provider && servedBinding.nativeId === servedIdentity.nativeId &&
+      servedBinding.workspace === servedIdentity.workspace && servedBinding.endpoint === servedIdentity.endpoint &&
+      servedBinding.generation === servedIdentity.generation ? servedBinding : null;
     await monitor.start();
     monitorStarted = true;
     if (ordinaryStartupBinding) {
