@@ -554,6 +554,7 @@ class DiscordGateway {
     this.recoveryController = null;
     this.recoveryPromise = null;
     this.reconnectPromise = null;
+    this.transportReady = false;
     this.fetchHistoryInjected = typeof fetchHistory === 'function';
     this.fetchHistory = fetchHistory || ((channel, options) => channel.messages?.fetch(options));
     this.historyPageLimit = Math.min(RECOVERY_LIMITS.pageSize, Math.max(1, Number(recoveryOptions.pageLimit || RECOVERY_LIMITS.pageSize)));
@@ -669,6 +670,7 @@ class DiscordGateway {
   pauseConnection(detail) {
     if (this.stopping) return;
     this.ready = false;
+    this.transportReady = false;
     this.connectionEpoch += 1;
     this.recoveryController?.abort();
     for (const binding of this.state.listBindings().filter(item => item.active)) {
@@ -679,14 +681,16 @@ class DiscordGateway {
 
   beginReconnectRecovery(reason) {
     if (this.stopping) return Promise.resolve({ ready: false, state: 'stopped' });
+    this.transportReady = false;
     const connectionEpoch = this.connectionEpoch;
     const previousRecovery = this.recoveryPromise;
     const task = (async () => {
       await previousRecovery?.catch(() => {});
       if (this.stopping || connectionEpoch !== this.connectionEpoch) return { ready: false, state: 'stopped' };
       const result = await this.recoverTransport('reconnect', this.lifecycleEpoch);
-      if (result.ready && !this.stopping && connectionEpoch === this.connectionEpoch) {
-        await this.reconcilePending();
+      if (!this.stopping && connectionEpoch === this.connectionEpoch) {
+        this.transportReady = true;
+        if (result.ready) await this.reconcilePending();
         if (!this.stopping && connectionEpoch === this.connectionEpoch) this.onReady?.();
       }
       return result;
@@ -716,6 +720,7 @@ class DiscordGateway {
       const recovery = await this.recoverTransport('startup', epoch);
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during recovery');
       if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
+      this.transportReady = true;
       this.started = true;
     })();
     this.startPromise = startPromise;
@@ -1086,6 +1091,7 @@ class DiscordGateway {
     this.connectionEpoch += 1;
     this.stopping = true;
     this.started = false;
+    this.transportReady = false;
     this.stopPromise = (async () => {
       this.ready = false;
       this.recoveryController?.abort();

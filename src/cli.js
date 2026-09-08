@@ -1075,18 +1075,18 @@ function writePid(pidFile, guildId, stateDir) {
   fs.chmodSync(pidFile, 0o600);
 }
 
-function createBindingWakeController({ getGateway, isReady, isStopping, logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
+function createBindingWakeController({ getGateway, isReady, isTransportReady = isReady, isStopping, logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
   let wakePromise = null;
   let wakeRequested = false;
   const request = () => {
     wakeRequested = true;
     const gateway = getGateway?.();
-    if (isStopping?.() || !gateway || !isReady?.() || wakePromise) return;
+    if (isStopping?.() || !gateway || !isTransportReady?.() || wakePromise) return;
     wakePromise = (async () => {
       while (wakeRequested && !isStopping?.()) {
         wakeRequested = false;
         const currentGateway = getGateway?.();
-        if (!currentGateway || !isReady?.()) return;
+        if (!currentGateway || !isTransportReady?.()) return;
         const joinedRecovery = Boolean(currentGateway.recoveryPromise);
         const recovery = await currentGateway.recoverTransport('ordinary-bind');
         if (joinedRecovery) {
@@ -1123,6 +1123,7 @@ async function runRuntime(args) {
   const bindingWake = createBindingWakeController({
     getGateway: () => gateway,
     isReady: () => gatewayReady && gateway?.ready === true,
+    isTransportReady: () => gatewayReady && gateway?.transportReady === true,
     isStopping: () => stopping
   });
   const stop = async () => {

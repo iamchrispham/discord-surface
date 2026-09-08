@@ -647,6 +647,30 @@ test('binding wake remains queued while the Gateway is disconnected', async () =
   assert.deepEqual(calls, ['recover:ordinary-bind', 'reconcile']);
 });
 
+test('binding wake starts when reconnect transport is ready after partial recovery', async () => {
+  const calls = [];
+  const gateway = {
+    ready: false,
+    transportReady: true,
+    recoveryPromise: null,
+    async recoverTransport(reason) {
+      calls.push(`recover:${reason}`);
+      this.ready = true;
+      return { ready: true, state: 'ready' };
+    },
+    async reconcilePending() { calls.push('reconcile'); }
+  };
+  const wake = createBindingWakeController({
+    getGateway: () => gateway,
+    isReady: () => gateway.ready,
+    isTransportReady: () => gateway.transportReady,
+    isStopping: () => false
+  });
+  wake.request();
+  await wake.wait();
+  assert.deepEqual(calls, ['recover:ordinary-bind', 'reconcile']);
+});
+
 test('ordinary binding decision refuses a non-ordinary or inactive existing owner', () => {
   const request = {
     provider: 'codex', channelId: 'channel', guildId: 'guild', nativeId: CODEX, workspace: '/tmp/workspace',
@@ -1362,6 +1386,26 @@ test('Gateway reconnect replays binding wakes after reconciliation', async t => 
   const result = await gateway.beginReconnectRecovery('shard-ready');
   assert.equal(result.ready, true);
   assert.deepEqual(calls, ['reconcile', 'ready']);
+  await gateway.stop();
+});
+
+test('Gateway reconnect notifies binding wakes after partial recovery', async t => {
+  const f = fixture(t);
+  const calls = [];
+  const client = { on() {}, off() {}, async destroy() {} };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client,
+    providers: {},
+    onReady: () => calls.push('ready')
+  });
+  gateway.started = true;
+  gateway.recoverTransport = async () => ({ ready: false, state: 'unavailable' });
+  gateway.reconcilePending = async () => calls.push('reconcile');
+  const result = await gateway.beginReconnectRecovery('shard-ready');
+  assert.equal(result.ready, false);
+  assert.equal(gateway.transportReady, true);
+  assert.deepEqual(calls, ['ready']);
   await gateway.stop();
 });
 
