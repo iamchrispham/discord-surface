@@ -54,6 +54,21 @@ migration is not authorization to redesign delivery or change persisted formats.
   review and disposition of remaining findings, never because an iteration cap
   elapsed.
 
+## Aperture command and reference resolution
+
+In this document, `apt` means the Aperture CLI, never Debian's package manager.
+Resolve its installed executable and check its help output for Aperture commands
+before invoking it. If PATH resolves a different tool, use the `apt` executable
+at the root of the actual Aperture checkout. Do not assume a checkout location.
+If Aperture is unavailable, report that prerequisite rather than running the
+system package manager or claiming the check passed.
+
+The managed block's `docs/contracts/aperture-run-jobs/external-lane-registry-v0.md`
+reference is relative to the Aperture checkout, not this repository. Read that
+file there when evaluating a conflict override. If the checkout or contract is
+unavailable, retain the conflict and report the missing prerequisite. Do not
+copy that contract into this repository or bypass the conflict.
+
 ## Managed guidance
 
 Keep repository-specific rules above this section. The block below belongs to
