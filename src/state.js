@@ -1139,10 +1139,15 @@ class SurfaceState {
     const binding = this.getBinding(channelId);
     if (!binding) throw new BindingError('channel is not bound');
     if (!binding.active) return true;
-    if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot unbind while work is unresolved');
+    if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
+      throw new UnresolvedWorkError('cannot unbind while work is unresolved');
+    }
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, binding)) throw new StaleGenerationError('unbind source identity is stale');
+      if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
+        throw new UnresolvedWorkError('cannot unbind while work is unresolved');
+      }
       this.assertLegacyMigrationSafe(channelId);
       this.db.prepare('UPDATE bindings SET active=0, updated_at=? WHERE channel_id=?').run(now(), channelId);
       this.receipt(null, 'unbound', { channelId, generation: binding.generation });
@@ -2196,6 +2201,56 @@ class SurfaceState {
       if (existing) return existing.detail;
       const next = { ...attempt.detail, ...detail, outcome };
       this.receipt(null, DIRECT_POST_OUTCOME, next);
+      return next;
+    });
+  }
+
+  reconcileDirectPostOutcome(requestId, attemptId, resolution, evidence = {}) {
+    assertText(requestId, 'requestId', 256);
+    assertText(attemptId, 'attemptId', 128);
+    if (!['sent', 'not_sent'].includes(resolution)) {
+      throw new BindingError('direct post reconciliation must resolve to sent or not_sent');
+    }
+    if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
+      throw new BindingError('direct post reconciliation evidence is required');
+    }
+    const evidenceText = [evidence.evidenceScope, evidence.scope, evidence.source, evidence.reason, evidence.note,
+      evidence.evidence, evidence.messageId, evidence.nonce]
+      .find(value => typeof value === 'string' && value.trim().length > 0);
+    if (!evidenceText) throw new BindingError('direct post reconciliation evidence is required');
+    return this.transaction(() => {
+      const rows = this.directPostRows(requestId);
+      const attempt = rows.find(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.attemptId === attemptId);
+      if (!attempt) throw new BindingError('direct post attempt is unknown');
+      const outcomes = rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId === attemptId)
+        .sort((left, right) => left.id - right.id);
+      const previous = outcomes.at(-1);
+      if (!previous || previous.detail.outcome !== 'unknown') {
+        throw new BindingError('direct post attempt does not need reconciliation');
+      }
+      for (const key of ['channelId', 'guildId']) {
+        if (evidence[key] !== undefined && evidence[key] !== attempt.detail[key]) {
+          throw new BindingError(`direct post reconciliation ${key} does not match the attempt`);
+        }
+      }
+      const next = {
+        ...attempt.detail,
+        outcome: resolution,
+        reconciledFrom: 'unknown',
+        reconciliationEvidence: evidence
+      };
+      if (resolution === 'sent') {
+        if (evidence.messageId !== undefined) next.messageId = assertText(evidence.messageId, 'messageId', 128);
+        if (evidence.nonce !== undefined) next.nonce = assertText(evidence.nonce, 'nonce', 256);
+        if (!next.messageId && !next.nonce) {
+          throw new BindingError('sent direct post reconciliation requires a messageId or nonce');
+        }
+      }
+      this.receipt(null, DIRECT_POST_OUTCOME, next);
+      this.receipt(null, 'direct-post-reconciled', {
+        requestId, attemptId, channelId: attempt.detail.channelId, guildId: attempt.detail.guildId,
+        outcome: resolution, evidence
+      });
       return next;
     });
   }

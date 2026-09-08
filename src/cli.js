@@ -346,6 +346,19 @@ function recover(args) {
         partIndex: args['part-index'] === undefined ? null : Number(args['part-index']),
         replyMessageId: args['reply-message-id']
       }));
+    } else if (args['direct-post-request-id']) {
+      const resolution = required(args, 'resolution');
+      if (!['sent', 'not_sent'].includes(resolution)) throw new Error('--resolution must be sent or not_sent for direct-post reconciliation');
+      print(state.reconcileDirectPostOutcome(
+        required(args, 'direct-post-request-id'),
+        required(args, 'direct-post-attempt-id'),
+        resolution,
+        {
+          evidenceScope: required(args, 'evidence-scope'),
+          messageId: args['direct-post-message-id'],
+          nonce: args['direct-post-nonce']
+        }
+      ));
     } else if (args['message-id'] && args.resolution) print(state.reconcileUncertain(required(args, 'message-id'), args.resolution));
     else print(state.recoverAfterRestart());
   }
