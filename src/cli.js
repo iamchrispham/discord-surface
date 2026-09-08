@@ -27,6 +27,11 @@ const { sessionRoot: codexSessionRoot, validateCodexSessionIdentityAsync } = req
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
 
+const NATIVE_PROOF_STATUSES = Object.freeze({
+  PENDING: 'pending',
+  VERIFIED: 'verified'
+});
+
 const GATEWAY_CAPABILITIES = Object.freeze({
   ordinaryBindWake: 'ordinary-bind-wake-v1'
 });
@@ -48,6 +53,58 @@ function parseArgs(argv) {
     else args[key] = true;
   }
   return { command: positional[0], subcommand: positional[1], args };
+}
+
+function historyMessages(result) {
+  if (!result) return [];
+  if (Array.isArray(result)) return result;
+  if (typeof result.values === 'function') return [...result.values()];
+  if (typeof result[Symbol.iterator] === 'function') return [...result];
+  return [];
+}
+
+async function assertOrdinaryIntakeRange(channel, state, binding, recoveredThrough, fenceId, operation) {
+  if (!recoveredThrough) throw new Error(`${operation} requires a confirmed Discord intake boundary`);
+  if (typeof channel?.messages?.fetch !== 'function') throw new Error(`${operation} requires Discord history range access`);
+  let after = recoveredThrough;
+  let pages = 0;
+  let total = 0;
+  while (pages < RECOVERY_LIMITS.maxPages && total < RECOVERY_LIMITS.maxMessages) {
+    const page = historyMessages(await channel.messages.fetch({
+      limit: RECOVERY_LIMITS.pageSize,
+      after
+    }));
+    pages += 1;
+    if (!page.length) {
+      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
+      return;
+    }
+    if (page.some(message => typeof message?.id !== 'string' || message.id.length === 0)) {
+      throw new Error(`${operation} encountered a Discord message without a stable ID`);
+    }
+    page.sort((left, right) => {
+      if (typeof left?.id !== 'string' || typeof right?.id !== 'string') return 0;
+      return discordIdAfter(left.id, right.id) ? 1 : discordIdAfter(right.id, left.id) ? -1 : 0;
+    });
+    const reachedFence = page.some(message => !discordIdAfter(fenceId, message.id));
+    const fresh = page.filter(message => discordIdAfter(message.id, after) && discordIdAfter(fenceId, message.id));
+    if (!fresh.length) {
+      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
+      return;
+    }
+    for (const message of fresh) {
+      if (total >= RECOVERY_LIMITS.maxMessages || !state.hasIntakeEvidence(message.id)) {
+        throw new Error(`${operation} requires Discord intake to be durably drained`);
+      }
+      after = message.id;
+      total += 1;
+    }
+    if (reachedFence || page.length < RECOVERY_LIMITS.pageSize) {
+      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
+      return;
+    }
+  }
+  throw new Error(`${operation} requires Discord intake to be durably drained`);
 }
 
 function pathsFor(args) {
@@ -263,11 +320,11 @@ async function ordinaryBind(args, dependencies = {}) {
         binding = raced;
       }
     }
-    let nativeProof = { status: 'pending', reason: 'Codex transcript proof is pending' };
+    let nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: 'Codex transcript proof is pending' };
     if (nativeProofError) {
       const unavailable = state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, nativeProofError.message, binding);
       if (unavailable) binding = unavailable;
-      nativeProof = { status: 'pending', reason: nativeProofError.message };
+      nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: nativeProofError.message };
     } else if (state.hasOrdinaryPreflight(binding)) {
       const verifiedBinding = state.transaction(() => {
         const current = state.getBinding(binding.channelId);
@@ -276,7 +333,7 @@ async function ordinaryBind(args, dependencies = {}) {
       });
       if (!verifiedBinding) throw new Error('ordinary binding changed before native preflight proof was reused');
       binding = verifiedBinding;
-      nativeProof = { status: 'verified', reason: 'Codex transcript proof already recorded' };
+      nativeProof = { status: NATIVE_PROOF_STATUSES.VERIFIED, reason: 'Codex transcript proof already recorded' };
     } else if (nativeProofDetail) {
       let recordedBinding;
       let preflightError;
@@ -291,17 +348,17 @@ async function ordinaryBind(args, dependencies = {}) {
         preflightError = error;
       }
       if (preflightError) {
-        nativeProof = { status: 'pending', reason: preflightError.message };
+        nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: preflightError.message };
       } else if (!recordedBinding) {
         throw new Error('ordinary binding changed before native preflight receipt was committed');
       } else {
         binding = recordedBinding;
-        nativeProof = { status: 'verified', file: nativeProofDetail.file, workspace: nativeProofDetail.workspace };
+        nativeProof = { status: NATIVE_PROOF_STATUSES.VERIFIED, file: nativeProofDetail.file, workspace: nativeProofDetail.workspace };
       }
     } else {
-      nativeProof = { status: 'pending', reason: nativeProofError?.message || 'Codex transcript proof is pending' };
+      nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: nativeProofError?.message || 'Codex transcript proof is pending' };
     }
-    if (decision === 'reuse' && nativeProof.status === 'verified' && nativeProofDetail && !nativeProofError) {
+    if (decision === 'reuse' && nativeProof.status === NATIVE_PROOF_STATUSES.VERIFIED && nativeProofDetail && !nativeProofError) {
       const watermark = state.getIntakeWatermark(binding.channelId);
       if (watermark && [READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark.state)) {
         const reopened = state.reconcileIntake(binding.channelId, binding);
@@ -361,11 +418,7 @@ async function unbind(args, dependencies = {}) {
       throw new Error('ordinary unbind requires Discord intake to be durably drained');
     }
     fence = await createHandoffFence(channel, 'ordinary unbind');
-    const preFenceCutoff = await latestChannelMessageId(channel, { before: fence.id });
-    const drainedThrough = channelCutoff || recoveredThrough;
-    if (preFenceCutoff && drainedThrough && discordIdAfter(preFenceCutoff, drainedThrough)) {
-      throw new Error('ordinary unbind requires Discord intake to be durably drained');
-    }
+    await assertOrdinaryIntakeRange(channel, state, binding, recoveredThrough, fence.id, 'ordinary unbind');
     const result = state.unbind(channelId, { expectedBinding: binding, intakeCutoff: fence.id });
     if (!result) throw new Error('ordinary binding changed before intake fence was committed');
     output({ unbound: result });
@@ -845,11 +898,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     handoffFence = await createHandoffFence(channel);
     if (handoffFence) {
       if (current.active) {
-        const preFenceCutoff = await latestChannelMessageId(channel, { before: handoffFence.id });
-        const drainedThrough = channelCutoff || recoveredThrough;
-        if (preFenceCutoff && drainedThrough && discordIdAfter(preFenceCutoff, drainedThrough)) {
-          throw new Error('ordinary handoff requires Discord intake to be durably drained');
-        }
+        await assertOrdinaryIntakeRange(channel, state, current, recoveredThrough, handoffFence.id, 'ordinary handoff');
       }
       handoffCutoff = handoffFence.id;
     }
@@ -1418,4 +1467,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, ordinaryHandoffInternal, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, unbind };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryBindingArgs, ordinaryHandoffInternal, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, unbind };

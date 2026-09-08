@@ -1007,6 +1007,9 @@ class SurfaceState {
         if (dispatching) {
           throw new BindingError('ordinary binding root relocation is unavailable while dispatch is in flight');
         }
+        if (this.hasUnresolvedOrdinaryPost(binding.channelId)) {
+          throw new BindingError('ordinary binding root relocation has unresolved post custody');
+        }
         this.assertLegacyMigrationSafe(binding.channelId);
         const updatedAt = now();
         this.db.prepare('UPDATE bindings SET session_root=?, readiness=?, updated_at=? WHERE channel_id=?')
@@ -1476,6 +1479,35 @@ class SurfaceState {
   getIntakeWatermark(channelId) {
     assertText(channelId, 'channelId', 128);
     return this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(channelId) || null;
+  }
+
+  hasIntakeEvidence(discordId) {
+    assertText(discordId, 'discordId', 128);
+    const row = this.db.prepare(`SELECT 1 FROM messages WHERE discord_id=?
+      UNION ALL SELECT 1 FROM receipts WHERE kind='intake-rejected'
+        AND json_extract(detail, '$.discordId')=?
+        AND json_extract(detail, '$.reason') IN ('bot-source', 'automatic-publication', 'unauthorized-sender', 'invalid-event')
+      LIMIT 1`).get(discordId, discordId);
+    return Boolean(row);
+  }
+
+  checkpointIntake(channelId, coverageId, expectedBinding = null) {
+    assertText(channelId, 'channelId', 128);
+    assertText(coverageId, 'coverageId', 128);
+    return this.transaction(() => {
+      const binding = this.getBinding(channelId);
+      if (!binding || !binding.active) throw new BindingError('intake channel is not active');
+      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+      const existing = this.getIntakeWatermark(channelId);
+      if (!existing) throw new BindingError('intake watermark is unknown');
+      const recoveredThrough = existing.recovered_through_id && compareDiscordIds(existing.recovered_through_id, coverageId) >= 0
+        ? existing.recovered_through_id
+        : coverageId;
+      this.db.prepare('UPDATE intake_watermarks SET recovered_through_id=?, updated_at=? WHERE channel_id=?')
+        .run(recoveredThrough, now(), channelId);
+      this.receipt(null, 'intake-checkpoint', { channelId, coverageId: recoveredThrough });
+      return this.getIntakeWatermark(channelId);
+    });
   }
 
   setIntakeBaseline(channelId, lastSeenId, detail, expectedBinding = null) {

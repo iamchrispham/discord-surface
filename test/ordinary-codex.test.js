@@ -829,8 +829,17 @@ test('ordinary handoff refuses unmatched and active direct-post custody', t => {
     nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
     handoffId: 'ordinary-post-handoff-id', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
   };
+  const relocation = { ...binding, sessionRoot: successorRoot };
+  const relocationProof = { ...proof, sessionId: CODEX, threadId: CODEX, workspace: binding.workspace };
+  const assertRelocationHeld = () => {
+    const before = f.state.getBinding(binding.channelId);
+    assert.throws(() => f.state.rebindOrdinary(relocation, f.identity, relocationProof), /unresolved.*post/);
+    assert.deepEqual(f.state.getBinding(binding.channelId), before);
+  };
+  assertRelocationHeld();
   assert.throws(() => f.state.handoffOrdinary(handoff), /unresolved/);
   f.state.receipt(null, 'direct-post-outcome', { ...attempt, outcome: 'sent', messageId: 'sent-message' });
+  assertRelocationHeld();
   assert.throws(() => f.state.handoffOrdinary(handoff), /unresolved/);
   const finalAttempt = { ...attempt, attemptId: 'ordinary-post-final-attempt', partIndex: 1 };
   f.state.receipt(null, 'direct-post-attempt', finalAttempt);
@@ -1172,7 +1181,8 @@ test('explicit ordinary handoff fences remote messages through its ownership com
     const channel = {
       id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
       messages: { fetch: async options => {
-        if (options?.before === '150') {
+        if (options?.after === '100') {
+          assert.equal(options.before, undefined);
           beforeFenceFetches += 1;
           return new Map([['latest', { id: preFenceId }]]);
         }
@@ -1253,7 +1263,7 @@ test('ordinary unbind fences remote intake before revoking custody', async t => 
     id: binding.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
     lastMessageId: '140',
     messages: { fetch: async options => {
-      if (options?.before === '150') return new Map();
+      if (options?.after === '100') { assert.equal(options.before, undefined); return new Map(); }
       return new Map([['latest', { id: '140' }]]);
     } },
     send: async () => {
@@ -1660,4 +1670,71 @@ test('simulated: ordinary binding wake honors the Gateway capability', () => {
     kill: () => {}
   }), { requested: false, state: 'stopped', reason: 'gateway-not-running' });
   assert.deepEqual(wakeSignals, [{ pid: 4242, signal: 'SIGUSR2' }]);
+});
+
+test('healthy intake checkpoint requires durable history and honors cancellation', async t => {
+  for (const mode of ['covered', 'missing', 'unrelated-receipt', 'cutoff-rejection', 'cancelled']) {
+    await t.test(mode, async t => {
+      const f = fixture(t);
+      const binding = ordinary(f);
+      f.state.recordOrdinaryPreflight(binding, { file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir });
+      f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'checkpoint baseline');
+      f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'fixture ready');
+      const event = { id: '101', guildId: 'guild', channelId: binding.channelId, authorId: 'bot', isBot: true, content: 'notice' };
+      if (mode === 'covered' || mode === 'cancelled') {
+        assert.equal(f.state.acceptDiscordMessage(event).reason, 'bot-source');
+      } else if (mode === 'unrelated-receipt') {
+        f.state.receipt(null, 'test-note', { discordId: '101' });
+      } else if (mode === 'cutoff-rejection') {
+        f.state.receipt(null, 'intake-rejected', { discordId: '101', reason: 'before-intake-cutoff' });
+      }
+      const controller = new AbortController();
+      const channel = {
+        id: binding.channelId, guildId: 'guild', permissionsFor: () => ({ has: () => true }),
+        messages: { fetch: async () => {
+          if (mode === 'cancelled') controller.abort();
+          return new Map([['101', event]]);
+        } }
+      };
+      const gateway = new DiscordGateway({
+        state: f.state,
+        client: { user: { id: 'bot' }, on() {}, off() {}, channels: { fetch: async () => channel } },
+        fetchHistory: async () => [event]
+      });
+      const work = gateway.checkpointHealthyIntake(controller.signal, gateway.lifecycleEpoch);
+      if (mode === 'cancelled') await assert.rejects(work, error => error.recoveryKind === 'stopped');
+      else await work;
+      assert.equal(f.state.getIntakeWatermark(binding.channelId).recovered_through_id, mode === 'covered' ? '101' : '100');
+    });
+  }
+});
+
+test('live intake checkpoints keep sequential traffic within recovery bounds', async t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.recordOrdinaryPreflight(binding, { file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir });
+  f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'checkpoint baseline');
+  f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'fixture ready');
+  const history = [];
+  const channel = {
+    id: binding.channelId, guildId: 'guild', permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => new Map(history.slice(-1).map(message => [message.id, message])) }
+  };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, on() {}, off() {}, channels: { fetch: async () => channel } },
+    fetchHistory: async (_channel, options) => history.filter(message => BigInt(message.id) > BigInt(options.after)).slice(0, options.limit),
+    recoveryOptions: { maxMessages: 4 }
+  });
+  gateway.ready = true;
+  for (let id = 101; id <= 106; id += 1) {
+    const message = { id: String(id), guildId: 'guild', channelId: binding.channelId, author: { id: 'bot', bot: true }, content: 'notice' };
+    history.push(message);
+    gateway.boundMessage(message);
+    await Promise.all([...gateway.inFlight]);
+    await gateway.liveCheckpointPromise;
+  }
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).recovered_through_id, '106');
+  assert.equal(f.state.listMessages().length, 0);
+  assert.equal(history.length > gateway.historyMaxMessages, true);
 });

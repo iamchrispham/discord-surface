@@ -83,17 +83,34 @@ function walk(dir, result = [], depth = 0) {
   return result;
 }
 
-async function readSessionHeaderAsync(file) {
+function assertValidationActive(options = {}) {
+  if (options.signal?.aborted) {
+    const error = new Error('Codex transcript validation was stopped');
+    error.recoveryKind = 'stopped';
+    throw error;
+  }
+  if (options.deadline !== undefined && Date.now() >= options.deadline) {
+    const error = new Error('Codex transcript validation deadline exceeded');
+    error.recoveryKind = 'deadline';
+    throw error;
+  }
+}
+
+async function readSessionHeaderAsync(file, options = {}) {
+  assertValidationActive(options);
   const handle = await fs.promises.open(file, 'r');
   try {
     const { size } = await handle.stat();
     const parts = [];
     for (let position = 0; position < size;) {
+      assertValidationActive(options);
       const length = Math.min(TRANSCRIPT_BLOCK_BYTES, size - position);
       const bytes = Buffer.allocUnsafe(length);
       let read = 0;
       while (read < length) {
+        assertValidationActive(options);
         const result = await handle.read(bytes, read, length - read, position + read);
+        assertValidationActive(options);
         if (!result.bytesRead) throw new Error('transcript shortened during read');
         read += result.bytesRead;
       }
@@ -108,25 +125,29 @@ async function readSessionHeaderAsync(file) {
   }
 }
 
-async function* walkAsync(dir, depth = 0) {
+async function* walkAsync(dir, depth = 0, options = {}) {
+  assertValidationActive(options);
   if (depth > 5) return;
   let entries;
-  try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+  try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
+  catch (error) { if (error?.recoveryKind) throw error; return; }
   for (const entry of entries) {
+    assertValidationActive(options);
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) yield* walkAsync(full, depth + 1);
+    if (entry.isDirectory()) yield* walkAsync(full, depth + 1, options);
     else if (entry.isFile() && entry.name.endsWith('.jsonl')) yield full;
     await new Promise(resolve => setImmediate(resolve));
   }
 }
 
-async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
+async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot(), options = {}) {
   validateNativeId(nativeId);
   const matches = [];
-  for await (const file of walkAsync(root)) {
+  for await (const file of walkAsync(root, 0, options)) {
+    assertValidationActive(options);
     if (!file.includes(nativeId)) continue;
     try {
-      const row = JSON.parse(await readSessionHeaderAsync(file));
+      const row = JSON.parse(await readSessionHeaderAsync(file, options));
       const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
@@ -136,8 +157,11 @@ async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
         file, sessionId: nativeId, threadId: nativeId,
         workspace: typeof payload.cwd === 'string' ? payload.cwd : null
       });
-    } catch {}
+    } catch (error) {
+      if (error?.recoveryKind) throw error;
+    }
   }
+  assertValidationActive(options);
   if (matches.length === 0) return null;
   if (matches.length > 1) return { ambiguous: true, files: matches.map(match => match.file) };
   return matches[0];
@@ -263,11 +287,11 @@ function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot())
   return identity;
 }
 
-async function validateCodexSessionIdentityAsync(nativeId, workspace, root = sessionRoot()) {
+async function validateCodexSessionIdentityAsync(nativeId, workspace, root = sessionRoot(), options = {}) {
   validateNativeId(nativeId);
   if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
   codexHomeForSessionRoot(root);
-  const identity = await readCodexSessionIdentityAsync(nativeId, root);
+  const identity = await readCodexSessionIdentityAsync(nativeId, root, options);
   if (!identity) throw new Error('Codex transcript identity is unavailable');
   if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
   if (identity.sessionId !== nativeId || identity.threadId !== nativeId) {

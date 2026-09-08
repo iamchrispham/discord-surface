@@ -593,6 +593,9 @@ class DiscordGateway {
     this.connectionEpoch = 0;
     this.recoveryController = null;
     this.recoveryPromise = null;
+    this.liveCheckpointController = null;
+    this.liveCheckpointPromise = null;
+    this.liveIntakeCounts = new Map();
     this.reconnectPromise = null;
     this.transportReady = false;
     this.fetchHistoryInjected = typeof fetchHistory === 'function';
@@ -601,13 +604,19 @@ class DiscordGateway {
     this.historyMaxPages = Math.min(RECOVERY_LIMITS.maxPages, Math.max(1, Number(recoveryOptions.maxPages || RECOVERY_LIMITS.maxPages)));
     this.historyMaxMessages = Math.min(RECOVERY_LIMITS.maxMessages, Math.max(1, Number(recoveryOptions.maxMessages || RECOVERY_LIMITS.maxMessages)));
     this.recoveryTimeoutMs = Math.min(RECOVERY_LIMITS.timeoutMs, Math.max(1000, Number(recoveryOptions.timeoutMs || RECOVERY_LIMITS.timeoutMs)));
+    this.liveCheckpointThreshold = Math.max(1, Math.floor(this.historyMaxMessages / 2));
     this.codexSessionRoot = recoveryOptions.codexSessionRoot;
     this.ready = false;
     this.providers = providers || {
       codex: new CodexProvider(),
       claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(state, id, options) })
     };
-    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (binding => validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot));
+    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || ((binding, options = {}) => validateCodexSessionIdentityAsync(
+      binding.nativeId,
+      binding.workspace,
+      binding.sessionRoot || this.codexSessionRoot,
+      options
+    ));
     this.consumer = createSurfaceConsumer({
       state,
       providers: this.providers,
@@ -617,11 +626,15 @@ class DiscordGateway {
     });
     this.boundMessage = message => {
       if (this.stopping) return;
+      const readyLive = this.ready;
       const controller = new AbortController();
       this.controllers.add(controller);
       const work = (this.ready ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false, null, null, true))
         .catch(error => this.logger(`message handling failed: ${error.message}`))
-        .finally(() => this.controllers.delete(controller));
+        .finally(() => {
+          this.controllers.delete(controller);
+          if (readyLive) this.noteLiveIntake(message);
+        });
       this.inFlight.add(work);
       work.finally(() => this.inFlight.delete(work));
     };
@@ -713,6 +726,7 @@ class DiscordGateway {
     this.transportReady = false;
     this.connectionEpoch += 1;
     this.recoveryController?.abort();
+    this.liveCheckpointController?.abort();
     for (const binding of this.state.listBindings().filter(item => item.active)) {
       try { this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, detail, binding); }
       catch (error) { this.logger(`Discord disconnect readiness update failed: ${error.message}`); }
@@ -724,8 +738,10 @@ class DiscordGateway {
     this.transportReady = false;
     const connectionEpoch = this.connectionEpoch;
     const previousRecovery = this.recoveryPromise;
+    const previousCheckpoint = this.liveCheckpointPromise;
     const task = (async () => {
       await previousRecovery?.catch(() => {});
+      await previousCheckpoint?.catch(() => {});
       if (this.stopping || connectionEpoch !== this.connectionEpoch) return { ready: false, state: 'stopped' };
       const result = await this.recoverTransport('reconnect', this.lifecycleEpoch);
       if (!this.stopping && connectionEpoch === this.connectionEpoch) {
@@ -826,16 +842,99 @@ class DiscordGateway {
     return { watermark, topicPublished: true, publication: null };
   }
 
+  noteLiveIntake(message) {
+    const channelId = typeof message?.channelId === 'string' ? message.channelId : null;
+    if (!channelId || this.stopping || !this.state.getBinding(channelId)?.active) return;
+    const count = (this.liveIntakeCounts.get(channelId) || 0) + 1;
+    this.liveIntakeCounts.set(channelId, count);
+    if (count < this.liveCheckpointThreshold || this.liveCheckpointPromise || this.recoveryPromise || !this.ready) return;
+    this.liveIntakeCounts.set(channelId, 0);
+    this.beginLiveCheckpoint();
+  }
+
+  beginLiveCheckpoint() {
+    if (this.liveCheckpointPromise || this.stopping || !this.ready || this.recoveryPromise) return;
+    const controller = new AbortController();
+    const epoch = this.lifecycleEpoch;
+    this.liveCheckpointController = controller;
+    const checkpoint = this.checkpointHealthyIntake(controller.signal, epoch)
+      .catch(error => {
+        if (recoveryKind(error) !== 'stopped') this.logger(`Discord live intake checkpoint failed: ${error.message}`);
+      })
+      .finally(() => {
+        if (this.liveCheckpointPromise === checkpoint) this.liveCheckpointPromise = null;
+        if (this.liveCheckpointController === controller) this.liveCheckpointController = null;
+      });
+    this.liveCheckpointPromise = checkpoint;
+  }
+
+  async checkpointHealthyIntake(signal, lifecycleEpoch) {
+    const deadline = Date.now() + this.recoveryTimeoutMs;
+    const bindings = this.state.listBindings().filter(binding => binding.active && binding.readiness === READINESS.READY);
+    for (const binding of bindings) {
+      if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError('stopped', 'Discord live intake checkpoint was stopped');
+      const watermark = this.state.getIntakeWatermark(binding.channelId);
+      if (!watermark?.recovered_through_id || typeof this.state.hasIntakeEvidence !== 'function') continue;
+      if (typeof this.client?.channels?.fetch !== 'function') continue;
+      let channel;
+      try {
+        channel = await waitForRecoveryOperation(() => this.client.channels.fetch(binding.channelId), signal, deadline);
+        if (!channel || typeof channel.messages?.fetch !== 'function') continue;
+        const permission = this.historyPermission(channel, { requireSend: this.state.isOrdinaryBinding?.(binding) });
+        if (!permission.known || !permission.allowed) continue;
+        let after = watermark.recovered_through_id;
+        let pages = 0;
+        let total = 0;
+        let complete = false;
+        while (pages < this.historyMaxPages && total < this.historyMaxMessages && Date.now() < deadline) {
+          if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError('stopped', 'Discord live intake checkpoint was stopped');
+          const page = this.historyMessages(await waitForRecoveryOperation(
+            () => this.fetchHistory(channel, { limit: this.historyPageLimit, after, signal }),
+            signal,
+            deadline
+          ));
+          pages += 1;
+          if (!page.length) { complete = true; break; }
+          if (page.some(message => typeof message?.id !== 'string' || message.id.length === 0)) break;
+          page.sort((left, right) => compareDiscordIds(left?.id, right?.id));
+          const fresh = page.filter(message => typeof message?.id === 'string' && compareDiscordIds(message.id, after) > 0);
+          if (!fresh.length) { complete = true; break; }
+          for (const message of fresh) {
+            if (total >= this.historyMaxMessages) break;
+            if (!this.state.hasIntakeEvidence(message.id)) {
+              complete = false;
+              break;
+            }
+            after = message.id;
+            total += 1;
+          }
+          if (!complete && total < this.historyMaxMessages && fresh.some(message => !this.state.hasIntakeEvidence(message.id))) break;
+          if (total >= this.historyMaxMessages) break;
+          if (page.length < this.historyPageLimit) { complete = true; break; }
+        }
+        if (!complete || !after) continue;
+        const remoteCutoff = await waitForRecoveryOperation(() => latestChannelMessageId(channel), signal, deadline);
+        if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError('stopped', 'Discord live intake checkpoint was stopped');
+        if (remoteCutoff && compareDiscordIds(remoteCutoff, after) > 0) continue;
+        this.state.checkpointIntake(binding.channelId, after, binding);
+      } catch (error) {
+        if (recoveryKind(error) === 'stopped') throw error;
+      }
+    }
+  }
+
   isCurrentBinding(binding) {
     return bindingIdentityMatches(binding, this.state.getBinding(binding.channelId));
   }
 
-  async verifyOrdinaryNative(binding) {
+  async verifyOrdinaryNative(binding, options = {}) {
     if (!this.state.isOrdinaryBinding?.(binding)) return null;
     if (!this.providers.codex || typeof this.providers.codex.dispatch !== 'function') {
       throw new Error('Codex delivery provider is unavailable for ordinary binding');
     }
-    const proof = await this.ordinaryNativePreflight(binding);
+    const proof = await this.ordinaryNativePreflight(binding, options);
+    if (options.signal?.aborted) throw recoveryError('stopped', 'Codex native preflight was stopped');
+    if (options.deadline !== undefined && Date.now() >= options.deadline) throw recoveryError('deadline', 'Codex native preflight deadline exceeded');
     if (!proof || typeof proof !== 'object') throw new Error('Codex native preflight returned no proof');
     if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'ordinary Codex binding changed during native preflight');
     const recorded = this.state.recordOrdinaryPreflight(binding, proof);
@@ -887,8 +986,16 @@ class DiscordGateway {
         continue;
       }
       if (ordinary) {
+        const preflightController = new AbortController();
+        const relayAbort = () => preflightController.abort();
+        signal?.addEventListener('abort', relayAbort, { once: true });
         try {
-          await waitForRecoveryOperation(() => this.verifyOrdinaryNative(binding), signal, deadline);
+          await waitForRecoveryOperation(
+            () => this.verifyOrdinaryNative(binding, { signal: preflightController.signal, deadline }),
+            signal,
+            deadline,
+            () => preflightController.abort()
+          );
         } catch (error) {
           const kind = recoveryKind(error);
           if (kind === 'stopped') return { ready: false, state: 'stopped' };
@@ -899,6 +1006,9 @@ class DiscordGateway {
           await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
           failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
           continue;
+        } finally {
+          signal?.removeEventListener('abort', relayAbort);
+          preflightController.abort();
         }
       }
       if (!ordinary && !conductorMarkerMatchesTopic(channel.topic, binding)) {
@@ -1136,9 +1246,12 @@ class DiscordGateway {
     this.stopPromise = (async () => {
       this.ready = false;
       this.recoveryController?.abort();
+      this.liveCheckpointController?.abort();
       const recovery = this.recoveryPromise;
       const reconnect = this.reconnectPromise;
-      await Promise.allSettled([recovery, reconnect].filter(Boolean));
+      const liveCheckpoint = this.liveCheckpointPromise;
+      await Promise.allSettled([recovery, reconnect, liveCheckpoint].filter(Boolean));
+      this.liveIntakeCounts.clear();
       for (const controller of this.controllers) controller.abort();
       for (const controller of this.receiptControllers) controller.abort();
       this.consumer.abortNativeWork();
