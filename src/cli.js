@@ -6,8 +6,23 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
-const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
-const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('./ordinary-codex');
+const {
+  createHandoffFence,
+  deleteHandoffFence,
+  DiscordGateway,
+  discordIdAfter,
+  latestChannelMessageId,
+  readSecret,
+  requireInstalled,
+  serverDerivedChannelCutoff
+} = require('./discord');
+const {
+  createOrdinaryCodexRequestFromEnvironment,
+  ordinaryBindingDecision,
+  ORDINARY_BINDING_DECISIONS,
+  resolveExistingChannel,
+  resolveInvocationIdentity
+} = require('./ordinary-codex');
 const { sessionRoot: codexSessionRoot, validateCodexSessionIdentityAsync } = require('./native');
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
@@ -98,50 +113,6 @@ function ordinaryBindingArgs(args, environment = process.env, channelId = null, 
     sessionRoot,
     environment
   });
-}
-
-async function latestChannelMessageId(channel, options = {}) {
-  const cached = typeof channel?.lastMessageId === 'string' && channel.lastMessageId.length > 0 ? channel.lastMessageId : null;
-  if (typeof channel?.messages?.fetch !== 'function') return cached;
-  const scopedBefore = options != null && Object.prototype.hasOwnProperty.call(options, 'before');
-  const fetched = await channel.messages.fetch({ limit: 1, ...options });
-  let message = null;
-  if (Array.isArray(fetched)) message = fetched[0];
-  else if (typeof fetched?.first === 'function') message = fetched.first();
-  else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
-  if (typeof message?.id === 'string' && message.id.length > 0) return message.id;
-  if (scopedBefore) return null;
-  return cached;
-}
-
-async function createHandoffFence(channel, operation = 'ordinary handoff') {
-  if (typeof channel?.send !== 'function') throw new Error(`${operation} requires a Discord server fence`);
-  const message = await channel.send({
-    content: '\u200b',
-    allowedMentions: { parse: [] }
-  });
-  if (typeof message?.id !== 'string' || message.id.length === 0) {
-    throw new Error('Discord handoff fence has no stable ID');
-  }
-  return message;
-}
-
-async function deleteHandoffFence(message) {
-  if (typeof message?.delete !== 'function') return;
-  try { await message.delete(); } catch {}
-}
-
-function serverDerivedChannelCutoff(channel) {
-  return typeof channel?.id === 'string' && /^\d+$/.test(channel.id) ? channel.id : null;
-}
-
-function discordIdAfter(left, right) {
-  if (!left || !right) return false;
-  try {
-    return BigInt(left) > BigInt(right);
-  } catch {
-    return String(left).localeCompare(String(right)) > 0;
-  }
 }
 
 function bindingIdentityMatches(binding, expected) {
@@ -258,13 +229,13 @@ async function ordinaryBind(args, dependencies = {}) {
     const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: validationRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     let adoptionCutoff = null;
-    if (decision !== 'reuse' && !existing?.active) {
+    if (decision !== ORDINARY_BINDING_DECISIONS.REUSE && !existing?.active) {
       const cutoff = await latestChannelMessageId(discordChannel);
       adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
     }
     let binding;
-    if (decision === 'reuse') binding = existing;
-    else if (decision === 'rebind') {
+    if (decision === ORDINARY_BINDING_DECISIONS.REUSE) binding = existing;
+    else if (decision === ORDINARY_BINDING_DECISIONS.REBIND) {
       try {
         binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence, adoptionCutoff);
       } catch (error) {
@@ -272,8 +243,8 @@ async function ordinaryBind(args, dependencies = {}) {
         const racedDecision = raced
           ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
           : null;
-        if (racedDecision !== 'reuse') throw error;
-        decision = 'reuse';
+        if (racedDecision !== ORDINARY_BINDING_DECISIONS.REUSE) throw error;
+        decision = ORDINARY_BINDING_DECISIONS.REUSE;
         binding = raced;
       }
     }
@@ -285,8 +256,8 @@ async function ordinaryBind(args, dependencies = {}) {
         const racedDecision = raced
           ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
           : null;
-        if (racedDecision !== 'reuse') throw error;
-        decision = 'reuse';
+        if (racedDecision !== ORDINARY_BINDING_DECISIONS.REUSE) throw error;
+        decision = ORDINARY_BINDING_DECISIONS.REUSE;
         binding = raced;
       }
     }

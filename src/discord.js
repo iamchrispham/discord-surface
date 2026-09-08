@@ -54,6 +54,46 @@ function compareDiscordIds(left, right) {
   }
 }
 
+async function latestChannelMessageId(channel, options = {}) {
+  const cached = typeof channel?.lastMessageId === 'string' && channel.lastMessageId.length > 0 ? channel.lastMessageId : null;
+  if (typeof channel?.messages?.fetch !== 'function') return cached;
+  const scopedBefore = options != null && Object.prototype.hasOwnProperty.call(options, 'before');
+  const fetched = await channel.messages.fetch({ limit: 1, ...options });
+  let message = null;
+  if (Array.isArray(fetched)) message = fetched[0];
+  else if (typeof fetched?.first === 'function') message = fetched.first();
+  else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
+  if (typeof message?.id === 'string' && message.id.length > 0) return message.id;
+  if (scopedBefore) return null;
+  return cached;
+}
+
+async function createHandoffFence(channel, operation = 'ordinary handoff') {
+  if (typeof channel?.send !== 'function') throw new Error(`${operation} requires a Discord server fence`);
+  const message = await channel.send({
+    content: '\u200b',
+    allowedMentions: { parse: [] }
+  });
+  if (typeof message?.id !== 'string' || message.id.length === 0) {
+    throw new Error('Discord handoff fence has no stable ID');
+  }
+  return message;
+}
+
+async function deleteHandoffFence(message) {
+  if (typeof message?.delete !== 'function') return;
+  try { await message.delete(); } catch {}
+}
+
+function serverDerivedChannelCutoff(channel) {
+  return typeof channel?.id === 'string' && /^\d+$/.test(channel.id) ? channel.id : null;
+}
+
+function discordIdAfter(left, right) {
+  if (!left || !right) return false;
+  return compareDiscordIds(left, right) > 0;
+}
+
 function conductorMarkerMatchesTopic(topic, binding) {
   if (!binding.conductorId && !binding.repoKey) return true;
   if (!binding.conductorId || !binding.repoKey || typeof topic !== 'string') return false;
@@ -1128,8 +1168,13 @@ module.exports = {
   DiscordGateway,
   classifyReplyError,
   createSurfaceConsumer,
+  createHandoffFence,
+  deleteHandoffFence,
+  discordIdAfter,
   eventToInput,
+  latestChannelMessageId,
   readSecret,
   requireInstalled,
+  serverDerivedChannelCutoff,
   sendDiscordMessage,
 };

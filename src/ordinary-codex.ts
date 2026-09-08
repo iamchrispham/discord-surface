@@ -51,6 +51,14 @@ export interface InvocationEnvironment {
   PWD?: string;
 }
 
+export const ORDINARY_BINDING_DECISIONS = {
+  BIND: 'bind',
+  REUSE: 'reuse',
+  REBIND: 'rebind'
+} as const;
+
+export type OrdinaryBindingDecision = typeof ORDINARY_BINDING_DECISIONS[keyof typeof ORDINARY_BINDING_DECISIONS];
+
 function requiredText(value: unknown, name: string, max = 4096): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`${name} must be a non-empty string`);
@@ -113,8 +121,8 @@ export function ordinaryBindingDecision(
   request: OrdinaryCodexRequest,
   ordinaryMarker = false,
   nativeProof: OrdinaryCodexNativeProof | null = null
-): 'bind' | 'reuse' | 'rebind' {
-  if (!existing) return 'bind';
+): OrdinaryBindingDecision {
+  if (!existing) return ORDINARY_BINDING_DECISIONS.BIND;
   const sessionRootMatches = request.sessionRoot === undefined || (existing.sessionRoot || null) === request.sessionRoot;
   const verifiedRootRelocation = !sessionRootMatches && typeof nativeProof?.file === 'string' && nativeProof.file.startsWith('/') &&
     nativeProof.sessionId === request.nativeId && nativeProof.threadId === request.nativeId &&
@@ -124,7 +132,9 @@ export function ordinaryBindingDecision(
     existing.nativeId === request.nativeId && existing.workspace === request.workspace &&
     (sessionRootMatches || verifiedRootRelocation) &&
     !existing.conductorId && !existing.repoKey;
-  if (sameOwner) return existing.active && sessionRootMatches ? 'reuse' : 'rebind';
+  if (sameOwner) return existing.active && sessionRootMatches
+    ? ORDINARY_BINDING_DECISIONS.REUSE
+    : ORDINARY_BINDING_DECISIONS.REBIND;
   const handoffCommand = [
     'handoff --ordinary --provider codex',
     `--channel-id ${request.channelId}`,

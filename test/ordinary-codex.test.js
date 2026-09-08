@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
-const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordinaryBind, unbind } = require('../src/cli');
+const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordinaryBind, requestGatewayRecovery, unbind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
 const { CodexProvider, readCodexSessionIdentityAsync, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
 const { SurfaceState, READINESS, StaleGenerationError } = require('../src/state');
@@ -1312,6 +1312,34 @@ test('ordinary readiness requires native proof before the intake boundary can be
   assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.READY);
 });
 
+test('ordinary preflight evidence is scoped to the active transcript root', t => {
+  const f = fixture(t);
+  const original = transcript(t, f.dir);
+  const successor = transcript(t, f.dir);
+  const binding = f.state.bindOrdinary({
+    channelId: 'ordinary-root-scope', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    workspace: f.dir, sessionRoot: original.root
+  }, { sessionId: CODEX, threadId: CODEX });
+  f.state.recordOrdinaryPreflight(binding, {
+    file: original.file, sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  assert.equal(f.state.hasOrdinaryPreflight(binding), true);
+  f.state.acceptDiscordMessage({
+    id: 'root-relocation-held', guildId: 'guild', channelId: binding.channelId,
+    authorId: 'operator', isBot: false, content: 'held during root relocation'
+  }, { ready: false });
+
+  const relocated = f.state.rebindOrdinary({ ...binding, sessionRoot: successor.root }, {
+    sessionId: CODEX, threadId: CODEX
+  }, {
+    file: successor.file, sessionId: CODEX, threadId: CODEX, workspace: f.dir, sessionRoot: successor.root
+  });
+  assert.equal(relocated.generation, binding.generation);
+  assert.equal(relocated.sessionRoot, successor.root);
+  assert.equal(f.state.hasOrdinaryPreflight(relocated), false);
+  assert.throws(() => f.state.markIntakeBoundary(relocated.channelId, READINESS.READY, 'history complete', null, null, relocated), /preflight/);
+});
+
 test('Gateway repeats ordinary native preflight on reconnect before promoting intake', async t => {
   const f = fixture(t);
   const session = transcript(t, f.dir);
@@ -1514,3 +1542,28 @@ for (const action of ['rebind', 'handoff']) {
     });
   }
 }
+
+test('simulated: ordinary binding wake honors the Gateway capability', () => {
+  const paths = { stateDir: '/tmp/ordinary-wake', pid: '/tmp/ordinary-wake.pid' };
+  const wakeSignals = [];
+  const running = { state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] };
+  assert.deepEqual(requestGatewayRecovery(paths, {
+    status: () => running,
+    kill: (pid, signal) => wakeSignals.push({ pid, signal })
+  }), { requested: true, pid: 4242, signal: 'SIGUSR2' });
+  assert.deepEqual(requestGatewayRecovery(paths, {
+    status: () => ({ ...running, capabilities: [] }),
+    kill: () => {}
+  }), {
+    requested: false,
+    pid: 4242,
+    state: 'running',
+    reason: 'gateway-wake-unsupported',
+    capability: GATEWAY_CAPABILITIES.ordinaryBindWake
+  });
+  assert.deepEqual(requestGatewayRecovery(paths, {
+    status: () => ({ state: 'stopped' }),
+    kill: () => {}
+  }), { requested: false, state: 'stopped', reason: 'gateway-not-running' });
+  assert.deepEqual(wakeSignals, [{ pid: 4242, signal: 'SIGUSR2' }]);
+});

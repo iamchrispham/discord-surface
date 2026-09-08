@@ -1055,8 +1055,9 @@ class SurfaceState {
         AND json_extract(detail, '$.nativeId')=?
         AND json_extract(detail, '$.workspace')=?
         AND json_extract(detail, '$.generation')=?
+        AND json_extract(detail, '$.sessionRoot') IS ?
         AND json_extract(detail, '$.outcome')='verified'
-      LIMIT 1`).get(binding.channelId, binding.nativeId, binding.workspace, binding.generation));
+      LIMIT 1`).get(binding.channelId, binding.nativeId, binding.workspace, binding.generation, binding.sessionRoot || null));
   }
 
   recordOrdinaryPreflight(binding, detail = {}) {
@@ -1072,6 +1073,7 @@ class SurfaceState {
         ...detail,
         channelId: current.channelId, guildId: current.guildId, provider: current.provider,
         nativeId: current.nativeId, workspace: current.workspace, generation: current.generation,
+        sessionRoot: current.sessionRoot || null,
         outcome: 'verified'
       });
       return current;

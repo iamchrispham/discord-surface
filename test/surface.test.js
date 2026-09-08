@@ -11,7 +11,7 @@ const { SurfaceState, StateCorruptError, StaleGenerationError, UnresolvedWorkErr
 const { CodexProvider, claudeEvent, codexPrompt, dispatchAndObserve, finalText, observeCodexReply, observeSubmitted, readInitialCursor, runCodex } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway, readSecret } = require('../src/discord');
 const { deriveLiaisonFacts, rawReceiptFor, runLiaisonDraft, validateLiaisonSelection } = require('../src/liaison');
-const { bindingArgs, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, migrateLegacyTopic, pathsFor, provisionMarker, requestGatewayRecovery } = require('../src/cli');
+const { bindingArgs, conductorMarker, ensureProvisionedChannel, gatewayProcessStatus, migrateLegacyTopic, pathsFor, provisionMarker } = require('../src/cli');
 const { ClaudeChannel } = require('../src/claude-channel');
 const { conductorMarkerMatches, topicWithReadiness } = require('../src/topic');
 const requireInstalled = require;
@@ -1441,7 +1441,6 @@ test('simulated: status distinguishes matching, stopped, stale, and unknown Gate
   assert.deepEqual(status(), { state: 'stopped', pid: null, connection: 'unavailable', reason: 'pid-file-missing' });
 
   const preload = path.join(dir, 'status-gateway-preload.cjs');
-  const wakeMarker = path.join(dir, 'gateway-wake');
   fs.writeFileSync(preload, `
 const fs = require('node:fs');
 const target = require.resolve(${JSON.stringify(path.resolve(__dirname, '../src/discord.js'))});
@@ -1449,12 +1448,7 @@ const loaded = require(target);
 class FixtureGateway {
   constructor() { this.ready = false; this.timer = setInterval(() => {}, 1000); }
   async start() { this.ready = true; }
-  async recoverTransport() {
-    const count = fs.existsSync(${JSON.stringify(wakeMarker)}) ? Number(fs.readFileSync(${JSON.stringify(wakeMarker)}, 'utf8')) : 0;
-    fs.writeFileSync(${JSON.stringify(wakeMarker)}, String(count + 1));
-    if (count === 0) await new Promise(resolve => setTimeout(resolve, 50));
-    return { ready: true };
-  }
+  async recoverTransport() { return { ready: true }; }
   async reconcilePending() {}
   async stop() { this.ready = false; clearInterval(this.timer); }
 }
@@ -1475,36 +1469,6 @@ require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
     assert.equal(printed.status, 0, printed.stderr);
     assert.equal(JSON.parse(printed.stdout).gateway.state, 'running');
     assert.equal(fs.existsSync(paths.pid), true);
-
-    fs.writeFileSync(paths.pid, JSON.stringify({
-      pid: matching.pid,
-      guildId: 'guild-1',
-      stateDir: dir,
-      command: 'run',
-      startedAt: new Date().toISOString(),
-      capabilities: ['ordinary-bind-wake-v1']
-    }), { mode: 0o600 });
-    assert.deepEqual(requestGatewayRecovery(paths), {
-      requested: true,
-      pid: matching.pid,
-      signal: 'SIGUSR2'
-    });
-    await waitForCondition(() => fs.existsSync(wakeMarker) && fs.readFileSync(wakeMarker, 'utf8') === '1');
-    assert.deepEqual(requestGatewayRecovery(paths), {
-      requested: true,
-      pid: matching.pid,
-      signal: 'SIGUSR2'
-    });
-    await waitForCondition(() => fs.existsSync(wakeMarker) && fs.readFileSync(wakeMarker, 'utf8') === '2');
-
-    fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
-    assert.deepEqual(requestGatewayRecovery(paths), {
-      requested: false,
-      pid: matching.pid,
-      state: 'running',
-      reason: 'gateway-wake-unsupported',
-      capability: 'ordinary-bind-wake-v1'
-    });
     assert.doesNotThrow(() => process.kill(matching.pid, 0));
   } finally {
     matching.kill('SIGTERM');
