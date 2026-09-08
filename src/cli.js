@@ -314,6 +314,21 @@ async function ordinaryBind(args, dependencies = {}) {
   }
 }
 
+function ordinaryBindCommand(args) {
+  const paths = pathsFor(args);
+  const runtime = gatewayProcessStatus(paths);
+  if (runtime?.state === 'running' && runtime.pid) return ordinaryBind(args);
+
+  fs.mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 });
+  const forwarded = Object.entries(args).flatMap(([key, value]) => value === true ? [`--${key}`] : [`--${key}`, String(value)]);
+  const result = spawnSync('lockf', ['-t', '0', '-k', paths.lock, process.execPath, __filename, 'ordinary-bind-run', ...forwarded], {
+    stdio: 'inherit',
+    env: { ...process.env, DISCORD_SURFACE_ORDINARY_BIND_LOCK_HELD: '1' }
+  });
+  if (result.error) throw result.error;
+  process.exitCode = result.status ?? 1;
+}
+
 async function resolveCurrentClaudeCaller(dependencies = {}) {
   if (typeof dependencies.resolveClaudeCaller === 'function') return dependencies.resolveClaudeCaller();
   const resolverPath = path.join(os.homedir(), '.claude', 'hooks', 'session-chat-binding.mjs');
@@ -1458,7 +1473,12 @@ async function main() {
   switch (command) {
     case 'configure': return configure(args);
     case 'bind': return bind(args);
-    case 'ordinary-bind': return ordinaryBind(args);
+    case 'ordinary-bind':
+      if (process.env.DISCORD_SURFACE_ORDINARY_BIND_LOCK_HELD !== '1') return ordinaryBindCommand(args);
+      return ordinaryBind(args);
+    case 'ordinary-bind-run':
+      if (process.env.DISCORD_SURFACE_ORDINARY_BIND_LOCK_HELD !== '1') throw new Error('ordinary-bind-run is internal; use ordinary-bind');
+      return ordinaryBind(args);
     case 'ordinary-claude-bind': return ordinaryClaudeBind(args);
     case 'rebind': return bind(args, true);
     case 'unbind': return unbind(args);
