@@ -62,6 +62,12 @@ test('typed ordinary request rejects missing or conflicting invocation identity'
   });
   assert.deepEqual(request.identity, { sessionId: CODEX, threadId: CODEX });
   assert.equal(request.nativeId, CODEX);
+  const upperRequest = createOrdinaryCodexRequestFromEnvironment({
+    channelId: 'channel', guildId: 'guild', nativeId: CODEX.toUpperCase(), workspace: '/tmp/workspace',
+    environment: { CODEX_SESSION_ID: CODEX.toUpperCase(), CODEX_THREAD_ID: CODEX.toUpperCase() }
+  });
+  assert.equal(upperRequest.nativeId, CODEX);
+  assert.deepEqual(upperRequest.identity, { sessionId: CODEX, threadId: CODEX });
   assert.equal(resolveInvocationIdentity({ CODEX_SESSION_ID: CODEX_V7, CODEX_THREAD_ID: CODEX_V7, PWD: '/tmp/workspace' }).sessionId, CODEX_V7);
   assert.equal(resolveInvocationIdentity({ CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: '/checkout' }, '/session-workspace').workspace, '/session-workspace');
   assert.equal(resolveInvocationIdentity({ CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: '/checkout' }).workspace, undefined);
@@ -1238,8 +1244,11 @@ test('explicit ordinary handoff fences remote messages through its ownership com
       binding: recovered.getBinding(original.channelId),
       watermark: recovered.getIntakeWatermark(original.channelId)
     };
+    const postAbortIntake = recovered.acceptDiscordMessage({
+      id: '160', guildId: 'guild', channelId: original.channelId, authorId: 'operator', content: 'message after aborted handoff'
+    }, { ready: snapshot.binding.readiness === READINESS.READY });
     recovered.close();
-    return { result, error, snapshot, lateIntake, beforeFenceFetches, wasDeleted: () => deleted };
+    return { result, error, snapshot, lateIntake, postAbortIntake, beforeFenceFetches, wasDeleted: () => deleted };
   }
 
   const accepted = await invokeCase('100');
@@ -1258,6 +1267,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.equal(rejected.snapshot.binding.nativeId, CODEX);
   assert.equal(rejected.lateIntake.accepted, false);
   assert.equal(rejected.lateIntake.reason, 'handoff-intake-paused');
+  assert.equal(rejected.postAbortIntake.accepted, true);
   assert.equal(rejected.wasDeleted(), true);
 });
 

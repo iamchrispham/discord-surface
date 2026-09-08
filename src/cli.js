@@ -772,9 +772,12 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   const { paths, state } = openState(args);
   let client;
   let handoffFence;
+  let sourceBinding = null;
+  let handoffCommitted = false;
   try {
     const config = state.requireConfig();
     const current = state.getBinding(channelId);
+    sourceBinding = current;
     if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey) {
       throw new Error('ordinary handoff source is unavailable');
     }
@@ -804,6 +807,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
           sessionRoot: validationRoot
         }
       });
+      handoffCommitted = true;
       const gatewayWake = wake(paths, {
         status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
         kill: dependencies.killProcess || process.kill
@@ -856,6 +860,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       identity: { sessionId: nativeProof.sessionId, threadId: nativeProof.threadId },
       nativeProof: { ...nativeProof, sessionRoot: validationRoot }
     });
+    handoffCommitted = true;
     const gatewayWake = wake(paths, {
       status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
       kill: dependencies.killProcess || process.kill
@@ -865,6 +870,15 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       readiness: binding.readiness, gatewayWake });
     return { binding, gatewayWake, handoffReconciled: Boolean(binding.handoffReconciled) };
   } finally {
+    if (!handoffCommitted && sourceBinding) {
+      try {
+        state.restoreOrdinaryHandoffIntake(channelId, sourceBinding);
+      } catch (error) {
+        state.auditReceipt(null, 'ordinary-handoff-intake-restore-failed', {
+          channelId, generation: sourceBinding.generation, error: error.message
+        });
+      }
+    }
     await deleteHandoffFence(handoffFence);
     await client?.destroy();
     state.close();
