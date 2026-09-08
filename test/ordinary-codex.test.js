@@ -105,6 +105,7 @@ test('channel resolution accepts exact ID, mention, and one name only in the con
 test('ordinary bind reuses the exact owner and wakes an already-running Gateway', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-cli-'));
   const db = path.join(dir, 'surface.sqlite');
+  const defaultRoot = path.join(dir, 'default-sessions');
   const setup = new SurfaceState(db);
   setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   setup.close();
@@ -135,6 +136,7 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
       validationRoots.push(args[2]);
       return { file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir };
     },
+    codexSessionRoot: () => defaultRoot,
     gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] }),
     killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
     print: () => {}
@@ -146,7 +148,8 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   assert.equal(second.reused, true);
   assert.equal(first.binding.generation, 1);
   assert.equal(second.binding.generation, 1);
-  assert.deepEqual(validationRoots, [undefined, undefined]);
+  assert.deepEqual(validationRoots, [defaultRoot, defaultRoot]);
+  assert.equal(first.binding.sessionRoot, defaultRoot);
   assert.equal(second.binding.readiness, READINESS.PENDING);
   assert.equal(first.nativeProof.status, 'verified');
   assert.equal(second.nativeProof.status, 'verified');
@@ -1037,6 +1040,63 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '200');
   await gateway.stop();
   recoveredState.close();
+});
+
+test('explicit ordinary handoff refuses an active remote intake gap', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-active-handoff-cli-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-active-handoff-workspace-'));
+  const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-active-handoff-root-'));
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  const original = setup.bindOrdinary({
+    channelId: '123456789012345678', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    workspace: dir
+  }, { sessionId: CODEX, threadId: CODEX });
+  setup.recordOrdinaryPreflight(original, {
+    file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir
+  });
+  setup.setIntakeCutoff(original.channelId, 'guild', '100', 'ordinary active handoff baseline');
+  setup.markIntakeBoundary(original.channelId, READINESS.READY, 'ordinary active handoff drained', null, null, original);
+  setup.close();
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(successorWorkspace, { recursive: true, force: true });
+    fs.rmSync(successorRoot, { recursive: true, force: true });
+  });
+
+  const channel = {
+    id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
+    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) }
+  };
+  class FakeClient {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: { fetch: async () => channel } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  await assert.rejects(() => handoffInternal({
+    ordinary: true, 'state-dir': dir, provider: 'codex', 'channel-id': original.channelId,
+    'from-native-id': CODEX, 'from-generation': '1', 'native-id': OTHER,
+    workspace: successorWorkspace, 'session-root': successorRoot, 'handoff-id': 'ordinary-active-gap'
+  }, {
+    environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: successorWorkspace },
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity: async () => ({
+      file: path.join(successorRoot, `${OTHER}.jsonl`), sessionId: OTHER, threadId: OTHER,
+      workspace: successorWorkspace
+    })
+  }), /durably drained/);
+
+  const recovered = new SurfaceState(db);
+  try {
+    assert.equal(recovered.getBinding(original.channelId).nativeId, CODEX);
+    assert.equal(recovered.getBinding(original.channelId).generation, 1);
+  } finally {
+    recovered.close();
+  }
 });
 
 test('native preflight requires exact session metadata and workspace', async t => {

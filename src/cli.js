@@ -115,6 +115,15 @@ function serverDerivedChannelCutoff(channel) {
   return typeof channel?.id === 'string' && /^\d+$/.test(channel.id) ? channel.id : null;
 }
 
+function discordIdAfter(left, right) {
+  if (!left || !right) return false;
+  try {
+    return BigInt(left) > BigInt(right);
+  } catch {
+    return String(left).localeCompare(String(right)) > 0;
+  }
+}
+
 function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill } = {}) {
   const runtime = status(paths);
   if (runtime?.state !== 'running' || !runtime.pid) {
@@ -207,7 +216,7 @@ async function ordinaryBind(args, dependencies = {}) {
     if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
       throw new Error('channel is already bound to another owner; use explicit handoff');
     }
-    let validationRoot = sessionRoot ?? existing?.sessionRoot ?? undefined;
+    let validationRoot = sessionRoot ?? existing?.sessionRoot ?? (dependencies.codexSessionRoot || codexSessionRoot)();
     if (!sessionRoot) {
       const proof = await validateNativeProof(validationRoot);
       nativeProofDetail = proof.detail;
@@ -722,10 +731,19 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
     }]);
     if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
+    const channelCutoff = await latestChannelMessageId(channel);
     let adoptionCutoff = null;
-    if (!current.active) {
-      const cutoff = await latestChannelMessageId(channel);
-      adoptionCutoff = cutoff || serverDerivedChannelCutoff(channel);
+    if (current.active) {
+      const watermark = state.getIntakeWatermark(channelId);
+      const recoveredThrough = watermark?.recovered_through_id || null;
+      const liveCustodyAhead = recoveredThrough && watermark?.last_seen_id && discordIdAfter(watermark.last_seen_id, recoveredThrough);
+      const remoteCustodyAhead = recoveredThrough && channelCutoff && discordIdAfter(channelCutoff, recoveredThrough);
+      if (watermark?.state !== READINESS.READY || !recoveredThrough || liveCustodyAhead || remoteCustodyAhead) {
+        throw new Error('ordinary handoff requires Discord intake to be durably drained');
+      }
+      adoptionCutoff = channelCutoff || recoveredThrough;
+    } else {
+      adoptionCutoff = channelCutoff || serverDerivedChannelCutoff(channel);
     }
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
