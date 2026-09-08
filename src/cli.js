@@ -154,6 +154,7 @@ async function ordinaryBind(args, dependencies = {}) {
   const validate = dependencies.validateCodexSessionIdentity || validateCodexSessionIdentityAsync;
   const output = dependencies.print || print;
   let client;
+  let adoptionFence;
   try {
     const config = state.requireConfig();
     const channelSelection = args.channel || args['channel-id'];
@@ -230,8 +231,8 @@ async function ordinaryBind(args, dependencies = {}) {
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     let adoptionCutoff = null;
     if (decision !== ORDINARY_BINDING_DECISIONS.REUSE && !existing?.active) {
-      const cutoff = await latestChannelMessageId(discordChannel);
-      adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
+      adoptionFence = await createHandoffFence(discordChannel, 'ordinary binding adoption');
+      adoptionCutoff = adoptionFence.id;
     }
     let binding;
     if (decision === ORDINARY_BINDING_DECISIONS.REUSE) binding = existing;
@@ -318,6 +319,7 @@ async function ordinaryBind(args, dependencies = {}) {
     output({ bound: true, reused: decision === 'reuse', binding: resultBinding, nativeProof, gatewayWake });
     return { binding: resultBinding, nativeProof, gatewayWake, reused: decision === 'reuse' };
   } finally {
+    await deleteHandoffFence(adoptionFence);
     try { await client?.destroy(); } finally { state.close(); }
   }
 }

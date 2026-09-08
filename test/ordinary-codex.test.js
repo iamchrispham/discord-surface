@@ -111,11 +111,16 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   setup.close();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-  let cutoffFetches = 0;
+  const fences = [];
   const validationRoots = [];
   const channel = {
     id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
-    messages: { fetch: async () => { cutoffFetches += 1; return new Map([['latest', { id: `latest-${cutoffFetches}` }]]); } }
+    async send() {
+      const id = `adoption-fence-${fences.length + 1}`;
+      const message = { id, async delete() { fences.find(fence => fence.id === id).deleted = true; } };
+      fences.push({ id, deleted: false });
+      return message;
+    }
   };
   const category = { id: 'category-channel', guildId: 'guild', name: 'category', isTextBased: () => false };
   const wakeSignals = [];
@@ -171,11 +176,14 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   assert.equal(rebound.binding.generation, 2);
   assert.equal(rebound.binding.readiness, READINESS.PENDING);
   assert.equal(rebound.nativeProof.status, 'verified');
-  assert.equal(cutoffFetches, 2);
+  assert.deepEqual(fences, [
+    { id: 'adoption-fence-1', deleted: true },
+    { id: 'adoption-fence-2', deleted: true }
+  ]);
 
   const stateAfterRebind = new SurfaceState(db);
   try {
-    assert.equal(stateAfterRebind.getIntakeWatermark(channel.id).last_seen_id, 'latest-2');
+    assert.equal(stateAfterRebind.getIntakeWatermark(channel.id).last_seen_id, 'adoption-fence-2');
   } finally { stateAfterRebind.close(); }
 
   await assert.rejects(() => ordinaryBind({ ...args, channel: '#category' }, dependencies), /message-capable/);
@@ -202,7 +210,10 @@ test('ordinary bind reopens terminal intake after native proof recovers', async 
   setup.close();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-  const channel = { id: 'ordinary-recovery-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'ordinary-recovery-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    async send() { return { id: 'adoption-fence-recovery', async delete() {} }; }
+  };
   class FakeClient {
     constructor() {
       this.guilds = { fetch: async () => ({ channels: {
@@ -258,7 +269,10 @@ test('ordinary bind derives workspace from exact transcript metadata across chec
     fs.rmSync(sessionWorkspace, { recursive: true, force: true });
   });
 
-  const channel = { id: 'workspace-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'workspace-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    async send() { return { id: 'adoption-fence-workspace', async delete() {} }; }
+  };
   let logins = 0;
   class FakeClient {
     constructor() {
@@ -401,7 +415,7 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
   assert.equal(state.getMessage('gateway-held-input').state, 'replied');
 });
 
-test('ordinary bind uses the empty channel snowflake as its cutoff', async t => {
+test('ordinary bind uses the server fence as its adoption cutoff', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-empty-cutoff-'));
   const db = path.join(dir, 'surface.sqlite');
   const setup = new SurfaceState(db);
@@ -409,16 +423,16 @@ test('ordinary bind uses the empty channel snowflake as its cutoff', async t => 
   setup.close();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-  let fetchStartedAt = 0;
-  let fetchCompletedAt = 0;
+  let sendStartedAt = 0;
+  let sendCompletedAt = 0;
   const channel = {
     id: '123456789012345678', guildId: 'guild', name: 'dev', isTextBased: () => true,
-    messages: { fetch: async () => {
-      fetchStartedAt = Date.now();
+    send: async () => {
+      sendStartedAt = Date.now();
       await new Promise(resolve => setTimeout(resolve, 50));
-      fetchCompletedAt = Date.now();
-      return new Map();
-    } }
+      sendCompletedAt = Date.now();
+      return { id: '123456789012345679', async delete() {} };
+    }
   };
   class FakeClient {
     constructor() {
@@ -441,8 +455,8 @@ test('ordinary bind uses the empty channel snowflake as its cutoff', async t => 
   const state = new SurfaceState(db);
   try {
     const watermark = state.getIntakeWatermark(channel.id);
-    assert.equal(watermark.last_seen_id, channel.id);
-    assert.ok(fetchCompletedAt >= fetchStartedAt);
+    assert.equal(watermark.last_seen_id, '123456789012345679');
+    assert.ok(sendCompletedAt >= sendStartedAt);
   } finally { state.close(); }
 });
 
@@ -1505,7 +1519,8 @@ for (const action of ['rebind', 'handoff']) {
       };
       const channel = {
         id: channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
-        messages: { fetch: async () => new Map([['latest', { id: '200' }]]) }
+        messages: { fetch: async () => new Map([['latest', { id: '200' }]]) },
+        async send() { return { id: '200', async delete() {} }; }
       };
       class FakeClient {
         constructor() { this.guilds = { fetch: async () => ({ channels: {
