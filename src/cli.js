@@ -843,6 +843,10 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     }
     let handoffCutoff = (current.active ? recoveredThrough : null) ||
       serverDerivedChannelCutoff(channel);
+    if (current.active) {
+      const paused = state.pauseOrdinaryHandoffIntake(channelId, current);
+      if (!paused) throw new Error('ordinary handoff source binding changed while pausing intake');
+    }
     handoffFence = await createHandoffFence(channel);
     if (handoffFence) {
       if (current.active) {

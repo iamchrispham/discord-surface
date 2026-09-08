@@ -13,6 +13,9 @@ const READINESS = Object.freeze({
   RECOVERING: 'recovering',
   GAP: 'gap'
 });
+const INTAKE_BOUNDARY_DETAILS = Object.freeze({
+  ORDINARY_HANDOFF: 'ordinary handoff fence'
+});
 const RECOVERY_LIMITS = Object.freeze({ pageSize: 100, maxPages: 10, maxMessages: 1000, timeoutMs: 30000 });
 const MESSAGE_STATES = Object.freeze({
   ACCEPTED: 'accepted',
@@ -1600,6 +1603,17 @@ class SurfaceState {
     });
   }
 
+  pauseOrdinaryHandoffIntake(channelId, expectedBinding = null) {
+    return this.markIntakeBoundary(
+      channelId,
+      READINESS.PENDING,
+      INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF,
+      null,
+      null,
+      expectedBinding
+    );
+  }
+
   recordTopicPublication(channelId, publication, expectedBinding = null) {
     assertText(channelId, 'channelId', 128);
     if (!publication || typeof publication.desiredReadiness !== 'string') throw new BindingError('topic publication readiness is required');
@@ -1722,6 +1736,10 @@ class SurfaceState {
         const result = this.transaction(() => {
           const binding = this.getBinding(event.channelId);
           if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
+          if (this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+            this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
+            return this.reject('handoff-intake-paused');
+          }
           this.upsertIntakeWatermark(event, ready, coverageId);
           this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'invalid-event', ready });
           return null;
@@ -1734,6 +1752,10 @@ class SurfaceState {
     return this.transaction(() => {
       const binding = this.getBinding(event.channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
+      if (this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
+        return this.reject('handoff-intake-paused');
+      }
       const intakeCutoff = this.getIntakeWatermark(event.channelId)?.recovered_through_id || null;
       this.upsertIntakeWatermark(event, ready, coverageId);
       let reason = null;

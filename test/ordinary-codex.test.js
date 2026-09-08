@@ -1179,6 +1179,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
 
     let beforeFenceFetches = 0;
     let deleted = false;
+    let lateIntake;
     const channel = {
       id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
       messages: { fetch: async options => {
@@ -1189,7 +1190,20 @@ test('explicit ordinary handoff fences remote messages through its ownership com
         }
         return new Map([['latest', { id: '100' }]]);
       } },
-      send: async () => ({ id: '150', delete: async () => { deleted = true; } })
+      send: async () => {
+        const duringFence = new SurfaceState(db);
+        try {
+          const bindingDuringFence = duringFence.getBinding(original.channelId);
+          assert.equal(bindingDuringFence.readiness, READINESS.PENDING);
+          lateIntake = duringFence.acceptDiscordMessage({
+            id: '151', guildId: 'guild', channelId: original.channelId,
+            authorId: 'operator', content: 'message after handoff fence'
+          }, { ready: bindingDuringFence.readiness === READINESS.READY });
+        } finally {
+          duringFence.close();
+        }
+        return { id: '150', delete: async () => { deleted = true; } };
+      }
     };
     class FakeClient {
       constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => channel } }) }; }
@@ -1221,7 +1235,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
       watermark: recovered.getIntakeWatermark(original.channelId)
     };
     recovered.close();
-    return { result, error, snapshot, beforeFenceFetches, wasDeleted: () => deleted };
+    return { result, error, snapshot, lateIntake, beforeFenceFetches, wasDeleted: () => deleted };
   }
 
   const accepted = await invokeCase('100');
@@ -1229,6 +1243,8 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.equal(accepted.result.binding.generation, 2);
   assert.equal(accepted.snapshot.watermark.last_seen_id, '150');
   assert.equal(accepted.snapshot.watermark.recovered_through_id, '150');
+  assert.equal(accepted.lateIntake.accepted, false);
+  assert.equal(accepted.lateIntake.reason, 'handoff-intake-paused');
   assert.equal(accepted.beforeFenceFetches, 1);
   assert.equal(accepted.wasDeleted(), true);
 
@@ -1236,6 +1252,8 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.match(rejected.error?.message || '', /durably drained/);
   assert.equal(rejected.snapshot.binding.generation, 1);
   assert.equal(rejected.snapshot.binding.nativeId, CODEX);
+  assert.equal(rejected.lateIntake.accepted, false);
+  assert.equal(rejected.lateIntake.reason, 'handoff-intake-paused');
   assert.equal(rejected.wasDeleted(), true);
 });
 
