@@ -124,6 +124,15 @@ function discordIdAfter(left, right) {
   }
 }
 
+function bindingIdentityMatches(binding, expected) {
+  return Boolean(binding) && Boolean(expected) && binding.active === expected.active &&
+    binding.channelId === expected.channelId && binding.guildId === expected.guildId &&
+    binding.provider === expected.provider && binding.nativeId === expected.nativeId &&
+    binding.generation === expected.generation &&
+    (binding.sessionRoot || null) === (expected.sessionRoot || null) &&
+    binding.conductorId === expected.conductorId && binding.repoKey === expected.repoKey;
+}
+
 function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill } = {}) {
   const runtime = status(paths);
   if (runtime?.state !== 'running' || !runtime.pid) {
@@ -267,6 +276,13 @@ async function ordinaryBind(args, dependencies = {}) {
       if (unavailable) binding = unavailable;
       nativeProof = { status: 'pending', reason: nativeProofError.message };
     } else if (state.hasOrdinaryPreflight(binding)) {
+      const verifiedBinding = state.transaction(() => {
+        const current = state.getBinding(binding.channelId);
+        if (!bindingIdentityMatches(current, binding) || !state.hasOrdinaryPreflight(current)) return null;
+        return current;
+      });
+      if (!verifiedBinding) throw new Error('ordinary binding changed before native preflight proof was reused');
+      binding = verifiedBinding;
       nativeProof = { status: 'verified', reason: 'Codex transcript proof already recorded' };
     } else if (nativeProofDetail) {
       let recordedBinding;
@@ -303,8 +319,13 @@ async function ordinaryBind(args, dependencies = {}) {
       status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
       kill: dependencies.killProcess || process.kill
     });
-    output({ bound: true, reused: decision === 'reuse', binding: state.getBinding(binding.channelId), nativeProof, gatewayWake });
-    return { binding: state.getBinding(binding.channelId), nativeProof, gatewayWake, reused: decision === 'reuse' };
+    const resultBinding = state.transaction(() => {
+      const current = state.getBinding(binding.channelId);
+      return bindingIdentityMatches(current, binding) ? current : null;
+    });
+    if (!resultBinding) throw new Error('ordinary binding changed before bind result was returned');
+    output({ bound: true, reused: decision === 'reuse', binding: resultBinding, nativeProof, gatewayWake });
+    return { binding: resultBinding, nativeProof, gatewayWake, reused: decision === 'reuse' };
   } finally {
     try { await client?.destroy(); } finally { state.close(); }
   }
@@ -769,26 +790,32 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
     }]);
     if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
-    const channelCutoff = await latestChannelMessageId(channel);
-    let adoptionCutoff = null;
+    let channelCutoff = null;
+    let recoveredThrough = null;
     if (current.active) {
+      channelCutoff = await latestChannelMessageId(channel);
       const watermark = state.getIntakeWatermark(channelId);
-      const recoveredThrough = watermark?.recovered_through_id || null;
+      recoveredThrough = watermark?.recovered_through_id || null;
       const liveCustodyAhead = recoveredThrough && watermark?.last_seen_id && discordIdAfter(watermark.last_seen_id, recoveredThrough);
       const remoteCustodyAhead = recoveredThrough && channelCutoff && discordIdAfter(channelCutoff, recoveredThrough);
       if (!handoffRetry && (watermark?.state !== READINESS.READY || !recoveredThrough || liveCustodyAhead || remoteCustodyAhead)) {
         throw new Error('ordinary handoff requires Discord intake to be durably drained');
       }
-      adoptionCutoff = channelCutoff || recoveredThrough;
-    } else {
-      adoptionCutoff = channelCutoff || serverDerivedChannelCutoff(channel);
     }
+    const handoffCutoff = current.active ? (channelCutoff || recoveredThrough) : null;
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
-      sessionRoot: validationRoot, handoffId, intakeCutoff: adoptionCutoff,
+      sessionRoot: validationRoot, handoffId, intakeCutoff: handoffCutoff,
       identity: { sessionId: nativeProof.sessionId, threadId: nativeProof.threadId },
       nativeProof: { ...nativeProof, sessionRoot: validationRoot }
     });
+    const fencedCutoff = await latestChannelMessageId(channel);
+    const adoptionCutoff = fencedCutoff || handoffCutoff || serverDerivedChannelCutoff(channel);
+    if (adoptionCutoff) {
+      const fenced = state.setIntakeCutoff(channelId, binding.guildId, adoptionCutoff,
+        'ordinary handoff adoption cutoff', binding);
+      if (!fenced) throw new Error('ordinary handoff binding changed before intake cutoff was fenced');
+    }
     const gatewayWake = wake(paths, {
       status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
       kill: dependencies.killProcess || process.kill
