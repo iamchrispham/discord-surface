@@ -142,6 +142,36 @@ node /absolute/path/to/discord-surface/src/cli.js claude-monitor \
 
 The Monitor process owns its listener lifetime. It ignores stdin EOF, stops on native cancellation or signal, and removes only its own socket. Reply files belong to the native owner and are never blanket-cleaned by the adapter. A second listener on the same socket is rejected. Monitor startup does not promote native execution readiness. Discord intake readiness and native execution status remain separate. A stopped or abruptly lost Monitor never causes submitted work to be sent again.
 
+### Ordinary Codex session binding
+
+Run these commands from the existing Codex session's own command context after configuring the adapter. Caller identity comes from the native session environment and is checked against its transcript. Do not copy another session's identity into that environment.
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-bind \
+  --state-dir "$HOME/.config/discord-surface" \
+  --channel-id EXISTING_CHANNEL_ID
+```
+
+The channel must already exist in the configured server. A quoted `--channel '#channel-name'` can select an unambiguous name instead. The command preserves the current native session and reports its binding, generation, transcript-proof status and Gateway wake result. It does not create a session or a channel. If needed, supply `--workspace /absolute/workspace` and `--session-root /absolute/codex/sessions`; the workspace must match the transcript. Existing bindings retain their recorded session root when that option is omitted.
+
+A successful binding or requested wake is not delivery proof. Readiness can remain pending or unavailable until native identity and intake recovery succeed. A running Gateway must advertise ordinary-binding wake support. Coordinate an upgrade with its owner when it does not; do not send signals to an incompatible shared Gateway.
+
+For a milestone from that same bound session, use the returned native ID and generation:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --channel-id EXISTING_CHANNEL_ID \
+  --native-id CURRENT_CODEX_SESSION_UUID \
+  --generation BINDING_GENERATION \
+  --text-file /absolute/path/to/milestone.txt \
+  --dedupe-key STABLE_MILESTONE_KEY
+```
+
+Keep the dedupe key unchanged when retrying the same milestone. The command checks the caller against the active Codex binding before posting. Its receipt distinguishes a completed Discord send from a pending or uncertain outcome.
+
+`/discord-bind` is maintained outside this package in the shared skills repository. Its ordinary-session integration is a separate delivery requirement; these CLI commands do not install or verify that skill integration. Live native delivery and operating-system qualification remain separate from local simulated tests.
+
 ### Ordinary Claude session binding
 
 This path binds one existing Claude Code session to one existing message-capable channel. It does not create a channel, start or resume Claude, copy transcript history, change permission mode, or bypass native approval. Run the bind command from the existing Claude Code session's own command context:
