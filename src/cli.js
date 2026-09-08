@@ -846,7 +846,6 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   const channelId = required(args, 'channel-id');
   const handoffId = required(args, 'handoff-id');
   const requestedSessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
-  const validationRoot = requestedSessionRoot || (dependencies.codexSessionRoot || codexSessionRoot)();
   const { paths, state } = openState(args);
   const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
   let client;
@@ -857,6 +856,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey) {
       throw new Error('ordinary handoff source is unavailable');
     }
+    const validationRoot = requestedSessionRoot || (current.sessionRoot ? path.resolve(current.sessionRoot) : (dependencies.codexSessionRoot || codexSessionRoot)());
     const invocation = resolveInvocationIdentity(environment, workspace);
     if (invocation.sessionId !== nativeId || invocation.threadId !== nativeId) {
       throw new Error('ordinary handoff successor identity does not match the native UUID');

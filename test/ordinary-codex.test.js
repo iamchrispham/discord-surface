@@ -598,14 +598,14 @@ test('ordinary handoff clears an explicit default transcript root', t => {
   assert.equal(rebound.generation, 2);
 });
 
-test('ordinary CLI handoff changes a custom root to its default root', async t => {
+test('ordinary CLI handoff inherits a custom persisted root when omitted', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-cli-'));
   const db = path.join(dir, 'surface.sqlite');
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-workspace-'));
-  const predecessorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-predecessor-'));
-  const defaultRoot = path.join(dir, 'sessions');
-  fs.mkdirSync(defaultRoot);
-  const transcriptFile = path.join(defaultRoot, OTHER + '.jsonl');
+  const predecessorHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-default-root-predecessor-'));
+  const predecessorRoot = path.join(predecessorHome, 'sessions');
+  fs.mkdirSync(predecessorRoot);
+  const transcriptFile = path.join(predecessorRoot, OTHER + '.jsonl');
   fs.writeFileSync(transcriptFile, `${JSON.stringify({ type: 'session_meta', payload: {
     session_id: OTHER, id: OTHER, cwd: successorWorkspace
   } })}\n`);
@@ -620,8 +620,7 @@ test('ordinary CLI handoff changes a custom root to its default root', async t =
   t.after(() => {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(successorWorkspace, { recursive: true, force: true });
-    fs.rmSync(predecessorRoot, { recursive: true, force: true });
-    fs.rmSync(defaultRoot, { recursive: true, force: true });
+    fs.rmSync(predecessorHome, { recursive: true, force: true });
   });
 
   const channel = {
@@ -638,7 +637,7 @@ test('ordinary CLI handoff changes a custom root to its default root', async t =
     'from-native-id': CODEX, 'from-generation': '1', 'native-id': OTHER,
     workspace: successorWorkspace, 'handoff-id': 'ordinary-default-root-cli-handoff'
   }, {
-    codexSessionRoot: () => defaultRoot,
+    codexSessionRoot: () => path.join(dir, 'sessions'),
     environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: successorWorkspace },
     requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
     readSecret: () => 'fixture-token',
@@ -646,7 +645,7 @@ test('ordinary CLI handoff changes a custom root to its default root', async t =
     gatewayProcessStatus: () => ({ state: 'stopped' }),
     print: () => {}
   });
-  assert.equal(result.binding.sessionRoot, defaultRoot);
+  assert.equal(result.binding.sessionRoot, predecessorRoot);
   assert.equal(result.binding.generation, 2);
 });
 
