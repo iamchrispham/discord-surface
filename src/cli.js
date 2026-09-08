@@ -889,17 +889,37 @@ function acquireHeldLock(lockPath) {
   });
 }
 
+const RUNTIME_BIND_LOCK_WAIT_MS = 30_000;
+
 async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
+  const deadline = Date.now() + RUNTIME_BIND_LOCK_WAIT_MS;
+  const timeoutError = () => {
+    const error = new Error('timed out waiting for runtime bind lock');
+    error.code = 'RUNTIME_BIND_LOCK_TIMEOUT';
+    return error;
+  };
   let reportedContention = false;
   while (!isStopping?.()) {
-    try { return await acquireHeldLock(lockPath); }
+    if (Date.now() >= deadline) throw timeoutError();
+    try {
+      const lock = await acquireHeldLock(lockPath);
+      if (Date.now() >= deadline) {
+        await lock.release();
+        throw timeoutError();
+      }
+      return lock;
+    }
     catch (error) {
       if (error.code !== 'RUNTIME_BIND_LOCK_BUSY') throw error;
       if (!reportedContention) {
         reportedContention = true;
         process.stderr.write('discord-surface: runtime bind lock is busy; waiting for the holder to release it\n');
       }
-      await new Promise(resolve => setTimeout(resolve, 50));
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw timeoutError();
+      }
+      await new Promise(resolve => setTimeout(resolve, Math.min(50, remainingMs)));
     }
   }
   return null;

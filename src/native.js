@@ -342,12 +342,10 @@ async function validateCodexSessionIdentityAsync(nativeId, workspace, root = ses
   return normalizedIdentity;
 }
 
-const CLAUDE_METADATA_BYTES = 256 * 1024;
-
 function readClaudeSessionMetadata(file) {
   const fd = fs.openSync(file, 'r');
   try {
-    const size = Math.min(fs.fstatSync(fd).size, CLAUDE_METADATA_BYTES);
+    const size = fs.fstatSync(fd).size;
     if (!size) throw new Error('Claude transcript metadata is empty');
     const bytes = Buffer.allocUnsafe(size);
     let offset = 0;

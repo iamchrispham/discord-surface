@@ -108,10 +108,16 @@ test('ordinary Claude accepts single or equal transcript IDs and rejects conflic
   const payloadOnly = write('payload-only.jsonl', { ...metadata, payload: { session_id: CLAUDE } });
   const equalAliases = write('equal-aliases.jsonl', { ...metadata, sessionId: CLAUDE, payload: { session_id: CLAUDE } });
   const conflicting = write('conflicting-aliases.jsonl', { ...metadata, sessionId: CLAUDE, payload: { session_id: OTHER } });
+  const lateConflict = path.join(f.dir, 'late-conflict.jsonl');
+  fs.writeFileSync(lateConflict, [
+    ...Array.from({ length: 5000 }, () => ({ ...metadata, sessionId: CLAUDE })),
+    { ...metadata, sessionId: OTHER }
+  ].map(row => JSON.stringify(row)).join('\n') + '\n', { mode: 0o600 });
   assert.equal(validateClaudeSessionIdentity(CLAUDE, topLevel).sessionId, CLAUDE);
   assert.equal(validateClaudeSessionIdentity(CLAUDE, payloadOnly).sessionId, CLAUDE);
   assert.equal(validateClaudeSessionIdentity(CLAUDE, equalAliases).sessionId, CLAUDE);
   assert.throws(() => validateClaudeSessionIdentity(CLAUDE, conflicting), /identity or workspace is unavailable/);
+  assert.throws(() => validateClaudeSessionIdentity(CLAUDE, lateConflict), /identity is ambiguous/);
 });
 
 test('ordinary Claude selection and same-owner decision preserve channel custody', () => {
