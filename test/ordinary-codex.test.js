@@ -778,6 +778,34 @@ test('ordinary root relocation refuses an in-flight dispatch', t => {
   assert.equal(f.state.getBinding(binding.channelId).sessionRoot, binding.sessionRoot);
 });
 
+test('ordinary root relocation refuses an uncertain dispatch', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-relocated-uncertain-root-'));
+  t.after(() => fs.rmSync(sessionRoot, { recursive: true, force: true }));
+  f.state.recordOrdinaryPreflight(binding, {
+    file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  f.state.markIntakeBoundary(binding.channelId, 'ready', null, null, null, binding);
+  const accepted = f.state.acceptDiscordMessage({
+    id: 'uncertain-root-relocation', guildId: 'guild', channelId: binding.channelId,
+    authorId: 'operator', isBot: false, content: 'uncertain'
+  });
+  assert.equal(accepted.accepted, true);
+  f.state.claimDispatch(accepted.message.id);
+  f.state.markUncertain(accepted.message.id, new Error('dispatch outcome unknown'));
+  const request = {
+    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
+    workspace: f.dir, sessionRoot, identity: { sessionId: CODEX, threadId: CODEX }
+  };
+  const proof = {
+    file: path.join(sessionRoot, `${CODEX}.jsonl`), sessionId: CODEX, threadId: CODEX,
+    workspace: f.dir, sessionRoot
+  };
+  assert.throws(() => f.state.rebindOrdinary(request, request.identity, proof), /work drains|dispatch/);
+  assert.equal(f.state.getBinding(binding.channelId).sessionRoot, binding.sessionRoot);
+});
+
 test('ordinary bind rejects a successor and explicit tombstone handoff transfers custody', t => {
   const f = fixture(t);
   const originalRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-original-root-'));
