@@ -193,7 +193,7 @@ async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
       scan.fileFailures += 1;
     }
   }
-  if (!scan.complete) return null;
+  if (!scan.complete || scan.fileFailures > 0) return null;
   return match;
 }
 

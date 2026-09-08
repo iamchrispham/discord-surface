@@ -279,7 +279,8 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
       const snapshot = assertGatewayWakeCompatible(paths, gatewayStatus, runtime);
       if (expectedRuntimePid !== undefined &&
         (snapshot?.state !== 'running' || String(snapshot.pid) !== expectedRuntimePid ||
-          !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock))) {
+          !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock) ||
+          !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryClaudeBind))) {
         throw new Error('running Gateway changed while binding ordinary Claude session');
       }
       return snapshot;

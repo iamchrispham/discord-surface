@@ -13,6 +13,7 @@ const { DiscordGateway } = require('../src/discord');
 const { ClaudeProvider, dispatchAndObserve, postUnixJson, probeClaudeChannel, probeUnixSocket, validateClaudeSessionIdentity, waitForReply } = require('../src/native');
 const { MESSAGE_STATES, READINESS, SurfaceState, StaleGenerationError } = require('../src/state');
 const { runDirectPost } = require('../src/direct-post');
+const { GATEWAY_CAPABILITIES } = require('../src/ordinary-bind/constants');
 
 const CLAUDE = '79e3da8e-94b4-4aff-8f88-b45b3a451dd1';
 const OTHER = '9caa5d21-2169-429d-918b-5f08651b5dbd';
@@ -853,6 +854,11 @@ test('ordinary Claude preflight rereads Gateway after binding mutation', async t
   const f = fixture(t, { bind: false });
   const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
   let reads = 0;
+  const supportedCapabilities = [
+    GATEWAY_CAPABILITIES.ordinaryBindWake,
+    GATEWAY_CAPABILITIES.runtimeBindLock,
+    GATEWAY_CAPABILITIES.ordinaryClaudeBind
+  ];
   await assert.rejects(() => ordinaryClaudeBind({
     'state-dir': f.dir, channel: '#dev', transcript: f.session.file, socket: f.socketPath
   }, {
@@ -860,11 +866,12 @@ test('ordinary Claude preflight rereads Gateway after binding mutation', async t
     requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
     readSecret: () => 'fixture-token',
     gatewayProcessStatus: () => (++reads < 3
-      ? { state: 'running', pid: 4242, capabilities: ['ordinary-bind-wake-v1'] }
-      : { state: 'running', pid: 4243, capabilities: [] }),
+      ? { state: 'running', pid: 4242, capabilities: supportedCapabilities }
+      : { state: 'running', pid: 4243, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock] }),
+    environment: { DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID: '4242' },
     killProcess: () => {},
     print: () => {}
-  }), /does not support ordinary binding wake/);
+  }), /running Gateway changed while binding ordinary Claude session/);
   const binding = f.state.getBinding(channel.id);
   assert.ok(binding);
   assert.equal(f.state.hasOrdinaryPreflight(binding), false);

@@ -183,7 +183,9 @@ function ordinaryBindCommand(args) {
 function ordinaryClaudeBindCommand(args) {
   const paths = pathsFor(args);
   const runtime = gatewayProcessStatus(paths);
-  const supportsBindLock = runtime?.state === 'running' && runtime.pid && runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock);
+  const supportsBindLock = runtime?.state === 'running' && runtime.pid &&
+    runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock) &&
+    runtime.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryClaudeBind);
   const lockPath = supportsBindLock ? paths.bindLock : paths.lock;
   runLockedOrdinaryCommand(args, {
     command: 'ordinary-claude-bind-run',
@@ -826,7 +828,11 @@ function writePid(pidFile, guildId, stateDir) {
     stateDir,
     command: 'run',
     startedAt: new Date().toISOString(),
-    capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock]
+    capabilities: [
+      GATEWAY_CAPABILITIES.ordinaryBindWake,
+      GATEWAY_CAPABILITIES.runtimeBindLock,
+      GATEWAY_CAPABILITIES.ordinaryClaudeBind
+    ]
   }), { mode: 0o600 });
   fs.chmodSync(pidFile, 0o600);
 }
@@ -883,10 +889,7 @@ function acquireHeldLock(lockPath) {
   });
 }
 
-const RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS = 30_000;
-
 async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
-  const deadline = Date.now() + RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS;
   let reportedContention = false;
   while (!isStopping?.()) {
     try { return await acquireHeldLock(lockPath); }
@@ -896,13 +899,7 @@ async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
         reportedContention = true;
         process.stderr.write('discord-surface: runtime bind lock is busy; waiting for the holder to release it\n');
       }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        const timeoutError = new Error('timed out waiting for runtime bind lock');
-        timeoutError.code = 'RUNTIME_BIND_LOCK_TIMEOUT';
-        throw timeoutError;
-      }
-      await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)));
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
   return null;
