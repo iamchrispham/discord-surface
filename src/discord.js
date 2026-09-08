@@ -584,8 +584,9 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     }, awaitExisting, handoff);
   }
 
-  async function handleMessage(message, signal) {
-    const intake = state.acceptDiscordMessage(eventToInput(message));
+  async function handleMessage(message, signal, expectedBinding = null, onIntake = null) {
+    const intake = state.acceptDiscordMessage(eventToInput(message), { expectedBinding });
+    if (!intake.stale) onIntake?.(message, intake);
     if (!intake.accepted) return intake;
     launchTransportReceipt(message);
     return processAccepted(message, signal);
@@ -682,11 +683,12 @@ class DiscordGateway {
       const readyLive = this.ready && (!binding || binding.readiness === READINESS.READY);
       const controller = new AbortController();
       this.controllers.add(controller);
-      const work = (readyLive ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false, null, null, true))
+      const work = (readyLive
+        ? this.consumer.handleMessage(message, controller.signal, binding, () => this.noteLiveIntake(message))
+        : this.consumer.intakeMessage(message, false, null, null, true))
         .catch(error => this.logger(`message handling failed: ${error.message}`))
         .finally(() => {
           this.controllers.delete(controller);
-          if (readyLive) this.noteLiveIntake(message);
         });
       this.inFlight.add(work);
       work.finally(() => this.inFlight.delete(work));
@@ -1206,8 +1208,9 @@ class DiscordGateway {
     const controller = this.recoveryController;
     this.recoveryPromise = (async () => {
       const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch);
-      if (result.ready && this.isCurrentLifecycle(lifecycleEpoch)) this.ready = true;
-      else if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+      const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+      this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
       return result;
     })();
     try { return await this.recoveryPromise; }
