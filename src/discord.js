@@ -920,6 +920,12 @@ class DiscordGateway {
       .finally(() => {
         if (this.liveCheckpointPromise === checkpoint) this.liveCheckpointPromise = null;
         if (this.liveCheckpointController === controller) this.liveCheckpointController = null;
+        if (this.stopping || this.recoveryPromise) return;
+        const deferredChannels = [...this.liveIntakeCounts.entries()]
+          .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getBinding(channelId)?.active);
+        if (!deferredChannels.length) return;
+        for (const [channelId] of deferredChannels) this.liveIntakeCounts.set(channelId, 0);
+        this.beginLiveCheckpoint();
       });
     this.liveCheckpointPromise = checkpoint;
   }
