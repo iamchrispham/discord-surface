@@ -216,6 +216,31 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   } finally { state.close(); }
 });
 
+test('ordinary bind refuses an incompatible running Gateway before mutation', async t => {
+  const f = fixture(t);
+  const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  let printed = false;
+  class Client {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection ? channel : new Map([[channel.id, channel]])
+      } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  await assert.rejects(() => ordinaryBind({ 'state-dir': f.dir, channel: '#dev', workspace: f.dir }, {
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: f.dir },
+    requireInstalled: () => ({ Client, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity: () => ({ file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir }),
+    gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [] }),
+    print: () => { printed = true; }
+  }), /does not support ordinary binding wake/);
+  assert.equal(f.state.getBinding(channel.id), null);
+  assert.equal(printed, false);
+});
+
 test('ordinary bind reopens terminal intake after native proof recovers', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-recovery-'));
   const db = path.join(dir, 'surface.sqlite');
@@ -724,6 +749,33 @@ test('ordinary root relocation reopens a drained terminal intake watermark', t =
   assert.equal(watermark.state, 'pending');
   assert.equal(watermark.gap_from, null);
   assert.equal(watermark.gap_to, null);
+});
+
+test('ordinary root relocation refuses an in-flight dispatch', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-relocated-dispatch-root-'));
+  t.after(() => fs.rmSync(sessionRoot, { recursive: true, force: true }));
+  f.state.recordOrdinaryPreflight(binding, {
+    file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  f.state.markIntakeBoundary(binding.channelId, 'ready', null, null, null, binding);
+  const accepted = f.state.acceptDiscordMessage({
+    id: 'dispatching-root-relocation', guildId: 'guild', channelId: binding.channelId,
+    authorId: 'operator', isBot: false, content: 'dispatching'
+  });
+  assert.equal(accepted.accepted, true);
+  f.state.claimDispatch(accepted.message.id);
+  const request = {
+    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
+    workspace: f.dir, sessionRoot, identity: { sessionId: CODEX, threadId: CODEX }
+  };
+  const proof = {
+    file: path.join(sessionRoot, `${CODEX}.jsonl`), sessionId: CODEX, threadId: CODEX,
+    workspace: f.dir, sessionRoot
+  };
+  assert.throws(() => f.state.rebindOrdinary(request, request.identity, proof), /work drains|dispatch/);
+  assert.equal(f.state.getBinding(binding.channelId).sessionRoot, binding.sessionRoot);
 });
 
 test('ordinary bind rejects a successor and explicit tombstone handoff transfers custody', t => {

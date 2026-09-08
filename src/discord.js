@@ -1052,7 +1052,7 @@ class DiscordGateway {
             failure ||= { ready: false, state: 'unavailable', error };
             continue;
           }
-          const detail = binding.provider === 'claude' && reason === 'Claude endpoint unavailable'
+          const detail = binding.provider === 'claude' && ['Claude endpoint unavailable', 'ordinary-bind'].includes(reason)
             ? `Claude endpoint unavailable before event write: ${error.message}`
             : error.message;
           await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', detail, watermark?.recovered_through_id, null, signal, deadline);

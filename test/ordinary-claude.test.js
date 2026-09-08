@@ -179,6 +179,24 @@ test('ordinary Claude bind compares resolved channel selectors before mutation',
   assert.equal(bound.nativeProof.status, 'verified');
 });
 
+test('ordinary Claude bind refuses an incompatible running Gateway before mutation', async t => {
+  const f = fixture(t, { bind: false });
+  const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  let printed = false;
+  const deps = {
+    resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code' }),
+    requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [] }),
+    print: () => { printed = true; }
+  };
+  await assert.rejects(() => ordinaryClaudeBind({
+    'state-dir': f.dir, channel: '#dev', transcript: f.session.file, socket: f.socketPath
+  }, deps), /does not support ordinary binding wake/);
+  assert.equal(f.state.getBinding(channel.id), null);
+  assert.equal(printed, false);
+});
+
 test('ordinary Claude bind rejects conflicting endpoint aliases before mutation', async t => {
   const f = fixture(t, { bind: false });
   const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
@@ -534,6 +552,23 @@ for (const terminalState of [READINESS.UNAVAILABLE, READINESS.GAP]) {
     await gateway.stop();
   });
 }
+
+test('ordinary Claude bind-time endpoint failure keeps an endpoint watermark', async t => {
+  const f = fixture(t);
+  const channel = { id: f.binding.channelId, guildId: 'guild' };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
+    providers: { claude: { async dispatch() { throw new Error('must stay held'); } } },
+    ordinaryNativePreflight: async () => { throw new Error('connect ENOENT'); }
+  });
+  const result = await gateway.recoverTransport('ordinary-bind', 0);
+  assert.equal(result.ready, false);
+  assert.equal(result.state, READINESS.UNAVAILABLE);
+  assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.match(f.state.getIntakeWatermark(f.binding.channelId).detail, /^Claude endpoint unavailable before event write: connect ENOENT/);
+  await gateway.stop();
+});
 
 test('ordinary Claude recovery cannot restore a stale terminal binding', async t => {
   const f = fixture(t);

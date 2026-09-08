@@ -139,6 +139,12 @@ function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = p
   }
 }
 
+function assertGatewayWakeCompatible(paths, status = gatewayProcessStatus) {
+  const runtime = status(paths);
+  if (runtime?.state !== 'running' || !runtime.pid || runtime.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryBindWake)) return;
+  throw new Error('running Gateway does not support ordinary binding wake; stop or restart it before binding');
+}
+
 async function ordinaryBind(args, dependencies = {}) {
   const { paths, state } = openState(args);
   const environment = dependencies.environment || process.env;
@@ -219,6 +225,8 @@ async function ordinaryBind(args, dependencies = {}) {
     }
     const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, effectiveSessionRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
+    const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
+    assertGatewayWakeCompatible(paths, gatewayStatus);
     const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: effectiveSessionRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     let adoptionCutoff = null;
@@ -287,7 +295,7 @@ async function ordinaryBind(args, dependencies = {}) {
       }
     }
     const gatewayWake = requestGatewayRecovery(paths, {
-      status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+      status: gatewayStatus,
       kill: dependencies.killProcess || process.kill
     });
     output({ bound: true, reused: decision === 'reuse', binding: state.getBinding(binding.channelId), nativeProof, gatewayWake });
@@ -378,6 +386,8 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     }
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const boundRequest = { ...request, channelId: channel.id };
+    const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
+    assertGatewayWakeCompatible(paths, gatewayStatus);
     const existing = state.getBinding(channel.id);
     let decision = ordinaryBindingDecision(existing, boundRequest, existing ? state.isOrdinaryBindingRecord(existing) : false);
     let adoptionCutoff = null;
@@ -435,7 +445,7 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
       }
     }
     const gatewayWake = requestGatewayRecovery(paths, {
-      status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+      status: gatewayStatus,
       kill: dependencies.killProcess || process.kill
     });
     output({ bound: true, reused: decision === 'reuse', binding: state.getBinding(binding.channelId), nativeProof, monitor: { status: 'pending' }, gatewayWake });
