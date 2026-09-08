@@ -142,8 +142,24 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
   if (!stdout || typeof stdout.write !== 'function') throw new TypeError('stdout must be writable');
   const entries = new Map();
   let closed = false;
+  let transportNotified = false;
+  let mcp;
+  const onStdoutError = error => {
+    if (closed || transportNotified) return;
+    transportNotified = true;
+    mcp?.onerror?.(error);
+  };
+  const onStdoutClose = () => {
+    if (closed || transportNotified) return;
+    transportNotified = true;
+    mcp?.onclose?.();
+  };
+  const detachStdoutListeners = () => {
+    stdout.removeListener?.('error', onStdoutError);
+    stdout.removeListener?.('close', onStdoutClose);
+  };
 
-  return {
+  mcp = {
     async notification(event) {
       if (closed) throw new Error('Claude Monitor transport is closed');
       const values = eventValues(event);
@@ -179,8 +195,12 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
     async close() {
       if (closed) return;
       closed = true;
+      detachStdoutListeners();
     }
   };
+  stdout.once?.('error', onStdoutError);
+  stdout.once?.('close', onStdoutClose);
+  return mcp;
 }
 
 function createClaudeMonitor(options) {

@@ -699,6 +699,52 @@ test('real ClaudeProvider and Claude Monitor path preserves exact reply custody'
   await monitor.stop();
 });
 
+test('Claude Monitor stdout failure stops transport and detaches listeners', async t => {
+  const errorFixture = fixture(t);
+  const closeFixture = fixture(t);
+  const errorStdout = new EventEmitter();
+  const closeStdout = new EventEmitter();
+  errorStdout.write = (_chunk, callback) => { callback?.(); return true; };
+  closeStdout.write = (_chunk, callback) => { callback?.(); return true; };
+  let errorTransportCloses = 0;
+  let closeTransportCloses = 0;
+  const errorMonitor = createClaudeMonitor({
+    state: errorFixture.state, nativeId: CLAUDE, socketPath: errorFixture.socketPath,
+    stateDir: errorFixture.dir, dbPath: errorFixture.db, stdout: errorStdout,
+    onTransportClose: () => { errorTransportCloses += 1; }
+  });
+  const closeMonitor = createClaudeMonitor({
+    state: closeFixture.state, nativeId: CLAUDE, socketPath: closeFixture.socketPath,
+    stateDir: closeFixture.dir, dbPath: closeFixture.db, stdout: closeStdout,
+    onTransportClose: () => { closeTransportCloses += 1; }
+  });
+  t.after(async () => {
+    await errorMonitor.stop().catch(() => {});
+    await closeMonitor.stop().catch(() => {});
+  });
+
+  await Promise.all([errorMonitor.start(), closeMonitor.start()]);
+  assert.equal(errorStdout.listenerCount('error'), 1);
+  assert.equal(errorStdout.listenerCount('close'), 1);
+  assert.equal(closeStdout.listenerCount('error'), 1);
+  assert.equal(closeStdout.listenerCount('close'), 1);
+
+  assert.doesNotThrow(() => errorStdout.emit('error', new Error('stdout failed')));
+  assert.doesNotThrow(() => closeStdout.emit('close'));
+  await waitFor(() => !errorMonitor.started && !closeMonitor.started);
+
+  assert.equal(errorMonitor.ready, false);
+  assert.equal(closeMonitor.ready, false);
+  assert.equal(errorTransportCloses, 1);
+  assert.equal(closeTransportCloses, 1);
+  assert.equal(errorStdout.listenerCount('error'), 0);
+  assert.equal(errorStdout.listenerCount('close'), 0);
+  assert.equal(closeStdout.listenerCount('error'), 0);
+  assert.equal(closeStdout.listenerCount('close'), 0);
+  assert.equal(fs.existsSync(errorFixture.socketPath), false);
+  assert.equal(fs.existsSync(closeFixture.socketPath), false);
+});
+
 test('ordinary Claude post preserves dedupe and stale generation custody', async t => {
   const f = fixture(t);
   const textFile = path.join(f.dir, 'milestone.txt');
