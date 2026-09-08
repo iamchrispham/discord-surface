@@ -47,6 +47,34 @@ function transcript(t, workspace, id = CODEX, overrides = {}) {
   return { root, file };
 }
 
+function controlRootEnumeration(t, root, tailNames) {
+  const originalOpendir = fs.promises.opendir;
+  const orders = [];
+  t.mock.method(fs.promises, 'opendir', async (target, ...args) => {
+    const handle = await originalOpendir(target, ...args);
+    if (path.resolve(String(target)) !== path.resolve(root)) return handle;
+    const entries = [];
+    try {
+      for (;;) {
+        const entry = await handle.read();
+        if (!entry) break;
+        entries.push(entry);
+      }
+    } finally {
+      try { await handle.close(); } catch {}
+    }
+    const tail = new Set(tailNames);
+    const ordered = entries.filter(entry => !tail.has(entry.name)).concat(entries.filter(entry => tail.has(entry.name)));
+    orders.push(ordered.map(entry => entry.name));
+    let index = 0;
+    return {
+      read: async () => ordered[index++] || null,
+      close: async () => {}
+    };
+  });
+  return orders;
+}
+
 test('typed ordinary request rejects missing or conflicting invocation identity', () => {
   assert.throws(() => resolveInvocationIdentity({ CODEX_SESSION_ID: CODEX, PWD: '/tmp/workspace' }), /CODEX_THREAD_ID/);
   assert.equal(resolveInvocationIdentity({ CODEX_THREAD_ID: CODEX, PWD: '/tmp/workspace' }).sessionId, CODEX);
@@ -1062,6 +1090,126 @@ test('native preflight requires exact session metadata and workspace', t => {
   assert.throws(() => validateCodexSessionIdentity(CODEX, f.dir, wrongWorkspace.root), /workspace/);
   const wrongIdentity = transcript(t, f.dir, CODEX, { id: OTHER });
   assert.throws(() => validateCodexSessionIdentity(CODEX, f.dir, wrongIdentity.root), /identity/);
+});
+
+test('ordinary bind validates a session beyond the historical entry cutoff', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-large-root-'));
+  const workspace = path.join(dir, 'workspace');
+  const sessionRoot = path.join(dir, 'sessions');
+  fs.mkdirSync(workspace);
+  fs.mkdirSync(sessionRoot);
+  const targetName = `target-${CODEX}.jsonl`;
+  const targetFile = path.join(sessionRoot, targetName);
+  fs.writeFileSync(targetFile, `${JSON.stringify({ type: 'session_meta', payload: {
+    session_id: CODEX, id: CODEX, cwd: workspace
+  } })}\n`);
+  for (let index = 0; index < 2050; index += 1) {
+    fs.writeFileSync(path.join(sessionRoot, `filler-${String(index).padStart(4, '0')}.jsonl`), '{}\n');
+  }
+  const orders = controlRootEnumeration(t, sessionRoot, [targetName]);
+  const opened = [];
+  const originalOpen = fs.promises.open;
+  t.mock.method(fs.promises, 'open', async (target, ...args) => {
+    opened.push(String(target));
+    return originalOpen.call(fs.promises, target, ...args);
+  });
+  const setup = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  setup.close();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const identity = await validateCodexSessionIdentityAsync(CODEX, undefined, sessionRoot);
+  assert.equal(identity.file, targetFile);
+  assert.equal(identity.workspace, workspace);
+  assert.ok(orders[0].indexOf(targetName) > 2048);
+  assert.deepEqual(opened, [targetFile]);
+
+  const channel = { id: 'large-root-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  class FakeClient {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection ? channel : new Map([[channel.id, channel]])
+      } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  const result = await ordinaryBind({
+    'state-dir': dir, channel: '#dev', workspace, 'session-root': sessionRoot
+  }, {
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: workspace },
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    gatewayProcessStatus: () => ({ state: 'stopped' }),
+    print: () => {}
+  });
+  assert.equal(result.nativeProof.status, 'verified');
+  assert.equal(result.binding.sessionRoot, sessionRoot);
+});
+
+test('async identity discovery returns ambiguity after two valid candidates', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-ambiguous-root-'));
+  const workspace = path.join(dir, 'workspace');
+  const sessionRoot = path.join(dir, 'sessions');
+  fs.mkdirSync(workspace);
+  fs.mkdirSync(sessionRoot);
+  const candidateNames = ['first', 'second', 'third'].map(prefix => `${prefix}-${CODEX}.jsonl`);
+  for (const name of candidateNames) {
+    fs.writeFileSync(path.join(sessionRoot, name), `${JSON.stringify({ type: 'session_meta', payload: {
+      session_id: CODEX, id: CODEX, cwd: workspace
+    } })}\n`);
+  }
+  controlRootEnumeration(t, sessionRoot, candidateNames);
+  const opened = [];
+  const originalOpen = fs.promises.open;
+  t.mock.method(fs.promises, 'open', async (target, ...args) => {
+    opened.push(String(target));
+    return originalOpen.call(fs.promises, target, ...args);
+  });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  await assert.rejects(
+    () => validateCodexSessionIdentityAsync(CODEX, undefined, sessionRoot),
+    /ambiguous/
+  );
+  assert.equal(opened.length, 2);
+  assert.equal(new Set(opened.map(file => path.basename(file))).size, 2);
+  assert.ok(opened.every(file => candidateNames.includes(path.basename(file))));
+});
+
+test('async identity discovery closes its directory on deadline', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-deadline-root-'));
+  fs.mkdirSync(path.join(root, 'sessions'));
+  const sessionRoot = path.join(root, 'sessions');
+  const originalNow = Date.now;
+  const started = originalNow();
+  let calls = 0;
+  let closes = 0;
+  Date.now = () => {
+    calls += 1;
+    return calls >= 4 ? started + 6000 : started;
+  };
+  const originalOpendir = fs.promises.opendir;
+  t.mock.method(fs.promises, 'opendir', async (target, ...args) => {
+    const handle = await originalOpendir(target, ...args);
+    return {
+      read: (...readArgs) => handle.read(...readArgs),
+      close: async (...closeArgs) => {
+        closes += 1;
+        return handle.close(...closeArgs);
+      }
+    };
+  });
+  t.after(() => {
+    Date.now = originalNow;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    () => validateCodexSessionIdentityAsync(CODEX, undefined, sessionRoot),
+    /unavailable/
+  );
+  assert.equal(closes, 1);
 });
 
 test('ordinary readiness requires the applicable Discord reply permission', t => {
