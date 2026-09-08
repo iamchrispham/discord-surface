@@ -10,6 +10,7 @@ const {
   createHandoffFence,
   deleteHandoffFence,
   DiscordGateway,
+  assertOrdinaryIntakeRange,
   discordIdAfter,
   latestChannelMessageId,
   readSecret,
@@ -53,58 +54,6 @@ function parseArgs(argv) {
     else args[key] = true;
   }
   return { command: positional[0], subcommand: positional[1], args };
-}
-
-function historyMessages(result) {
-  if (!result) return [];
-  if (Array.isArray(result)) return result;
-  if (typeof result.values === 'function') return [...result.values()];
-  if (typeof result[Symbol.iterator] === 'function') return [...result];
-  return [];
-}
-
-async function assertOrdinaryIntakeRange(channel, state, binding, recoveredThrough, fenceId, operation) {
-  if (!recoveredThrough) throw new Error(`${operation} requires a confirmed Discord intake boundary`);
-  if (typeof channel?.messages?.fetch !== 'function') throw new Error(`${operation} requires Discord history range access`);
-  let after = recoveredThrough;
-  let pages = 0;
-  let total = 0;
-  while (pages < RECOVERY_LIMITS.maxPages && total < RECOVERY_LIMITS.maxMessages) {
-    const page = historyMessages(await channel.messages.fetch({
-      limit: RECOVERY_LIMITS.pageSize,
-      after
-    }));
-    pages += 1;
-    if (!page.length) {
-      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
-      return;
-    }
-    if (page.some(message => typeof message?.id !== 'string' || message.id.length === 0)) {
-      throw new Error(`${operation} encountered a Discord message without a stable ID`);
-    }
-    page.sort((left, right) => {
-      if (typeof left?.id !== 'string' || typeof right?.id !== 'string') return 0;
-      return discordIdAfter(left.id, right.id) ? 1 : discordIdAfter(right.id, left.id) ? -1 : 0;
-    });
-    const reachedFence = page.some(message => !discordIdAfter(fenceId, message.id));
-    const fresh = page.filter(message => discordIdAfter(message.id, after) && discordIdAfter(fenceId, message.id));
-    if (!fresh.length) {
-      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
-      return;
-    }
-    for (const message of fresh) {
-      if (total >= RECOVERY_LIMITS.maxMessages || !state.hasIntakeEvidence(message.id)) {
-        throw new Error(`${operation} requires Discord intake to be durably drained`);
-      }
-      after = message.id;
-      total += 1;
-    }
-    if (reachedFence || page.length < RECOVERY_LIMITS.pageSize) {
-      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
-      return;
-    }
-  }
-  throw new Error(`${operation} requires Discord intake to be durably drained`);
 }
 
 function pathsFor(args) {
@@ -413,8 +362,7 @@ async function unbind(args, dependencies = {}) {
     const channelCutoff = await latestChannelMessageId(channel);
     const watermark = state.getIntakeWatermark(channelId);
     const recoveredThrough = watermark?.recovered_through_id || null;
-    const remoteCustodyAhead = channelCutoff && (!watermark?.last_seen_id || discordIdAfter(channelCutoff, watermark.last_seen_id));
-    if (watermark?.state !== READINESS.READY || !recoveredThrough || remoteCustodyAhead) {
+    if (watermark?.state !== READINESS.READY || !recoveredThrough) {
       throw new Error('ordinary unbind requires Discord intake to be durably drained');
     }
     fence = await createHandoffFence(channel, 'ordinary unbind');
@@ -888,8 +836,10 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     if (current.active) {
       const watermark = state.getIntakeWatermark(channelId);
       recoveredThrough = watermark?.recovered_through_id || null;
-      const remoteCustodyAhead = channelCutoff && (!watermark?.last_seen_id || discordIdAfter(channelCutoff, watermark.last_seen_id));
-      if (!handoffRetry && (watermark?.state !== READINESS.READY || !recoveredThrough || remoteCustodyAhead)) {
+      if (!handoffRetry && (watermark?.state !== READINESS.READY || !recoveredThrough)) {
+        throw new Error('ordinary handoff requires Discord intake to be durably drained');
+      }
+      if (!handoffRetry && typeof channel?.send !== 'function' && channelCutoff && discordIdAfter(channelCutoff, recoveredThrough)) {
         throw new Error('ordinary handoff requires Discord intake to be durably drained');
       }
     }

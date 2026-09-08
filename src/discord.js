@@ -89,6 +89,58 @@ function serverDerivedChannelCutoff(channel) {
   return typeof channel?.id === 'string' && /^\d+$/.test(channel.id) ? channel.id : null;
 }
 
+function historyMessages(result) {
+  if (!result) return [];
+  if (Array.isArray(result)) return result;
+  if (typeof result.values === 'function') return [...result.values()];
+  if (typeof result[Symbol.iterator] === 'function') return [...result];
+  return [];
+}
+
+async function assertOrdinaryIntakeRange(channel, state, binding, recoveredThrough, fenceId, operation) {
+  if (!recoveredThrough) throw new Error(`${operation} requires a confirmed Discord intake boundary`);
+  if (typeof channel?.messages?.fetch !== 'function') throw new Error(`${operation} requires Discord history range access`);
+  let after = recoveredThrough;
+  let pages = 0;
+  let total = 0;
+  while (pages < RECOVERY_LIMITS.maxPages && total < RECOVERY_LIMITS.maxMessages) {
+    const page = historyMessages(await channel.messages.fetch({
+      limit: RECOVERY_LIMITS.pageSize,
+      after
+    }));
+    pages += 1;
+    if (!page.length) {
+      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
+      return;
+    }
+    if (page.some(message => typeof message?.id !== 'string' || message.id.length === 0)) {
+      throw new Error(`${operation} encountered a Discord message without a stable ID`);
+    }
+    page.sort((left, right) => compareDiscordIds(left.id, right.id));
+    const reachedFence = page.some(message => compareDiscordIds(message.id, fenceId) >= 0);
+    const fresh = page.filter(message => compareDiscordIds(message.id, after) > 0 && compareDiscordIds(message.id, fenceId) < 0);
+    if (!fresh.length) {
+      if (reachedFence || page.length < RECOVERY_LIMITS.pageSize) {
+        if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
+        return;
+      }
+      throw new Error(`${operation} requires Discord intake to be durably drained`);
+    }
+    for (const message of fresh) {
+      if (total >= RECOVERY_LIMITS.maxMessages || !state.hasIntakeEvidence(message.id)) {
+        throw new Error(`${operation} requires Discord intake to be durably drained`);
+      }
+      after = message.id;
+      total += 1;
+    }
+    if (reachedFence || page.length < RECOVERY_LIMITS.pageSize) {
+      if (after !== recoveredThrough && !state.checkpointIntake(binding.channelId, after, binding)) throw new Error(`${operation} source binding changed`);
+      return;
+    }
+  }
+  throw new Error(`${operation} requires Discord intake to be durably drained`);
+}
+
 function discordIdAfter(left, right) {
   if (!left || !right) return false;
   return compareDiscordIds(left, right) > 0;
@@ -626,10 +678,11 @@ class DiscordGateway {
     });
     this.boundMessage = message => {
       if (this.stopping) return;
-      const readyLive = this.ready;
+      const bindingReady = this.transportReady && this.state.getBinding(message?.channelId)?.readiness === READINESS.READY;
+      const readyLive = this.ready || bindingReady;
       const controller = new AbortController();
       this.controllers.add(controller);
-      const work = (this.ready ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false, null, null, true))
+      const work = (readyLive ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false, null, null, true))
         .catch(error => this.logger(`message handling failed: ${error.message}`))
         .finally(() => {
           this.controllers.delete(controller);
@@ -847,13 +900,13 @@ class DiscordGateway {
     if (!channelId || this.stopping || !this.state.getBinding(channelId)?.active) return;
     const count = (this.liveIntakeCounts.get(channelId) || 0) + 1;
     this.liveIntakeCounts.set(channelId, count);
-    if (count < this.liveCheckpointThreshold || this.liveCheckpointPromise || this.recoveryPromise || !this.ready) return;
+    if (count < this.liveCheckpointThreshold || this.liveCheckpointPromise || this.recoveryPromise) return;
     this.liveIntakeCounts.set(channelId, 0);
     this.beginLiveCheckpoint();
   }
 
   beginLiveCheckpoint() {
-    if (this.liveCheckpointPromise || this.stopping || !this.ready || this.recoveryPromise) return;
+    if (this.liveCheckpointPromise || this.stopping || this.recoveryPromise) return;
     const controller = new AbortController();
     const epoch = this.lifecycleEpoch;
     this.liveCheckpointController = controller;
@@ -913,9 +966,8 @@ class DiscordGateway {
           if (page.length < this.historyPageLimit) { complete = true; break; }
         }
         if (!complete || !after) continue;
-        const remoteCutoff = await waitForRecoveryOperation(() => latestChannelMessageId(channel), signal, deadline);
+        await waitForRecoveryOperation(() => latestChannelMessageId(channel), signal, deadline);
         if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError('stopped', 'Discord live intake checkpoint was stopped');
-        if (remoteCutoff && compareDiscordIds(remoteCutoff, after) > 0) continue;
         this.state.checkpointIntake(binding.channelId, after, binding);
       } catch (error) {
         if (recoveryKind(error) === 'stopped') throw error;
@@ -1290,5 +1342,6 @@ module.exports = {
   readSecret,
   requireInstalled,
   serverDerivedChannelCutoff,
+  assertOrdinaryIntakeRange,
   sendDiscordMessage,
 };

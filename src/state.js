@@ -1500,6 +1500,9 @@ class SurfaceState {
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       const existing = this.getIntakeWatermark(channelId);
       if (!existing) throw new BindingError('intake watermark is unknown');
+      if (existing.last_seen_id && compareDiscordIds(existing.last_seen_id, coverageId) < 0) {
+        return existing;
+      }
       const recoveredThrough = existing.recovered_through_id && compareDiscordIds(existing.recovered_through_id, coverageId) >= 0
         ? existing.recovered_through_id
         : coverageId;
