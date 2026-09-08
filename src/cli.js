@@ -843,16 +843,16 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     }
     let handoffCutoff = channelCutoff || (current.active ? recoveredThrough : null) ||
       serverDerivedChannelCutoff(channel);
-    if (current.active) {
-      handoffFence = await createHandoffFence(channel);
-      if (handoffFence) {
+    handoffFence = await createHandoffFence(channel);
+    if (handoffFence) {
+      if (current.active) {
         const preFenceCutoff = await latestChannelMessageId(channel, { before: handoffFence.id });
         const drainedThrough = channelCutoff || recoveredThrough;
         if (preFenceCutoff && drainedThrough && discordIdAfter(preFenceCutoff, drainedThrough)) {
           throw new Error('ordinary handoff requires Discord intake to be durably drained');
         }
-        handoffCutoff = handoffFence.id;
       }
+      handoffCutoff = handoffFence.id;
     }
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
