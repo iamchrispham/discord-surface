@@ -283,7 +283,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function ownerQueueFor(key) {
     let queue = ownerQueues.get(key);
     if (!queue) {
-      queue = { active: null, blockedMessageId: null, entries: [] };
+      queue = { active: null, blockedMessageId: null, blockedReason: null, entries: [] };
       ownerQueues.set(key, queue);
     }
     return queue;
@@ -306,15 +306,23 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function finishOwner(entry) {
     const queue = ownerQueues.get(entry.ownerKey);
     if (!queue || queue.active !== entry) return;
+    if (entry.dispatchBlocked) {
+      queue.blockedMessageId = entry.message.id;
+      queue.blockedReason = 'not_submitted';
+      return;
+    }
     if (!ownerCanAdvance(entry.message.id)) {
       queue.blockedMessageId = entry.message.id;
+      queue.blockedReason = null;
       return;
     }
     if (!ownerBindingReady(entry.message.id)) {
       queue.blockedMessageId = entry.message.id;
+      queue.blockedReason = null;
       return;
     }
     queue.blockedMessageId = null;
+    queue.blockedReason = null;
     queue.active = null;
     pumpOwner(entry.ownerKey);
   }
@@ -331,6 +339,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     }
     if (queue.blockedMessageId !== messageId) return false;
     queue.blockedMessageId = null;
+    queue.blockedReason = null;
     pumpOwner(nativeOwnerKey(message));
     return true;
   }
@@ -354,7 +363,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     removeAbortHandler(entry);
     let result;
     try {
-      result = entry.starter(() => finishOwner(entry));
+      result = entry.starter(() => finishOwner(entry), entry);
     } catch (error) {
       finishOwner(entry);
       entry.reject(error);
@@ -397,9 +406,12 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const ownerKey = nativeOwnerKey(message);
     const queue = ownerQueueFor(ownerKey);
     const queueMessage = state.getMessage(message.id) || message;
-    if (queue.blockedMessageId && ownerCanAdvance(queue.blockedMessageId)) {
+    const dispatchBlocked = queue.blockedReason === 'not_submitted';
+    if (queue.blockedMessageId && ownerCanAdvance(queue.blockedMessageId) &&
+      (!dispatchBlocked || queue.blockedMessageId === message.id)) {
       if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
       queue.blockedMessageId = null;
+      queue.blockedReason = null;
     }
     let resolve;
     let reject;
@@ -420,6 +432,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       sequence: queueSequence++,
       started: false,
       cancelled: false,
+      dispatchBlocked: false,
       onAbort: null
     };
     if (!queue.active && queue.blockedMessageId === message.id) {
@@ -534,7 +547,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
-    return enqueueOwnerWork(message, signal, onNativeSettled => {
+    return enqueueOwnerWork(message, signal, (onNativeSettled, ownerEntry) => {
       let settleHandoff;
       let rejectHandoff;
       let settleDispatchOutcome;
@@ -561,7 +574,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
             ...observeOptions,
             signal: taskSignal,
             continueUntilFinal,
-            onDispatchOutcome: outcome => settleDispatchOutcome?.(outcome),
+            onDispatchOutcome: outcome => {
+              if (outcome?.status === 'not_submitted') ownerEntry.dispatchBlocked = true;
+              settleDispatchOutcome?.(outcome);
+            },
             onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
           });
           const promoted = state.getMessage(message.id);
@@ -1009,14 +1025,24 @@ class DiscordGateway {
     const demoted = this.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, detail, binding);
     if (!demoted || this.stopping) return;
     const lifecycleEpoch = this.lifecycleEpoch;
-    this.recoverTransport('Claude endpoint unavailable', lifecycleEpoch).then(result => {
+    const recoverAndReconcile = async () => {
+      let result = await this.recoverTransport('Claude endpoint unavailable', lifecycleEpoch);
       if (!this.isCurrentLifecycle(lifecycleEpoch)) return result;
-      const current = this.state.getBinding(binding.channelId);
+      let current = this.state.getBinding(binding.channelId);
+      const matchesBinding = current?.active && current.provider === 'claude' && current.nativeId === binding.nativeId &&
+        current.generation === binding.generation && current.workspace === binding.workspace && current.endpoint === binding.endpoint;
+      if (matchesBinding && current.readiness === READINESS.READY) return this.reconcilePending();
+      if (!matchesBinding || current.readiness !== READINESS.UNAVAILABLE) return result;
+
+      result = await this.recoverTransport('Claude endpoint unavailable follow-up', lifecycleEpoch);
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) return result;
+      current = this.state.getBinding(binding.channelId);
       const recovered = current?.active && current.provider === 'claude' && current.nativeId === binding.nativeId &&
         current.generation === binding.generation && current.workspace === binding.workspace && current.endpoint === binding.endpoint &&
         current.readiness === READINESS.READY;
       return recovered ? this.reconcilePending() : result;
-    }).catch(recoveryError => {
+    };
+    recoverAndReconcile().catch(recoveryError => {
       this.logger(`Claude endpoint recovery failed: ${recoveryError.message}`);
     });
   }
