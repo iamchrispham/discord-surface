@@ -173,6 +173,7 @@ async function ordinaryBind(args, dependencies = {}) {
           throw new Error('Codex transcript workspace is unavailable');
         }
       } catch (caught) {
+        if (String(caught?.message || '').startsWith('Unsupported Codex session root')) throw caught;
         error = caught;
         if (!invocation.workspace) throw new Error(`Codex transcript workspace is required: ${caught.message}`);
       }
@@ -1048,7 +1049,8 @@ function writePid(pidFile, guildId, stateDir) {
   fs.chmodSync(pidFile, 0o600);
 }
 
-function createBindingWakeController({ getGateway, isReady, isTransportReady = isReady, isStopping, logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
+function createBindingWakeController({ getGateway, isReady, isTransportReady = isReady, isStopping,
+  pauseLiveDispatch = () => {}, logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
   let wakePromise = null;
   let wakeRequested = false;
   const request = () => {
@@ -1061,6 +1063,7 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
         const currentGateway = getGateway?.();
         if (!currentGateway || !isTransportReady?.()) return;
         const joinedRecovery = Boolean(currentGateway.recoveryPromise);
+        pauseLiveDispatch(currentGateway);
         const recovery = await currentGateway.recoverTransport('ordinary-bind');
         if (joinedRecovery) {
           wakeRequested = true;
@@ -1097,7 +1100,8 @@ async function runRuntime(args) {
     getGateway: () => gateway,
     isReady: () => gatewayReady && gateway?.ready === true,
     isTransportReady: () => gatewayReady && gateway?.transportReady === true,
-    isStopping: () => stopping
+    isStopping: () => stopping,
+    pauseLiveDispatch: currentGateway => { currentGateway.ready = false; }
   });
   const stop = async () => {
     if (stopping) return;

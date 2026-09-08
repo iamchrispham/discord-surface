@@ -1701,6 +1701,7 @@ class SurfaceState {
     return this.transaction(() => {
       const binding = this.getBinding(event.channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
+      const intakeCutoff = this.getIntakeWatermark(event.channelId)?.recovered_through_id || null;
       this.upsertIntakeWatermark(event, ready, coverageId);
       let reason = null;
       if (typeof event.content !== 'string' || event.content.length > 10000 || attachments === null || (event.content.length === 0 && attachments?.length === 0)) reason = 'invalid-event';
@@ -1714,6 +1715,11 @@ class SurfaceState {
       }
       const committed = this.getMessage(event.id);
       if (committed) return { accepted: false, duplicate: true, reason: 'duplicate-message', message: committed };
+      const comparableIntakeCutoff = /^\d+$/.test(event.id) && /^\d+$/.test(intakeCutoff || '');
+      if (ready && comparableIntakeCutoff && compareDiscordIds(event.id, intakeCutoff) <= 0) {
+        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'before-intake-cutoff', ready });
+        return this.reject('before-intake-cutoff');
+      }
       if (this.failNextIntakeFlag) {
         this.failNextIntakeFlag = false;
         throw new Error('injected intake transaction failure');

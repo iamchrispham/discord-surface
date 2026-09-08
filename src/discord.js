@@ -533,7 +533,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleMessage(message, signal) {
-    const intake = state.acceptDiscordMessage(eventToInput(message));
+    const coverageId = typeof message?.id === 'string' && message.id.length > 0 ? message.id : null;
+    const intake = state.acceptDiscordMessage(eventToInput(message), { coverageId });
     if (!intake.accepted) return intake;
     launchTransportReceipt(message);
     return processAccepted(message, signal);
