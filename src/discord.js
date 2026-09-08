@@ -905,27 +905,46 @@ class DiscordGateway {
     this.liveIntakeCounts.set(channelId, count);
     if (count < this.liveCheckpointThreshold || this.liveCheckpointPromise || this.recoveryPromise) return;
     this.liveIntakeCounts.set(channelId, 0);
-    this.beginLiveCheckpoint();
+    this.beginLiveCheckpoint(new Map([[channelId, count]]));
   }
 
-  beginLiveCheckpoint() {
+  beginLiveCheckpoint(triggeredCounts = new Map()) {
     if (this.liveCheckpointPromise || this.stopping || this.recoveryPromise) return;
     const controller = new AbortController();
     const epoch = this.lifecycleEpoch;
     this.liveCheckpointController = controller;
+    let advancedChannels = new Set();
     const checkpoint = this.checkpointHealthyIntake(controller.signal, epoch)
+      .then(result => {
+        advancedChannels = result instanceof Set ? result : new Set();
+        return result;
+      })
       .catch(error => {
         if (recoveryKind(error) !== 'stopped') this.logger(`Discord live intake checkpoint failed: ${error.message}`);
       })
       .finally(() => {
         if (this.liveCheckpointPromise === checkpoint) this.liveCheckpointPromise = null;
         if (this.liveCheckpointController === controller) this.liveCheckpointController = null;
-        if (this.stopping || this.recoveryPromise) return;
+        if (this.stopping) return;
         const deferredChannels = [...this.liveIntakeCounts.entries()]
           .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getBinding(channelId)?.active);
-        if (!deferredChannels.length) return;
+        const deferredCounts = new Map(deferredChannels);
         for (const [channelId] of deferredChannels) this.liveIntakeCounts.set(channelId, 0);
-        this.beginLiveCheckpoint();
+        for (const [channelId, count] of triggeredCounts) {
+          if (advancedChannels.has(channelId) || !this.state.getBinding(channelId)?.active) continue;
+          const currentCount = this.liveIntakeCounts.get(channelId) || 0;
+          const deferredCount = deferredCounts.get(channelId);
+          if (deferredCount === undefined) this.liveIntakeCounts.set(channelId, Math.max(currentCount, count));
+          else deferredCounts.set(channelId, Math.max(deferredCount, count));
+        }
+        if (this.recoveryPromise) {
+          for (const [channelId, count] of deferredCounts) {
+            const currentCount = this.liveIntakeCounts.get(channelId) || 0;
+            this.liveIntakeCounts.set(channelId, Math.max(currentCount, count));
+          }
+          return;
+        }
+        if (deferredCounts.size) this.beginLiveCheckpoint(deferredCounts);
       });
     this.liveCheckpointPromise = checkpoint;
   }
@@ -933,6 +952,7 @@ class DiscordGateway {
   async checkpointHealthyIntake(signal, lifecycleEpoch) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const bindings = this.state.listBindings().filter(binding => binding.active && binding.readiness === READINESS.READY);
+    const advancedChannels = new Set();
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError('stopped', 'Discord live intake checkpoint was stopped');
       const watermark = this.state.getIntakeWatermark(binding.channelId);
@@ -977,11 +997,15 @@ class DiscordGateway {
         if (!complete || !after) continue;
         await waitForRecoveryOperation(() => latestChannelMessageId(channel), signal, deadline);
         if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError('stopped', 'Discord live intake checkpoint was stopped');
-        this.state.checkpointIntake(binding.channelId, after, binding);
+        const checkpointed = this.state.checkpointIntake(binding.channelId, after, binding);
+        if (checkpointed?.recovered_through_id && compareDiscordIds(checkpointed.recovered_through_id, watermark.recovered_through_id) > 0) {
+          advancedChannels.add(binding.channelId);
+        }
       } catch (error) {
         if (recoveryKind(error) === 'stopped') throw error;
       }
     }
+    return advancedChannels;
   }
 
   isCurrentBinding(binding) {

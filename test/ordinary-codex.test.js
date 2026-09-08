@@ -1792,3 +1792,50 @@ test('live intake checkpoints reschedule traffic received during an in-flight ch
   assert.equal(historyFetches >= 2, true);
   assert.equal(f.state.getIntakeWatermark(binding.channelId).recovered_through_id, '104');
 });
+
+test('live intake checkpoints retain demand after a failed pass', async t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.recordOrdinaryPreflight(binding, { file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir });
+  f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'checkpoint baseline');
+  f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'fixture ready');
+  const history = [];
+  let historyFetches = 0;
+  const channel = {
+    id: binding.channelId, guildId: 'guild', permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => new Map(history.slice(-1).map(message => [message.id, message])) }
+  };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, on() {}, off() {}, channels: { fetch: async () => channel } },
+    fetchHistory: async (_channel, options) => {
+      historyFetches += 1;
+      if (historyFetches === 1) throw new Error('temporary history failure');
+      return history.filter(message => BigInt(message.id) > BigInt(options.after)).slice(0, options.limit);
+    },
+    recoveryOptions: { maxMessages: 4 }
+  });
+  gateway.ready = true;
+  const send = async id => {
+    const message = { id: String(id), guildId: 'guild', channelId: binding.channelId, author: { id: 'bot', bot: true }, content: 'notice' };
+    history.push(message);
+    gateway.boundMessage(message);
+    await Promise.all([...gateway.inFlight]);
+  };
+
+  await send(101);
+  await send(102);
+  const firstCheckpoint = gateway.liveCheckpointPromise;
+  assert.ok(firstCheckpoint);
+  await firstCheckpoint;
+  assert.equal(gateway.liveCheckpointPromise, null);
+  assert.equal(gateway.liveIntakeCounts.get(binding.channelId), gateway.liveCheckpointThreshold);
+
+  await send(103);
+  const retryCheckpoint = gateway.liveCheckpointPromise;
+  assert.ok(retryCheckpoint);
+  await retryCheckpoint;
+
+  assert.equal(historyFetches >= 2, true);
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).recovered_through_id, '103');
+});

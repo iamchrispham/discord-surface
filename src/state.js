@@ -1436,7 +1436,7 @@ class SurfaceState {
         if (!outcome || outcome.detail.outcome === 'unknown') return true;
         const partIndex = Number(row.detail.partIndex);
         const partCount = Number(row.detail.partCount);
-        if (Number.isInteger(partIndex) && Number.isInteger(partCount) && partIndex === partCount - 1) {
+        if (Number.isInteger(partIndex) && Number.isInteger(partCount) && partIndex === partCount - 1 && outcome.detail.outcome === 'sent') {
           hasFinalPart = true;
         }
       }
