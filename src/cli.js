@@ -269,16 +269,25 @@ async function ordinaryBind(args, dependencies = {}) {
     } else if (state.hasOrdinaryPreflight(binding)) {
       nativeProof = { status: 'verified', reason: 'Codex transcript proof already recorded' };
     } else if (nativeProofDetail) {
+      let recordedBinding;
+      let preflightError;
       try {
-        state.recordOrdinaryPreflight(binding, {
+        recordedBinding = state.recordOrdinaryPreflight(binding, {
           file: nativeProofDetail.file,
           sessionId: nativeProofDetail.sessionId,
           threadId: nativeProofDetail.threadId,
           workspace: nativeProofDetail.workspace
         });
-        nativeProof = { status: 'verified', file: nativeProofDetail.file, workspace: nativeProofDetail.workspace };
       } catch (error) {
-        nativeProof = { status: 'pending', reason: error.message };
+        preflightError = error;
+      }
+      if (preflightError) {
+        nativeProof = { status: 'pending', reason: preflightError.message };
+      } else if (!recordedBinding) {
+        throw new Error('ordinary binding changed before native preflight receipt was committed');
+      } else {
+        binding = recordedBinding;
+        nativeProof = { status: 'verified', file: nativeProofDetail.file, workspace: nativeProofDetail.workspace };
       }
     } else {
       nativeProof = { status: 'pending', reason: nativeProofError?.message || 'Codex transcript proof is pending' };
@@ -725,6 +734,28 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       previousHandoff.generation === current.generation && current.active &&
       current.nativeId === nativeId && current.generation === fromGeneration + 1 &&
       current.workspace === workspace && (current.sessionRoot || null) === (validationRoot || null);
+    if (handoffRetry) {
+      const binding = state.handoffOrdinary({
+        channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
+        sessionRoot: validationRoot, handoffId,
+        identity: { sessionId: nativeId, threadId: nativeId },
+        nativeProof: {
+          file: previousHandoff.transcriptFile,
+          sessionId: nativeId,
+          threadId: nativeId,
+          workspace,
+          sessionRoot: validationRoot
+        }
+      });
+      const gatewayWake = wake(paths, {
+        status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+        kill: dependencies.killProcess || process.kill
+      });
+      output({ handedOff: true, ordinary: true, channelId, handoffId,
+        url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding,
+        readiness: binding.readiness, gatewayWake });
+      return { binding, gatewayWake, handoffReconciled: Boolean(binding.handoffReconciled) };
+    }
     const nativeProof = await validate(nativeId, workspace, validationRoot);
     const { Client, GatewayIntentBits } = install('discord.js');
     client = new Client({ intents: [GatewayIntentBits.Guilds] });
