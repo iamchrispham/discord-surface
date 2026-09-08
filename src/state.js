@@ -921,6 +921,7 @@ class SurfaceState {
     const ordinaryIdentity = binding.ordinaryIdentity || null;
     const intakeCutoff = options.intakeCutoff ?? null;
     const intakeCutoffDetail = options.intakeCutoffDetail || null;
+    const beforeMutation = options.beforeMutation;
     const input = this.bindingInput(binding);
     if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     if (ordinaryIdentity) {
@@ -942,6 +943,7 @@ class SurfaceState {
       const nextGeneration = Number(generationRow.next);
       const generation = input.generation == null ? nextGeneration : input.generation;
       if (generation < nextGeneration) throw new BindingError('binding generation would move backwards');
+      if (typeof beforeMutation === 'function') beforeMutation();
       this.db.prepare(`INSERT INTO bindings(channel_id, guild_id, provider, native_id, workspace, session_root, endpoint, category_id, conductor_id, repo_key, readiness, generation, active, updated_at)
         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(input.channelId, input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, input.conductorId, input.repoKey, input.readiness, generation, createdAt);
       this.receipt(null, 'bound', { channelId: input.channelId, provider: input.provider, conductorId: input.conductorId, generation });
@@ -961,27 +963,29 @@ class SurfaceState {
     });
   }
 
-  bindOrdinary(binding, identity, adoptionCutoff = null) {
+  bindOrdinary(binding, identity, adoptionCutoff = null, options = {}) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CODEX, identity);
     assertOrdinaryNativeIdentity(PROVIDERS.CODEX, binding.nativeId, identity);
-    return this.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? undefined : {
+    return this.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? options : {
       intakeCutoff: adoptionCutoff,
-      intakeCutoffDetail: 'ordinary binding adoption cutoff'
+      intakeCutoffDetail: 'ordinary binding adoption cutoff',
+      beforeMutation: options.beforeMutation
     });
   }
 
-  bindOrdinaryClaude(binding, identity, adoptionCutoff = null) {
+  bindOrdinaryClaude(binding, identity, adoptionCutoff = null, options = {}) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
     assertOrdinaryNativeIdentity(PROVIDERS.CLAUDE, binding.nativeId, identity);
-    return this.bind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? undefined : {
+    return this.bind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? options : {
       intakeCutoff: adoptionCutoff,
-      intakeCutoffDetail: 'ordinary binding adoption cutoff'
+      intakeCutoffDetail: 'ordinary binding adoption cutoff',
+      beforeMutation: options.beforeMutation
     });
   }
 
-  rebindOrdinary(binding, identity, nativeProof = null, intakeCutoff = null) {
+  rebindOrdinary(binding, identity, nativeProof = null, intakeCutoff = null, options = {}) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CODEX, identity);
     const existing = this.getBinding(binding.channelId);
@@ -1023,6 +1027,7 @@ class SurfaceState {
           throw new UnresolvedWorkError('cannot relocate while dispatch or reply observation is in flight');
         }
         this.assertLegacyMigrationSafe(binding.channelId);
+        if (typeof options.beforeMutation === 'function') options.beforeMutation();
         const updatedAt = now();
         this.db.prepare('UPDATE bindings SET session_root=?, readiness=?, updated_at=? WHERE channel_id=?')
           .run(input.sessionRoot, READINESS.PENDING, updatedAt, binding.channelId);
@@ -1042,11 +1047,12 @@ class SurfaceState {
     return this.rebind(rebound, {
       intakeCutoff,
       resetIntake: !sessionRootMatches,
-      sessionRootOverride: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : undefined
+      sessionRootOverride: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : undefined,
+      beforeMutation: options.beforeMutation
     });
   }
 
-  rebindOrdinaryClaude(binding, identity, intakeCutoff = null) {
+  rebindOrdinaryClaude(binding, identity, intakeCutoff = null, options = {}) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
     const existing = this.getBinding(binding.channelId);
@@ -1058,7 +1064,10 @@ class SurfaceState {
       identity.sessionId !== existing.nativeId || identity.threadId !== existing.nativeId) {
       throw new BindingError('ordinary binding owner changed; use explicit handoff');
     }
-    return this.rebind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, { intakeCutoff });
+    return this.rebind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, {
+      intakeCutoff,
+      beforeMutation: options.beforeMutation
+    });
   }
 
   isOrdinaryBindingRecord(binding) {
@@ -1112,7 +1121,7 @@ class SurfaceState {
     });
   }
 
-  rebind(binding, { resetIntake = false, sessionRootOverride = undefined, intakeCutoff = null } = {}) {
+  rebind(binding, { resetIntake = false, sessionRootOverride = undefined, intakeCutoff = null, beforeMutation = undefined } = {}) {
     if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     const channelId = assertText(binding.channelId, 'channelId', 128);
     const existing = this.getBinding(channelId);
@@ -1147,6 +1156,7 @@ class SurfaceState {
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
       this.assertLegacyMigrationSafe(channelId);
       this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
+      if (typeof beforeMutation === 'function') beforeMutation();
       if (intakeCutoff !== null) {
         this.setIntakeCutoffInTransaction(channelId, input.guildId, intakeCutoff, 'ordinary binding adoption cutoff', current);
       }
@@ -1255,7 +1265,7 @@ class SurfaceState {
     });
   }
 
-  handoffOrdinary({ channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null }) {
+  handoffOrdinary({ channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, beforeMutation = undefined }) {
     if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     if (provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff requires the Codex provider');
     assertUuid(fromNativeId, 'fromNativeId');
@@ -1325,6 +1335,7 @@ class SurfaceState {
         if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
         this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
         this.assertLegacyMigrationSafe(channelId);
+        if (typeof beforeMutation === 'function') beforeMutation();
         if (intakeCutoff !== null) {
           this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
         }

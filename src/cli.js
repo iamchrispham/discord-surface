@@ -16,6 +16,7 @@ const { createClaudeMonitor } = require('./claude-monitor');
 const GATEWAY_CAPABILITIES = Object.freeze({
   ordinaryBindWake: 'ordinary-bind-wake-v1'
 });
+const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
 const { runLiaisonDraft } = require('./liaison');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
 const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
@@ -226,7 +227,8 @@ async function ordinaryBind(args, dependencies = {}) {
     const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, effectiveSessionRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
     const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
-    assertGatewayWakeCompatible(paths, gatewayStatus);
+    const assertGatewayCompatible = () => assertGatewayWakeCompatible(paths, gatewayStatus);
+    assertGatewayCompatible();
     const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: effectiveSessionRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     let adoptionCutoff = null;
@@ -238,7 +240,9 @@ async function ordinaryBind(args, dependencies = {}) {
     if (decision === 'reuse') binding = existing;
     else if (decision === 'rebind') {
       try {
-        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence, adoptionCutoff);
+        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence, adoptionCutoff, {
+          beforeMutation: assertGatewayCompatible
+        });
       } catch (error) {
         const raced = state.getBinding(request.channelId);
         const racedDecision = raced
@@ -251,7 +255,9 @@ async function ordinaryBind(args, dependencies = {}) {
     }
     else {
       try {
-        binding = state.bindOrdinary(request, request.identity, adoptionCutoff);
+        binding = state.bindOrdinary(request, request.identity, adoptionCutoff, {
+          beforeMutation: assertGatewayCompatible
+        });
       } catch (error) {
         const raced = state.getBinding(request.channelId);
         const racedDecision = raced
@@ -264,7 +270,8 @@ async function ordinaryBind(args, dependencies = {}) {
     }
     let nativeProof = { status: 'pending', reason: 'Codex transcript proof is pending' };
     if (nativeProofError) {
-      const unavailable = state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, nativeProofError.message, binding);
+      const detail = `${ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX} ${nativeProofError.message}`;
+      const unavailable = state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, detail, binding);
       if (unavailable === null) throw new Error('ordinary binding changed before native proof was recorded');
       if (unavailable) binding = unavailable;
       nativeProof = { status: 'pending', reason: nativeProofError.message };
@@ -289,7 +296,9 @@ async function ordinaryBind(args, dependencies = {}) {
     }
     if (decision === 'reuse' && nativeProof.status === 'verified' && nativeProofDetail && !nativeProofError) {
       const watermark = state.getIntakeWatermark(binding.channelId);
-      if (watermark && [READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark.state)) {
+      const nativeProofUnavailable = watermark && watermark.state === READINESS.UNAVAILABLE &&
+        typeof watermark.detail === 'string' && watermark.detail.startsWith(ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX);
+      if (nativeProofUnavailable) {
         const reopened = state.reconcileIntake(binding.channelId, binding);
         if (reopened) binding = state.getBinding(binding.channelId);
       }
@@ -387,7 +396,8 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
     const boundRequest = { ...request, channelId: channel.id };
     const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
-    assertGatewayWakeCompatible(paths, gatewayStatus);
+    const assertGatewayCompatible = () => assertGatewayWakeCompatible(paths, gatewayStatus);
+    assertGatewayCompatible();
     const existing = state.getBinding(channel.id);
     let decision = ordinaryBindingDecision(existing, boundRequest, existing ? state.isOrdinaryBindingRecord(existing) : false);
     let adoptionCutoff = null;
@@ -399,7 +409,9 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     if (decision === 'reuse') binding = existing;
     else if (decision === 'rebind') {
       try {
-        binding = state.rebindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff);
+        binding = state.rebindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff, {
+          beforeMutation: assertGatewayCompatible
+        });
       } catch (error) {
         const raced = state.getBinding(boundRequest.channelId);
         const racedDecision = raced
@@ -411,7 +423,9 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
       }
     } else {
       try {
-        binding = state.bindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff);
+        binding = state.bindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff, {
+          beforeMutation: assertGatewayCompatible
+        });
       } catch (error) {
         const raced = state.getBinding(boundRequest.channelId);
         const racedDecision = raced
@@ -439,7 +453,10 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     }
     if (decision === 'reuse' && nativeProof.status === 'verified') {
       const watermark = state.getIntakeWatermark(binding.channelId);
-      if (watermark && [READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark.state)) {
+      const endpointUnavailable = watermark?.state === READINESS.UNAVAILABLE &&
+        typeof watermark.detail === 'string' &&
+        watermark.detail.startsWith('Claude endpoint unavailable before event write:');
+      if (endpointUnavailable) {
         const reopened = state.reconcileIntake(binding.channelId, binding);
         if (reopened) binding = state.getBinding(binding.channelId);
       }
@@ -848,9 +865,10 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   const requestedSessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
   const { paths, state } = openState(args);
   const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
+  const assertGatewayCompatible = () => assertGatewayWakeCompatible(paths, gatewayStatus);
   let client;
   try {
-    assertGatewayWakeCompatible(paths, gatewayStatus);
+    assertGatewayCompatible();
     const config = state.requireConfig();
     const current = state.getBinding(channelId);
     if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey) {
@@ -883,7 +901,8 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
       sessionRoot: validationRoot, handoffId, intakeCutoff: adoptionCutoff,
       identity: { sessionId: nativeProof.sessionId, threadId: nativeProof.threadId },
-      nativeProof: { ...nativeProof, sessionRoot: validationRoot }
+      nativeProof: { ...nativeProof, sessionRoot: validationRoot },
+      beforeMutation: assertGatewayCompatible
     });
     const gatewayWake = wake(paths, {
       status: gatewayStatus,

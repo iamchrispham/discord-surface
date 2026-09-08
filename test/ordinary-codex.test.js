@@ -269,7 +269,40 @@ test('ordinary bind refuses an incompatible running Gateway before mutation', as
   assert.equal(printed, false);
 });
 
-test('ordinary bind reopens terminal intake after native proof recovers', async t => {
+test('ordinary bind rolls back when Gateway becomes incompatible after history fetch', async t => {
+  const f = fixture(t);
+  const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  let printed = false;
+  let historyFetched = false;
+  channel.messages = { fetch: async () => { historyFetched = true; return new Map([['100', { id: '100' }]]); } };
+  const beforeReceipts = f.state.listReceipts();
+  class Client {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection ? channel : new Map([[channel.id, channel]])
+      } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  await assert.rejects(() => ordinaryBind({ 'state-dir': f.dir, channel: '#dev', workspace: f.dir }, {
+    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: f.dir },
+    requireInstalled: () => ({ Client, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity: () => ({ file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir }),
+    gatewayProcessStatus: () => historyFetched
+      ? { state: 'running', pid: 4242, capabilities: [] }
+      : { state: 'stopped' },
+    print: () => { printed = true; }
+  }), /does not support ordinary binding wake/);
+  assert.equal(f.state.getBinding(channel.id), null);
+  assert.equal(printed, false);
+  assert.equal(historyFetched, true);
+  assert.equal(f.state.getIntakeWatermark(channel.id), null);
+  assert.deepEqual(f.state.listReceipts(), beforeReceipts);
+});
+
+test('ordinary bind preserves unrelated terminal intake after native proof recovers', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-recovery-'));
   const db = path.join(dir, 'surface.sqlite');
   const session = transcript(t, dir);
@@ -314,8 +347,8 @@ test('ordinary bind reopens terminal intake after native proof recovers', async 
 
   const state = new SurfaceState(db);
   try {
-    assert.equal(state.getBinding('ordinary-recovery-channel').readiness, READINESS.PENDING);
-    assert.equal(state.getIntakeWatermark('ordinary-recovery-channel').state, READINESS.PENDING);
+    assert.equal(state.getBinding('ordinary-recovery-channel').readiness, READINESS.UNAVAILABLE);
+    assert.equal(state.getIntakeWatermark('ordinary-recovery-channel').state, READINESS.UNAVAILABLE);
   } finally { state.close(); }
 });
 
