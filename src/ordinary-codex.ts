@@ -2,6 +2,14 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 
 export type OrdinaryProvider = 'codex' | 'claude';
 
+export const ORDINARY_BINDING_DECISIONS = Object.freeze({
+  BIND: 'bind',
+  REUSE: 'reuse',
+  REBIND: 'rebind'
+} as const);
+
+export type OrdinaryBindingDecision = typeof ORDINARY_BINDING_DECISIONS[keyof typeof ORDINARY_BINDING_DECISIONS];
+
 export interface ExistingDiscordChannel {
   id: string;
   guildId: string;
@@ -138,8 +146,8 @@ export function ordinaryBindingDecision(
   request: OrdinaryBindingRequest,
   ordinaryMarker = false,
   nativeProof: OrdinaryCodexNativeProof | null = null
-): 'bind' | 'reuse' | 'rebind' {
-  if (!existing) return 'bind';
+): OrdinaryBindingDecision {
+  if (!existing) return ORDINARY_BINDING_DECISIONS.BIND;
   const sessionRootMatches = request.provider !== 'codex' || request.sessionRoot === undefined || (existing.sessionRoot || null) === request.sessionRoot;
   const verifiedRootRelocation = request.provider === 'codex' && !sessionRootMatches && typeof nativeProof?.file === 'string' && nativeProof.file.startsWith('/') &&
     nativeProof.sessionId === request.nativeId && nativeProof.threadId === request.nativeId &&
@@ -150,7 +158,7 @@ export function ordinaryBindingDecision(
     (request.provider !== 'claude' || existing.endpoint === request.endpoint) &&
     (sessionRootMatches || verifiedRootRelocation) &&
     !existing.conductorId && !existing.repoKey;
-  if (sameOwner) return existing.active && sessionRootMatches ? 'reuse' : 'rebind';
+  if (sameOwner) return existing.active && sessionRootMatches ? ORDINARY_BINDING_DECISIONS.REUSE : ORDINARY_BINDING_DECISIONS.REBIND;
   if (request.provider === 'claude') {
     throw new Error('channel is already bound to another owner; Claude owner replacement requires an explicit supported handoff');
   }

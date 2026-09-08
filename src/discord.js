@@ -1,7 +1,8 @@
 const fs = require('node:fs');
 const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
-const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 
 const requireInstalled = require;
@@ -1039,7 +1040,7 @@ class DiscordGateway {
     if (!binding || !binding.active || binding.provider !== 'claude' || binding.nativeId !== message.nativeId ||
       binding.generation !== message.generation || binding.workspace !== message.workspace || binding.endpoint !== message.endpoint ||
       !this.state.isOrdinaryBinding(binding)) return;
-    const detail = `Claude endpoint unavailable before event write: ${String(error?.message || error || 'unknown error').slice(0, 900)}`;
+    const detail = `${CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX} ${String(error?.message || error || 'unknown error').slice(0, 900)}`;
     const demoted = this.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, detail, binding);
     if (!demoted || this.stopping) return;
     const lifecycleEpoch = this.lifecycleEpoch;
@@ -1137,7 +1138,7 @@ class DiscordGateway {
           const preflightReason = ['Claude endpoint unavailable', 'Claude endpoint unavailable follow-up', 'ordinary-bind', 'reconnect', 'startup'].includes(reason);
           let detail = error.message;
           if (preflightReason && binding.provider === 'claude') {
-            detail = `Claude endpoint unavailable before event write: ${error.message}`;
+            detail = `${CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX} ${error.message}`;
           } else if (preflightReason && binding.provider === 'codex') {
             detail = `Codex transcript proof unavailable before event write: ${error.message}`;
           }
@@ -1372,7 +1373,7 @@ class DiscordGateway {
           this.state.recoverNativeReplyAcknowledgment(message.id);
           result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
         }
-        if (result === 'not_submitted' || result?.state === 'not_submitted' || result?.status === 'not_submitted') {
+        if (result === DISPATCH_OUTCOMES.NOT_SUBMITTED || result?.status === DISPATCH_OUTCOMES.NOT_SUBMITTED) {
           blockedOwners.add(key);
         }
       } catch (error) {

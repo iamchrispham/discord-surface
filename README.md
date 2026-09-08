@@ -154,7 +154,7 @@ node /absolute/path/to/discord-surface/src/cli.js ordinary-bind \
 
 The channel must already exist in the configured server. A quoted `--channel '#channel-name'` can select an unambiguous name instead. The command preserves the current native session and reports its binding, generation, transcript-proof status and Gateway wake result. It does not create a session or a channel. If needed, supply `--workspace /absolute/workspace` and `--session-root /absolute/codex/sessions`; the workspace must match the transcript. Existing bindings retain their recorded session root when that option is omitted.
 
-A successful binding or requested wake is not delivery proof. Readiness can remain pending or unavailable until native identity and intake recovery succeed. A running Gateway must advertise ordinary-binding wake support. Coordinate an upgrade with its owner when it does not; do not send signals to an incompatible shared Gateway.
+A successful binding or requested wake is not delivery proof. Readiness can remain pending or unavailable until native identity and intake recovery succeed. A running Gateway must advertise ordinary-binding wake support. Coordinate an upgrade with its owner when it does not; do not send signals to an incompatible shared Gateway. Only one ordinary bind runs at a time, exit 75 means the lock was busy, and the command is safe to retry.
 
 For a milestone from that same bound session, use the returned native ID and generation:
 
@@ -202,6 +202,8 @@ node /absolute/path/to/discord-surface/src/cli.js claude-monitor \
 ```
 
 Run this as the native Monitor tool, not as an unrelated background shell. The command must use the exact bound UUID and endpoint. It emits no startup line. Each accepted Discord instruction produces one JSON pointer containing `payloadPath`, message ID, native UUID, and generation. Read the complete payload file, run its acknowledgment command once when the message is picked up, write the final answer to its owner-only reply file, and run its exact `reply.command`. Acknowledgment records receipt, not completion. The reply command records the final answer for the exact message and generation. Do not guess either identifier. A Monitor stop or transport loss leaves submitted custody for recovery and does not replay the instruction automatically.
+
+The Monitor marks ordinary binding readiness unavailable with `Claude Monitor unavailable` when it stops. On startup, if intake is unavailable because the Claude endpoint was unavailable before event write, it reconciles that intake and requests a Gateway wake.
 
 For an explicit milestone from the same ordinary Claude session, write the text to an owner-controlled file and run:
 

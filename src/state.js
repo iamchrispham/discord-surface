@@ -3,6 +3,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { normalizeAttachments } = require('./attachments');
+const { ORDINARY_RECEIPT_KINDS } = require('./ordinary/constants');
+const { createOrdinaryRepository } = require('./ordinary');
 
 const SCHEMA_VERSION = '1.6';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -42,6 +44,7 @@ const NATIVE_ACK_RECEIPT = 'native-ack';
 const DIRECT_POST_ATTEMPT = 'direct-post-attempt';
 const DIRECT_POST_OUTCOME = 'direct-post-outcome';
 const DIRECT_POST_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
+const DISPATCH_OUTCOMES = Object.freeze({ NOT_SUBMITTED: 'not_submitted' });
 
 const ACTIVE_STATES = new Set([
   MESSAGE_STATES.ACCEPTED,
@@ -375,7 +378,19 @@ class SurfaceState {
     }
     this.dbPath = dbPath;
     this.failNextIntakeFlag = Boolean(options.failNextIntake);
+    this.ordinary = createOrdinaryRepository({ state: this, assertOrdinaryIdentity, assertOrdinaryNativeIdentity });
   }
+
+  bindOrdinary(...args) { return this.ordinary.bindOrdinary(...args); }
+  bindOrdinaryClaude(...args) { return this.ordinary.bindOrdinaryClaude(...args); }
+  rebindOrdinary(...args) { return this.ordinary.rebindOrdinary(...args); }
+  rebindOrdinaryClaude(...args) { return this.ordinary.rebindOrdinaryClaude(...args); }
+  isOrdinaryBindingRecord(...args) { return this.ordinary.isOrdinaryBindingRecord(...args); }
+  isOrdinaryBinding(...args) { return this.ordinary.isOrdinaryBinding(...args); }
+  hasOrdinaryPreflight(...args) { return this.ordinary.hasOrdinaryPreflight(...args); }
+  recordOrdinaryPreflight(...args) { return this.ordinary.recordOrdinaryPreflight(...args); }
+  findOrdinaryHandoff(...args) { return this.ordinary.findOrdinaryHandoff(...args); }
+  handoffOrdinary(...args) { return this.ordinary.handoffOrdinary(...args); }
 
   createSchema() {
     this.db.exec(`
@@ -948,7 +963,7 @@ class SurfaceState {
         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(input.channelId, input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, input.conductorId, input.repoKey, input.readiness, generation, createdAt);
       this.receipt(null, 'bound', { channelId: input.channelId, provider: input.provider, conductorId: input.conductorId, generation });
       if (ordinaryIdentity) {
-        this.receipt(null, 'ordinary-bound', {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
           channelId: input.channelId, guildId: input.guildId, provider: input.provider,
           nativeId: input.nativeId, workspace: input.workspace, generation,
           sessionRoot: input.sessionRoot,
@@ -963,7 +978,7 @@ class SurfaceState {
     });
   }
 
-  bindOrdinary(binding, identity, adoptionCutoff = null, options = {}) {
+  _bindOrdinary(binding, identity, adoptionCutoff = null, options = {}) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CODEX, identity);
     assertOrdinaryNativeIdentity(PROVIDERS.CODEX, binding.nativeId, identity);
@@ -974,7 +989,7 @@ class SurfaceState {
     });
   }
 
-  bindOrdinaryClaude(binding, identity, adoptionCutoff = null, options = {}) {
+  _bindOrdinaryClaude(binding, identity, adoptionCutoff = null, options = {}) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
     assertOrdinaryNativeIdentity(PROVIDERS.CLAUDE, binding.nativeId, identity);
@@ -985,11 +1000,11 @@ class SurfaceState {
     });
   }
 
-  rebindOrdinary(binding, identity, nativeProof = null, intakeCutoff = null, options = {}) {
+  _rebindOrdinary(binding, identity, nativeProof = null, intakeCutoff = null, options = {}) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CODEX, identity);
     const existing = this.getBinding(binding.channelId);
-    if (!existing || !this.isOrdinaryBindingRecord(existing)) {
+    if (!existing || !this._isOrdinaryBindingRecord(existing)) {
       throw new BindingError('ordinary binding tombstone is unavailable for reuse');
     }
     const requestedSessionRoot = binding.sessionRoot === undefined
@@ -1033,7 +1048,7 @@ class SurfaceState {
           .run(input.sessionRoot, READINESS.PENDING, updatedAt, binding.channelId);
         this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
           .run('ordinary transcript root relocated; intake recovery reopened', updatedAt, binding.channelId);
-        this.receipt(null, 'ordinary-root-relocated', {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.ROOT_RELOCATED, {
           channelId: binding.channelId, generation: existing.generation, sessionRoot: input.sessionRoot
         });
         return this.getBinding(binding.channelId);
@@ -1052,11 +1067,11 @@ class SurfaceState {
     });
   }
 
-  rebindOrdinaryClaude(binding, identity, intakeCutoff = null, options = {}) {
+  _rebindOrdinaryClaude(binding, identity, intakeCutoff = null, options = {}) {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
     const existing = this.getBinding(binding.channelId);
-    if (!existing || existing.active || !this.isOrdinaryBindingRecord(existing)) {
+    if (!existing || existing.active || !this._isOrdinaryBindingRecord(existing)) {
       throw new BindingError('ordinary binding tombstone is unavailable for reuse');
     }
     if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CLAUDE ||
@@ -1070,40 +1085,40 @@ class SurfaceState {
     });
   }
 
-  isOrdinaryBindingRecord(binding) {
+  _isOrdinaryBindingRecord(binding) {
     if (!binding || !Object.values(PROVIDERS).includes(binding.provider) || binding.conductorId || binding.repoKey) return false;
     return Boolean(this.db.prepare(`SELECT 1 FROM receipts
-      WHERE kind='ordinary-bound'
+      WHERE kind=?
         AND json_extract(detail, '$.channelId')=?
         AND json_extract(detail, '$.provider')=?
         AND json_extract(detail, '$.nativeId')=?
         AND json_extract(detail, '$.workspace')=?
         AND json_extract(detail, '$.generation')=?
-      LIMIT 1`).get(binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation));
+      LIMIT 1`).get(ORDINARY_RECEIPT_KINDS.BOUND, binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation));
   }
 
-  isOrdinaryBinding(binding) {
-    return Boolean(binding?.active) && this.isOrdinaryBindingRecord(binding);
+  _isOrdinaryBinding(binding) {
+    return Boolean(binding?.active) && this._isOrdinaryBindingRecord(binding);
   }
 
-  hasOrdinaryPreflight(binding) {
-    if (!this.isOrdinaryBinding(binding)) return false;
+  _hasOrdinaryPreflight(binding) {
+    if (!this._isOrdinaryBinding(binding)) return false;
     return Boolean(this.db.prepare(`SELECT 1 FROM receipts
-      WHERE kind='ordinary-native-preflight'
+      WHERE kind=?
         AND json_extract(detail, '$.channelId')=?
         AND json_extract(detail, '$.provider')=?
         AND json_extract(detail, '$.nativeId')=?
         AND json_extract(detail, '$.workspace')=?
         AND json_extract(detail, '$.generation')=?
         AND json_extract(detail, '$.outcome')='verified'
-      LIMIT 1`).get(binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation));
+      LIMIT 1`).get(ORDINARY_RECEIPT_KINDS.NATIVE_PREFLIGHT, binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation));
   }
 
-  recordOrdinaryPreflight(binding, detail = {}) {
+  _recordOrdinaryPreflight(binding, detail = {}) {
     return this.transaction(() => {
       const current = this.getBinding(binding?.channelId);
       if (!bindingMatchesExpected(current, binding)) return null;
-      if (!this.isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${current?.provider || 'native'} binding`);
+      if (!this._isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${current?.provider || 'native'} binding`);
       if (!detail || typeof detail !== 'object' || typeof detail.file !== 'string' || !path.isAbsolute(detail.file) ||
         detail.sessionId !== current.nativeId || detail.threadId !== current.nativeId || detail.workspace !== current.workspace) {
         throw new BindingError(`ordinary ${current.provider} native preflight proof does not match the binding`);
@@ -1111,7 +1126,7 @@ class SurfaceState {
       if (current.provider === PROVIDERS.CLAUDE && (detail.harness !== 'claude-code' || detail.endpoint !== current.endpoint)) {
         throw new BindingError('ordinary Claude native preflight proof does not match the binding');
       }
-      this.receipt(null, 'ordinary-native-preflight', {
+      this.receipt(null, ORDINARY_RECEIPT_KINDS.NATIVE_PREFLIGHT, {
         ...detail,
         channelId: current.channelId, guildId: current.guildId, provider: current.provider,
         nativeId: current.nativeId, workspace: current.workspace, generation: current.generation,
@@ -1134,7 +1149,7 @@ class SurfaceState {
     }
     const input = this.bindingInput({ ...binding, channelId }, existing);
     if (sessionRootOverride !== undefined) input.sessionRoot = sessionRootOverride;
-    const ordinary = this.isOrdinaryBindingRecord(existing);
+    const ordinary = this._isOrdinaryBindingRecord(existing);
     const ordinaryIdentityMatches = input.nativeId === existing.nativeId &&
       ordinaryIdentity?.sessionId === existing.nativeId && ordinaryIdentity?.threadId === existing.nativeId;
     if (ordinary && existing.provider === PROVIDERS.CODEX && (!ordinaryIdentity || input.provider !== PROVIDERS.CODEX || input.conductorId || input.repoKey ||
@@ -1164,7 +1179,7 @@ class SurfaceState {
         .run(input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
       this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
       if (ordinary && !input.conductorId && !input.repoKey) {
-        this.receipt(null, 'ordinary-bound', {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
           channelId, guildId: input.guildId, provider: input.provider, nativeId: input.nativeId,
           workspace: input.workspace, generation,
           sessionRoot: input.sessionRoot,
@@ -1227,7 +1242,7 @@ class SurfaceState {
       const binding = this.getBinding(channelId);
       if (!binding) throw new BindingError('channel is not bound');
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
-      if (readiness === READINESS.READY && this.isOrdinaryBinding(binding) && !this.hasOrdinaryPreflight(binding)) {
+      if (readiness === READINESS.READY && this._isOrdinaryBinding(binding) && !this._hasOrdinaryPreflight(binding)) {
         throw new BindingError(`ordinary ${binding.provider} native preflight is required before READY`);
       }
       if (readiness === READINESS.READY) this.assertLegacyMigrationSafe(channelId);
@@ -1247,9 +1262,9 @@ class SurfaceState {
     return null;
   }
 
-  findOrdinaryHandoff(handoffId) {
+  _findOrdinaryHandoff(handoffId) {
     assertText(handoffId, 'handoffId', 256);
-    const rows = this.db.prepare("SELECT detail FROM receipts WHERE kind='ordinary-handoff' ORDER BY id DESC").all();
+    const rows = this.db.prepare('SELECT detail FROM receipts WHERE kind=? ORDER BY id DESC').all(ORDINARY_RECEIPT_KINDS.HANDOFF);
     for (const row of rows) {
       const detail = parseJson(row.detail, {});
       if (detail.handoffId === handoffId) return detail;
@@ -1265,7 +1280,7 @@ class SurfaceState {
     });
   }
 
-  handoffOrdinary({ channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, beforeMutation = undefined }) {
+  _handoffOrdinary({ channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, beforeMutation = undefined }) {
     if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     if (provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff requires the Codex provider');
     assertUuid(fromNativeId, 'fromNativeId');
@@ -1280,7 +1295,7 @@ class SurfaceState {
     assertText(workspace, 'workspace', 4096);
     if (!path.isAbsolute(workspace)) throw new BindingError('workspace must be absolute');
     const existing = this.getBinding(channelId);
-    if (!existing || !this.isOrdinaryBindingRecord(existing)) throw new BindingError('ordinary handoff source is unavailable');
+    if (!existing || !this._isOrdinaryBindingRecord(existing)) throw new BindingError('ordinary handoff source is unavailable');
     const requestedSessionRoot = sessionRoot === undefined ? existing.sessionRoot : sessionRoot;
     if (requestedSessionRoot !== null && requestedSessionRoot !== undefined) {
       assertText(requestedSessionRoot, 'sessionRoot', 4096);
@@ -1295,7 +1310,7 @@ class SurfaceState {
       (nativeProof.sessionRoot || null) !== (input.sessionRoot || null)) {
       throw new BindingError('ordinary handoff requires a matching Codex transcript proof');
     }
-    const previous = this.findOrdinaryHandoff(handoffId);
+    const previous = this._findOrdinaryHandoff(handoffId);
     if (previous) {
       const sameRequest = previous.channelId === channelId && previous.provider === PROVIDERS.CODEX &&
         previous.fromNativeId === fromNativeId && previous.fromGeneration === fromGeneration &&
@@ -1305,7 +1320,7 @@ class SurfaceState {
         (existing.sessionRoot || null) === (input.sessionRoot || null);
       if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
       return this.transaction(() => {
-        this.receipt(null, 'ordinary-handoff-retry', {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF_RETRY, {
           channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: existing.generation
         });
         return { ...existing, handoffReconciled: true };
@@ -1347,13 +1362,13 @@ class SurfaceState {
             PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
         this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
           .run('ordinary handoff; intake recovery reopened', updatedAt, channelId);
-        this.receipt(null, 'ordinary-handoff', {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF, {
           channelId, provider: PROVIDERS.CODEX, handoffId,
           fromNativeId, fromGeneration, fromActive: existing.active,
           nativeId: input.nativeId, generation, workspace: input.workspace, sessionRoot: input.sessionRoot,
           sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
         });
-        this.receipt(null, 'ordinary-bound', {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
           channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId: input.nativeId,
           workspace: input.workspace, generation, sessionRoot: input.sessionRoot,
           sessionId: identity.sessionId, threadId: identity.threadId
@@ -1362,7 +1377,7 @@ class SurfaceState {
       });
     } catch (error) {
       if (!(error instanceof StaleGenerationError)) throw error;
-      const committed = this.findOrdinaryHandoff(handoffId);
+      const committed = this._findOrdinaryHandoff(handoffId);
       const successor = this.getBinding(channelId);
       const reconciled = committed && successor && successor.active && successor.provider === PROVIDERS.CODEX &&
         !successor.conductorId && !successor.repoKey && successor.nativeId === nativeId &&
@@ -1375,10 +1390,10 @@ class SurfaceState {
       if (!reconciled) throw error;
       return this.transaction(() => {
         const current = this.getBinding(channelId);
-        const latest = this.findOrdinaryHandoff(handoffId);
+        const latest = this._findOrdinaryHandoff(handoffId);
         if (!latest || !bindingMatchesExpected(current, successor) || latest.nativeId !== nativeId ||
           latest.generation !== current.generation) throw error;
-        this.receipt(null, 'ordinary-handoff-retry', {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF_RETRY, {
           channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: current.generation
         });
         return { ...current, handoffReconciled: true };
@@ -1562,7 +1577,7 @@ class SurfaceState {
       const existing = this.getIntakeWatermark(channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       if (!existing && !binding) throw new BindingError('intake channel is unknown');
-      if (state === 'ready' && this.isOrdinaryBinding(binding) && !this.hasOrdinaryPreflight(binding)) {
+      if (state === 'ready' && this._isOrdinaryBinding(binding) && !this._hasOrdinaryPreflight(binding)) {
         throw new BindingError(`ordinary ${binding.provider} native preflight is required before READY`);
       }
       if (state === 'ready') this.assertLegacyMigrationSafe(channelId);
@@ -2526,6 +2541,7 @@ module.exports = {
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
   DIRECT_POST_OUTCOMES,
+  DISPATCH_OUTCOMES,
   TOPIC_PUBLICATION_STATES,
   UnresolvedWorkError,
   UUID,

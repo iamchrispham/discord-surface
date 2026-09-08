@@ -574,13 +574,17 @@ for (const terminalState of [READINESS.UNAVAILABLE, READINESS.GAP]) {
 test('ordinary Claude bind-time endpoint failure keeps an endpoint watermark', async t => {
   const f = fixture(t);
   const channel = { id: f.binding.channelId, guildId: 'guild' };
+  let preflightCalls = 0;
   const gateway = new DiscordGateway({
     state: f.state,
     client: { user: { id: 'bot' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
     providers: { claude: { async dispatch() { throw new Error('must stay held'); } } },
-    ordinaryNativePreflight: async () => { throw new Error('connect ENOENT'); }
+    recoveryOptions: {
+      ordinaryNativePreflight: async () => { preflightCalls += 1; throw new Error('connect ENOENT'); }
+    }
   });
   const result = await gateway.recoverTransport('ordinary-bind', 0);
+  assert.equal(preflightCalls, 1);
   assert.equal(result.ready, false);
   assert.equal(result.state, READINESS.UNAVAILABLE);
   assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
@@ -842,4 +846,26 @@ test('Monitor construction failure releases allocated timers and listeners', t =
   assert.equal(timers.size, 0);
   assert.equal(stdout.listenerCount('error'), 0);
   assert.equal(stdout.listenerCount('close'), 0);
+});
+
+
+test('ordinary Claude preflight rereads Gateway after binding mutation', async t => {
+  const f = fixture(t, { bind: false });
+  const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  let reads = 0;
+  await assert.rejects(() => ordinaryClaudeBind({
+    'state-dir': f.dir, channel: '#dev', transcript: f.session.file, socket: f.socketPath
+  }, {
+    resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code' }),
+    requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    gatewayProcessStatus: () => (++reads < 3
+      ? { state: 'running', pid: 4242, capabilities: ['ordinary-bind-wake-v1'] }
+      : { state: 'running', pid: 4243, capabilities: [] }),
+    killProcess: () => {},
+    print: () => {}
+  }), /does not support ordinary binding wake/);
+  const binding = f.state.getBinding(channel.id);
+  assert.ok(binding);
+  assert.equal(f.state.hasOrdinaryPreflight(binding), false);
 });

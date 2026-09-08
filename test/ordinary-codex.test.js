@@ -1531,3 +1531,22 @@ for (const action of ['rebind', 'handoff']) {
     });
   }
 }
+
+
+test('async identity discovery refuses an unreadable matching sibling', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-incomplete-'));
+  const root = path.join(dir, 'sessions');
+  fs.mkdirSync(root);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, `valid-${CODEX}.jsonl`), JSON.stringify({
+    type: 'session_meta', payload: { session_id: CODEX, id: CODEX, cwd: root }
+  }) + '\n');
+  const broken = path.join(root, `unreadable-${CODEX}.jsonl`);
+  fs.writeFileSync(broken, '{}\n');
+  const open = fs.promises.open;
+  t.mock.method(fs.promises, 'open', async (file, ...args) => {
+    if (String(file) === broken) throw Object.assign(new Error('fixture unreadable'), { code: 'EACCES' });
+    return open.call(fs.promises, file, ...args);
+  });
+  await assert.rejects(() => validateCodexSessionIdentityAsync(CODEX, undefined, root), /transcript identity is unavailable/);
+});

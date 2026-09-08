@@ -13,11 +13,11 @@ const { createOrdinaryClaudeRequest, createOrdinaryCodexRequestFromEnvironment, 
 const { sessionRoot: codexSessionRoot, validateClaudeSessionIdentity, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('./native');
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
+const { ordinaryBind: runOrdinaryBind, ordinaryClaudeBind: runOrdinaryClaudeBind } = require('./ordinary-bind');
+const { assertGatewayWakeCompatible } = require('./ordinary-bind/gateway-capability');
+const { GATEWAY_CAPABILITIES } = require('./ordinary-bind/constants');
+const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 
-const GATEWAY_CAPABILITIES = Object.freeze({
-  ordinaryBindWake: 'ordinary-bind-wake-v1',
-  runtimeBindLock: 'runtime-bind-lock-v1'
-});
 const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID';
 const LOCK_CONTENTION_EXIT = 75;
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
@@ -152,178 +152,8 @@ function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = p
   }
 }
 
-function assertGatewayWakeCompatible(paths, status = gatewayProcessStatus) {
-  const runtime = status(paths);
-  if (runtime?.state !== 'running' || !runtime.pid || runtime.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryBindWake)) return;
-  throw new Error('running Gateway does not support ordinary binding wake; stop or restart it before binding');
-}
-
 async function ordinaryBind(args, dependencies = {}) {
-  const { paths, state } = openState(args);
-  const environment = dependencies.environment || process.env;
-  const install = dependencies.requireInstalled || requireInstalled;
-  const read = dependencies.readSecret || readSecret;
-  const validate = dependencies.validateCodexSessionIdentity || validateCodexSessionIdentityAsync;
-  const output = dependencies.print || print;
-  let client;
-  try {
-    const config = state.requireConfig();
-    const channelSelection = args.channel || args['channel-id'];
-    if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
-    const invocation = resolveInvocationIdentity(environment, args.workspace ? path.resolve(args.workspace) : undefined);
-    const sessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
-    let nativeProofDetail = null;
-    let nativeProofError = null;
-    let resolvedWorkspace = invocation.workspace;
-    const validateNativeProof = async root => {
-      let detail = null;
-      let error = null;
-      try {
-        detail = await validate(invocation.sessionId, undefined, root);
-        if (!detail || typeof detail.workspace !== 'string' || !path.isAbsolute(detail.workspace)) {
-          throw new Error('Codex transcript workspace is unavailable');
-        }
-      } catch (caught) {
-        error = caught;
-        if (!invocation.workspace) throw new Error(`Codex transcript workspace is required: ${caught.message}`);
-      }
-      if (detail && invocation.workspace && path.resolve(detail.workspace) !== invocation.workspace) {
-        throw new Error('Codex transcript workspace does not match the supplied workspace');
-      }
-      return { detail, error, workspace: detail?.workspace || invocation.workspace };
-    };
-    if (sessionRoot) {
-      const proof = await validateNativeProof(sessionRoot);
-      nativeProofDetail = proof.detail;
-      nativeProofError = proof.error;
-      resolvedWorkspace = proof.workspace;
-    }
-    const { Client, GatewayIntentBits } = install('discord.js');
-    client = new Client({ intents: [GatewayIntentBits.Guilds] });
-    await client.login(read(config.secretFile));
-    const guild = await client.guilds.fetch(config.guildId);
-    const mentionId = channelSelection.match(/^<#([^>]+)>$/)?.[1] || (/^\d+$/.test(channelSelection) ? channelSelection : null);
-    let fetchedChannels;
-    let fetchedChannelObjects;
-    if (mentionId) {
-      const channel = await guild.channels.fetch(mentionId);
-      fetchedChannelObjects = channel ? [channel] : [];
-      fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
-        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];
-    } else {
-      const fetched = await guild.channels.fetch();
-      const values = Array.isArray(fetched) ? fetched : typeof fetched?.values === 'function' ? [...fetched.values()] : [];
-      fetchedChannelObjects = values;
-      fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
-        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
-    }
-    const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
-    if (args.channel && args['channel-id']) {
-      const namedChannel = resolveExistingChannel(args.channel, config.guildId, fetchedChannels);
-      const idChannel = resolveExistingChannel(args['channel-id'], config.guildId, fetchedChannels);
-      if (namedChannel.id !== idChannel.id) throw new Error('--channel and --channel-id must identify the same channel');
-    }
-    const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
-    const existing = state.getBinding(channel.id);
-    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
-      throw new Error('channel is already bound to another owner; use explicit handoff');
-    }
-    const validationRoot = sessionRoot ?? existing?.sessionRoot ?? undefined;
-    const effectiveSessionRoot = validationRoot ?? codexSessionRoot(environment);
-    if (!sessionRoot) {
-      const proof = await validateNativeProof(validationRoot);
-      nativeProofDetail = proof.detail;
-      nativeProofError = proof.error;
-      resolvedWorkspace = proof.workspace;
-    }
-    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, effectiveSessionRoot);
-    if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
-    const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
-    const assertGatewayCompatible = () => assertGatewayWakeCompatible(paths, gatewayStatus);
-    assertGatewayCompatible();
-    const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: effectiveSessionRoot } : null;
-    let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
-    let adoptionCutoff = null;
-    if (decision !== 'reuse' && !existing?.active) {
-      const cutoff = await latestChannelMessageId(discordChannel);
-      adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
-    }
-    let binding;
-    if (decision === 'reuse') binding = existing;
-    else if (decision === 'rebind') {
-      try {
-        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence, adoptionCutoff, {
-          beforeMutation: assertGatewayCompatible
-        });
-      } catch (error) {
-        const raced = state.getBinding(request.channelId);
-        const racedDecision = raced
-          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
-          : null;
-        if (racedDecision !== 'reuse') throw error;
-        decision = 'reuse';
-        binding = raced;
-      }
-    }
-    else {
-      try {
-        binding = state.bindOrdinary(request, request.identity, adoptionCutoff, {
-          beforeMutation: assertGatewayCompatible
-        });
-      } catch (error) {
-        const raced = state.getBinding(request.channelId);
-        const racedDecision = raced
-          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
-          : null;
-        if (racedDecision !== 'reuse') throw error;
-        decision = 'reuse';
-        binding = raced;
-      }
-    }
-    let nativeProof = { status: 'pending', reason: 'Codex transcript proof is pending' };
-    if (nativeProofError) {
-      const detail = `${ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX} ${nativeProofError.message}`;
-      const unavailable = state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, detail, binding);
-      if (unavailable === null) throw new Error('ordinary binding changed before native proof was recorded');
-      if (unavailable) binding = unavailable;
-      nativeProof = { status: 'pending', reason: nativeProofError.message };
-    } else if (state.hasOrdinaryPreflight(binding)) {
-      nativeProof = { status: 'verified', reason: 'Codex transcript proof already recorded' };
-    } else if (nativeProofDetail) {
-      let recorded;
-      try {
-        recorded = state.recordOrdinaryPreflight(binding, {
-          file: nativeProofDetail.file,
-          sessionId: nativeProofDetail.sessionId,
-          threadId: nativeProofDetail.threadId,
-          workspace: nativeProofDetail.workspace
-        });
-        nativeProof = { status: 'verified', file: nativeProofDetail.file, workspace: nativeProofDetail.workspace };
-      } catch (error) {
-        nativeProof = { status: 'pending', reason: error.message };
-      }
-      if (recorded === null) throw new Error('ordinary binding changed before native proof was recorded');
-    } else {
-      nativeProof = { status: 'pending', reason: nativeProofError?.message || 'Codex transcript proof is pending' };
-    }
-    if (decision === 'reuse' && nativeProof.status === 'verified' && nativeProofDetail && !nativeProofError) {
-      const watermark = state.getIntakeWatermark(binding.channelId);
-      const nativeProofUnavailable = watermark && watermark.state === READINESS.UNAVAILABLE &&
-        typeof watermark.detail === 'string' && watermark.detail.startsWith(ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX);
-      if (nativeProofUnavailable) {
-        const reopened = state.reconcileIntake(binding.channelId, binding);
-        if (reopened) binding = state.getBinding(binding.channelId);
-      }
-    }
-    const gatewayWake = requestGatewayRecovery(paths, {
-      status: gatewayStatus,
-      kill: dependencies.killProcess || process.kill
-    });
-    output({ bound: true, reused: decision === 'reuse', binding: state.getBinding(binding.channelId), nativeProof, gatewayWake });
-    return { binding: state.getBinding(binding.channelId), nativeProof, gatewayWake, reused: decision === 'reuse' };
-  } finally {
-    try { await client?.destroy(); } finally { state.close(); }
-  }
+  return runOrdinaryBind(args, dependencies);
 }
 
 function runLockedOrdinaryCommand(args, { command, environmentKey, lockPath, environment = {} }) {
@@ -379,158 +209,7 @@ async function resolveCurrentClaudeCaller(dependencies = {}) {
 }
 
 async function ordinaryClaudeBind(args, dependencies = {}) {
-  const { paths, state } = openState(args);
-  const environment = dependencies.environment || process.env;
-  const install = dependencies.requireInstalled || requireInstalled;
-  const read = dependencies.readSecret || readSecret;
-  const resolveCaller = dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies));
-  const validate = dependencies.validateClaudeSessionIdentity || validateClaudeSessionIdentity;
-  const output = dependencies.print || print;
-  let client;
-  try {
-    const config = state.requireConfig();
-    const channelSelection = args.channel || args['channel-id'];
-    if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
-    const endpoint = required(args, args.endpoint !== undefined ? 'endpoint' : 'socket');
-    const socketAlias = args.socket === undefined ? undefined : required(args, 'socket');
-    const transcript = required(args, 'transcript');
-    if (!path.isAbsolute(endpoint)) throw new Error('Claude endpoint must be an absolute Unix socket path');
-    if (socketAlias !== undefined && path.resolve(endpoint) !== path.resolve(socketAlias)) {
-      throw new Error('--endpoint and --socket must identify the same socket');
-    }
-    if (!path.isAbsolute(transcript)) throw new Error('Claude transcript path must be absolute');
-    const resolvedEndpoint = path.resolve(endpoint);
-    const caller = await resolveCaller();
-    if (!caller || caller.harness !== 'claude-code' || typeof caller.sessionId !== 'string') {
-      throw new Error('ordinary Claude caller identity is unavailable or uses the wrong harness');
-    }
-    const sessionId = caller.sessionId;
-    const requestedWorkspace = args.workspace === undefined ? undefined : required(args, 'workspace');
-    if (requestedWorkspace !== undefined && !path.isAbsolute(requestedWorkspace)) {
-      throw new Error('Claude workspace must be absolute');
-    }
-    const identityProof = validate(sessionId, transcript, requestedWorkspace);
-    const request = createOrdinaryClaudeRequest({
-      channelId: channelSelection,
-      guildId: config.guildId,
-      nativeId: args['native-id'],
-      workspace: identityProof.workspace,
-      endpoint: resolvedEndpoint,
-      identity: { sessionId, threadId: sessionId, harness: 'claude-code' }
-    });
-    const { Client, GatewayIntentBits } = install('discord.js');
-    client = new Client({ intents: [GatewayIntentBits.Guilds] });
-    await client.login(read(config.secretFile));
-    const guild = await client.guilds.fetch(config.guildId);
-    const mentionId = channelSelection.match(/^<#([^>]+)>$/)?.[1] || (/^\d+$/.test(channelSelection) ? channelSelection : null);
-    let fetchedChannels;
-    let fetchedChannelObjects;
-    if (mentionId) {
-      const channel = await guild.channels.fetch(mentionId);
-      fetchedChannelObjects = channel ? [channel] : [];
-      fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
-        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];
-    } else {
-      const fetched = await guild.channels.fetch();
-      const values = Array.isArray(fetched) ? fetched : typeof fetched?.values === 'function' ? [...fetched.values()] : [];
-      fetchedChannelObjects = values;
-      fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
-        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
-    }
-    const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
-    if (args.channel && args['channel-id']) {
-      const namedChannel = resolveExistingChannel(args.channel, config.guildId, fetchedChannels);
-      const idChannel = resolveExistingChannel(args['channel-id'], config.guildId, fetchedChannels);
-      if (namedChannel.id !== idChannel.id) throw new Error('--channel and --channel-id must identify the same channel');
-    }
-    const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
-    const boundRequest = { ...request, channelId: channel.id };
-    const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
-    const expectedRuntimePid = environment[ORDINARY_CLAUDE_RUNTIME_PID_ENV];
-    const assertGatewayCompatible = () => {
-      const runtime = gatewayStatus(paths);
-      if (expectedRuntimePid !== undefined &&
-        (runtime?.state !== 'running' || String(runtime.pid) !== expectedRuntimePid ||
-          !runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock))) {
-        throw new Error('running Gateway changed while binding ordinary Claude session');
-      }
-      if (runtime?.state !== 'running' || !runtime.pid || runtime.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryBindWake)) return;
-      throw new Error('running Gateway does not support ordinary binding wake; stop or restart it before binding');
-    };
-    assertGatewayCompatible();
-    const existing = state.getBinding(channel.id);
-    let decision = ordinaryBindingDecision(existing, boundRequest, existing ? state.isOrdinaryBindingRecord(existing) : false);
-    let adoptionCutoff = null;
-    if (decision !== 'reuse' && !existing?.active) {
-      const cutoff = await latestChannelMessageId(discordChannel);
-      adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
-    }
-    let binding;
-    if (decision === 'reuse') binding = existing;
-    else if (decision === 'rebind') {
-      try {
-        binding = state.rebindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff, {
-          beforeMutation: assertGatewayCompatible
-        });
-      } catch (error) {
-        const raced = state.getBinding(boundRequest.channelId);
-        const racedDecision = raced
-          ? ordinaryBindingDecision(raced, boundRequest, state.isOrdinaryBindingRecord(raced))
-          : null;
-        if (racedDecision !== 'reuse') throw error;
-        decision = 'reuse';
-        binding = raced;
-      }
-    } else {
-      try {
-        binding = state.bindOrdinaryClaude(boundRequest, boundRequest.identity, adoptionCutoff, {
-          beforeMutation: assertGatewayCompatible
-        });
-      } catch (error) {
-        const raced = state.getBinding(boundRequest.channelId);
-        const racedDecision = raced
-          ? ordinaryBindingDecision(raced, boundRequest, state.isOrdinaryBindingRecord(raced))
-          : null;
-        if (racedDecision !== 'reuse') throw error;
-        decision = 'reuse';
-        binding = raced;
-      }
-    }
-    let nativeProof = { status: 'pending', reason: 'Claude Monitor capability is pending' };
-    if (state.hasOrdinaryPreflight(binding)) {
-      nativeProof = { status: 'verified', reason: 'Claude transcript proof already recorded' };
-    } else {
-      assertGatewayCompatible();
-      const recorded = state.recordOrdinaryPreflight(binding, {
-        file: identityProof.file,
-        sessionId: identityProof.sessionId,
-        threadId: identityProof.threadId,
-        workspace: identityProof.workspace,
-        endpoint: resolvedEndpoint,
-        harness: 'claude-code'
-      });
-      if (!recorded) throw new Error('ordinary Claude binding changed before native proof was recorded');
-      nativeProof = { status: 'verified', file: identityProof.file, workspace: identityProof.workspace };
-    }
-    if (decision === 'reuse' && nativeProof.status === 'verified') {
-      const watermark = state.getIntakeWatermark(binding.channelId);
-      const endpointUnavailable = watermark?.state === READINESS.UNAVAILABLE &&
-        typeof watermark.detail === 'string' &&
-        watermark.detail.startsWith('Claude endpoint unavailable before event write:');
-      if (endpointUnavailable) {
-        const reopened = state.reconcileIntake(binding.channelId, binding);
-        if (reopened) binding = state.getBinding(binding.channelId);
-      }
-    }
-    const gatewayWake = requestGatewayRecovery(paths, {
-      status: gatewayStatus,
-      kill: dependencies.killProcess || process.kill
-    });
-    output({ bound: true, reused: decision === 'reuse', binding: state.getBinding(binding.channelId), nativeProof, monitor: { status: 'pending' }, gatewayWake });
-    return { binding: state.getBinding(binding.channelId), nativeProof, monitor: { status: 'pending' }, gatewayWake, reused: decision === 'reuse' };
-  } finally {
-    try { await client?.destroy(); } finally { state.close(); }
-  }
+  return runOrdinaryClaudeBind(args, dependencies);
 }
 
 function unbind(args) {
@@ -1205,10 +884,15 @@ function acquireHeldLock(lockPath) {
 }
 
 async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
+  let reportedContention = false;
   while (!isStopping?.()) {
     try { return await acquireHeldLock(lockPath); }
     catch (error) {
       if (error.code !== 'RUNTIME_BIND_LOCK_BUSY') throw error;
+      if (!reportedContention) {
+        reportedContention = true;
+        process.stderr.write('discord-surface: runtime bind lock is busy; waiting for the holder to release it\n');
+      }
       await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
@@ -1418,11 +1102,14 @@ async function claudeMonitor(args) {
       const watermark = state.getIntakeWatermark(ordinaryStartupBinding.channelId);
       const endpointUnavailable = watermark?.state === READINESS.UNAVAILABLE &&
         typeof watermark.detail === 'string' &&
-        watermark.detail.startsWith('Claude endpoint unavailable before event write:');
+        watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX);
       if (endpointUnavailable) {
         state.reconcileIntake(ordinaryStartupBinding.channelId, ordinaryStartupBinding);
       }
-      requestGatewayRecovery(paths);
+      const gatewayWake = requestGatewayRecovery(paths);
+      if (!gatewayWake.requested) {
+        process.stderr.write(`discord-surface: Claude Monitor startup could not wake Gateway (${gatewayWake.reason})\n`);
+      }
     }
   } catch (error) {
     await stop();
@@ -1454,7 +1141,7 @@ function claudeReply(args) {
   } finally { state.close(); }
 }
 
-async function directPost(args, provider = null, ordinary = false) {
+async function directPost(args, provider = null, ordinary = false, dependencies = {}) {
   const { state } = openState(args);
   const controller = new AbortController();
   let receivedSignal = null;
@@ -1473,8 +1160,8 @@ async function directPost(args, provider = null, ordinary = false) {
     const channelId = ordinary ? required(args, 'channel-id') : (args['channel-id'] || null);
     if (ordinary) {
       const invocation = provider === PROVIDERS.CLAUDE
-        ? await resolveCurrentClaudeCaller()
-        : resolveInvocationIdentity(process.env);
+        ? await (dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies)))()
+        : (dependencies.resolveInvocationIdentity || resolveInvocationIdentity)(dependencies.environment || process.env);
       if (provider === PROVIDERS.CLAUDE &&
         (!invocation || invocation.harness !== 'claude-code' || typeof invocation.sessionId !== 'string')) {
         throw new Error('ordinary Claude caller identity is unavailable or uses the wrong harness');
@@ -1658,4 +1345,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller };

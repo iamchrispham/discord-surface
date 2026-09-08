@@ -4,6 +4,7 @@ const path = require('node:path');
 const {
   BindingError,
   DIRECT_POST_OUTCOMES,
+  PROVIDERS,
   StaleGenerationError,
   discordNonce,
   splitReply,
@@ -56,7 +57,7 @@ function bindingMatchesRequest(binding, { nativeId, generation, channelId, provi
 
 function resolveDirectBinding(state, { nativeId, generation, channelId = null, provider = null, ordinary = false }) {
   validateNativeId(nativeId);
-  if (ordinary && provider && !['codex', 'claude'].includes(provider)) throw new BindingError(`ordinary post does not support provider: ${provider}`);
+  if (ordinary && provider && !Object.values(PROVIDERS).includes(provider)) throw new BindingError(`ordinary post does not support provider: ${provider}`);
   const config = state.requireConfig();
   const candidates = state.listBindings().filter(binding => binding.guildId === config.guildId &&
     bindingMatchesRequest(binding, { nativeId, generation, channelId, provider, ordinary }) &&

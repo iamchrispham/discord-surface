@@ -2804,6 +2804,7 @@ require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
       reason: 'gateway-wake-unsupported',
       capability: 'ordinary-bind-wake-v1'
     });
+    assert.equal(fs.readFileSync(wakeMarker, 'utf8'), '2');
     assert.doesNotThrow(() => process.kill(matching.pid, 0));
   } finally {
     matching.kill('SIGTERM');
