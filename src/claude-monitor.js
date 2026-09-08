@@ -172,8 +172,9 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
       }
       const textFile = replyFileFor(stateDir, values.messageId, values.generation);
       const payloadPath = payloadFileFor(stateDir, values.messageId, values.nativeId, values.generation, dbPath);
-      const operation = (async () => {
-        const payload = monitorEvent({
+      let payload;
+      try {
+        payload = monitorEvent({
           ...values,
           content: message.content,
           attachments: message.attachments,
@@ -183,9 +184,18 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
           textFile
         });
         writePayloadFile(payloadPath, JSON.stringify(payload));
+      } catch (error) {
+        error.potentiallyDelivered = false;
+        throw error;
+      }
+      const operation = (async () => {
         try { await writeStdoutLine(stdout, JSON.stringify(monitorPointer({ ...values, payloadPath }))); }
         catch (error) {
           error.potentiallyDelivered = true;
+          if (!closed && !transportNotified) {
+            transportNotified = true;
+            mcp?.onerror?.(error);
+          }
           throw error;
         }
       })();

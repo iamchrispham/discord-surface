@@ -148,7 +148,7 @@ class ClaudeChannel {
       if (attachments.length) params.attachments = attachments;
       await this.mcp.notification({ method: 'notifications/claude/channel', params });
     } catch (error) {
-      error.potentiallyDelivered = true;
+      if (error.potentiallyDelivered === undefined) error.potentiallyDelivered = true;
       throw error;
     }
   }

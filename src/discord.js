@@ -334,6 +334,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     if (!queue) return false;
     if (queue.active?.message.id === messageId) {
       const active = queue.active;
+      active.dispatchBlocked = false;
       finishOwner(active);
       return queue.active !== active;
     }
@@ -575,7 +576,9 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
             signal: taskSignal,
             continueUntilFinal,
             onDispatchOutcome: outcome => {
-              if (outcome?.status === 'not_submitted') ownerEntry.dispatchBlocked = true;
+              if (outcome?.status === 'not_submitted') {
+                ownerEntry.dispatchBlocked = !hasCurrentNativeAcknowledgment(state.getMessage(message.id));
+              }
               settleDispatchOutcome?.(outcome);
             },
             onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
@@ -1116,7 +1119,7 @@ class DiscordGateway {
             failure ||= { ready: false, state: 'unavailable', error };
             continue;
           }
-          const detail = binding.provider === 'claude' && ['Claude endpoint unavailable', 'ordinary-bind', 'reconnect', 'startup'].includes(reason)
+          const detail = binding.provider === 'claude' && ['Claude endpoint unavailable', 'Claude endpoint unavailable follow-up', 'ordinary-bind', 'reconnect', 'startup'].includes(reason)
             ? `Claude endpoint unavailable before event write: ${error.message}`
             : error.message;
           await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', detail, watermark?.recovered_through_id, null, signal, deadline);
