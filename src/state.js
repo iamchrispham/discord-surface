@@ -1001,8 +1001,8 @@ class SurfaceState {
         const current = this.getBinding(binding.channelId);
         if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary root relocation source identity is stale');
         const dispatching = this.db.prepare(
-          'SELECT 1 FROM messages WHERE channel_id=? AND state=? LIMIT 1'
-        ).get(binding.channelId, MESSAGE_STATES.DISPATCHING);
+          'SELECT 1 FROM messages WHERE channel_id=? AND state IN (?, ?) LIMIT 1'
+        ).get(binding.channelId, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN);
         if (dispatching) {
           throw new BindingError('ordinary binding root relocation is unavailable while dispatch is in flight');
         }
@@ -1272,7 +1272,9 @@ class SurfaceState {
     if (!existing.active && !this.hasUnboundReceipt(channelId, fromGeneration)) {
       throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
     }
-    if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+    if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
+      throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+    }
     this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
     return this.transaction(() => {
       const current = this.getBinding(channelId);
@@ -1284,7 +1286,9 @@ class SurfaceState {
       if (!current.active && !this.hasUnboundReceipt(channelId, fromGeneration)) {
         throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
       }
-      if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+      if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
+        throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+      }
       this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
       this.assertLegacyMigrationSafe(channelId);
       if (intakeCutoff !== null) {
@@ -1371,6 +1375,37 @@ class SurfaceState {
     const row = this.db.prepare(`SELECT 1 FROM messages WHERE channel_id=? AND state IN (${states.map(() => '?').join(',')}) LIMIT 1`)
       .get(channelId, ...states);
     return Boolean(row);
+  }
+
+  hasUnresolvedOrdinaryPost(channelId) {
+    const rows = this.directPostRows();
+    const outcomes = new Map(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail?.attemptId)
+      .map(row => [row.detail.attemptId, row]));
+    const requests = new Map();
+    for (const row of rows) {
+      if (row.kind !== DIRECT_POST_ATTEMPT || row.detail.channelId !== channelId ||
+        row.detail.provider !== PROVIDERS.CODEX || row.detail.conductorId || row.detail.repoKey) continue;
+      const request = requests.get(row.detail.requestId) || new Map();
+      request.set(row.detail.partIndex, row);
+      requests.set(row.detail.requestId, request);
+    }
+    for (const parts of requests.values()) {
+      let hasFinalPart = false;
+      let activeOwner = false;
+      for (const row of parts.values()) {
+        const outcome = outcomes.get(row.detail.attemptId);
+        if (!outcome || outcome.detail.outcome === 'unknown') return true;
+        const partIndex = Number(row.detail.partIndex);
+        const partCount = Number(row.detail.partCount);
+        if (Number.isInteger(partIndex) && Number.isInteger(partCount) && partIndex === partCount - 1) {
+          hasFinalPart = true;
+        } else if (this.directPostOwnerAlive(row.detail.ownerPid, row.detail)) {
+          activeOwner = true;
+        }
+      }
+      if (!hasFinalPart && activeOwner) return true;
+    }
+    return false;
   }
 
   reject(reason) {

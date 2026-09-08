@@ -748,9 +748,49 @@ test('ordinary root relocation refuses an active dispatch', t => {
     workspace: f.dir, sessionRoot, identity: { sessionId: CODEX, threadId: CODEX }
   };
   assert.throws(() => f.state.rebindOrdinary(request, request.identity, proof), /dispatch is in flight/);
+  f.state.markUncertain('ordinary-relocation-dispatch', 'network outcome is uncertain');
+  assert.throws(() => f.state.rebindOrdinary(request, request.identity, proof), /dispatch is in flight/);
   const unchanged = f.state.getBinding(binding.channelId);
   assert.equal(unchanged.sessionRoot, null);
   assert.equal(unchanged.generation, binding.generation);
+});
+
+test('ordinary handoff refuses unmatched and active direct-post custody', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-post-handoff-workspace-'));
+  const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-post-handoff-root-'));
+  t.after(() => {
+    fs.rmSync(successorWorkspace, { recursive: true, force: true });
+    fs.rmSync(successorRoot, { recursive: true, force: true });
+  });
+  const proof = {
+    file: path.join(successorRoot, `${OTHER}.jsonl`), sessionId: OTHER, threadId: OTHER,
+    workspace: successorWorkspace, sessionRoot: successorRoot
+  };
+  f.state.directPostOwnerAlive = () => true;
+  const attempt = {
+    journal: 'direct-post-v1', requestId: 'ordinary-post-handoff', attemptId: 'ordinary-post-attempt',
+    ownerPid: 1, sourcePath: path.join(f.dir, 'milestone.txt'), textHash: 'text-hash', operatorId: 'operator',
+    partHash: 'part-hash', channelId: binding.channelId, guildId: 'guild', provider: 'codex',
+    nativeId: CODEX, generation: binding.generation, conductorId: null, repoKey: null,
+    partIndex: 0, partCount: 2, nonce: 'ordinary-post-nonce', status: 'attempted'
+  };
+  f.state.receipt(null, 'direct-post-attempt', attempt);
+  const handoff = {
+    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: binding.generation,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-post-handoff-id', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
+  };
+  assert.throws(() => f.state.handoffOrdinary(handoff), /unresolved/);
+  f.state.receipt(null, 'direct-post-outcome', { ...attempt, outcome: 'sent', messageId: 'sent-message' });
+  assert.throws(() => f.state.handoffOrdinary(handoff), /unresolved/);
+  const finalAttempt = { ...attempt, attemptId: 'ordinary-post-final-attempt', partIndex: 1 };
+  f.state.receipt(null, 'direct-post-attempt', finalAttempt);
+  f.state.receipt(null, 'direct-post-outcome', { ...finalAttempt, outcome: 'sent', messageId: 'final-message' });
+  const transferred = f.state.handoffOrdinary({ ...handoff, handoffId: 'ordinary-post-complete-id' });
+  assert.equal(transferred.nativeId, OTHER);
+  assert.equal(f.state.getBinding(binding.channelId).nativeId, OTHER);
 });
 
 test('ordinary bind rejects a successor and explicit tombstone handoff transfers custody', t => {
