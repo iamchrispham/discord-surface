@@ -1067,9 +1067,12 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
           continue;
         }
         if (!isStopping?.()) {
-          if (isReady?.()) await currentGateway.reconcilePending();
+          if (isReady?.()) {
+            if (recovery?.ready) await currentGateway.reconcilePending();
+            else await currentGateway.reconcilePending(undefined, { readyOnly: true });
+          }
           else if (['gap', 'unavailable'].includes(recovery?.state)) {
-            await currentGateway.reconcilePending(undefined, { allowPaused: true });
+            await currentGateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
           }
         }
       }

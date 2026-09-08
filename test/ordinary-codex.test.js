@@ -638,7 +638,7 @@ test('binding wake reconciles recovered owners after a partial recovery pauses l
   await wake.wait();
   assert.deepEqual(calls, [
     'recover:ordinary-bind',
-    { phase: 'reconcile', options: { allowPaused: true } }
+    { phase: 'reconcile', options: { allowPaused: true, readyOnly: true } }
   ]);
 });
 

@@ -802,6 +802,7 @@ class DiscordGateway {
       if (!this.stopping && connectionEpoch === this.connectionEpoch) {
         this.transportReady = true;
         if (result.ready) await this.reconcilePending();
+        else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true });
         if (!this.stopping && connectionEpoch === this.connectionEpoch) this.onReady?.();
       }
       return result;
@@ -1220,12 +1221,12 @@ class DiscordGateway {
     }
   }
 
-  async reconcilePending(before = new Date().toISOString(), { allowPaused = false } = {}) {
+  async reconcilePending(before = new Date().toISOString(), { allowPaused = false, readyOnly = false } = {}) {
     if (!this.ready && !allowPaused) throw new Error('Discord gateway is not ready for recovery');
     if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
-    this.recoveryPromise = this._reconcilePending(before, controller.signal, allowPaused);
+    this.recoveryPromise = this._reconcilePending(before, controller.signal, readyOnly || allowPaused);
     try { return await this.recoveryPromise; }
     finally {
       this.recoveryPromise = null;
