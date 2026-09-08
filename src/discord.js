@@ -935,7 +935,7 @@ class DiscordGateway {
           const currentCount = this.liveIntakeCounts.get(channelId) || 0;
           const deferredCount = deferredCounts.get(channelId);
           if (deferredCount === undefined) this.liveIntakeCounts.set(channelId, Math.max(currentCount, count));
-          else deferredCounts.set(channelId, Math.max(deferredCount, count));
+          else deferredCounts.set(channelId, deferredCount + count);
         }
         if (this.recoveryPromise) {
           for (const [channelId, count] of deferredCounts) {

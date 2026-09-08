@@ -830,7 +830,6 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
     }]);
     if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
-    const channelCutoff = await latestChannelMessageId(channel);
     let recoveredThrough = null;
     if (current.active) {
       const watermark = state.getIntakeWatermark(channelId);
@@ -838,11 +837,11 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       if (!handoffRetry && (watermark?.state !== READINESS.READY || !recoveredThrough)) {
         throw new Error('ordinary handoff requires Discord intake to be durably drained');
       }
-      if (!handoffRetry && typeof channel?.send !== 'function' && channelCutoff && discordIdAfter(channelCutoff, recoveredThrough)) {
+      if (!handoffRetry && typeof channel?.send !== 'function') {
         throw new Error('ordinary handoff requires Discord intake to be durably drained');
       }
     }
-    let handoffCutoff = channelCutoff || (current.active ? recoveredThrough : null) ||
+    let handoffCutoff = (current.active ? recoveredThrough : null) ||
       serverDerivedChannelCutoff(channel);
     handoffFence = await createHandoffFence(channel);
     if (handoffFence) {
