@@ -290,8 +290,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   function ownerAdmissionOrder(messageId) {
-    const index = state.listMessages().findIndex(message => message.id === messageId);
-    return index >= 0 ? index : null;
+    const rowId = state.getMessageRowId(messageId);
+    return Number.isSafeInteger(rowId) ? rowId : null;
   }
 
   function compareOwnerEntries(left, right) {

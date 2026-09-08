@@ -372,18 +372,22 @@ function readClaudeSessionIdentity(nativeId, transcriptFile) {
   }
   const stat = fs.statSync(transcriptFile);
   if (!stat.isFile()) throw new Error('Claude transcript path must be a regular file');
-  const matches = readClaudeSessionMetadata(transcriptFile).filter(row => {
+  const qualifyingMatches = readClaudeSessionMetadata(transcriptFile).flatMap(row => {
     const sessionId = row?.sessionId;
     const payloadSessionId = row?.payload?.session_id;
     const hasSessionId = sessionId !== undefined && sessionId !== null;
     const hasPayloadSessionId = payloadSessionId !== undefined && payloadSessionId !== null;
-    if (hasSessionId && hasPayloadSessionId && sessionId !== payloadSessionId) return false;
+    if (hasSessionId && hasPayloadSessionId && sessionId !== payloadSessionId) return [];
     let candidateSessionId = null;
     if (hasSessionId) candidateSessionId = sessionId;
     else if (hasPayloadSessionId) candidateSessionId = payloadSessionId;
-    return candidateSessionId === nativeId && row?.entrypoint === 'cli' && typeof row?.version === 'string' &&
-      typeof row?.cwd === 'string' && path.isAbsolute(row.cwd);
+    if (candidateSessionId === null || row?.entrypoint !== 'cli' || typeof row?.version !== 'string' ||
+      typeof row?.cwd !== 'string' || !path.isAbsolute(row.cwd)) return [];
+    return [{ row, sessionId: candidateSessionId }];
   });
+  const sessionIds = [...new Set(qualifyingMatches.map(match => match.sessionId))];
+  if (sessionIds.length > 1) throw new Error('Claude transcript identity is ambiguous');
+  const matches = qualifyingMatches.filter(match => match.sessionId === nativeId).map(match => match.row);
   if (!matches.length) throw new Error('Claude transcript identity or workspace is unavailable');
   const workspaces = [...new Set(matches.map(row => path.resolve(row.cwd)))];
   if (workspaces.length !== 1) throw new Error('Claude transcript workspace is ambiguous');

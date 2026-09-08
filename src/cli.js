@@ -1224,6 +1224,7 @@ async function claudeMonitor(args) {
   let monitor;
   let monitorStarted = false;
   let stopPromise;
+  let detachStdoutTransport = () => {};
   const revokeOrdinaryReadiness = () => {
     if (!monitorStarted || !ordinaryStartupBinding) return;
     const current = state.getBinding(ordinaryStartupBinding.channelId);
@@ -1235,12 +1236,24 @@ async function claudeMonitor(args) {
     if (stopPromise) return stopPromise;
     stopPromise = (async () => {
       try {
+        detachStdoutTransport();
         revokeOrdinaryReadiness();
         await monitor?.stop();
       } finally { state.close(); }
     })();
     return stopPromise;
   };
+  const handleStopFailure = error => {
+    process.stderr.write(`discord-surface: Claude Monitor stop failed: ${error.message}\n`);
+    process.exitCode = 1;
+  };
+  const onStdoutTransportFailure = () => { stop().catch(handleStopFailure); };
+  detachStdoutTransport = () => {
+    process.stdout.removeListener?.('error', onStdoutTransportFailure);
+    process.stdout.removeListener?.('close', onStdoutTransportFailure);
+  };
+  process.stdout.once?.('error', onStdoutTransportFailure);
+  process.stdout.once?.('close', onStdoutTransportFailure);
   const handleSignal = signal => {
     stop().then(() => {
       process.exitCode = 128 + (os.constants.signals?.[signal] || 1);

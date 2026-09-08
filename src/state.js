@@ -2436,6 +2436,11 @@ class SurfaceState {
     return message;
   }
 
+  getMessageRowId(messageId) {
+    const row = this.db.prepare('SELECT rowid FROM messages WHERE discord_id=?').get(messageId);
+    return row ? Number(row.rowid) : null;
+  }
+
   listMessages() {
     return this.db.prepare('SELECT discord_id FROM messages ORDER BY created_at, rowid').all().map(row => this.getMessage(row.discord_id));
   }
