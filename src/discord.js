@@ -1270,6 +1270,10 @@ class DiscordGateway {
         author: { id: message.authorId, bot: false },
         channel
       };
+      if (this.state.getBinding(message.channelId)?.readiness !== READINESS.READY) {
+        blockedOwners.add(key);
+        continue;
+      }
       let result;
       try {
         if (message.state === 'accepted') {
@@ -1287,6 +1291,9 @@ class DiscordGateway {
         } else {
           this.state.recoverNativeReplyAcknowledgment(message.id);
           result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
+        }
+        if (result === 'not_submitted' || result?.state === 'not_submitted' || result?.status === 'not_submitted') {
+          blockedOwners.add(key);
         }
       } catch (error) {
         if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before);
