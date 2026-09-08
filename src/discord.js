@@ -273,6 +273,13 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       (message.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(message));
   }
 
+  function ownerBindingReady(messageId) {
+    const message = state.getMessage(messageId);
+    if (!message) return true;
+    const binding = state.getBinding(message.channelId);
+    return !binding || !binding.active || binding.readiness === READINESS.READY;
+  }
+
   function ownerQueueFor(key) {
     let queue = ownerQueues.get(key);
     if (!queue) {
@@ -300,6 +307,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const queue = ownerQueues.get(entry.ownerKey);
     if (!queue || queue.active !== entry) return;
     if (!ownerCanAdvance(entry.message.id)) {
+      queue.blockedMessageId = entry.message.id;
+      return;
+    }
+    if (!ownerBindingReady(entry.message.id)) {
       queue.blockedMessageId = entry.message.id;
       return;
     }
@@ -999,8 +1010,12 @@ class DiscordGateway {
     if (!demoted || this.stopping) return;
     const lifecycleEpoch = this.lifecycleEpoch;
     this.recoverTransport('Claude endpoint unavailable', lifecycleEpoch).then(result => {
-      if (result?.ready && this.isCurrentLifecycle(lifecycleEpoch)) return this.reconcilePending();
-      return result;
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) return result;
+      const current = this.state.getBinding(binding.channelId);
+      const recovered = current?.active && current.provider === 'claude' && current.nativeId === binding.nativeId &&
+        current.generation === binding.generation && current.workspace === binding.workspace && current.endpoint === binding.endpoint &&
+        current.readiness === READINESS.READY;
+      return recovered ? this.reconcilePending() : result;
     }).catch(recoveryError => {
       this.logger(`Claude endpoint recovery failed: ${recoveryError.message}`);
     });
