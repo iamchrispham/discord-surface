@@ -680,7 +680,7 @@ class DiscordGateway {
     this.boundMessage = message => {
       if (this.stopping) return;
       const binding = this.state.getBinding(message?.channelId);
-      const readyLive = this.ready && (!binding || binding.readiness === READINESS.READY);
+      const readyLive = this.ready && binding?.readiness === READINESS.READY;
       const controller = new AbortController();
       this.controllers.add(controller);
       const work = (readyLive
