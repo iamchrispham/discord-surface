@@ -1212,6 +1212,71 @@ test('async identity discovery closes its directory on deadline', async t => {
   assert.equal(closes, 1);
 });
 
+test('async identity discovery closes a directory that opens after its deadline', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-late-open-root-'));
+  fs.mkdirSync(path.join(root, 'sessions'));
+  const sessionRoot = path.join(root, 'sessions');
+  const originalNow = Date.now;
+  const started = originalNow();
+  let calls = 0;
+  let resolveOpen;
+  let closes = 0;
+  Date.now = () => {
+    calls += 1;
+    return calls >= 3 ? started + 4999 : started;
+  };
+  t.mock.method(fs.promises, 'opendir', () => new Promise(resolve => { resolveOpen = resolve; }));
+  t.after(() => {
+    Date.now = originalNow;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const rejected = assert.rejects(
+    () => validateCodexSessionIdentityAsync(CODEX, undefined, sessionRoot),
+    /unavailable/
+  );
+  await new Promise(resolve => setTimeout(resolve, 20));
+  resolveOpen({
+    read: async () => null,
+    close: async () => { closes += 1; }
+  });
+  await rejected;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(closes, 1);
+});
+
+test('async identity discovery closes a directory after a pending read deadline', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-pending-read-root-'));
+  fs.mkdirSync(path.join(root, 'sessions'));
+  const sessionRoot = path.join(root, 'sessions');
+  const originalNow = Date.now;
+  const started = originalNow();
+  let calls = 0;
+  let resolveRead;
+  let closes = 0;
+  Date.now = () => {
+    calls += 1;
+    return calls >= 3 ? started + 4999 : started;
+  };
+  t.mock.method(fs.promises, 'opendir', async () => ({
+    read: () => new Promise(resolve => { resolveRead = resolve; }),
+    close: async () => { closes += 1; }
+  }));
+  t.after(() => {
+    Date.now = originalNow;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const rejected = assert.rejects(
+    () => validateCodexSessionIdentityAsync(CODEX, undefined, sessionRoot),
+    /unavailable/
+  );
+  await new Promise(resolve => setTimeout(resolve, 20));
+  resolveRead(null);
+  await rejected;
+  assert.equal(closes, 1);
+});
+
 test('ordinary readiness requires the applicable Discord reply permission', t => {
   const f = fixture(t);
   const permissions = new Set();

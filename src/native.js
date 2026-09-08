@@ -121,6 +121,16 @@ function awaitWithDeadline(task, deadline) {
   return Promise.race([operation, timeout]).finally(() => clearTimeout(timer));
 }
 
+function openDirectoryWithDeadline(dir, deadline) {
+  const opening = Promise.resolve().then(() => fs.promises.opendir(dir));
+  return awaitWithDeadline(() => opening, deadline).catch(error => {
+    opening.then(async handle => {
+      try { await handle.close(); } catch {}
+    }, () => {});
+    throw error;
+  });
+}
+
 async function* walkAsync(dir, depth = 0, options = undefined) {
   const limitReached = () => options && Date.now() >= options.deadline;
   if (depth > 5 || limitReached()) {
@@ -130,7 +140,7 @@ async function* walkAsync(dir, depth = 0, options = undefined) {
   let handle;
   try {
     handle = options
-      ? await awaitWithDeadline(() => fs.promises.opendir(dir), options.deadline)
+      ? await openDirectoryWithDeadline(dir, options.deadline)
       : await fs.promises.opendir(dir);
     for (;;) {
       if (limitReached()) {
