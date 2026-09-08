@@ -336,7 +336,7 @@ async function unbind(args, dependencies = {}) {
   try {
     const binding = state.getBinding(channelId);
     if (!binding || !binding.active || !state.isOrdinaryBindingRecord(binding)) {
-      const result = state.unbind(channelId);
+      const result = state.unbind(channelId, { expectedBinding: binding || undefined });
       output({ unbound: result });
       return { unbound: result };
     }

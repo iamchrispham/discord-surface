@@ -1278,6 +1278,70 @@ test('ordinary unbind fences remote intake before revoking custody', async t => 
   } finally { recovered.close(); }
 });
 
+test('ordinary ready intake advances confirmed coverage for lifecycle drains', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary live coverage baseline');
+  f.state.recordOrdinaryPreflight(binding, {
+    file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary live coverage drained', null, null, binding);
+
+  const intake = f.state.acceptDiscordMessage({
+    id: '150', guildId: 'guild', channelId: binding.channelId, authorId: 'bot', isBot: true, content: 'receipt'
+  }, { ready: true });
+  assert.equal(intake.accepted, false);
+  assert.equal(intake.reason, 'bot-source');
+  const watermark = f.state.getIntakeWatermark(binding.channelId);
+  assert.equal(watermark.last_seen_id, '150');
+  assert.equal(watermark.recovered_through_id, '150');
+});
+
+test('ordinary paused intake rejects messages at or before the persisted cutoff', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary paused intake cutoff');
+
+  const stale = f.state.acceptDiscordMessage({
+    id: '100', guildId: 'guild', channelId: binding.channelId, authorId: 'operator', isBot: false, content: 'stale'
+  }, { ready: false });
+  assert.equal(stale.accepted, false);
+  assert.equal(stale.reason, 'before-intake-cutoff');
+  assert.equal(f.state.getMessage('100'), null);
+
+  const fresh = f.state.acceptDiscordMessage({
+    id: '101', guildId: 'guild', channelId: binding.channelId, authorId: 'operator', isBot: false, content: 'fresh'
+  }, { ready: false });
+  assert.equal(fresh.accepted, true);
+  assert.equal(fresh.message.generation, binding.generation);
+});
+
+test('ordinary unbind keeps a reactivated successor when its observed tombstone is stale', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.unbind(binding.channelId);
+  const tombstone = f.state.getBinding(binding.channelId);
+  const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-stale-unbind-workspace-'));
+  const successorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-stale-unbind-root-'));
+  t.after(() => {
+    fs.rmSync(successorWorkspace, { recursive: true, force: true });
+    fs.rmSync(successorRoot, { recursive: true, force: true });
+  });
+  const proof = {
+    file: path.join(successorRoot, `${OTHER}.jsonl`), sessionId: OTHER, threadId: OTHER,
+    workspace: successorWorkspace, sessionRoot: successorRoot
+  };
+  const successor = f.state.handoffOrdinary({
+    channelId: binding.channelId, provider: 'codex', fromNativeId: CODEX, fromGeneration: binding.generation,
+    nativeId: OTHER, workspace: successorWorkspace, sessionRoot: successorRoot,
+    handoffId: 'ordinary-stale-unbind-successor', identity: { sessionId: OTHER, threadId: OTHER }, nativeProof: proof
+  });
+  assert.equal(successor.active, true);
+  assert.throws(() => f.state.unbind(binding.channelId, { expectedBinding: tombstone }), /stale/);
+  assert.equal(f.state.getBinding(binding.channelId).nativeId, OTHER);
+  assert.equal(f.state.getBinding(binding.channelId).active, true);
+});
+
 test('native preflight requires exact session metadata and workspace', async t => {
   const f = fixture(t);
   const matching = transcript(t, f.dir);

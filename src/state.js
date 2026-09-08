@@ -1452,8 +1452,9 @@ class SurfaceState {
   upsertIntakeWatermark(event, ready, coverageId = null) {
     const existing = this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(event.channelId);
     const lastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, event.id) >= 0 ? existing.last_seen_id : event.id;
-    const recoveredThrough = coverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, coverageId) < 0)
-      ? coverageId
+    const confirmedCoverageId = coverageId || (ready ? event.id : null);
+    const recoveredThrough = confirmedCoverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, confirmedCoverageId) < 0)
+      ? confirmedCoverageId
       : existing?.recovered_through_id || null;
     const state = existing?.state === READINESS.GAP ? 'gap' : existing?.state === READINESS.UNAVAILABLE ? 'unavailable' : ready ? 'ready' : 'pending';
     if (existing) {
@@ -1716,7 +1717,7 @@ class SurfaceState {
       const committed = this.getMessage(event.id);
       if (committed) return { accepted: false, duplicate: true, reason: 'duplicate-message', message: committed };
       const comparableIntakeCutoff = /^\d+$/.test(event.id) && /^\d+$/.test(intakeCutoff || '');
-      if (ready && comparableIntakeCutoff && compareDiscordIds(event.id, intakeCutoff) <= 0) {
+      if (comparableIntakeCutoff && compareDiscordIds(event.id, intakeCutoff) <= 0) {
         this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'before-intake-cutoff', ready });
         return this.reject('before-intake-cutoff');
       }
