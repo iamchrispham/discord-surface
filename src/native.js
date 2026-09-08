@@ -174,7 +174,7 @@ async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
   validateNativeId(nativeId);
   let match = null;
   const deadline = Date.now() + CODEX_SESSION_DISCOVERY_TIMEOUT_MS;
-  const scan = { deadline, complete: true };
+  const scan = { deadline, complete: true, fileFailures: 0 };
   for await (const file of walkAsync(root, 0, scan)) {
     if (!file.includes(nativeId)) continue;
     try {
@@ -190,7 +190,7 @@ async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
       if (match) return { ambiguous: true, files: [match.file, candidate.file] };
       match = candidate;
     } catch {
-      scan.complete = false;
+      scan.fileFailures += 1;
     }
   }
   if (!scan.complete) return null;

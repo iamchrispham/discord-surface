@@ -1533,7 +1533,7 @@ for (const action of ['rebind', 'handoff']) {
 }
 
 
-test('async identity discovery refuses an unreadable matching sibling', async t => {
+test('async identity discovery preserves a valid match beside an unreadable sibling', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-incomplete-'));
   const root = path.join(dir, 'sessions');
   fs.mkdirSync(root);
@@ -1548,5 +1548,6 @@ test('async identity discovery refuses an unreadable matching sibling', async t 
     if (String(file) === broken) throw Object.assign(new Error('fixture unreadable'), { code: 'EACCES' });
     return open.call(fs.promises, file, ...args);
   });
-  await assert.rejects(() => validateCodexSessionIdentityAsync(CODEX, undefined, root), /transcript identity is unavailable/);
+  const identity = await validateCodexSessionIdentityAsync(CODEX, undefined, root);
+  assert.equal(identity.file, path.join(root, `valid-${CODEX}.jsonl`));
 });
