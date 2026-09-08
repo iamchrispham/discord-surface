@@ -1168,6 +1168,8 @@ class SurfaceState {
       this.assertLegacyMigrationSafe(channelId);
       if (intakeCutoff !== null) {
         this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary unbind intake fence', current);
+        this.db.prepare("UPDATE intake_watermarks SET state='ready', updated_at=? WHERE channel_id=?")
+          .run(now(), channelId);
       }
       this.db.prepare('UPDATE bindings SET active=0, updated_at=? WHERE channel_id=?').run(now(), channelId);
       this.receipt(null, 'unbound', {

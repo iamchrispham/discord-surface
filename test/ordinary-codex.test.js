@@ -480,7 +480,8 @@ test('ordinary bind rejects an inactive different owner despite verified proof',
 
   const channel = {
     id: original.channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
-    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) }
+    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) },
+    send: async () => ({ id: '201', async delete() {} })
   };
   class FakeClient {
     constructor() {
@@ -564,7 +565,8 @@ test('ordinary CLI handoff changes a custom root to its default root', async t =
 
   const channel = {
     id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
-    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) }
+    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) },
+    send: async () => ({ id: '201', async delete() {} })
   };
   class FakeClient {
     constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => channel } }) }; }
@@ -998,7 +1000,8 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
 
   const channel = {
     id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
-    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) }
+    messages: { fetch: async () => new Map([['latest', { id: '200' }]]) },
+    send: async () => ({ id: '201', async delete() {} })
   };
   const wakeSignals = [];
   const output = [];
@@ -1041,8 +1044,8 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   const recoveredState = new SurfaceState(db);
   const recoveredBinding = recoveredState.getBinding(original.channelId);
   assert.equal(recoveredBinding.generation, 2);
-  assert.equal(recoveredState.getIntakeWatermark(original.channelId).last_seen_id, '200');
-  assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '200');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).last_seen_id, '201');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '201');
   assert.equal(recoveredState.getIntakeWatermark(original.channelId).state, 'pending');
   assert.equal(recoveredState.getIntakeWatermark(original.channelId).gap_from, null);
   assert.equal(recoveredState.getIntakeWatermark(original.channelId).gap_to, null);
@@ -1075,7 +1078,7 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   assert.equal(preflights, 1);
   assert.equal(recoveredState.getBinding(original.channelId).readiness, READINESS.READY);
   assert.equal(recoveredState.getIntakeWatermark(original.channelId).state, 'ready');
-  assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '200');
+  assert.equal(recoveredState.getIntakeWatermark(original.channelId).recovered_through_id, '201');
   await gateway.stop();
   recoveredState.close();
 });
@@ -1270,7 +1273,8 @@ test('ordinary unbind fences remote intake before revoking custody', async t => 
     const watermark = recovered.getIntakeWatermark(binding.channelId);
     assert.equal(watermark.last_seen_id, '150');
     assert.equal(watermark.recovered_through_id, '150');
-    assert.equal(watermark.state, 'pending');
+    assert.equal(watermark.state, 'ready');
+    assert.equal(recovered.getReadiness().limits.connectionBackfill, 'bounded-by-discord-watermark');
   } finally { recovered.close(); }
 });
 
