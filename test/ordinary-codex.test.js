@@ -1408,6 +1408,24 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
   await gateway.stop();
 });
 
+test('ordinary Codex bind-time proof failure keeps a reopenable transcript watermark', async t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  const channel = { id: binding.channelId, guildId: 'guild' };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
+    providers: { codex: { async dispatch() { throw new Error('must stay held'); } } },
+    recoveryOptions: { ordinaryNativePreflight: async () => { throw new Error('transcript unreadable'); } }
+  });
+  const result = await gateway.recoverTransport('ordinary-bind', 0);
+  assert.equal(result.ready, false);
+  assert.equal(result.state, READINESS.UNAVAILABLE);
+  assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.match(f.state.getIntakeWatermark(binding.channelId).detail, /^Codex transcript proof unavailable before event write: transcript unreadable/);
+  await gateway.stop();
+});
+
 test('ordinary post uses explicit binding custody and suppresses duplicate and unknown resend', async t => {
   const f = fixture(t);
   const binding = ordinary(f);

@@ -1134,9 +1134,13 @@ class DiscordGateway {
             failure ||= { ready: false, state: 'unavailable', error };
             continue;
           }
-          const detail = binding.provider === 'claude' && ['Claude endpoint unavailable', 'Claude endpoint unavailable follow-up', 'ordinary-bind', 'reconnect', 'startup'].includes(reason)
-            ? `Claude endpoint unavailable before event write: ${error.message}`
-            : error.message;
+          const preflightReason = ['Claude endpoint unavailable', 'Claude endpoint unavailable follow-up', 'ordinary-bind', 'reconnect', 'startup'].includes(reason);
+          let detail = error.message;
+          if (preflightReason && binding.provider === 'claude') {
+            detail = `Claude endpoint unavailable before event write: ${error.message}`;
+          } else if (preflightReason && binding.provider === 'codex') {
+            detail = `Codex transcript proof unavailable before event write: ${error.message}`;
+          }
           await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', detail, watermark?.recovered_through_id, null, signal, deadline);
           failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
           continue;
