@@ -678,8 +678,8 @@ class DiscordGateway {
     });
     this.boundMessage = message => {
       if (this.stopping) return;
-      const bindingReady = this.transportReady && this.state.getBinding(message?.channelId)?.readiness === READINESS.READY;
-      const readyLive = this.ready || bindingReady;
+      const binding = this.state.getBinding(message?.channelId);
+      const readyLive = this.ready && (!binding || binding.readiness === READINESS.READY);
       const controller = new AbortController();
       this.controllers.add(controller);
       const work = (readyLive ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false, null, null, true))
