@@ -974,7 +974,11 @@ class DiscordGateway {
     const detail = `Claude endpoint unavailable before event write: ${String(error?.message || error || 'unknown error').slice(0, 900)}`;
     const demoted = this.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, detail, binding);
     if (!demoted || this.stopping) return;
-    this.recoverTransport('Claude endpoint unavailable', this.lifecycleEpoch).catch(recoveryError => {
+    const lifecycleEpoch = this.lifecycleEpoch;
+    this.recoverTransport('Claude endpoint unavailable', lifecycleEpoch).then(result => {
+      if (result?.ready && this.isCurrentLifecycle(lifecycleEpoch)) return this.reconcilePending();
+      return result;
+    }).catch(recoveryError => {
       this.logger(`Claude endpoint recovery failed: ${recoveryError.message}`);
     });
   }

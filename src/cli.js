@@ -1191,9 +1191,10 @@ async function claudeMonitor(args) {
   const startupBinding = state.findNativeBinding(nativeId, PROVIDERS.CLAUDE);
   const ordinaryStartupBinding = startupBinding?.active && state.isOrdinaryBinding(startupBinding) ? startupBinding : null;
   let monitor;
+  let monitorStarted = false;
   let stopPromise;
   const revokeOrdinaryReadiness = () => {
-    if (!ordinaryStartupBinding) return;
+    if (!monitorStarted || !ordinaryStartupBinding) return;
     const current = state.getBinding(ordinaryStartupBinding.channelId);
     if (!current || !current.active || current.provider !== PROVIDERS.CLAUDE || current.nativeId !== ordinaryStartupBinding.nativeId ||
       current.workspace !== ordinaryStartupBinding.workspace || current.endpoint !== ordinaryStartupBinding.endpoint) return;
@@ -1230,6 +1231,7 @@ async function claudeMonitor(args) {
       onTransportClose: stop
     });
     await monitor.start();
+    monitorStarted = true;
     if (ordinaryStartupBinding) {
       const watermark = state.getIntakeWatermark(ordinaryStartupBinding.channelId);
       if (watermark?.state === READINESS.UNAVAILABLE) {

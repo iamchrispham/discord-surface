@@ -935,6 +935,7 @@ class SurfaceState {
     const createdAt = now();
     return this.transaction(() => {
       if (this.getBinding(input.channelId)) throw new BindingError('channel is already bound; use rebind after work drains');
+      this.assertNativeOwnerFree(input.provider, input.nativeId);
       const generationRow = input.conductorId
         ? this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE provider=? AND conductor_id=?').get(input.provider, input.conductorId)
         : this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE channel_id=?').get(input.channelId);
