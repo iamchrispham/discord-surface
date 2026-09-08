@@ -718,6 +718,13 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     if (invocation.sessionId !== nativeId || invocation.threadId !== nativeId) {
       throw new Error('ordinary handoff successor identity does not match the native UUID');
     }
+    const previousHandoff = state.findOrdinaryHandoff(handoffId);
+    const handoffRetry = previousHandoff && previousHandoff.channelId === channelId &&
+      previousHandoff.provider === provider && previousHandoff.fromNativeId === fromNativeId &&
+      previousHandoff.fromGeneration === fromGeneration && previousHandoff.nativeId === nativeId &&
+      previousHandoff.generation === current.generation && current.active &&
+      current.nativeId === nativeId && current.generation === fromGeneration + 1 &&
+      current.workspace === workspace && (current.sessionRoot || null) === (validationRoot || null);
     const nativeProof = await validate(nativeId, workspace, validationRoot);
     const { Client, GatewayIntentBits } = install('discord.js');
     client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -738,7 +745,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       const recoveredThrough = watermark?.recovered_through_id || null;
       const liveCustodyAhead = recoveredThrough && watermark?.last_seen_id && discordIdAfter(watermark.last_seen_id, recoveredThrough);
       const remoteCustodyAhead = recoveredThrough && channelCutoff && discordIdAfter(channelCutoff, recoveredThrough);
-      if (watermark?.state !== READINESS.READY || !recoveredThrough || liveCustodyAhead || remoteCustodyAhead) {
+      if (!handoffRetry && (watermark?.state !== READINESS.READY || !recoveredThrough || liveCustodyAhead || remoteCustodyAhead)) {
         throw new Error('ordinary handoff requires Discord intake to be durably drained');
       }
       adoptionCutoff = channelCutoff || recoveredThrough;
