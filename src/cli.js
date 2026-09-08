@@ -100,15 +100,32 @@ function ordinaryBindingArgs(args, environment = process.env, channelId = null, 
   });
 }
 
-async function latestChannelMessageId(channel) {
+async function latestChannelMessageId(channel, options = {}) {
   const cached = typeof channel?.lastMessageId === 'string' && channel.lastMessageId.length > 0 ? channel.lastMessageId : null;
   if (typeof channel?.messages?.fetch !== 'function') return cached;
-  const fetched = await channel.messages.fetch({ limit: 1 });
+  const fetched = await channel.messages.fetch({ limit: 1, ...options });
   let message = null;
   if (Array.isArray(fetched)) message = fetched[0];
   else if (typeof fetched?.first === 'function') message = fetched.first();
   else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
   return typeof message?.id === 'string' && message.id.length > 0 ? message.id : cached;
+}
+
+async function createHandoffFence(channel) {
+  if (typeof channel?.send !== 'function') throw new Error('ordinary handoff requires a Discord server fence');
+  const message = await channel.send({
+    content: '\u200b',
+    allowedMentions: { parse: [] }
+  });
+  if (typeof message?.id !== 'string' || message.id.length === 0) {
+    throw new Error('Discord handoff fence has no stable ID');
+  }
+  return message;
+}
+
+async function deleteHandoffFence(message) {
+  if (typeof message?.delete !== 'function') return;
+  try { await message.delete(); } catch {}
 }
 
 function serverDerivedChannelCutoff(channel) {
@@ -738,6 +755,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   const validationRoot = requestedSessionRoot || (dependencies.codexSessionRoot || codexSessionRoot)();
   const { paths, state } = openState(args);
   let client;
+  let handoffFence;
   try {
     const config = state.requireConfig();
     const current = state.getBinding(channelId);
@@ -801,8 +819,19 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
         throw new Error('ordinary handoff requires Discord intake to be durably drained');
       }
     }
-    const handoffCutoff = channelCutoff || (current.active ? recoveredThrough : null) ||
+    let handoffCutoff = channelCutoff || (current.active ? recoveredThrough : null) ||
       serverDerivedChannelCutoff(channel);
+    if (current.active) {
+      handoffFence = await createHandoffFence(channel);
+      if (handoffFence) {
+        const preFenceCutoff = await latestChannelMessageId(channel, { before: handoffFence.id });
+        const drainedThrough = channelCutoff || recoveredThrough;
+        if (preFenceCutoff && drainedThrough && discordIdAfter(preFenceCutoff, drainedThrough)) {
+          throw new Error('ordinary handoff requires Discord intake to be durably drained');
+        }
+        handoffCutoff = handoffFence.id;
+      }
+    }
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
       sessionRoot: validationRoot, handoffId, intakeCutoff: handoffCutoff,
@@ -818,6 +847,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       readiness: binding.readiness, gatewayWake });
     return { binding, gatewayWake, handoffReconciled: Boolean(binding.handoffReconciled) };
   } finally {
+    await deleteHandoffFence(handoffFence);
     await client?.destroy();
     state.close();
   }

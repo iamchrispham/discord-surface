@@ -1099,6 +1099,90 @@ test('explicit ordinary handoff refuses an active remote intake gap', async t =>
   }
 });
 
+test('explicit ordinary handoff fences remote messages through its ownership commit', async t => {
+  async function invokeCase(preFenceId) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-handoff-fence-'));
+    const db = path.join(dir, 'surface.sqlite');
+    const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-handoff-fence-workspace-'));
+    const session = transcript(t, successorWorkspace, OTHER);
+    const setup = new SurfaceState(db);
+    setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+    const original = setup.bindOrdinary({
+      channelId: '123456789012345678', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+      workspace: dir
+    }, { sessionId: CODEX, threadId: CODEX });
+    setup.recordOrdinaryPreflight(original, {
+      file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir
+    });
+    setup.setIntakeCutoff(original.channelId, 'guild', '100', 'ordinary active handoff baseline');
+    setup.markIntakeBoundary(original.channelId, READINESS.READY, 'ordinary active handoff drained', null, null, original);
+    setup.close();
+    t.after(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(successorWorkspace, { recursive: true, force: true });
+    });
+
+    let beforeFenceFetches = 0;
+    let deleted = false;
+    const channel = {
+      id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
+      messages: { fetch: async options => {
+        if (options?.before === '150') {
+          beforeFenceFetches += 1;
+          return new Map([['latest', { id: preFenceId }]]);
+        }
+        return new Map([['latest', { id: '100' }]]);
+      } },
+      send: async () => ({ id: '150', delete: async () => { deleted = true; } })
+    };
+    class FakeClient {
+      constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => channel } }) }; }
+      async login() {}
+      async destroy() {}
+    }
+    const dependencies = {
+      environment: { CODEX_SESSION_ID: OTHER, CODEX_THREAD_ID: OTHER, PWD: successorWorkspace },
+      requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+      readSecret: () => 'fixture-token',
+      validateCodexSessionIdentity: async () => ({ file: session.file, sessionId: OTHER, threadId: OTHER, workspace: successorWorkspace }),
+      gatewayProcessStatus: () => ({ state: 'stopped' }), print: () => {}
+    };
+    const args = {
+      ordinary: true, 'state-dir': dir, provider: 'codex', 'channel-id': original.channelId,
+      'from-native-id': CODEX, 'from-generation': '1', 'native-id': OTHER,
+      workspace: successorWorkspace, 'session-root': session.root, 'handoff-id': `ordinary-fence-${preFenceId}`
+    };
+    let result;
+    let error;
+    try {
+      result = await handoffInternal(args, dependencies);
+    } catch (caught) {
+      error = caught;
+    }
+    const recovered = new SurfaceState(db);
+    const snapshot = {
+      binding: recovered.getBinding(original.channelId),
+      watermark: recovered.getIntakeWatermark(original.channelId)
+    };
+    recovered.close();
+    return { result, error, snapshot, beforeFenceFetches, wasDeleted: () => deleted };
+  }
+
+  const accepted = await invokeCase('100');
+  assert.equal(accepted.error, undefined);
+  assert.equal(accepted.result.binding.generation, 2);
+  assert.equal(accepted.snapshot.watermark.last_seen_id, '150');
+  assert.equal(accepted.snapshot.watermark.recovered_through_id, '150');
+  assert.equal(accepted.beforeFenceFetches, 1);
+  assert.equal(accepted.wasDeleted(), true);
+
+  const rejected = await invokeCase('140');
+  assert.match(rejected.error?.message || '', /durably drained/);
+  assert.equal(rejected.snapshot.binding.generation, 1);
+  assert.equal(rejected.snapshot.binding.nativeId, CODEX);
+  assert.equal(rejected.wasDeleted(), true);
+});
+
 test('native preflight requires exact session metadata and workspace', async t => {
   const f = fixture(t);
   const matching = transcript(t, f.dir);
