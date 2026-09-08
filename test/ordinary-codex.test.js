@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -1498,6 +1499,77 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
   assert.equal(second.ready, true);
   assert.equal(preflights, 2);
   assert.equal(f.state.getMessage('held-input').state, 'replied');
+  await gateway.stop();
+});
+
+test('Gateway preserves recovered readiness while another binding wake fails', async t => {
+  const f = fixture(t);
+  const first = ordinary(f, 'ordinary-A', CODEX);
+  const second = ordinary(f, 'ordinary-B', CODEX_V7);
+  const dispatches = [];
+  let replies = 0;
+  const channelA = {
+    id: first.channelId,
+    guildId: 'guild',
+    topic: null,
+    permissionsFor: () => ({ has: () => true }),
+    async send() {
+      replies += 1;
+      return { id: `reply-${replies}` };
+    }
+  };
+  const client = new EventEmitter();
+  client.user = { id: 'bot' };
+  client.channels = {
+    fetch: async channelId => {
+      if (channelId === second.channelId) {
+        client.emit('messageCreate', {
+          id: 'live-A',
+          guildId: 'guild',
+          channelId: first.channelId,
+          content: 'held while the second binding recovers',
+          author: { id: 'operator', bot: false },
+          channel: channelA
+        });
+        throw new Error('second binding unavailable');
+      }
+      return channelA;
+    }
+  };
+  client.destroy = async () => {};
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client,
+    fetchHistory: async () => [],
+    providers: {
+      codex: {
+        async dispatch(message) {
+          dispatches.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe() { return { text: 'answer after paused intake' }; }
+      }
+    },
+    recoveryOptions: {
+      ordinaryNativePreflight: async current => ({
+        file: path.join(f.dir, `${current.channelId}.jsonl`),
+        sessionId: current.nativeId,
+        threadId: current.nativeId,
+        workspace: current.workspace
+      })
+    }
+  });
+
+  const result = await gateway.beginReconnectRecovery('resume');
+  assert.equal(result.ready, false);
+  assert.equal(result.state, 'unavailable');
+  assert.ok(result.error);
+  assert.equal(gateway.ready, true);
+  assert.equal(f.state.getBinding(first.channelId).readiness, READINESS.READY);
+  assert.equal(f.state.getIntakeWatermark(first.channelId).state, READINESS.READY);
+  assert.equal(f.state.getBinding(second.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.deepEqual(dispatches, ['live-A']);
+  assert.equal(f.state.getMessage('live-A').state, 'replied');
   await gateway.stop();
 });
 
