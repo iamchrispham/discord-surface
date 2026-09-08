@@ -1431,7 +1431,6 @@ class SurfaceState {
     }
     for (const parts of requests.values()) {
       let hasFinalPart = false;
-      let activeOwner = false;
       for (const row of parts.values()) {
         const outcome = outcomes.get(row.detail.attemptId);
         if (!outcome || outcome.detail.outcome === 'unknown') return true;
@@ -1439,11 +1438,9 @@ class SurfaceState {
         const partCount = Number(row.detail.partCount);
         if (Number.isInteger(partIndex) && Number.isInteger(partCount) && partIndex === partCount - 1) {
           hasFinalPart = true;
-        } else if (this.directPostOwnerAlive(row.detail.ownerPid, row.detail)) {
-          activeOwner = true;
         }
       }
-      if (!hasFinalPart && activeOwner) return true;
+      if (!hasFinalPart) return true;
     }
     return false;
   }

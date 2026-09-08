@@ -307,7 +307,7 @@ async function ordinaryBind(args, dependencies = {}) {
     } else {
       nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: nativeProofError?.message || 'Codex transcript proof is pending' };
     }
-    if (decision === 'reuse' && nativeProof.status === NATIVE_PROOF_STATUSES.VERIFIED && nativeProofDetail && !nativeProofError) {
+    if (decision === ORDINARY_BINDING_DECISIONS.REUSE && nativeProof.status === NATIVE_PROOF_STATUSES.VERIFIED && nativeProofDetail && !nativeProofError) {
       const watermark = state.getIntakeWatermark(binding.channelId);
       if (watermark && [READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark.state)) {
         const reopened = state.reconcileIntake(binding.channelId, binding);
@@ -323,8 +323,8 @@ async function ordinaryBind(args, dependencies = {}) {
       return bindingIdentityMatches(current, binding) ? current : null;
     });
     if (!resultBinding) throw new Error('ordinary binding changed before bind result was returned');
-    output({ bound: true, reused: decision === 'reuse', binding: resultBinding, nativeProof, gatewayWake });
-    return { binding: resultBinding, nativeProof, gatewayWake, reused: decision === 'reuse' };
+    output({ bound: true, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE, binding: resultBinding, nativeProof, gatewayWake });
+    return { binding: resultBinding, nativeProof, gatewayWake, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE };
   } finally {
     await deleteHandoffFence(adoptionFence);
     try { await client?.destroy(); } finally { state.close(); }
@@ -359,7 +359,6 @@ async function unbind(args, dependencies = {}) {
       messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
     }]);
     if (channelInfo.id !== binding.channelId) throw new Error('unbind channel does not match the ordinary binding');
-    const channelCutoff = await latestChannelMessageId(channel);
     const watermark = state.getIntakeWatermark(channelId);
     const recoveredThrough = watermark?.recovered_through_id || null;
     if (watermark?.state !== READINESS.READY || !recoveredThrough) {
