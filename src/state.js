@@ -1144,23 +1144,34 @@ class SurfaceState {
     });
   }
 
-  unbind(channelId) {
+  unbind(channelId, { expectedBinding = undefined, intakeCutoff = null } = {}) {
     assertText(channelId, 'channelId', 128);
+    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     const binding = this.getBinding(channelId);
     if (!binding) throw new BindingError('channel is not bound');
+    if (expectedBinding !== undefined && !bindingMatchesExpected(binding, expectedBinding)) {
+      throw new StaleGenerationError('unbind source identity is stale');
+    }
     if (!binding.active) return true;
     if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
       throw new UnresolvedWorkError('cannot unbind while work is unresolved');
     }
     return this.transaction(() => {
       const current = this.getBinding(channelId);
-      if (!bindingMatchesExpected(current, binding)) throw new StaleGenerationError('unbind source identity is stale');
+      const expected = expectedBinding === undefined ? binding : expectedBinding;
+      if (!bindingMatchesExpected(current, expected)) throw new StaleGenerationError('unbind source identity is stale');
       if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
         throw new UnresolvedWorkError('cannot unbind while work is unresolved');
       }
       this.assertLegacyMigrationSafe(channelId);
+      if (intakeCutoff !== null) {
+        this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary unbind intake fence', current);
+      }
       this.db.prepare('UPDATE bindings SET active=0, updated_at=? WHERE channel_id=?').run(now(), channelId);
-      this.receipt(null, 'unbound', { channelId, generation: binding.generation });
+      this.receipt(null, 'unbound', {
+        channelId, generation: current.generation,
+        intakeCutoff: intakeCutoff || undefined
+      });
       return true;
     });
   }

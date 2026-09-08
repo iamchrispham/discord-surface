@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
-const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordinaryBind } = require('../src/cli');
+const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordinaryBind, unbind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
 const { CodexProvider, readCodexSessionIdentityAsync, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
 const { SurfaceState, READINESS, StaleGenerationError } = require('../src/state');
@@ -1181,6 +1181,59 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.equal(rejected.snapshot.binding.generation, 1);
   assert.equal(rejected.snapshot.binding.nativeId, CODEX);
   assert.equal(rejected.wasDeleted(), true);
+});
+
+test('ordinary unbind fences remote intake before revoking custody', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-unbind-fence-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  const binding = setup.bindOrdinary({
+    channelId: '123456789012345680', guildId: 'guild', provider: 'codex', nativeId: CODEX,
+    workspace: dir
+  }, { sessionId: CODEX, threadId: CODEX });
+  setup.recordOrdinaryPreflight(binding, {
+    file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir
+  });
+  setup.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary unbind baseline');
+  setup.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary unbind drained', null, null, binding);
+  setup.close();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  let deleted = false;
+  const channel = {
+    id: binding.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
+    lastMessageId: '100',
+    messages: { fetch: async options => {
+      if (options?.before === '150') return new Map();
+      return new Map([['latest', { id: '100' }]]);
+    } },
+    send: async () => {
+      channel.lastMessageId = '150';
+      return { id: '150', delete: async () => { deleted = true; } };
+    }
+  };
+  class FakeClient {
+    constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => channel } }) }; }
+    async login() {}
+    async destroy() {}
+  }
+
+  const result = await unbind({ 'state-dir': dir, 'channel-id': binding.channelId }, {
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token', print: () => {}
+  });
+  assert.equal(result.unbound, true);
+  assert.equal(deleted, true);
+
+  const recovered = new SurfaceState(db);
+  try {
+    assert.equal(recovered.getBinding(binding.channelId).active, false);
+    const watermark = recovered.getIntakeWatermark(binding.channelId);
+    assert.equal(watermark.last_seen_id, '150');
+    assert.equal(watermark.recovered_through_id, '150');
+    assert.equal(watermark.state, 'pending');
+  } finally { recovered.close(); }
 });
 
 test('native preflight requires exact session metadata and workspace', async t => {

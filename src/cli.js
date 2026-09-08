@@ -103,16 +103,19 @@ function ordinaryBindingArgs(args, environment = process.env, channelId = null, 
 async function latestChannelMessageId(channel, options = {}) {
   const cached = typeof channel?.lastMessageId === 'string' && channel.lastMessageId.length > 0 ? channel.lastMessageId : null;
   if (typeof channel?.messages?.fetch !== 'function') return cached;
+  const scopedBefore = options != null && Object.prototype.hasOwnProperty.call(options, 'before');
   const fetched = await channel.messages.fetch({ limit: 1, ...options });
   let message = null;
   if (Array.isArray(fetched)) message = fetched[0];
   else if (typeof fetched?.first === 'function') message = fetched.first();
   else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
-  return typeof message?.id === 'string' && message.id.length > 0 ? message.id : cached;
+  if (typeof message?.id === 'string' && message.id.length > 0) return message.id;
+  if (scopedBefore) return null;
+  return cached;
 }
 
-async function createHandoffFence(channel) {
-  if (typeof channel?.send !== 'function') throw new Error('ordinary handoff requires a Discord server fence');
+async function createHandoffFence(channel, operation = 'ordinary handoff') {
+  if (typeof channel?.send !== 'function') throw new Error(`${operation} requires a Discord server fence`);
   const message = await channel.send({
     content: '\u200b',
     allowedMentions: { parse: [] }
@@ -348,10 +351,56 @@ async function ordinaryBind(args, dependencies = {}) {
   }
 }
 
-function unbind(args) {
+async function unbind(args, dependencies = {}) {
   const { state } = openState(args);
-  try { print({ unbound: state.unbind(required(args, 'channel-id')) }); }
-  finally { state.close(); }
+  const channelId = required(args, 'channel-id');
+  const install = dependencies.requireInstalled || requireInstalled;
+  const read = dependencies.readSecret || readSecret;
+  const output = dependencies.print || print;
+  let client;
+  let fence;
+  try {
+    const binding = state.getBinding(channelId);
+    if (!binding || !binding.active || !state.isOrdinaryBindingRecord(binding)) {
+      const result = state.unbind(channelId);
+      output({ unbound: result });
+      return { unbound: result };
+    }
+    const config = state.requireConfig();
+    const { Client, GatewayIntentBits } = install('discord.js');
+    client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    await client.login(read(config.secretFile));
+    const guild = await client.guilds.fetch(config.guildId);
+    const channel = await guild.channels.fetch(channelId);
+    const channelInfo = resolveExistingChannel(channelId, config.guildId, [{
+      id: channel?.id || channelId,
+      guildId: channel?.guildId || config.guildId,
+      name: channel?.name || null,
+      messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
+    }]);
+    if (channelInfo.id !== binding.channelId) throw new Error('unbind channel does not match the ordinary binding');
+    const channelCutoff = await latestChannelMessageId(channel);
+    const watermark = state.getIntakeWatermark(channelId);
+    const recoveredThrough = watermark?.recovered_through_id || null;
+    const liveCustodyAhead = recoveredThrough && watermark?.last_seen_id && discordIdAfter(watermark.last_seen_id, recoveredThrough);
+    const remoteCustodyAhead = recoveredThrough && channelCutoff && discordIdAfter(channelCutoff, recoveredThrough);
+    if (watermark?.state !== READINESS.READY || !recoveredThrough || liveCustodyAhead || remoteCustodyAhead) {
+      throw new Error('ordinary unbind requires Discord intake to be durably drained');
+    }
+    fence = await createHandoffFence(channel, 'ordinary unbind');
+    const preFenceCutoff = await latestChannelMessageId(channel, { before: fence.id });
+    const drainedThrough = channelCutoff || recoveredThrough;
+    if (preFenceCutoff && drainedThrough && discordIdAfter(preFenceCutoff, drainedThrough)) {
+      throw new Error('ordinary unbind requires Discord intake to be durably drained');
+    }
+    const result = state.unbind(channelId, { expectedBinding: binding, intakeCutoff: fence.id });
+    if (!result) throw new Error('ordinary binding changed before intake fence was committed');
+    output({ unbound: result });
+    return { unbound: result };
+  } finally {
+    await deleteHandoffFence(fence);
+    try { await client?.destroy(); } finally { state.close(); }
+  }
 }
 
 function status(args) {
@@ -1388,4 +1437,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, ordinaryHandoffInternal, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryBindingArgs, ordinaryHandoffInternal, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, unbind };
