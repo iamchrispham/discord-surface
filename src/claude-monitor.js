@@ -3,9 +3,11 @@ const { acknowledgmentCommand } = require('./acknowledgment');
 const fs = require('node:fs');
 const path = require('node:path');
 const { ClaudeChannel } = require('./claude-channel');
-const { normalizeAttachments } = require('./state');
+const { MESSAGE_STATES, normalizeAttachments } = require('./state');
 
 const PAYLOAD_SCHEMA_VERSION = 2;
+const MONITOR_DEDUPE_CLEANUP_INTERVAL_MS = 1000;
+const MONITOR_DEDUPE_STATES = new Set([MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED]);
 
 function replyFileFor(directory, messageId, generation) {
   const key = crypto.createHash('sha256')
@@ -141,6 +143,17 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
   if (typeof stateDir !== 'string' || !stateDir) throw new TypeError('stateDir is required');
   if (!stdout || typeof stdout.write !== 'function') throw new TypeError('stdout must be writable');
   const entries = new Map();
+  const pruneEntries = () => {
+    for (const [key, entry] of entries) {
+      if (!entry.settled) continue;
+      const messageId = key.slice(0, key.indexOf('\0'));
+      let message;
+      try { message = state.getMessage(messageId); } catch { continue; }
+      if (!message || !MONITOR_DEDUPE_STATES.has(message.state)) entries.delete(key);
+    }
+  };
+  const cleanupTimer = setInterval(pruneEntries, MONITOR_DEDUPE_CLEANUP_INTERVAL_MS);
+  cleanupTimer.unref?.();
   let closed = false;
   let transportNotified = false;
   let mcp;
@@ -163,7 +176,7 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
       const values = eventValues(event);
       const key = `${values.messageId}\0${values.nativeId}\0${values.generation}`;
       const existing = entries.get(key);
-      if (existing) return existing;
+      if (existing) return existing.promise;
       const message = state.getMessage(values.messageId);
       if (!message || message.provider !== 'claude' || message.nativeId !== values.nativeId || message.generation !== values.generation) {
         throw new Error('Claude Monitor event has no accepted custody');
@@ -186,7 +199,8 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
         error.potentiallyDelivered = false;
         throw error;
       }
-      const operation = (async () => {
+      const entry = { promise: null, settled: false };
+      entry.promise = (async () => {
         try { await writeStdoutLine(stdout, JSON.stringify(monitorPointer({ ...values, payloadPath }))); }
         catch (error) {
           error.potentiallyDelivered = true;
@@ -194,12 +208,21 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
           throw error;
         }
       })();
-      entries.set(key, operation);
-      return operation;
+      entries.set(key, entry);
+      entry.promise.then(() => {
+        entry.settled = true;
+        pruneEntries();
+      }, () => {
+        entry.settled = true;
+        entries.delete(key);
+      });
+      return entry.promise;
     },
     async close() {
       if (closed) return;
       closed = true;
+      clearInterval(cleanupTimer);
+      entries.clear();
       detachStdoutListeners();
     }
   };
@@ -218,7 +241,12 @@ function createClaudeMonitor(options) {
     }
     : undefined;
   const mcp = createMonitorMcp({ ...options, onTransportClose });
-  return new ClaudeChannel({ ...options, mcp, onTransportClose });
+  try {
+    return new ClaudeChannel({ ...options, mcp, onTransportClose });
+  } catch (error) {
+    void mcp.close().catch(() => {});
+    throw error;
+  }
 }
 
 module.exports = {

@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const { resolveDedupeKey, runDirectPost } = require('./direct-post');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync, spawnSync } = require('node:child_process');
+const { execFileSync, spawn, spawnSync } = require('node:child_process');
+const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
 const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
@@ -14,8 +15,10 @@ const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
 
 const GATEWAY_CAPABILITIES = Object.freeze({
-  ordinaryBindWake: 'ordinary-bind-wake-v1'
+  ordinaryBindWake: 'ordinary-bind-wake-v1',
+  runtimeBindLock: 'runtime-bind-lock-v1'
 });
+const LOCK_CONTENTION_EXIT = 75;
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
 const { runLiaisonDraft } = require('./liaison');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
@@ -41,7 +44,15 @@ function parseArgs(argv) {
 function pathsFor(args) {
   const stateDir = path.resolve(args['state-dir'] || process.env.DISCORD_SURFACE_DIR || path.join(os.homedir(), '.config', 'discord-surface'));
   const db = path.resolve(args.db || path.join(stateDir, 'surface.sqlite'));
-  return { stateDir, db, lock: path.join(stateDir, 'runtime.lock'), provisionLock: path.join(stateDir, 'provision.lock'), pid: path.join(stateDir, 'runtime.pid') };
+  return {
+    stateDir,
+    db,
+    lock: path.join(stateDir, 'runtime.lock'),
+    // The Gateway keeps runtime.lock for its lifetime, so this interlock is released after startup.
+    bindLock: path.join(stateDir, 'runtime-bind.lock'),
+    provisionLock: path.join(stateDir, 'provision.lock'),
+    pid: path.join(stateDir, 'runtime.pid')
+  };
 }
 
 function required(args, key) {
@@ -314,19 +325,40 @@ async function ordinaryBind(args, dependencies = {}) {
   }
 }
 
-function ordinaryBindCommand(args) {
+function runLockedOrdinaryCommand(args, { command, environmentKey, lockPath }) {
   const paths = pathsFor(args);
-  const runtime = gatewayProcessStatus(paths);
-  if (runtime?.state === 'running' && runtime.pid) return ordinaryBind(args);
-
   fs.mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 });
   const forwarded = Object.entries(args).flatMap(([key, value]) => value === true ? [`--${key}`] : [`--${key}`, String(value)]);
-  const result = spawnSync('lockf', ['-t', '0', '-k', paths.lock, process.execPath, __filename, 'ordinary-bind-run', ...forwarded], {
+  const result = spawnSync('lockf', ['-t', '0', '-k', lockPath, process.execPath, __filename, command, ...forwarded], {
     stdio: 'inherit',
-    env: { ...process.env, DISCORD_SURFACE_ORDINARY_BIND_LOCK_HELD: '1' }
+    env: { ...process.env, [environmentKey]: '1' }
   });
   if (result.error) throw result.error;
   process.exitCode = result.status ?? 1;
+}
+
+function ordinaryBindCommand(args) {
+  const paths = pathsFor(args);
+  const runtime = gatewayProcessStatus(paths);
+  const supportsBindLock = runtime?.state === 'running' && runtime.pid && runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock);
+  const lockPath = supportsBindLock ? paths.bindLock : paths.lock;
+  runLockedOrdinaryCommand(args, {
+    command: 'ordinary-bind-run',
+    environmentKey: 'DISCORD_SURFACE_ORDINARY_BIND_LOCK_HELD',
+    lockPath
+  });
+}
+
+function ordinaryClaudeBindCommand(args) {
+  const paths = pathsFor(args);
+  const runtime = gatewayProcessStatus(paths);
+  const supportsBindLock = runtime?.state === 'running' && runtime.pid && runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock);
+  const lockPath = supportsBindLock ? paths.bindLock : paths.lock;
+  runLockedOrdinaryCommand(args, {
+    command: 'ordinary-claude-bind-run',
+    environmentKey: 'DISCORD_SURFACE_ORDINARY_CLAUDE_BIND_LOCK_HELD',
+    lockPath
+  });
 }
 
 async function resolveCurrentClaudeCaller(dependencies = {}) {
@@ -1101,9 +1133,72 @@ function writePid(pidFile, guildId, stateDir) {
     stateDir,
     command: 'run',
     startedAt: new Date().toISOString(),
-    capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake]
+    capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock]
   }), { mode: 0o600 });
   fs.chmodSync(pidFile, 0o600);
+}
+
+function acquireHeldLock(lockPath) {
+  const parentPid = String(process.pid);
+  const holderScript = [
+    "const parentPid = Number(process.env.DISCORD_SURFACE_LOCK_PARENT_PID);",
+    "process.stdout.write('locked\\n');",
+    "process.stdin.resume();",
+    "process.stdin.once('end', () => process.exit(0));",
+    "setInterval(() => { try { process.kill(parentPid, 0); } catch { process.exit(0); } }, 100);"
+  ].join('');
+  const holder = spawn('lockf', ['-t', '1', '-k', lockPath, process.execPath, '-e', holderScript], {
+    stdio: ['pipe', 'pipe', 'inherit'],
+    env: { ...process.env, DISCORD_SURFACE_LOCK_PARENT_PID: parentPid }
+  });
+  let ready = false;
+  let settled = false;
+  let output = '';
+  const acquired = new Promise((resolve, reject) => {
+    const fail = error => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    holder.stdout.setEncoding('utf8');
+    holder.stdout.on('data', chunk => {
+      if (ready) return;
+      output += String(chunk);
+      if (!output.includes('locked')) return;
+      ready = true;
+      settled = true;
+      resolve();
+    });
+    holder.once('error', fail);
+    holder.once('exit', (code, signal) => {
+      if (ready) return;
+      const error = new Error(`could not acquire runtime bind lock${signal ? ` (${signal})` : ` (exit ${code})`}`);
+      if (!signal && code === LOCK_CONTENTION_EXIT) error.code = 'RUNTIME_BIND_LOCK_BUSY';
+      fail(error);
+    });
+  });
+  return acquired.then(() => {
+    let released = false;
+    return {
+      async release() {
+        if (released) return;
+        released = true;
+        try { holder.stdin.end(); } catch {}
+        if (holder.exitCode === null && holder.signalCode === null) await once(holder, 'exit');
+      }
+    };
+  });
+}
+
+async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
+  while (!isStopping?.()) {
+    try { return await acquireHeldLock(lockPath); }
+    catch (error) {
+      if (error.code !== 'RUNTIME_BIND_LOCK_BUSY') throw error;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+  return null;
 }
 
 function createBindingWakeController({ getGateway, isReady, isStopping, logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
@@ -1147,10 +1242,10 @@ async function runRuntime(args) {
   const { paths, state } = openState(args);
   const config = state.requireConfig();
   const recoveryCutoff = new Date().toISOString();
-  state.recoverAfterRestart();
   let gateway;
   let gatewayReady = false;
   let stopping = false;
+  let startupLock = null;
   const bindingWake = createBindingWakeController({
     getGateway: () => gateway,
     isReady: () => gatewayReady,
@@ -1162,6 +1257,8 @@ async function runRuntime(args) {
     const pendingBindingWake = bindingWake.wait();
     try { await gateway?.stop(); } finally {
       await pendingBindingWake;
+      await startupLock?.release();
+      startupLock = null;
       try { fs.unlinkSync(paths.pid); } catch {}
       process.removeListener('SIGUSR2', bindingWake.request);
       state.close();
@@ -1171,6 +1268,9 @@ async function runRuntime(args) {
   process.once('SIGTERM', () => stop().then(() => process.exit(0)));
   process.on('SIGUSR2', bindingWake.request);
   try {
+    startupLock = await acquireHeldLockUntilAvailable(paths.bindLock, () => stopping);
+    if (stopping || !startupLock) return;
+    state.recoverAfterRestart();
     writePid(paths.pid, config.guildId, paths.stateDir);
     gateway = new DiscordGateway({ state, observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) } });
     await gateway.start(config.secretFile);
@@ -1180,6 +1280,9 @@ async function runRuntime(args) {
   } catch (error) {
     await stop();
     throw error;
+  } finally {
+    await startupLock?.release();
+    startupLock = null;
   }
   await new Promise(() => {});
 }
@@ -1479,7 +1582,12 @@ async function main() {
     case 'ordinary-bind-run':
       if (process.env.DISCORD_SURFACE_ORDINARY_BIND_LOCK_HELD !== '1') throw new Error('ordinary-bind-run is internal; use ordinary-bind');
       return ordinaryBind(args);
-    case 'ordinary-claude-bind': return ordinaryClaudeBind(args);
+    case 'ordinary-claude-bind':
+      if (process.env.DISCORD_SURFACE_ORDINARY_CLAUDE_BIND_LOCK_HELD !== '1') return ordinaryClaudeBindCommand(args);
+      return ordinaryClaudeBind(args);
+    case 'ordinary-claude-bind-run':
+      if (process.env.DISCORD_SURFACE_ORDINARY_CLAUDE_BIND_LOCK_HELD !== '1') throw new Error('ordinary-claude-bind-run is internal; use ordinary-claude-bind');
+      return ordinaryClaudeBind(args);
     case 'rebind': return bind(args, true);
     case 'unbind': return unbind(args);
     case 'status': return status(args);

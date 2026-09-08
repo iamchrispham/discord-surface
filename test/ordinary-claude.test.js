@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { createOrdinaryClaudeRequest, ordinaryBindingDecision, resolveExistingChannel } = require('../src/ordinary-codex');
-const { createClaudeMonitor } = require('../src/claude-monitor');
+const { createClaudeMonitor, createMonitorMcp } = require('../src/claude-monitor');
 const { ordinaryClaudeBind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
 const { ClaudeProvider, dispatchAndObserve, postUnixJson, probeClaudeChannel, probeUnixSocket, validateClaudeSessionIdentity, waitForReply } = require('../src/native');
@@ -684,6 +684,43 @@ test('ordinary Claude Monitor leaves readiness promotion to Gateway and revokes 
   observed.close();
 });
 
+test('Claude Monitor releases settled dedupe after native reply becomes terminal', async t => {
+  const f = fixture(t);
+  const stdout = new EventEmitter();
+  const events = [];
+  let prune;
+  const timer = { unref() {} };
+  t.mock.method(global, 'setInterval', callback => {
+    prune = callback;
+    return timer;
+  });
+  t.mock.method(global, 'clearInterval', value => assert.equal(value, timer));
+  stdout.write = (chunk, callback) => {
+    events.push(JSON.parse(String(chunk)));
+    callback?.();
+    return true;
+  };
+  const monitor = createMonitorMcp({ state: f.state, stateDir: f.dir, dbPath: f.db, stdout });
+  f.state.setBindingReadiness(f.binding.channelId, READINESS.READY, 'test Monitor ready', f.binding);
+  const intake = f.state.acceptDiscordMessage({
+    id: 'ordinary-claude-dedupe-release', guildId: 'guild', channelId: f.binding.channelId,
+    authorId: 'operator', isBot: false, content: 'answer this'
+  });
+  assert.equal(f.state.claimDispatch(intake.message.id).claimed, true);
+  f.state.markSubmitted(intake.message.id);
+  const event = {
+    method: 'notifications/claude/channel',
+    params: { content: 'answer this', meta: { messageId: intake.message.id, nativeId: CLAUDE, generation: '1' } }
+  };
+  await monitor.notification(event);
+  assert.equal(events.length, 1);
+  f.state.recordNativeReply({ provider: 'claude', messageId: intake.message.id, nativeId: CLAUDE, generation: 1, text: 'done' });
+  prune();
+  await monitor.notification(event);
+  assert.equal(events.length, 2);
+  await monitor.close();
+});
+
 test('real ClaudeProvider and Claude Monitor path preserves exact reply custody', async t => {
   const f = fixture(t);
   const stdout = new EventEmitter();
@@ -782,4 +819,27 @@ test('ordinary Claude post preserves dedupe and stale generation custody', async
   assert.equal(rebound.generation, 2);
   await assert.rejects(() => runDirectPost({ state: f.state, token: 'fixture', nativeId: CLAUDE, generation: 1, channelId: f.binding.channelId,
     provider: 'claude', ordinary: true, textFile, dedupeKey: 'stale-claude', fetchImpl }), error => error instanceof StaleGenerationError);
+});
+
+
+test('Monitor construction failure releases allocated timers and listeners', t => {
+  const timers = new Set();
+  t.mock.method(global, 'setInterval', () => {
+    const timer = { unref() {} };
+    timers.add(timer);
+    return timer;
+  });
+  t.mock.method(global, 'clearInterval', timer => timers.delete(timer));
+  const stdout = new EventEmitter();
+  stdout.write = () => true;
+  assert.throws(() => createClaudeMonitor({
+    state: { findNativeBinding: () => null },
+    nativeId: CLAUDE,
+    socketPath: '/tmp/monitor-construction-failure.sock',
+    stateDir: '/tmp/monitor-construction-failure',
+    stdout
+  }), /pre-bound, opted-in/);
+  assert.equal(timers.size, 0);
+  assert.equal(stdout.listenerCount('error'), 0);
+  assert.equal(stdout.listenerCount('close'), 0);
 });
