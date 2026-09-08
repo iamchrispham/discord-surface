@@ -1000,6 +1000,12 @@ class SurfaceState {
       return this.transaction(() => {
         const current = this.getBinding(binding.channelId);
         if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary root relocation source identity is stale');
+        const dispatching = this.db.prepare(
+          'SELECT 1 FROM messages WHERE channel_id=? AND state=? LIMIT 1'
+        ).get(binding.channelId, MESSAGE_STATES.DISPATCHING);
+        if (dispatching) {
+          throw new BindingError('ordinary binding root relocation is unavailable while dispatch is in flight');
+        }
         this.assertLegacyMigrationSafe(binding.channelId);
         const updatedAt = now();
         this.db.prepare('UPDATE bindings SET session_root=?, readiness=?, updated_at=? WHERE channel_id=?')

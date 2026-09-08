@@ -7,7 +7,7 @@ const path = require('node:path');
 const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
 const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordinaryBind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
-const { CodexProvider, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
+const { CodexProvider, readCodexSessionIdentityAsync, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
 const { SurfaceState, READINESS, StaleGenerationError } = require('../src/state');
 const { runDirectPost } = require('../src/direct-post');
 const facade = require('../src/ordinary-codex');
@@ -619,6 +619,31 @@ test('binding wake reconciles after a partial recovery leaves the Gateway ready'
   assert.deepEqual(calls, ['recover:ordinary-bind', 'reconcile']);
 });
 
+test('binding wake remains queued while the Gateway is disconnected', async () => {
+  const calls = [];
+  const gateway = {
+    ready: false,
+    recoveryPromise: null,
+    async recoverTransport(reason) {
+      calls.push(`recover:${reason}`);
+      return { ready: true, state: 'ready' };
+    },
+    async reconcilePending() { calls.push('reconcile'); }
+  };
+  const wake = createBindingWakeController({
+    getGateway: () => gateway,
+    isReady: () => gateway.ready,
+    isStopping: () => false
+  });
+  wake.request();
+  await wake.wait();
+  assert.deepEqual(calls, []);
+  gateway.ready = true;
+  wake.start();
+  await wake.wait();
+  assert.deepEqual(calls, ['recover:ordinary-bind', 'reconcile']);
+});
+
 test('ordinary binding decision refuses a non-ordinary or inactive existing owner', () => {
   const request = {
     provider: 'codex', channelId: 'channel', guildId: 'guild', nativeId: CODEX, workspace: '/tmp/workspace',
@@ -698,6 +723,34 @@ test('ordinary root relocation reopens a drained terminal intake watermark', t =
   assert.equal(watermark.state, 'pending');
   assert.equal(watermark.gap_from, null);
   assert.equal(watermark.gap_to, null);
+});
+
+test('ordinary root relocation refuses an active dispatch', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-relocated-dispatch-root-'));
+  const proof = {
+    file: path.join(sessionRoot, `${CODEX}.jsonl`), sessionId: CODEX, threadId: CODEX,
+    workspace: f.dir, sessionRoot
+  };
+  t.after(() => fs.rmSync(sessionRoot, { recursive: true, force: true }));
+  f.state.recordOrdinaryPreflight(binding, {
+    file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  const ready = f.state.setBindingReadiness(binding.channelId, READINESS.READY, 'test', binding);
+  f.state.acceptDiscordMessage({
+    id: 'ordinary-relocation-dispatch', guildId: 'guild', channelId: binding.channelId,
+    authorId: 'operator', isBot: false, content: 'dispatch'
+  }, { expectedBinding: ready });
+  assert.equal(f.state.claimDispatch('ordinary-relocation-dispatch').claimed, true);
+  const request = {
+    provider: 'codex', channelId: binding.channelId, guildId: 'guild', nativeId: CODEX,
+    workspace: f.dir, sessionRoot, identity: { sessionId: CODEX, threadId: CODEX }
+  };
+  assert.throws(() => f.state.rebindOrdinary(request, request.identity, proof), /dispatch is in flight/);
+  const unchanged = f.state.getBinding(binding.channelId);
+  assert.equal(unchanged.sessionRoot, null);
+  assert.equal(unchanged.generation, binding.generation);
 });
 
 test('ordinary bind rejects a successor and explicit tombstone handoff transfers custody', t => {
@@ -946,11 +999,19 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   recoveredState.close();
 });
 
-test('native preflight requires exact session metadata and workspace', t => {
+test('native preflight requires exact session metadata and workspace', async t => {
   const f = fixture(t);
   const matching = transcript(t, f.dir);
   const proof = validateCodexSessionIdentity(CODEX, f.dir, matching.root);
   assert.equal(proof.file, matching.file);
+  const singleField = transcript(t, f.dir, CODEX, { id: undefined });
+  const singleFieldProof = validateCodexSessionIdentity(CODEX, f.dir, singleField.root);
+  assert.deepEqual({ sessionId: singleFieldProof.sessionId, threadId: singleFieldProof.threadId }, { sessionId: CODEX, threadId: CODEX });
+  const asyncSingleFieldProof = await readCodexSessionIdentityAsync(CODEX, singleField.root);
+  assert.deepEqual({ sessionId: asyncSingleFieldProof.sessionId, threadId: asyncSingleFieldProof.threadId }, { sessionId: CODEX, threadId: CODEX });
+  const otherSingleField = transcript(t, f.dir, CODEX, { session_id: undefined });
+  const otherSingleFieldProof = validateCodexSessionIdentity(CODEX, f.dir, otherSingleField.root);
+  assert.deepEqual({ sessionId: otherSingleFieldProof.sessionId, threadId: otherSingleFieldProof.threadId }, { sessionId: CODEX, threadId: CODEX });
   assert.equal(validateCodexSessionIdentity(CODEX, undefined, matching.root).workspace, f.dir);
   const wrongWorkspace = transcript(t, '/tmp/other-workspace');
   assert.throws(() => validateCodexSessionIdentity(CODEX, f.dir, wrongWorkspace.root), /workspace/);
@@ -1045,6 +1106,25 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
   assert.equal(second.ready, true);
   assert.equal(preflights, 2);
   assert.equal(f.state.getMessage('held-input').state, 'replied');
+  await gateway.stop();
+});
+
+test('Gateway reconnect replays binding wakes after reconciliation', async t => {
+  const f = fixture(t);
+  const calls = [];
+  const client = { on() {}, off() {}, async destroy() {} };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client,
+    providers: {},
+    onReady: () => calls.push('ready')
+  });
+  gateway.started = true;
+  gateway.recoverTransport = async () => ({ ready: true, state: 'ready' });
+  gateway.reconcilePending = async () => calls.push('reconcile');
+  const result = await gateway.beginReconnectRecovery('shard-ready');
+  assert.equal(result.ready, true);
+  assert.deepEqual(calls, ['reconcile', 'ready']);
   await gateway.stop();
 });
 

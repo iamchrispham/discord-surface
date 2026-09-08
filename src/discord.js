@@ -535,9 +535,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
 }
 
 class DiscordGateway {
-  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {} } = {}) {
+  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null } = {}) {
     this.state = state;
     this.logger = logger;
+    this.onReady = typeof onReady === 'function' ? onReady : null;
     this.client = client || this.createClient();
     this.discordToken = null;
     this.controllers = new Set();
@@ -684,7 +685,10 @@ class DiscordGateway {
       await previousRecovery?.catch(() => {});
       if (this.stopping || connectionEpoch !== this.connectionEpoch) return { ready: false, state: 'stopped' };
       const result = await this.recoverTransport('reconnect', this.lifecycleEpoch);
-      if (result.ready && !this.stopping && connectionEpoch === this.connectionEpoch) await this.reconcilePending();
+      if (result.ready && !this.stopping && connectionEpoch === this.connectionEpoch) {
+        await this.reconcilePending();
+        if (!this.stopping && connectionEpoch === this.connectionEpoch) this.onReady?.();
+      }
       return result;
     })().catch(error => {
       this.logger(`Discord recovery failed: ${error.message}`);

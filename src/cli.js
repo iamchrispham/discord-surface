@@ -953,7 +953,7 @@ async function runRuntime(args) {
   let stopping = false;
   const bindingWake = createBindingWakeController({
     getGateway: () => gateway,
-    isReady: () => gatewayReady,
+    isReady: () => gatewayReady && gateway?.ready === true,
     isStopping: () => stopping
   });
   const stop = async () => {
@@ -972,7 +972,11 @@ async function runRuntime(args) {
   process.on('SIGUSR2', bindingWake.request);
   try {
     writePid(paths.pid, config.guildId, paths.stateDir);
-    gateway = new DiscordGateway({ state, observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) } });
+    gateway = new DiscordGateway({
+      state,
+      observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) },
+      onReady: () => bindingWake.start()
+    });
     await gateway.start(config.secretFile);
     await gateway.reconcilePending(recoveryCutoff);
     gatewayReady = true;

@@ -130,9 +130,10 @@ async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
       const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
-      if (sessionId !== nativeId && threadId !== nativeId) continue;
+      if (sessionId && threadId && sessionId !== threadId) continue;
+      if ((sessionId || threadId) !== nativeId) continue;
       matches.push({
-        file, sessionId, threadId,
+        file, sessionId: nativeId, threadId: nativeId,
         workspace: typeof payload.cwd === 'string' ? payload.cwd : null
       });
     } catch {}
@@ -228,9 +229,10 @@ function readCodexSessionIdentity(nativeId, root = sessionRoot()) {
       const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
-      if (sessionId !== nativeId && threadId !== nativeId) continue;
+      if (sessionId && threadId && sessionId !== threadId) continue;
+      if ((sessionId || threadId) !== nativeId) continue;
       matches.push({
-        file, sessionId, threadId,
+        file, sessionId: nativeId, threadId: nativeId,
         workspace: typeof payload.cwd === 'string' ? payload.cwd : null
       });
     } catch {}
