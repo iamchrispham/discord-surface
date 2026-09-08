@@ -1234,7 +1234,10 @@ async function claudeMonitor(args) {
     monitorStarted = true;
     if (ordinaryStartupBinding) {
       const watermark = state.getIntakeWatermark(ordinaryStartupBinding.channelId);
-      if (watermark?.state === READINESS.UNAVAILABLE) {
+      const endpointUnavailable = watermark?.state === READINESS.UNAVAILABLE &&
+        typeof watermark.detail === 'string' &&
+        watermark.detail.startsWith('Claude endpoint unavailable before event write:');
+      if (endpointUnavailable) {
         state.reconcileIntake(ordinaryStartupBinding.channelId, ordinaryStartupBinding);
       }
       requestGatewayRecovery(paths);

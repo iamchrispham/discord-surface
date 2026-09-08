@@ -1052,7 +1052,10 @@ class DiscordGateway {
             failure ||= { ready: false, state: 'unavailable', error };
             continue;
           }
-          await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+          const detail = binding.provider === 'claude' && reason === 'Claude endpoint unavailable'
+            ? `Claude endpoint unavailable before event write: ${error.message}`
+            : error.message;
+          await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', detail, watermark?.recovered_through_id, null, signal, deadline);
           failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
           continue;
         }
@@ -1195,6 +1198,7 @@ class DiscordGateway {
 
   async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+    this.ready = false;
     if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
@@ -1202,6 +1206,7 @@ class DiscordGateway {
       const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch);
       if (result.ready && this.isCurrentLifecycle(lifecycleEpoch)) this.ready = true;
       else if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+      else this.ready = false;
       return result;
     })();
     try { return await this.recoveryPromise; }

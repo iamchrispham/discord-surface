@@ -463,9 +463,32 @@ test('old ordinary Claude Monitor stop cannot revoke a successor generation', as
   observed.close();
 });
 
-test('ordinary Claude Monitor startup reopens an existing recovery-unavailable state', async t => {
+test('ordinary Claude Monitor startup preserves unrelated recovery-unavailable state', async t => {
   const f = fixture(t);
   f.state.markIntakeBoundary(f.binding.channelId, 'unavailable', 'prior recovery failure', null, null, f.binding);
+  f.state.close();
+  const child = spawn(process.execPath, [CLI_PATH, 'claude-monitor', '--state-dir', f.dir, '--db', f.db, '--native-id', CLAUDE, '--socket', f.socketPath], {
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  t.after(async () => {
+    if (child.exitCode === null) child.kill('SIGTERM');
+  });
+  const observed = new SurfaceState(f.db);
+  await waitFor(() => fs.existsSync(f.socketPath));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.equal(observed.getIntakeWatermark(f.binding.channelId).state, READINESS.UNAVAILABLE);
+  child.kill('SIGTERM');
+  await new Promise((resolve, reject) => {
+    child.once('close', resolve);
+    child.once('error', reject);
+  });
+  observed.close();
+});
+
+test('ordinary Claude Monitor startup reopens an endpoint-unavailable recovery watermark', async t => {
+  const f = fixture(t);
+  f.state.markIntakeBoundary(f.binding.channelId, 'unavailable', 'Claude endpoint unavailable before event write: connect ENOENT', null, null, f.binding);
   f.state.close();
   const child = spawn(process.execPath, [CLI_PATH, 'claude-monitor', '--state-dir', f.dir, '--db', f.db, '--native-id', CLAUDE, '--socket', f.socketPath], {
     stdio: ['ignore', 'pipe', 'pipe']
@@ -574,6 +597,7 @@ test('ordinary Claude pre-write endpoint loss demotes only matching binding and 
   assert.equal(result.status, 'not_submitted');
   assert.equal(f.state.getMessage('endpoint-loss').state, MESSAGE_STATES.ACCEPTED);
   await waitFor(() => f.state.getBinding(f.binding.channelId)?.readiness === READINESS.UNAVAILABLE);
+  assert.equal(gateway.ready, false);
   const held = await gateway.consumer.intakeMessage({
     id: 'endpoint-loss-held', guildId: 'guild', channelId: f.binding.channelId, content: 'hold after loss',
     author: { id: 'operator', bot: false }, channel
