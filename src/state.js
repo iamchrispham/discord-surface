@@ -1157,7 +1157,6 @@ class SurfaceState {
     if (expectedBinding !== undefined && !bindingMatchesExpected(binding, expectedBinding)) {
       throw new StaleGenerationError('unbind source identity is stale');
     }
-    if (!binding.active) return true;
     if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
       throw new UnresolvedWorkError('cannot unbind while work is unresolved');
     }
@@ -1165,6 +1164,7 @@ class SurfaceState {
       const current = this.getBinding(channelId);
       const expected = expectedBinding === undefined ? binding : expectedBinding;
       if (!bindingMatchesExpected(current, expected)) throw new StaleGenerationError('unbind source identity is stale');
+      if (!current.active) return true;
       if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
         throw new UnresolvedWorkError('cannot unbind while work is unresolved');
       }
