@@ -7,7 +7,7 @@ const path = require('node:path');
 const { createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('../src/ordinary-codex');
 const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordinaryBind } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
-const { CodexProvider, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
+const { CodexProvider, sessionRoot, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
 const { SurfaceState, READINESS, StaleGenerationError } = require('../src/state');
 const { runDirectPost } = require('../src/direct-post');
 const facade = require('../src/ordinary-codex');
@@ -172,7 +172,7 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   assert.equal(second.reused, true);
   assert.equal(first.binding.generation, 1);
   assert.equal(second.binding.generation, 1);
-  assert.deepEqual(validationRoots, [undefined, undefined]);
+  assert.deepEqual(validationRoots, [undefined, sessionRoot({})]);
   assert.equal(second.binding.readiness, READINESS.PENDING);
   assert.equal(first.nativeProof.status, 'verified');
   assert.equal(second.nativeProof.status, 'verified');

@@ -210,15 +210,16 @@ async function ordinaryBind(args, dependencies = {}) {
       throw new Error('channel is already bound to another owner; use explicit handoff');
     }
     const validationRoot = sessionRoot ?? existing?.sessionRoot ?? undefined;
+    const effectiveSessionRoot = validationRoot ?? codexSessionRoot(environment);
     if (!sessionRoot) {
       const proof = await validateNativeProof(validationRoot);
       nativeProofDetail = proof.detail;
       nativeProofError = proof.error;
       resolvedWorkspace = proof.workspace;
     }
-    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, sessionRoot);
+    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, effectiveSessionRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
-    const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: validationRoot } : null;
+    const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: effectiveSessionRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     let adoptionCutoff = null;
     if (decision !== 'reuse' && !existing?.active) {
@@ -323,9 +324,13 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     const config = state.requireConfig();
     const channelSelection = args.channel || args['channel-id'];
     if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
-    const endpoint = required(args, args.endpoint ? 'endpoint' : 'socket');
+    const endpoint = required(args, args.endpoint !== undefined ? 'endpoint' : 'socket');
+    const socketAlias = args.socket === undefined ? undefined : required(args, 'socket');
     const transcript = required(args, 'transcript');
     if (!path.isAbsolute(endpoint)) throw new Error('Claude endpoint must be an absolute Unix socket path');
+    if (socketAlias !== undefined && path.resolve(endpoint) !== path.resolve(socketAlias)) {
+      throw new Error('--endpoint and --socket must identify the same socket');
+    }
     if (!path.isAbsolute(transcript)) throw new Error('Claude transcript path must be absolute');
     const resolvedEndpoint = path.resolve(endpoint);
     const caller = await resolveCaller();

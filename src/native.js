@@ -68,9 +68,9 @@ function claudeEvent(message) {
   return event;
 }
 
-function sessionRoot() {
+function sessionRoot(environment = process.env) {
   const home = os.homedir();
-  return path.join(process.env.CODEX_HOME || path.join(home, '.codex'), 'sessions');
+  return path.join(environment.CODEX_HOME || path.join(home, '.codex'), 'sessions');
 }
 
 function walk(dir, result = [], depth = 0) {
@@ -110,25 +110,48 @@ async function readSessionHeaderAsync(file) {
   }
 }
 
-async function* walkAsync(dir, depth = 0) {
-  if (depth > 5) return;
+function awaitWithDeadline(task, deadline) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new Error('operation deadline exceeded'));
+  let timer;
+  const operation = Promise.resolve().then(task);
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('operation deadline exceeded')), remaining);
+  });
+  return Promise.race([operation, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function* walkAsync(dir, depth = 0, options = undefined) {
+  const limitReached = () => options && (Date.now() >= options.deadline || options.entries >= options.maxEntries);
+  if (depth > 5 || limitReached()) return;
   let entries;
-  try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+  try {
+    entries = options
+      ? await awaitWithDeadline(() => fs.promises.readdir(dir, { withFileTypes: true }), options.deadline)
+      : await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch { return; }
   for (const entry of entries) {
+    if (limitReached()) return;
+    if (options) options.entries += 1;
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) yield* walkAsync(full, depth + 1);
+    if (entry.isDirectory()) yield* walkAsync(full, depth + 1, options);
     else if (entry.isFile() && entry.name.endsWith('.jsonl')) yield full;
     await new Promise(resolve => setImmediate(resolve));
   }
 }
 
+const CODEX_SESSION_DISCOVERY_TIMEOUT_MS = 5000;
+const CODEX_SESSION_DISCOVERY_MAX_ENTRIES = 2048;
+
 async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
   validateNativeId(nativeId);
   const matches = [];
-  for await (const file of walkAsync(root)) {
+  const deadline = Date.now() + CODEX_SESSION_DISCOVERY_TIMEOUT_MS;
+  const scan = { deadline, maxEntries: CODEX_SESSION_DISCOVERY_MAX_ENTRIES, entries: 0 };
+  for await (const file of walkAsync(root, 0, scan)) {
     if (!file.includes(nativeId)) continue;
     try {
-      const row = JSON.parse(await readSessionHeaderAsync(file));
+      const row = JSON.parse(await awaitWithDeadline(() => readSessionHeaderAsync(file), deadline));
       const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
