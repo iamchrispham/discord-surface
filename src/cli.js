@@ -665,7 +665,8 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     });
     const gatewayWake = wake(paths, {
       status: gatewayStatus,
-      kill: dependencies.killProcess || process.kill
+      kill: dependencies.killProcess || process.kill,
+      expectedPid: supportsBindLock ? runtime.pid : undefined
     });
     output({ handedOff: true, ordinary: true, channelId, handoffId,
       url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding,

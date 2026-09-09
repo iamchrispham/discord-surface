@@ -1067,6 +1067,7 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   };
   const wakeSignals = [];
   const output = [];
+  let wakeExpectedPid;
   let proofArguments;
   class FakeClient {
     constructor() {
@@ -1088,11 +1089,12 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
       return { file: session.file, sessionId: OTHER, threadId: OTHER, workspace: successorWorkspace };
     },
     requestGatewayRecovery: (_paths, options) => {
+      wakeExpectedPid = options.expectedPid;
       const runtime = options.status(_paths);
       options.kill(runtime.pid, 'SIGUSR2');
       return { requested: true, pid: runtime.pid, signal: 'SIGUSR2' };
     },
-    gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] }),
+    gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock] }),
     killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
     print: value => output.push(value)
   });
@@ -1101,6 +1103,7 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   assert.equal(result.binding.readiness, READINESS.PENDING);
   assert.deepEqual(proofArguments, [OTHER, successorWorkspace, session.root]);
   assert.deepEqual(wakeSignals, [{ pid: 4242, signal: 'SIGUSR2' }]);
+  assert.equal(wakeExpectedPid, 4242);
   assert.equal(output[0].ordinary, true);
 
   const recoveredState = new SurfaceState(db);

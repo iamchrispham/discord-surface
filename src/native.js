@@ -422,7 +422,7 @@ function* readClaudeSessionMetadata(file) {
     };
     while (position < size) {
       const count = fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - position), position);
-      if (!count) break;
+      if (!count) throw new Error('transcript shortened during read');
       position += count;
       let start = 0;
       while (start < count) {

@@ -281,6 +281,18 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return !binding || !binding.active || binding.readiness === READINESS.READY;
   }
 
+  function releaseReadyOwnerBlock(message) {
+    const ownerKey = nativeOwnerKey(message);
+    const queue = ownerQueues.get(ownerKey);
+    if (!queue?.blockedMessageId || !ownerBindingReady(message.id)) return;
+    const blocked = state.getMessage(queue.blockedMessageId);
+    if (!blocked || ![MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(blocked.state)) return;
+    if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
+    queue.blockedMessageId = null;
+    queue.blockedReason = null;
+    pumpOwner(ownerKey);
+  }
+
   function ownerQueueFor(key) {
     let queue = ownerQueues.get(key);
     if (!queue) {
@@ -408,6 +420,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   function existingNativeWork(message, awaitExisting) {
+    releaseReadyOwnerBlock(message);
     const existing = nativeWork.get(message.id)?.promise;
     if (existing) return awaitExisting ? existing : Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
     const queued = queuedNativeWork.get(message.id);

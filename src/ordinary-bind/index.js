@@ -358,7 +358,8 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     }
     const gatewayWake = requestGatewayRecovery(paths, {
       status: gatewayStatus,
-      kill: dependencies.killProcess || process.kill
+      kill: dependencies.killProcess || process.kill,
+      expectedPid: expectedRuntimePid
     });
     output({ bound: true, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE, binding: state.getBinding(binding.channelId), nativeProof, monitor: { status: 'pending' }, gatewayWake });
     return { binding: state.getBinding(binding.channelId), nativeProof, monitor: { status: 'pending' }, gatewayWake, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE };

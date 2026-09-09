@@ -1377,6 +1377,52 @@ test('simulated: same native owner dispatches its next message while the prior A
   state.close();
 });
 
+test('simulated: readiness recovery releases a terminal owner blocker before a queued message is replayed', async () => {
+  const { dir, state } = fixture();
+  const binding = state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const firstId = 'readiness-terminal-first';
+  const secondId = 'readiness-terminal-second';
+  const dispatches = [];
+  let releaseFirst;
+  const firstReply = new Promise(resolve => { releaseFirst = resolve; });
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: {
+      codex: {
+        async dispatch(message) {
+          dispatches.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message) {
+          return message.id === firstId ? firstReply : { text: 'second answer' };
+        }
+      }
+    },
+    sendTransportReceipt: async () => ({ id: 'transport-receipt' }),
+    sendReply: async (_message, reply) => ({ id: `reply-${reply.id}` })
+  });
+
+  const first = consumer.handleMessage(discordMessage({ id: firstId, channelId: binding.channelId }));
+  await waitForCondition(() => dispatches.includes(firstId));
+  const second = consumer.handleMessage(discordMessage({ id: secondId, channelId: binding.channelId }));
+  await new Promise(resolve => setImmediate(resolve));
+  state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, 'Claude Monitor stopped', binding);
+  releaseFirst({ text: 'first answer' });
+  await waitForCondition(() => state.getMessage(firstId).state === MESSAGE_STATES.REPLIED);
+  assert.deepEqual(dispatches, [firstId]);
+
+  const recoveredBinding = state.setBindingReadiness(binding.channelId, READINESS.READY, 'Claude Monitor recovered', state.getBinding(binding.channelId));
+  assert.equal(recoveredBinding.readiness, READINESS.READY);
+  await consumer.handleStoredMessage(state.getMessage(secondId));
+  await waitForCondition(() => dispatches.includes(secondId));
+  await second;
+  assert.equal(state.getMessage(secondId).state, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(dispatches, [firstId, secondId]);
+  await first;
+  await consumer.waitForReceipts();
+  state.close();
+});
+
 test('simulated: current native ACK releases a queued owner before the first reply', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });

@@ -133,6 +133,19 @@ test('ordinary Claude accepts single or equal transcript IDs and rejects conflic
   assert.equal(validateClaudeSessionIdentity(CLAUDE, growing).sessionId, CLAUDE);
 });
 
+test('ordinary Claude rejects a transcript shortened during metadata scanning', t => {
+  const f = fixture(t, { bind: false });
+  fs.appendFileSync(f.session.file, 'x'.repeat(70 * 1024));
+  const realReadSync = fs.readSync;
+  let reads = 0;
+  t.mock.method(fs, 'readSync', (fd, buffer, offset, length, position) => {
+    reads += 1;
+    if (reads === 2) return 0;
+    return realReadSync(fd, buffer, offset, length, position);
+  });
+  assert.throws(() => validateClaudeSessionIdentity(CLAUDE, f.session.file), /transcript shortened during read/);
+});
+
 test('oversized Claude metadata records fail closed', t => {
   const f = fixture(t, { bind: false });
   const file = path.join(f.dir, 'oversized-conflict.jsonl');
@@ -904,4 +917,30 @@ test('ordinary Claude preflight rereads Gateway after binding mutation', async t
   const binding = f.state.getBinding(channel.id);
   assert.ok(binding);
   assert.equal(f.state.hasOrdinaryPreflight(binding), false);
+});
+
+test('ordinary Claude bind pins recovery wake to the selected Gateway', async t => {
+  const f = fixture(t, { bind: false });
+  const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const selected = {
+    state: 'running', pid: 4242,
+    capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock, GATEWAY_CAPABILITIES.ordinaryClaudeBind]
+  };
+  const replacement = { state: 'running', pid: 4243, capabilities: [] };
+  let reads = 0;
+  const wakeSignals = [];
+  const result = await ordinaryClaudeBind({
+    'state-dir': f.dir, channel: '#dev', transcript: f.session.file, socket: f.socketPath
+  }, {
+    resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code' }),
+    requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateClaudeSessionIdentity: () => ({ file: f.session.file, sessionId: CLAUDE, threadId: CLAUDE, workspace: f.dir }),
+    gatewayProcessStatus: () => (++reads < 4 ? selected : replacement),
+    environment: { DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID: String(selected.pid) },
+    killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
+    print: () => {}
+  });
+  assert.deepEqual(result.gatewayWake, { requested: false, pid: replacement.pid, state: 'running', reason: 'gateway-changed' });
+  assert.deepEqual(wakeSignals, []);
 });
