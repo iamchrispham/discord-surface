@@ -162,6 +162,19 @@ function openDirectoryWithDeadline(dir, deadline) {
   });
 }
 
+async function closeDirectoryWithDeadline(handle, options) {
+  const closing = Promise.resolve().then(() => handle.close());
+  closing.catch(() => {
+    if (options) options.complete = false;
+  });
+  try {
+    if (options) await awaitWithDeadline(() => closing, options.deadline);
+    else await closing;
+  } catch {
+    if (options) options.complete = false;
+  }
+}
+
 async function* walkAsync(dir, depth = 0, options = undefined) {
   const limitReached = () => options && Date.now() >= options.deadline;
   if (depth > 5 || limitReached()) {
@@ -191,11 +204,7 @@ async function* walkAsync(dir, depth = 0, options = undefined) {
     if (options) options.complete = false;
     return;
   } finally {
-    if (handle) {
-      try { await handle.close(); } catch {
-        if (options) options.complete = false;
-      }
-    }
+    if (handle) await closeDirectoryWithDeadline(handle, options);
   }
 }
 
