@@ -1284,6 +1284,7 @@ test('interrupted ordinary handoff pause restores readiness from durable ownersh
   f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary handoff baseline');
   f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary handoff drained', null, null, binding);
   f.state.pauseOrdinaryHandoffIntake(binding.channelId, binding);
+  f.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, 'Discord shard reconnecting', binding);
   const pausedReceipt = f.state.listReceipts().find(receipt => receipt.kind === 'ordinary-handoff-intake-paused');
   const pausedDetail = JSON.parse(pausedReceipt.detail);
   pausedDetail.ownerPid = 999999;
@@ -1877,6 +1878,67 @@ test('live intake checkpoints keep sequential traffic within recovery bounds', a
   assert.equal(f.state.getIntakeWatermark(binding.channelId).recovered_through_id, '106');
   assert.equal(f.state.listMessages().length, 0);
   assert.equal(history.length > gateway.historyMaxMessages, true);
+});
+
+test('live intake checkpoints skip unrelated ready bindings when a channel triggers the pass', async t => {
+  const f = fixture(t);
+  const blocked = ordinary(f, '0-blocked-channel', OTHER);
+  const triggered = ordinary(f, '1-triggered-channel', CODEX);
+  for (const binding of [blocked, triggered]) {
+    f.state.recordOrdinaryPreflight(binding, {
+      file: path.join(f.dir, `${binding.channelId}.jsonl`),
+      sessionId: binding.nativeId,
+      threadId: binding.nativeId,
+      workspace: f.dir
+    });
+    f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'checkpoint baseline');
+    f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'fixture ready');
+  }
+  const event = {
+    id: '101',
+    guildId: 'guild',
+    channelId: triggered.channelId,
+    authorId: 'bot',
+    isBot: true,
+    content: 'triggering notice',
+    attachments: []
+  };
+  assert.equal(f.state.acceptDiscordMessage(event).reason, 'bot-source');
+  const channels = new Map([blocked, triggered].map(binding => [binding.channelId, {
+    id: binding.channelId,
+    guildId: 'guild',
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => new Map([['101', event]]) }
+  }]));
+  let blockedFetches = 0;
+  let gateway;
+  gateway = new DiscordGateway({
+    state: f.state,
+    client: {
+      user: { id: 'bot' },
+      on() {},
+      off() {},
+      channels: {
+        fetch: async channelId => {
+          if (channelId === blocked.channelId) {
+            blockedFetches += 1;
+            gateway.liveCheckpointController?.abort();
+            await new Promise(resolve => setImmediate(resolve));
+          }
+          return channels.get(channelId);
+        }
+      }
+    },
+    fetchHistory: async channel => channel.id === triggered.channelId ? [event] : [],
+    recoveryOptions: { maxMessages: 2 }
+  });
+  gateway.ready = true;
+  gateway.noteLiveIntake(event);
+  await gateway.liveCheckpointPromise;
+
+  assert.equal(blockedFetches, 0);
+  assert.equal(f.state.getIntakeWatermark(triggered.channelId).recovered_through_id, '101');
+  assert.equal(f.state.getIntakeWatermark(blocked.channelId).recovered_through_id, '100');
 });
 
 test('live intake checkpoints reschedule traffic received during an in-flight checkpoint', async t => {

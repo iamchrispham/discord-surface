@@ -848,7 +848,7 @@ class DiscordGateway {
     const epoch = this.lifecycleEpoch;
     this.liveCheckpointController = controller;
     let advancedChannels = new Set();
-    const checkpoint = this.checkpointHealthyIntake(controller.signal, epoch)
+    const checkpoint = this.checkpointHealthyIntake(controller.signal, epoch, triggeredCounts)
       .then(result => {
         advancedChannels = result instanceof Set ? result : new Set();
         return result;
@@ -883,9 +883,12 @@ class DiscordGateway {
     this.liveCheckpointPromise = checkpoint;
   }
 
-  async checkpointHealthyIntake(signal, lifecycleEpoch) {
+  async checkpointHealthyIntake(signal, lifecycleEpoch, triggeredCounts = new Map()) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
-    const bindings = this.state.listBindings().filter(binding => binding.active && binding.readiness === READINESS.READY);
+    const triggeredChannels = triggeredCounts instanceof Map ? new Set(triggeredCounts.keys()) : new Set();
+    const bindings = this.state.listBindings().filter(binding => binding.active
+      && binding.readiness === READINESS.READY
+      && (!triggeredChannels.size || triggeredChannels.has(binding.channelId)));
     const advancedChannels = new Set();
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord live intake checkpoint was stopped');

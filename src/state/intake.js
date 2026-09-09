@@ -51,9 +51,6 @@ function restoreOrdinaryHandoffIntake(state, channelId, expectedBinding) {
   let result = null;
   if (snapshot) {
     const pauseMetadata = { ownerToken: snapshot.ownerToken };
-    if (snapshot.pausedReadiness !== undefined && snapshot.pausedReadiness !== null) {
-      pauseMetadata.expectedReadiness = snapshot.pausedReadiness;
-    }
     result = state.markIntakeBoundary(channelId, snapshot.state, snapshot.detail, snapshot.gapFrom, snapshot.gapTo,
       expectedBinding || snapshot.expectedBinding || null, pauseMetadata);
   }
@@ -118,9 +115,6 @@ function recoverInterruptedOrdinaryHandoffIntake(state, channelId, expectedBindi
   const snapshot = pause.snapshot;
   if (!snapshot || typeof snapshot.state !== 'string') return null;
   const pauseMetadata = { ownerToken: pause.ownerToken };
-  if (snapshot.readiness !== undefined && snapshot.readiness !== null) {
-    pauseMetadata.expectedReadiness = snapshot.readiness;
-  }
   const restored = state.markIntakeBoundary(channelId, snapshot.state || readyState, snapshot.detail || null,
     snapshot.gapFrom || null, snapshot.gapTo || null, expectedBinding || pause.expectedBinding || null,
     pauseMetadata);
