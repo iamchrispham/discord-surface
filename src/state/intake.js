@@ -51,6 +51,9 @@ function restoreOrdinaryHandoffIntake(state, channelId, expectedBinding) {
   let result = null;
   if (snapshot) {
     const pauseMetadata = { ownerToken: snapshot.ownerToken };
+    if (Object.prototype.hasOwnProperty.call(snapshot, 'pausedReadiness')) {
+      pauseMetadata.expectedReadiness = snapshot.pausedReadiness;
+    }
     result = state.markIntakeBoundary(channelId, snapshot.state, snapshot.detail, snapshot.gapFrom, snapshot.gapTo,
       expectedBinding || snapshot.expectedBinding || null, pauseMetadata);
   }

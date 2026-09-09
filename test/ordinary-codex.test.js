@@ -1275,6 +1275,24 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.equal(rejected.wasDeleted(), true);
 });
 
+test('aborted ordinary handoff preserves a newer unavailable readiness result', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.recordOrdinaryPreflight(binding, {
+    file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary handoff drained', null, null, binding);
+  f.state.pauseOrdinaryHandoffIntake(binding.channelId, binding);
+  f.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, 'native proof failed', binding);
+
+  const restored = f.state.restoreOrdinaryHandoffIntake(binding.channelId, binding);
+
+  assert.equal(restored, null);
+  assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).state, READINESS.PENDING);
+  assert.equal(f.state.ordinaryHandoffPauses.has(binding.channelId), true);
+});
+
 test('interrupted ordinary handoff pause restores readiness from durable ownership state', t => {
   const f = fixture(t);
   const binding = ordinary(f);
