@@ -112,6 +112,7 @@ async function readSessionHeaderAsync(file, signal = null) {
     if (signal?.aborted) throw new Error('transcript header read aborted');
     const { size } = await guarded(handle.stat());
     const parts = [];
+    let headerBytes = 0;
     for (let position = 0; position < size;) {
       const length = Math.min(TRANSCRIPT_BLOCK_BYTES, size - position);
       const bytes = Buffer.allocUnsafe(length);
@@ -122,7 +123,12 @@ async function readSessionHeaderAsync(file, signal = null) {
         read += result.bytesRead;
       }
       const newline = bytes.indexOf(0x0a);
-      parts.push(newline < 0 ? bytes : bytes.subarray(0, newline));
+      const part = newline < 0 ? bytes : bytes.subarray(0, newline);
+      if (headerBytes + part.length > TRANSCRIPT_HEADER_MAX_BYTES) {
+        throw new Error(`transcript header exceeds ${TRANSCRIPT_HEADER_MAX_BYTES} bytes`);
+      }
+      parts.push(part);
+      headerBytes += part.length;
       if (newline >= 0) break;
       position += bytes.length;
     }
@@ -273,6 +279,7 @@ function cursorTailBytes(cursor) {
 
 // A valid JSONL record may span blocks, but retained metadata stays bounded.
 const TRANSCRIPT_BLOCK_BYTES = 64 * 1024;
+const TRANSCRIPT_HEADER_MAX_BYTES = 1024 * 1024;
 const CLAUDE_METADATA_RECORD_MAX_BYTES = 1024 * 1024;
 
 function readTranscriptBlock(fd, position, length) {
@@ -291,10 +298,16 @@ function readSessionHeader(file) {
   try {
     const size = fs.fstatSync(fd).size;
     const parts = [];
+    let headerBytes = 0;
     for (let position = 0; position < size;) {
       const bytes = readTranscriptBlock(fd, position, Math.min(TRANSCRIPT_BLOCK_BYTES, size - position));
       const newline = bytes.indexOf(0x0a);
-      parts.push(newline < 0 ? bytes : bytes.subarray(0, newline));
+      const part = newline < 0 ? bytes : bytes.subarray(0, newline);
+      if (headerBytes + part.length > TRANSCRIPT_HEADER_MAX_BYTES) {
+        throw new Error(`transcript header exceeds ${TRANSCRIPT_HEADER_MAX_BYTES} bytes`);
+      }
+      parts.push(part);
+      headerBytes += part.length;
       if (newline >= 0) break;
       position += bytes.length;
     }
@@ -430,7 +443,7 @@ function readClaudeSessionIdentity(nativeId, transcriptFile) {
   if (!stat.isFile()) throw new Error('Claude transcript path must be a regular file');
   let hasMatch = false;
   const sessionIds = new Set();
-  const workspaces = new Set();
+  let workspace = null;
   for (const row of readClaudeSessionMetadata(transcriptFile)) {
     const sessionId = row?.sessionId;
     const payloadSessionId = row?.payload?.session_id;
@@ -449,12 +462,15 @@ function readClaudeSessionIdentity(nativeId, transcriptFile) {
     if (sessionIds.size > 1) throw new Error('Claude transcript identity is ambiguous');
     if (candidateSessionId === nativeId) {
       hasMatch = true;
-      workspaces.add(path.resolve(row.cwd));
+      const candidateWorkspace = path.resolve(row.cwd);
+      if (workspace !== null && workspace !== candidateWorkspace) {
+        throw new Error('Claude transcript workspace is ambiguous');
+      }
+      workspace = candidateWorkspace;
     }
   }
   if (!hasMatch) throw new Error('Claude transcript identity or workspace is unavailable');
-  if (workspaces.size !== 1) throw new Error('Claude transcript workspace is ambiguous');
-  return { file: transcriptFile, sessionId: nativeId, threadId: nativeId, workspace: [...workspaces][0] };
+  return { file: transcriptFile, sessionId: nativeId, threadId: nativeId, workspace };
 }
 
 function validateClaudeSessionIdentity(nativeId, transcriptFile, workspace) {

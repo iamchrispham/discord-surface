@@ -20,7 +20,6 @@ const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 
 const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID';
 const LOCK_CONTENTION_EXIT = 75;
-const RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS = 30000;
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
 const { runLiaisonDraft } = require('./liaison');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
@@ -904,13 +903,9 @@ function acquireHeldLock(lockPath) {
   });
 }
 
-async function acquireHeldLockUntilAvailable(lockPath, isStopping, timeoutMs = RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS) {
+async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
   let reportedContention = false;
-  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS);
   while (!isStopping?.()) {
-    if (Date.now() >= deadline) {
-      throw new Error(`runtime bind lock wait exceeded ${Math.max(1, Number(timeoutMs) || RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS)}ms`);
-    }
     try {
       const lock = await acquireHeldLock(lockPath);
       const stopping = isStopping?.();
@@ -927,9 +922,7 @@ async function acquireHeldLockUntilAvailable(lockPath, isStopping, timeoutMs = R
         process.stderr.write('discord-surface: runtime bind lock is busy; waiting for the holder to release it\n');
       }
       if (isStopping?.()) return null;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) continue;
-      await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)));
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
   return null;
