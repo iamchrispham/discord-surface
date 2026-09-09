@@ -96,8 +96,10 @@ function persistedHandoffPause(state, channelId) {
   return pause;
 }
 
-function supersedePersistedHandoffPause(state, channelId, pauseMetadata) {
+function supersedePersistedHandoffPause(state, channelId, pauseMetadata, now) {
   if (!pauseMetadata?.ownerToken) return;
+  state.db.prepare("UPDATE intake_watermarks SET detail=NULL, updated_at=? WHERE channel_id=? AND state='unavailable'")
+    .run(now(), channelId);
   state.receipt(null, 'ordinary-handoff-intake-pause-superseded', {
     channelId,
     ownerToken: pauseMetadata.ownerToken,
@@ -227,7 +229,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
         if (pauseMetadata && Object.prototype.hasOwnProperty.call(pauseMetadata, 'expectedReadiness')
           && binding?.readiness !== pauseMetadata.expectedReadiness) return null;
         if (pauseMetadata?.preserveUnavailable && binding?.readiness === READINESS.UNAVAILABLE) {
-          supersedePersistedHandoffPause(state, channelId, pauseMetadata);
+          supersedePersistedHandoffPause(state, channelId, pauseMetadata, now);
           return state.getIntakeWatermark(channelId);
         }
         if (!existing && !binding) throw new BindingError('intake channel is unknown');
