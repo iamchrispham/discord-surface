@@ -84,7 +84,7 @@ function createDefaultMcp({ nativeId, state }) {
 }
 
 class ClaudeChannel {
-  constructor({ state, nativeId, socketPath, mcp, onTransportClose } = {}) {
+  constructor({ state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} } = {}) {
     if (!state) throw new TypeError('state is required');
     validateNativeId(nativeId);
     assertSocketPath(socketPath);
@@ -113,6 +113,7 @@ class ClaudeChannel {
     this.ready = false;
     this.transportClosed = false;
     this.onTransportClose = typeof onTransportClose === 'function' ? onTransportClose : null;
+    this.logger = logger;
     this.mcp.onclose = () => {
       this.transportClosed = true;
       if (this.started && !this.stopPromise) this.stop().catch(() => {}).finally(() => this.onTransportClose?.());
