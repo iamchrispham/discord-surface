@@ -1350,6 +1350,10 @@ class SurfaceState {
     return this.db.prepare('SELECT * FROM intake_watermarks ORDER BY channel_id').all();
   }
 
+  listPendingOrdinaryHandoffChannels() {
+    return intakeHandlers.listPendingOrdinaryHandoffChannels(this);
+  }
+
   markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null) {
     return intakeHandlers.markIntakeBoundary(this, channelId, state, detail, gapFrom, gapTo, expectedBinding, pauseMetadata);
   }

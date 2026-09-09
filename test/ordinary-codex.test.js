@@ -850,6 +850,7 @@ test('ordinary handoff refuses unmatched and active direct-post custody', t => {
   assertRelocationHeld();
   assert.throws(() => f.state.handoffOrdinary(handoff), /unresolved/);
   f.state.receipt(null, 'direct-post-outcome', { ...attempt, outcome: 'sent', messageId: 'sent-message' });
+  assert.equal(f.state.hasIntakeEvidence('sent-message'), true);
   assertRelocationHeld();
   assert.throws(() => f.state.handoffOrdinary(handoff), /unresolved/);
   const finalAttempt = { ...attempt, attemptId: 'ordinary-post-final-attempt', partIndex: 1 };
@@ -2333,6 +2334,8 @@ test('Gateway observes a committed pending ordinary generation without a wake si
   gateway.transportReady = true;
   gateway.schedulePendingHandoffRecoveryPoll();
 
+  f.state.pauseOrdinaryHandoffIntake(binding.channelId, binding);
+
   f.state.handoffOrdinary({
     channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
     nativeId: OTHER, workspace: f.dir, sessionRoot: null, handoffId: 'poll-handoff',
@@ -2340,6 +2343,7 @@ test('Gateway observes a committed pending ordinary generation without a wake si
     nativeProof: { file: session.file, sessionId: OTHER, threadId: OTHER, workspace: f.dir }
   });
 
+  assert.deepEqual(f.state.listPendingOrdinaryHandoffChannels(), [binding.channelId]);
   await new Promise(resolve => setTimeout(resolve, 350));
   assert.equal(preflights, 1);
   assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.READY);

@@ -161,8 +161,21 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
         UNION ALL SELECT 1 FROM receipts WHERE kind='intake-rejected'
           AND json_extract(detail, '$.discordId')=?
           AND json_extract(detail, '$.reason') IN ('bot-source', 'automatic-publication', 'unauthorized-sender', 'invalid-event')
-        LIMIT 1`).get(discordId, discordId);
+        UNION ALL SELECT 1 FROM receipts WHERE kind='direct-post-outcome'
+          AND json_extract(detail, '$.messageId')=?
+          AND json_extract(detail, '$.outcome')='sent'
+        LIMIT 1`).get(discordId, discordId, discordId);
       return Boolean(row);
+    },
+
+    listPendingOrdinaryHandoffChannels(state) {
+      return state.db.prepare(`SELECT DISTINCT b.channel_id AS channelId
+        FROM bindings b
+        JOIN receipts r ON r.kind='ordinary-handoff'
+          AND json_extract(r.detail, '$.channelId')=b.channel_id
+          AND CAST(json_extract(r.detail, '$.generation') AS INTEGER)=b.generation
+        WHERE b.active=1 AND b.readiness IN ('pending', 'recovering')
+        ORDER BY b.channel_id`).all().map(row => row.channelId);
     },
 
     checkpointIntake(state, channelId, coverageId, expectedBinding = null) {

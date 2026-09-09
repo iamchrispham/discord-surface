@@ -940,10 +940,14 @@ class DiscordGateway {
     const timer = setTimeout(() => {
       if (this.pendingHandoffRecoveryPollTimer === timer) this.pendingHandoffRecoveryPollTimer = null;
       if (this.stopping || !this.started) return;
+      const pendingHandoffChannels = new Set(this.state.listPendingOrdinaryHandoffChannels?.() || []);
       for (const binding of this.state.listBindings?.() || []) {
         if (binding.active && binding.readiness === READINESS.PENDING && this.state.isOrdinaryBinding?.(binding)) {
-          this.scheduleDeferredHandoffRecovery(binding.channelId, { pendingGeneration: true });
+          pendingHandoffChannels.add(binding.channelId);
         }
+      }
+      for (const channelId of pendingHandoffChannels) {
+        this.scheduleDeferredHandoffRecovery(channelId, { pendingGeneration: true });
       }
       this.schedulePendingHandoffRecoveryPoll();
     }, PENDING_HANDOFF_RECOVERY_POLL_MS);
