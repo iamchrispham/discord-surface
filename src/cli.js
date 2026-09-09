@@ -1235,14 +1235,17 @@ function readProcessCommand(pid) {
 }
 
 function pidMatches(value, stateDir, db, command) {
-  if (!value || value.command !== 'run' || value.stateDir !== stateDir || value.db !== db) return false;
+  if (!value || value.command !== 'run' || value.stateDir !== stateDir) return false;
   try {
     const actualCommand = (command ?? readProcessCommand(value.pid)).trim();
     const expectedPrefix = `${process.execPath} ${__filename} run --state-dir ${stateDir}`;
-    if (actualCommand === expectedPrefix) return db === path.join(stateDir, 'surface.sqlite');
+    if (actualCommand === expectedPrefix) {
+      return (value.db == null || value.db === db) && db === path.join(stateDir, 'surface.sqlite');
+    }
     const suffix = actualCommand.startsWith(expectedPrefix) ? actualCommand.slice(expectedPrefix.length).trim() : '';
     const commandDb = suffix.startsWith('--db=') ? suffix.slice('--db='.length) : suffix.startsWith('--db ') ? suffix.slice('--db '.length).trim() : null;
     if (!commandDb) return false;
+    if (value.db !== db) return false;
     const unquotedDb = commandDb.length >= 2 && ((commandDb.startsWith('"') && commandDb.endsWith('"')) || (commandDb.startsWith("'") && commandDb.endsWith("'")))
       ? commandDb.slice(1, -1)
       : commandDb;
