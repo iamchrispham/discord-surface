@@ -135,7 +135,8 @@ async function readSessionHeaderAsync(file, signal = null) {
     return Buffer.concat(parts).toString('utf8');
   } finally {
     if (signal && onAbort) signal.removeEventListener('abort', onAbort);
-    await closeHandle();
+    const closing = closeHandle();
+    if (!signal?.aborted) await closing;
   }
 }
 
