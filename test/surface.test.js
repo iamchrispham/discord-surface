@@ -386,6 +386,7 @@ test('simulated: deterministic saved receipt follows durable intake and does not
   const resultPromise = consumer.handleMessage(discordMessage({ id: 'receipt-input', channelId: 'receipt-codex' }));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(dispatchStarted, true);
+  assert.equal(receiptPayload.reaction, '📥');
   assert.equal(receiptPayload.content, 'Receipt: saved for this conductor.');
   assert.equal(receiptPayload.enforceNonce, true);
   assert.ok(receiptPayload.nonce.length <= 25);
@@ -396,6 +397,9 @@ test('simulated: deterministic saved receipt follows durable intake and does not
   await consumer.waitForReceipts();
   const receiptOutcome = state.getTransportReceipt('receipt-input').outcome;
   assert.equal(receiptOutcome.outcome, 'sent');
+  assert.equal(receiptOutcome.reaction, '📥');
+  assert.equal(receiptOutcome.targetMessageId, 'receipt-input');
+  assert.equal(receiptOutcome.receiptMessageId, undefined);
   assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
   state.close();
 });
@@ -1952,7 +1956,7 @@ test('simulated: real-client receipt uses one abortable request without SDK send
   let channelSendCalls = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (url, options) => {
-    if (String(url).includes('/reactions/')) {
+    if (String(url).includes(encodeURIComponent('👀'))) {
       acknowledgmentFetches += 1;
       return Promise.resolve({ ok: true, status: 204 });
     }
@@ -1989,11 +1993,10 @@ test('simulated: real-client receipt uses one abortable request without SDK send
     assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
     await gateway.stop();
     assert.equal(fetchCalls, 1);
-    assert.equal(capturedUrl, 'https://discord.com/api/v10/channels/receipt-http/messages');
+    assert.equal(capturedUrl, `https://discord.com/api/v10/channels/receipt-http/messages/receipt-http-input/reactions/${encodeURIComponent('📥')}/@me`);
+    assert.equal(capturedOptions.method, 'PUT');
     assert.equal(capturedOptions.headers.Authorization, 'Bot fake-token');
-    assert.equal(JSON.parse(capturedOptions.body).enforce_nonce, true);
-    assert.deepEqual(JSON.parse(capturedOptions.body).allowed_mentions, { parse: [], replied_user: false });
-    assert.deepEqual(JSON.parse(capturedOptions.body).message_reference, { message_id: 'receipt-http-input', fail_if_not_exists: false });
+    assert.equal(capturedOptions.body, undefined);
     assert.equal(capturedSignal.aborted, true);
     assert.equal(channelSendCalls, 1);
     assert.equal(state.getTransportReceipt('receipt-http-input').outcome.outcome, 'unknown');
@@ -2014,7 +2017,7 @@ test('simulated: rejected receipt response cancels its body before dropping the 
   let bodyCancelled = false;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async url => {
-    if (String(url).includes('/reactions/')) return { ok: true, status: 204 };
+    if (String(url).includes(encodeURIComponent('👀'))) return { ok: true, status: 204 };
     fetchCalls += 1;
     return {
       ok: false,
@@ -3320,11 +3323,12 @@ test('simulated: accepted recovery transfers submitted custody without blocking 
   state.close();
   state = new SurfaceState(db);
   const sends = [];
+  const reactions = [];
   let dispatches = 0;
   let observations = 0;
   let release;
   const channel = {
-    messages: { fetch: async () => ({ react: async () => {} }) },
+    messages: { fetch: async () => ({ react: async reaction => { reactions.push(reaction); } }) },
     async send(payload) {
       sends.push(payload);
       return { id: `sent-${sends.length}` };
@@ -3357,7 +3361,8 @@ test('simulated: accepted recovery transfers submitted custody without blocking 
   assert.equal(dispatches, 1);
   assert.equal(observations, 1);
   assert.equal(state.getMessage('accepted-recovery-late').state, MESSAGE_STATES.SUBMITTED);
-  assert.equal(sends.filter(payload => String(payload.content).startsWith('Receipt:')).length, 1);
+  assert.equal(sends.filter(payload => String(payload.content).startsWith('Receipt:')).length, 0);
+  assert.deepEqual(reactions, ['📥']);
   release({ text: 'answer after recovery' });
   for (let attempt = 0; attempt < 100 && state.getMessage('accepted-recovery-late').state !== MESSAGE_STATES.REPLIED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
   assert.equal(state.getMessage('accepted-recovery-late').state, MESSAGE_STATES.REPLIED);
