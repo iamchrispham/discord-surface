@@ -1242,7 +1242,8 @@ test('explicit ordinary handoff fences remote messages through its ownership com
     const recovered = new SurfaceState(db);
     const snapshot = {
       binding: recovered.getBinding(original.channelId),
-      watermark: recovered.getIntakeWatermark(original.channelId)
+      watermark: recovered.getIntakeWatermark(original.channelId),
+      retainedEvidence: recovered.hasIntakeEvidence('151')
     };
     const postAbortIntake = recovered.acceptDiscordMessage({
       id: '160', guildId: 'guild', channelId: original.channelId, authorId: 'operator', content: 'message after aborted handoff'
@@ -1254,8 +1255,9 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   const accepted = await invokeCase('100');
   assert.equal(accepted.error, undefined);
   assert.equal(accepted.result.binding.generation, 2);
-  assert.equal(accepted.snapshot.watermark.last_seen_id, '150');
+  assert.equal(accepted.snapshot.watermark.last_seen_id, '151');
   assert.equal(accepted.snapshot.watermark.recovered_through_id, '150');
+  assert.equal(accepted.snapshot.retainedEvidence, true);
   assert.equal(accepted.lateIntake.accepted, false);
   assert.equal(accepted.lateIntake.reason, 'handoff-intake-paused');
   assert.equal(accepted.beforeFenceFetches, 1);
@@ -1265,6 +1267,8 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.match(rejected.error?.message || '', /durably drained/);
   assert.equal(rejected.snapshot.binding.generation, 1);
   assert.equal(rejected.snapshot.binding.nativeId, CODEX);
+  assert.equal(rejected.snapshot.watermark.last_seen_id, '151');
+  assert.equal(rejected.snapshot.retainedEvidence, true);
   assert.equal(rejected.lateIntake.accepted, false);
   assert.equal(rejected.lateIntake.reason, 'handoff-intake-paused');
   assert.equal(rejected.postAbortIntake.accepted, true);

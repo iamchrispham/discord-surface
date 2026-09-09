@@ -1474,6 +1474,7 @@ class SurfaceState {
           const binding = this.getBinding(event.channelId);
           if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
           if (this.ordinaryHandoffPauses.has(event.channelId) || this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+            this.upsertIntakeWatermark(event, false, coverageId);
             this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
             return this.reject('handoff-intake-paused');
           }
@@ -1490,6 +1491,7 @@ class SurfaceState {
       const binding = this.getBinding(event.channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
       if (this.ordinaryHandoffPauses.has(event.channelId) || this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+        this.upsertIntakeWatermark(event, false, coverageId);
         this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
         return this.reject('handoff-intake-paused');
       }
