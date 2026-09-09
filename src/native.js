@@ -420,8 +420,8 @@ function* readClaudeSessionMetadata(file) {
       recordLength = 0;
       return row;
     };
-    while (true) {
-      const count = fs.readSync(fd, chunk, 0, chunk.length, position);
+    while (position < size) {
+      const count = fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - position), position);
       if (!count) break;
       position += count;
       let start = 0;

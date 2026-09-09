@@ -118,6 +118,19 @@ test('ordinary Claude accepts single or equal transcript IDs and rejects conflic
   assert.equal(validateClaudeSessionIdentity(CLAUDE, equalAliases).sessionId, CLAUDE);
   assert.throws(() => validateClaudeSessionIdentity(CLAUDE, conflicting), /Claude transcript identity is ambiguous/);
   assert.throws(() => validateClaudeSessionIdentity(CLAUDE, lateConflict), /identity is ambiguous/);
+
+  const growing = write('growing.jsonl', { ...metadata, sessionId: CLAUDE });
+  const realReadSync = fs.readSync;
+  let appended = false;
+  t.mock.method(fs, 'readSync', (fd, buffer, offset, length, position) => {
+    const count = realReadSync(fd, buffer, offset, length, position);
+    if (!appended) {
+      appended = true;
+      fs.appendFileSync(growing, `${JSON.stringify({ ...metadata, sessionId: OTHER })}\n`);
+    }
+    return count;
+  });
+  assert.equal(validateClaudeSessionIdentity(CLAUDE, growing).sessionId, CLAUDE);
 });
 
 test('oversized Claude metadata records fail closed', t => {

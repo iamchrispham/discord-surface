@@ -215,7 +215,8 @@ async function ordinaryBind(args, dependencies = {}) {
     }
     const gatewayWake = requestGatewayRecovery(paths, {
       status: gatewayStatus,
-      kill: dependencies.killProcess || process.kill
+      kill: dependencies.killProcess || process.kill,
+      expectedPid: expectedRuntimePid
     });
     output({ bound: true, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE, binding: state.getBinding(binding.channelId), nativeProof, gatewayWake });
     return { binding: state.getBinding(binding.channelId), nativeProof, gatewayWake, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE };

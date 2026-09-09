@@ -2796,6 +2796,12 @@ require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
       signal: 'SIGUSR2'
     });
     await waitForCondition(() => fs.existsSync(wakeMarker) && fs.readFileSync(wakeMarker, 'utf8') === '2');
+    assert.deepEqual(requestGatewayRecovery(paths, { expectedPid: matching.pid + 1 }), {
+      requested: false,
+      pid: matching.pid,
+      state: 'running',
+      reason: 'gateway-changed'
+    });
 
     fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, db, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
     assert.deepEqual(requestGatewayRecovery(paths), {

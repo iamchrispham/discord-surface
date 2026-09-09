@@ -131,10 +131,13 @@ function serverDerivedChannelCutoff(channel) {
   return typeof channel?.id === 'string' && /^\d+$/.test(channel.id) ? channel.id : null;
 }
 
-function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill } = {}) {
+function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill, expectedPid } = {}) {
   const runtime = status(paths);
   if (runtime?.state !== 'running' || !runtime.pid) {
     return { requested: false, state: runtime?.state || 'unknown', reason: 'gateway-not-running' };
+  }
+  if (expectedPid !== undefined && String(runtime.pid) !== String(expectedPid)) {
+    return { requested: false, pid: runtime.pid, state: runtime.state, reason: 'gateway-changed' };
   }
   if (!runtime.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryBindWake)) {
     return {

@@ -269,6 +269,39 @@ test('ordinary bind refuses an incompatible running Gateway before mutation', as
   assert.equal(printed, false);
 });
 
+test('ordinary bind does not wake a replacement Gateway after commit', async t => {
+  const f = fixture(t);
+  const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const wakeSignals = [];
+  let reads = 0;
+  class Client {
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: {
+        fetch: async selection => selection ? channel : new Map([[channel.id, channel]])
+      } }) };
+    }
+    async login() {}
+    async destroy() {}
+  }
+  const selected = { state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock] };
+  const replacement = { state: 'running', pid: 4243, capabilities: [] };
+  const result = await ordinaryBind({ 'state-dir': f.dir, channel: '#dev', workspace: f.dir }, {
+    environment: {
+      CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: f.dir,
+      DISCORD_SURFACE_ORDINARY_CODEX_RUNTIME_PID: String(selected.pid)
+    },
+    requireInstalled: () => ({ Client, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    validateCodexSessionIdentity: () => ({ file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir }),
+    gatewayProcessStatus: () => (++reads < 3 ? selected : replacement),
+    killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
+    print: () => {}
+  });
+  assert.deepEqual(result.gatewayWake, { requested: false, pid: replacement.pid, state: 'running', reason: 'gateway-changed' });
+  assert.deepEqual(wakeSignals, []);
+  assert.equal(f.state.getBinding(channel.id).readiness, READINESS.PENDING);
+});
+
 test('ordinary bind rolls back when Gateway becomes incompatible after history fetch', async t => {
   const f = fixture(t);
   const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
