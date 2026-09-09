@@ -117,7 +117,7 @@ function recoverInterruptedOrdinaryHandoffIntake(state, channelId, expectedBindi
   if (pauseOwnerAlive(state, pause)) return null;
   const snapshot = pause.snapshot;
   if (!snapshot || typeof snapshot.state !== 'string') return null;
-  const pauseMetadata = { ownerToken: pause.ownerToken };
+  const pauseMetadata = { ownerToken: pause.ownerToken, preserveUnavailable: true };
   const restored = state.markIntakeBoundary(channelId, snapshot.state || readyState, snapshot.detail || null,
     snapshot.gapFrom || null, snapshot.gapTo || null, expectedBinding || pause.expectedBinding || null,
     pauseMetadata);
@@ -215,6 +215,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
         if (!intakePauseAllowsUpdate(state, channelId, pauseMetadata)) return null;
         if (pauseMetadata && Object.prototype.hasOwnProperty.call(pauseMetadata, 'expectedReadiness')
           && binding?.readiness !== pauseMetadata.expectedReadiness) return null;
+        if (pauseMetadata?.preserveUnavailable && binding?.readiness === READINESS.UNAVAILABLE) return null;
         if (!existing && !binding) throw new BindingError('intake channel is unknown');
         if (boundaryState === 'ready' && state.isOrdinaryBinding(binding) && !state.hasOrdinaryPreflight(binding)) {
           throw new BindingError('ordinary Codex native preflight is required before READY');

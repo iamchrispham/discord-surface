@@ -1293,6 +1293,38 @@ test('aborted ordinary handoff preserves a newer unavailable readiness result', 
   assert.equal(f.state.ordinaryHandoffPauses.has(binding.channelId), true);
 });
 
+test('interrupted ordinary handoff preserves a newer unavailable readiness result', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.recordOrdinaryPreflight(binding, {
+    file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary handoff drained', null, null, binding);
+  f.state.pauseOrdinaryHandoffIntake(binding.channelId, binding);
+  f.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, 'native proof failed', binding);
+  const pausedReceipt = f.state.listReceipts().find(receipt => receipt.kind === 'ordinary-handoff-intake-paused');
+  const pausedDetail = JSON.parse(pausedReceipt.detail);
+  pausedDetail.ownerPid = 999999;
+  f.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(JSON.stringify(pausedDetail), pausedReceipt.id);
+  f.state.ordinaryHandoffPauses.clear();
+  f.state.ordinaryHandoffPauseSnapshots.clear();
+  f.state.close();
+
+  const recovered = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+  t.after(() => recovered.close());
+  const restored = recovered.recoverInterruptedOrdinaryHandoffIntake(binding.channelId, binding);
+
+  assert.equal(restored, null);
+  assert.equal(recovered.getBinding(binding.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.equal(recovered.getIntakeWatermark(binding.channelId).state, READINESS.PENDING);
+  assert.equal(recovered.listReceipts().some(receipt => receipt.kind === 'ordinary-handoff-intake-recovered'), false);
+  const intake = recovered.acceptDiscordMessage({
+    id: '200', guildId: 'guild', channelId: binding.channelId, authorId: 'operator', content: 'after failed recovery'
+  });
+  assert.equal(intake.accepted, false);
+  assert.equal(intake.reason, 'handoff-intake-paused');
+});
+
 test('interrupted ordinary handoff pause restores readiness from durable ownership state', t => {
   const f = fixture(t);
   const binding = ordinary(f);
