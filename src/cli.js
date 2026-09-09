@@ -609,7 +609,12 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
   const assertGatewayCompatible = () => assertGatewayWakeCompatible(paths, gatewayStatus);
   let client;
+  let runtimeInterlock;
   try {
+    const runtime = gatewayStatus(paths);
+    const supportsBindLock = runtime?.state === 'running' && runtime.pid && runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock);
+    const lockPath = supportsBindLock ? paths.bindLock : paths.lock;
+    runtimeInterlock = await acquireHeldLockUntilAvailable(lockPath);
     assertGatewayCompatible();
     const config = state.requireConfig();
     const current = state.getBinding(channelId);
@@ -655,6 +660,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       readiness: binding.readiness, gatewayWake });
     return { binding, gatewayWake, handoffReconciled: Boolean(binding.handoffReconciled) };
   } finally {
+    await runtimeInterlock?.release();
     await client?.destroy();
     state.close();
   }
@@ -889,29 +895,15 @@ function acquireHeldLock(lockPath) {
   });
 }
 
-const RUNTIME_BIND_LOCK_TIMEOUT_MS = 30_000;
-
 async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
-  const deadline = Date.now() + RUNTIME_BIND_LOCK_TIMEOUT_MS;
-  const timeoutError = () => {
-    process.stderr.write('discord-surface: runtime bind lock wait timed out; giving up\n');
-    const error = new Error('timed out waiting for runtime bind lock');
-    error.code = 'RUNTIME_BIND_LOCK_TIMEOUT';
-    return error;
-  };
   let reportedContention = false;
   while (!isStopping?.()) {
-    if (Date.now() >= deadline) {
-      throw timeoutError();
-    }
     try {
       const lock = await acquireHeldLock(lockPath);
       const stopping = isStopping?.();
-      const expired = Date.now() >= deadline;
-      if (stopping || expired) {
+      if (stopping) {
         await lock.release();
-        if (stopping) return null;
-        throw timeoutError();
+        return null;
       }
       return lock;
     }
@@ -922,11 +914,7 @@ async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
         process.stderr.write('discord-surface: runtime bind lock is busy; waiting for the holder to release it\n');
       }
       if (isStopping?.()) return null;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw timeoutError();
-      }
-      await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)));
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
   return null;
