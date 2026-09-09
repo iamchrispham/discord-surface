@@ -16,6 +16,7 @@ const { GATEWAY_CAPABILITIES } = require('./constants');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('../ordinary/constants');
 
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
+const ORDINARY_CODEX_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CODEX_RUNTIME_PID';
 const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID';
 
 function required(args, key) {
@@ -128,7 +129,16 @@ async function ordinaryBind(args, dependencies = {}) {
     const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, effectiveSessionRoot);
     if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
     const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
-    const assertGatewayCompatible = runtime => assertGatewayWakeCompatible(paths, gatewayStatus, runtime);
+    const expectedRuntimePid = environment[ORDINARY_CODEX_RUNTIME_PID_ENV];
+    const assertGatewayCompatible = runtime => {
+      const snapshot = assertGatewayWakeCompatible(paths, gatewayStatus, runtime);
+      if (expectedRuntimePid !== undefined &&
+        (snapshot?.state !== 'running' || String(snapshot.pid) !== expectedRuntimePid ||
+          !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock))) {
+        throw new Error('running Gateway changed while binding ordinary Codex session');
+      }
+      return snapshot;
+    };
     assertGatewayCompatible();
     const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: effectiveSessionRoot } : null;
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);

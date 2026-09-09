@@ -19,6 +19,7 @@ const { GATEWAY_CAPABILITIES } = require('./ordinary-bind/constants');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 
 const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID';
+const ORDINARY_CODEX_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CODEX_RUNTIME_PID';
 const LOCK_CONTENTION_EXIT = 75;
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
 const { runLiaisonDraft } = require('./liaison');
@@ -176,7 +177,8 @@ function ordinaryBindCommand(args) {
   runLockedOrdinaryCommand(args, {
     command: 'ordinary-bind-run',
     environmentKey: 'DISCORD_SURFACE_ORDINARY_BIND_LOCK_HELD',
-    lockPath
+    lockPath,
+    environment: supportsBindLock ? { [ORDINARY_CODEX_RUNTIME_PID_ENV]: String(runtime.pid) } : {}
   });
 }
 
