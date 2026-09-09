@@ -1,15 +1,34 @@
+const crypto = require('node:crypto');
+
 function pauseOrdinaryHandoffIntake(state, channelId, expectedBinding, pendingState, detail) {
   const binding = state.getBinding(channelId);
   const watermark = state.getIntakeWatermark(channelId);
-  state.ordinaryHandoffPauseSnapshots?.set(channelId, {
+  const snapshot = {
     state: watermark?.state || (binding?.readiness === 'ready' ? 'ready' : 'pending'),
     detail: watermark?.detail || null,
     gapFrom: watermark?.gap_from || null,
-    gapTo: watermark?.gap_to || null
-  });
+    gapTo: watermark?.gap_to || null,
+    expectedBinding: expectedBinding || binding || null,
+    ownerPid: process.pid,
+    ownerIdentity: state.directPostOwnerIdentity?.(process.pid) || null,
+    ownerToken: crypto.randomUUID()
+  };
+  state.ordinaryHandoffPauseSnapshots?.set(channelId, snapshot);
   state.ordinaryHandoffPauses.add(channelId);
   try {
-    const result = state.markIntakeBoundary(channelId, pendingState, detail, null, null, expectedBinding);
+    const result = state.markIntakeBoundary(channelId, pendingState, detail, null, null, expectedBinding, {
+      channelId,
+      ownerPid: snapshot.ownerPid,
+      ownerIdentity: snapshot.ownerIdentity,
+      ownerToken: snapshot.ownerToken,
+      snapshot: {
+        state: snapshot.state,
+        detail: snapshot.detail,
+        gapFrom: snapshot.gapFrom,
+        gapTo: snapshot.gapTo
+      },
+      expectedBinding: snapshot.expectedBinding
+    });
     if (!result) {
       state.ordinaryHandoffPauses.delete(channelId);
       state.ordinaryHandoffPauseSnapshots?.delete(channelId);
@@ -26,11 +45,57 @@ function restoreOrdinaryHandoffIntake(state, channelId, expectedBinding) {
   const snapshot = state.ordinaryHandoffPauseSnapshots?.get(channelId);
   let result = null;
   if (snapshot) {
-    result = state.markIntakeBoundary(channelId, snapshot.state, snapshot.detail, snapshot.gapFrom, snapshot.gapTo, expectedBinding);
+    result = state.markIntakeBoundary(channelId, snapshot.state, snapshot.detail, snapshot.gapFrom, snapshot.gapTo,
+      expectedBinding || snapshot.expectedBinding || null);
   }
   state.ordinaryHandoffPauses.delete(channelId);
   state.ordinaryHandoffPauseSnapshots?.delete(channelId);
   return result;
+}
+
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function pauseOwnerAlive(state, pause) {
+  if (pause.ownerPid === process.pid) return true;
+  if (!processAlive(pause.ownerPid)) return false;
+  if (!pause.ownerIdentity || typeof state.directPostOwnerIdentity !== 'function') return true;
+  const actualIdentity = state.directPostOwnerIdentity(pause.ownerPid);
+  if (!actualIdentity) return true;
+  if (pause.ownerIdentity.ownerStartTime && actualIdentity.ownerStartTime !== pause.ownerIdentity.ownerStartTime) return false;
+  if (pause.ownerIdentity.ownerCommand && actualIdentity.ownerCommand !== pause.ownerIdentity.ownerCommand) return false;
+  return true;
+}
+
+function recoverInterruptedOrdinaryHandoffIntake(state, channelId, expectedBinding, readyState, handoffDetail) {
+  if (state.ordinaryHandoffPauses?.has(channelId)) return null;
+  const watermark = state.getIntakeWatermark(channelId);
+  if (!watermark || watermark.detail !== handoffDetail) return null;
+  const row = state.db.prepare("SELECT detail FROM receipts WHERE kind='ordinary-handoff-intake-paused' AND json_extract(detail, '$.channelId')=? ORDER BY id DESC LIMIT 1").get(channelId);
+  if (!row) return null;
+  let pause;
+  try { pause = JSON.parse(row.detail); } catch { return null; }
+  if (pauseOwnerAlive(state, pause)) return null;
+  const snapshot = pause.snapshot;
+  if (!snapshot || typeof snapshot.state !== 'string') return null;
+  const restored = state.markIntakeBoundary(channelId, snapshot.state || readyState, snapshot.detail || null,
+    snapshot.gapFrom || null, snapshot.gapTo || null, expectedBinding || pause.expectedBinding || null);
+  if (!restored) return null;
+  state.receipt(null, 'ordinary-handoff-intake-recovered', {
+    channelId,
+    ownerPid: pause.ownerPid,
+    ownerIdentity: pause.ownerIdentity,
+    ownerToken: pause.ownerToken,
+    state: restored.state
+  });
+  return restored;
 }
 
 function intakeCutoffDecision(eventId, cutoffId, compare) {
@@ -46,7 +111,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
       const row = state.db.prepare(`SELECT 1 FROM messages WHERE discord_id=?
         UNION ALL SELECT 1 FROM receipts WHERE kind='intake-rejected'
           AND json_extract(detail, '$.discordId')=?
-          AND json_extract(detail, '$.reason') IN ('bot-source', 'automatic-publication', 'unauthorized-sender', 'invalid-event', 'handoff-intake-paused')
+          AND json_extract(detail, '$.reason') IN ('bot-source', 'automatic-publication', 'unauthorized-sender', 'invalid-event')
         LIMIT 1`).get(discordId, discordId);
       return Boolean(row);
     },
@@ -106,7 +171,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
       return state.getIntakeWatermark(channelId);
     },
 
-    markIntakeBoundary(state, channelId, boundaryState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null) {
+    markIntakeBoundary(state, channelId, boundaryState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null) {
       assertText(channelId, 'channelId', 128);
       if (!['pending', 'ready', 'gap', 'unavailable'].includes(boundaryState)) throw new BindingError('invalid intake watermark state');
       return state.transaction(() => {
@@ -131,6 +196,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
           state.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
         }
         state.receipt(null, 'intake-boundary', { channelId, state: boundaryState, detail: detail || undefined, gapFrom: gapFrom || undefined, gapTo: gapTo || undefined });
+        if (pauseMetadata) state.receipt(null, 'ordinary-handoff-intake-paused', pauseMetadata);
         return state.getIntakeWatermark(channelId);
       });
     },
@@ -156,5 +222,6 @@ module.exports = {
   createIntakeHandlers,
   intakeCutoffDecision,
   pauseOrdinaryHandoffIntake,
-  restoreOrdinaryHandoffIntake
+  restoreOrdinaryHandoffIntake,
+  recoverInterruptedOrdinaryHandoffIntake
 };

@@ -1257,7 +1257,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.equal(accepted.result.binding.generation, 2);
   assert.equal(accepted.snapshot.watermark.last_seen_id, '151');
   assert.equal(accepted.snapshot.watermark.recovered_through_id, '150');
-  assert.equal(accepted.snapshot.retainedEvidence, true);
+  assert.equal(accepted.snapshot.retainedEvidence, false);
   assert.equal(accepted.lateIntake.accepted, false);
   assert.equal(accepted.lateIntake.reason, 'handoff-intake-paused');
   assert.equal(accepted.beforeFenceFetches, 1);
@@ -1268,11 +1268,40 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.equal(rejected.snapshot.binding.generation, 1);
   assert.equal(rejected.snapshot.binding.nativeId, CODEX);
   assert.equal(rejected.snapshot.watermark.last_seen_id, '151');
-  assert.equal(rejected.snapshot.retainedEvidence, true);
+  assert.equal(rejected.snapshot.retainedEvidence, false);
   assert.equal(rejected.lateIntake.accepted, false);
   assert.equal(rejected.lateIntake.reason, 'handoff-intake-paused');
   assert.equal(rejected.postAbortIntake.accepted, true);
   assert.equal(rejected.wasDeleted(), true);
+});
+
+test('interrupted ordinary handoff pause restores readiness from durable ownership state', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.recordOrdinaryPreflight(binding, {
+    file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary handoff baseline');
+  f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary handoff drained', null, null, binding);
+  f.state.pauseOrdinaryHandoffIntake(binding.channelId, binding);
+  const pausedReceipt = f.state.listReceipts().find(receipt => receipt.kind === 'ordinary-handoff-intake-paused');
+  const pausedDetail = JSON.parse(pausedReceipt.detail);
+  pausedDetail.ownerPid = 999999;
+  f.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(JSON.stringify(pausedDetail), pausedReceipt.id);
+  f.state.ordinaryHandoffPauses.clear();
+  f.state.ordinaryHandoffPauseSnapshots.clear();
+  f.state.close();
+
+  const recovered = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+  t.after(() => recovered.close());
+  assert.equal(recovered.getIntakeWatermark(binding.channelId).state, READINESS.PENDING);
+  const restored = recovered.recoverInterruptedOrdinaryHandoffIntake(binding.channelId, binding);
+  assert.equal(restored.state, READINESS.READY);
+  assert.equal(recovered.getBinding(binding.channelId).readiness, READINESS.READY);
+  const intake = recovered.acceptDiscordMessage({
+    id: '200', guildId: 'guild', channelId: binding.channelId, authorId: 'operator', content: 'after recovery'
+  });
+  assert.equal(intake.accepted, true);
 });
 
 test('ordinary unbind fences remote intake before revoking custody', async t => {

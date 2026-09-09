@@ -5,7 +5,13 @@ const { DatabaseSync } = require('node:sqlite');
 const { normalizeAttachments } = require('./attachments');
 const { createDirectPostHandlers, queryDirectPostRows } = require('./state/direct-post');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
-const { createIntakeHandlers, intakeCutoffDecision, pauseOrdinaryHandoffIntake, restoreOrdinaryHandoffIntake } = require('./state/intake');
+const {
+  createIntakeHandlers,
+  intakeCutoffDecision,
+  pauseOrdinaryHandoffIntake,
+  restoreOrdinaryHandoffIntake,
+  recoverInterruptedOrdinaryHandoffIntake
+} = require('./state/intake');
 
 const SCHEMA_VERSION = '1.6';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -1344,8 +1350,8 @@ class SurfaceState {
     return this.db.prepare('SELECT * FROM intake_watermarks ORDER BY channel_id').all();
   }
 
-  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null) {
-    return intakeHandlers.markIntakeBoundary(this, channelId, state, detail, gapFrom, gapTo, expectedBinding);
+  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null) {
+    return intakeHandlers.markIntakeBoundary(this, channelId, state, detail, gapFrom, gapTo, expectedBinding, pauseMetadata);
   }
 
   pauseOrdinaryHandoffIntake(channelId, expectedBinding = null) {
@@ -1360,6 +1366,16 @@ class SurfaceState {
 
   restoreOrdinaryHandoffIntake(channelId, expectedBinding = null) {
     return restoreOrdinaryHandoffIntake(this, channelId, expectedBinding);
+  }
+
+  recoverInterruptedOrdinaryHandoffIntake(channelId, expectedBinding = null) {
+    return recoverInterruptedOrdinaryHandoffIntake(
+      this,
+      channelId,
+      expectedBinding,
+      READINESS.READY,
+      INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF
+    );
   }
 
   recordTopicPublication(channelId, publication, expectedBinding = null) {
@@ -1464,6 +1480,7 @@ class SurfaceState {
   acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null } = {}) {
     const config = this.requireConfig();
     if (coverageId !== null) assertText(coverageId, 'coverageId', 128);
+    if (typeof event?.channelId === 'string') this.recoverInterruptedOrdinaryHandoffIntake(event.channelId, expectedBinding);
     let attachments;
     try { attachments = normalizeAttachments(event?.attachments); } catch { attachments = null; }
     const validEvent = event && [event.id, event.guildId, event.channelId, event.authorId].every(value => typeof value === 'string' && value.length > 0) &&
@@ -2148,6 +2165,13 @@ class SurfaceState {
 
   close() {
     if (!this.db) return;
+    for (const channelId of this.ordinaryHandoffPauses) {
+      try { this.restoreOrdinaryHandoffIntake(channelId); } catch (error) {
+        this.auditReceipt(null, 'ordinary-handoff-intake-restore-failed', {
+          channelId, error: error.message
+        });
+      }
+    }
     this.ordinaryHandoffPauses.clear();
     this.ordinaryHandoffPauseSnapshots.clear();
     this.db.close();

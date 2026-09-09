@@ -832,6 +832,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
     let recoveredThrough = null;
     if (current.active) {
+      state.recoverInterruptedOrdinaryHandoffIntake(channelId, current);
       const watermark = state.getIntakeWatermark(channelId);
       recoveredThrough = watermark?.recovered_through_id || null;
       if (!handoffRetry && (watermark?.state !== READINESS.READY || !recoveredThrough)) {

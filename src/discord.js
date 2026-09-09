@@ -592,14 +592,19 @@ class DiscordGateway {
     });
     this.boundMessage = message => {
       if (this.stopping) return;
+      if (typeof message?.channelId === 'string') this.state.recoverInterruptedOrdinaryHandoffIntake?.(message.channelId);
       const binding = this.state.getBinding(message?.channelId);
       const bindingReady = binding?.readiness === READINESS.READY;
       const readyLive = this.ready && bindingReady;
+      const heldReady = !this.ready && bindingReady;
       const controller = new AbortController();
       this.controllers.add(controller);
       const work = (readyLive
         ? this.consumer.handleMessage(message, controller.signal, binding, () => this.noteLiveIntake(message))
-        : this.consumer.intakeMessage(message, bindingReady, null, null, true))
+        : this.consumer.intakeMessage(message, bindingReady, null, null, true).then(intake => {
+          if (heldReady && !intake?.stale) this.noteLiveIntake(message);
+          return intake;
+        }))
         .catch(error => this.logger(`message handling failed: ${error.message}`))
         .finally(() => {
           this.controllers.delete(controller);
