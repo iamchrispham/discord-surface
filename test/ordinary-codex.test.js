@@ -1314,15 +1314,20 @@ test('interrupted ordinary handoff preserves a newer unavailable readiness resul
   t.after(() => recovered.close());
   const restored = recovered.recoverInterruptedOrdinaryHandoffIntake(binding.channelId, binding);
 
-  assert.equal(restored, null);
+  assert.equal(restored.state, READINESS.PENDING);
   assert.equal(recovered.getBinding(binding.channelId).readiness, READINESS.UNAVAILABLE);
   assert.equal(recovered.getIntakeWatermark(binding.channelId).state, READINESS.PENDING);
-  assert.equal(recovered.listReceipts().some(receipt => receipt.kind === 'ordinary-handoff-intake-recovered'), false);
+  assert.equal(recovered.listReceipts().some(receipt => receipt.kind === 'ordinary-handoff-intake-recovered'), true);
+  const superseded = recovered.listReceipts().find(receipt => receipt.kind === 'ordinary-handoff-intake-pause-superseded');
+  assert.equal(JSON.parse(superseded.detail).channelId, binding.channelId);
+  const reconciled = recovered.reconcileIntake(binding.channelId, binding);
+  assert.equal(reconciled.state, READINESS.PENDING);
+  const reopened = recovered.markIntakeBoundary(binding.channelId, READINESS.READY, 'native proof recovered', null, null, binding);
+  assert.equal(reopened.state, READINESS.READY);
   const intake = recovered.acceptDiscordMessage({
-    id: '200', guildId: 'guild', channelId: binding.channelId, authorId: 'operator', content: 'after failed recovery'
+    id: '200', guildId: 'guild', channelId: binding.channelId, authorId: 'operator', content: 'after recovery'
   });
-  assert.equal(intake.accepted, false);
-  assert.equal(intake.reason, 'handoff-intake-paused');
+  assert.equal(intake.accepted, true);
 });
 
 test('interrupted ordinary handoff pause restores readiness from durable ownership state', t => {

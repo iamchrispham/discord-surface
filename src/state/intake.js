@@ -87,13 +87,24 @@ function pauseOwnerAlive(state, pause) {
 function persistedHandoffPause(state, channelId) {
   const watermark = state.getIntakeWatermark(channelId);
   if (!watermark) return null;
-  const row = state.db.prepare("SELECT detail FROM receipts WHERE kind='ordinary-handoff-intake-paused' AND json_extract(detail, '$.channelId')=? ORDER BY id DESC LIMIT 1").get(channelId);
-  if (!row) return null;
+  const row = state.db.prepare("SELECT kind, detail FROM receipts WHERE kind IN ('ordinary-handoff-intake-paused', 'ordinary-handoff-intake-pause-superseded') AND json_extract(detail, '$.channelId')=? ORDER BY id DESC LIMIT 1").get(channelId);
+  if (!row || row.kind !== 'ordinary-handoff-intake-paused') return null;
   let pause;
   try { pause = JSON.parse(row.detail); } catch { return null; }
   if (!pause || typeof pause !== 'object') return null;
   if (pause.pauseState !== watermark.state || pause.pauseDetail !== watermark.detail) return null;
   return pause;
+}
+
+function supersedePersistedHandoffPause(state, channelId, pauseMetadata) {
+  if (!pauseMetadata?.ownerToken) return;
+  state.receipt(null, 'ordinary-handoff-intake-pause-superseded', {
+    channelId,
+    ownerToken: pauseMetadata.ownerToken,
+    pauseState: pauseMetadata.pauseState,
+    pauseDetail: pauseMetadata.pauseDetail,
+    reason: 'unavailable-readiness-preserved'
+  });
 }
 
 function intakePauseAllowsUpdate(state, channelId, pauseMetadata = null) {
@@ -110,8 +121,8 @@ function recoverInterruptedOrdinaryHandoffIntake(state, channelId, expectedBindi
   if (state.ordinaryHandoffPauses?.has(channelId)) return null;
   const watermark = state.getIntakeWatermark(channelId);
   if (!watermark || watermark.detail !== handoffDetail) return null;
-  const row = state.db.prepare("SELECT detail FROM receipts WHERE kind='ordinary-handoff-intake-paused' AND json_extract(detail, '$.channelId')=? ORDER BY id DESC LIMIT 1").get(channelId);
-  if (!row) return null;
+  const row = state.db.prepare("SELECT kind, detail FROM receipts WHERE kind IN ('ordinary-handoff-intake-paused', 'ordinary-handoff-intake-pause-superseded') AND json_extract(detail, '$.channelId')=? ORDER BY id DESC LIMIT 1").get(channelId);
+  if (!row || row.kind !== 'ordinary-handoff-intake-paused') return null;
   let pause;
   try { pause = JSON.parse(row.detail); } catch { return null; }
   if (pauseOwnerAlive(state, pause)) return null;
@@ -215,7 +226,10 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
         if (!intakePauseAllowsUpdate(state, channelId, pauseMetadata)) return null;
         if (pauseMetadata && Object.prototype.hasOwnProperty.call(pauseMetadata, 'expectedReadiness')
           && binding?.readiness !== pauseMetadata.expectedReadiness) return null;
-        if (pauseMetadata?.preserveUnavailable && binding?.readiness === READINESS.UNAVAILABLE) return null;
+        if (pauseMetadata?.preserveUnavailable && binding?.readiness === READINESS.UNAVAILABLE) {
+          supersedePersistedHandoffPause(state, channelId, pauseMetadata);
+          return state.getIntakeWatermark(channelId);
+        }
         if (!existing && !binding) throw new BindingError('intake channel is unknown');
         if (boundaryState === 'ready' && state.isOrdinaryBinding(binding) && !state.hasOrdinaryPreflight(binding)) {
           throw new BindingError('ordinary Codex native preflight is required before READY');
