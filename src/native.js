@@ -241,8 +241,9 @@ function cursorTailBytes(cursor) {
   return typeof cursor?.tail === 'string' ? Buffer.from(cursor.tail, 'utf8') : Buffer.alloc(0);
 }
 
-// This bounds each read, not record size. A valid JSONL record may span blocks.
+// A valid JSONL record may span blocks, but retained metadata stays bounded.
 const TRANSCRIPT_BLOCK_BYTES = 64 * 1024;
+const CLAUDE_METADATA_RECORD_MAX_BYTES = 1024 * 1024;
 
 function readTranscriptBlock(fd, position, length) {
   const bytes = Buffer.allocUnsafe(length);
@@ -347,29 +348,49 @@ function* readClaudeSessionMetadata(file) {
   try {
     const size = fs.fstatSync(fd).size;
     if (!size) throw new Error('Claude transcript metadata is empty');
-    const chunk = Buffer.allocUnsafe(64 * 1024);
-    let remainder = Buffer.alloc(0);
+    const chunk = Buffer.allocUnsafe(TRANSCRIPT_BLOCK_BYTES);
+    let recordParts = [];
+    let recordLength = 0;
+    let oversized = false;
     let position = 0;
     const parseLine = line => {
       if (!line.trim()) return null;
       try { return JSON.parse(line); } catch { return null; }
     };
+    const consumeRecord = (part, complete) => {
+      if (!oversized) {
+        if (recordLength + part.length > CLAUDE_METADATA_RECORD_MAX_BYTES) {
+          oversized = true;
+          recordParts = [];
+        } else if (part.length) {
+          recordParts.push(Buffer.from(part));
+        }
+      }
+      recordLength = Math.min(CLAUDE_METADATA_RECORD_MAX_BYTES + 1, recordLength + part.length);
+      if (!complete) return null;
+      const row = oversized ? null : parseLine(Buffer.concat(recordParts, recordLength).toString('utf8'));
+      recordParts = [];
+      recordLength = 0;
+      oversized = false;
+      return row;
+    };
     while (true) {
       const count = fs.readSync(fd, chunk, 0, chunk.length, position);
       if (!count) break;
       position += count;
-      const data = remainder.length ? Buffer.concat([remainder, chunk.subarray(0, count)]) : chunk.subarray(0, count);
       let start = 0;
-      while (true) {
-        const newline = data.indexOf(0x0a, start);
-        if (newline < 0) break;
-        const row = parseLine(data.subarray(start, newline).toString('utf8'));
+      while (start < count) {
+        const newline = chunk.indexOf(0x0a, start);
+        if (newline < 0) {
+          consumeRecord(chunk.subarray(start, count), false);
+          break;
+        }
+        const row = consumeRecord(chunk.subarray(start, newline), true);
         if (row !== null) yield row;
         start = newline + 1;
       }
-      remainder = Buffer.from(data.subarray(start));
     }
-    const row = parseLine(remainder.toString('utf8'));
+    const row = consumeRecord(Buffer.alloc(0), true);
     if (row !== null) yield row;
   } finally {
     fs.closeSync(fd);
@@ -391,12 +412,15 @@ function readClaudeSessionIdentity(nativeId, transcriptFile) {
     const payloadSessionId = row?.payload?.session_id;
     const hasSessionId = sessionId !== undefined && sessionId !== null;
     const hasPayloadSessionId = payloadSessionId !== undefined && payloadSessionId !== null;
-    if (hasSessionId && hasPayloadSessionId && sessionId !== payloadSessionId) continue;
+    if (row?.entrypoint !== 'cli' || typeof row?.version !== 'string' ||
+      typeof row?.cwd !== 'string' || !path.isAbsolute(row.cwd)) continue;
+    if (hasSessionId && hasPayloadSessionId && sessionId !== payloadSessionId) {
+      throw new Error('Claude transcript identity is ambiguous');
+    }
     let candidateSessionId = null;
     if (hasSessionId) candidateSessionId = sessionId;
     else if (hasPayloadSessionId) candidateSessionId = payloadSessionId;
-    if (candidateSessionId === null || row?.entrypoint !== 'cli' || typeof row?.version !== 'string' ||
-      typeof row?.cwd !== 'string' || !path.isAbsolute(row.cwd)) continue;
+    if (candidateSessionId === null) continue;
     sessionIds.add(candidateSessionId);
     if (sessionIds.size > 1) throw new Error('Claude transcript identity is ambiguous');
     if (candidateSessionId === nativeId) {
