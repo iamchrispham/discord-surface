@@ -136,6 +136,11 @@ export function ordinaryBindingDecision(
   if (sameOwner) return existing.active && sessionRootMatches
     ? ORDINARY_BINDING_DECISIONS.REUSE
     : ORDINARY_BINDING_DECISIONS.REBIND;
+  const conductorOwned = Boolean(existing.conductorId || existing.repoKey);
+  if (!ordinaryMarker || conductorOwned) {
+    const owner = conductorOwned ? 'a conductor' : 'an incompatible owner';
+    throw new Error(`channel is already bound to ${owner}; drain and unbind the existing binding before retrying ordinary-bind`);
+  }
   const handoffCommand = [
     'handoff --ordinary --provider codex',
     `--channel-id ${request.channelId}`,

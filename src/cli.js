@@ -873,7 +873,13 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   } finally {
     if (!handoffCommitted && sourceBinding) {
       try {
-        state.restoreOrdinaryHandoffIntake(channelId, sourceBinding);
+        const restored = state.restoreOrdinaryHandoffIntake(channelId, sourceBinding);
+        if (restored) {
+          wake(paths, {
+            status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+            kill: dependencies.killProcess || process.kill
+          });
+        }
       } catch (error) {
         state.auditReceipt(null, 'ordinary-handoff-intake-restore-failed', {
           channelId, generation: sourceBinding.generation, error: error.message

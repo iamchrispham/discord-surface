@@ -1190,6 +1190,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
     let beforeFenceFetches = 0;
     let deleted = false;
     let lateIntake;
+    const wakeSignals = [];
     const channel = {
       id: original.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
       messages: { fetch: async options => {
@@ -1225,7 +1226,14 @@ test('explicit ordinary handoff fences remote messages through its ownership com
       requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
       readSecret: () => 'fixture-token',
       validateCodexSessionIdentity: async () => ({ file: session.file, sessionId: OTHER, threadId: OTHER, workspace: successorWorkspace }),
-      gatewayProcessStatus: () => ({ state: 'stopped' }), print: () => {}
+      requestGatewayRecovery: (_paths, options) => {
+        const runtime = options.status(_paths);
+        options.kill(runtime.pid, 'SIGUSR2');
+        return { requested: true, pid: runtime.pid, signal: 'SIGUSR2' };
+      },
+      gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] }),
+      killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
+      print: () => {}
     };
     const args = {
       ordinary: true, 'state-dir': dir, provider: PROVIDERS.CODEX, 'channel-id': original.channelId,
@@ -1249,7 +1257,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
       id: '160', guildId: 'guild', channelId: original.channelId, authorId: 'operator', content: 'message after aborted handoff'
     }, { ready: snapshot.binding.readiness === READINESS.READY });
     recovered.close();
-    return { result, error, snapshot, lateIntake, postAbortIntake, beforeFenceFetches, wasDeleted: () => deleted };
+    return { result, error, snapshot, lateIntake, postAbortIntake, beforeFenceFetches, wakeSignals, wasDeleted: () => deleted };
   }
 
   const accepted = await invokeCase('100');
@@ -1261,6 +1269,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.equal(accepted.lateIntake.accepted, false);
   assert.equal(accepted.lateIntake.reason, 'handoff-intake-paused');
   assert.equal(accepted.beforeFenceFetches, 1);
+  assert.deepEqual(accepted.wakeSignals, [{ pid: 4242, signal: 'SIGUSR2' }]);
   assert.equal(accepted.wasDeleted(), true);
 
   const rejected = await invokeCase('140');
@@ -1272,6 +1281,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
   assert.equal(rejected.lateIntake.accepted, false);
   assert.equal(rejected.lateIntake.reason, 'handoff-intake-paused');
   assert.equal(rejected.postAbortIntake.accepted, true);
+  assert.deepEqual(rejected.wakeSignals, [{ pid: 4242, signal: 'SIGUSR2' }]);
   assert.equal(rejected.wasDeleted(), true);
 });
 
