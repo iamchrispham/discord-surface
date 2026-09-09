@@ -116,7 +116,7 @@ test('ordinary Claude accepts single or equal transcript IDs and rejects conflic
   assert.equal(validateClaudeSessionIdentity(CLAUDE, topLevel).sessionId, CLAUDE);
   assert.equal(validateClaudeSessionIdentity(CLAUDE, payloadOnly).sessionId, CLAUDE);
   assert.equal(validateClaudeSessionIdentity(CLAUDE, equalAliases).sessionId, CLAUDE);
-  assert.throws(() => validateClaudeSessionIdentity(CLAUDE, conflicting), /identity or workspace is unavailable/);
+  assert.throws(() => validateClaudeSessionIdentity(CLAUDE, conflicting), /Claude transcript identity is ambiguous/);
   assert.throws(() => validateClaudeSessionIdentity(CLAUDE, lateConflict), /identity is ambiguous/);
 });
 
