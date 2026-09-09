@@ -1410,6 +1410,7 @@ test('simulated: readiness recovery releases a terminal owner blocker before a q
   releaseFirst({ text: 'first answer' });
   await waitForCondition(() => state.getMessage(firstId).state === MESSAGE_STATES.REPLIED);
   assert.deepEqual(dispatches, [firstId]);
+  assert.equal(state.getMessage(secondId).state, MESSAGE_STATES.ACCEPTED);
 
   const recoveredBinding = state.setBindingReadiness(binding.channelId, READINESS.READY, 'Claude Monitor recovered', state.getBinding(binding.channelId));
   assert.equal(recoveredBinding.readiness, READINESS.READY);

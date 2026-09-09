@@ -162,7 +162,15 @@ class ClaudeChannel {
       if (typeof this.mcp.connect === 'function') await this.mcp.connect(this.mcp.transportFactory());
       this.server = http.createServer(async (request, response) => {
         if (request.method === 'GET' && request.url === '/identity') {
-          const current = this.state.getBinding(this.bindingIdentity.channelId);
+          let current;
+          try {
+            current = this.state.getBinding(this.bindingIdentity.channelId);
+          } catch (error) {
+            this.logger(`Claude identity read failed: ${error.message}`);
+            response.writeHead(503, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({ provider: 'claude', nativeId: this.nativeId, generation: this.bindingIdentity.generation, endpoint: this.socketPath, channelReady: false }));
+            return;
+          }
           const currentIdentity = current && current.active && current.channelId === this.bindingIdentity.channelId &&
             current.guildId === this.bindingIdentity.guildId && current.provider === this.bindingIdentity.provider &&
             current.nativeId === this.bindingIdentity.nativeId && current.workspace === this.bindingIdentity.workspace &&

@@ -612,13 +612,18 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   const requestedSessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
   const { paths, state } = openState(args);
   const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
+  let stopping = false;
+  const handleSignal = () => { stopping = true; };
+  process.once('SIGINT', handleSignal);
+  process.once('SIGTERM', handleSignal);
   let client;
   let runtimeInterlock;
   try {
     const runtime = gatewayStatus(paths);
     const supportsBindLock = runtime?.state === 'running' && runtime.pid && runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock);
     const lockPath = supportsBindLock ? paths.bindLock : paths.lock;
-    runtimeInterlock = await acquireHeldLockUntilAvailable(lockPath);
+    runtimeInterlock = await acquireHeldLockUntilAvailable(lockPath, () => stopping);
+    if (stopping || !runtimeInterlock) throw new Error('ordinary handoff stopped while waiting for the runtime bind lock');
     const assertGatewayCompatible = () => {
       const snapshot = assertGatewayWakeCompatible(paths, gatewayStatus);
       if (supportsBindLock && (snapshot?.state !== 'running' || String(snapshot.pid) !== String(runtime.pid) ||
@@ -673,6 +678,8 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       readiness: binding.readiness, gatewayWake });
     return { binding, gatewayWake, handoffReconciled: Boolean(binding.handoffReconciled) };
   } finally {
+    process.removeListener('SIGINT', handleSignal);
+    process.removeListener('SIGTERM', handleSignal);
     await runtimeInterlock?.release();
     await client?.destroy();
     state.close();
@@ -1259,7 +1266,7 @@ function pidMatches(value, stateDir, db, command) {
     const suffix = actualCommand.startsWith(expectedPrefix) ? actualCommand.slice(expectedPrefix.length).trim() : '';
     const commandDb = suffix.startsWith('--db=') ? suffix.slice('--db='.length) : suffix.startsWith('--db ') ? suffix.slice('--db '.length).trim() : null;
     if (!commandDb) return false;
-    if (value.db !== db) return false;
+    if (value.db != null && value.db !== db) return false;
     const unquotedDb = commandDb.length >= 2 && ((commandDb.startsWith('"') && commandDb.endsWith('"')) || (commandDb.startsWith("'") && commandDb.endsWith("'")))
       ? commandDb.slice(1, -1)
       : commandDb;

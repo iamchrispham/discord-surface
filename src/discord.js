@@ -963,14 +963,16 @@ class DiscordGateway {
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during login');
       const recovery = await this.recoverTransport('startup', epoch);
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during recovery');
-      const hasEndpointUnavailableBinding = !recovery.ready && ['gap', 'unavailable'].includes(recovery.state) && this.state.listBindings().some(binding => {
-        const watermark = this.state.getIntakeWatermark(binding.channelId);
-        return binding.active && watermark?.state === READINESS.UNAVAILABLE &&
-          typeof watermark.detail === 'string' && (
-            watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX) ||
-            watermark.detail.startsWith('Codex transcript proof unavailable before event write:')
-          );
-      });
+      const unresolvedBindings = this.state.listBindings().filter(binding => binding.active && binding.readiness !== READINESS.READY);
+      const hasEndpointUnavailableBinding = !recovery.ready && ['gap', 'unavailable'].includes(recovery.state) &&
+        unresolvedBindings.length > 0 && unresolvedBindings.every(binding => {
+          const watermark = this.state.getIntakeWatermark(binding.channelId);
+          return watermark?.state === READINESS.UNAVAILABLE &&
+            typeof watermark.detail === 'string' && (
+              watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX) ||
+              watermark.detail.startsWith('Codex transcript proof unavailable before event write:')
+            );
+        });
       if (!recovery.ready && !hasEndpointUnavailableBinding) throw new Error(`Discord intake recovery is ${recovery.state}`);
       if (hasEndpointUnavailableBinding) this.ready = true;
       this.started = true;

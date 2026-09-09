@@ -197,7 +197,6 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
         writePayloadFile(payloadPath, JSON.stringify(payload));
       } catch (error) {
         error.potentiallyDelivered = false;
-        notifyTransport('onerror', error);
         throw error;
       }
       const entry = { promise: null, settled: false };
