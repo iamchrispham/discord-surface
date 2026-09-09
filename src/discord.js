@@ -594,7 +594,10 @@ class DiscordGateway {
     });
     this.boundMessage = message => {
       if (this.stopping) return;
-      if (typeof message?.channelId === 'string') this.state.recoverInterruptedOrdinaryHandoffIntake?.(message.channelId);
+      if (typeof message?.channelId === 'string') {
+        const recovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(message.channelId);
+        if (recovery?.deferred) this.scheduleDeferredHandoffRecovery(message.channelId);
+      }
       const binding = this.state.getBinding(message?.channelId);
       const bindingReady = binding?.readiness === READINESS.READY;
       const readyLive = this.ready && bindingReady;

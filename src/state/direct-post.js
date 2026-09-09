@@ -47,17 +47,10 @@ function createDirectPostHandlers({
         requests.set(row.detail.requestId, request);
       }
       for (const parts of requests.values()) {
-        let hasFinalPart = false;
         for (const row of parts.values()) {
           const outcome = outcomes.get(row.detail.attemptId);
           if (!outcome || outcome.detail.outcome === 'unknown') return true;
-          const partIndex = Number(row.detail.partIndex);
-          const partCount = Number(row.detail.partCount);
-          if (Number.isInteger(partIndex) && Number.isInteger(partCount) && partIndex === partCount - 1 && outcome.detail.outcome === 'sent') {
-            hasFinalPart = true;
-          }
         }
-        if (!hasFinalPart) return true;
       }
       return false;
     },
