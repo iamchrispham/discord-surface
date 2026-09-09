@@ -1132,6 +1132,14 @@ async function claudeMonitor(args) {
     await monitor.start();
     monitorStarted = true;
     if (ordinaryStartupBinding) {
+      const startedIdentity = monitor?.bindingIdentity;
+      const startedBinding = startedIdentity ? state.getBinding(startedIdentity.channelId) : null;
+      const bindingStillCurrent = startedBinding?.active && state.isOrdinaryBinding(startedBinding) &&
+        startedBinding.channelId === startedIdentity?.channelId && startedBinding.guildId === startedIdentity?.guildId &&
+        startedBinding.provider === startedIdentity?.provider && startedBinding.nativeId === startedIdentity?.nativeId &&
+        startedBinding.workspace === startedIdentity?.workspace && startedBinding.endpoint === startedIdentity?.endpoint &&
+        startedBinding.generation === startedIdentity?.generation;
+      if (!bindingStillCurrent) throw new Error('Claude Monitor binding changed during startup');
       const watermark = state.getIntakeWatermark(ordinaryStartupBinding.channelId);
       const endpointUnavailable = watermark?.state === READINESS.UNAVAILABLE &&
         typeof watermark.detail === 'string' &&
