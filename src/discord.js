@@ -953,7 +953,10 @@ class DiscordGateway {
       const hasEndpointUnavailableBinding = !recovery.ready && ['gap', 'unavailable'].includes(recovery.state) && this.state.listBindings().some(binding => {
         const watermark = this.state.getIntakeWatermark(binding.channelId);
         return binding.active && watermark?.state === READINESS.UNAVAILABLE &&
-          typeof watermark.detail === 'string' && watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX);
+          typeof watermark.detail === 'string' && (
+            watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX) ||
+            watermark.detail.startsWith('Codex transcript proof unavailable before event write:')
+          );
       });
       if (!recovery.ready && !hasEndpointUnavailableBinding) throw new Error(`Discord intake recovery is ${recovery.state}`);
       if (hasEndpointUnavailableBinding) this.ready = true;

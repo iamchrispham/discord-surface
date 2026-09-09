@@ -193,7 +193,15 @@ class ClaudeChannel {
           response.writeHead(202);
           response.end('accepted');
         } catch (error) {
-          const status = !this.ready ? 503 : error.potentiallyDelivered ? 503 : /custody|stale|mismatch|generation|authorization/i.test(error.message) ? 409 : 400;
+          const isCustodyConflict = /custody|stale|mismatch|generation|authorization/i.test(error.message);
+          let status;
+          if (error.potentiallyDelivered === false) {
+            status = isCustodyConflict ? 409 : 400;
+          } else if (!this.ready || error.potentiallyDelivered) {
+            status = 503;
+          } else {
+            status = isCustodyConflict ? 409 : 400;
+          }
           response.writeHead(status);
           response.end(status === 503 ? 'uncertain' : 'rejected');
         }
