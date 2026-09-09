@@ -1,9 +1,14 @@
 const fs = require('node:fs');
-const { dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, waitForReply } = require('./native');
-const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
+const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
+const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 
 const requireInstalled = require;
+const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
+const DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS = 5000;
+const PENDING_HANDOFF_RECOVERY_POLL_MS = 100;
 
 function recoveryError(kind, detail) {
   const error = new Error(detail);
@@ -12,9 +17,9 @@ function recoveryError(kind, detail) {
 }
 
 function waitForRecoveryOperation(operation, signal, deadline, onDeadline = null) {
-  if (signal?.aborted) return Promise.reject(recoveryError('stopped', 'Discord recovery was stopped'));
+  if (signal?.aborted) return Promise.reject(recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord recovery was stopped'));
   const remaining = deadline - Date.now();
-  if (remaining <= 0) return Promise.reject(recoveryError('deadline', 'Discord recovery deadline exceeded'));
+  if (remaining <= 0) return Promise.reject(recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Discord recovery deadline exceeded'));
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer;
@@ -28,9 +33,9 @@ function waitForRecoveryOperation(operation, signal, deadline, onDeadline = null
       cleanup();
       callback(value);
     };
-    const onAbort = () => finish(reject, recoveryError('stopped', 'Discord recovery was stopped'));
+    const onAbort = () => finish(reject, recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord recovery was stopped'));
     timer = setTimeout(() => {
-      try { onDeadline?.(); } finally { finish(reject, recoveryError('deadline', 'Discord recovery deadline exceeded')); }
+      try { onDeadline?.(); } finally { finish(reject, recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Discord recovery deadline exceeded')); }
     }, remaining);
     signal?.addEventListener('abort', onAbort, { once: true });
     Promise.resolve().then(operation).then(
@@ -52,6 +57,11 @@ function compareDiscordIds(left, right) {
   } catch {
     return String(left).localeCompare(String(right));
   }
+}
+
+function discordIdAfter(left, right) {
+  if (!left || !right) return false;
+  return compareDiscordIds(left, right) > 0;
 }
 
 function conductorMarkerMatchesTopic(topic, binding) {
@@ -127,6 +137,25 @@ async function cancelResponseBody(response) {
   } catch {}
 }
 
+async function readRetryAfter(response) {
+  const headerValue = typeof response?.headers?.get === 'function'
+    ? response.headers.get('retry-after') ?? response.headers.get('Retry-After')
+    : response?.headers?.['retry-after'] ?? response?.headers?.['Retry-After'];
+  const hasHeaderValue = headerValue !== null && headerValue !== undefined && String(headerValue).trim() !== '';
+  const headerSeconds = hasHeaderValue ? Number(headerValue) : NaN;
+  if (Number.isFinite(headerSeconds) && headerSeconds >= 0) {
+    return { raw: headerValue, milliseconds: Math.ceil(headerSeconds * 1000) };
+  }
+  try {
+    const body = await response?.json?.();
+    const bodySeconds = Number(body?.retry_after);
+    if (Number.isFinite(bodySeconds) && bodySeconds >= 0) {
+      return { raw: body.retry_after, milliseconds: Math.ceil(bodySeconds * 1000) };
+    }
+  } catch {}
+  return null;
+}
+
 async function sendDiscordMessage({ token, channelId, content, nonce, signal, timeoutMs = RECOVERY_LIMITS.timeoutMs,
   fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] } }) {
   if (typeof fetchImpl !== 'function') throw Object.assign(new Error('Discord message fetch is unavailable'), { outcome: 'not_sent' });
@@ -194,7 +223,7 @@ function transportReceiptText(message, attempt) {
   return 'Receipt: saved. Delivery was paused when this receipt was prepared.';
 }
 
-function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, trackReceipt, observeOptions = {} }) {
+function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {} }) {
   const receiptWork = new Set();
   const nativeWork = new Map();
   const ownerQueues = new Map();
@@ -242,18 +271,56 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return `${durable.provider}:${durable.nativeId}`;
   }
 
+  function hasCurrentNativeAcknowledgment(message) {
+    if (!message || !state.hasNativeAcknowledgment(message)) return false;
+    return state.currentMessageBinding(message).current;
+  }
+
   function ownerCanAdvance(messageId) {
     const message = state.getMessage(messageId);
-    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state);
+    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state) ||
+      (message.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(message));
+  }
+
+  function ownerBindingReady(messageId) {
+    const message = state.getMessage(messageId);
+    if (!message) return true;
+    const binding = state.getBinding(message.channelId);
+    return !binding || !binding.active || binding.readiness === READINESS.READY;
+  }
+
+  function releaseReadyOwnerBlock(message) {
+    const ownerKey = nativeOwnerKey(message);
+    const queue = ownerQueues.get(ownerKey);
+    if (!queue?.blockedMessageId || !ownerBindingReady(message.id)) return;
+    const blocked = state.getMessage(queue.blockedMessageId);
+    if (!blocked || ![MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(blocked.state)) return;
+    if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
+    queue.blockedMessageId = null;
+    queue.blockedReason = null;
+    pumpOwner(ownerKey);
   }
 
   function ownerQueueFor(key) {
     let queue = ownerQueues.get(key);
     if (!queue) {
-      queue = { active: null, blockedMessageId: null, entries: [] };
+      queue = { active: null, blockedMessageId: null, blockedReason: null, entries: [] };
       ownerQueues.set(key, queue);
     }
     return queue;
+  }
+
+  function ownerAdmissionOrder(messageId) {
+    const rowId = state.getMessageRowId(messageId);
+    return Number.isSafeInteger(rowId) ? rowId : null;
+  }
+
+  function compareOwnerEntries(left, right) {
+    const createdAtOrder = left.queueMessage.createdAt.localeCompare(right.queueMessage.createdAt);
+    if (createdAtOrder) return createdAtOrder;
+    const leftAdmissionOrder = Number.isInteger(left.admissionOrder) ? left.admissionOrder : Number.MAX_SAFE_INTEGER;
+    const rightAdmissionOrder = Number.isInteger(right.admissionOrder) ? right.admissionOrder : Number.MAX_SAFE_INTEGER;
+    return leftAdmissionOrder - rightAdmissionOrder || left.sequence - right.sequence;
   }
 
   function blockingEarlierOwnerMessage(message) {
@@ -261,7 +328,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const currentIndex = messages.findIndex(candidate => candidate.id === message.id);
     if (currentIndex < 0) return null;
     return messages.slice(0, currentIndex).find(candidate => nativeOwnerKey(candidate) === nativeOwnerKey(message) &&
-      [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLYING].includes(candidate.state)) || null;
+      [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLYING].includes(candidate.state) &&
+      !(candidate.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(candidate))) || null;
   }
 
   function removeAbortHandler(entry) {
@@ -272,13 +340,43 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function finishOwner(entry) {
     const queue = ownerQueues.get(entry.ownerKey);
     if (!queue || queue.active !== entry) return;
+    if (entry.dispatchBlocked) {
+      queue.blockedMessageId = entry.message.id;
+      queue.blockedReason = 'not_submitted';
+      return;
+    }
     if (!ownerCanAdvance(entry.message.id)) {
       queue.blockedMessageId = entry.message.id;
+      queue.blockedReason = null;
+      return;
+    }
+    if (!ownerBindingReady(entry.message.id)) {
+      queue.blockedMessageId = entry.message.id;
+      queue.blockedReason = null;
       return;
     }
     queue.blockedMessageId = null;
+    queue.blockedReason = null;
     queue.active = null;
     pumpOwner(entry.ownerKey);
+  }
+
+  function releaseAcknowledged(messageId) {
+    const message = state.getMessage(messageId);
+    if (!message || !hasCurrentNativeAcknowledgment(message) || !ownerCanAdvance(messageId)) return false;
+    const queue = ownerQueues.get(nativeOwnerKey(message));
+    if (!queue) return false;
+    if (queue.active?.message.id === messageId) {
+      const active = queue.active;
+      active.dispatchBlocked = false;
+      finishOwner(active);
+      return queue.active !== active;
+    }
+    if (queue.blockedMessageId !== messageId) return false;
+    queue.blockedMessageId = null;
+    queue.blockedReason = null;
+    pumpOwner(nativeOwnerKey(message));
+    return true;
   }
 
   function cancelQueuedEntry(entry) {
@@ -300,11 +398,15 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     removeAbortHandler(entry);
     let result;
     try {
-      result = entry.starter(() => finishOwner(entry));
+      result = entry.starter(() => finishOwner(entry), entry);
     } catch (error) {
       finishOwner(entry);
       entry.reject(error);
       return;
+    }
+    const startedMessage = state.getMessage(entry.message.id);
+    if (startedMessage?.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(startedMessage)) {
+      releaseAcknowledged(entry.message.id);
     }
     Promise.resolve(result).then(entry.resolve, entry.reject);
   }
@@ -326,6 +428,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   function existingNativeWork(message, awaitExisting) {
+    releaseReadyOwnerBlock(message);
     const existing = nativeWork.get(message.id)?.promise;
     if (existing) return awaitExisting ? existing : Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
     const queued = queuedNativeWork.get(message.id);
@@ -339,9 +442,12 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const ownerKey = nativeOwnerKey(message);
     const queue = ownerQueueFor(ownerKey);
     const queueMessage = state.getMessage(message.id) || message;
-    if (queue.blockedMessageId && ownerCanAdvance(queue.blockedMessageId)) {
+    const dispatchBlocked = queue.blockedReason === 'not_submitted';
+    if (queue.blockedMessageId && ownerCanAdvance(queue.blockedMessageId) &&
+      (!dispatchBlocked || queue.blockedMessageId === message.id)) {
       if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
       queue.blockedMessageId = null;
+      queue.blockedReason = null;
     }
     let resolve;
     let reject;
@@ -359,9 +465,11 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       promise,
       resolve,
       reject,
+      admissionOrder: ownerAdmissionOrder(queueMessage.id),
       sequence: queueSequence++,
       started: false,
       cancelled: false,
+      dispatchBlocked: false,
       onAbort: null
     };
     if (!queue.active && queue.blockedMessageId === message.id) {
@@ -385,7 +493,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       queue.blockedMessageId = earlier.id;
     }
     queue.entries.push(entry);
-    queue.entries.sort((left, right) => left.queueMessage.createdAt.localeCompare(right.queueMessage.createdAt) || left.sequence - right.sequence);
+    queue.entries.sort(compareOwnerEntries);
     queuedNativeWork.set(message.id, entry);
     if (signal) {
       entry.onAbort = () => cancelQueuedEntry(entry);
@@ -437,6 +545,15 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
 
   async function deliverReply(message, result, signal) {
     if (result.message?.state !== 'reply_ready') return result;
+    if (prepareReply) {
+      try {
+        const preparation = prepareReply(result.message.id, signal);
+        const prepared = preparation ? await preparation : preparation;
+        if (prepared === ACK_WAITING) return { ...result, message: state.getMessage(result.message.id) };
+      }
+      catch (error) { return { ...result, message: state.getMessage(result.message.id), error }; }
+      if (signal?.aborted) return { ...result, message: state.getMessage(result.message.id) };
+    }
     let ready;
     try {
       ready = state.beginReply(result.message.id);
@@ -464,36 +581,79 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return { ...result, message: state.getMessage(ready.message.id) };
   }
 
-  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false } = {}) {
+  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
-    return enqueueOwnerWork(message, signal, onNativeSettled => {
+    return enqueueOwnerWork(message, signal, (onNativeSettled, ownerEntry) => {
       let settleHandoff;
       let rejectHandoff;
+      let settleDispatchOutcome;
+      let rejectDispatchOutcome;
       const handoffPromise = handoff ? new Promise((resolve, reject) => {
         settleHandoff = resolve;
         rejectHandoff = reject;
       }) : null;
+      const dispatchOutcomePromise = awaitDispatchOutcome ? new Promise((resolve, reject) => {
+        settleDispatchOutcome = resolve;
+        rejectDispatchOutcome = reject;
+      }) : null;
       handoffPromise?.catch(() => {});
-      const work = startNativeWork(message.id, signal, async taskSignal => {
-        const result = await dispatchAndObserve(state, message.id, providers, {
-          ...observeOptions,
-          signal: taskSignal,
-          continueUntilFinal,
-          onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
-        });
-        return deliverReply(message, result, taskSignal);
-      }, () => {
+      let nativeSettled = false;
+      const settleNative = () => {
+        if (nativeSettled) return;
+        nativeSettled = true;
         onNativeSettled();
-      });
+      };
+      const work = startNativeWork(message.id, signal, async taskSignal => {
+        let result;
+        try {
+          result = await dispatchAndObserve(state, message.id, providers, {
+            ...observeOptions,
+            signal: taskSignal,
+            continueUntilFinal,
+            onDispatchOutcome: outcome => {
+              if (outcome?.status === 'not_submitted') {
+                ownerEntry.dispatchBlocked = !hasCurrentNativeAcknowledgment(state.getMessage(message.id));
+              }
+              settleDispatchOutcome?.(outcome);
+            },
+            onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
+          });
+          const promoted = state.getMessage(message.id);
+          if (promoted?.state === MESSAGE_STATES.REPLY_READY && result.message?.state !== MESSAGE_STATES.REPLY_READY) {
+            result = { ...result, message: promoted };
+          }
+          if (['uncertain', 'not_submitted'].includes(result.status) && promoted?.state === MESSAGE_STATES.SUBMITTED) {
+            result = await observeSubmitted(state, promoted, providers[promoted.provider], {
+              ...observeOptions,
+              signal: taskSignal,
+              continueUntilFinal
+            });
+          }
+        } finally {
+          settleNative();
+        }
+        return deliverReply(message, result, taskSignal);
+      }, settleNative);
+      work.then(
+        result => {
+          settleHandoff?.(result);
+          settleDispatchOutcome?.(result);
+        },
+        error => {
+          rejectHandoff?.(error);
+          rejectDispatchOutcome?.(error);
+        }
+      );
+      if (awaitDispatchOutcome) return dispatchOutcomePromise;
       if (!handoff) return work;
-      work.then(result => settleHandoff?.(result), error => rejectHandoff?.(error));
       return handoffPromise;
     }, awaitExisting, handoff);
   }
 
-  async function handleMessage(message, signal) {
-    const intake = state.acceptDiscordMessage(eventToInput(message));
+  async function handleMessage(message, signal, expectedBinding = null, onIntake = null) {
+    const intake = state.acceptDiscordMessage(eventToInput(message), { expectedBinding });
+    if (!intake.stale) onIntake?.(message, intake);
     if (!intake.accepted) return intake;
     launchTransportReceipt(message);
     return processAccepted(message, signal);
@@ -505,41 +665,57 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return intake;
   }
 
-  async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false } = {}) {
+  async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false, awaitDispatchOutcome = false } = {}) {
     launchTransportReceipt(message);
-    return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff });
+    return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff, awaitDispatchOutcome });
   }
 
   function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false } = {}) {
     launchTransportReceipt(message);
     const existing = existingNativeWork(message, awaitExisting);
-    if (existing) return existing;
-    return enqueueOwnerWork(message, signal, onNativeSettled => {
+    if (existing) {
+      releaseAcknowledged(message.id);
+      return existing;
+    }
+    const work = enqueueOwnerWork(message, signal, onNativeSettled => {
+      let nativeSettled = false;
+      const settleNative = () => {
+        if (nativeSettled) return;
+        nativeSettled = true;
+        onNativeSettled();
+      };
       const work = startNativeWork(message.id, signal, async taskSignal => {
         const provider = providers[message.provider];
-        const result = await observeSubmitted(state, message, provider, { ...observeOptions, signal: taskSignal, continueUntilFinal });
+        let result;
+        try {
+          result = await observeSubmitted(state, message, provider, { ...observeOptions, signal: taskSignal, continueUntilFinal });
+        } finally {
+          settleNative();
+        }
         return deliverReply(message, result, taskSignal);
-      }, () => {
-        onNativeSettled();
-      });
+      }, settleNative);
       if (continueUntilFinal) return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
       return work;
     }, awaitExisting, continueUntilFinal);
+    releaseAcknowledged(message.id);
+    return work;
   }
 
   async function waitForReceipts() {
     await Promise.allSettled([...receiptWork]);
   }
 
-  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, resumeSubmitted, waitForNativeWork, waitForReceipts };
+  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, releaseAcknowledged, resumeSubmitted, waitForNativeWork, waitForReceipts };
 }
 
 class DiscordGateway {
-  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {} } = {}) {
+  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null } = {}) {
     this.state = state;
     this.logger = logger;
+    this.onReady = typeof onReady === 'function' ? onReady : null;
     this.client = client || this.createClient();
     this.discordToken = null;
+    this.acknowledgments = null;
     this.controllers = new Set();
     this.receiptControllers = new Set();
     this.inFlight = new Set();
@@ -552,32 +728,87 @@ class DiscordGateway {
     this.connectionEpoch = 0;
     this.recoveryController = null;
     this.recoveryPromise = null;
+    this.liveCheckpointController = null;
+    this.liveCheckpointPromise = null;
+    this.liveIntakeCounts = new Map();
     this.reconnectPromise = null;
+    this.deferredHandoffRecoveryTimer = null;
+    this.pendingHandoffRecoveryPollTimer = null;
+    this.deferredHandoffRecoveryChannels = new Set();
+    this.pendingHandoffRecoveryChannels = new Set();
+    this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
+    this.transportReady = false;
     this.fetchHistoryInjected = typeof fetchHistory === 'function';
     this.fetchHistory = fetchHistory || ((channel, options) => channel.messages?.fetch(options));
     this.historyPageLimit = Math.min(RECOVERY_LIMITS.pageSize, Math.max(1, Number(recoveryOptions.pageLimit || RECOVERY_LIMITS.pageSize)));
     this.historyMaxPages = Math.min(RECOVERY_LIMITS.maxPages, Math.max(1, Number(recoveryOptions.maxPages || RECOVERY_LIMITS.maxPages)));
     this.historyMaxMessages = Math.min(RECOVERY_LIMITS.maxMessages, Math.max(1, Number(recoveryOptions.maxMessages || RECOVERY_LIMITS.maxMessages)));
     this.recoveryTimeoutMs = Math.min(RECOVERY_LIMITS.timeoutMs, Math.max(1000, Number(recoveryOptions.timeoutMs || RECOVERY_LIMITS.timeoutMs)));
+    this.liveCheckpointThreshold = Math.max(1, Math.floor(this.historyMaxMessages / 2));
+    this.codexSessionRoot = recoveryOptions.codexSessionRoot;
     this.ready = false;
+    this.deliverAcknowledgment = createAcknowledgmentDelivery({
+      state,
+      send: (message, reaction) => this.sendAcknowledgment(message, reaction)
+    });
     this.providers = providers || {
-      codex: new CodexProvider(),
+      codex: new CodexProvider({ acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath) }),
       claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(state, id, options) })
     };
+    this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (async (binding, options = {}) => {
+      if (binding.provider === 'codex') return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot, options);
+      if (binding.provider === 'claude') {
+        return probeClaudeChannel(binding.endpoint, {
+          nativeId: binding.nativeId,
+          generation: binding.generation,
+          workspace: binding.workspace,
+          endpoint: binding.endpoint
+        });
+      }
+      throw new Error(`unsupported ordinary provider: ${binding.provider}`);
+    });
+    const onNativeUnavailable = observeOptions.onNativeUnavailable;
     this.consumer = createSurfaceConsumer({
       state,
       providers: this.providers,
       sendReply: (message, reply) => this.sendReply(message, reply),
+      prepareReply: (messageId, signal) => this.prepareReply(messageId, signal),
       sendTransportReceipt: (message, receipt) => this.sendTransportReceipt(message, receipt),
-      observeOptions
+      observeOptions: {
+        ...observeOptions,
+        onNativeUnavailable: (message, error, outcome) => {
+          try { onNativeUnavailable?.(message, error, outcome); } catch {}
+          this.handleNativeUnavailable(message, error, outcome);
+        }
+      }
     });
     this.boundMessage = message => {
       if (this.stopping) return;
+      let handoffRecovery = null;
+      if (typeof message?.channelId === 'string') {
+        handoffRecovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(message.channelId);
+      }
+      const binding = this.state.getBinding(message?.channelId);
+      if (handoffRecovery?.deferred) this.scheduleDeferredHandoffRecovery(message.channelId);
+      else if (!handoffRecovery && binding?.active && binding.readiness === READINESS.PENDING &&
+        this.state.isOrdinaryBinding?.(binding)) {
+        this.scheduleDeferredHandoffRecovery(message.channelId, { pendingGeneration: true });
+      }
+      const bindingReady = binding?.readiness === READINESS.READY;
+      const readyLive = this.ready && bindingReady;
+      const heldReady = !this.ready && bindingReady;
       const controller = new AbortController();
       this.controllers.add(controller);
-      const work = (this.ready ? this.consumer.handleMessage(message, controller.signal) : this.consumer.intakeMessage(message, false, null, null, true))
+      const work = (readyLive
+        ? this.consumer.handleMessage(message, controller.signal, binding, () => this.noteLiveIntake(message))
+        : this.consumer.intakeMessage(message, bindingReady, null, null, true).then(intake => {
+          if (heldReady && !intake?.stale) this.noteLiveIntake(message);
+          return intake;
+        }))
         .catch(error => this.logger(`message handling failed: ${error.message}`))
-        .finally(() => this.controllers.delete(controller));
+        .finally(() => {
+          this.controllers.delete(controller);
+        });
       this.inFlight.add(work);
       work.finally(() => this.inFlight.delete(work));
     };
@@ -607,8 +838,11 @@ class DiscordGateway {
     this.state.assertMessageCurrent(reply.id, 'reply-send');
     if (typeof reply.replyText !== 'string' || reply.replyText.length > 2000) throw new Error('Discord reply must be at most 2000 characters per message');
     if (typeof reply.replyNonce !== 'string' || reply.replyNonce.length > 25) throw new Error('Discord reply nonce must be at most 25 characters');
+    const channel = message.channel || await this.client.channels?.fetch?.(message.channelId);
+    if (!channel?.send) throw new Error('Discord reply channel is unavailable');
+    this.state.assertMessageCurrent(reply.id, 'reply-send');
     try {
-      return await message.channel.send({
+      return await channel.send({
         content: reply.replyText,
         nonce: reply.replyNonce,
         enforceNonce: true,
@@ -620,6 +854,24 @@ class DiscordGateway {
     }
   }
 
+  prepareReply(messageId, signal) {
+    if (signal?.aborted || this.stopping) return;
+    return waitForAcknowledgment(this.state, this.deliverAcknowledgment, messageId, signal);
+  }
+
+  async sendAcknowledgment(message, reaction) {
+    if (this.stopping) throw new Error('Discord acknowledgment stopped');
+    this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
+    let source = message;
+    if (!source.channel && !(this.discordToken && this.client?.rest)) {
+      const channel = await this.client.channels?.fetch?.(message.channelId);
+      if (!channel) throw new Error('Discord acknowledgment channel is unavailable');
+      source = { ...message, channel };
+    }
+    this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
+    return this.sendTransportReceipt(source, { reaction });
+  }
+
   async sendTransportReceipt(message, receipt) {
     const controller = new AbortController();
     this.receiptControllers.add(controller);
@@ -628,22 +880,58 @@ class DiscordGateway {
       try {
         // discord.js channel.send drops the signal and uses the shared REST retry queue.
         if (this.discordToken && this.client?.rest && typeof globalThis.fetch === 'function') {
-          sendPromise = sendDiscordMessage({
-            token: this.discordToken, channelId: message.channelId || message.channel.id,
-            content: receipt.content, nonce: receipt.nonce, signal: controller.signal,
-            timeoutMs: this.recoveryTimeoutMs, allowedMentions: { parse: [], replied_user: false },
-            messageReference: { message_id: message.id, fail_if_not_exists: false }
-          });
+          if (receipt.reaction) {
+            const channelId = message.channelId || message.channel.id;
+            const url = `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(message.id)}/reactions/${encodeURIComponent(receipt.reaction)}/@me`;
+            sendPromise = globalThis.fetch(url, {
+              method: 'PUT',
+              headers: {
+                Authorization: `Bot ${this.discordToken}`,
+                'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
+                'Content-Type': 'application/json'
+              },
+              signal: controller.signal
+            }).then(async response => {
+              if (!response?.ok) {
+                const retryAfter = response?.status === 429 ? await readRetryAfter(response) : null;
+                await cancelResponseBody(response);
+                const error = new Error('Discord acknowledgment request rejected');
+                error.status = response?.status;
+                if (retryAfter) {
+                  error.retryAfter = retryAfter.raw;
+                  error.retryAfterMs = retryAfter.milliseconds;
+                }
+                throw error;
+              }
+              await cancelResponseBody(response);
+              return { id: message.id, reaction: receipt.reaction };
+            });
+          } else {
+            sendPromise = sendDiscordMessage({
+              token: this.discordToken, channelId: message.channelId || message.channel.id,
+              content: receipt.content, nonce: receipt.nonce, signal: controller.signal,
+              timeoutMs: this.recoveryTimeoutMs, allowedMentions: { parse: [], replied_user: false },
+              messageReference: { message_id: message.id, fail_if_not_exists: false }
+            });
+          }
         } else if (this.discordToken && this.client?.rest) {
           throw new Error('Discord transport receipt fetch is unavailable');
         } else {
-          sendPromise = message.channel.send({
-            content: receipt.content,
-            nonce: receipt.nonce,
-            enforceNonce: true,
-            allowedMentions: receipt.allowedMentions,
-            reply: receipt.reply
-          });
+          const reactToFetchedMessage = async () => {
+            const source = await message.channel.messages.fetch(message.id);
+            this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
+            return source.react(receipt.reaction);
+          };
+          sendPromise = receipt.reaction
+            ? Promise.resolve(message.react ? message.react(receipt.reaction) : reactToFetchedMessage())
+              .then(() => ({ id: message.id, reaction: receipt.reaction }))
+            : message.channel.send({
+              content: receipt.content,
+              nonce: receipt.nonce,
+              enforceNonce: true,
+              allowedMentions: receipt.allowedMentions,
+              reply: receipt.reply
+            });
         }
       } catch (error) {
         sendPromise = Promise.reject(error);
@@ -663,11 +951,18 @@ class DiscordGateway {
     return !this.stopping && this.lifecycleEpoch === epoch;
   }
 
+  pauseLiveDispatch() {
+    if (this.stopping) return;
+    this.ready = false;
+  }
+
   pauseConnection(detail) {
     if (this.stopping) return;
     this.ready = false;
+    this.transportReady = false;
     this.connectionEpoch += 1;
     this.recoveryController?.abort();
+    this.liveCheckpointController?.abort();
     for (const binding of this.state.listBindings().filter(item => item.active)) {
       try { this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, detail, binding); }
       catch (error) { this.logger(`Discord disconnect readiness update failed: ${error.message}`); }
@@ -676,13 +971,22 @@ class DiscordGateway {
 
   beginReconnectRecovery(reason) {
     if (this.stopping) return Promise.resolve({ ready: false, state: 'stopped' });
+    this.transportReady = false;
     const connectionEpoch = this.connectionEpoch;
+    const lifecycleEpoch = this.lifecycleEpoch;
     const previousRecovery = this.recoveryPromise;
+    const previousCheckpoint = this.liveCheckpointPromise;
     const task = (async () => {
       await previousRecovery?.catch(() => {});
+      await previousCheckpoint?.catch(() => {});
       if (this.stopping || connectionEpoch !== this.connectionEpoch) return { ready: false, state: 'stopped' };
-      const result = await this.recoverTransport('reconnect', this.lifecycleEpoch);
-      if (result.ready && !this.stopping && connectionEpoch === this.connectionEpoch) await this.reconcilePending();
+      const result = await this.recoverTransport('reconnect', lifecycleEpoch);
+      if (this.isCurrentLifecycle(lifecycleEpoch) && !this.stopping && connectionEpoch === this.connectionEpoch && result.state !== 'stopped') {
+        this.transportReady = true;
+        if (result.ready) await this.reconcilePending();
+        else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true });
+        if (!this.stopping && connectionEpoch === this.connectionEpoch) this.onReady?.();
+      }
       return result;
     })().catch(error => {
       this.logger(`Discord recovery failed: ${error.message}`);
@@ -706,11 +1010,40 @@ class DiscordGateway {
       const token = readSecret(secretFile);
       this.discordToken = token;
       await this.client.login(token);
-      if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during login');
+      if (!this.isCurrentLifecycle(epoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord startup was stopped during login');
+      for (const binding of this.state.listBindings().filter(binding => binding.active)) {
+        this.state.recoverInterruptedOrdinaryHandoffIntake?.(binding.channelId, binding);
+      }
       const recovery = await this.recoverTransport('startup', epoch);
-      if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during recovery');
-      if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
+      if (!this.isCurrentLifecycle(epoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord startup was stopped during recovery');
+      const unresolvedBindings = this.state.listBindings().filter(binding => binding.active && binding.readiness !== READINESS.READY);
+      const hasEndpointUnavailableBinding = !recovery.ready && ['gap', 'unavailable'].includes(recovery.state) &&
+        unresolvedBindings.length > 0 && unresolvedBindings.every(binding => {
+          const watermark = this.state.getIntakeWatermark(binding.channelId);
+          return watermark?.state === READINESS.UNAVAILABLE &&
+            typeof watermark.detail === 'string' && (
+              watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX) ||
+              watermark.detail.startsWith('Codex transcript proof unavailable before event write:')
+            );
+        });
+      if (!recovery.ready && !hasEndpointUnavailableBinding) throw new Error(`Discord intake recovery is ${recovery.state}`);
+      if (hasEndpointUnavailableBinding) this.ready = true;
+      this.transportReady = true;
       this.started = true;
+      this.schedulePendingHandoffRecoveryPoll();
+      this.acknowledgments = watchAcknowledgments({
+        state: this.state,
+        send: (message, reaction) => this.sendAcknowledgment(message, reaction),
+        deliver: this.deliverAcknowledgment,
+        onAcknowledged: messageId => {
+          if (this.stopping) return null;
+          const message = this.state.getMessage(messageId);
+          if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY].includes(message?.state)) return null;
+          this.consumer?.releaseAcknowledged?.(messageId);
+          return this.consumer?.resumeSubmitted(message, undefined, { awaitExisting: false, continueUntilFinal: true });
+        },
+        logger: this.logger
+      });
     })();
     this.startPromise = startPromise;
     try { return await startPromise; }
@@ -738,15 +1071,23 @@ class DiscordGateway {
     return [];
   }
 
-  historyPermission(channel) {
+  historyPermission(channel, { requireSend = false } = {}) {
     if (!this.client.user || typeof channel?.permissionsFor !== 'function') return { known: false, allowed: false };
     try {
       const { PermissionFlagsBits } = requireInstalled('discord.js');
       const permissions = channel.permissionsFor(this.client.user);
       if (!permissions || typeof permissions.has !== 'function') return { known: false, allowed: false };
+      const historyAllowed = permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory);
+      const replyPermission = typeof channel.isThread === 'function' && channel.isThread()
+        ? PermissionFlagsBits.SendMessagesInThreads
+        : PermissionFlagsBits.SendMessages;
+      const threadStateBlocksSend = typeof channel.isThread === 'function' && channel.isThread() &&
+        channel.locked === true && !permissions.has(PermissionFlagsBits.ManageThreads) &&
+        !permissions.has(PermissionFlagsBits.Administrator);
+      const sendAllowed = !requireSend || (replyPermission !== undefined && permissions.has(replyPermission) && !threadStateBlocksSend);
       return {
         known: true,
-        allowed: permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory)
+        allowed: historyAllowed && sendAllowed
       };
     } catch {
       return { known: false, allowed: false };
@@ -768,19 +1109,287 @@ class DiscordGateway {
     return { watermark, topicPublished: true, publication: null };
   }
 
+  noteLiveIntake(message) {
+    const channelId = typeof message?.channelId === 'string' ? message.channelId : null;
+    if (!channelId || this.stopping || !this.state.getBinding(channelId)?.active) return;
+    const count = (this.liveIntakeCounts.get(channelId) || 0) + 1;
+    this.liveIntakeCounts.set(channelId, count);
+    if (count < this.liveCheckpointThreshold || this.liveCheckpointPromise || this.recoveryPromise) return;
+    this.liveIntakeCounts.set(channelId, 0);
+    this.beginLiveCheckpoint(new Map([[channelId, count]]));
+  }
+
+  scheduleHeldLiveCheckpoints() {
+    if (this.stopping || this.recoveryPromise || this.liveCheckpointPromise) return;
+    const heldChannels = [...this.liveIntakeCounts.entries()]
+      .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getBinding(channelId)?.active);
+    if (!heldChannels.length) return;
+    const triggeredCounts = new Map(heldChannels);
+    for (const [channelId] of heldChannels) this.liveIntakeCounts.set(channelId, 0);
+    this.beginLiveCheckpoint(triggeredCounts);
+  }
+
+  scheduleDeferredHandoffRecovery(channelId, { pendingGeneration = false } = {}) {
+    if (this.stopping || typeof channelId !== 'string') return;
+    const channels = pendingGeneration ? this.pendingHandoffRecoveryChannels : this.deferredHandoffRecoveryChannels;
+    channels.add(channelId);
+    if (this.deferredHandoffRecoveryTimer) return;
+    const delay = this.deferredHandoffRecoveryDelayMs;
+    this.deferredHandoffRecoveryDelayMs = Math.min(delay * 2, DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS);
+    const timer = setTimeout(() => {
+      if (this.deferredHandoffRecoveryTimer === timer) this.deferredHandoffRecoveryTimer = null;
+      if (this.stopping || (!this.deferredHandoffRecoveryChannels.size && !this.pendingHandoffRecoveryChannels.size)) return;
+      const deferredChannels = [...this.deferredHandoffRecoveryChannels];
+      const pendingChannels = [...this.pendingHandoffRecoveryChannels];
+      this.deferredHandoffRecoveryChannels.clear();
+      this.pendingHandoffRecoveryChannels.clear();
+      const requeue = (channelIds, pendingGeneration = false) => {
+        for (const deferredChannelId of channelIds) {
+          this.scheduleDeferredHandoffRecovery(deferredChannelId, { pendingGeneration });
+        }
+      };
+      if (this.started && !this.transportReady) {
+        requeue(deferredChannels);
+        requeue(pendingChannels, true);
+        return;
+      }
+      Promise.resolve().then(async () => {
+        if (this.stopping) return;
+        if (this.recoveryPromise) {
+          requeue(deferredChannels);
+          requeue(pendingChannels, true);
+          return;
+        }
+        const recoverableChannels = new Set();
+        const reconcileOnlyChannels = new Set();
+        for (const channelId of new Set([...deferredChannels, ...pendingChannels])) {
+          const binding = this.state.getBinding(channelId);
+          const recovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(channelId, binding);
+          if (recovery?.deferred) {
+            this.deferredHandoffRecoveryChannels.add(channelId);
+          } else if (recovery && binding?.active) {
+            recoverableChannels.add(channelId);
+          } else if (binding?.active && this.state.isOrdinaryBinding?.(binding) &&
+            [READINESS.PENDING, READINESS.RECOVERING].includes(binding.readiness)) {
+            recoverableChannels.add(channelId);
+          } else if (binding?.active && binding.readiness === READINESS.READY) {
+            reconcileOnlyChannels.add(channelId);
+          }
+        }
+        if (recoverableChannels.size) {
+          const recovery = await this.recoverTransport('ordinary-handoff', this.lifecycleEpoch, recoverableChannels);
+          if (recovery.ready) await this.reconcilePending(undefined, { channelIds: recoverableChannels });
+          else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true, channelIds: recoverableChannels });
+        }
+        if (reconcileOnlyChannels.size) {
+          await this.reconcilePending(undefined, {
+            allowPaused: !this.ready,
+            readyOnly: true,
+            channelIds: reconcileOnlyChannels
+          });
+        }
+      }).catch(error => this.logger(`Deferred ordinary handoff recovery failed: ${error.message}`)).finally(() => {
+        if (this.stopping) return;
+        if (this.deferredHandoffRecoveryChannels.size || this.pendingHandoffRecoveryChannels.size) {
+          if (this.deferredHandoffRecoveryChannels.size) requeue([...this.deferredHandoffRecoveryChannels]);
+          if (this.pendingHandoffRecoveryChannels.size) requeue([...this.pendingHandoffRecoveryChannels], true);
+        } else {
+          this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
+        }
+      });
+    }, delay);
+    timer.unref?.();
+    this.deferredHandoffRecoveryTimer = timer;
+  }
+
+  schedulePendingHandoffRecoveryPoll() {
+    if (this.stopping || !this.started || this.pendingHandoffRecoveryPollTimer) return;
+    const timer = setTimeout(() => {
+      if (this.pendingHandoffRecoveryPollTimer === timer) this.pendingHandoffRecoveryPollTimer = null;
+      if (this.stopping || !this.started) return;
+      const pendingHandoffChannels = new Set(this.state.listPendingOrdinaryHandoffChannels?.() || []);
+      for (const binding of this.state.listBindings?.() || []) {
+        if (binding.active && binding.readiness === READINESS.PENDING && this.state.isOrdinaryBinding?.(binding)) {
+          pendingHandoffChannels.add(binding.channelId);
+        }
+      }
+      for (const channelId of pendingHandoffChannels) {
+        this.scheduleDeferredHandoffRecovery(channelId, { pendingGeneration: true });
+      }
+      this.schedulePendingHandoffRecoveryPoll();
+    }, PENDING_HANDOFF_RECOVERY_POLL_MS);
+    timer.unref?.();
+    this.pendingHandoffRecoveryPollTimer = timer;
+  }
+
+  beginLiveCheckpoint(triggeredCounts = new Map()) {
+    if (this.liveCheckpointPromise || this.stopping || this.recoveryPromise) return;
+    const controller = new AbortController();
+    const epoch = this.lifecycleEpoch;
+    this.liveCheckpointController = controller;
+    let advancedChannels = new Set();
+    const checkpoint = this.checkpointHealthyIntake(controller.signal, epoch, triggeredCounts)
+      .then(result => {
+        advancedChannels = result instanceof Set ? result : new Set();
+        return result;
+      })
+      .catch(error => {
+        if (recoveryKind(error) !== CODEX_VALIDATION_KINDS.STOPPED) this.logger(`Discord live intake checkpoint failed: ${error.message}`);
+      })
+      .finally(() => {
+        if (this.liveCheckpointPromise === checkpoint) this.liveCheckpointPromise = null;
+        if (this.liveCheckpointController === controller) this.liveCheckpointController = null;
+        if (this.stopping) return;
+        const deferredChannels = [...this.liveIntakeCounts.entries()]
+          .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getBinding(channelId)?.active);
+        const deferredCounts = new Map(deferredChannels);
+        for (const [channelId] of deferredChannels) this.liveIntakeCounts.set(channelId, 0);
+        for (const [channelId, count] of triggeredCounts) {
+          if (advancedChannels.has(channelId) || !this.state.getBinding(channelId)?.active) continue;
+          const currentCount = this.liveIntakeCounts.get(channelId) || 0;
+          const deferredCount = deferredCounts.get(channelId);
+          if (deferredCount === undefined) this.liveIntakeCounts.set(channelId, currentCount + count);
+          else deferredCounts.set(channelId, deferredCount + count);
+        }
+        if (this.recoveryPromise) {
+          for (const [channelId, count] of deferredCounts) {
+            const currentCount = this.liveIntakeCounts.get(channelId) || 0;
+            this.liveIntakeCounts.set(channelId, Math.max(currentCount, count));
+          }
+          return;
+        }
+        if (deferredCounts.size) this.beginLiveCheckpoint(deferredCounts);
+      });
+    this.liveCheckpointPromise = checkpoint;
+  }
+
+  async checkpointHealthyIntake(signal, lifecycleEpoch, triggeredCounts = new Map()) {
+    const deadline = Date.now() + this.recoveryTimeoutMs;
+    const triggeredChannels = triggeredCounts instanceof Map ? new Set(triggeredCounts.keys()) : new Set();
+    const bindings = this.state.listBindings().filter(binding => binding.active
+      && binding.readiness === READINESS.READY
+      && (!triggeredChannels.size || triggeredChannels.has(binding.channelId)));
+    const advancedChannels = new Set();
+    for (const binding of bindings) {
+      if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord live intake checkpoint was stopped');
+      const watermark = this.state.getIntakeWatermark(binding.channelId);
+      if (!watermark?.recovered_through_id || typeof this.state.hasIntakeEvidence !== 'function') continue;
+      if (typeof this.client?.channels?.fetch !== 'function') continue;
+      let channel;
+      try {
+        channel = await waitForRecoveryOperation(() => this.client.channels.fetch(binding.channelId), signal, deadline);
+        if (!channel || typeof channel.messages?.fetch !== 'function') continue;
+        const permission = this.historyPermission(channel, { requireSend: this.state.isOrdinaryBinding?.(binding) });
+        if (!permission.known || !permission.allowed) continue;
+        let after = watermark.recovered_through_id;
+        let pages = 0;
+        let total = 0;
+        let complete = false;
+        while (pages < this.historyMaxPages && total < this.historyMaxMessages && Date.now() < deadline) {
+          if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord live intake checkpoint was stopped');
+          const page = this.historyMessages(await waitForRecoveryOperation(
+            () => this.fetchHistory(channel, { limit: this.historyPageLimit, after, signal }),
+            signal,
+            deadline
+          ));
+          pages += 1;
+          if (!page.length) { complete = true; break; }
+          if (page.some(message => typeof message?.id !== 'string' || message.id.length === 0)) break;
+          page.sort((left, right) => compareDiscordIds(left?.id, right?.id));
+          const fresh = page.filter(message => typeof message?.id === 'string' && compareDiscordIds(message.id, after) > 0);
+          if (!fresh.length) { complete = true; break; }
+          for (const message of fresh) {
+            if (total >= this.historyMaxMessages) break;
+            if (!this.state.hasIntakeEvidence(message.id)) {
+              complete = false;
+              break;
+            }
+            after = message.id;
+            total += 1;
+          }
+          if (!complete && total < this.historyMaxMessages && fresh.some(message => !this.state.hasIntakeEvidence(message.id))) break;
+          if (total >= this.historyMaxMessages) break;
+          if (page.length < this.historyPageLimit) { complete = true; break; }
+        }
+        if (!complete || !after) continue;
+        const checkpointed = this.state.checkpointIntake(binding.channelId, after, binding);
+        if (checkpointed?.recovered_through_id && compareDiscordIds(checkpointed.recovered_through_id, watermark.recovered_through_id) > 0) {
+          advancedChannels.add(binding.channelId);
+        }
+      } catch (error) {
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) throw error;
+      }
+    }
+    return advancedChannels;
+  }
+
   isCurrentBinding(binding) {
     return bindingIdentityMatches(binding, this.state.getBinding(binding.channelId));
   }
 
-  async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch) {
+  handleNativeUnavailable(message, error, outcome) {
+    if (message?.provider !== 'claude' || outcome?.endpointUnavailable !== true || this.stopping) return;
+    const binding = this.state.getBinding(message.channelId);
+    if (!binding || !binding.active || binding.provider !== 'claude' || binding.nativeId !== message.nativeId ||
+      binding.generation !== message.generation || binding.workspace !== message.workspace || binding.endpoint !== message.endpoint ||
+      !this.state.isOrdinaryBinding(binding)) return;
+    const detail = `${CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX} ${String(error?.message || error || 'unknown error').slice(0, 900)}`;
+    const demoted = this.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, detail, binding);
+    if (!demoted || this.stopping) return;
+    const lifecycleEpoch = this.lifecycleEpoch;
+    const recoverAndReconcile = async () => {
+      let result = await this.recoverTransport('Claude endpoint unavailable', lifecycleEpoch);
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) return result;
+      let current = this.state.getBinding(binding.channelId);
+      const matchesBinding = current?.active && current.provider === 'claude' && current.nativeId === binding.nativeId &&
+        current.generation === binding.generation && current.workspace === binding.workspace && current.endpoint === binding.endpoint;
+      if (matchesBinding && current.readiness === READINESS.READY) return this.reconcilePending();
+      if (!matchesBinding || current.readiness !== READINESS.UNAVAILABLE) return result;
+
+      result = await this.recoverTransport('Claude endpoint unavailable follow-up', lifecycleEpoch);
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) return result;
+      current = this.state.getBinding(binding.channelId);
+      const recovered = current?.active && current.provider === 'claude' && current.nativeId === binding.nativeId &&
+        current.generation === binding.generation && current.workspace === binding.workspace && current.endpoint === binding.endpoint &&
+        current.readiness === READINESS.READY;
+      return recovered ? this.reconcilePending() : result;
+    };
+    recoverAndReconcile().catch(recoveryError => {
+      this.logger(`Claude endpoint recovery failed: ${recoveryError.message}`);
+    });
+  }
+
+  async verifyOrdinaryNative(binding, options = {}) {
+    if (!this.state.isOrdinaryBinding?.(binding)) return null;
+    if (!this.providers[binding.provider] || typeof this.providers[binding.provider].dispatch !== 'function') {
+      throw new Error(`${binding.provider} delivery provider is unavailable for ordinary binding`);
+    }
+    const proof = await this.ordinaryNativePreflight(binding, options);
+    if (options.signal?.aborted) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Codex native preflight was stopped');
+    if (options.deadline !== undefined && Date.now() >= options.deadline) throw recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Codex native preflight deadline exceeded');
+    if (!proof || typeof proof !== 'object') throw new Error(`${binding.provider} native preflight returned no proof`);
+    if (!this.isCurrentBinding(binding)) throw recoveryError('stale', `ordinary ${binding.provider} binding changed during native preflight`);
+    const recorded = this.state.recordOrdinaryPreflight(binding, proof);
+    if (!recorded) throw recoveryError('stale', `ordinary ${binding.provider} binding changed before native preflight was recorded`);
+    return proof;
+  }
+
+  async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
-    const bindings = this.state.listBindings().filter(binding => binding.active);
+    const selectedChannels = channelIds ? new Set(channelIds) : null;
+    const bindings = this.state.listBindings().filter(binding => binding.active &&
+      (!selectedChannels || selectedChannels.has(binding.channelId)));
     let failure = null;
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (Date.now() >= deadline) {
         await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline);
         failure ||= { ready: false, state: 'gap' };
+        continue;
+      }
+      const handoffRecovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(binding.channelId, binding);
+      if (handoffRecovery?.deferred) {
+        this.scheduleDeferredHandoffRecovery(binding.channelId);
         continue;
       }
       const recovering = this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, `${reason} intake recovery in progress`, binding);
@@ -790,6 +1399,9 @@ class DiscordGateway {
       }
       let watermark = this.state.getIntakeWatermark(binding.channelId);
       if (watermark && ['gap', 'unavailable'].includes(watermark.state)) {
+        const terminalReadiness = watermark.state === READINESS.GAP ? READINESS.GAP : READINESS.UNAVAILABLE;
+        this.state.setBindingReadiness(binding.channelId, terminalReadiness,
+          watermark.detail || `${reason} intake ${watermark.state}`, binding);
         failure ||= { ready: false, state: watermark.state };
         continue;
       }
@@ -799,16 +1411,56 @@ class DiscordGateway {
         if (!channel) throw new Error('Discord channel is unavailable');
       } catch (error) {
         const kind = recoveryKind(error);
-        if (kind === 'stopped') return { ready: false, state: 'stopped' };
-        await this.recordBoundary(binding, null, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-        failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+        if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
+        await this.recordBoundary(binding, null, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+        failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
         continue;
       }
       if (!this.isCurrentBinding(binding)) {
         failure ||= { ready: false, state: 'unavailable' };
         continue;
       }
-      if (!conductorMarkerMatchesTopic(channel.topic, binding)) {
+      const ordinary = this.state.isOrdinaryBinding?.(binding);
+      if (ordinary && channel.guildId && channel.guildId !== binding.guildId) {
+        const error = new Error('Discord channel is outside the configured guild');
+        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+        failure ||= { ready: false, state: 'unavailable', error };
+        continue;
+      }
+      if (ordinary) {
+        const preflightController = new AbortController();
+        const relayAbort = () => preflightController.abort();
+        signal?.addEventListener('abort', relayAbort, { once: true });
+        try {
+          await waitForRecoveryOperation(
+            () => this.verifyOrdinaryNative(binding, { signal: preflightController.signal, deadline }),
+            signal,
+            deadline,
+            () => preflightController.abort()
+          );
+        } catch (error) {
+          const kind = recoveryKind(error);
+          if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
+          if (kind === 'stale') {
+            failure ||= { ready: false, state: 'unavailable', error };
+            continue;
+          }
+          const preflightReason = ['Claude endpoint unavailable', 'Claude endpoint unavailable follow-up', 'ordinary-bind', 'reconnect', 'startup'].includes(reason);
+          let detail = error.message;
+          if (preflightReason && binding.provider === 'claude') {
+            detail = `${CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX} ${error.message}`;
+          } else if (preflightReason && binding.provider === 'codex') {
+            detail = `Codex transcript proof unavailable before event write: ${error.message}`;
+          }
+          await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', detail, watermark?.recovered_through_id, null, signal, deadline);
+          failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+          continue;
+        } finally {
+          signal?.removeEventListener('abort', relayAbort);
+          preflightController.abort();
+        }
+      }
+      if (!ordinary && !conductorMarkerMatchesTopic(channel.topic, binding)) {
         const error = new Error('Discord channel topic does not identify the current conductor and native generation');
         await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
         failure ||= { ready: false, state: 'unavailable', error };
@@ -820,9 +1472,12 @@ class DiscordGateway {
         failure ||= { ready: false, state: 'unavailable', error };
         continue;
       }
-      const permission = this.historyPermission(channel);
+      const permission = this.historyPermission(channel, { requireSend: ordinary });
       if (!permission.known || !permission.allowed) {
-        const error = new Error(permission.known ? 'Discord channel lacks ViewChannel or ReadMessageHistory' : 'Discord channel history permission is unknown');
+        let detail = 'Discord channel history permission is unknown';
+        if (permission.known && ordinary) detail = 'Discord channel lacks history or reply permission';
+        else if (permission.known) detail = 'Discord channel lacks ViewChannel or ReadMessageHistory';
+        const error = new Error(detail);
         await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
         failure ||= { ready: false, state: 'unavailable', error };
         continue;
@@ -832,9 +1487,9 @@ class DiscordGateway {
         try { baseline = this.historyMessages(await waitForRecoveryOperation(() => this.fetchHistory(channel, { limit: 1, signal }), signal, deadline)); }
         catch (error) {
           const kind = recoveryKind(error);
-          if (kind === 'stopped') return { ready: false, state: 'stopped' };
-          await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-          failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+          if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
+          await this.recordBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
+          failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
           continue;
         }
         if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
@@ -891,7 +1546,7 @@ class DiscordGateway {
           for (const message of fresh) {
             if (total >= this.historyMaxMessages) break;
             if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-            if (Date.now() >= deadline) throw recoveryError('deadline', 'Discord recovery deadline exceeded while admitting history');
+            if (Date.now() >= deadline) throw recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Discord recovery deadline exceeded while admitting history');
             attemptedId = message.id;
             const admitted = await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id, binding);
             if (admitted?.stale) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
@@ -907,13 +1562,13 @@ class DiscordGateway {
         }
       } catch (error) {
         const kind = recoveryKind(error);
-        if (kind === 'stopped') return { ready: false, state: 'stopped' };
+        if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
         if (kind === 'stale') {
           failure ||= { ready: false, state: 'unavailable', error };
           continue;
         }
-        await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, attemptedId || after, signal, deadline);
-        failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+        await this.recordBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, attemptedId || after, signal, deadline);
+        failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
         continue;
       }
       if (!complete) {
@@ -941,49 +1596,59 @@ class DiscordGateway {
     return failure || { ready: true, state: 'ready' };
   }
 
-  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch) {
+  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+    this.ready = false;
     if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
     this.recoveryPromise = (async () => {
-      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch);
-      if (result.ready && this.isCurrentLifecycle(lifecycleEpoch)) this.ready = true;
-      else if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch, channelIds);
+      const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+      this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
       return result;
     })();
     try { return await this.recoveryPromise; }
     finally {
       this.recoveryPromise = null;
       this.recoveryController = null;
+      this.scheduleHeldLiveCheckpoints();
     }
   }
 
-  async reconcilePending(before = new Date().toISOString()) {
-    if (!this.ready) throw new Error('Discord gateway is not ready for recovery');
+  async reconcilePending(before = new Date().toISOString(), { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
+    const hasReadyBinding = this.state.listBindings().some(binding => {
+      return binding.active && binding.readiness === READINESS.READY;
+    });
+    if (!this.ready && !allowPaused && !hasReadyBinding) throw new Error('Discord gateway is not ready for recovery');
     if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
-    this.recoveryPromise = this._reconcilePending(before, controller.signal);
+    this.recoveryPromise = this._reconcilePending(before, controller.signal, readyOnly || allowPaused, channelIds);
     try { return await this.recoveryPromise; }
     finally {
       this.recoveryPromise = null;
       this.recoveryController = null;
+      this.scheduleHeldLiveCheckpoints();
     }
   }
 
-  async _reconcilePending(before, signal) {
+  async _reconcilePending(before, signal, readyOnly = false, channelIds = null) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
-    const candidates = this.state.recoveryCandidates(before);
+    const selectedChannels = channelIds ? new Set(channelIds) : null;
+    const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId)) &&
+      (!readyOnly || this.state.getBinding(message.channelId)?.readiness === READINESS.READY);
+    const candidates = this.state.recoveryCandidates(before).filter(allowed);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const blockedOwners = new Set();
     for (const message of ordered) {
-      if (signal?.aborted) return this.state.recoveryCandidates(before);
+      if (signal?.aborted) return this.state.recoveryCandidates(before).filter(allowed);
       const key = `${message.provider}:${message.nativeId}`;
       if (blockedOwners.has(key)) continue;
       let channel;
       try { channel = await waitForRecoveryOperation(() => this.client.channels.fetch(message.channelId), signal, deadline); } catch (error) {
-        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before);
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
         continue;
@@ -1002,11 +1667,15 @@ class DiscordGateway {
         author: { id: message.authorId, bot: false },
         channel
       };
+      if (this.state.getBinding(message.channelId)?.readiness !== READINESS.READY) {
+        blockedOwners.add(key);
+        continue;
+      }
       let result;
       try {
         if (message.state === 'accepted') {
           result = await waitForRecoveryOperation(
-            () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true }),
+            () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true, awaitDispatchOutcome: true }),
             signal,
             deadline
           );
@@ -1017,16 +1686,20 @@ class DiscordGateway {
             deadline
           );
         } else {
+          this.state.recoverNativeReplyAcknowledgment(message.id);
           result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
         }
+        if (result === DISPATCH_OUTCOMES.NOT_SUBMITTED || result?.status === DISPATCH_OUTCOMES.NOT_SUBMITTED) {
+          blockedOwners.add(key);
+        }
       } catch (error) {
-        if (recoveryKind(error) === 'stopped') return this.state.recoveryCandidates(before);
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
         continue;
       }
     }
-    return this.state.recoveryCandidates(before);
+    return this.state.recoveryCandidates(before).filter(allowed);
   }
 
   async stop() {
@@ -1035,18 +1708,32 @@ class DiscordGateway {
     this.connectionEpoch += 1;
     this.stopping = true;
     this.started = false;
+    this.transportReady = false;
+    if (this.deferredHandoffRecoveryTimer) clearTimeout(this.deferredHandoffRecoveryTimer);
+    this.deferredHandoffRecoveryTimer = null;
+    if (this.pendingHandoffRecoveryPollTimer) clearTimeout(this.pendingHandoffRecoveryPollTimer);
+    this.pendingHandoffRecoveryPollTimer = null;
+    this.deferredHandoffRecoveryChannels.clear();
+    this.pendingHandoffRecoveryChannels.clear();
+    this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.stopPromise = (async () => {
       this.ready = false;
       this.recoveryController?.abort();
+      this.liveCheckpointController?.abort();
       const recovery = this.recoveryPromise;
       const reconnect = this.reconnectPromise;
-      await Promise.allSettled([recovery, reconnect].filter(Boolean));
+      const liveCheckpoint = this.liveCheckpointPromise;
+      await Promise.allSettled([recovery, reconnect, liveCheckpoint].filter(Boolean));
+      this.liveIntakeCounts.clear();
       for (const controller of this.controllers) controller.abort();
       for (const controller of this.receiptControllers) controller.abort();
+      const acknowledgmentStop = this.acknowledgments?.stop();
+      this.acknowledgments = null;
       this.consumer.abortNativeWork();
       await Promise.allSettled([...this.inFlight]);
       await this.consumer.waitForNativeWork();
       await this.consumer.waitForReceipts();
+      await acknowledgmentStop;
       this.client.off?.('messageCreate', this.boundMessage);
       this.client.off?.('shardResume', this.boundResume);
       this.client.off?.('resume', this.boundResume);
@@ -1071,6 +1758,7 @@ module.exports = {
   DiscordGateway,
   classifyReplyError,
   createSurfaceConsumer,
+  discordIdAfter,
   eventToInput,
   readSecret,
   requireInstalled,

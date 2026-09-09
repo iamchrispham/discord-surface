@@ -1,9 +1,18 @@
 const fs = require('node:fs');
 const http = require('node:http');
+const net = require('node:net');
 const { execFile } = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
 const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('./state');
+
+const CODEX_VALIDATION_KINDS = Object.freeze({
+  UNSUPPORTED_ROOT: 'unsupported-root',
+  STOPPED: 'stopped',
+  DEADLINE: 'deadline'
+});
+
+const VALIDATION_SCAN_BATCH_SIZE = 64;
 
 function sleep(ms, signal) {
   if (signal?.aborted) return Promise.resolve();
@@ -31,7 +40,7 @@ function attachmentPrompt(message) {
   ].join('\n');
 }
 
-function codexPrompt(message) {
+function codexPrompt(message, acknowledgment = null) {
   const marker = `[[discord-surface:${message.id}]]`;
   const prompt = [
     `This is an inbound Discord message for native session ${message.nativeId}.`,
@@ -41,6 +50,7 @@ function codexPrompt(message) {
     '',
     message.content
   ];
+  if (acknowledgment) prompt.splice(3, 0, `At pickup, acknowledge this exact message by running this command once, preserving argument boundaries: ${JSON.stringify(acknowledgment)}. Then handle the request normally. Acknowledgment means received, not completed.`);
   const attachments = attachmentPrompt(message);
   if (attachments) prompt.push('', attachments);
   return prompt.join('\n');
@@ -66,9 +76,9 @@ function claudeEvent(message) {
   return event;
 }
 
-function sessionRoot() {
+function sessionRoot(environment = process.env) {
   const home = os.homedir();
-  return path.join(process.env.CODEX_HOME || path.join(home, '.codex'), 'sessions');
+  return path.join(environment.CODEX_HOME || path.join(home, '.codex'), 'sessions');
 }
 
 function walk(dir, result = [], depth = 0) {
@@ -83,13 +93,219 @@ function walk(dir, result = [], depth = 0) {
   return result;
 }
 
+function normalizeValidationOptions(options = {}) {
+  if (options && typeof options.aborted === 'boolean' && typeof options.addEventListener === 'function') {
+    return { signal: options };
+  }
+  return options || {};
+}
+
+function validationError(kind, message) {
+  const error = new Error(message);
+  error.recoveryKind = kind;
+  return error;
+}
+
+function assertValidationActive(rawOptions = {}) {
+  const options = normalizeValidationOptions(rawOptions);
+  if (options.signal?.aborted) {
+    throw validationError(CODEX_VALIDATION_KINDS.STOPPED, 'Codex transcript validation was stopped');
+  }
+  if (options.deadline !== undefined && Date.now() >= options.deadline) {
+    throw validationError(CODEX_VALIDATION_KINDS.DEADLINE, 'Codex transcript validation deadline exceeded');
+  }
+}
+
+async function readSessionHeaderAsync(file, rawOptions = {}) {
+  const options = normalizeValidationOptions(rawOptions);
+  let handle = null;
+  let closePromise = null;
+  const closeHandle = () => {
+    if (!handle) return Promise.resolve();
+    if (!closePromise) closePromise = handle.close().catch(() => {});
+    return closePromise;
+  };
+  let onAbort;
+  const abortPromise = options.signal ? new Promise((_, reject) => {
+    onAbort = () => {
+      closeHandle();
+      reject(validationError(CODEX_VALIDATION_KINDS.STOPPED, 'Codex transcript validation was stopped'));
+    };
+    if (options.signal.aborted) onAbort();
+    else options.signal.addEventListener('abort', onAbort, { once: true });
+  }) : null;
+  const guarded = operation => abortPromise ? Promise.race([operation, abortPromise]) : operation;
+  try {
+    const opening = fs.promises.open(file, 'r');
+    opening.then(candidate => {
+      if (options.signal?.aborted) candidate.close().catch(() => {});
+    }, () => {});
+    handle = await guarded(opening);
+    assertValidationActive(options);
+    const { size } = await guarded(handle.stat());
+    assertValidationActive(options);
+    const parts = [];
+    let headerBytes = 0;
+    for (let position = 0; position < size;) {
+      assertValidationActive(options);
+      const length = Math.min(TRANSCRIPT_BLOCK_BYTES, size - position);
+      const bytes = Buffer.allocUnsafe(length);
+      let read = 0;
+      while (read < length) {
+        const result = await guarded(handle.read(bytes, read, length - read, position + read));
+        assertValidationActive(options);
+        if (!result.bytesRead) throw new Error('transcript shortened during read');
+        read += result.bytesRead;
+      }
+      const newline = bytes.indexOf(0x0a);
+      const part = newline < 0 ? bytes : bytes.subarray(0, newline);
+      if (headerBytes + part.length > TRANSCRIPT_HEADER_MAX_BYTES) {
+        throw new Error(`transcript header exceeds ${TRANSCRIPT_HEADER_MAX_BYTES} bytes`);
+      }
+      parts.push(part);
+      headerBytes += part.length;
+      if (newline >= 0) break;
+      position += bytes.length;
+    }
+    return Buffer.concat(parts).toString('utf8');
+  } finally {
+    if (options.signal && onAbort) options.signal.removeEventListener('abort', onAbort);
+    const closing = closeHandle();
+    if (!options.signal?.aborted) await closing;
+  }
+}
+
+function awaitWithDeadline(task, deadline, onDeadline = null) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(validationError(CODEX_VALIDATION_KINDS.DEADLINE, 'operation deadline exceeded'));
+  let timer;
+  const operation = Promise.resolve().then(task);
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      try { onDeadline?.(); } finally {
+        reject(validationError(CODEX_VALIDATION_KINDS.DEADLINE, 'operation deadline exceeded'));
+      }
+    }, Math.min(remaining, 0x7fffffff));
+  });
+  return Promise.race([operation, timeout]).finally(() => clearTimeout(timer));
+}
+
+function openDirectoryWithDeadline(dir, deadline) {
+  const opening = Promise.resolve().then(() => fs.promises.opendir(dir));
+  return awaitWithDeadline(() => opening, deadline).catch(error => {
+    opening.then(async handle => {
+      try { await handle.close(); } catch {}
+    }, () => {});
+    throw error;
+  });
+}
+
+async function closeDirectoryWithDeadline(handle, options) {
+  const closing = Promise.resolve().then(() => handle.close());
+  closing.catch(() => {
+    if (options) options.complete = false;
+  });
+  try {
+    if (options) await awaitWithDeadline(() => closing, options.deadline);
+    else await closing;
+  } catch {
+    if (options) options.complete = false;
+  }
+}
+
+async function* walkAsync(dir, depth = 0, options = undefined) {
+  const scan = options ? normalizeValidationOptions(options) : null;
+  const limitReached = () => scan && Date.now() >= scan.deadline;
+  if (scan) assertValidationActive(scan);
+  if (depth > 5 || limitReached()) {
+    return;
+  }
+  let handle;
+  try {
+    handle = scan
+      ? await openDirectoryWithDeadline(dir, scan.deadline)
+      : await fs.promises.opendir(dir);
+    for (;;) {
+      if (scan) assertValidationActive(scan);
+      if (limitReached()) {
+        return;
+      }
+      const entry = scan
+        ? await awaitWithDeadline(() => handle.read(), scan.deadline)
+        : await handle.read();
+      if (!entry) break;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) yield* walkAsync(full, depth + 1, scan);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) yield full;
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  } catch (error) {
+    if (error?.recoveryKind) throw error;
+    return;
+  } finally {
+    if (handle) await closeDirectoryWithDeadline(handle, scan);
+  }
+}
+
+const CODEX_SESSION_DISCOVERY_TIMEOUT_MS = 5000;
+
+async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot(), rawOptions = {}) {
+  validateNativeId(nativeId);
+  const supplied = normalizeValidationOptions(rawOptions);
+  const options = supplied.deadline === undefined
+    ? { ...supplied, deadline: Date.now() + CODEX_SESSION_DISCOVERY_TIMEOUT_MS }
+    : supplied;
+  const matches = [];
+  let fileFailures = 0;
+  for await (const file of walkAsync(root, 0, options)) {
+    assertValidationActive(options);
+    if (!file.includes(nativeId)) continue;
+    const controller = new AbortController();
+    const relayAbort = () => controller.abort();
+    options.signal?.addEventListener('abort', relayAbort, { once: true });
+    try {
+      const readOptions = Object.create(options);
+      Object.defineProperty(readOptions, 'signal', { value: controller.signal, enumerable: true });
+      const row = JSON.parse(await awaitWithDeadline(
+        () => readSessionHeaderAsync(file, readOptions),
+        options.deadline,
+        () => controller.abort()
+      ));
+      assertValidationActive(options);
+      const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
+      const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
+      const threadId = typeof payload?.id === 'string' ? payload.id : null;
+      if (sessionId && threadId && sessionId !== threadId) continue;
+      if ((sessionId || threadId) !== nativeId) continue;
+      matches.push({
+        file, sessionId: nativeId, threadId: nativeId,
+        workspace: typeof payload.cwd === 'string' ? payload.cwd : null
+      });
+      if (matches.length > 1) return { ambiguous: true, files: matches.map(match => match.file) };
+    } catch (error) {
+      if (error?.recoveryKind) throw error;
+      fileFailures += 1;
+    } finally {
+      options.signal?.removeEventListener('abort', relayAbort);
+    }
+  }
+  assertValidationActive(options);
+  if (fileFailures > 0) return null;
+  if (matches.length === 0) return null;
+  return matches[0];
+}
+
 function findCodexSessionFile(nativeId, root = sessionRoot()) {
   for (const file of walk(root)) {
     if (!file.includes(nativeId)) continue;
     try {
       const line = readSessionHeader(file);
       const row = JSON.parse(line);
-      if (row.type === 'session_meta' && (row.payload?.session_id || row.payload?.id) === nativeId) return file;
+      if (row.type !== 'session_meta') continue;
+      const sessionId = typeof row.payload?.session_id === 'string' ? row.payload.session_id : null;
+      const threadId = typeof row.payload?.id === 'string' ? row.payload.id : null;
+      if (sessionId && threadId && sessionId !== threadId) continue;
+      if ((sessionId || threadId) === nativeId) return file;
     } catch {}
   }
   return null;
@@ -127,8 +343,10 @@ function cursorTailBytes(cursor) {
   return typeof cursor?.tail === 'string' ? Buffer.from(cursor.tail, 'utf8') : Buffer.alloc(0);
 }
 
-// This bounds each read, not record size. A valid JSONL record may span blocks.
+// A valid JSONL record may span blocks, but retained metadata stays bounded.
 const TRANSCRIPT_BLOCK_BYTES = 64 * 1024;
+const TRANSCRIPT_HEADER_MAX_BYTES = 1024 * 1024;
+const CLAUDE_METADATA_RECORD_MAX_BYTES = 1024 * 1024;
 
 function readTranscriptBlock(fd, position, length) {
   const bytes = Buffer.allocUnsafe(length);
@@ -146,10 +364,16 @@ function readSessionHeader(file) {
   try {
     const size = fs.fstatSync(fd).size;
     const parts = [];
+    let headerBytes = 0;
     for (let position = 0; position < size;) {
       const bytes = readTranscriptBlock(fd, position, Math.min(TRANSCRIPT_BLOCK_BYTES, size - position));
       const newline = bytes.indexOf(0x0a);
-      parts.push(newline < 0 ? bytes : bytes.subarray(0, newline));
+      const part = newline < 0 ? bytes : bytes.subarray(0, newline);
+      if (headerBytes + part.length > TRANSCRIPT_HEADER_MAX_BYTES) {
+        throw new Error(`transcript header exceeds ${TRANSCRIPT_HEADER_MAX_BYTES} bytes`);
+      }
+      parts.push(part);
+      headerBytes += part.length;
       if (newline >= 0) break;
       position += bytes.length;
     }
@@ -157,6 +381,275 @@ function readSessionHeader(file) {
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function readCodexSessionIdentity(nativeId, root = sessionRoot()) {
+  validateNativeId(nativeId);
+  const matches = [];
+  for (const file of walk(root)) {
+    if (!file.includes(nativeId)) continue;
+    try {
+      const row = JSON.parse(readSessionHeader(file));
+      const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
+      const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
+      const threadId = typeof payload?.id === 'string' ? payload.id : null;
+      if (sessionId && threadId && sessionId !== threadId) continue;
+      if ((sessionId || threadId) !== nativeId) continue;
+      matches.push({
+        file, sessionId: nativeId, threadId: nativeId,
+        workspace: typeof payload.cwd === 'string' ? payload.cwd : null
+      });
+    } catch {}
+  }
+  if (matches.length === 0) return null;
+  if (matches.length > 1) return { ambiguous: true, files: matches.map(match => match.file) };
+  return matches[0];
+}
+
+function codexHomeForSessionRoot(root) {
+  if (!path.isAbsolute(root) || path.basename(root) !== 'sessions') {
+    const error = new Error('Unsupported Codex session root: queue requires <CODEX_HOME>/sessions');
+    error.recoveryKind = CODEX_VALIDATION_KINDS.UNSUPPORTED_ROOT;
+    throw error;
+  }
+  return path.dirname(root);
+}
+
+function normalizeCodexSessionIdentity(identity, nativeId) {
+  const sessionId = identity.sessionId ?? null;
+  const threadId = identity.threadId ?? null;
+  if (sessionId !== null && threadId !== null && sessionId !== threadId) {
+    throw new Error('Codex transcript identity does not match the supplied native UUID');
+  }
+  if ((sessionId ?? threadId) !== nativeId) {
+    throw new Error('Codex transcript identity does not match the supplied native UUID');
+  }
+  return {
+    ...identity,
+    sessionId: sessionId ?? threadId,
+    threadId: threadId ?? sessionId
+  };
+}
+
+function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot()) {
+  validateNativeId(nativeId);
+  if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
+  codexHomeForSessionRoot(root);
+  const identity = readCodexSessionIdentity(nativeId, root);
+  if (!identity) throw new Error('Codex transcript identity is unavailable');
+  if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
+  const normalizedIdentity = normalizeCodexSessionIdentity(identity, nativeId);
+  if (workspace !== undefined && normalizedIdentity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
+  return normalizedIdentity;
+}
+
+async function validateCodexSessionIdentityAsync(nativeId, workspace, root = sessionRoot(), options = {}) {
+  validateNativeId(nativeId);
+  if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
+  codexHomeForSessionRoot(root);
+  let identity;
+  try {
+    identity = await readCodexSessionIdentityAsync(nativeId, root, options);
+  } catch (error) {
+    if (error?.recoveryKind === CODEX_VALIDATION_KINDS.STOPPED || error?.recoveryKind === CODEX_VALIDATION_KINDS.DEADLINE) {
+      const unavailable = new Error('Codex transcript identity is unavailable', { cause: error });
+      unavailable.recoveryKind = error.recoveryKind;
+      throw unavailable;
+    }
+    throw error;
+  }
+  if (!identity) throw new Error('Codex transcript identity is unavailable');
+  if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
+  const normalizedIdentity = normalizeCodexSessionIdentity(identity, nativeId);
+  if (workspace !== undefined && normalizedIdentity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
+  return normalizedIdentity;
+}
+
+function* readClaudeSessionMetadata(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (!size) throw new Error('Claude transcript metadata is empty');
+    const chunk = Buffer.allocUnsafe(TRANSCRIPT_BLOCK_BYTES);
+    let recordParts = [];
+    let recordLength = 0;
+    let position = 0;
+    const parseLine = line => {
+      if (!line.trim()) return null;
+      try { return JSON.parse(line); } catch { return null; }
+    };
+    const consumeRecord = (part, complete) => {
+      if (recordLength + part.length > CLAUDE_METADATA_RECORD_MAX_BYTES) {
+        throw new Error('Claude transcript metadata record is too large');
+      }
+      if (part.length) recordParts.push(Buffer.from(part));
+      recordLength += part.length;
+      if (!complete) return null;
+      const row = parseLine(Buffer.concat(recordParts, recordLength).toString('utf8'));
+      recordParts = [];
+      recordLength = 0;
+      return row;
+    };
+    while (position < size) {
+      const count = fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - position), position);
+      if (!count) throw new Error('transcript shortened during read');
+      position += count;
+      let start = 0;
+      while (start < count) {
+        const newline = chunk.indexOf(0x0a, start);
+        if (newline < 0) {
+          consumeRecord(chunk.subarray(start, count), false);
+          break;
+        }
+        const row = consumeRecord(chunk.subarray(start, newline), true);
+        if (row !== null) yield row;
+        start = newline + 1;
+      }
+    }
+    const row = consumeRecord(Buffer.alloc(0), true);
+    if (row !== null) yield row;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readClaudeSessionIdentity(nativeId, transcriptFile) {
+  validateNativeId(nativeId);
+  if (typeof transcriptFile !== 'string' || !path.isAbsolute(transcriptFile)) {
+    throw new Error('Claude transcript path must be absolute');
+  }
+  const stat = fs.statSync(transcriptFile);
+  if (!stat.isFile()) throw new Error('Claude transcript path must be a regular file');
+  let hasMatch = false;
+  const sessionIds = new Set();
+  let workspace = null;
+  for (const row of readClaudeSessionMetadata(transcriptFile)) {
+    const sessionId = row?.sessionId;
+    const payloadSessionId = row?.payload?.session_id;
+    const hasSessionId = sessionId !== undefined && sessionId !== null;
+    const hasPayloadSessionId = payloadSessionId !== undefined && payloadSessionId !== null;
+    if (row?.entrypoint !== 'cli' || typeof row?.version !== 'string' ||
+      typeof row?.cwd !== 'string' || !path.isAbsolute(row.cwd)) continue;
+    if (hasSessionId && hasPayloadSessionId && sessionId !== payloadSessionId) {
+      throw new Error('Claude transcript identity is ambiguous');
+    }
+    let candidateSessionId = null;
+    if (hasSessionId) candidateSessionId = sessionId;
+    else if (hasPayloadSessionId) candidateSessionId = payloadSessionId;
+    if (candidateSessionId === null) continue;
+    sessionIds.add(candidateSessionId);
+    if (sessionIds.size > 1) throw new Error('Claude transcript identity is ambiguous');
+    if (candidateSessionId === nativeId) {
+      hasMatch = true;
+      const candidateWorkspace = path.resolve(row.cwd);
+      if (workspace !== null && workspace !== candidateWorkspace) {
+        throw new Error('Claude transcript workspace is ambiguous');
+      }
+      workspace = candidateWorkspace;
+    }
+  }
+  if (!hasMatch) throw new Error('Claude transcript identity or workspace is unavailable');
+  return { file: transcriptFile, sessionId: nativeId, threadId: nativeId, workspace };
+}
+
+function validateClaudeSessionIdentity(nativeId, transcriptFile, workspace) {
+  if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) {
+    throw new Error('Claude workspace must be absolute');
+  }
+  const identity = readClaudeSessionIdentity(nativeId, transcriptFile);
+  if (workspace !== undefined && path.resolve(identity.workspace) !== path.resolve(workspace)) {
+    throw new Error('Claude transcript workspace does not match the supplied workspace');
+  }
+  return identity;
+}
+
+function probeUnixSocket(socketPath, { timeoutMs = 1000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ path: socketPath });
+    const timer = setTimeout(() => socket.destroy(new Error('native channel probe timed out')), timeoutMs);
+    const finish = (error) => {
+      clearTimeout(timer);
+      socket.removeListener('connect', onConnect);
+      socket.removeListener('error', onError);
+      socket.destroy();
+      if (error) reject(error);
+      else resolve({ socketPath });
+    };
+    const onConnect = () => finish();
+    const onError = error => finish(error);
+    socket.once('connect', onConnect);
+    socket.once('error', onError);
+  });
+}
+
+function probeClaudeChannel(socketPath, expected, { timeoutMs = 1000, maxBytes = 16384 } = {}) {
+  if (typeof socketPath !== 'string' || !path.isAbsolute(socketPath)) throw new Error('Claude channel endpoint must be absolute');
+  if (!expected || typeof expected !== 'object' || typeof expected.nativeId !== 'string' ||
+    !Number.isInteger(expected.generation) || expected.generation < 1 || expected.endpoint !== socketPath ||
+    typeof expected.workspace !== 'string' || !path.isAbsolute(expected.workspace)) {
+    throw new Error('Claude channel identity probe requires the expected binding');
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let request;
+    const deadlineMs = Math.max(1, Number(timeoutMs));
+    let deadlineTimer;
+    const finish = (error, proof = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      if (error) reject(error);
+      else resolve(proof);
+    };
+    deadlineTimer = setTimeout(() => {
+      const error = new Error('Claude channel identity probe timed out');
+      request?.destroy(error);
+      finish(error);
+    }, deadlineMs);
+    try {
+      request = http.request({ agent: false, socketPath, path: '/identity', method: 'GET',
+        headers: { accept: 'application/json' } }, response => {
+        let output = '';
+        response.setEncoding('utf8');
+        response.on('data', chunk => {
+          output += chunk;
+          if (Buffer.byteLength(output, 'utf8') > maxBytes) {
+            request.destroy(new Error('Claude channel identity response is too large'));
+          }
+        });
+        response.on('error', finish);
+        response.on('end', () => {
+          if (response.statusCode !== 200) {
+            finish(new Error(`Claude channel identity endpoint returned HTTP ${response.statusCode}`));
+            return;
+          }
+          let identity;
+          try { identity = JSON.parse(output); }
+          catch { finish(new Error('Claude channel identity response is invalid JSON')); return; }
+          if (identity?.provider !== 'claude' || identity.nativeId !== expected.nativeId ||
+            identity.generation !== expected.generation || identity.endpoint !== expected.endpoint ||
+            identity.workspace !== expected.workspace || identity.channelReady !== true) {
+            finish(new Error('Claude channel identity does not match the ordinary binding'));
+            return;
+          }
+          finish(null, {
+            file: socketPath,
+            sessionId: expected.nativeId,
+            threadId: expected.nativeId,
+            workspace: expected.workspace,
+            endpoint: socketPath,
+            harness: 'claude-code',
+            generation: expected.generation,
+            channelReady: true
+          });
+        });
+      });
+      request.once('error', finish);
+      request.end();
+    } catch (error) {
+      finish(error);
+    }
+  });
 }
 
 function readTranscriptTail(fd, size) {
@@ -173,18 +666,43 @@ function readTranscriptTail(fd, size) {
   return Buffer.concat(parts.reverse());
 }
 
-async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), pollMs = 250, signal, onCursor, continueUntilFinal = false, isCurrent } = {}) {
+async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000, root = sessionRoot(), resolveRoot, pollMs = 250, signal, onCursor, continueUntilFinal = false, isCurrent } = {}) {
   if (!marker) throw new Error('Codex observer requires a unique response marker');
   const startedAt = Date.now();
-  let file = cursor?.file || findCodexSessionFile(nativeId, root);
   let offset = Number(cursor?.offset || 0);
   let tailBytes = cursorTailBytes(cursor);
   let since = Number(cursor?.since || startedAt);
+  const initialSince = since;
+  const normalizeRoot = value => typeof value === 'string' && value.length > 0 ? path.resolve(value) : null;
+  const staticRoot = normalizeRoot(root);
+  const currentRoot = () => {
+    if (typeof resolveRoot !== 'function') return staticRoot;
+    try { return normalizeRoot(resolveRoot()) || staticRoot; } catch { return staticRoot; }
+  };
+  let activeRoot = currentRoot();
+  let file = cursor?.file || null;
+  if (file && activeRoot) {
+    const relative = path.relative(activeRoot, path.resolve(file));
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      file = null;
+      offset = 0;
+      tailBytes = Buffer.alloc(0);
+    }
+  }
+  if (!file) file = findCodexSessionFile(nativeId, activeRoot);
   const currentCursor = () => ({ file, offset, since, tail: tailBytes.toString('utf8'), tailBytes: tailBytes.toString('base64') });
   const stopped = () => signal?.aborted || (isCurrent && !isCurrent());
   while (continueUntilFinal || Date.now() - startedAt < timeoutMs) {
     if (stopped()) return { stopped: true, cursor: currentCursor() };
-    if (!file) file = findCodexSessionFile(nativeId, root);
+    const nextRoot = currentRoot();
+    if (nextRoot !== activeRoot) {
+      activeRoot = nextRoot;
+      file = null;
+      offset = 0;
+      tailBytes = Buffer.alloc(0);
+      since = initialSince;
+    }
+    if (!file) file = findCodexSessionFile(nativeId, activeRoot);
     if (file) {
       try {
         const fd = fs.openSync(file, 'r');
@@ -228,7 +746,12 @@ async function observeCodexReply(nativeId, cursor, { marker, timeoutMs = 120000,
         }
         if (text) return { text, cursor: currentCursor() };
         onCursor?.(currentCursor());
-      } catch {
+      } catch (error) {
+        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+          file = null;
+          offset = 0;
+          tailBytes = Buffer.alloc(0);
+        }
         onCursor?.(currentCursor());
       }
     }
@@ -258,7 +781,7 @@ function readInitialCursor(nativeId, root = sessionRoot()) {
 function runCodex(command, args, options = {}) {
   return new Promise(resolve => {
     let spawned = false;
-    const child = execFile(command, args, { cwd: options.cwd, env: process.env, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+    const child = execFile(command, args, { cwd: options.cwd, env: options.env || process.env, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
       if (!error) return resolve({ status: 'submitted', stdout, stderr });
       const text = `${error.message} ${stderr || ''}`;
       if (!spawned || error.code === 'ENOENT') return resolve({ status: 'not_submitted', error: new Error(text) });
@@ -276,27 +799,38 @@ function runCodex(command, args, options = {}) {
 }
 
 class CodexProvider {
-  constructor({ command = 'codex', root = sessionRoot(), run = runCodex } = {}) {
+  constructor({ command = 'codex', root = sessionRoot(), run = runCodex, acknowledgmentFor = null } = {}) {
     this.command = command;
     this.root = root;
     this.run = run;
+    this.acknowledgmentFor = acknowledgmentFor;
   }
 
-  async dispatch(message) {
+  async dispatch(message, { onCursor } = {}) {
     try { validateNativeId(message.nativeId); } catch (error) {
       return { status: 'not_submitted', error };
     }
-    const cursor = readInitialCursor(message.nativeId, this.root);
-    const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message), '--cd', message.workspace];
-    const result = await this.run(this.command, args, { cwd: message.workspace });
+    const root = message.sessionRoot || this.root;
+    let codexHome;
+    try { codexHome = codexHomeForSessionRoot(root); } catch (error) {
+      return { status: 'not_submitted', error };
+    }
+    const cursor = readInitialCursor(message.nativeId, root);
+    onCursor?.(cursor);
+    const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message, this.acknowledgmentFor?.(message)), '--cd', message.workspace];
+    const result = await this.run(this.command, args, {
+      cwd: message.workspace,
+      env: { ...process.env, CODEX_HOME: codexHome }
+    });
     return { ...result, cursor };
   }
 
-  observe(message, outcome, options) {
+  observe(message, outcome, options = {}) {
     return observeCodexReply(message.nativeId, outcome.cursor || message.observerCursor, {
       ...options,
       marker: `[[discord-surface:${message.id}]]`,
-      root: this.root
+      root: message.sessionRoot || this.root,
+      resolveRoot: typeof options.resolveRoot === 'function' ? () => options.resolveRoot() || this.root : undefined
     });
   }
 }
@@ -305,7 +839,7 @@ function postUnixJson(socketPath, body, { timeoutMs = 10000 } = {}) {
   return new Promise((resolve, reject) => {
     const encoded = Buffer.from(JSON.stringify(body));
     let wrote = false;
-    const request = http.request({ socketPath, path: '/event', method: 'POST', timeout: timeoutMs,
+    const request = http.request({ agent: false, socketPath, path: '/event', method: 'POST', timeout: timeoutMs,
       headers: { 'content-type': 'application/json', 'content-length': encoded.length } }, response => {
       let output = '';
       response.setEncoding('utf8');
@@ -329,14 +863,14 @@ class ClaudeProvider {
     try { validateNativeId(message.nativeId); } catch (error) {
       return { status: 'not_submitted', error };
     }
-    if (!message.endpoint) return { status: 'not_submitted', error: new Error('Claude binding has no native channel endpoint') };
+    if (!message.endpoint) return { status: 'not_submitted', endpointUnavailable: true, error: new Error('Claude binding has no native channel endpoint') };
     try {
       const result = await this.post(message.endpoint, claudeEvent(message));
       if (result.statusCode === 202) return { status: 'submitted' };
       if (result.statusCode >= 400 && result.statusCode < 500) return { status: 'not_submitted', error: new Error(`Claude channel rejected event: ${result.statusCode}`) };
       return { status: 'uncertain', error: new Error(`Claude channel returned ${result.statusCode}`) };
     } catch (error) {
-      return { status: error.wrote ? 'uncertain' : 'not_submitted', error };
+      return { status: error.wrote ? 'uncertain' : 'not_submitted', endpointUnavailable: !error.wrote, error };
     }
   }
 
@@ -380,9 +914,14 @@ async function observeSubmitted(state, message, provider, options = {}) {
     }
   };
   try {
-    reply = await provider.observe(message, outcome, {
+    reply = await provider.observe(providerMessageForBinding(state, message), outcome, {
       ...options,
       isCurrent,
+      resolveRoot: () => {
+        const currentMessage = state.getMessage(message.id);
+        if (!currentMessage) return undefined;
+        return state.currentMessageBinding(currentMessage)?.binding?.sessionRoot || undefined;
+      },
       onCursor: cursor => { observedCursor = cursor; }
     });
   } catch (error) {
@@ -405,43 +944,62 @@ async function observeSubmitted(state, message, provider, options = {}) {
   return { status: state.getMessage(message.id)?.state || message.state, message: state.getMessage(message.id) };
 }
 
+function providerMessageForBinding(state, message) {
+  if (typeof state?.currentMessageBinding !== 'function') return message;
+  try {
+    const binding = state.currentMessageBinding(message)?.binding;
+    if (!binding || binding.sessionRoot == null) return message;
+    return { ...message, sessionRoot: binding.sessionRoot };
+  } catch {
+    return message;
+  }
+}
+
 async function dispatchAndObserve(state, messageId, providers, options = {}) {
+  const reportOutcome = outcome => {
+    try { options.onDispatchOutcome?.(outcome); } catch {}
+    return outcome;
+  };
   let claimed;
   try {
     claimed = state.claimDispatch(messageId);
   } catch (error) {
-    return { status: 'rejected', message: state.getMessage(messageId), error };
+    return reportOutcome({ status: 'rejected', message: state.getMessage(messageId), error });
   }
-  if (!claimed.claimed) return { status: claimed.reason || claimed.message?.state || 'ignored', message: claimed.message };
+  if (!claimed.claimed) return reportOutcome({ status: claimed.reason || claimed.message?.state || 'ignored', message: claimed.message });
   const message = claimed.message;
   const provider = providers[message.provider];
   if (!provider) {
     const error = new Error(`provider is not configured: ${message.provider}`);
     state.markUncertain(message.id, error);
-    return { status: 'uncertain', message: state.getMessage(message.id), error };
+    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error });
   }
+  const marker = `[[discord-surface:${message.id}]]`;
   let outcome;
   try {
-    outcome = await provider.dispatch(message);
+    outcome = await provider.dispatch(providerMessageForBinding(state, message), {
+      onCursor: cursor => state.setObserverCursor(message.id, cursor, marker)
+    });
   } catch (error) {
     state.markUncertain(message.id, error);
-    return { status: 'uncertain', message: state.getMessage(message.id), error };
+    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error });
   }
   if (!outcome || !['submitted', 'not_submitted', 'uncertain'].includes(outcome.status)) {
     const error = new Error('native dispatcher returned an invalid outcome');
     state.markUncertain(message.id, error);
-    return { status: 'uncertain', message: state.getMessage(message.id), error };
+    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error });
   }
   if (outcome.status === 'not_submitted') {
+    try { options.onNativeUnavailable?.(message, outcome.error, outcome); } catch {}
     state.markNotSubmitted(message.id, outcome.error);
-    return { status: 'not_submitted', message: state.getMessage(message.id), error: outcome.error };
+    return reportOutcome({ status: 'not_submitted', message: state.getMessage(message.id), error: outcome.error });
   }
   if (outcome.status === 'uncertain') {
     state.markUncertain(message.id, outcome.error);
-    return { status: 'uncertain', message: state.getMessage(message.id), error: outcome.error };
+    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error: outcome.error });
   }
-  const marker = `[[discord-surface:${message.id}]]`;
   state.markSubmitted(message.id, outcome.cursor || null, marker);
+  reportOutcome({ status: 'submitted', message: state.getMessage(message.id) });
   try { options.onSubmitted?.(state.getMessage(message.id)); } catch {}
   const observation = await observeSubmitted(state, state.getMessage(message.id), provider, options);
   return observation;
@@ -449,6 +1007,7 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
 
 module.exports = {
   attachmentPrompt,
+  CODEX_VALIDATION_KINDS,
   ClaudeProvider,
   CodexProvider,
   claudeEvent,
@@ -459,9 +1018,18 @@ module.exports = {
   observeCodexReply,
   observeSubmitted,
   postUnixJson,
+  probeClaudeChannel,
+  probeUnixSocket,
+  readClaudeSessionIdentity,
+  readCodexSessionIdentity,
+  readCodexSessionIdentityAsync,
   readInitialCursor,
   runCodex,
   sessionRoot,
+  validateClaudeSessionIdentity,
+  validateCodexSessionIdentity,
+  validateCodexSessionIdentityAsync,
   waitForReply,
-  walk
+  walk,
+  walkAsync
 };

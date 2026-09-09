@@ -4,6 +4,7 @@ const path = require('node:path');
 const {
   BindingError,
   DIRECT_POST_OUTCOMES,
+  PROVIDERS,
   StaleGenerationError,
   discordNonce,
   splitReply,
@@ -46,17 +47,23 @@ function readTextFile(textFile) {
   return { sourcePath, text, textHash: hash(text), parts };
 }
 
-function bindingMatchesRequest(binding, { nativeId, generation, channelId, provider }) {
-  return binding.active && binding.conductorId && binding.repoKey && binding.nativeId === nativeId &&
+function bindingMatchesRequest(binding, { nativeId, generation, channelId, provider, ordinary = false }) {
+  const authorityMatches = ordinary
+    ? !binding.conductorId && !binding.repoKey
+    : Boolean(binding.conductorId && binding.repoKey);
+  return binding.active && authorityMatches && binding.nativeId === nativeId &&
     binding.generation === generation && (!channelId || binding.channelId === channelId) && (!provider || binding.provider === provider);
 }
 
-function resolveDirectBinding(state, { nativeId, generation, channelId = null, provider = null }) {
+function resolveDirectBinding(state, { nativeId, generation, channelId = null, provider = null, ordinary = false }) {
   validateNativeId(nativeId);
+  if (ordinary && provider && !Object.values(PROVIDERS).includes(provider)) throw new BindingError(`ordinary post does not support provider: ${provider}`);
   const config = state.requireConfig();
-  const candidates = state.listBindings().filter(binding => binding.guildId === config.guildId && bindingMatchesRequest(binding, { nativeId, generation, channelId, provider }));
-  if (candidates.length === 0) throw new StaleGenerationError('no active conductor binding matches the requested native owner');
-  if (candidates.length !== 1) throw new BindingError('direct post requires --channel-id when the native owner is ambiguous');
+  const candidates = state.listBindings().filter(binding => binding.guildId === config.guildId &&
+    bindingMatchesRequest(binding, { nativeId, generation, channelId, provider, ordinary }) &&
+    (!ordinary || state.isOrdinaryBinding(binding)));
+  if (candidates.length === 0) throw new StaleGenerationError(`no active ${ordinary ? `ordinary ${provider || 'native'}` : 'conductor'} binding matches the requested native owner`);
+  if (candidates.length !== 1) throw new BindingError(`${ordinary ? 'ordinary post' : 'direct post'} requires --channel-id when the native owner is ambiguous`);
   return candidates[0];
 }
 
@@ -112,8 +119,8 @@ function outcomeFor(error) {
 }
 
 async function runDirectPost({ state, token, nativeId, generation, channelId = null, provider = null, textFile,
-  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs }) {
-  const binding = resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider });
+  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs, ordinary = false }) {
+  const binding = resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
   const operatorId = state.requireConfig().operatorId;
   const source = readTextFile(textFile);
   const replyTarget = inReplyToValue(inReplyTo);

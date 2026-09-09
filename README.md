@@ -142,6 +142,86 @@ node /absolute/path/to/discord-surface/src/cli.js claude-monitor \
 
 The Monitor process owns its listener lifetime. It ignores stdin EOF, stops on native cancellation or signal, and removes only its own socket. Reply files belong to the native owner and are never blanket-cleaned by the adapter. A second listener on the same socket is rejected. Monitor startup does not promote native execution readiness. Discord intake readiness and native execution status remain separate. A stopped or abruptly lost Monitor never causes submitted work to be sent again.
 
+### Ordinary Codex session binding
+
+Run these commands from the existing Codex session's own command context after configuring the adapter. Caller identity comes from the native session environment and is checked against its transcript. Do not copy another session's identity into that environment.
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-bind \
+  --state-dir "$HOME/.config/discord-surface" \
+  --channel-id EXISTING_CHANNEL_ID
+```
+
+The channel must already exist in the configured server. A quoted `--channel '#channel-name'` can select an unambiguous name instead. The command preserves the current native session and reports its binding, generation, transcript-proof status and Gateway wake result. It does not create a session or a channel. If needed, supply `--workspace /absolute/workspace` and `--session-root /absolute/codex/sessions`; the workspace must match the transcript. Existing bindings retain their recorded session root when that option is omitted.
+
+A successful binding or requested wake is not delivery proof. Readiness can remain pending or unavailable until native identity and intake recovery succeed. A running Gateway must advertise ordinary-binding wake support. Coordinate an upgrade with its owner when it does not; do not send signals to an incompatible shared Gateway. Only one ordinary bind runs at a time, exit 75 means the lock was busy, and the command is safe to retry.
+
+For a milestone from that same bound session, use the returned native ID and generation:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --channel-id EXISTING_CHANNEL_ID \
+  --native-id CURRENT_CODEX_SESSION_UUID \
+  --generation BINDING_GENERATION \
+  --text-file /absolute/path/to/milestone.txt \
+  --dedupe-key STABLE_MILESTONE_KEY
+```
+
+Keep the dedupe key unchanged when retrying the same milestone. The command checks the caller against the active Codex binding before posting. Its receipt distinguishes a completed Discord send from a pending or uncertain outcome.
+
+`/discord-bind` is maintained outside this package in the shared skills repository. Its ordinary-session integration is a separate delivery requirement; these CLI commands do not install or verify that skill integration. Live native delivery and operating-system qualification remain separate from local simulated tests.
+
+### Ordinary Claude session binding
+
+This path binds one existing Claude Code session to one existing message-capable channel. It does not create a channel, start or resume Claude, copy transcript history, change permission mode, or bypass native approval. Run the bind command from the existing Claude Code session's own command context:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-claude-bind \
+  --state-dir "$HOME/.config/discord-surface" \
+  --channel-id EXISTING_CHANNEL_ID \
+  --endpoint SHORT_OWNER_ONLY_SOCKET_PATH \
+  --transcript /absolute/path/to/the/exact/current/session.jsonl
+```
+
+The state directory must already be configured. `--channel-id` must name a message-capable channel in the configured guild. `--endpoint` is the exact short absolute Unix socket path that the Monitor will use. `--socket` is accepted as an alias when it names the same path. `--workspace` is optional and must equal the workspace recorded in the transcript when supplied. `--native-id` is optional and must equal the resolved Claude session ID, so omit it unless that value is already known exactly.
+
+The command imports the current local `~/.claude/hooks/session-chat-binding.mjs` hook and requires it to return exactly one active `claude-code` caller with a session ID. Run it in that caller context. Do not set or copy a guessed identity. If the hook cannot identify one active caller, or reports another harness, the command refuses.
+
+`--transcript` is an explicit evidence path, not an identity authority or a newest-file selector. The adapter checks the initial transcript metadata for the resolved session ID, `entrypoint: "cli"`, a version, and one absolute `cwd`. It derives the binding workspace from that `cwd`, and rejects an ambiguous or mismatching `--workspace`. Keep the transcript path tied to the same session that the caller hook returned.
+
+The bind result reports the binding, generation, transcript proof, and a Monitor-pending state. It does not prove that the native session is listening or that Discord intake is ready. If a running Gateway does not advertise ordinary-bind wake support, the bind must be retried after that Gateway is stopped or restarted with the supported build.
+
+After the bind succeeds, read `binding.nativeId`, `binding.endpoint`, `binding.channelId`, and `binding.generation` from its JSON result. In the same Claude session, start the native `Monitor` tool with `persistent: true` and this command:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js claude-monitor \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id BINDING_NATIVE_ID \
+  --socket BINDING_ENDPOINT
+```
+
+Run this as the native Monitor tool, not as an unrelated background shell. The command must use the exact bound UUID and endpoint. It emits no startup line. Each accepted Discord instruction produces one JSON pointer containing `payloadPath`, message ID, native UUID, and generation. Read the complete payload file, run its acknowledgment command once when the message is picked up, write the final answer to its owner-only reply file, and run its exact `reply.command`. Acknowledgment records receipt, not completion. The reply command records the final answer for the exact message and generation. Do not guess either identifier. A Monitor stop or transport loss leaves submitted custody for recovery and does not replay the instruction automatically.
+
+The Monitor marks ordinary binding readiness unavailable with `Claude Monitor unavailable` when it stops. On startup, if intake is unavailable because the Claude endpoint was unavailable before event write, it reconciles that intake and requests a Gateway wake.
+
+For an explicit milestone from the same ordinary Claude session, write the text to an owner-controlled file and run:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js ordinary-claude-post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --db "$HOME/.config/discord-surface/surface.sqlite" \
+  --channel-id BOUND_CHANNEL_ID \
+  --native-id BINDING_NATIVE_ID \
+  --generation CURRENT_GENERATION \
+  --text-file /absolute/path/to/milestone.txt \
+  --dedupe-key MILESTONE_KEY
+```
+
+This command resolves the current Claude caller again and requires the active ordinary Claude binding, exact native ID, channel, and generation. Repeat the same dedupe key with unchanged text to inspect or resume the same milestone. Add `--in-reply-to DISCORD_MESSAGE_ID` only when the milestone belongs to that source message. A successful result proves Discord accepted the returned message IDs. It does not prove that a human read the milestone or that Claude acted on it.
+
+This path is currently qualified only by local simulated tests and package smoke. The adapter requires Node 22.13.x through 22.x. Claude attachment uses an owner-only Unix socket with a short absolute path, so Windows support is not established by this text. macOS, Linux, and Windows Claude host and provider rows, native session opt-in, Discord permissions, approval behavior, endpoint recovery, and a live instruction/reply/milestone round trip require separate direct verification.
+
 Accepted input is durable before a Discord handler returns. After authorized intake commits, live input gets one deterministic transport receipt. The receipt says either `Receipt: saved for this conductor.` or `Receipt: saved. Delivery was paused when this receipt was prepared.` It is a reply to the source message with mentions disabled. It never claims that the native agent has read, acted on, or answered the input. Receipt delivery is independent of native forwarding, uses a stable nonce, and never retries an uncertain send. Duplicate or rejected input gets no receipt attempt.
 
 Discord attachments are retained as validated URL metadata with the message, including filename, MIME type, and size. The adapter never downloads or archives attachment bytes. CDN URLs can expire, so native sessions receive the references as untrusted user data and decide whether they need to read them.

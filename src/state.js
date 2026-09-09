@@ -3,8 +3,19 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { normalizeAttachments } = require('./attachments');
+const { ORDINARY_RECEIPT_KINDS } = require('./ordinary/constants');
+const { createOrdinaryRepository } = require('./ordinary');
+const { createDirectPostHandlers, queryDirectPostRows } = require('./state/direct-post');
+const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
+const {
+  createIntakeHandlers,
+  intakeCutoffDecision,
+  pauseOrdinaryHandoffIntake,
+  restoreOrdinaryHandoffIntake,
+  recoverInterruptedOrdinaryHandoffIntake
+} = require('./state/intake');
 
-const SCHEMA_VERSION = '1.5';
+const SCHEMA_VERSION = '1.6';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
 const READINESS = Object.freeze({
   PENDING: 'pending',
@@ -12,6 +23,9 @@ const READINESS = Object.freeze({
   UNAVAILABLE: 'unavailable',
   RECOVERING: 'recovering',
   GAP: 'gap'
+});
+const INTAKE_BOUNDARY_DETAILS = Object.freeze({
+  ORDINARY_HANDOFF: 'ordinary handoff fence'
 });
 const RECOVERY_LIMITS = Object.freeze({ pageSize: 100, maxPages: 10, maxMessages: 1000, timeoutMs: 30000 });
 const MESSAGE_STATES = Object.freeze({
@@ -37,10 +51,12 @@ const TOPIC_DEFINITE_NOT_PUBLISHED = new Set(['rate_limited', 'rejected', 'stopp
 const TRANSPORT_RECEIPT_ATTEMPT = 'transport-receipt-attempt';
 const TRANSPORT_RECEIPT_OUTCOME = 'transport-receipt-outcome';
 const TRANSPORT_RECEIPT_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
+const NATIVE_ACK_RECEIPT = 'native-ack';
 
 const DIRECT_POST_ATTEMPT = 'direct-post-attempt';
 const DIRECT_POST_OUTCOME = 'direct-post-outcome';
 const DIRECT_POST_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
+const DISPATCH_OUTCOMES = Object.freeze({ NOT_SUBMITTED: 'not_submitted' });
 
 const ACTIVE_STATES = new Set([
   MESSAGE_STATES.ACCEPTED,
@@ -60,6 +76,41 @@ class BindingError extends Error {}
 class AuthorizationError extends Error {}
 class StaleGenerationError extends Error {}
 class UnresolvedWorkError extends Error {}
+
+const ordinaryBindingHandlers = createOrdinaryBindingHandlers({
+  BindingError,
+  StaleGenerationError,
+  MESSAGE_STATES,
+  PROVIDERS,
+  READINESS,
+  UnresolvedWorkError,
+  assertText,
+  assertUuid,
+  bindingMatchesExpected,
+  now
+});
+
+const directPostHandlers = createDirectPostHandlers({
+  BindingError,
+  StaleGenerationError,
+  StateCorruptError,
+  DIRECT_POST_ATTEMPT,
+  DIRECT_POST_OUTCOME,
+  DIRECT_POST_OUTCOMES,
+  assertText,
+  bindingMatchesExpected,
+  parseJson,
+  now
+});
+
+const intakeHandlers = createIntakeHandlers({
+  BindingError,
+  READINESS,
+  assertText,
+  bindingMatchesExpected,
+  compareDiscordIds,
+  now
+});
 
 function assertText(value, name, max = 512) {
   if (typeof value !== 'string' || value.length === 0 || value.length > max) {
@@ -279,6 +330,7 @@ function rowBinding(row) {
     provider: row.provider,
     nativeId: row.native_id,
     workspace: row.workspace,
+    sessionRoot: row.session_root || null,
     endpoint: row.endpoint,
     categoryId: row.category_id || null,
     conductorId: row.conductor_id || null,
@@ -320,7 +372,28 @@ function bindingMatchesExpected(binding, expected) {
   return Boolean(binding) && binding.active === expected.active && binding.channelId === expected.channelId &&
     binding.guildId === expected.guildId && binding.provider === expected.provider &&
     binding.nativeId === expected.nativeId && binding.generation === expected.generation &&
+    (binding.sessionRoot || null) === (expected.sessionRoot || null) &&
     binding.conductorId === expected.conductorId && binding.repoKey === expected.repoKey;
+}
+
+function assertOrdinaryIdentity(provider, identity) {
+  if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' ||
+    identity.sessionId !== identity.threadId) {
+    throw new BindingError(`ordinary ${provider} identity is missing or conflicting`);
+  }
+  assertUuid(identity.sessionId, 'sessionId');
+  assertUuid(identity.threadId, 'threadId');
+  if (provider === PROVIDERS.CLAUDE && identity.harness !== 'claude-code') {
+    throw new BindingError('ordinary Claude identity requires the claude-code harness');
+  }
+  return identity;
+}
+
+function assertOrdinaryNativeIdentity(provider, nativeId, identity) {
+  if (identity.sessionId !== nativeId || identity.threadId !== nativeId) {
+    const label = provider === PROVIDERS.CLAUDE ? 'Claude' : 'Codex';
+    throw new BindingError(`ordinary ${label} identity does not match the native session`);
+  }
 }
 
 function bindingIdentityMatchesTopicPublication(binding, publication) {
@@ -352,7 +425,21 @@ class SurfaceState {
     }
     this.dbPath = dbPath;
     this.failNextIntakeFlag = Boolean(options.failNextIntake);
+    this.ordinary = createOrdinaryRepository({ state: this, assertOrdinaryIdentity, assertOrdinaryNativeIdentity });
+    this.ordinaryHandoffPauses = new Set();
+    this.ordinaryHandoffPauseSnapshots = new Map();
   }
+
+  bindOrdinary(...args) { return this._bindOrdinary(...args); }
+  bindOrdinaryClaude(...args) { return this._bindOrdinaryClaude(...args); }
+  rebindOrdinary(...args) { return this._rebindOrdinary(...args); }
+  rebindOrdinaryClaude(...args) { return this._rebindOrdinaryClaude(...args); }
+  isOrdinaryBindingRecord(...args) { return this._isOrdinaryBindingRecord(...args); }
+  isOrdinaryBinding(...args) { return this._isOrdinaryBinding(...args); }
+  hasOrdinaryPreflight(...args) { return this._hasOrdinaryPreflight(...args); }
+  recordOrdinaryPreflight(...args) { return this._recordOrdinaryPreflight(...args); }
+  findOrdinaryHandoff(...args) { return this._findOrdinaryHandoff(...args); }
+  handoffOrdinary(...args) { return this._handoffOrdinary(...args); }
 
   createSchema() {
     this.db.exec(`
@@ -368,6 +455,7 @@ class SurfaceState {
         provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),
         native_id TEXT NOT NULL,
         workspace TEXT NOT NULL,
+        session_root TEXT,
         endpoint TEXT,
         category_id TEXT,
         conductor_id TEXT,
@@ -490,16 +578,38 @@ class SurfaceState {
         ON receipts(json_extract(detail, '$.messageId')) WHERE kind='direct-post-outcome';
       CREATE INDEX IF NOT EXISTS direct_post_outcome_nonce_idx
         ON receipts(json_extract(detail, '$.nonce')) WHERE kind='direct-post-outcome';
+      CREATE INDEX IF NOT EXISTS acknowledgment_receipt_idx
+        ON receipts(kind, discord_id, id);
+      CREATE INDEX IF NOT EXISTS receipts_channel_kind_idx
+        ON receipts(json_extract(detail, '$.channelId'), kind);
+      CREATE INDEX IF NOT EXISTS ordinary_bound_identity_idx
+        ON receipts(
+          json_extract(detail, '$.channelId'),
+          json_extract(detail, '$.nativeId'),
+          json_extract(detail, '$.workspace'),
+          json_extract(detail, '$.generation')
+        ) WHERE kind='ordinary-bound';
+      CREATE INDEX IF NOT EXISTS ordinary_preflight_identity_idx
+        ON receipts(
+          json_extract(detail, '$.channelId'),
+          json_extract(detail, '$.nativeId'),
+          json_extract(detail, '$.workspace'),
+          json_extract(detail, '$.generation'),
+          json_extract(detail, '$.sessionRoot'),
+          json_extract(detail, '$.outcome')
+        ) WHERE kind='ordinary-native-preflight';
     `);
   }
 
   migrateSchema() {
     const version = this.db.prepare("SELECT value FROM meta WHERE key='schema'").get();
     if (!version) throw new StateCorruptError('state schema metadata is missing');
-    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== SCHEMA_VERSION) {
+    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== '1.5' && version.value !== SCHEMA_VERSION) {
       throw new StateCorruptError(`unsupported state schema ${version.value}`);
     }
     if (version.value === SCHEMA_VERSION) {
+      const bindings = this.tableColumns('bindings');
+      if (!bindings.has('session_root')) this.db.exec('ALTER TABLE bindings ADD COLUMN session_root TEXT');
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_publications (
           request_id TEXT PRIMARY KEY,
@@ -588,6 +698,7 @@ class SurfaceState {
       if (!bindings.has('conductor_id')) this.db.exec('ALTER TABLE bindings ADD COLUMN conductor_id TEXT');
       if (!bindings.has('repo_key')) this.db.exec('ALTER TABLE bindings ADD COLUMN repo_key TEXT');
       if (!bindings.has('readiness')) this.db.exec("ALTER TABLE bindings ADD COLUMN readiness TEXT NOT NULL DEFAULT 'pending'");
+      if (!bindings.has('session_root')) this.db.exec('ALTER TABLE bindings ADD COLUMN session_root TEXT');
       if (!messages.has('conductor_id')) this.db.exec('ALTER TABLE messages ADD COLUMN conductor_id TEXT');
       if (!messages.has('repo_key')) this.db.exec('ALTER TABLE messages ADD COLUMN repo_key TEXT');
       if (!messages.has('attachments')) this.db.exec("ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'");
@@ -692,7 +803,7 @@ class SurfaceState {
     this.assertColumns('bindings', {
       channel_id: { type: 'TEXT' }, guild_id: { type: 'TEXT', notnull: true },
       provider: { type: 'TEXT', notnull: true }, native_id: { type: 'TEXT', notnull: true },
-      workspace: { type: 'TEXT', notnull: true }, conductor_id: { type: 'TEXT' }, repo_key: { type: 'TEXT' },
+      workspace: { type: 'TEXT', notnull: true }, session_root: { type: 'TEXT' }, conductor_id: { type: 'TEXT' }, repo_key: { type: 'TEXT' },
       readiness: { type: 'TEXT', notnull: true }, generation: { type: 'INTEGER', notnull: true },
       active: { type: 'INTEGER', notnull: true }, updated_at: { type: 'TEXT', notnull: true }
     });
@@ -868,6 +979,11 @@ class SurfaceState {
     const nativeId = assertUuid(binding.nativeId);
     const workspace = assertText(binding.workspace, 'workspace', 4096);
     if (!path.isAbsolute(workspace)) throw new BindingError('workspace must be absolute');
+    let sessionRoot;
+    if (binding.sessionRoot === undefined) sessionRoot = existing?.sessionRoot || null;
+    else if (binding.sessionRoot === null) sessionRoot = null;
+    else sessionRoot = assertText(binding.sessionRoot, 'sessionRoot', 4096);
+    if (sessionRoot !== null && !path.isAbsolute(sessionRoot)) throw new BindingError('sessionRoot must be absolute');
     const endpoint = binding.endpoint == null ? null : assertEndpoint(binding.endpoint);
     if (provider === PROVIDERS.CLAUDE && !endpoint) throw new BindingError('Claude bindings require a channel endpoint');
     const categoryId = binding.categoryId == null ? (existing?.categoryId || null) : assertText(binding.categoryId, 'categoryId', 128);
@@ -880,11 +996,21 @@ class SurfaceState {
     if (!Object.values(READINESS).includes(readiness)) throw new BindingError('invalid binding readiness');
     const config = this.requireConfig();
     if (guildId !== config.guildId) throw new BindingError('binding guild is not the configured guild');
-    return { channelId, guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey, readiness, generation };
+    return { channelId, guildId, provider, nativeId, workspace, sessionRoot, endpoint, categoryId, conductorId, repoKey, readiness, generation };
   }
 
-  bind(binding) {
+  bind(binding, options = {}) {
+    const ordinaryIdentity = binding.ordinaryIdentity || null;
+    const intakeCutoff = options.intakeCutoff ?? null;
+    const intakeCutoffDetail = options.intakeCutoffDetail || null;
+    const beforeMutation = options.beforeMutation;
     const input = this.bindingInput(binding);
+    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
+    if (ordinaryIdentity) {
+      if (input.conductorId || input.repoKey) throw new BindingError(`ordinary ${input.provider} bindings cannot carry conductor identity`);
+      assertOrdinaryIdentity(input.provider, ordinaryIdentity);
+      assertOrdinaryNativeIdentity(input.provider, input.nativeId, ordinaryIdentity);
+    }
     const existing = this.getBinding(input.channelId);
     if (existing) throw new BindingError('channel is already bound; use rebind after work drains');
     this.assertNativeOwnerFree(input.provider, input.nativeId);
@@ -892,25 +1018,228 @@ class SurfaceState {
     const createdAt = now();
     return this.transaction(() => {
       if (this.getBinding(input.channelId)) throw new BindingError('channel is already bound; use rebind after work drains');
+      this.assertNativeOwnerFree(input.provider, input.nativeId);
       const generationRow = input.conductorId
         ? this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE provider=? AND conductor_id=?').get(input.provider, input.conductorId)
         : this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE channel_id=?').get(input.channelId);
       const nextGeneration = Number(generationRow.next);
       const generation = input.generation == null ? nextGeneration : input.generation;
       if (generation < nextGeneration) throw new BindingError('binding generation would move backwards');
-      this.db.prepare(`INSERT INTO bindings(channel_id, guild_id, provider, native_id, workspace, endpoint, category_id, conductor_id, repo_key, readiness, generation, active, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(input.channelId, input.guildId, input.provider, input.nativeId, input.workspace, input.endpoint, input.categoryId, input.conductorId, input.repoKey, input.readiness, generation, createdAt);
+      if (typeof beforeMutation === 'function') beforeMutation();
+      this.db.prepare(`INSERT INTO bindings(channel_id, guild_id, provider, native_id, workspace, session_root, endpoint, category_id, conductor_id, repo_key, readiness, generation, active, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(input.channelId, input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, input.conductorId, input.repoKey, input.readiness, generation, createdAt);
       this.receipt(null, 'bound', { channelId: input.channelId, provider: input.provider, conductorId: input.conductorId, generation });
+      if (ordinaryIdentity) {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
+          channelId: input.channelId, guildId: input.guildId, provider: input.provider,
+          nativeId: input.nativeId, workspace: input.workspace, generation,
+          sessionRoot: input.sessionRoot,
+          sessionId: ordinaryIdentity.sessionId, threadId: ordinaryIdentity.threadId,
+          harness: ordinaryIdentity.harness || undefined, endpoint: input.endpoint || undefined
+        });
+      }
+      if (intakeCutoff !== null) {
+        this.setIntakeCutoffInTransaction(input.channelId, input.guildId, intakeCutoff, intakeCutoffDetail);
+      }
       return this.getBinding(input.channelId);
     });
   }
 
-  rebind(binding) {
+  _bindOrdinary(binding, identity, adoptionCutoff = null, options = {}) {
+    if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
+    assertOrdinaryIdentity(PROVIDERS.CODEX, identity);
+    assertOrdinaryNativeIdentity(PROVIDERS.CODEX, binding.nativeId, identity);
+    return this.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? options : {
+      intakeCutoff: adoptionCutoff,
+      intakeCutoffDetail: 'ordinary binding adoption cutoff',
+      beforeMutation: options.beforeMutation
+    });
+  }
+
+  _bindOrdinaryClaude(binding, identity, adoptionCutoff = null, options = {}) {
+    if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
+    assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
+    assertOrdinaryNativeIdentity(PROVIDERS.CLAUDE, binding.nativeId, identity);
+    return this.bind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? options : {
+      intakeCutoff: adoptionCutoff,
+      intakeCutoffDetail: 'ordinary binding adoption cutoff',
+      beforeMutation: options.beforeMutation
+    });
+  }
+
+  _rebindOrdinary(binding, identity, nativeProof = null, intakeCutoff = null, options = {}) {
+    if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
+    assertOrdinaryIdentity(PROVIDERS.CODEX, identity);
+    const existing = this.getBinding(binding.channelId);
+    if (!existing || !this._isOrdinaryBindingRecord(existing)) {
+      throw new BindingError('ordinary binding tombstone is unavailable for reuse');
+    }
+    const requestedSessionRoot = binding.sessionRoot === undefined
+      ? (!existing.active && nativeProof ? nativeProof.sessionRoot || null : existing.sessionRoot)
+      : binding.sessionRoot;
+    const sessionRootMatches = (existing.sessionRoot || null) === (requestedSessionRoot || null);
+    const verifiedRootRelocation = sessionRootMatches || Boolean(nativeProof &&
+      typeof nativeProof.file === 'string' && path.isAbsolute(nativeProof.file) &&
+      nativeProof.sessionId === existing.nativeId && nativeProof.threadId === existing.nativeId &&
+      nativeProof.workspace === existing.workspace && nativeProof.sessionRoot === requestedSessionRoot);
+    const sameOwner = existing.nativeId === binding.nativeId && existing.workspace === binding.workspace &&
+      identity.sessionId === existing.nativeId && identity.threadId === existing.nativeId && verifiedRootRelocation;
+    if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CODEX ||
+      !sameOwner) {
+      throw new BindingError('ordinary binding owner changed; use explicit handoff');
+    }
+    if (existing.active && sessionRootMatches) {
+      throw new BindingError('ordinary binding tombstone is unavailable for reuse');
+    }
+    if (existing.active && !sessionRootMatches &&
+      (this.hasUnresolved(binding.channelId) || this.hasUnresolvedOrdinaryPost(binding.channelId))) {
+      const input = this.bindingInput({
+        ...binding,
+        channelId: binding.channelId,
+        provider: PROVIDERS.CODEX,
+        conductorId: null,
+        repoKey: null,
+        readiness: READINESS.PENDING,
+        ordinaryIdentity: identity
+      }, existing);
+      return this.transaction(() => {
+        const current = this.getBinding(binding.channelId);
+        if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary root relocation source identity is stale');
+        const dispatching = this.db.prepare(
+          'SELECT 1 FROM messages WHERE channel_id=? AND state IN (?, ?, ?) LIMIT 1'
+        ).get(binding.channelId, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED);
+        if (dispatching) throw new BindingError('ordinary binding root relocation is unavailable while dispatch is in flight');
+        if (this.hasUnresolvedOrdinaryPost(binding.channelId)) {
+          throw new BindingError('ordinary binding root relocation has unresolved post custody');
+        }
+        this.assertLegacyMigrationSafe(binding.channelId);
+        if (typeof options.beforeMutation === 'function') options.beforeMutation();
+        const updatedAt = now();
+        this.db.prepare('UPDATE bindings SET session_root=?, readiness=?, updated_at=? WHERE channel_id=?')
+          .run(input.sessionRoot, READINESS.PENDING, updatedAt, binding.channelId);
+        this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
+          .run('ordinary transcript root relocated; intake recovery reopened', updatedAt, binding.channelId);
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.ROOT_RELOCATED, {
+          channelId: binding.channelId, generation: existing.generation, sessionRoot: input.sessionRoot
+        });
+        return this.getBinding(binding.channelId);
+      });
+    }
+    const rebound = {
+      ...binding,
+      sessionRoot: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : binding.sessionRoot,
+      provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity
+    };
+    return this.rebind(rebound, {
+      intakeCutoff,
+      resetIntake: !sessionRootMatches,
+      sessionRootOverride: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : undefined,
+      beforeMutation: options.beforeMutation
+    });
+  }
+
+  _rebindOrdinaryClaude(binding, identity, intakeCutoff = null, options = {}) {
+    if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
+    assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
+    const existing = this.getBinding(binding.channelId);
+    if (!existing || existing.active || !this._isOrdinaryBindingRecord(existing)) {
+      throw new BindingError('ordinary binding tombstone is unavailable for reuse');
+    }
+    if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CLAUDE ||
+      existing.nativeId !== binding.nativeId || existing.workspace !== binding.workspace || existing.endpoint !== binding.endpoint ||
+      identity.sessionId !== existing.nativeId || identity.threadId !== existing.nativeId) {
+      throw new BindingError('ordinary binding owner changed; use explicit handoff');
+    }
+    return this.rebind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, {
+      intakeCutoff,
+      beforeMutation: options.beforeMutation
+    });
+  }
+
+  _isOrdinaryBindingRecord(binding) {
+    if (!binding || !Object.values(PROVIDERS).includes(binding.provider) || binding.conductorId || binding.repoKey) return false;
+    return Boolean(this.db.prepare(`SELECT 1 FROM receipts
+      WHERE kind=?
+        AND json_extract(detail, '$.channelId')=?
+        AND json_extract(detail, '$.provider')=?
+        AND json_extract(detail, '$.nativeId')=?
+        AND json_extract(detail, '$.workspace')=?
+        AND json_extract(detail, '$.generation')=?
+      LIMIT 1`).get(ORDINARY_RECEIPT_KINDS.BOUND, binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation));
+  }
+
+  _isOrdinaryBinding(binding) {
+    return Boolean(binding?.active) && this._isOrdinaryBindingRecord(binding);
+  }
+
+  _hasOrdinaryPreflight(binding) {
+    if (!this._isOrdinaryBinding(binding)) return false;
+    return Boolean(this.db.prepare(`SELECT 1 FROM receipts
+      WHERE kind=?
+        AND json_extract(detail, '$.channelId')=?
+        AND json_extract(detail, '$.provider')=?
+        AND json_extract(detail, '$.nativeId')=?
+        AND json_extract(detail, '$.workspace')=?
+        AND json_extract(detail, '$.generation')=?
+        AND json_extract(detail, '$.sessionRoot') IS ?
+        AND json_extract(detail, '$.outcome')='verified'
+      LIMIT 1`).get(ORDINARY_RECEIPT_KINDS.NATIVE_PREFLIGHT, binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation, binding.sessionRoot || null));
+  }
+
+  _recordOrdinaryPreflight(binding, detail = {}) {
+    return this.transaction(() => {
+      const current = this.getBinding(binding?.channelId);
+      if (!bindingMatchesExpected(current, binding)) return null;
+      if (!this._isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${current?.provider || 'native'} binding`);
+      if (!detail || typeof detail !== 'object' || typeof detail.file !== 'string' || !path.isAbsolute(detail.file) ||
+        detail.sessionId !== current.nativeId || detail.threadId !== current.nativeId || detail.workspace !== current.workspace) {
+        throw new BindingError(`ordinary ${current.provider} native preflight proof does not match the binding`);
+      }
+      if (current.provider === PROVIDERS.CLAUDE && (detail.harness !== 'claude-code' || detail.endpoint !== current.endpoint)) {
+        throw new BindingError('ordinary Claude native preflight proof does not match the binding');
+      }
+      this.receipt(null, ORDINARY_RECEIPT_KINDS.NATIVE_PREFLIGHT, {
+        ...detail,
+        channelId: current.channelId, guildId: current.guildId, provider: current.provider,
+        nativeId: current.nativeId, workspace: current.workspace, generation: current.generation,
+        sessionRoot: current.sessionRoot || null,
+        outcome: 'verified'
+      });
+      return current;
+    });
+  }
+
+  rebind(binding, {
+    resetIntake = false,
+    sessionRootOverride = undefined,
+    intakeCutoff = null,
+    beforeMutation = undefined,
+    rejectUnresolvedOrdinaryPost = false
+  } = {}) {
+    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     const channelId = assertText(binding.channelId, 'channelId', 128);
     const existing = this.getBinding(channelId);
     if (!existing) throw new BindingError('channel is not bound');
     if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
+    const ordinaryIdentity = binding.ordinaryIdentity || null;
+    if (ordinaryIdentity) {
+      if (binding.conductorId || binding.repoKey) throw new BindingError(`ordinary ${binding.provider} bindings cannot carry conductor identity`);
+      assertOrdinaryIdentity(binding.provider, ordinaryIdentity);
+    }
     const input = this.bindingInput({ ...binding, channelId }, existing);
+    if (sessionRootOverride !== undefined) input.sessionRoot = sessionRootOverride;
+    const ordinary = this._isOrdinaryBindingRecord(existing);
+    const ordinaryIdentityMatches = input.nativeId === existing.nativeId &&
+      ordinaryIdentity?.sessionId === existing.nativeId && ordinaryIdentity?.threadId === existing.nativeId;
+    if (ordinary && existing.provider === PROVIDERS.CODEX && (!ordinaryIdentity || input.provider !== PROVIDERS.CODEX || input.conductorId || input.repoKey ||
+      !ordinaryIdentityMatches)) {
+      throw new BindingError('ordinary bindings require matching invocation identity');
+    }
+    if (ordinary && existing.provider === PROVIDERS.CLAUDE && (!ordinaryIdentity || input.provider !== PROVIDERS.CLAUDE || input.conductorId || input.repoKey ||
+      input.nativeId !== existing.nativeId || input.workspace !== existing.workspace || input.endpoint !== existing.endpoint ||
+      ordinaryIdentity.sessionId !== existing.nativeId || ordinaryIdentity.threadId !== existing.nativeId)) {
+      throw new BindingError('ordinary Claude bindings require matching owner and endpoint');
+    }
     this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
     if (existing.conductorId !== input.conductorId || existing.repoKey !== input.repoKey) throw new BindingError('conductor identity changes require an explicit handoff');
     if (existing.conductorId && existing.provider !== input.provider) throw new BindingError('conductor provider changes require an explicit handoff');
@@ -918,26 +1247,67 @@ class SurfaceState {
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
+      if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
+      if (rejectUnresolvedOrdinaryPost && ordinary && this.hasUnresolvedOrdinaryPost(channelId)) {
+        throw new UnresolvedWorkError('cannot rebind while an ordinary post is unresolved');
+      }
       this.assertLegacyMigrationSafe(channelId);
-      this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
-        .run(input.guildId, input.provider, input.nativeId, input.workspace, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
+      this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
+      if (typeof beforeMutation === 'function') beforeMutation();
+      if (intakeCutoff !== null) {
+        this.setIntakeCutoffInTransaction(channelId, input.guildId, intakeCutoff, 'ordinary binding adoption cutoff', current);
+      }
+      this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, session_root=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
+        .run(input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
       this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
+      if (ordinary && !input.conductorId && !input.repoKey) {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
+          channelId, guildId: input.guildId, provider: input.provider, nativeId: input.nativeId,
+          workspace: input.workspace, generation,
+          sessionRoot: input.sessionRoot,
+          sessionId: ordinaryIdentity?.sessionId || input.nativeId,
+          threadId: ordinaryIdentity?.threadId || input.nativeId,
+          harness: ordinaryIdentity?.harness || undefined, endpoint: input.endpoint || undefined
+        });
+      }
+      if (resetIntake) {
+        this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
+          .run('binding generation changed; intake recovery reopened', now(), channelId);
+      }
       return this.getBinding(channelId);
     });
   }
 
-  unbind(channelId) {
+  unbind(channelId, { expectedBinding = undefined, intakeCutoff = null } = {}) {
     assertText(channelId, 'channelId', 128);
+    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     const binding = this.getBinding(channelId);
     if (!binding) throw new BindingError('channel is not bound');
-    if (!binding.active) return true;
-    if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot unbind while work is unresolved');
+    if (expectedBinding !== undefined && !bindingMatchesExpected(binding, expectedBinding)) {
+      throw new StaleGenerationError('unbind source identity is stale');
+    }
+    if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
+      throw new UnresolvedWorkError('cannot unbind while work is unresolved');
+    }
     return this.transaction(() => {
       const current = this.getBinding(channelId);
-      if (!bindingMatchesExpected(current, binding)) throw new StaleGenerationError('unbind source identity is stale');
+      const expected = expectedBinding === undefined ? binding : expectedBinding;
+      if (!bindingMatchesExpected(current, expected)) throw new StaleGenerationError('unbind source identity is stale');
+      if (!current.active) return true;
+      if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
+        throw new UnresolvedWorkError('cannot unbind while work is unresolved');
+      }
       this.assertLegacyMigrationSafe(channelId);
+      if (intakeCutoff !== null) {
+        this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary unbind intake fence', current);
+        this.db.prepare("UPDATE intake_watermarks SET state='ready', updated_at=? WHERE channel_id=?")
+          .run(now(), channelId);
+      }
       this.db.prepare('UPDATE bindings SET active=0, updated_at=? WHERE channel_id=?').run(now(), channelId);
-      this.receipt(null, 'unbound', { channelId, generation: binding.generation });
+      this.receipt(null, 'unbound', {
+        channelId, generation: current.generation,
+        intakeCutoff: intakeCutoff || undefined
+      });
       return true;
     });
   }
@@ -972,6 +1342,9 @@ class SurfaceState {
       const binding = this.getBinding(channelId);
       if (!binding) throw new BindingError('channel is not bound');
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+      if (readiness === READINESS.READY && this._isOrdinaryBinding(binding) && !this._hasOrdinaryPreflight(binding)) {
+        throw new BindingError(`ordinary ${binding.provider} native preflight is required before READY`);
+      }
       if (readiness === READINESS.READY) this.assertLegacyMigrationSafe(channelId);
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
       this.receipt(null, 'binding-readiness', { channelId, conductorId: binding.conductorId, readiness, detail: detail || undefined });
@@ -987,6 +1360,158 @@ class SurfaceState {
       if (detail.handoffId === handoffId) return detail;
     }
     return null;
+  }
+
+  _findOrdinaryHandoff(handoffId) {
+    assertText(handoffId, 'handoffId', 256);
+    const rows = this.db.prepare('SELECT detail FROM receipts WHERE kind=? ORDER BY id DESC').all(ORDINARY_RECEIPT_KINDS.HANDOFF);
+    for (const row of rows) {
+      const detail = parseJson(row.detail, {});
+      if (detail.handoffId === handoffId) return detail;
+    }
+    return null;
+  }
+
+  hasUnboundReceipt(channelId, generation) {
+    const rows = this.db.prepare("SELECT detail FROM receipts WHERE kind='unbound' ORDER BY id DESC").all();
+    return rows.some(row => {
+      const detail = parseJson(row.detail, {});
+      return detail.channelId === channelId && detail.generation === generation;
+    });
+  }
+
+  _handoffOrdinary({ channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, beforeMutation = undefined }) {
+    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
+    if (provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff requires the Codex provider');
+    assertUuid(fromNativeId, 'fromNativeId');
+    assertUuid(nativeId, 'nativeId');
+    if (!Number.isInteger(fromGeneration) || fromGeneration < 1) throw new BindingError('fromGeneration must be a positive integer');
+    assertText(handoffId, 'handoffId', 256);
+    if (!identity || identity.sessionId !== nativeId || identity.threadId !== nativeId) {
+      throw new BindingError('ordinary handoff identity does not match the successor native session');
+    }
+    assertUuid(identity.sessionId, 'sessionId');
+    assertUuid(identity.threadId, 'threadId');
+    assertText(workspace, 'workspace', 4096);
+    if (!path.isAbsolute(workspace)) throw new BindingError('workspace must be absolute');
+    const existing = this.getBinding(channelId);
+    if (!existing || !this._isOrdinaryBindingRecord(existing)) throw new BindingError('ordinary handoff source is unavailable');
+    const requestedSessionRoot = sessionRoot === undefined ? existing.sessionRoot : sessionRoot;
+    if (requestedSessionRoot !== null && requestedSessionRoot !== undefined) {
+      assertText(requestedSessionRoot, 'sessionRoot', 4096);
+      if (!path.isAbsolute(requestedSessionRoot)) throw new BindingError('sessionRoot must be absolute');
+    }
+    const input = this.bindingInput({
+      channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId, workspace,
+      sessionRoot: requestedSessionRoot, conductorId: null, repoKey: null, readiness: READINESS.PENDING
+    }, existing);
+    if (!nativeProof || typeof nativeProof.file !== 'string' || !path.isAbsolute(nativeProof.file) ||
+      nativeProof.sessionId !== nativeId || nativeProof.threadId !== nativeId || nativeProof.workspace !== workspace ||
+      (nativeProof.sessionRoot || null) !== (input.sessionRoot || null)) {
+      throw new BindingError('ordinary handoff requires a matching Codex transcript proof');
+    }
+    const previous = this._findOrdinaryHandoff(handoffId);
+    if (previous) {
+      const sameRequest = previous.channelId === channelId && previous.provider === PROVIDERS.CODEX &&
+        previous.fromNativeId === fromNativeId && previous.fromGeneration === fromGeneration &&
+        previous.nativeId === nativeId &&
+        previous.generation === existing.generation && existing.active && existing.nativeId === nativeId &&
+        existing.generation === fromGeneration + 1 && existing.workspace === input.workspace &&
+        (existing.sessionRoot || null) === (input.sessionRoot || null);
+      if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
+      const retryResult = this.transaction(() => {
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF_RETRY, {
+          channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: existing.generation
+        });
+        return { ...existing, handoffReconciled: true };
+      });
+      this.ordinaryHandoffPauses.delete(channelId);
+      this.ordinaryHandoffPauseSnapshots.delete(channelId);
+      return retryResult;
+    }
+    if (existing.provider !== PROVIDERS.CODEX || existing.conductorId || existing.repoKey ||
+      existing.nativeId !== fromNativeId || existing.generation !== fromGeneration) {
+      throw new StaleGenerationError('ordinary handoff source identity is stale');
+    }
+    if (nativeId === fromNativeId) throw new BindingError('successor handoff requires a different native session UUID');
+    if (!existing.active && !this.hasUnboundReceipt(channelId, fromGeneration)) {
+      throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
+    }
+    if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
+      throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+    }
+    this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+    try {
+      const handoffResult = this.transaction(() => {
+        const current = this.getBinding(channelId);
+        if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary handoff source identity is stale');
+        if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
+          current.nativeId !== fromNativeId || current.generation !== fromGeneration) {
+          throw new StaleGenerationError('ordinary handoff source identity is stale');
+        }
+        if (!current.active && !this.hasUnboundReceipt(channelId, fromGeneration)) {
+          throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
+        }
+        if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
+          throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+        }
+        this.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+        this.assertLegacyMigrationSafe(channelId);
+        if (typeof beforeMutation === 'function') beforeMutation();
+        if (intakeCutoff !== null) {
+          this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
+        }
+        const generation = existing.generation + 1;
+        const updatedAt = now();
+        this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
+          WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
+          .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,
+            PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
+        this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
+          .run('ordinary handoff; intake recovery reopened', updatedAt, channelId);
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF, {
+          channelId, provider: PROVIDERS.CODEX, handoffId,
+          fromNativeId, fromGeneration, fromActive: existing.active,
+          nativeId: input.nativeId, generation, workspace: input.workspace, sessionRoot: input.sessionRoot,
+          sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
+        });
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
+          channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId: input.nativeId,
+          workspace: input.workspace, generation, sessionRoot: input.sessionRoot,
+          sessionId: identity.sessionId, threadId: identity.threadId
+        });
+        return this.getBinding(channelId);
+      });
+      this.ordinaryHandoffPauses.delete(channelId);
+      this.ordinaryHandoffPauseSnapshots.delete(channelId);
+      return handoffResult;
+    } catch (error) {
+      if (!(error instanceof StaleGenerationError)) throw error;
+      const committed = this._findOrdinaryHandoff(handoffId);
+      const successor = this.getBinding(channelId);
+      const reconciled = committed && successor && successor.active && successor.provider === PROVIDERS.CODEX &&
+        !successor.conductorId && !successor.repoKey && successor.nativeId === nativeId &&
+        successor.generation === fromGeneration + 1 && successor.workspace === input.workspace &&
+        (successor.sessionRoot || null) === (input.sessionRoot || null) &&
+        committed.channelId === channelId && committed.provider === PROVIDERS.CODEX &&
+        committed.fromNativeId === fromNativeId && committed.fromGeneration === fromGeneration &&
+        committed.nativeId === nativeId && committed.generation === successor.generation &&
+        committed.workspace === input.workspace && (committed.sessionRoot || null) === (input.sessionRoot || null);
+      if (!reconciled) throw error;
+      const retryResult = this.transaction(() => {
+        const current = this.getBinding(channelId);
+        const latest = this._findOrdinaryHandoff(handoffId);
+        if (!latest || !bindingMatchesExpected(current, successor) || latest.nativeId !== nativeId ||
+          latest.generation !== current.generation) throw error;
+        this.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF_RETRY, {
+          channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: current.generation
+        });
+        return { ...current, handoffReconciled: true };
+      });
+      this.ordinaryHandoffPauses.delete(channelId);
+      this.ordinaryHandoffPauseSnapshots.delete(channelId);
+      return retryResult;
+    }
   }
 
   handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId }) {
@@ -1021,8 +1546,8 @@ class SurfaceState {
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       this.assertLegacyMigrationSafe(channelId);
       const generation = existing.generation + 1;
-      this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
-        .run(input.nativeId, input.workspace, input.endpoint, READINESS.PENDING, generation, now(), channelId, provider, conductorId, fromGeneration, fromNativeId);
+      this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
+        .run(input.nativeId, input.workspace, input.sessionRoot, input.endpoint, READINESS.PENDING, generation, now(), channelId, provider, conductorId, fromGeneration, fromNativeId);
       this.receipt(null, 'conductor-handoff', {
         channelId, conductorId, repoKey, provider, handoffId,
         fromNativeId, fromGeneration, nativeId: input.nativeId, generation
@@ -1049,6 +1574,25 @@ class SurfaceState {
     return Boolean(row);
   }
 
+  hasDispatching(channelId) {
+    return Boolean(this.db.prepare('SELECT 1 FROM messages WHERE channel_id=? AND state=? LIMIT 1')
+      .get(channelId, MESSAGE_STATES.DISPATCHING));
+  }
+
+  hasSubmitted(channelId) {
+    return Boolean(this.db.prepare('SELECT 1 FROM messages WHERE channel_id=? AND state=? LIMIT 1')
+      .get(channelId, MESSAGE_STATES.SUBMITTED));
+  }
+
+  hasUncertain(channelId) {
+    return Boolean(this.db.prepare('SELECT 1 FROM messages WHERE channel_id=? AND state=? LIMIT 1')
+      .get(channelId, MESSAGE_STATES.UNCERTAIN));
+  }
+
+  hasUnresolvedOrdinaryPost(channelId) {
+    return directPostHandlers.hasUnresolvedOrdinaryPost(this, channelId);
+  }
+
   reject(reason) {
     return { accepted: false, reason };
   }
@@ -1056,8 +1600,9 @@ class SurfaceState {
   upsertIntakeWatermark(event, ready, coverageId = null) {
     const existing = this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(event.channelId);
     const lastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, event.id) >= 0 ? existing.last_seen_id : event.id;
-    const recoveredThrough = coverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, coverageId) < 0)
-      ? coverageId
+    const confirmedCoverageId = coverageId;
+    const recoveredThrough = confirmedCoverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, confirmedCoverageId) < 0)
+      ? confirmedCoverageId
       : existing?.recovered_through_id || null;
     const state = existing?.state === READINESS.GAP ? 'gap' : existing?.state === READINESS.UNAVAILABLE ? 'unavailable' : ready ? 'ready' : 'pending';
     if (existing) {
@@ -1079,6 +1624,14 @@ class SurfaceState {
   getIntakeWatermark(channelId) {
     assertText(channelId, 'channelId', 128);
     return this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(channelId) || null;
+  }
+
+  hasIntakeEvidence(discordId) {
+    return intakeHandlers.hasIntakeEvidence(this, discordId);
+  }
+
+  checkpointIntake(channelId, coverageId, expectedBinding = null) {
+    return intakeHandlers.checkpointIntake(this, channelId, coverageId, expectedBinding);
   }
 
   setIntakeBaseline(channelId, lastSeenId, detail, expectedBinding = null) {
@@ -1105,34 +1658,48 @@ class SurfaceState {
     });
   }
 
+  setIntakeCutoff(channelId, guildId, lastSeenId, detail, expectedBinding = undefined) {
+    return intakeHandlers.setIntakeCutoff(this, channelId, guildId, lastSeenId, detail, expectedBinding);
+  }
+
+  setIntakeCutoffInTransaction(channelId, guildId, lastSeenId, detail, expectedBinding = undefined) {
+    return intakeHandlers.setIntakeCutoffInTransaction(this, channelId, guildId, lastSeenId, detail, expectedBinding);
+  }
+
   listIntakeWatermarks() {
     return this.db.prepare('SELECT * FROM intake_watermarks ORDER BY channel_id').all();
   }
 
-  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null) {
-    assertText(channelId, 'channelId', 128);
-    if (!['pending', 'ready', 'gap', 'unavailable'].includes(state)) throw new BindingError('invalid intake watermark state');
-    return this.transaction(() => {
-      const binding = this.getBinding(channelId);
-      const existing = this.getIntakeWatermark(channelId);
-      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
-      if (!existing && !binding) throw new BindingError('intake channel is unknown');
-      if (state === 'ready') this.assertLegacyMigrationSafe(channelId);
-      const guildId = existing?.guild_id || binding.guildId;
-      if (existing) {
-        this.db.prepare('UPDATE intake_watermarks SET state=?, detail=?, gap_from=?, gap_to=?, updated_at=? WHERE channel_id=?')
-          .run(state, detail ? String(detail).slice(0, 1000) : null, gapFrom, gapTo, now(), channelId);
-      } else {
-        this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, state, detail, gap_from, gap_to, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
-          .run(channelId, guildId, state, detail ? String(detail).slice(0, 1000) : null, gapFrom, gapTo, now());
-      }
-      if (binding) {
-        const readiness = state === 'ready' ? READINESS.READY : state === 'gap' ? READINESS.GAP : state === 'unavailable' ? READINESS.UNAVAILABLE : READINESS.PENDING;
-        this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
-      }
-      this.receipt(null, 'intake-boundary', { channelId, state, detail: detail || undefined, gapFrom: gapFrom || undefined, gapTo: gapTo || undefined });
-      return this.getIntakeWatermark(channelId);
-    });
+  listPendingOrdinaryHandoffChannels() {
+    return intakeHandlers.listPendingOrdinaryHandoffChannels(this);
+  }
+
+  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null) {
+    return intakeHandlers.markIntakeBoundary(this, channelId, state, detail, gapFrom, gapTo, expectedBinding, pauseMetadata);
+  }
+
+  pauseOrdinaryHandoffIntake(channelId, expectedBinding = null) {
+    return pauseOrdinaryHandoffIntake(
+      this,
+      channelId,
+      expectedBinding,
+      READINESS.PENDING,
+      INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF
+    );
+  }
+
+  restoreOrdinaryHandoffIntake(channelId, expectedBinding = null) {
+    return restoreOrdinaryHandoffIntake(this, channelId, expectedBinding);
+  }
+
+  recoverInterruptedOrdinaryHandoffIntake(channelId, expectedBinding = null) {
+    return recoverInterruptedOrdinaryHandoffIntake(
+      this,
+      channelId,
+      expectedBinding,
+      READINESS.READY,
+      INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF
+    );
   }
 
   recordTopicPublication(channelId, publication, expectedBinding = null) {
@@ -1230,23 +1797,14 @@ class SurfaceState {
     });
   }
 
-  reconcileIntake(channelId) {
-    assertText(channelId, 'channelId', 128);
-    return this.transaction(() => {
-      const binding = this.getBinding(channelId);
-      const watermark = this.getIntakeWatermark(channelId);
-      if (!binding || !binding.active || !watermark) throw new BindingError('intake boundary is unknown');
-      this.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
-        .run('explicit intake reconciliation requested', now(), channelId);
-      this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(READINESS.PENDING, now(), channelId);
-      this.receipt(null, 'intake-reconcile-requested', { channelId, conductorId: binding.conductorId });
-      return this.getIntakeWatermark(channelId);
-    });
+  reconcileIntake(channelId, expectedBinding = null) {
+    return intakeHandlers.reconcileIntake(this, channelId, expectedBinding);
   }
 
   acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null } = {}) {
     const config = this.requireConfig();
     if (coverageId !== null) assertText(coverageId, 'coverageId', 128);
+    if (typeof event?.channelId === 'string') this.recoverInterruptedOrdinaryHandoffIntake(event.channelId, expectedBinding);
     let attachments;
     try { attachments = normalizeAttachments(event?.attachments); } catch { attachments = null; }
     const validEvent = event && [event.id, event.guildId, event.channelId, event.authorId].every(value => typeof value === 'string' && value.length > 0) &&
@@ -1256,6 +1814,11 @@ class SurfaceState {
         const result = this.transaction(() => {
           const binding = this.getBinding(event.channelId);
           if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
+          if (this.ordinaryHandoffPauses.has(event.channelId) || this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+            this.upsertIntakeWatermark(event, false, null);
+            this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
+            return this.reject('handoff-intake-paused');
+          }
           this.upsertIntakeWatermark(event, ready, coverageId);
           this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'invalid-event', ready });
           return null;
@@ -1268,6 +1831,12 @@ class SurfaceState {
     return this.transaction(() => {
       const binding = this.getBinding(event.channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
+      if (this.ordinaryHandoffPauses.has(event.channelId) || this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+        this.upsertIntakeWatermark(event, false, null);
+        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
+        return this.reject('handoff-intake-paused');
+      }
+      const intakeCutoff = this.getIntakeWatermark(event.channelId)?.recovered_through_id || null;
       this.upsertIntakeWatermark(event, ready, coverageId);
       let reason = null;
       if (typeof event.content !== 'string' || event.content.length > 10000 || attachments === null || (event.content.length === 0 && attachments?.length === 0)) reason = 'invalid-event';
@@ -1281,6 +1850,11 @@ class SurfaceState {
       }
       const committed = this.getMessage(event.id);
       if (committed) return { accepted: false, duplicate: true, reason: 'duplicate-message', message: committed };
+      const cutoffReason = intakeCutoffDecision(event.id, intakeCutoff, compareDiscordIds);
+      if (cutoffReason) {
+        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: cutoffReason, ready });
+        return this.reject(cutoffReason);
+      }
       if (this.failNextIntakeFlag) {
         this.failNextIntakeFlag = false;
         throw new Error('injected intake transaction failure');
@@ -1382,6 +1956,37 @@ class SurfaceState {
     return { config, binding, identity, current };
   }
 
+  hasNativeAcknowledgment(message) {
+    const row = this.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id DESC LIMIT 1')
+      .get(message.id, NATIVE_ACK_RECEIPT);
+    const identity = parseJson(row?.detail, null);
+    return Boolean(identity && identity.provider === message.provider && identity.nativeId === message.nativeId && identity.generation === message.generation);
+  }
+
+  recoverNativeReplyAcknowledgment(messageId) {
+    return this.transaction(() => {
+      const message = this.getMessage(messageId);
+      if (!message || message.state !== MESSAGE_STATES.REPLY_READY) return { recovered: false, reason: 'not-reply-ready' };
+      const check = this.currentMessageBinding(message);
+      if (!check.current) return { recovered: false, reason: check.identity ? 'authorization-revoked' : 'stale-generation' };
+      if (this.hasNativeAcknowledgment(message)) return { recovered: false, duplicate: true };
+      const receiptRows = this.db.prepare(`SELECT detail FROM receipts
+        WHERE discord_id=? AND kind IN (?, ?) ORDER BY id DESC`).all(messageId, 'native-reply', 'native-reply-before-submit');
+      const partCount = Number(this.db.prepare('SELECT COUNT(*) AS count FROM reply_parts WHERE discord_id=?').get(messageId).count);
+      const provenance = receiptRows
+        .map(row => parseJson(row.detail, null))
+        .find(detail => detail && detail.generation === message.generation && Number.isInteger(detail.parts) && detail.parts > 0 && detail.parts === partCount);
+      if (!provenance) return { recovered: false, reason: 'native-reply-provenance-missing' };
+      this.receipt(messageId, NATIVE_ACK_RECEIPT, {
+        provider: message.provider,
+        nativeId: message.nativeId,
+        generation: message.generation,
+        source: 'native-reply'
+      });
+      return { recovered: true, message: this.getMessage(messageId) };
+    });
+  }
+
   assertMessageCurrent(messageId, phase) {
     try {
       return this.transaction(() => {
@@ -1411,6 +2016,12 @@ class SurfaceState {
           this.receipt(messageId, 'dispatch-rejected-auth', { generation: message.generation });
           return { claimed: false, message, reason: 'authorization-revoked' };
         }
+        if (this.hasNativeAcknowledgment(message)) {
+          this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.SUBMITTED, now(), messageId, MESSAGE_STATES.ACCEPTED);
+          this.receipt(messageId, 'dispatch-already-acknowledged', { generation: message.generation });
+          return { claimed: false, message: this.getMessage(messageId), reason: 'native-already-acknowledged' };
+        }
         if (check.binding.readiness !== READINESS.READY) {
           this.receipt(messageId, 'dispatch-held-not-ready', { readiness: check.binding.readiness, generation: message.generation });
           return { claimed: false, message, reason: 'binding-not-ready' };
@@ -1430,9 +2041,17 @@ class SurfaceState {
     return this.transaction(() => {
       const message = this.getMessage(messageId);
       if (!message) throw new BindingError('message is unknown');
+      const serializedCursor = cursor === null || cursor === undefined ? null : safeDetail(cursor);
+      const submittedMarker = marker === undefined ? null : marker;
+      if (message.state === MESSAGE_STATES.SUBMITTED) {
+        if (serializedCursor === null && submittedMarker === null) return message;
+        this.db.prepare('UPDATE messages SET observer_cursor=COALESCE(observer_cursor, ?), observer_marker=COALESCE(observer_marker, ?), updated_at=? WHERE discord_id=? AND state=?')
+          .run(serializedCursor, submittedMarker, now(), messageId, MESSAGE_STATES.SUBMITTED);
+        return this.getMessage(messageId);
+      }
       if (message.state !== MESSAGE_STATES.DISPATCHING) return message;
       this.db.prepare('UPDATE messages SET state=?, observer_cursor=?, observer_marker=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
-        .run(MESSAGE_STATES.SUBMITTED, cursor ? safeDetail(cursor) : null, marker, now(), messageId, MESSAGE_STATES.DISPATCHING);
+        .run(MESSAGE_STATES.SUBMITTED, serializedCursor, submittedMarker, now(), messageId, MESSAGE_STATES.DISPATCHING);
       this.receipt(messageId, 'submitted', { marker: marker || undefined });
       return this.getMessage(messageId);
     });
@@ -1441,7 +2060,7 @@ class SurfaceState {
   setObserverCursor(messageId, cursor, marker = null) {
     return this.transaction(() => {
       const message = this.getMessage(messageId);
-      if (!message || ![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED].includes(message.state)) return message;
+      if (!message || ![MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED].includes(message.state)) return message;
       this.db.prepare('UPDATE messages SET observer_cursor=?, observer_marker=COALESCE(?, observer_marker), updated_at=? WHERE discord_id=?')
         .run(safeDetail(cursor), marker, now(), messageId);
       return this.getMessage(messageId);
@@ -1472,6 +2091,12 @@ class SurfaceState {
       const message = this.getMessage(messageId);
       if (!message) throw new BindingError('message is unknown');
       if (message.state !== expected) return message;
+      if ([MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.UNCERTAIN].includes(next) && this.hasNativeAcknowledgment(message)) {
+        this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+          .run(MESSAGE_STATES.SUBMITTED, now(), messageId, expected);
+        this.receipt(messageId, 'dispatch-already-acknowledged', { generation: message.generation });
+        return this.getMessage(messageId);
+      }
       this.db.prepare('UPDATE messages SET state=?, error=?, updated_at=? WHERE discord_id=? AND state=?')
         .run(next, error ? String(error.message || error).slice(0, 1000) : null, now(), messageId, expected);
       this.receipt(messageId, kind, { error: error ? String(error.message || error).slice(0, 200) : undefined });
@@ -1487,7 +2112,7 @@ class SurfaceState {
     assertText(text, 'reply text', 10000);
     try {
       return this.transaction(() => {
-        const message = this.getMessage(messageId);
+        let message = this.getMessage(messageId);
         if (!message) throw new StaleGenerationError('native reply is stale');
         const check = this.currentMessageBinding(message);
         if (message.provider !== provider || !check.binding || message.nativeId !== nativeId || message.generation !== generation ||
@@ -1495,7 +2120,20 @@ class SurfaceState {
           throw new StaleGenerationError('native reply is stale');
         }
         if (!check.current) throw new AuthorizationError('native reply authorization is no longer valid');
-        if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) return { duplicate: true, message };
+        const ensureNativeReplyAcknowledgment = () => {
+          const existing = this.db.prepare('SELECT 1 FROM receipts WHERE discord_id=? AND kind=? LIMIT 1')
+            .get(messageId, NATIVE_ACK_RECEIPT);
+          if (!existing) this.receipt(messageId, NATIVE_ACK_RECEIPT, { provider, nativeId, generation, source: 'native-reply' });
+        };
+        ensureNativeReplyAcknowledgment();
+        if (message.state === MESSAGE_STATES.UNCERTAIN) {
+          this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.SUBMITTED, now(), messageId, MESSAGE_STATES.UNCERTAIN);
+          message = this.getMessage(messageId);
+        }
+        if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) {
+          return { duplicate: true, message };
+        }
         if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.DISPATCHING].includes(message.state)) throw new BindingError(`reply is not accepted in state ${message.state}`);
         const timestamp = now();
         const parts = splitReply(text);
@@ -1652,6 +2290,13 @@ class SurfaceState {
       }
       const dispatching = this.db.prepare('SELECT discord_id FROM messages WHERE state=?').all(MESSAGE_STATES.DISPATCHING);
       for (const row of dispatching) {
+        const message = this.getMessage(row.discord_id);
+        if (this.hasNativeAcknowledgment(message)) {
+          this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.SUBMITTED, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
+          this.receipt(row.discord_id, 'dispatch-already-acknowledged', { generation: message.generation, afterRestart: true });
+          continue;
+        }
         this.db.prepare('UPDATE messages SET state=?, error=?, updated_at=? WHERE discord_id=?')
           .run(MESSAGE_STATES.UNCERTAIN, 'process stopped at dispatch boundary', now(), row.discord_id);
         this.receipt(row.discord_id, 'dispatch-uncertain-after-restart', {});
@@ -1668,16 +2313,15 @@ class SurfaceState {
     });
   }
 
-  directPostRows(requestId = null) {
-    if (requestId !== null) assertText(requestId, 'requestId', 256);
-    const rows = this.db.prepare(`SELECT id, kind, detail, created_at FROM receipts
-      WHERE discord_id IS NULL AND kind IN (?, ?) ORDER BY id`).all(DIRECT_POST_ATTEMPT, DIRECT_POST_OUTCOME);
-    return rows.map(row => {
-      const detail = parseJson(row.detail, null);
-      if (!detail || detail.journal !== 'direct-post-v1') throw new StateCorruptError('direct post receipt is malformed');
-      if (detail.inReplyTo === undefined) detail.inReplyTo = null;
-      return { id: Number(row.id), kind: row.kind, detail, createdAt: row.created_at };
-    }).filter(row => requestId === null || row.detail.requestId === requestId);
+  directPostRows(requestId = null, channelId = null) {
+    return queryDirectPostRows({
+      db: this.db,
+      assertText,
+      parseJson,
+      StateCorruptError,
+      attemptKind: DIRECT_POST_ATTEMPT,
+      outcomeKind: DIRECT_POST_OUTCOME
+    }, requestId, channelId);
   }
 
   directPostOwnerIdentity(pid) {
@@ -1755,83 +2399,30 @@ class SurfaceState {
   }
 
   beginDirectPostPart(meta) {
-    if (!meta || typeof meta !== 'object') throw new BindingError('direct post metadata is required');
-    assertText(meta.requestId, 'requestId', 256);
-    assertText(meta.attemptId, 'attemptId', 128);
-    if (!Number.isInteger(meta.partIndex) || meta.partIndex < 0 || !Number.isInteger(meta.partCount) || meta.partCount < 1 || meta.partIndex >= meta.partCount) {
-      throw new BindingError('direct post part index is invalid');
-    }
-    return this.transaction(() => {
-      const rows = this.directPostRows(meta.requestId);
-      const identityKeys = ['textHash', 'inReplyTo', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount'];
-      for (const row of rows) {
-        for (const key of identityKeys) {
-          if (row.detail[key] !== meta[key]) throw new BindingError('direct post request identity conflicts with existing custody');
-        }
-      }
-      if (!this.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
-      const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
-      const outcomes = new Map(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId).map(row => [row.detail.attemptId, row]));
-      const latest = attempts.at(-1);
-      if (latest) {
-        const outcome = outcomes.get(latest.detail.attemptId);
-        if (!outcome) return { claimed: false, status: 'in_flight', attemptId: latest.detail.attemptId, nonce: latest.detail.nonce };
-        const status = outcome.detail.outcome;
-        if (status === 'sent' || status === 'unknown') return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
-        if (!['not_sent', 'rejected', 'rate_limited', 'stale'].includes(status)) return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
-      }
-      const ownerIdentity = this.directPostOwnerIdentity(process.pid);
-      this.receipt(null, DIRECT_POST_ATTEMPT, {
-        journal: 'direct-post-v1', ...meta, ...ownerIdentity, status: 'attempted'
-      });
-      return { claimed: true, status: 'claimed', attemptId: meta.attemptId, nonce: meta.nonce };
-    });
+    return directPostHandlers.beginDirectPostPart(this, meta);
   }
 
   recordDirectPostOutcome(requestId, attemptId, outcome, detail = {}) {
-    assertText(requestId, 'requestId', 256);
-    assertText(attemptId, 'attemptId', 128);
-    if (!DIRECT_POST_OUTCOMES.includes(outcome)) throw new BindingError('invalid direct post outcome');
-    return this.transaction(() => {
-      const rows = this.directPostRows(requestId);
-      const attempt = rows.find(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.attemptId === attemptId);
-      if (!attempt) throw new BindingError('direct post attempt is unknown');
-      const existing = rows.find(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId === attemptId);
-      if (existing) return existing.detail;
-      const next = { ...attempt.detail, ...detail, outcome };
-      this.receipt(null, DIRECT_POST_OUTCOME, next);
-      return next;
-    });
+    return directPostHandlers.recordDirectPostOutcome(this, requestId, attemptId, outcome, detail);
+  }
+
+  reconcileDirectPostOutcome(requestId, attemptId, resolution, evidence = {}) {
+    return directPostHandlers.reconcileDirectPostOutcome(this, requestId, attemptId, resolution, evidence);
   }
 
   directPostOutcomeMatches(event, key, value) {
-    const jsonPath = { messageId: '$.messageId', nonce: '$.nonce' }[key];
-    if (!jsonPath) throw new BindingError('direct post outcome lookup key is invalid');
-    const rows = this.db.prepare(`SELECT detail FROM receipts
-      WHERE discord_id IS NULL AND kind=?
-        AND json_extract(detail, '${jsonPath}')=?
-        AND json_extract(detail, '$.channelId')=?
-        AND json_extract(detail, '$.guildId')=?`).all(
-      DIRECT_POST_OUTCOME, value, event.channelId, event.guildId
-    );
-    return rows.some(row => {
-      const detail = parseJson(row.detail, null);
-      if (!detail || detail.journal !== 'direct-post-v1') throw new StateCorruptError('direct post receipt is malformed');
-      return detail.outcome === 'sent' && detail[key] === value;
-    });
+    return directPostHandlers.directPostOutcomeMatches(this, event, key, value);
   }
 
   excludeDirectPost(event) {
-    if (!event || typeof event.id !== 'string' || typeof event.channelId !== 'string' || typeof event.guildId !== 'string') return false;
-    if (this.directPostOutcomeMatches(event, 'messageId', event.id)) return true;
-    return Boolean(event.isBot && typeof event.nonce === 'string' && this.directPostOutcomeMatches(event, 'nonce', event.nonce));
+    return directPostHandlers.excludeDirectPost(this, event);
   }
 
   recoveryCandidates(before = null) {
     const states = [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY];
     const rows = before
-      ? this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) AND created_at<=? ORDER BY created_at`).all(...states, before)
-      : this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) ORDER BY created_at`).all(...states);
+      ? this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) AND created_at<=? ORDER BY created_at, rowid`).all(...states, before)
+      : this.db.prepare(`SELECT discord_id FROM messages WHERE state IN (?, ?, ?) ORDER BY created_at, rowid`).all(...states);
     return rows.map(row => this.getMessage(row.discord_id));
   }
 
@@ -1839,7 +2430,11 @@ class SurfaceState {
     if (!['submitted', 'not_submitted'].includes(resolution)) throw new BindingError('resolution must be submitted or not_submitted');
     return this.transaction(() => {
       const message = this.getMessage(messageId);
-      if (!message || message.state !== MESSAGE_STATES.UNCERTAIN) throw new BindingError('message is not uncertain');
+      if (!message) throw new BindingError('message is not uncertain');
+      if (resolution === 'not_submitted' && this.hasNativeAcknowledgment(message)) {
+        throw new BindingError('native acknowledgment prevents retrying delivery');
+      }
+      if (message.state !== MESSAGE_STATES.UNCERTAIN) throw new BindingError('message is not uncertain');
       const next = resolution === 'submitted' ? MESSAGE_STATES.SUBMITTED : MESSAGE_STATES.ACCEPTED;
       this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
         .run(next, now(), messageId, MESSAGE_STATES.UNCERTAIN);
@@ -1912,8 +2507,13 @@ class SurfaceState {
     return message;
   }
 
+  getMessageRowId(messageId) {
+    const row = this.db.prepare('SELECT rowid FROM messages WHERE discord_id=?').get(messageId);
+    return row ? Number(row.rowid) : null;
+  }
+
   listMessages() {
-    return this.db.prepare('SELECT discord_id FROM messages ORDER BY created_at').all().map(row => this.getMessage(row.discord_id));
+    return this.db.prepare('SELECT discord_id FROM messages ORDER BY created_at, rowid').all().map(row => this.getMessage(row.discord_id));
   }
 
   listReceipts() {
@@ -1969,6 +2569,15 @@ class SurfaceState {
 
   close() {
     if (!this.db) return;
+    for (const channelId of this.ordinaryHandoffPauses) {
+      try { this.restoreOrdinaryHandoffIntake(channelId); } catch (error) {
+        this.auditReceipt(null, 'ordinary-handoff-intake-restore-failed', {
+          channelId, error: error.message
+        });
+      }
+    }
+    this.ordinaryHandoffPauses.clear();
+    this.ordinaryHandoffPauseSnapshots.clear();
     this.db.close();
     this.db = null;
   }
@@ -1993,9 +2602,11 @@ module.exports = {
   TRANSPORT_RECEIPT_ATTEMPT,
   TRANSPORT_RECEIPT_OUTCOME,
   TRANSPORT_RECEIPT_OUTCOMES,
+  NATIVE_ACK_RECEIPT,
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
   DIRECT_POST_OUTCOMES,
+  DISPATCH_OUTCOMES,
   TOPIC_PUBLICATION_STATES,
   UnresolvedWorkError,
   UUID,

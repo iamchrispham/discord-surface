@@ -1,4 +1,5 @@
 const fs = require('node:fs');
+const { recordNativeAcknowledgment } = require('./acknowledgment');
 const http = require('node:http');
 const path = require('node:path');
 const { MESSAGE_STATES, normalizeAttachments, validateNativeId } = require('./state');
@@ -44,11 +45,16 @@ function createDefaultMcp({ nativeId, state }) {
     { name: 'discord-surface-claude-channel', version: '0.1.0' },
     {
       capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
-      instructions: 'This channel is explicitly opted in by the native Claude session. For each event, answer the user and call reply with the exact messageId and generation from the event. Do not attach, resume, or start another session.'
+      instructions: 'This channel is explicitly opted in by the native Claude session. For each event, call acknowledge at pickup, then answer the user and call reply with the exact messageId and generation from the event. Do not attach, resume, or start another session.'
     }
   );
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [{
+      name: 'acknowledge',
+      description: 'Record that this native owner received the exact Discord message, without claiming completion.',
+      inputSchema: { type: 'object', properties: { messageId: { type: 'string' }, generation: { type: 'integer', minimum: 1 } },
+        required: ['messageId', 'generation'], additionalProperties: false }
+    }, {
       name: 'reply',
       description: 'Persist the final answer for the exact Discord message and ownership generation.',
       inputSchema: {
@@ -64,8 +70,12 @@ function createDefaultMcp({ nativeId, state }) {
     }]
   }));
   mcp.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
-    if (params.name !== 'reply') throw new Error('unknown Claude channel tool');
     const args = params.arguments || {};
+    if (params.name === 'acknowledge') {
+      const result = recordNativeAcknowledgment(state, { provider: 'claude', messageId: args.messageId, nativeId, generation: args.generation });
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    }
+    if (params.name !== 'reply') throw new Error('unknown Claude channel tool');
     const result = state.recordNativeReply({ provider: 'claude', messageId: args.messageId, nativeId, generation: args.generation, text: args.text });
     return { content: [{ type: 'text', text: result.duplicate ? 'Already recorded.' : 'Recorded.' }] };
   });
@@ -74,7 +84,7 @@ function createDefaultMcp({ nativeId, state }) {
 }
 
 class ClaudeChannel {
-  constructor({ state, nativeId, socketPath, mcp, onTransportClose } = {}) {
+  constructor({ state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} } = {}) {
     if (!state) throw new TypeError('state is required');
     validateNativeId(nativeId);
     assertSocketPath(socketPath);
@@ -82,6 +92,15 @@ class ClaudeChannel {
     if (!binding || !binding.active || binding.provider !== 'claude' || binding.endpoint !== socketPath) {
       throw new Error('Claude channel requires a pre-bound, opted-in native session');
     }
+    this.bindingIdentity = {
+      channelId: binding.channelId,
+      guildId: binding.guildId,
+      provider: binding.provider,
+      nativeId: binding.nativeId,
+      workspace: binding.workspace,
+      endpoint: binding.endpoint,
+      generation: binding.generation
+    };
     this.state = state;
     this.nativeId = nativeId;
     this.socketPath = socketPath;
@@ -94,6 +113,7 @@ class ClaudeChannel {
     this.ready = false;
     this.transportClosed = false;
     this.onTransportClose = typeof onTransportClose === 'function' ? onTransportClose : null;
+    this.logger = logger;
     this.mcp.onclose = () => {
       this.transportClosed = true;
       if (this.started && !this.stopPromise) this.stop().catch(() => {}).finally(() => this.onTransportClose?.());
@@ -129,7 +149,7 @@ class ClaudeChannel {
       if (attachments.length) params.attachments = attachments;
       await this.mcp.notification({ method: 'notifications/claude/channel', params });
     } catch (error) {
-      error.potentiallyDelivered = true;
+      if (error.potentiallyDelivered === undefined) error.potentiallyDelivered = true;
       throw error;
     }
   }
@@ -142,6 +162,36 @@ class ClaudeChannel {
     try {
       if (typeof this.mcp.connect === 'function') await this.mcp.connect(this.mcp.transportFactory());
       this.server = http.createServer(async (request, response) => {
+        if (request.method === 'GET' && request.url === '/identity') {
+          let current;
+          try {
+            current = this.state.getBinding(this.bindingIdentity.channelId);
+          } catch (error) {
+            this.logger(`Claude identity read failed: ${error.message}`);
+            response.writeHead(503, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({ provider: 'claude', nativeId: this.nativeId, generation: this.bindingIdentity.generation, endpoint: this.socketPath, channelReady: false }));
+            return;
+          }
+          const currentIdentity = current && current.active && current.channelId === this.bindingIdentity.channelId &&
+            current.guildId === this.bindingIdentity.guildId && current.provider === this.bindingIdentity.provider &&
+            current.nativeId === this.bindingIdentity.nativeId && current.workspace === this.bindingIdentity.workspace &&
+            current.endpoint === this.bindingIdentity.endpoint && current.generation === this.bindingIdentity.generation;
+          if (!this.ready || !currentIdentity) {
+            response.writeHead(currentIdentity ? 503 : 409, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({ provider: 'claude', nativeId: this.nativeId, generation: this.bindingIdentity.generation, endpoint: this.socketPath, channelReady: false }));
+            return;
+          }
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({
+            provider: 'claude',
+            nativeId: this.nativeId,
+            generation: this.bindingIdentity.generation,
+            endpoint: this.socketPath,
+            workspace: this.bindingIdentity.workspace,
+            channelReady: true
+          }));
+          return;
+        }
         if (request.method !== 'POST' || request.url !== '/event') {
           response.writeHead(404);
           response.end();
@@ -152,7 +202,15 @@ class ClaudeChannel {
           response.writeHead(202);
           response.end('accepted');
         } catch (error) {
-          const status = !this.ready ? 503 : error.potentiallyDelivered ? 503 : /custody|stale|mismatch|generation|authorization/i.test(error.message) ? 409 : 400;
+          const isCustodyConflict = /custody|stale|mismatch|generation|authorization/i.test(error.message);
+          let status;
+          if (error.potentiallyDelivered === false) {
+            status = isCustodyConflict ? 409 : 400;
+          } else if (!this.ready || error.potentiallyDelivered) {
+            status = 503;
+          } else {
+            status = isCustodyConflict ? 409 : 400;
+          }
           response.writeHead(status);
           response.end(status === 503 ? 'uncertain' : 'rejected');
         }
