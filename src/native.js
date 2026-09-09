@@ -187,7 +187,11 @@ function findCodexSessionFile(nativeId, root = sessionRoot()) {
     try {
       const line = readSessionHeader(file);
       const row = JSON.parse(line);
-      if (row.type === 'session_meta' && (row.payload?.session_id || row.payload?.id) === nativeId) return file;
+      if (row.type !== 'session_meta') continue;
+      const sessionId = typeof row.payload?.session_id === 'string' ? row.payload.session_id : null;
+      const threadId = typeof row.payload?.id === 'string' ? row.payload.id : null;
+      if (sessionId && threadId && sessionId !== threadId) continue;
+      if ((sessionId || threadId) === nativeId) return file;
     } catch {}
   }
   return null;

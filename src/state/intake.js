@@ -21,6 +21,8 @@ function pauseOrdinaryHandoffIntake(state, channelId, expectedBinding, pendingSt
       ownerPid: snapshot.ownerPid,
       ownerIdentity: snapshot.ownerIdentity,
       ownerToken: snapshot.ownerToken,
+      pauseState: pendingState,
+      pauseDetail: String(detail || '').slice(0, 1000) || null,
       snapshot: {
         state: snapshot.state,
         detail: snapshot.detail,
@@ -46,10 +48,12 @@ function restoreOrdinaryHandoffIntake(state, channelId, expectedBinding) {
   let result = null;
   if (snapshot) {
     result = state.markIntakeBoundary(channelId, snapshot.state, snapshot.detail, snapshot.gapFrom, snapshot.gapTo,
-      expectedBinding || snapshot.expectedBinding || null);
+      expectedBinding || snapshot.expectedBinding || null, { ownerToken: snapshot.ownerToken });
   }
-  state.ordinaryHandoffPauses.delete(channelId);
-  state.ordinaryHandoffPauseSnapshots?.delete(channelId);
+  if (!snapshot || result) {
+    state.ordinaryHandoffPauses.delete(channelId);
+    state.ordinaryHandoffPauseSnapshots?.delete(channelId);
+  }
   return result;
 }
 
@@ -64,7 +68,6 @@ function processAlive(pid) {
 }
 
 function pauseOwnerAlive(state, pause) {
-  if (pause.ownerPid === process.pid) return true;
   if (!processAlive(pause.ownerPid)) return false;
   if (!pause.ownerIdentity || typeof state.directPostOwnerIdentity !== 'function') return true;
   const actualIdentity = state.directPostOwnerIdentity(pause.ownerPid);
@@ -72,6 +75,28 @@ function pauseOwnerAlive(state, pause) {
   if (pause.ownerIdentity.ownerStartTime && actualIdentity.ownerStartTime !== pause.ownerIdentity.ownerStartTime) return false;
   if (pause.ownerIdentity.ownerCommand && actualIdentity.ownerCommand !== pause.ownerIdentity.ownerCommand) return false;
   return true;
+}
+
+function persistedHandoffPause(state, channelId) {
+  const watermark = state.getIntakeWatermark(channelId);
+  if (!watermark) return null;
+  const row = state.db.prepare("SELECT detail FROM receipts WHERE kind='ordinary-handoff-intake-paused' AND json_extract(detail, '$.channelId')=? ORDER BY id DESC LIMIT 1").get(channelId);
+  if (!row) return null;
+  let pause;
+  try { pause = JSON.parse(row.detail); } catch { return null; }
+  if (!pause || typeof pause !== 'object') return null;
+  if (pause.pauseState !== watermark.state || pause.pauseDetail !== watermark.detail) return null;
+  return pause;
+}
+
+function intakePauseAllowsUpdate(state, channelId, pauseMetadata = null) {
+  if (state.ordinaryHandoffPauses?.has(channelId)) {
+    const snapshot = state.ordinaryHandoffPauseSnapshots?.get(channelId);
+    return Boolean(snapshot && pauseMetadata?.ownerToken && pauseMetadata.ownerToken === snapshot.ownerToken);
+  }
+  const pause = persistedHandoffPause(state, channelId);
+  if (!pause) return true;
+  return Boolean(pauseMetadata?.ownerToken && pauseMetadata.ownerToken === pause.ownerToken);
 }
 
 function recoverInterruptedOrdinaryHandoffIntake(state, channelId, expectedBinding, readyState, handoffDetail) {
@@ -86,7 +111,8 @@ function recoverInterruptedOrdinaryHandoffIntake(state, channelId, expectedBindi
   const snapshot = pause.snapshot;
   if (!snapshot || typeof snapshot.state !== 'string') return null;
   const restored = state.markIntakeBoundary(channelId, snapshot.state || readyState, snapshot.detail || null,
-    snapshot.gapFrom || null, snapshot.gapTo || null, expectedBinding || pause.expectedBinding || null);
+    snapshot.gapFrom || null, snapshot.gapTo || null, expectedBinding || pause.expectedBinding || null,
+    { ownerToken: pause.ownerToken });
   if (!restored) return null;
   state.receipt(null, 'ordinary-handoff-intake-recovered', {
     channelId,
@@ -178,6 +204,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
         const binding = state.getBinding(channelId);
         const existing = state.getIntakeWatermark(channelId);
         if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+        if (!intakePauseAllowsUpdate(state, channelId, pauseMetadata)) return null;
         if (!existing && !binding) throw new BindingError('intake channel is unknown');
         if (boundaryState === 'ready' && state.isOrdinaryBinding(binding) && !state.hasOrdinaryPreflight(binding)) {
           throw new BindingError('ordinary Codex native preflight is required before READY');
@@ -204,6 +231,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
     reconcileIntake(state, channelId, expectedBinding = null) {
       assertText(channelId, 'channelId', 128);
       return state.transaction(() => {
+        if (!intakePauseAllowsUpdate(state, channelId)) return null;
         const binding = state.getBinding(channelId);
         const watermark = state.getIntakeWatermark(channelId);
         if (!binding || !binding.active || !watermark) throw new BindingError('intake boundary is unknown');

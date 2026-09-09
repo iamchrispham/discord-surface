@@ -832,6 +832,16 @@ class DiscordGateway {
     this.beginLiveCheckpoint(new Map([[channelId, count]]));
   }
 
+  scheduleHeldLiveCheckpoints() {
+    if (this.stopping || this.recoveryPromise || this.liveCheckpointPromise) return;
+    const heldChannels = [...this.liveIntakeCounts.entries()]
+      .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getBinding(channelId)?.active);
+    if (!heldChannels.length) return;
+    const triggeredCounts = new Map(heldChannels);
+    for (const [channelId] of heldChannels) this.liveIntakeCounts.set(channelId, 0);
+    this.beginLiveCheckpoint(triggeredCounts);
+  }
+
   beginLiveCheckpoint(triggeredCounts = new Map()) {
     if (this.liveCheckpointPromise || this.stopping || this.recoveryPromise) return;
     const controller = new AbortController();
@@ -1170,6 +1180,7 @@ class DiscordGateway {
     finally {
       this.recoveryPromise = null;
       this.recoveryController = null;
+      this.scheduleHeldLiveCheckpoints();
     }
   }
 
@@ -1183,6 +1194,7 @@ class DiscordGateway {
     finally {
       this.recoveryPromise = null;
       this.recoveryController = null;
+      this.scheduleHeldLiveCheckpoints();
     }
   }
 
