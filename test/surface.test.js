@@ -2793,8 +2793,8 @@ const fs = require('node:fs');
 const target = require.resolve(${JSON.stringify(path.resolve(__dirname, '../src/discord.js'))});
 const loaded = require(target);
 class FixtureGateway {
-  constructor() { this.timer = setInterval(() => {}, 1000); }
-  async start() {}
+  constructor() { this.ready = false; this.transportReady = false; this.timer = setInterval(() => {}, 1000); }
+  async start() { this.ready = true; this.transportReady = true; }
   async recoverTransport() {
     const count = fs.existsSync(${JSON.stringify(wakeMarker)}) ? Number(fs.readFileSync(${JSON.stringify(wakeMarker)}, 'utf8')) : 0;
     fs.writeFileSync(${JSON.stringify(wakeMarker)}, String(count + 1));
@@ -2802,7 +2802,7 @@ class FixtureGateway {
     return { ready: true };
   }
   async reconcilePending() {}
-  async stop() { clearInterval(this.timer); }
+  async stop() { this.ready = false; this.transportReady = false; clearInterval(this.timer); }
 }
 require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
 `, { mode: 0o600 });
@@ -2821,7 +2821,6 @@ require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
     assert.equal(printed.status, 0, printed.stderr);
     assert.equal(JSON.parse(printed.stdout).gateway.state, 'running');
     assert.equal(fs.existsSync(paths.pid), true);
-
     fs.writeFileSync(paths.pid, JSON.stringify({
       pid: matching.pid,
       guildId: 'guild-1',
@@ -3982,7 +3981,7 @@ test('simulated: old topic rate limits are irrelevant to static recovery', async
     assert.equal(binding.readiness, READINESS.READY, label);
     assert.equal(state.listTopicPublications().length, 0, label);
     assert.equal(rest.options.rejectOnRateLimit, null, label);
-    const held = await gateway.consumer.handleMessage(discordMessage({ id: `held-${label}`, channelId }));
+    const held = await gateway.consumer.handleMessage(discordMessage({ id: '101', channelId }));
     assert.equal(dispatches, 1, label);
     assert.equal(held.message.state, MESSAGE_STATES.REPLIED, label);
     await gateway.stop();

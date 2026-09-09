@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { findCodexSessionFile, observeCodexReply, readInitialCursor } = require('../src/native');
+const { findCodexSessionFile, observeCodexReply, readInitialCursor, validateCodexSessionIdentityAsync } = require('../src/native');
 
 const ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const MARKER = '[[discord-surface:bounded-read]]';
@@ -34,6 +34,102 @@ function cursorAt(file, offset = fs.statSync(file).size) {
 function finalRow(text, { marker = MARKER, timestamp = new Date(Date.now() + 60000).toISOString() } = {}) {
   return `${JSON.stringify({ type: 'response_item', timestamp,
     payload: { type: 'message', phase: 'final_answer', content: [{ type: 'output_text', text: `${marker}\n${text}` }] } })}\n`;
+}
+
+function identityFixture(t) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-identity-'));
+  const root = path.join(fixtureRoot, 'sessions');
+  const workspace = path.join(fixtureRoot, 'workspace');
+  fs.mkdirSync(root);
+  fs.mkdirSync(workspace);
+  const file = path.join(root, `${ID}.jsonl`);
+  fs.writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { session_id: ID, id: ID, cwd: workspace } })}\n`);
+  t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
+  return { root, workspace, file };
+}
+
+async function settle(promise) {
+  try { return { status: 'fulfilled', value: await promise }; }
+  catch (error) { return { status: 'rejected', error }; }
+}
+
+test('async identity validation returns verified session identity', async t => {
+  const { root, workspace, file } = identityFixture(t);
+  const result = await validateCodexSessionIdentityAsync(ID, workspace, root);
+  assert.deepEqual(result, { file, sessionId: ID, threadId: ID, workspace });
+});
+
+test('async identity validation stops before scanning when already aborted', async t => {
+  const { root, workspace } = identityFixture(t);
+  const controller = new AbortController();
+  controller.abort();
+  const realReaddir = fs.promises.readdir;
+  let readdirCalls = 0;
+  t.mock.method(fs.promises, 'readdir', (...args) => {
+    readdirCalls += 1;
+    return realReaddir.apply(fs.promises, args);
+  });
+  let outcome;
+  try {
+    outcome = await settle(validateCodexSessionIdentityAsync(ID, workspace, root, { signal: controller.signal }));
+  } finally {
+    t.mock.restoreAll();
+  }
+  assert.equal(fs.promises.readdir, realReaddir);
+  assert.equal(outcome.status, 'rejected');
+  assert.equal(outcome.error.recoveryKind, 'stopped');
+  assert.equal(readdirCalls, 0);
+});
+
+for (const mode of ['stopped', 'deadline']) {
+  test(`async identity validation returns no proof when ${mode} occurs during read`, async t => {
+    const { root, workspace, file } = identityFixture(t);
+    let releaseRead;
+    let readStartedResolve;
+    const readGate = new Promise(resolve => { releaseRead = resolve; });
+    const readStarted = new Promise(resolve => { readStartedResolve = resolve; });
+    const realOpen = fs.promises.open;
+    let openCalls = 0;
+    let closeCalls = 0;
+    t.mock.method(fs.promises, 'open', async (...args) => {
+      const handle = await realOpen.apply(fs.promises, args);
+      if (args[0] !== file) return handle;
+      openCalls += 1;
+      const realRead = handle.read.bind(handle);
+      handle.read = async (...readArgs) => {
+        readStartedResolve();
+        await readGate;
+        return realRead(...readArgs);
+      };
+      const realClose = handle.close.bind(handle);
+      handle.close = async (...closeArgs) => {
+        closeCalls += 1;
+        return realClose(...closeArgs);
+      };
+      return handle;
+    });
+    const controller = new AbortController();
+    const options = mode === 'stopped'
+      ? { signal: controller.signal }
+      : { deadline: Number.MAX_SAFE_INTEGER };
+    const validation = validateCodexSessionIdentityAsync(ID, workspace, root, options);
+    await readStarted;
+    if (mode === 'stopped') controller.abort();
+    else options.deadline = 0;
+    releaseRead();
+    let outcome;
+    try {
+      outcome = await settle(validation);
+    } finally {
+      t.mock.restoreAll();
+    }
+    assert.equal(fs.promises.open, realOpen);
+    assert.equal(outcome.status, 'rejected');
+    assert.equal(outcome.error.recoveryKind, mode);
+    assert.equal(outcome.value, undefined);
+    assert.equal(openCalls, 1);
+    assert.equal(closeCalls, 1);
+  });
 }
 
 // Instrument the actual fs operations on this fixture, including the old

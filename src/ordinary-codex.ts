@@ -1,3 +1,5 @@
+import * as path from 'node:path';
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type OrdinaryProvider = 'codex' | 'claude';
@@ -75,7 +77,6 @@ export interface OrdinaryCodexNativeProof {
 export interface InvocationEnvironment {
   CODEX_SESSION_ID?: string;
   CODEX_THREAD_ID?: string;
-  PWD?: string;
 }
 
 function requiredText(value: unknown, name: string, max = 4096): string {
@@ -88,12 +89,12 @@ function requiredText(value: unknown, name: string, max = 4096): string {
 function uuid(value: unknown, name: string): string {
   const result = requiredText(value, name, 128);
   if (!UUID_PATTERN.test(result)) throw new Error(`${name} must be a UUID`);
-  return result;
+  return result.toLowerCase();
 }
 
 function absolutePath(value: unknown, name: string): string {
   const result = requiredText(value, name);
-  if (!result.startsWith('/')) throw new Error(`${name} must be absolute`);
+  if (!path.isAbsolute(result)) throw new Error(`${name} must be absolute`);
   return result;
 }
 
@@ -159,6 +160,11 @@ export function ordinaryBindingDecision(
     (sessionRootMatches || verifiedRootRelocation) &&
     !existing.conductorId && !existing.repoKey;
   if (sameOwner) return existing.active && sessionRootMatches ? ORDINARY_BINDING_DECISIONS.REUSE : ORDINARY_BINDING_DECISIONS.REBIND;
+  const conductorOwned = Boolean(existing.conductorId || existing.repoKey);
+  if (!ordinaryMarker || conductorOwned) {
+    const owner = conductorOwned ? 'a conductor' : 'an incompatible owner';
+    throw new Error(`channel is already bound to ${owner}; drain and unbind the existing binding before retrying ordinary-bind`);
+  }
   if (request.provider === 'claude') {
     throw new Error('channel is already bound to another owner; Claude owner replacement requires an explicit supported handoff');
   }

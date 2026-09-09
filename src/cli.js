@@ -8,9 +8,22 @@ const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
-const { DiscordGateway, readSecret, requireInstalled } = require('./discord');
-const { createOrdinaryClaudeRequest, createOrdinaryCodexRequestFromEnvironment, ordinaryBindingDecision, resolveExistingChannel, resolveInvocationIdentity } = require('./ordinary-codex');
-const { sessionRoot: codexSessionRoot, validateClaudeSessionIdentity, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('./native');
+const { DiscordGateway, discordIdAfter, readSecret, requireInstalled } = require('./discord');
+const {
+  assertOrdinaryIntakeRange,
+  createHandoffFence,
+  deleteHandoffFence,
+  serverDerivedChannelCutoff
+} = require('./discord/handoff-fence');
+const {
+  createOrdinaryClaudeRequest,
+  createOrdinaryCodexRequestFromEnvironment,
+  ordinaryBindingDecision,
+  ORDINARY_BINDING_DECISIONS,
+  resolveExistingChannel,
+  resolveInvocationIdentity
+} = require('./ordinary-codex');
+const { CODEX_VALIDATION_KINDS, sessionRoot: codexSessionRoot, validateClaudeSessionIdentity, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('./native');
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
 const { ordinaryBind: runOrdinaryBind, ordinaryClaudeBind: runOrdinaryClaudeBind } = require('./ordinary-bind');
@@ -22,6 +35,10 @@ const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME
 const ORDINARY_CODEX_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CODEX_RUNTIME_PID';
 const LOCK_CONTENTION_EXIT = 75;
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
+const NATIVE_PROOF_STATUSES = Object.freeze({
+  PENDING: 'pending',
+  VERIFIED: 'verified'
+});
 const { runLiaisonDraft } = require('./liaison');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
 const { conductorMarkerMatches: matchesTopicMarker, parseLegacyConductorMarker, staticConductorMarker, topicPresentation } = require('./topic');
@@ -116,6 +133,15 @@ function ordinaryBindingArgs(args, environment = process.env, channelId = null, 
   });
 }
 
+function bindingIdentityMatches(binding, expected) {
+  return Boolean(binding) && Boolean(expected) && binding.active === expected.active &&
+    binding.channelId === expected.channelId && binding.guildId === expected.guildId &&
+    binding.provider === expected.provider && binding.nativeId === expected.nativeId &&
+    binding.generation === expected.generation &&
+    (binding.sessionRoot || null) === (expected.sessionRoot || null) &&
+    binding.conductorId === expected.conductorId && binding.repoKey === expected.repoKey;
+}
+
 async function latestChannelMessageId(channel) {
   const cached = typeof channel?.lastMessageId === 'string' && channel.lastMessageId.length > 0 ? channel.lastMessageId : null;
   if (typeof channel?.messages?.fetch !== 'function') return cached;
@@ -125,10 +151,6 @@ async function latestChannelMessageId(channel) {
   else if (typeof fetched?.first === 'function') message = fetched.first();
   else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
   return typeof message?.id === 'string' && message.id.length > 0 ? message.id : cached;
-}
-
-function serverDerivedChannelCutoff(channel) {
-  return typeof channel?.id === 'string' && /^\d+$/.test(channel.id) ? channel.id : null;
 }
 
 function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill, expectedPid } = {}) {
@@ -157,7 +179,206 @@ function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = p
 }
 
 async function ordinaryBind(args, dependencies = {}) {
-  return runOrdinaryBind(args, dependencies);
+  const { paths, state } = openState(args);
+  const environment = dependencies.environment || process.env;
+  const install = dependencies.requireInstalled || requireInstalled;
+  const read = dependencies.readSecret || readSecret;
+  const validate = dependencies.validateCodexSessionIdentity || validateCodexSessionIdentityAsync;
+  const output = dependencies.print || print;
+  let client;
+  let adoptionFence;
+  try {
+    const config = state.requireConfig();
+    const channelSelection = args.channel || args['channel-id'];
+    if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
+    const invocation = resolveInvocationIdentity(environment, args.workspace ? path.resolve(args.workspace) : undefined);
+    const sessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
+    let nativeProofDetail = null;
+    let nativeProofError = null;
+    let resolvedWorkspace = invocation.workspace;
+    const validateNativeProof = async root => {
+      let detail = null;
+      let error = null;
+      try {
+        detail = await validate(invocation.sessionId, undefined, root);
+        if (!detail || typeof detail.workspace !== 'string' || !path.isAbsolute(detail.workspace)) {
+          throw new Error('Codex transcript workspace is unavailable');
+        }
+      } catch (caught) {
+        if (caught?.recoveryKind === CODEX_VALIDATION_KINDS.UNSUPPORTED_ROOT) throw caught;
+        error = caught;
+        if (!invocation.workspace) throw new Error(`Codex transcript workspace is required: ${caught.message}`);
+      }
+      if (detail && invocation.workspace && path.resolve(detail.workspace) !== invocation.workspace) {
+        throw new Error('Codex transcript workspace does not match the supplied workspace');
+      }
+      return { detail, error, workspace: detail?.workspace || invocation.workspace };
+    };
+    if (sessionRoot) {
+      const proof = await validateNativeProof(sessionRoot);
+      nativeProofDetail = proof.detail;
+      nativeProofError = proof.error;
+      resolvedWorkspace = proof.workspace;
+    }
+    const { Client, GatewayIntentBits } = install('discord.js');
+    client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    await client.login(read(config.secretFile));
+    const guild = await client.guilds.fetch(config.guildId);
+    const mentionId = channelSelection.match(/^<#([^>]+)>$/)?.[1] || (/^\d+$/.test(channelSelection) ? channelSelection : null);
+    let fetchedChannels;
+    let fetchedChannelObjects;
+    if (mentionId) {
+      const channel = await guild.channels.fetch(mentionId);
+      fetchedChannelObjects = channel ? [channel] : [];
+      fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
+        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];
+    } else {
+      const fetched = await guild.channels.fetch();
+      const values = Array.isArray(fetched) ? fetched : typeof fetched?.values === 'function' ? [...fetched.values()] : [];
+      fetchedChannelObjects = values;
+      fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
+        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
+    }
+    const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
+    if (args.channel && args['channel-id']) {
+      const namedChannel = resolveExistingChannel(args.channel, config.guildId, fetchedChannels);
+      const idChannel = resolveExistingChannel(args['channel-id'], config.guildId, fetchedChannels);
+      if (namedChannel.id !== idChannel.id) throw new Error('--channel and --channel-id must identify the same channel');
+    }
+    const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
+    const existing = state.getBinding(channel.id);
+    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
+      throw new Error('channel is already bound to another owner; use explicit handoff');
+    }
+    let validationRoot = sessionRoot ?? existing?.sessionRoot ?? (dependencies.codexSessionRoot || codexSessionRoot)();
+    if (!sessionRoot) {
+      const proof = await validateNativeProof(validationRoot);
+      nativeProofDetail = proof.detail;
+      nativeProofError = proof.error;
+      resolvedWorkspace = proof.workspace;
+    }
+    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, validationRoot);
+    if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
+    const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
+    const expectedRuntimePid = environment[ORDINARY_CODEX_RUNTIME_PID_ENV];
+    const assertGatewayCompatible = runtime => {
+      const snapshot = assertGatewayWakeCompatible(paths, gatewayStatus, runtime);
+      if (expectedRuntimePid !== undefined &&
+        (snapshot?.state !== 'running' || String(snapshot.pid) !== expectedRuntimePid ||
+          !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock))) {
+        throw new Error('running Gateway changed while binding ordinary Codex session');
+      }
+      return snapshot;
+    };
+    assertGatewayCompatible();
+    const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: validationRoot } : null;
+    let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
+    let adoptionCutoff = null;
+    if (decision !== ORDINARY_BINDING_DECISIONS.REUSE && !existing?.active) {
+      if (typeof discordChannel?.send === 'function') {
+        adoptionFence = await createHandoffFence(discordChannel, 'ordinary binding adoption');
+        adoptionCutoff = adoptionFence.id;
+      } else {
+        const cutoff = await latestChannelMessageId(discordChannel);
+        adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
+      }
+    }
+    let binding;
+    if (decision === ORDINARY_BINDING_DECISIONS.REUSE) binding = existing;
+    else if (decision === ORDINARY_BINDING_DECISIONS.REBIND) {
+      try {
+        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence, adoptionCutoff, {
+          beforeMutation: assertGatewayCompatible
+        });
+      } catch (error) {
+        const raced = state.getBinding(request.channelId);
+        const racedDecision = raced
+          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
+          : null;
+        if (racedDecision !== ORDINARY_BINDING_DECISIONS.REUSE) throw error;
+        decision = ORDINARY_BINDING_DECISIONS.REUSE;
+        binding = raced;
+      }
+    }
+    else {
+      try {
+        binding = state.bindOrdinary(request, request.identity, adoptionCutoff, {
+          beforeMutation: assertGatewayCompatible
+        });
+      } catch (error) {
+        const raced = state.getBinding(request.channelId);
+        const racedDecision = raced
+          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
+          : null;
+        if (racedDecision !== ORDINARY_BINDING_DECISIONS.REUSE) throw error;
+        decision = ORDINARY_BINDING_DECISIONS.REUSE;
+        binding = raced;
+      }
+    }
+    let nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: 'Codex transcript proof is pending' };
+    if (nativeProofError) {
+      const detail = `${ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX} ${nativeProofError.message}`;
+      const unavailable = state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, detail, binding);
+      if (unavailable) binding = unavailable;
+      nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: nativeProofError.message };
+    } else if (state.hasOrdinaryPreflight(binding)) {
+      const verifiedBinding = state.transaction(() => {
+        const current = state.getBinding(binding.channelId);
+        if (!bindingIdentityMatches(current, binding) || !state.hasOrdinaryPreflight(current)) return null;
+        return current;
+      });
+      if (!verifiedBinding) throw new Error('ordinary binding changed before native preflight proof was reused');
+      binding = verifiedBinding;
+      nativeProof = { status: NATIVE_PROOF_STATUSES.VERIFIED, reason: 'Codex transcript proof already recorded' };
+    } else if (nativeProofDetail) {
+      let recordedBinding;
+      let preflightError;
+      try {
+        recordedBinding = state.recordOrdinaryPreflight(binding, {
+          file: nativeProofDetail.file,
+          sessionId: nativeProofDetail.sessionId,
+          threadId: nativeProofDetail.threadId,
+          workspace: nativeProofDetail.workspace
+        });
+      } catch (error) {
+        preflightError = error;
+      }
+      if (preflightError) {
+        nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: preflightError.message };
+      } else if (!recordedBinding) {
+        throw new Error('ordinary binding changed before native proof was recorded');
+      } else {
+        binding = recordedBinding;
+        nativeProof = { status: NATIVE_PROOF_STATUSES.VERIFIED, file: nativeProofDetail.file, workspace: nativeProofDetail.workspace };
+      }
+    } else {
+      nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: nativeProofError?.message || 'Codex transcript proof is pending' };
+    }
+    if (decision === ORDINARY_BINDING_DECISIONS.REUSE && nativeProof.status === NATIVE_PROOF_STATUSES.VERIFIED && nativeProofDetail && !nativeProofError) {
+      const watermark = state.getIntakeWatermark(binding.channelId);
+      const nativeProofUnavailable = watermark && watermark.state === READINESS.UNAVAILABLE &&
+        typeof watermark.detail === 'string' && watermark.detail.startsWith(ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX);
+      if (nativeProofUnavailable) {
+        const reopened = state.reconcileIntake(binding.channelId, binding);
+        if (reopened) binding = state.getBinding(binding.channelId);
+      }
+    }
+    const gatewayWake = requestGatewayRecovery(paths, {
+      status: gatewayStatus,
+      kill: dependencies.killProcess || process.kill,
+      expectedPid: expectedRuntimePid
+    });
+    const resultBinding = state.transaction(() => {
+      const current = state.getBinding(binding.channelId);
+      return bindingIdentityMatches(current, binding) ? current : null;
+    });
+    if (!resultBinding) throw new Error('ordinary binding changed before bind result was returned');
+    output({ bound: true, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE, binding: resultBinding, nativeProof, gatewayWake });
+    return { binding: resultBinding, nativeProof, gatewayWake, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE };
+  } finally {
+    await deleteHandoffFence(adoptionFence);
+    try { await client?.destroy(); } finally { state.close(); }
+  }
 }
 
 function runLockedOrdinaryCommand(args, { command, environmentKey, lockPath, environment = {} }) {
@@ -219,10 +440,71 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
   return runOrdinaryClaudeBind(args, dependencies);
 }
 
-function unbind(args) {
-  const { state } = openState(args);
-  try { print({ unbound: state.unbind(required(args, 'channel-id')) }); }
-  finally { state.close(); }
+async function unbind(args, dependencies = {}) {
+  const { paths, state } = openState(args);
+  const channelId = required(args, 'channel-id');
+  const install = dependencies.requireInstalled || requireInstalled;
+  const read = dependencies.readSecret || readSecret;
+  const wake = dependencies.requestGatewayRecovery || requestGatewayRecovery;
+  const output = dependencies.print || print;
+  let client;
+  let fence;
+  let intakePaused = false;
+  let binding = null;
+  try {
+    binding = state.getBinding(channelId);
+    if (!binding || !binding.active || !state.isOrdinaryBindingRecord(binding)) {
+      const result = state.unbind(channelId, { expectedBinding: binding || undefined });
+      output({ unbound: result });
+      return { unbound: result };
+    }
+    const config = state.requireConfig();
+    const { Client, GatewayIntentBits } = install('discord.js');
+    client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    await client.login(read(config.secretFile));
+    const guild = await client.guilds.fetch(config.guildId);
+    const channel = await guild.channels.fetch(channelId);
+    const channelInfo = resolveExistingChannel(channelId, config.guildId, [{
+      id: channel?.id || channelId,
+      guildId: channel?.guildId || config.guildId,
+      name: channel?.name || null,
+      messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
+    }]);
+    if (channelInfo.id !== binding.channelId) throw new Error('unbind channel does not match the ordinary binding');
+    const watermark = state.getIntakeWatermark(channelId);
+    const recoveredThrough = watermark?.recovered_through_id || null;
+    if (watermark?.state !== READINESS.READY || !recoveredThrough) {
+      throw new Error('ordinary unbind requires Discord intake to be durably drained');
+    }
+    const paused = state.pauseOrdinaryHandoffIntake(channelId, binding);
+    if (!paused) throw new Error('ordinary unbind source binding changed while pausing intake');
+    intakePaused = true;
+    fence = await createHandoffFence(channel, 'ordinary unbind');
+    await assertOrdinaryIntakeRange(channel, state, binding, recoveredThrough, fence.id, 'ordinary unbind');
+    const result = state.unbind(channelId, { expectedBinding: binding, intakeCutoff: fence.id });
+    if (!result) throw new Error('ordinary binding changed before intake fence was committed');
+    intakePaused = false;
+    output({ unbound: result });
+    return { unbound: result };
+  } finally {
+    if (intakePaused) {
+      try {
+        const restored = state.restoreOrdinaryHandoffIntake(channelId, binding);
+        if (restored) {
+          wake(paths, {
+            status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+            kill: dependencies.killProcess || process.kill
+          });
+        }
+      } catch (error) {
+        state.auditReceipt(null, 'ordinary-unbind-intake-restore-failed', {
+          channelId, generation: binding?.generation, error: error.message
+        });
+      }
+    }
+    await deleteHandoffFence(fence);
+    try { await client?.destroy(); } finally { state.close(); }
+  }
 }
 
 function status(args) {
@@ -274,6 +556,19 @@ function recover(args) {
         partIndex: args['part-index'] === undefined ? null : Number(args['part-index']),
         replyMessageId: args['reply-message-id']
       }));
+    } else if (args['direct-post-request-id']) {
+      const resolution = required(args, 'resolution');
+      if (!['sent', 'not_sent'].includes(resolution)) throw new Error('--resolution must be sent or not_sent for direct-post reconciliation');
+      print(state.reconcileDirectPostOutcome(
+        required(args, 'direct-post-request-id'),
+        required(args, 'direct-post-attempt-id'),
+        resolution,
+        {
+          evidenceScope: required(args, 'evidence-scope'),
+          messageId: args['direct-post-message-id'],
+          nonce: args['direct-post-nonce']
+        }
+      ));
     } else if (args['message-id'] && args.resolution) print(state.reconcileUncertain(required(args, 'message-id'), args.resolution));
     else print(state.recoverAfterRestart());
   }
@@ -618,6 +913,9 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   process.once('SIGTERM', handleSignal);
   let client;
   let runtimeInterlock;
+  let handoffFence;
+  let sourceBinding = null;
+  let handoffCommitted = false;
   try {
     const runtime = gatewayStatus(paths);
     const supportsBindLock = runtime?.state === 'running' && runtime.pid && runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock);
@@ -635,6 +933,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     assertGatewayCompatible();
     const config = state.requireConfig();
     const current = state.getBinding(channelId);
+    sourceBinding = current;
     if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey) {
       throw new Error('ordinary handoff source is unavailable');
     }
@@ -642,6 +941,36 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     const invocation = resolveInvocationIdentity(environment, workspace);
     if (invocation.sessionId !== nativeId || invocation.threadId !== nativeId) {
       throw new Error('ordinary handoff successor identity does not match the native UUID');
+    }
+    const previousHandoff = state.findOrdinaryHandoff(handoffId);
+    const handoffRetry = previousHandoff && previousHandoff.channelId === channelId &&
+      previousHandoff.provider === provider && previousHandoff.fromNativeId === fromNativeId &&
+      previousHandoff.fromGeneration === fromGeneration && previousHandoff.nativeId === nativeId &&
+      previousHandoff.generation === current.generation && current.active &&
+      current.nativeId === nativeId && current.generation === fromGeneration + 1 &&
+      current.workspace === workspace && (current.sessionRoot || null) === (validationRoot || null);
+    if (handoffRetry) {
+      const binding = state.handoffOrdinary({
+        channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
+        sessionRoot: validationRoot, handoffId,
+        identity: { sessionId: nativeId, threadId: nativeId },
+        nativeProof: {
+          file: previousHandoff.transcriptFile,
+          sessionId: nativeId,
+          threadId: nativeId,
+          workspace,
+          sessionRoot: validationRoot
+        }
+      });
+      handoffCommitted = true;
+      const gatewayWake = wake(paths, {
+        status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+        kill: dependencies.killProcess || process.kill
+      });
+      output({ handedOff: true, ordinary: true, channelId, handoffId,
+        url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding,
+        readiness: binding.readiness, gatewayWake });
+      return { binding, gatewayWake, handoffReconciled: Boolean(binding.handoffReconciled) };
     }
     const nativeProof = await validate(nativeId, workspace, validationRoot);
     const { Client, GatewayIntentBits } = install('discord.js');
@@ -656,18 +985,39 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
       messageCapable: typeof channel?.isTextBased === 'function' && channel.isTextBased()
     }]);
     if (channelInfo.id !== current.channelId) throw new Error('handoff channel does not match the ordinary binding');
-    let adoptionCutoff = null;
-    if (!current.active) {
-      const cutoff = await latestChannelMessageId(channel);
-      adoptionCutoff = cutoff || serverDerivedChannelCutoff(channel);
+    let recoveredThrough = null;
+    if (current.active) {
+      state.recoverInterruptedOrdinaryHandoffIntake(channelId, current);
+      const watermark = state.getIntakeWatermark(channelId);
+      recoveredThrough = watermark?.recovered_through_id || null;
+      if (!handoffRetry && (watermark?.state !== READINESS.READY || !recoveredThrough)) {
+        throw new Error('ordinary handoff requires Discord intake to be durably drained');
+      }
+      if (!handoffRetry && typeof channel?.send !== 'function') {
+        throw new Error('ordinary handoff requires Discord intake to be durably drained');
+      }
+    }
+    let handoffCutoff = (current.active ? recoveredThrough : null) ||
+      serverDerivedChannelCutoff(channel);
+    if (current.active) {
+      const paused = state.pauseOrdinaryHandoffIntake(channelId, current);
+      if (!paused) throw new Error('ordinary handoff source binding changed while pausing intake');
+    }
+    handoffFence = await createHandoffFence(channel);
+    if (handoffFence) {
+      if (current.active) {
+        await assertOrdinaryIntakeRange(channel, state, current, recoveredThrough, handoffFence.id, 'ordinary handoff');
+      }
+      handoffCutoff = handoffFence.id;
     }
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
-      sessionRoot: validationRoot, handoffId, intakeCutoff: adoptionCutoff,
+      sessionRoot: validationRoot, handoffId, intakeCutoff: handoffCutoff,
       identity: { sessionId: nativeProof.sessionId, threadId: nativeProof.threadId },
       nativeProof: { ...nativeProof, sessionRoot: validationRoot },
       beforeMutation: assertGatewayCompatible
     });
+    handoffCommitted = true;
     const gatewayWake = wake(paths, {
       status: gatewayStatus,
       kill: dependencies.killProcess || process.kill,
@@ -680,6 +1030,22 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   } finally {
     process.removeListener('SIGINT', handleSignal);
     process.removeListener('SIGTERM', handleSignal);
+    if (!handoffCommitted && sourceBinding) {
+      try {
+        const restored = state.restoreOrdinaryHandoffIntake(channelId, sourceBinding);
+        if (restored) {
+          wake(paths, {
+            status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+            kill: dependencies.killProcess || process.kill
+          });
+        }
+      } catch (error) {
+        state.auditReceipt(null, 'ordinary-handoff-intake-restore-failed', {
+          channelId, generation: sourceBinding.generation, error: error.message
+        });
+      }
+    }
+    await deleteHandoffFence(handoffFence);
     await runtimeInterlock?.release();
     await client?.destroy();
     state.close();
@@ -941,25 +1307,35 @@ async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
   return null;
 }
 
-function createBindingWakeController({ getGateway, isReady, isStopping, logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
+function createBindingWakeController({ getGateway, isReady, isTransportReady = isReady, isStopping,
+  logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
   let wakePromise = null;
   let wakeRequested = false;
   const request = () => {
     wakeRequested = true;
     const gateway = getGateway?.();
-    if (isStopping?.() || !gateway || !isReady?.() || wakePromise) return;
+    if (isStopping?.() || !gateway || !isTransportReady?.() || wakePromise) return;
     wakePromise = (async () => {
       while (wakeRequested && !isStopping?.()) {
         wakeRequested = false;
         const currentGateway = getGateway?.();
-        if (!currentGateway || !isReady?.()) return;
+        if (!currentGateway || !isTransportReady?.()) return;
         const joinedRecovery = Boolean(currentGateway.recoveryPromise);
+        currentGateway.pauseLiveDispatch?.();
         const recovery = await currentGateway.recoverTransport('ordinary-bind');
         if (joinedRecovery) {
           wakeRequested = true;
           continue;
         }
-        if (!isStopping?.() && isReady?.()) await currentGateway.reconcilePending();
+        if (!isStopping?.()) {
+          if (isReady?.()) {
+            if (recovery?.ready) await currentGateway.reconcilePending();
+            else await currentGateway.reconcilePending(undefined, { readyOnly: true });
+          }
+          else if (['gap', 'unavailable'].includes(recovery?.state)) {
+            await currentGateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+          }
+        }
       }
     })().catch(logger).finally(() => {
       wakePromise = null;
@@ -988,7 +1364,8 @@ async function runRuntime(args) {
   let startupLock = null;
   const bindingWake = createBindingWakeController({
     getGateway: () => gateway,
-    isReady: () => gatewayReady,
+    isReady: () => gatewayReady && gateway?.ready === true,
+    isTransportReady: () => gatewayReady && gateway?.transportReady === true,
     isStopping: () => stopping
   });
   const stop = async () => {
@@ -1012,7 +1389,11 @@ async function runRuntime(args) {
     if (stopping || !startupLock) return;
     state.recoverAfterRestart();
     writePid(paths.pid, config.guildId, paths.stateDir, paths.db);
-    gateway = new DiscordGateway({ state, observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) } });
+    gateway = new DiscordGateway({
+      state,
+      observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) },
+      onReady: () => bindingWake.start()
+    });
     await gateway.start(config.secretFile);
     await gateway.reconcilePending(recoveryCutoff);
     gatewayReady = true;
@@ -1401,7 +1782,7 @@ async function main() {
   }
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller };
+module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, unbind };
 
 if (require.main === module) {
   main().catch(error => {

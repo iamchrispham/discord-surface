@@ -6,6 +6,14 @@ const os = require('node:os');
 const path = require('node:path');
 const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('./state');
 
+const CODEX_VALIDATION_KINDS = Object.freeze({
+  UNSUPPORTED_ROOT: 'unsupported-root',
+  STOPPED: 'stopped',
+  DEADLINE: 'deadline'
+});
+
+const VALIDATION_SCAN_BATCH_SIZE = 64;
+
 function sleep(ms, signal) {
   if (signal?.aborted) return Promise.resolve();
   return new Promise(resolve => {
@@ -85,7 +93,31 @@ function walk(dir, result = [], depth = 0) {
   return result;
 }
 
-async function readSessionHeaderAsync(file, signal = null) {
+function normalizeValidationOptions(options = {}) {
+  if (options && typeof options.aborted === 'boolean' && typeof options.addEventListener === 'function') {
+    return { signal: options };
+  }
+  return options || {};
+}
+
+function validationError(kind, message) {
+  const error = new Error(message);
+  error.recoveryKind = kind;
+  return error;
+}
+
+function assertValidationActive(rawOptions = {}) {
+  const options = normalizeValidationOptions(rawOptions);
+  if (options.signal?.aborted) {
+    throw validationError(CODEX_VALIDATION_KINDS.STOPPED, 'Codex transcript validation was stopped');
+  }
+  if (options.deadline !== undefined && Date.now() >= options.deadline) {
+    throw validationError(CODEX_VALIDATION_KINDS.DEADLINE, 'Codex transcript validation deadline exceeded');
+  }
+}
+
+async function readSessionHeaderAsync(file, rawOptions = {}) {
+  const options = normalizeValidationOptions(rawOptions);
   let handle = null;
   let closePromise = null;
   const closeHandle = () => {
@@ -94,31 +126,34 @@ async function readSessionHeaderAsync(file, signal = null) {
     return closePromise;
   };
   let onAbort;
-  const abortPromise = signal ? new Promise((_, reject) => {
+  const abortPromise = options.signal ? new Promise((_, reject) => {
     onAbort = () => {
       closeHandle();
-      reject(new Error('transcript header read aborted'));
+      reject(validationError(CODEX_VALIDATION_KINDS.STOPPED, 'Codex transcript validation was stopped'));
     };
-    if (signal.aborted) onAbort();
-    else signal.addEventListener('abort', onAbort, { once: true });
+    if (options.signal.aborted) onAbort();
+    else options.signal.addEventListener('abort', onAbort, { once: true });
   }) : null;
   const guarded = operation => abortPromise ? Promise.race([operation, abortPromise]) : operation;
   try {
     const opening = fs.promises.open(file, 'r');
     opening.then(candidate => {
-      if (signal?.aborted) candidate.close().catch(() => {});
+      if (options.signal?.aborted) candidate.close().catch(() => {});
     }, () => {});
     handle = await guarded(opening);
-    if (signal?.aborted) throw new Error('transcript header read aborted');
+    assertValidationActive(options);
     const { size } = await guarded(handle.stat());
+    assertValidationActive(options);
     const parts = [];
     let headerBytes = 0;
     for (let position = 0; position < size;) {
+      assertValidationActive(options);
       const length = Math.min(TRANSCRIPT_BLOCK_BYTES, size - position);
       const bytes = Buffer.allocUnsafe(length);
       let read = 0;
       while (read < length) {
         const result = await guarded(handle.read(bytes, read, length - read, position + read));
+        assertValidationActive(options);
         if (!result.bytesRead) throw new Error('transcript shortened during read');
         read += result.bytesRead;
       }
@@ -134,21 +169,23 @@ async function readSessionHeaderAsync(file, signal = null) {
     }
     return Buffer.concat(parts).toString('utf8');
   } finally {
-    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+    if (options.signal && onAbort) options.signal.removeEventListener('abort', onAbort);
     const closing = closeHandle();
-    if (!signal?.aborted) await closing;
+    if (!options.signal?.aborted) await closing;
   }
 }
 
 function awaitWithDeadline(task, deadline, onDeadline = null) {
   const remaining = deadline - Date.now();
-  if (remaining <= 0) return Promise.reject(new Error('operation deadline exceeded'));
+  if (remaining <= 0) return Promise.reject(validationError(CODEX_VALIDATION_KINDS.DEADLINE, 'operation deadline exceeded'));
   let timer;
   const operation = Promise.resolve().then(task);
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
-      try { onDeadline?.(); } finally { reject(new Error('operation deadline exceeded')); }
-    }, remaining);
+      try { onDeadline?.(); } finally {
+        reject(validationError(CODEX_VALIDATION_KINDS.DEADLINE, 'operation deadline exceeded'));
+      }
+    }, Math.min(remaining, 0x7fffffff));
   });
   return Promise.race([operation, timeout]).finally(() => clearTimeout(timer));
 }
@@ -177,70 +214,85 @@ async function closeDirectoryWithDeadline(handle, options) {
 }
 
 async function* walkAsync(dir, depth = 0, options = undefined) {
-  const limitReached = () => options && Date.now() >= options.deadline;
+  const scan = options ? normalizeValidationOptions(options) : null;
+  const limitReached = () => scan && Date.now() >= scan.deadline;
+  if (scan) assertValidationActive(scan);
   if (depth > 5 || limitReached()) {
-    if (options) options.complete = false;
     return;
   }
   let handle;
   try {
-    handle = options
-      ? await openDirectoryWithDeadline(dir, options.deadline)
+    handle = scan
+      ? await openDirectoryWithDeadline(dir, scan.deadline)
       : await fs.promises.opendir(dir);
     for (;;) {
+      if (scan) assertValidationActive(scan);
       if (limitReached()) {
-        if (options) options.complete = false;
         return;
       }
-      const entry = options
-        ? await awaitWithDeadline(() => handle.read(), options.deadline)
+      const entry = scan
+        ? await awaitWithDeadline(() => handle.read(), scan.deadline)
         : await handle.read();
       if (!entry) break;
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) yield* walkAsync(full, depth + 1, options);
+      if (entry.isDirectory()) yield* walkAsync(full, depth + 1, scan);
       else if (entry.isFile() && entry.name.endsWith('.jsonl')) yield full;
       await new Promise(resolve => setImmediate(resolve));
     }
-  } catch {
-    if (options) options.complete = false;
+  } catch (error) {
+    if (error?.recoveryKind) throw error;
     return;
   } finally {
-    if (handle) await closeDirectoryWithDeadline(handle, options);
+    if (handle) await closeDirectoryWithDeadline(handle, scan);
   }
 }
 
 const CODEX_SESSION_DISCOVERY_TIMEOUT_MS = 5000;
 
-async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
+async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot(), rawOptions = {}) {
   validateNativeId(nativeId);
-  let match = null;
-  const deadline = Date.now() + CODEX_SESSION_DISCOVERY_TIMEOUT_MS;
-  const scan = { deadline, complete: true, fileFailures: 0 };
-  for await (const file of walkAsync(root, 0, scan)) {
+  const supplied = normalizeValidationOptions(rawOptions);
+  const options = supplied.deadline === undefined
+    ? { ...supplied, deadline: Date.now() + CODEX_SESSION_DISCOVERY_TIMEOUT_MS }
+    : supplied;
+  const matches = [];
+  let fileFailures = 0;
+  for await (const file of walkAsync(root, 0, options)) {
+    assertValidationActive(options);
     if (!file.includes(nativeId)) continue;
+    const controller = new AbortController();
+    const relayAbort = () => controller.abort();
+    options.signal?.addEventListener('abort', relayAbort, { once: true });
     try {
-      const controller = new AbortController();
+      const readOptions = Object.create(options);
+      Object.defineProperty(readOptions, 'signal', { value: controller.signal, enumerable: true });
       const row = JSON.parse(await awaitWithDeadline(
-        () => readSessionHeaderAsync(file, controller.signal),
-        deadline,
+        () => readSessionHeaderAsync(file, readOptions),
+        options.deadline,
         () => controller.abort()
       ));
+      assertValidationActive(options);
       const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
-      if (sessionId !== nativeId && threadId !== nativeId) continue;
-      const candidate = {
-        file, sessionId, threadId,
+      if (sessionId && threadId && sessionId !== threadId) continue;
+      if ((sessionId || threadId) !== nativeId) continue;
+      matches.push({
+        file, sessionId: nativeId, threadId: nativeId,
         workspace: typeof payload.cwd === 'string' ? payload.cwd : null
-      };
-      if (match) return { ambiguous: true, files: [match.file, candidate.file] };
-      match = candidate;
-    } catch {
-      scan.fileFailures += 1;
+      });
+      if (matches.length > 1) return { ambiguous: true, files: matches.map(match => match.file) };
+    } catch (error) {
+      if (error?.recoveryKind) throw error;
+      fileFailures += 1;
+    } finally {
+      options.signal?.removeEventListener('abort', relayAbort);
     }
   }
-  if (!scan.complete || scan.fileFailures > 0) return null;
-  return match;
+  assertValidationActive(options);
+  if (fileFailures > 0) return null;
+  if (matches.length === 0) return null;
+  return matches[0];
 }
 
 function findCodexSessionFile(nativeId, root = sessionRoot()) {
@@ -249,7 +301,11 @@ function findCodexSessionFile(nativeId, root = sessionRoot()) {
     try {
       const line = readSessionHeader(file);
       const row = JSON.parse(line);
-      if (row.type === 'session_meta' && (row.payload?.session_id || row.payload?.id) === nativeId) return file;
+      if (row.type !== 'session_meta') continue;
+      const sessionId = typeof row.payload?.session_id === 'string' ? row.payload.session_id : null;
+      const threadId = typeof row.payload?.id === 'string' ? row.payload.id : null;
+      if (sessionId && threadId && sessionId !== threadId) continue;
+      if ((sessionId || threadId) === nativeId) return file;
     } catch {}
   }
   return null;
@@ -337,9 +393,10 @@ function readCodexSessionIdentity(nativeId, root = sessionRoot()) {
       const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
-      if (sessionId !== nativeId && threadId !== nativeId) continue;
+      if (sessionId && threadId && sessionId !== threadId) continue;
+      if ((sessionId || threadId) !== nativeId) continue;
       matches.push({
-        file, sessionId, threadId,
+        file, sessionId: nativeId, threadId: nativeId,
         workspace: typeof payload.cwd === 'string' ? payload.cwd : null
       });
     } catch {}
@@ -351,7 +408,9 @@ function readCodexSessionIdentity(nativeId, root = sessionRoot()) {
 
 function codexHomeForSessionRoot(root) {
   if (!path.isAbsolute(root) || path.basename(root) !== 'sessions') {
-    throw new Error('Unsupported Codex session root: queue requires <CODEX_HOME>/sessions');
+    const error = new Error('Unsupported Codex session root: queue requires <CODEX_HOME>/sessions');
+    error.recoveryKind = CODEX_VALIDATION_KINDS.UNSUPPORTED_ROOT;
+    throw error;
   }
   return path.dirname(root);
 }
@@ -384,11 +443,21 @@ function validateCodexSessionIdentity(nativeId, workspace, root = sessionRoot())
   return normalizedIdentity;
 }
 
-async function validateCodexSessionIdentityAsync(nativeId, workspace, root = sessionRoot()) {
+async function validateCodexSessionIdentityAsync(nativeId, workspace, root = sessionRoot(), options = {}) {
   validateNativeId(nativeId);
   if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
   codexHomeForSessionRoot(root);
-  const identity = await readCodexSessionIdentityAsync(nativeId, root);
+  let identity;
+  try {
+    identity = await readCodexSessionIdentityAsync(nativeId, root, options);
+  } catch (error) {
+    if (error?.recoveryKind === CODEX_VALIDATION_KINDS.STOPPED || error?.recoveryKind === CODEX_VALIDATION_KINDS.DEADLINE) {
+      const unavailable = new Error('Codex transcript identity is unavailable', { cause: error });
+      unavailable.recoveryKind = error.recoveryKind;
+      throw unavailable;
+    }
+    throw error;
+  }
   if (!identity) throw new Error('Codex transcript identity is unavailable');
   if (identity.ambiguous) throw new Error('Codex transcript identity is ambiguous');
   const normalizedIdentity = normalizeCodexSessionIdentity(identity, nativeId);
@@ -756,7 +825,7 @@ class CodexProvider {
     return { ...result, cursor };
   }
 
-  observe(message, outcome, options) {
+  observe(message, outcome, options = {}) {
     return observeCodexReply(message.nativeId, outcome.cursor || message.observerCursor, {
       ...options,
       marker: `[[discord-surface:${message.id}]]`,
@@ -938,6 +1007,7 @@ async function dispatchAndObserve(state, messageId, providers, options = {}) {
 
 module.exports = {
   attachmentPrompt,
+  CODEX_VALIDATION_KINDS,
   ClaudeProvider,
   CodexProvider,
   claudeEvent,
