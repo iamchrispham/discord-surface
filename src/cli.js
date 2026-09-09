@@ -327,15 +327,18 @@ async function ordinaryBind(args, dependencies = {}) {
 }
 
 async function unbind(args, dependencies = {}) {
-  const { state } = openState(args);
+  const { paths, state } = openState(args);
   const channelId = required(args, 'channel-id');
   const install = dependencies.requireInstalled || requireInstalled;
   const read = dependencies.readSecret || readSecret;
+  const wake = dependencies.requestGatewayRecovery || requestGatewayRecovery;
   const output = dependencies.print || print;
   let client;
   let fence;
+  let intakePaused = false;
+  let binding = null;
   try {
-    const binding = state.getBinding(channelId);
+    binding = state.getBinding(channelId);
     if (!binding || !binding.active || !state.isOrdinaryBindingRecord(binding)) {
       const result = state.unbind(channelId, { expectedBinding: binding || undefined });
       output({ unbound: result });
@@ -359,13 +362,32 @@ async function unbind(args, dependencies = {}) {
     if (watermark?.state !== READINESS.READY || !recoveredThrough) {
       throw new Error('ordinary unbind requires Discord intake to be durably drained');
     }
+    const paused = state.pauseOrdinaryHandoffIntake(channelId, binding);
+    if (!paused) throw new Error('ordinary unbind source binding changed while pausing intake');
+    intakePaused = true;
     fence = await createHandoffFence(channel, 'ordinary unbind');
     await assertOrdinaryIntakeRange(channel, state, binding, recoveredThrough, fence.id, 'ordinary unbind');
     const result = state.unbind(channelId, { expectedBinding: binding, intakeCutoff: fence.id });
     if (!result) throw new Error('ordinary binding changed before intake fence was committed');
+    intakePaused = false;
     output({ unbound: result });
     return { unbound: result };
   } finally {
+    if (intakePaused) {
+      try {
+        const restored = state.restoreOrdinaryHandoffIntake(channelId, binding);
+        if (restored) {
+          wake(paths, {
+            status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+            kill: dependencies.killProcess || process.kill
+          });
+        }
+      } catch (error) {
+        state.auditReceipt(null, 'ordinary-unbind-intake-restore-failed', {
+          channelId, generation: binding?.generation, error: error.message
+        });
+      }
+    }
     await deleteHandoffFence(fence);
     try { await client?.destroy(); } finally { state.close(); }
   }

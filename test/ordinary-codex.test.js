@@ -1427,6 +1427,61 @@ test('ordinary unbind fences remote intake before revoking custody', async t => 
   } finally { recovered.close(); }
 });
 
+test('aborted ordinary unbind restores intake and wakes the Gateway', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-unbind-abort-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+  const binding = setup.bindOrdinary({
+    channelId: '123456789012345680', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
+    workspace: dir
+  }, { sessionId: CODEX, threadId: CODEX });
+  setup.recordOrdinaryPreflight(binding, {
+    file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir
+  });
+  setup.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary unbind baseline');
+  setup.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary unbind drained', null, null, binding);
+  setup.close();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const wakeSignals = [];
+  const channel = {
+    id: binding.channelId, guildId: 'guild', name: 'ordinary', isTextBased: () => true,
+    messages: { fetch: async options => options?.after === '100'
+      ? new Map([['latest', { id: '140' }]])
+      : new Map([['latest', { id: '100' }]]) },
+    send: async () => ({ id: '150', async delete() {} })
+  };
+  class FakeClient {
+    constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => channel } }) }; }
+    async login() {}
+    async destroy() {}
+  }
+
+  await assert.rejects(() => unbind({ 'state-dir': dir, 'channel-id': binding.channelId }, {
+    requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+    readSecret: () => 'fixture-token',
+    requestGatewayRecovery: (_paths, options) => {
+      const runtime = options.status(_paths);
+      options.kill(runtime.pid, 'SIGUSR2');
+      return { requested: true, pid: runtime.pid, signal: 'SIGUSR2' };
+    },
+    gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] }),
+    killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
+    print: () => {}
+  }), /durably drained/);
+
+  const recovered = new SurfaceState(db);
+  try {
+    assert.equal(recovered.getBinding(binding.channelId).readiness, READINESS.READY);
+    assert.equal(recovered.getIntakeWatermark(binding.channelId).state, READINESS.READY);
+    assert.deepEqual(wakeSignals, [{ pid: 4242, signal: 'SIGUSR2' }]);
+    assert.equal(recovered.acceptDiscordMessage({
+      id: '160', guildId: 'guild', channelId: binding.channelId, authorId: 'operator', content: 'after aborted unbind'
+    }).accepted, true);
+  } finally { recovered.close(); }
+});
+
 test('ordinary ready intake records live observation without moving the recovery cutoff', t => {
   const f = fixture(t);
   const binding = ordinary(f);
@@ -1654,6 +1709,71 @@ test('Gateway defers startup recovery while an ordinary handoff owner is live', 
   assert.equal(gateway.ready, true);
   assert.equal(fetches, 0);
   assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.PENDING);
+  await gateway.stop();
+});
+
+test('Gateway retries deferred startup recovery after an ordinary handoff aborts', async t => {
+  const f = fixture(t);
+  const session = transcript(t, f.dir);
+  const binding = ordinary(f);
+  f.state.recordOrdinaryPreflight(binding, {
+    file: session.file, sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary handoff baseline');
+  f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary handoff drained', null, null, binding);
+  const held = f.state.acceptDiscordMessage({
+    id: '101', guildId: 'guild', channelId: binding.channelId, authorId: 'operator', content: 'held during handoff'
+  }, { ready: true });
+  assert.equal(held.accepted, true);
+  assert.ok(f.state.pauseOrdinaryHandoffIntake(binding.channelId, binding));
+  f.state.ordinaryHandoffPauses.clear();
+  f.state.ordinaryHandoffPauseSnapshots.clear();
+  const pausedReceipt = f.state.listReceipts().find(receipt => receipt.kind === 'ordinary-handoff-intake-paused');
+  const pausedDetail = JSON.parse(pausedReceipt.detail);
+  const secretFile = path.join(f.dir, 'discord.env');
+  fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  let dispatches = 0;
+  let replies = 0;
+  const channel = {
+    id: binding.channelId,
+    guildId: 'guild',
+    topic: null,
+    permissionsFor: () => ({ has: () => true }),
+    async send() { replies += 1; return { id: `reply-${replies}` }; }
+  };
+  const client = {
+    user: { id: 'bot' },
+    channels: { fetch: async () => channel },
+    on() {}, off() {}, async login() {}, async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client,
+    fetchHistory: async () => [{
+      id: '101', guildId: 'guild', channelId: binding.channelId,
+      author: { id: 'operator', bot: false }, content: 'held during handoff', attachments: []
+    }],
+    providers: { codex: {
+      async dispatch() { dispatches += 1; return { status: 'submitted' }; },
+      async observe() { return { text: 'answer' }; }
+    } },
+    recoveryOptions: {
+      ordinaryNativePreflight: async () => ({
+        file: session.file, sessionId: CODEX, threadId: CODEX, workspace: f.dir
+      })
+    }
+  });
+
+  await gateway.start(secretFile);
+  gateway.transportReady = true;
+  pausedDetail.ownerPid = 999999;
+  f.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(JSON.stringify(pausedDetail), pausedReceipt.id);
+  const restored = f.state.recoverInterruptedOrdinaryHandoffIntake(binding.channelId, binding);
+  assert.equal(restored.state, READINESS.READY);
+
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.equal(dispatches, 1);
+  assert.equal(f.state.getMessage('101').state, 'replied');
   await gateway.stop();
 });
 

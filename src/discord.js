@@ -563,6 +563,8 @@ class DiscordGateway {
     this.liveCheckpointPromise = null;
     this.liveIntakeCounts = new Map();
     this.reconnectPromise = null;
+    this.deferredHandoffRecoveryTimer = null;
+    this.deferredHandoffRecoveryChannels = new Set();
     this.transportReady = false;
     this.fetchHistoryInjected = typeof fetchHistory === 'function';
     this.fetchHistory = fetchHistory || ((channel, options) => channel.messages?.fetch(options));
@@ -845,6 +847,35 @@ class DiscordGateway {
     this.beginLiveCheckpoint(triggeredCounts);
   }
 
+  scheduleDeferredHandoffRecovery(channelId) {
+    if (this.stopping || typeof channelId !== 'string') return;
+    this.deferredHandoffRecoveryChannels.add(channelId);
+    if (this.deferredHandoffRecoveryTimer) return;
+    const timer = setTimeout(() => {
+      if (this.deferredHandoffRecoveryTimer === timer) this.deferredHandoffRecoveryTimer = null;
+      if (this.stopping || !this.deferredHandoffRecoveryChannels.size) return;
+      const channels = [...this.deferredHandoffRecoveryChannels];
+      this.deferredHandoffRecoveryChannels.clear();
+      if (this.started && !this.transportReady) {
+        for (const deferredChannelId of channels) this.scheduleDeferredHandoffRecovery(deferredChannelId);
+        return;
+      }
+      Promise.resolve().then(async () => {
+        const joinedRecovery = Boolean(this.recoveryPromise);
+        const recovery = await this.recoverTransport('ordinary-handoff');
+        if (this.stopping) return;
+        if (joinedRecovery) {
+          for (const deferredChannelId of channels) this.scheduleDeferredHandoffRecovery(deferredChannelId);
+          return;
+        }
+        if (recovery.ready) await this.reconcilePending();
+        else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true });
+      }).catch(error => this.logger(`Deferred ordinary handoff recovery failed: ${error.message}`));
+    }, 100);
+    timer.unref?.();
+    this.deferredHandoffRecoveryTimer = timer;
+  }
+
   beginLiveCheckpoint(triggeredCounts = new Map()) {
     if (this.liveCheckpointPromise || this.stopping || this.recoveryPromise) return;
     const controller = new AbortController();
@@ -977,7 +1008,10 @@ class DiscordGateway {
         continue;
       }
       const handoffRecovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(binding.channelId, binding);
-      if (handoffRecovery?.deferred) continue;
+      if (handoffRecovery?.deferred) {
+        this.scheduleDeferredHandoffRecovery(binding.channelId);
+        continue;
+      }
       const recovering = this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, `${reason} intake recovery in progress`, binding);
       if (!recovering) {
         failure ||= { ready: false, state: 'unavailable' };
@@ -1271,6 +1305,9 @@ class DiscordGateway {
     this.stopping = true;
     this.started = false;
     this.transportReady = false;
+    if (this.deferredHandoffRecoveryTimer) clearTimeout(this.deferredHandoffRecoveryTimer);
+    this.deferredHandoffRecoveryTimer = null;
+    this.deferredHandoffRecoveryChannels.clear();
     this.stopPromise = (async () => {
       this.ready = false;
       this.recoveryController?.abort();
