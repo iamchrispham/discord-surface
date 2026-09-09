@@ -127,7 +127,9 @@ function recoverInterruptedOrdinaryHandoffIntake(state, channelId, expectedBindi
   if (!row || row.kind !== 'ordinary-handoff-intake-paused') return null;
   let pause;
   try { pause = JSON.parse(row.detail); } catch { return null; }
-  if (pauseOwnerAlive(state, pause)) return null;
+  if (pauseOwnerAlive(state, pause)) {
+    return { deferred: true };
+  }
   const snapshot = pause.snapshot;
   if (!snapshot || typeof snapshot.state !== 'string') return null;
   const pauseMetadata = { ownerToken: pause.ownerToken, preserveUnavailable: true };

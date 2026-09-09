@@ -976,6 +976,8 @@ class DiscordGateway {
         failure ||= { ready: false, state: 'gap' };
         continue;
       }
+      const handoffRecovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(binding.channelId, binding);
+      if (handoffRecovery?.deferred) continue;
       const recovering = this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, `${reason} intake recovery in progress`, binding);
       if (!recovering) {
         failure ||= { ready: false, state: 'unavailable' };

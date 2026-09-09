@@ -1623,6 +1623,30 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
   await gateway.stop();
 });
 
+test('Gateway defers startup recovery while an ordinary handoff owner is live', async t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  assert.ok(f.state.pauseOrdinaryHandoffIntake(binding.channelId, binding));
+  f.state.ordinaryHandoffPauses.clear();
+  f.state.ordinaryHandoffPauseSnapshots.clear();
+  const secretFile = path.join(f.dir, 'discord.env');
+  fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  let fetches = 0;
+  const client = {
+    user: { id: 'bot' },
+    channels: { fetch: async () => { fetches += 1; throw new Error('startup recovery must be deferred'); } },
+    on() {}, off() {}, async login() {}, async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state: f.state, client, providers: {} });
+
+  await gateway.start(secretFile);
+
+  assert.equal(gateway.ready, true);
+  assert.equal(fetches, 0);
+  assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.PENDING);
+  await gateway.stop();
+});
+
 test('Gateway preserves recovered readiness while another binding wake fails', async t => {
   const f = fixture(t);
   const first = ordinary(f, 'ordinary-A', CODEX);
