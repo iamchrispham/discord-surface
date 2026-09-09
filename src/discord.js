@@ -868,7 +868,7 @@ class DiscordGateway {
           if (advancedChannels.has(channelId) || !this.state.getBinding(channelId)?.active) continue;
           const currentCount = this.liveIntakeCounts.get(channelId) || 0;
           const deferredCount = deferredCounts.get(channelId);
-          if (deferredCount === undefined) this.liveIntakeCounts.set(channelId, Math.max(currentCount, count));
+          if (deferredCount === undefined) this.liveIntakeCounts.set(channelId, currentCount + count);
           else deferredCounts.set(channelId, deferredCount + count);
         }
         if (this.recoveryPromise) {
