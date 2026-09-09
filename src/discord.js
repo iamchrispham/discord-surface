@@ -6,6 +6,7 @@ const { conductorMarkerMatches } = require('./topic');
 const requireInstalled = require;
 const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
 const DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS = 5000;
+const PENDING_HANDOFF_RECOVERY_POLL_MS = 100;
 
 function recoveryError(kind, detail) {
   const error = new Error(detail);
@@ -566,6 +567,7 @@ class DiscordGateway {
     this.liveIntakeCounts = new Map();
     this.reconnectPromise = null;
     this.deferredHandoffRecoveryTimer = null;
+    this.pendingHandoffRecoveryPollTimer = null;
     this.deferredHandoffRecoveryChannels = new Set();
     this.pendingHandoffRecoveryChannels = new Set();
     this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
@@ -775,6 +777,7 @@ class DiscordGateway {
       if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
       this.transportReady = true;
       this.started = true;
+      this.schedulePendingHandoffRecoveryPoll();
     })();
     this.startPromise = startPromise;
     try { return await startPromise; }
@@ -871,9 +874,6 @@ class DiscordGateway {
       if (this.stopping || (!this.deferredHandoffRecoveryChannels.size && !this.pendingHandoffRecoveryChannels.size)) return;
       const deferredChannels = [...this.deferredHandoffRecoveryChannels];
       const pendingChannels = [...this.pendingHandoffRecoveryChannels];
-      const deferredChannelSet = new Set(deferredChannels);
-      const pendingChannelSet = new Set(pendingChannels);
-      const pendingGenerationChannels = new Set(pendingChannels);
       this.deferredHandoffRecoveryChannels.clear();
       this.pendingHandoffRecoveryChannels.clear();
       const requeue = (channelIds, pendingGeneration = false) => {
@@ -895,31 +895,18 @@ class DiscordGateway {
         }
         const recoverableChannels = new Set();
         const reconcileOnlyChannels = new Set();
-        for (const deferredChannelId of deferredChannels) {
-          const binding = this.state.getBinding(deferredChannelId);
-          const recovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(deferredChannelId, binding);
+        for (const channelId of new Set([...deferredChannels, ...pendingChannels])) {
+          const binding = this.state.getBinding(channelId);
+          const recovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(channelId, binding);
           if (recovery?.deferred) {
-            this.deferredHandoffRecoveryChannels.add(deferredChannelId);
+            this.deferredHandoffRecoveryChannels.add(channelId);
           } else if (recovery && binding?.active) {
-            recoverableChannels.add(deferredChannelId);
-          } else if (binding?.active && binding.readiness === READINESS.PENDING && this.state.isOrdinaryBinding?.(binding)) {
-            pendingGenerationChannels.add(deferredChannelId);
+            recoverableChannels.add(channelId);
+          } else if (binding?.active && this.state.isOrdinaryBinding?.(binding) &&
+            [READINESS.PENDING, READINESS.RECOVERING].includes(binding.readiness)) {
+            recoverableChannels.add(channelId);
           } else if (binding?.active && binding.readiness === READINESS.READY) {
-            reconcileOnlyChannels.add(deferredChannelId);
-          }
-        }
-        for (const pendingChannelId of pendingGenerationChannels) {
-          if (deferredChannelSet.has(pendingChannelId) && pendingChannelSet.has(pendingChannelId)) continue;
-          const binding = this.state.getBinding(pendingChannelId);
-          const recovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(pendingChannelId, binding);
-          if (recovery?.deferred) {
-            this.deferredHandoffRecoveryChannels.add(pendingChannelId);
-          } else if (recovery && binding?.active) {
-            recoverableChannels.add(pendingChannelId);
-          } else if (binding?.active && binding.readiness === READINESS.PENDING && this.state.isOrdinaryBinding?.(binding)) {
-            recoverableChannels.add(pendingChannelId);
-          } else if (binding?.active && binding.readiness === READINESS.READY) {
-            reconcileOnlyChannels.add(pendingChannelId);
+            reconcileOnlyChannels.add(channelId);
           }
         }
         if (recoverableChannels.size) {
@@ -946,6 +933,22 @@ class DiscordGateway {
     }, delay);
     timer.unref?.();
     this.deferredHandoffRecoveryTimer = timer;
+  }
+
+  schedulePendingHandoffRecoveryPoll() {
+    if (this.stopping || !this.started || this.pendingHandoffRecoveryPollTimer) return;
+    const timer = setTimeout(() => {
+      if (this.pendingHandoffRecoveryPollTimer === timer) this.pendingHandoffRecoveryPollTimer = null;
+      if (this.stopping || !this.started) return;
+      for (const binding of this.state.listBindings?.() || []) {
+        if (binding.active && binding.readiness === READINESS.PENDING && this.state.isOrdinaryBinding?.(binding)) {
+          this.scheduleDeferredHandoffRecovery(binding.channelId, { pendingGeneration: true });
+        }
+      }
+      this.schedulePendingHandoffRecoveryPoll();
+    }, PENDING_HANDOFF_RECOVERY_POLL_MS);
+    timer.unref?.();
+    this.pendingHandoffRecoveryPollTimer = timer;
   }
 
   beginLiveCheckpoint(triggeredCounts = new Map()) {
@@ -1383,6 +1386,8 @@ class DiscordGateway {
     this.transportReady = false;
     if (this.deferredHandoffRecoveryTimer) clearTimeout(this.deferredHandoffRecoveryTimer);
     this.deferredHandoffRecoveryTimer = null;
+    if (this.pendingHandoffRecoveryPollTimer) clearTimeout(this.pendingHandoffRecoveryPollTimer);
+    this.pendingHandoffRecoveryPollTimer = null;
     this.deferredHandoffRecoveryChannels.clear();
     this.pendingHandoffRecoveryChannels.clear();
     this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;

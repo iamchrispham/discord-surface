@@ -2301,3 +2301,114 @@ test('live intake checkpoints retain demand after a failed pass', async t => {
   assert.equal(historyFetches >= 2, true);
   assert.equal(f.state.getIntakeWatermark(binding.channelId).recovered_through_id, '103');
 });
+
+test('Gateway observes a committed pending ordinary generation without a wake signal', async t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  const session = transcript(t, f.dir, OTHER);
+  f.state.recordOrdinaryPreflight(binding, {
+    file: path.join(f.dir, 'source-session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary handoff baseline');
+  f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'ordinary handoff drained', null, null, binding);
+  let preflights = 0;
+  const channel = {
+    id: binding.channelId, guildId: 'guild', topic: null,
+    permissionsFor: () => ({ has: () => true })
+  };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
+    fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { return { status: 'submitted' }; } } },
+    recoveryOptions: {
+      ordinaryNativePreflight: async current => {
+        preflights += 1;
+        return { file: session.file, sessionId: current.nativeId, threadId: current.nativeId, workspace: f.dir };
+      }
+    }
+  });
+  gateway.ready = true;
+  gateway.started = true;
+  gateway.transportReady = true;
+  gateway.schedulePendingHandoffRecoveryPoll();
+
+  f.state.handoffOrdinary({
+    channelId: binding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
+    nativeId: OTHER, workspace: f.dir, sessionRoot: null, handoffId: 'poll-handoff',
+    intakeCutoff: '100', identity: { sessionId: OTHER, threadId: OTHER },
+    nativeProof: { file: session.file, sessionId: OTHER, threadId: OTHER, workspace: f.dir }
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 350));
+  assert.equal(preflights, 1);
+  assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.READY);
+  await gateway.stop();
+});
+
+test('Gateway recovers a channel queued by both ordinary handoff recovery paths', async t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  const session = transcript(t, f.dir);
+  let preflights = 0;
+  const channel = {
+    id: binding.channelId, guildId: 'guild', topic: null,
+    permissionsFor: () => ({ has: () => true })
+  };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
+    fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { return { status: 'submitted' }; } } },
+    recoveryOptions: {
+      ordinaryNativePreflight: async current => {
+        preflights += 1;
+        return { file: session.file, sessionId: current.nativeId, threadId: current.nativeId, workspace: f.dir };
+      }
+    }
+  });
+  gateway.ready = true;
+  gateway.started = true;
+  gateway.transportReady = true;
+  gateway.deferredHandoffRecoveryChannels.add(binding.channelId);
+  gateway.pendingHandoffRecoveryChannels.add(binding.channelId);
+  gateway.scheduleDeferredHandoffRecovery(binding.channelId);
+
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.equal(preflights, 1);
+  assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.READY);
+  await gateway.stop();
+});
+
+test('Gateway recovers an orphaned recovering ordinary binding', async t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  const session = transcript(t, f.dir);
+  f.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, 'handoff intake race', binding);
+  let preflights = 0;
+  const channel = {
+    id: binding.channelId, guildId: 'guild', topic: null,
+    permissionsFor: () => ({ has: () => true })
+  };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client: { user: { id: 'bot' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
+    fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { return { status: 'submitted' }; } } },
+    recoveryOptions: {
+      ordinaryNativePreflight: async current => {
+        preflights += 1;
+        return { file: session.file, sessionId: current.nativeId, threadId: current.nativeId, workspace: f.dir };
+      }
+    }
+  });
+  gateway.ready = true;
+  gateway.started = true;
+  gateway.transportReady = true;
+  gateway.scheduleDeferredHandoffRecovery(binding.channelId);
+
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.equal(preflights, 1);
+  assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.READY);
+  await gateway.stop();
+});
