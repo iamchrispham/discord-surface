@@ -85,17 +85,39 @@ function walk(dir, result = [], depth = 0) {
   return result;
 }
 
-async function readSessionHeaderAsync(file) {
-  const handle = await fs.promises.open(file, 'r');
+async function readSessionHeaderAsync(file, signal = null) {
+  let handle = null;
+  let closePromise = null;
+  const closeHandle = () => {
+    if (!handle) return Promise.resolve();
+    if (!closePromise) closePromise = handle.close().catch(() => {});
+    return closePromise;
+  };
+  let onAbort;
+  const abortPromise = signal ? new Promise((_, reject) => {
+    onAbort = () => {
+      closeHandle();
+      reject(new Error('transcript header read aborted'));
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }) : null;
+  const guarded = operation => abortPromise ? Promise.race([operation, abortPromise]) : operation;
   try {
-    const { size } = await handle.stat();
+    const opening = fs.promises.open(file, 'r');
+    opening.then(candidate => {
+      if (signal?.aborted) candidate.close().catch(() => {});
+    }, () => {});
+    handle = await guarded(opening);
+    if (signal?.aborted) throw new Error('transcript header read aborted');
+    const { size } = await guarded(handle.stat());
     const parts = [];
     for (let position = 0; position < size;) {
       const length = Math.min(TRANSCRIPT_BLOCK_BYTES, size - position);
       const bytes = Buffer.allocUnsafe(length);
       let read = 0;
       while (read < length) {
-        const result = await handle.read(bytes, read, length - read, position + read);
+        const result = await guarded(handle.read(bytes, read, length - read, position + read));
         if (!result.bytesRead) throw new Error('transcript shortened during read');
         read += result.bytesRead;
       }
@@ -106,17 +128,20 @@ async function readSessionHeaderAsync(file) {
     }
     return Buffer.concat(parts).toString('utf8');
   } finally {
-    await handle.close();
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+    await closeHandle();
   }
 }
 
-function awaitWithDeadline(task, deadline) {
+function awaitWithDeadline(task, deadline, onDeadline = null) {
   const remaining = deadline - Date.now();
   if (remaining <= 0) return Promise.reject(new Error('operation deadline exceeded'));
   let timer;
   const operation = Promise.resolve().then(task);
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error('operation deadline exceeded')), remaining);
+    timer = setTimeout(() => {
+      try { onDeadline?.(); } finally { reject(new Error('operation deadline exceeded')); }
+    }, remaining);
   });
   return Promise.race([operation, timeout]).finally(() => clearTimeout(timer));
 }
@@ -178,7 +203,12 @@ async function readCodexSessionIdentityAsync(nativeId, root = sessionRoot()) {
   for await (const file of walkAsync(root, 0, scan)) {
     if (!file.includes(nativeId)) continue;
     try {
-      const row = JSON.parse(await awaitWithDeadline(() => readSessionHeaderAsync(file), deadline));
+      const controller = new AbortController();
+      const row = JSON.parse(await awaitWithDeadline(
+        () => readSessionHeaderAsync(file, controller.signal),
+        deadline,
+        () => controller.abort()
+      ));
       const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object' ? row.payload : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;

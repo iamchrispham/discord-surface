@@ -950,7 +950,13 @@ class DiscordGateway {
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during login');
       const recovery = await this.recoverTransport('startup', epoch);
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError('stopped', 'Discord startup was stopped during recovery');
-      if (!recovery.ready) throw new Error(`Discord intake recovery is ${recovery.state}`);
+      const hasEndpointUnavailableBinding = !recovery.ready && ['gap', 'unavailable'].includes(recovery.state) && this.state.listBindings().some(binding => {
+        const watermark = this.state.getIntakeWatermark(binding.channelId);
+        return binding.active && binding.provider === 'claude' && watermark?.state === READINESS.UNAVAILABLE &&
+          typeof watermark.detail === 'string' && watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX);
+      });
+      if (!recovery.ready && !hasEndpointUnavailableBinding) throw new Error(`Discord intake recovery is ${recovery.state}`);
+      if (hasEndpointUnavailableBinding) this.ready = true;
       this.started = true;
       this.acknowledgments = watchAcknowledgments({
         state: this.state,

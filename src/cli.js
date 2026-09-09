@@ -20,6 +20,7 @@ const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 
 const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID';
 const LOCK_CONTENTION_EXIT = 75;
+const RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS = 30000;
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
 const { runLiaisonDraft } = require('./liaison');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
@@ -833,12 +834,13 @@ async function handoffFromLockInternal(args) {
   }
 }
 
-function writePid(pidFile, guildId, stateDir) {
+function writePid(pidFile, guildId, stateDir, db) {
   fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
   fs.writeFileSync(pidFile, JSON.stringify({
     pid: process.pid,
     guildId,
     stateDir,
+    db,
     command: 'run',
     startedAt: new Date().toISOString(),
     capabilities: [
@@ -902,9 +904,13 @@ function acquireHeldLock(lockPath) {
   });
 }
 
-async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
+async function acquireHeldLockUntilAvailable(lockPath, isStopping, timeoutMs = RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS) {
   let reportedContention = false;
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS);
   while (!isStopping?.()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`runtime bind lock wait exceeded ${Math.max(1, Number(timeoutMs) || RUNTIME_BIND_LOCK_WAIT_TIMEOUT_MS)}ms`);
+    }
     try {
       const lock = await acquireHeldLock(lockPath);
       const stopping = isStopping?.();
@@ -921,7 +927,9 @@ async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
         process.stderr.write('discord-surface: runtime bind lock is busy; waiting for the holder to release it\n');
       }
       if (isStopping?.()) return null;
-      await new Promise(resolve => setTimeout(resolve, 50));
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) continue;
+      await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)));
     }
   }
   return null;
@@ -997,7 +1005,7 @@ async function runRuntime(args) {
     startupLock = await acquireHeldLockUntilAvailable(paths.bindLock, () => stopping);
     if (stopping || !startupLock) return;
     state.recoverAfterRestart();
-    writePid(paths.pid, config.guildId, paths.stateDir);
+    writePid(paths.pid, config.guildId, paths.stateDir, paths.db);
     gateway = new DiscordGateway({ state, observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) } });
     await gateway.start(config.secretFile);
     await gateway.reconcilePending(recoveryCutoff);
@@ -1081,8 +1089,10 @@ async function claudeMonitor(args) {
       try {
         detachStdoutTransport();
         revokeOrdinaryReadiness();
-        await monitor?.stop();
-      } finally { state.close(); }
+      } finally {
+        try { await monitor?.stop(); }
+        finally { state.close(); }
+      }
     })();
     return stopPromise;
   };
@@ -1231,12 +1241,19 @@ function readProcessCommand(pid) {
   return execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
 }
 
-function pidMatches(value, stateDir, command) {
-  if (!value || value.command !== 'run' || value.stateDir !== stateDir) return false;
+function pidMatches(value, stateDir, db, command) {
+  if (!value || value.command !== 'run' || value.stateDir !== stateDir || value.db !== db) return false;
   try {
     const actualCommand = (command ?? readProcessCommand(value.pid)).trim();
     const expectedPrefix = `${process.execPath} ${__filename} run --state-dir ${stateDir}`;
-    return actualCommand === expectedPrefix || actualCommand.startsWith(`${expectedPrefix} --db `);
+    if (actualCommand === expectedPrefix) return db === path.join(stateDir, 'surface.sqlite');
+    const suffix = actualCommand.startsWith(expectedPrefix) ? actualCommand.slice(expectedPrefix.length).trim() : '';
+    const commandDb = suffix.startsWith('--db=') ? suffix.slice('--db='.length) : suffix.startsWith('--db ') ? suffix.slice('--db '.length).trim() : null;
+    if (!commandDb) return false;
+    const unquotedDb = commandDb.length >= 2 && ((commandDb.startsWith('"') && commandDb.endsWith('"')) || (commandDb.startsWith("'") && commandDb.endsWith("'")))
+      ? commandDb.slice(1, -1)
+      : commandDb;
+    return path.resolve(unquotedDb) === db;
   } catch { return false; }
 }
 
@@ -1263,7 +1280,7 @@ function gatewayProcessStatus(paths) {
   let command;
   try { command = readProcessCommand(runtimePid); }
   catch { return { state: 'unknown', pid: runtimePid, connection: 'unknown', reason: 'process-inspection-failed' }; }
-  if (!pidMatches(value, paths.stateDir, command)) {
+  if (!pidMatches(value, paths.stateDir, paths.db, command)) {
     return { state: 'unknown', pid: runtimePid, connection: 'unknown', reason: 'pid-owner-mismatch' };
   }
   return {
@@ -1272,6 +1289,7 @@ function gatewayProcessStatus(paths) {
     connection: 'unverified-live',
     guildId: value.guildId,
     stateDir: value.stateDir,
+    db: value.db,
     startedAt: value.startedAt,
     capabilities: Array.isArray(value.capabilities) ? value.capabilities : []
   };
@@ -1288,13 +1306,13 @@ function waitForExit(pid, timeoutMs = 10000) {
 }
 
 function stop(args) {
-  const { stateDir, pid } = pathsFor(args);
+  const { stateDir, db, pid } = pathsFor(args);
   if (!fs.existsSync(pid)) return print({ stopped: false, reason: 'not-running' });
   let value;
   try { value = JSON.parse(fs.readFileSync(pid, 'utf8')); } catch { throw new Error('runtime pid file is corrupt'); }
   const runtimePid = Number(value.pid);
   if (!Number.isInteger(runtimePid) || runtimePid < 1) throw new Error('runtime pid file has an invalid owner');
-  if (!pidMatches(value, stateDir)) {
+  if (!pidMatches(value, stateDir, db)) {
     try { process.kill(runtimePid, 0); } catch (error) {
       if (error.code === 'ESRCH') { fs.unlinkSync(pid); print({ stopped: false, reason: 'stale-pid' }); return; }
     }

@@ -2765,7 +2765,7 @@ require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
   });
   try {
     await waitForFile(paths.pid);
-    fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
+    fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, db, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
     const running = status();
     assert.equal(running.state, 'running');
     assert.equal(running.pid, matching.pid);
@@ -2779,6 +2779,7 @@ require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
       pid: matching.pid,
       guildId: 'guild-1',
       stateDir: dir,
+      db,
       command: 'run',
       startedAt: new Date().toISOString(),
       capabilities: ['ordinary-bind-wake-v1']
@@ -2796,7 +2797,7 @@ require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
     });
     await waitForCondition(() => fs.existsSync(wakeMarker) && fs.readFileSync(wakeMarker, 'utf8') === '2');
 
-    fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
+    fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, db, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
     assert.deepEqual(requestGatewayRecovery(paths), {
       requested: false,
       pid: matching.pid,
