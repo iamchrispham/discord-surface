@@ -1777,6 +1777,57 @@ test('Gateway retries deferred startup recovery after an ordinary handoff aborts
   await gateway.stop();
 });
 
+test('Gateway polls a live handoff owner without recovering unrelated bindings', async t => {
+  const f = fixture(t);
+  const deferredBinding = ordinary(f, 'ordinary-deferred');
+  const healthyBinding = ordinary(f, 'ordinary-healthy', CODEX_V7);
+  const healthySession = transcript(t, f.dir, CODEX_V7);
+  assert.ok(f.state.pauseOrdinaryHandoffIntake(deferredBinding.channelId, deferredBinding));
+  f.state.ordinaryHandoffPauses.clear();
+  f.state.ordinaryHandoffPauseSnapshots.clear();
+  const secretFile = path.join(f.dir, 'discord.env');
+  fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  const channels = new Map([deferredBinding, healthyBinding].map(binding => [binding.channelId, {
+    id: binding.channelId,
+    guildId: 'guild',
+    topic: null,
+    permissionsFor: () => ({ has: () => true })
+  }]));
+  let historyFetches = 0;
+  let preflights = 0;
+  const client = {
+    user: { id: 'bot' },
+    channels: { fetch: async channelId => channels.get(channelId) },
+    on() {}, off() {}, async login() {}, async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state: f.state,
+    client,
+    fetchHistory: async () => { historyFetches += 1; return []; },
+    providers: { codex: {
+      async dispatch() { return { status: 'submitted' }; },
+      async observe() { return { text: 'answer' }; }
+    } },
+    recoveryOptions: {
+      ordinaryNativePreflight: async binding => {
+        preflights += 1;
+        return { file: healthySession.file, sessionId: binding.nativeId, threadId: binding.nativeId, workspace: f.dir };
+      }
+    }
+  });
+
+  await gateway.start(secretFile);
+  const startupHistoryFetches = historyFetches;
+  const startupPreflights = preflights;
+  await new Promise(resolve => setTimeout(resolve, 250));
+
+  assert.equal(historyFetches, startupHistoryFetches);
+  assert.equal(preflights, startupPreflights);
+  assert.equal(f.state.getIntakeWatermark(deferredBinding.channelId).state, READINESS.PENDING);
+  assert.ok(gateway.deferredHandoffRecoveryDelayMs > 100);
+  await gateway.stop();
+});
+
 test('Gateway preserves recovered readiness while another binding wake fails', async t => {
   const f = fixture(t);
   const first = ordinary(f, 'ordinary-A', CODEX);

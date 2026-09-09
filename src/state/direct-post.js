@@ -42,13 +42,25 @@ function createDirectPostHandlers({
       for (const row of rows) {
         if (row.kind !== DIRECT_POST_ATTEMPT || row.detail.channelId !== channelId ||
           row.detail.provider !== 'codex' || row.detail.conductorId || row.detail.repoKey) continue;
-        const request = requests.get(row.detail.requestId) || new Map();
-        request.set(row.detail.partIndex, row);
+        const partCount = Number(row.detail.partCount || 1);
+        const partIndex = Number.isInteger(row.detail.partIndex) ? row.detail.partIndex : 0;
+        if (!Number.isSafeInteger(partCount) || partCount < 1 || !Number.isSafeInteger(partIndex) || partIndex < 0 || partIndex >= partCount) return true;
+        const request = requests.get(row.detail.requestId) || { partCount, parts: new Map() };
+        if (request.partCount !== partCount) return true;
+        request.parts.set(partIndex, row);
         requests.set(row.detail.requestId, request);
       }
-      for (const parts of requests.values()) {
-        for (const row of parts.values()) {
+      for (const request of requests.values()) {
+        let definitiveFailure = false;
+        for (const row of request.parts.values()) {
           const outcome = outcomes.get(row.detail.attemptId);
+          if (!outcome || outcome.detail.outcome === 'unknown') return true;
+          if (outcome.detail.outcome !== 'sent') definitiveFailure = true;
+        }
+        if (definitiveFailure) continue;
+        for (let partIndex = 0; partIndex < request.partCount; partIndex += 1) {
+          const row = request.parts.get(partIndex);
+          const outcome = row && outcomes.get(row.detail.attemptId);
           if (!outcome || outcome.detail.outcome === 'unknown') return true;
         }
       }

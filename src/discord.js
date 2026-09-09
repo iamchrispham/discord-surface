@@ -4,6 +4,8 @@ const { MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = requ
 const { conductorMarkerMatches } = require('./topic');
 
 const requireInstalled = require;
+const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
+const DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS = 5000;
 
 function recoveryError(kind, detail) {
   const error = new Error(detail);
@@ -565,6 +567,7 @@ class DiscordGateway {
     this.reconnectPromise = null;
     this.deferredHandoffRecoveryTimer = null;
     this.deferredHandoffRecoveryChannels = new Set();
+    this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.transportReady = false;
     this.fetchHistoryInjected = typeof fetchHistory === 'function';
     this.fetchHistory = fetchHistory || ((channel, options) => channel.messages?.fetch(options));
@@ -854,27 +857,46 @@ class DiscordGateway {
     if (this.stopping || typeof channelId !== 'string') return;
     this.deferredHandoffRecoveryChannels.add(channelId);
     if (this.deferredHandoffRecoveryTimer) return;
+    const delay = this.deferredHandoffRecoveryDelayMs;
+    this.deferredHandoffRecoveryDelayMs = Math.min(delay * 2, DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS);
     const timer = setTimeout(() => {
       if (this.deferredHandoffRecoveryTimer === timer) this.deferredHandoffRecoveryTimer = null;
       if (this.stopping || !this.deferredHandoffRecoveryChannels.size) return;
       const channels = [...this.deferredHandoffRecoveryChannels];
       this.deferredHandoffRecoveryChannels.clear();
+      const requeue = channelIds => {
+        for (const deferredChannelId of channelIds) this.scheduleDeferredHandoffRecovery(deferredChannelId);
+      };
       if (this.started && !this.transportReady) {
-        for (const deferredChannelId of channels) this.scheduleDeferredHandoffRecovery(deferredChannelId);
+        requeue(channels);
         return;
       }
       Promise.resolve().then(async () => {
-        const joinedRecovery = Boolean(this.recoveryPromise);
-        const recovery = await this.recoverTransport('ordinary-handoff');
         if (this.stopping) return;
-        if (joinedRecovery) {
-          for (const deferredChannelId of channels) this.scheduleDeferredHandoffRecovery(deferredChannelId);
+        if (this.recoveryPromise) {
+          requeue(channels);
           return;
         }
-        if (recovery.ready) await this.reconcilePending();
-        else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true });
-      }).catch(error => this.logger(`Deferred ordinary handoff recovery failed: ${error.message}`));
-    }, 100);
+        const recoverableChannels = new Set();
+        for (const deferredChannelId of channels) {
+          const binding = this.state.getBinding(deferredChannelId);
+          const recovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(deferredChannelId, binding);
+          if (recovery?.deferred) {
+            this.deferredHandoffRecoveryChannels.add(deferredChannelId);
+          } else if (binding?.active) {
+            recoverableChannels.add(deferredChannelId);
+          }
+        }
+        if (!recoverableChannels.size) return;
+        const recovery = await this.recoverTransport('ordinary-handoff', this.lifecycleEpoch, recoverableChannels);
+        if (recovery.ready) await this.reconcilePending(undefined, { channelIds: recoverableChannels });
+        else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true, channelIds: recoverableChannels });
+      }).catch(error => this.logger(`Deferred ordinary handoff recovery failed: ${error.message}`)).finally(() => {
+        if (this.stopping) return;
+        if (this.deferredHandoffRecoveryChannels.size) requeue([...this.deferredHandoffRecoveryChannels]);
+        else this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
+      });
+    }, delay);
     timer.unref?.();
     this.deferredHandoffRecoveryTimer = timer;
   }
@@ -999,9 +1021,11 @@ class DiscordGateway {
     return proof;
   }
 
-  async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch) {
+  async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
-    const bindings = this.state.listBindings().filter(binding => binding.active);
+    const selectedChannels = channelIds ? new Set(channelIds) : null;
+    const bindings = this.state.listBindings().filter(binding => binding.active &&
+      (!selectedChannels || selectedChannels.has(binding.channelId)));
     let failure = null;
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
@@ -1209,13 +1233,13 @@ class DiscordGateway {
     return failure || { ready: true, state: 'ready' };
   }
 
-  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch) {
+  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
     if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
     this.recoveryPromise = (async () => {
-      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch);
+      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch, channelIds);
       const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
       if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
@@ -1229,12 +1253,12 @@ class DiscordGateway {
     }
   }
 
-  async reconcilePending(before = new Date().toISOString(), { allowPaused = false, readyOnly = false } = {}) {
+  async reconcilePending(before = new Date().toISOString(), { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
     if (!this.ready && !allowPaused) throw new Error('Discord gateway is not ready for recovery');
     if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
-    this.recoveryPromise = this._reconcilePending(before, controller.signal, readyOnly || allowPaused);
+    this.recoveryPromise = this._reconcilePending(before, controller.signal, readyOnly || allowPaused, channelIds);
     try { return await this.recoveryPromise; }
     finally {
       this.recoveryPromise = null;
@@ -1243,9 +1267,11 @@ class DiscordGateway {
     }
   }
 
-  async _reconcilePending(before, signal, readyOnly = false) {
+  async _reconcilePending(before, signal, readyOnly = false, channelIds = null) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
-    const allowed = message => !readyOnly || this.state.getBinding(message.channelId)?.readiness === READINESS.READY;
+    const selectedChannels = channelIds ? new Set(channelIds) : null;
+    const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId)) &&
+      (!readyOnly || this.state.getBinding(message.channelId)?.readiness === READINESS.READY);
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const blockedOwners = new Set();
@@ -1311,6 +1337,7 @@ class DiscordGateway {
     if (this.deferredHandoffRecoveryTimer) clearTimeout(this.deferredHandoffRecoveryTimer);
     this.deferredHandoffRecoveryTimer = null;
     this.deferredHandoffRecoveryChannels.clear();
+    this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.stopPromise = (async () => {
       this.ready = false;
       this.recoveryController?.abort();
