@@ -120,6 +120,16 @@ test('ordinary Claude accepts single or equal transcript IDs and rejects conflic
   assert.throws(() => validateClaudeSessionIdentity(CLAUDE, lateConflict), /identity is ambiguous/);
 });
 
+test('oversized Claude metadata records fail closed', t => {
+  const f = fixture(t, { bind: false });
+  const file = path.join(f.dir, 'oversized-conflict.jsonl');
+  fs.writeFileSync(file, [
+    JSON.stringify({ cwd: f.dir, entrypoint: 'cli', version: '1.0.0', sessionId: OTHER, filler: 'x'.repeat(1024 * 1024) }),
+    JSON.stringify({ cwd: f.dir, entrypoint: 'cli', version: '1.0.0', sessionId: CLAUDE })
+  ].join('\n') + '\n', { mode: 0o600 });
+  assert.throws(() => validateClaudeSessionIdentity(CLAUDE, file), /record is too large/);
+});
+
 test('ordinary Claude selection and same-owner decision preserve channel custody', () => {
   const channels = [
     { id: '123', guildId: 'guild', name: 'ops', messageCapable: true },

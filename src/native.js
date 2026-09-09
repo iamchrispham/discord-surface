@@ -351,27 +351,21 @@ function* readClaudeSessionMetadata(file) {
     const chunk = Buffer.allocUnsafe(TRANSCRIPT_BLOCK_BYTES);
     let recordParts = [];
     let recordLength = 0;
-    let oversized = false;
     let position = 0;
     const parseLine = line => {
       if (!line.trim()) return null;
       try { return JSON.parse(line); } catch { return null; }
     };
     const consumeRecord = (part, complete) => {
-      if (!oversized) {
-        if (recordLength + part.length > CLAUDE_METADATA_RECORD_MAX_BYTES) {
-          oversized = true;
-          recordParts = [];
-        } else if (part.length) {
-          recordParts.push(Buffer.from(part));
-        }
+      if (recordLength + part.length > CLAUDE_METADATA_RECORD_MAX_BYTES) {
+        throw new Error('Claude transcript metadata record is too large');
       }
-      recordLength = Math.min(CLAUDE_METADATA_RECORD_MAX_BYTES + 1, recordLength + part.length);
+      if (part.length) recordParts.push(Buffer.from(part));
+      recordLength += part.length;
       if (!complete) return null;
-      const row = oversized ? null : parseLine(Buffer.concat(recordParts, recordLength).toString('utf8'));
+      const row = parseLine(Buffer.concat(recordParts, recordLength).toString('utf8'));
       recordParts = [];
       recordLength = 0;
-      oversized = false;
       return row;
     };
     while (true) {
