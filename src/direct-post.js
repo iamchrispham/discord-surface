@@ -143,8 +143,9 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
     const address = canonicalAddress(binding);
     agentTarget = canonicalAddress(agentTarget);
-    const wire = encodeAgentMessage({ id: explicitRequestId, kind: agentKind, source: address, target: agentTarget, replyTo: agentReplyTo, text: source.text }, token);
-    source = { ...source, textHash: hash(wire), parts: [wire] };
+    const packet = { id: explicitRequestId, kind: agentKind, source: address, target: agentTarget, replyTo: agentReplyTo, text: source.text };
+    const wire = encodeAgentMessage(packet, token);
+    source = { ...source, textHash: hash(JSON.stringify(packet)), parts: [wire] };
   }
   const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, replyTarget);
   state.recoverDirectPostReceipts();

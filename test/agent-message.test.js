@@ -106,6 +106,7 @@ test('explicit sender posts one authenticated packet to recipient and retains so
     assert.equal(state.acceptDiscordMessage({ ...inbound, id: '5001' }, { agentToken: token }).accepted, false);
 
     assert.equal((await runDirectPost(input)).duplicate, true);
+    assert.equal((await runDirectPost({ ...input, token: 'rotated-test-credential' })).duplicate, true);
     assert.equal((await runDirectPost({ ...input, agentTarget: Object.fromEntries(Object.entries(destination).reverse()) })).duplicate, true);
     assert.equal(requests.length, 1);
     assert.equal(state.directPostRows('send-1')[0].detail.channelId, source.channelId);
