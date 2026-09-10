@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/topic.ts", "src/attachments.ts", "src/ordinary-codex.ts"]
+  "include": ["src/topic.ts", "src/attachments.ts", "src/ordinary-codex.ts", "src/ordinary-bind/channel-resolution.ts"]
 }
