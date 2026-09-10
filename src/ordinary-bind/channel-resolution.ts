@@ -23,6 +23,11 @@ function hasValues(value: unknown): value is DiscordChannelCollectionLike {
   return typeof (value as { values?: unknown } | null | undefined)?.values === 'function';
 }
 
+function isDiscordChannelLike(value: unknown): value is DiscordChannelLike {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) && !hasValues(value)
+    && typeof (value as { id?: unknown }).id === 'string';
+}
+
 export async function resolveDiscordChannel(
   guild: DiscordGuildLike,
   selection: string,
@@ -32,7 +37,8 @@ export async function resolveDiscordChannel(
   let fetchedChannels: ExistingDiscordChannel[];
   let fetchedChannelObjects: DiscordChannelLike[];
   if (mentionId) {
-    const channel = await guild.channels.fetch(mentionId) as DiscordChannelLike | null;
+    const fetched = await guild.channels.fetch(mentionId);
+    const channel = isDiscordChannelLike(fetched) ? fetched : null;
     fetchedChannelObjects = channel ? [channel] : [];
     fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
       messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];

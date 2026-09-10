@@ -32,6 +32,19 @@ test('CommonJS facade exposes emitted channel resolution and preserves fetched o
   assert.equal(mentioned.discordChannel, fetched);
 });
 
+test('narrows collection-like direct fetch results before channel access', async () => {
+  const directCollection = {
+    id: '123',
+    guildId: 'guild',
+    name: 'ops',
+    isTextBased: () => true,
+    values: function* values() { yield channel('123', 'guild', 'ops'); }
+  };
+  await assert.rejects(
+    () => emitted.resolveDiscordChannel(guildWith(directCollection, []), '123', 'guild')
+  );
+});
+
 test('resolves names from array and Collection-like fetch results', async () => {
   const ops = channel('123', 'guild', 'ops');
   const dev = channel('456', 'guild', 'dev');
