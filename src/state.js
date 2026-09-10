@@ -1,3 +1,4 @@
+const { PREFIX: AGENT_PREFIX, decodeAgentMessage } = require('./agent-message');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -1801,7 +1802,7 @@ class SurfaceState {
     return intakeHandlers.reconcileIntake(this, channelId, expectedBinding);
   }
 
-  acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null } = {}) {
+  acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null, agentToken = null } = {}) {
     const config = this.requireConfig();
     if (coverageId !== null) assertText(coverageId, 'coverageId', 128);
     if (typeof event?.channelId === 'string') this.recoverInterruptedOrdinaryHandoffIntake(event.channelId, expectedBinding);
@@ -1838,11 +1839,20 @@ class SurfaceState {
       }
       const intakeCutoff = this.getIntakeWatermark(event.channelId)?.recovered_through_id || null;
       this.upsertIntakeWatermark(event, ready, coverageId);
-      let reason = null;
+      let agent = null;
+      let invalidAgent = false;
+      if (event.isBot && event.content.startsWith(AGENT_PREFIX)) {
+        try {
+          const target = binding && Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation'].map(key => [key, binding[key]]));
+          agent = decodeAgentMessage(event.content, agentToken, target);
+          if (attachments.length) throw new BindingError('agent attachments are not supported');
+        } catch { invalidAgent = true; }
+      }
+      let reason = invalidAgent ? 'invalid-event' : null;
       if (typeof event.content !== 'string' || event.content.length > 10000 || attachments === null || (event.content.length === 0 && attachments?.length === 0)) reason = 'invalid-event';
-      else if (directPost) reason = 'automatic-publication';
-      else if (event.isBot) reason = 'bot-source';
-      else if (event.guildId !== config.guildId || event.authorId !== config.operatorId) reason = 'unauthorized-sender';
+      else if (!agent && directPost) reason = 'automatic-publication';
+      else if (!agent && event.isBot) reason = 'bot-source';
+      else if (event.guildId !== config.guildId || (!agent && event.authorId !== config.operatorId)) reason = 'unauthorized-sender';
       if (!reason && (!binding || !binding.active || binding.guildId !== event.guildId)) reason = 'unknown-binding';
       if (reason) {
         this.receipt(null, 'intake-rejected', { discordId: event.id, reason, ready });
@@ -1854,6 +1864,15 @@ class SurfaceState {
       if (cutoffReason) {
         this.receipt(null, 'intake-rejected', { discordId: event.id, reason: cutoffReason, ready });
         return this.reject(cutoffReason);
+      }
+      if (agent && this.db.prepare(`SELECT 1 FROM receipts WHERE kind='agent-message'
+        AND json_extract(detail, '$.packet.id')=?
+        AND json_extract(detail, '$.packet.source.provider')=?
+        AND json_extract(detail, '$.packet.source.nativeId')=?
+        AND json_extract(detail, '$.packet.source.generation')=? LIMIT 1`)
+        .get(agent.id, agent.source.provider, agent.source.nativeId, agent.source.generation)) {
+        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'agent-message-duplicate', ready });
+        return this.reject('agent-message-duplicate');
       }
       if (this.failNextIntakeFlag) {
         this.failNextIntakeFlag = false;
@@ -1870,6 +1889,7 @@ class SurfaceState {
         this.db.prepare('UPDATE intake_watermarks SET last_accepted_id=?, updated_at=? WHERE channel_id=?')
           .run(event.id, timestamp, event.channelId);
       }
+      if (agent) this.receipt(event.id, 'agent-message', { packet: agent, authorId: event.authorId });
       this.receipt(event.id, 'accepted', { channelId: event.channelId, conductorId: binding.conductorId, generation: binding.generation, readiness: ready ? 'ready' : 'pending' });
       if (!ready) this.receipt(event.id, 'intake-held-not-ready', { channelId: event.channelId });
       return { accepted: true, message: this.getMessage(event.id) };
@@ -1951,7 +1971,7 @@ class SurfaceState {
     const identity = Boolean(binding && binding.active && binding.guildId === message.guildId &&
       binding.generation === message.generation && binding.nativeId === message.nativeId && binding.provider === message.provider);
     const current = Boolean(identity && binding.guildId === config.guildId &&
-      message.guildId === config.guildId && message.authorId === config.operatorId &&
+      message.guildId === config.guildId && (message.authorId === config.operatorId || this.getAgentMessage(message.id)?.authorId === message.authorId) &&
       binding.generation === message.generation && binding.nativeId === message.nativeId && binding.provider === message.provider);
     return { config, binding, identity, current };
   }
@@ -2501,9 +2521,18 @@ class SurfaceState {
     });
   }
 
+  getAgentMessage(messageId) {
+    const row = this.db.prepare("SELECT detail FROM receipts WHERE discord_id=? AND kind='agent-message' ORDER BY id LIMIT 1").get(messageId);
+    return row ? parseJson(row.detail, null) : null;
+  }
+
   getMessage(messageId) {
     const message = rowMessage(this.db.prepare('SELECT * FROM messages WHERE discord_id=?').get(messageId));
-    if (message) message.replyParts = this.listReplyParts(messageId);
+    if (message) {
+      message.replyParts = this.listReplyParts(messageId);
+      const agent = message.content.startsWith(AGENT_PREFIX) ? this.getAgentMessage(messageId) : null;
+      if (agent) message.agentMessage = agent.packet;
+    }
     return message;
   }
 

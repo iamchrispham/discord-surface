@@ -1,3 +1,4 @@
+const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const fs = require('node:fs');
 const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
@@ -223,7 +224,7 @@ function transportReceiptText(message, attempt) {
   return 'Receipt: saved. Delivery was paused when this receipt was prepared.';
 }
 
-function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {} }) {
+function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {}, agentCredential = () => null }) {
   const receiptWork = new Set();
   const nativeWork = new Map();
   const ownerQueues = new Map();
@@ -652,7 +653,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleMessage(message, signal, expectedBinding = null, onIntake = null) {
-    const intake = state.acceptDiscordMessage(eventToInput(message), { expectedBinding });
+    const intake = state.acceptDiscordMessage(eventToInput(message), { expectedBinding, agentToken: message.author?.bot && message.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null });
     if (!intake.stale) onIntake?.(message, intake);
     if (!intake.accepted) return intake;
     launchTransportReceipt(message);
@@ -660,7 +661,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false) {
-    const intake = await state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding });
+    const intake = await state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding, agentToken: message.author?.bot && message.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null });
     if (emitReceipt && intake.accepted) launchTransportReceipt(message);
     return intake;
   }
@@ -771,6 +772,7 @@ class DiscordGateway {
     this.consumer = createSurfaceConsumer({
       state,
       providers: this.providers,
+      agentCredential: () => this.discordToken,
       sendReply: (message, reply) => this.sendReply(message, reply),
       prepareReply: (messageId, signal) => this.prepareReply(messageId, signal),
       sendTransportReceipt: (message, receipt) => this.sendTransportReceipt(message, receipt),

@@ -1,3 +1,4 @@
+const { encodeAgentMessage, KINDS } = require('./agent-message');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -119,12 +120,18 @@ function outcomeFor(error) {
 }
 
 async function runDirectPost({ state, token, nativeId, generation, channelId = null, provider = null, textFile,
-  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs, ordinary = false }) {
+  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs, ordinary = false, agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null }) {
   const binding = resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
   const operatorId = state.requireConfig().operatorId;
-  const source = readTextFile(textFile);
+  let source = readTextFile(textFile);
   const replyTarget = inReplyToValue(inReplyTo);
-  const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId });
+  const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: agentTarget !== null });
+  if (agentTarget !== null) {
+    if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
+    const address = Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation'].map(key => [key, binding[key]]));
+    const wire = encodeAgentMessage({ id: explicitRequestId, kind: agentKind, source: address, target: agentTarget, replyTo: agentReplyTo, text: source.text }, token);
+    source = { ...source, textHash: hash(wire), parts: [wire] };
+  }
   const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, replyTarget);
   state.recoverDirectPostReceipts();
   const parts = [];
@@ -136,6 +143,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       break;
     }
     const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex);
+    if (agentTarget !== null) meta.deliveryChannelId = agentTarget.channelId;
     let claim;
     try { claim = state.beginDirectPostPart(meta); }
     catch (error) {
@@ -155,7 +163,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       break;
     }
     try {
-      const sent = await sendDiscordMessage({ token, channelId: binding.channelId, content: source.parts[partIndex], nonce: claim.nonce,
+      const sent = await sendDiscordMessage({ token, channelId: agentTarget?.channelId || binding.channelId, content: source.parts[partIndex], nonce: claim.nonce,
         messageReference: replyTarget === null ? null : { message_id: replyTarget, channel_id: binding.channelId, fail_if_not_exists: true },
         signal, fetchImpl, timeoutMs });
       const outcome = state.recordDirectPostOutcome(requestId, claim.attemptId, 'sent', { messageId: String(sent.id), status: 200 });
@@ -170,7 +178,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   }
   const status = parts.every(part => part.status === 'sent') ? 'sent' : parts.find(part => part.status !== 'sent')?.status || 'not_sent';
   const duplicate = !claimedAny && parts.length > 0 && parts.every(part => part.status === 'sent');
-  return { requestId, dedupeKey: requestId, inReplyTo: replyTarget, channelId: binding.channelId, provider: binding.provider,
+  return { requestId, dedupeKey: requestId, inReplyTo: replyTarget, channelId: agentTarget?.channelId || binding.channelId, provider: binding.provider,
     nativeId: binding.nativeId, generation: binding.generation, status, state: status, recorded, duplicate,
     messageIds: parts.filter(part => part.messageId).map(part => part.messageId), parts };
 }

@@ -76,7 +76,7 @@ function createDirectPostHandlers({
       }
       return state.transaction(() => {
         const rows = state.directPostRows(meta.requestId);
-        const identityKeys = ['textHash', 'inReplyTo', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount'];
+        const identityKeys = ['textHash', 'inReplyTo', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount', 'deliveryChannelId'];
         for (const row of rows) {
           for (const key of identityKeys) {
             if (row.detail[key] !== meta[key]) throw new BindingError('direct post request identity conflicts with existing custody');

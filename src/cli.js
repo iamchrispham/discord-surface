@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+const { validAddress } = require('./agent-message');
 
 const fs = require('node:fs');
 const { resolveDedupeKey, runDirectPost } = require('./direct-post');
@@ -1574,6 +1575,20 @@ function claudeReply(args) {
   } finally { state.close(); }
 }
 
+async function agentSend(args) {
+  const provider = required(args, 'provider');
+  if (!['codex', 'claude'].includes(provider)) throw new Error('invalid agent provider');
+  const { state } = openState(args);
+  let ordinary;
+  try { ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id'))); }
+  finally { state.close(); }
+  const targetPath = required(args, 'target-file');
+  if (fs.statSync(targetPath).size > 2048) throw new Error('agent target file is too large');
+  const agentTarget = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
+  if (!validAddress(agentTarget)) throw new Error('agent target file must contain a complete binding address');
+  return directPost(args, provider, ordinary, { agentTarget });
+}
+
 async function directPost(args, provider = null, ordinary = false, dependencies = {}) {
   const { state } = openState(args);
   const controller = new AbortController();
@@ -1616,6 +1631,9 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       channelId,
       provider,
       textFile: required(args, 'text-file'),
+      agentTarget: dependencies.agentTarget ?? null,
+      agentKind: args['agent-reply-to'] ? 'result' : 'request',
+      agentReplyTo: args['agent-reply-to'] || null,
       dedupeKey,
       inReplyTo: args['in-reply-to'] === undefined ? null : args['in-reply-to'],
       signal: controller.signal,
@@ -1771,6 +1789,7 @@ async function main() {
       } finally { state.close(); }
     }
     case 'claude-reply': return claudeReply(args);
+    case 'agent-send': return agentSend(args);
     case 'post': return directPost(args);
     case 'ordinary-post': return directPost(args, 'codex', true);
     case 'ordinary-claude-post': return directPost(args, 'claude', true);
@@ -1778,7 +1797,7 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
   }
 }
 
