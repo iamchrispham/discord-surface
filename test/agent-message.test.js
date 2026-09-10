@@ -98,6 +98,7 @@ test('explicit sender posts one authenticated packet to recipient and retains so
     const decoded = decodeAgentMessage(requests[0].body.content, token, destination);
     assert.equal(decoded.source.nativeId, source.nativeId);
     assert.equal(decoded.text, packet.text);
+    assert.equal(state.hasIntakeEvidence('5000'), false);
     const inbound = { id: '5000', guildId: destination.guildId, channelId: destination.channelId,
       authorId: '901', isBot: true, content: requests[0].body.content, attachments: [] };
     assert.equal(state.acceptDiscordMessage(inbound, { agentToken: token }).accepted, true);
@@ -115,27 +116,32 @@ test('explicit sender posts one authenticated packet to recipient and retains so
 
 const { createSurfaceConsumer } = require('../src/discord');
 
-test('isolated senders cannot reuse a nonce for different destinations', async () => {
+test('agent nonces include source and destination identity', async () => {
   const nonces = [];
-  for (const channelId of ['102', '103']) {
+  const cases = [
+    { source, target: { ...target, channelId: '102' } },
+    { source, target: { ...target, channelId: '103' } },
+    { source: { ...source, channelId: '104' }, target: { ...target, channelId: '102' } }
+  ];
+  for (const testCase of cases) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-nonce-'));
     const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
     try {
-      state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-      state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+      state.setConfig({ operatorId: '900', guildId: testCase.source.guildId, secretFile: path.join(dir, 'secret') });
+      state.bind({ ...testCase.source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
       const textFile = path.join(dir, 'task.txt');
       fs.writeFileSync(textFile, packet.text);
-      const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: 1,
-        channelId: source.channelId, provider: source.provider, textFile, dedupeKey: 'same-key',
-        agentTarget: { ...target, channelId }, fetchImpl: async (_url, options) => {
+      const result = await runDirectPost({ state, token, nativeId: testCase.source.nativeId, generation: testCase.source.generation,
+        channelId: testCase.source.channelId, provider: testCase.source.provider, textFile, dedupeKey: 'same-key',
+        agentTarget: testCase.target, fetchImpl: async (_url, options) => {
           nonces.push(JSON.parse(options.body).nonce);
           return { ok: true, status: 200, json: async () => ({ id: '5000' }) };
         } });
       assert.equal(result.status, 'sent');
     } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   }
-  assert.equal(nonces.length, 2);
-  assert.notEqual(nonces[0], nonces[1]);
+  assert.equal(nonces.length, cases.length);
+  assert.equal(new Set(nonces).size, cases.length);
 });
 
 test('history consumer verifies credential before durable intake', async () => {

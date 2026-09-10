@@ -98,14 +98,14 @@ function canonicalAddress(address) {
   return Object.fromEntries(ADDRESS_KEYS.map(key => [key, address[key]]));
 }
 
-function addressIdentity(address) {
-  return JSON.stringify(canonicalAddress(address));
+function agentNonceScope(source, destination, requestId, partIndex) {
+  return hash(['agent-post-v1', canonicalAddress(source), canonicalAddress(destination), requestId, partIndex]);
 }
 
 function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHash, parts, partIndex, agentTarget = null) {
   const nonceScope = agentTarget === null
     ? `direct:${requestId}:${partIndex}`
-    : `agent:${addressIdentity(binding)}:${addressIdentity(agentTarget)}:${requestId}:${partIndex}`;
+    : agentNonceScope(binding, agentTarget, requestId, partIndex);
   return {
     requestId,
     inReplyTo,
