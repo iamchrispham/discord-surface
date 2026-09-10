@@ -1,6 +1,6 @@
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const fs = require('node:fs');
-const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
+const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
@@ -247,17 +247,31 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const payload = {
       ...authorized.attempt,
       content: transportReceiptText(message, authorized.attempt),
+      reaction: authorized.attempt.readiness === READINESS.READY ? REACTION.SAVED : null,
       nonce: authorized.nonce,
       enforceNonce: true,
       allowedMentions: { parse: [], repliedUser: false },
       reply: { messageReference: message.id, failIfNotExists: false }
     };
-    const sender = sendTransportReceipt || ((source, receipt) => source.channel?.send(receipt));
+    const sender = sendTransportReceipt || (async (source, receipt) => {
+      if (!receipt.reaction) return source.channel?.send(receipt);
+      let target = source;
+      if (typeof target.react !== 'function') {
+        target = await source.channel?.messages?.fetch?.(source.id);
+      }
+      if (typeof target?.react !== 'function') {
+        throw new Error('Discord source message does not support reactions');
+      }
+      await target.react(receipt.reaction);
+      return { messageId: source.id };
+    });
     try {
       const sent = await sender(message, payload);
       const receiptMessageId = sent?.id || sent?.messageId;
       if (!receiptMessageId) throw new Error('Discord did not return a transport receipt message id');
-      return state.recordTransportReceiptOutcome(message.id, 'sent', { receiptMessageId });
+      return state.recordTransportReceiptOutcome(message.id, 'sent', payload.reaction
+        ? { reaction: payload.reaction, targetMessageId: message.id }
+        : { receiptMessageId });
     } catch (error) {
       return state.recordTransportReceiptOutcome(message.id, classifyTransportReceiptError(error), { error: String(error?.message || error).slice(0, 200) });
     }
