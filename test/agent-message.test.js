@@ -105,6 +105,7 @@ test('explicit sender posts one authenticated packet to recipient and retains so
     assert.equal(state.acceptDiscordMessage({ ...inbound, id: '5001' }, { agentToken: token }).accepted, false);
 
     assert.equal((await runDirectPost(input)).duplicate, true);
+    assert.equal((await runDirectPost({ ...input, agentTarget: Object.fromEntries(Object.entries(destination).reverse()) })).duplicate, true);
     assert.equal(requests.length, 1);
     assert.equal(state.directPostRows('send-1')[0].detail.channelId, source.channelId);
     await assert.rejects(runDirectPost({ ...input, agentTarget: { ...target, generation: 3 } }), /identity conflicts/);
@@ -113,6 +114,29 @@ test('explicit sender posts one authenticated packet to recipient and retains so
 });
 
 const { createSurfaceConsumer } = require('../src/discord');
+
+test('isolated senders cannot reuse a nonce for different destinations', async () => {
+  const nonces = [];
+  for (const channelId of ['102', '103']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-nonce-'));
+    const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+    try {
+      state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+      state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+      const textFile = path.join(dir, 'task.txt');
+      fs.writeFileSync(textFile, packet.text);
+      const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: 1,
+        channelId: source.channelId, provider: source.provider, textFile, dedupeKey: 'same-key',
+        agentTarget: { ...target, channelId }, fetchImpl: async (_url, options) => {
+          nonces.push(JSON.parse(options.body).nonce);
+          return { ok: true, status: 200, json: async () => ({ id: '5000' }) };
+        } });
+      assert.equal(result.status, 'sent');
+    } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  assert.equal(nonces.length, 2);
+  assert.notEqual(nonces[0], nonces[1]);
+});
 
 test('history consumer verifies credential before durable intake', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-history-'));
