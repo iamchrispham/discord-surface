@@ -92,7 +92,20 @@ function requestIdFor(binding, _operatorId, sourcePath, textHash, explicitReques
   return hash(identity);
 }
 
-function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHash, parts, partIndex) {
+const ADDRESS_KEYS = Object.freeze(['guildId', 'channelId', 'provider', 'nativeId', 'generation']);
+
+function canonicalAddress(address) {
+  return Object.fromEntries(ADDRESS_KEYS.map(key => [key, address[key]]));
+}
+
+function addressIdentity(address) {
+  return JSON.stringify(canonicalAddress(address));
+}
+
+function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHash, parts, partIndex, agentTarget = null) {
+  const nonceScope = agentTarget === null
+    ? `direct:${requestId}:${partIndex}`
+    : `agent:${addressIdentity(binding)}:${addressIdentity(agentTarget)}:${requestId}:${partIndex}`;
   return {
     requestId,
     inReplyTo,
@@ -110,7 +123,7 @@ function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHas
     repoKey: binding.repoKey,
     partIndex,
     partCount: parts.length,
-    nonce: discordNonce(`direct:${requestId}:${partIndex}`),
+    nonce: discordNonce(nonceScope),
     binding
   };
 }
@@ -128,7 +141,8 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: agentTarget !== null });
   if (agentTarget !== null) {
     if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
-    const address = Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation'].map(key => [key, binding[key]]));
+    const address = canonicalAddress(binding);
+    agentTarget = canonicalAddress(agentTarget);
     const wire = encodeAgentMessage({ id: explicitRequestId, kind: agentKind, source: address, target: agentTarget, replyTo: agentReplyTo, text: source.text }, token);
     source = { ...source, textHash: hash(wire), parts: [wire] };
   }
@@ -142,7 +156,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
       break;
     }
-    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex);
+    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex, agentTarget);
     if (agentTarget !== null) meta.deliveryChannelId = agentTarget.channelId;
     let claim;
     try { claim = state.beginDirectPostPart(meta); }
