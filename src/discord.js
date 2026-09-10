@@ -252,7 +252,18 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       allowedMentions: { parse: [], repliedUser: false },
       reply: { messageReference: message.id, failIfNotExists: false }
     };
-    const sender = sendTransportReceipt || ((source, receipt) => source.channel?.send(receipt));
+    const sender = sendTransportReceipt || (async (source, receipt) => {
+      if (!receipt.reaction) return source.channel?.send(receipt);
+      let target = source;
+      if (typeof target.react !== 'function') {
+        target = await source.channel?.messages?.fetch?.(source.id);
+      }
+      if (typeof target?.react !== 'function') {
+        throw new Error('Discord source message does not support reactions');
+      }
+      await target.react(receipt.reaction);
+      return { messageId: source.id };
+    });
     try {
       const sent = await sender(message, payload);
       const receiptMessageId = sent?.id || sent?.messageId;
