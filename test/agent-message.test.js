@@ -188,9 +188,16 @@ test('agent sender retries after a destination lookup failure classified as unse
     fs.writeFileSync(textFile, packet.text);
     const input = { state, token, nativeId: source.nativeId, generation: source.generation, channelId: source.channelId,
       provider: source.provider, textFile, dedupeKey: 'lookup-retry', agentTarget: issueAgentAddress(target, token) };
-    const first = await runDirectPost({ ...input, fetchImpl: async () => { throw new Error('temporary lookup outage'); } });
+    let attemptsDuringLookup = null;
+    const first = await runDirectPost({ ...input, fetchImpl: async (_url, options) => {
+      if (options.method === 'GET') attemptsDuringLookup = state.directPostRows('lookup-retry').filter(row => row.kind === 'direct-post-attempt').length;
+      throw new Error('temporary lookup outage');
+    } });
     assert.equal(first.status, 'not_sent');
-    assert.equal(state.directPostRows('lookup-retry').find(row => row.kind === 'direct-post-outcome').detail.outcome, 'not_sent');
+    assert.equal(attemptsDuringLookup, 0);
+    const firstRows = state.directPostRows('lookup-retry');
+    assert.equal(firstRows.filter(row => row.kind === 'direct-post-attempt').length, 0);
+    assert.equal(firstRows.find(row => row.kind === 'direct-post-outcome').detail.outcome, 'not_sent');
     const second = await runDirectPost({ ...input, fetchImpl: async (url, options) => ({ ok: true, status: 200, json: async () => options.method === 'GET'
       ? { id: target.channelId, guild_id: target.guildId } : { id: '5200' } }) });
     assert.equal(second.status, 'sent');

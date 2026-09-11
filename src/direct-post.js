@@ -184,11 +184,49 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     }
     const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex, agentTarget);
     if (agentTarget !== null) meta.deliveryChannelId = agentTarget.channelId;
+    if (agentTarget !== null) {
+      let existing;
+      try { existing = state.inspectDirectPostPart(meta); }
+      catch (error) {
+        if (!(error instanceof StaleGenerationError)) throw error;
+        parts.push({ index: partIndex, status: 'stale', messageId: null });
+        break;
+      }
+      if (existing) {
+        parts.push({ index: partIndex, status: existing.status, messageId: existing.outcome?.messageId || null });
+        if (existing.status !== 'sent') break;
+        continue;
+      }
+      try {
+        await verifyAgentDestination({ token, agentTarget, fetchImpl, signal, timeoutMs });
+      } catch (error) {
+        const preflight = state.recordDirectPostPreflight(meta, outcomeFor(error), {
+          status: error.status || null, error: String(error.message || error).slice(0, 300)
+        });
+        parts.push({ index: partIndex, status: preflight.outcome, messageId: null });
+        break;
+      }
+      if (!state.directPostBindingCurrent(binding, operatorId)) {
+        const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
+        parts.push({ index: partIndex, status: stale.outcome, messageId: null });
+        break;
+      }
+      if (signal?.aborted) {
+        const stopped = state.recordDirectPostPreflight(meta, 'not_sent', { reason: 'direct post stopped before custody' });
+        parts.push({ index: partIndex, status: stopped.outcome, messageId: null });
+        break;
+      }
+    }
     let claim;
     try { claim = state.beginDirectPostPart(meta); }
     catch (error) {
       if (!(error instanceof StaleGenerationError)) throw error;
-      parts.push({ index: partIndex, status: 'stale', messageId: null });
+      if (agentTarget !== null) {
+        const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed before custody' });
+        parts.push({ index: partIndex, status: stale.outcome, messageId: null });
+      } else {
+        parts.push({ index: partIndex, status: 'stale', messageId: null });
+      }
       break;
     }
     if (!claim.claimed) {
@@ -203,7 +241,6 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       break;
     }
     try {
-      if (agentTarget !== null) await verifyAgentDestination({ token, agentTarget, fetchImpl, signal, timeoutMs });
       if (!state.directPostBindingCurrent(binding, operatorId)) {
         const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before send' });
         parts.push({ index: partIndex, status: stale.outcome });

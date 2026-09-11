@@ -2422,6 +2422,14 @@ class SurfaceState {
     return directPostHandlers.beginDirectPostPart(this, meta);
   }
 
+  inspectDirectPostPart(meta) {
+    return directPostHandlers.inspectDirectPostPart(this, meta);
+  }
+
+  recordDirectPostPreflight(meta, outcome, detail = {}) {
+    return directPostHandlers.recordDirectPostPreflight(this, meta, outcome, detail);
+  }
+
   recordDirectPostOutcome(requestId, attemptId, outcome, detail = {}) {
     return directPostHandlers.recordDirectPostOutcome(this, requestId, attemptId, outcome, detail);
   }

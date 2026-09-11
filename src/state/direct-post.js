@@ -33,6 +33,37 @@ function createDirectPostHandlers({
   parseJson,
   now
 }) {
+  const identityKeys = ['textHash', 'inReplyTo', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount', 'deliveryChannelId'];
+
+  function validateMeta(meta) {
+    if (!meta || typeof meta !== 'object') throw new BindingError('direct post metadata is required');
+    assertText(meta.requestId, 'requestId', 256);
+    assertText(meta.attemptId, 'attemptId', 128);
+    if (!Number.isInteger(meta.partIndex) || meta.partIndex < 0 || !Number.isInteger(meta.partCount) || meta.partCount < 1 || meta.partIndex >= meta.partCount) {
+      throw new BindingError('direct post part index is invalid');
+    }
+  }
+
+  function inspectPart(state, meta) {
+    const rows = state.directPostRows(meta.requestId);
+    for (const row of rows) {
+      for (const key of identityKeys) {
+        if (row.detail[key] !== meta[key]) throw new BindingError('direct post request identity conflicts with existing custody');
+      }
+    }
+    if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
+    const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
+    const outcomes = new Map(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId).map(row => [row.detail.attemptId, row]));
+    const latest = attempts.at(-1);
+    if (!latest) return null;
+    const outcome = outcomes.get(latest.detail.attemptId);
+    if (!outcome) return { claimed: false, status: 'in_flight', attemptId: latest.detail.attemptId, nonce: latest.detail.nonce };
+    const status = outcome.detail.outcome;
+    if (status === 'sent' || status === 'unknown') return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
+    if (!['not_sent', 'rejected', 'rate_limited', 'stale'].includes(status)) return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
+    return null;
+  }
+
   return {
     hasUnresolvedOrdinaryPost(state, channelId) {
       const rows = state.directPostRows(null, channelId);
@@ -67,32 +98,33 @@ function createDirectPostHandlers({
       return false;
     },
 
-    beginDirectPostPart(state, meta) {
-      if (!meta || typeof meta !== 'object') throw new BindingError('direct post metadata is required');
-      assertText(meta.requestId, 'requestId', 256);
-      assertText(meta.attemptId, 'attemptId', 128);
-      if (!Number.isInteger(meta.partIndex) || meta.partIndex < 0 || !Number.isInteger(meta.partCount) || meta.partCount < 1 || meta.partIndex >= meta.partCount) {
-        throw new BindingError('direct post part index is invalid');
-      }
+    inspectDirectPostPart(state, meta) {
+      validateMeta(meta);
+      return state.transaction(() => inspectPart(state, meta));
+    },
+
+    recordDirectPostPreflight(state, meta, outcome, detail = {}) {
+      validateMeta(meta);
+      if (!DIRECT_POST_OUTCOMES.includes(outcome)) throw new BindingError('invalid direct post outcome');
       return state.transaction(() => {
         const rows = state.directPostRows(meta.requestId);
-        const identityKeys = ['textHash', 'inReplyTo', 'channelId', 'guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'repoKey', 'partCount', 'deliveryChannelId'];
         for (const row of rows) {
           for (const key of identityKeys) {
             if (row.detail[key] !== meta[key]) throw new BindingError('direct post request identity conflicts with existing custody');
           }
         }
-        if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
-        const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
-        const outcomes = new Map(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId).map(row => [row.detail.attemptId, row]));
-        const latest = attempts.at(-1);
-        if (latest) {
-          const outcome = outcomes.get(latest.detail.attemptId);
-          if (!outcome) return { claimed: false, status: 'in_flight', attemptId: latest.detail.attemptId, nonce: latest.detail.nonce };
-          const status = outcome.detail.outcome;
-          if (status === 'sent' || status === 'unknown') return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
-          if (!['not_sent', 'rejected', 'rate_limited', 'stale'].includes(status)) return { claimed: false, status, attemptId: latest.detail.attemptId, nonce: latest.detail.nonce, outcome: outcome.detail };
-        }
+        const { attemptId: _attemptId, ...preflightMeta } = meta;
+        const next = { journal: 'direct-post-v1', ...preflightMeta, ...detail, phase: 'preflight', outcome };
+        state.receipt(null, DIRECT_POST_OUTCOME, next);
+        return next;
+      });
+    },
+
+    beginDirectPostPart(state, meta) {
+      validateMeta(meta);
+      return state.transaction(() => {
+        const existing = inspectPart(state, meta);
+        if (existing) return existing;
         const ownerIdentity = state.directPostOwnerIdentity(process.pid);
         state.receipt(null, DIRECT_POST_ATTEMPT, {
           journal: 'direct-post-v1', ...meta, ...ownerIdentity, status: 'attempted'
