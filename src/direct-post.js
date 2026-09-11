@@ -106,16 +106,20 @@ async function verifyAgentDestination({ token, agentTarget, fetchImpl, signal, t
 }
 
 function resolveAgentReplyRequest(state, replyTo, source, target = null) {
-  const matches = state.listReceipts()
+  const candidates = state.listReceipts()
     .filter(row => row.kind === 'agent-message')
     .map(row => {
-      try { return JSON.parse(row.detail)?.packet || null; }
-      catch { return null; }
+      try {
+        const detail = JSON.parse(row.detail);
+        const packet = detail?.packet || null;
+        return packet ? { packet, discordId: row.discord_id } : null;
+      } catch { return null; }
     })
-    .filter(packet => packet?.id === replyTo && packet.kind === KINDS.REQUEST &&
-      (target === null || sameAddress(packet.source, target)) && sameAddress(packet.target, source));
+    .filter(candidate => candidate?.packet.kind === KINDS.REQUEST &&
+      (target === null || sameAddress(candidate.packet.source, target)) && sameAddress(candidate.packet.target, source));
+  const matches = candidates.filter(candidate => candidate.discordId === replyTo || candidate.packet.id === replyTo);
   if (matches.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
-  return matches[0];
+  return matches[0].packet;
 }
 
 function agentNonceScope(source, destination, requestId, partIndex) {
