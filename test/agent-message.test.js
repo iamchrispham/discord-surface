@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { encodeAgentMessage, decodeAgentMessage, KINDS } = require('../src/agent-message');
+const { issueAgentAddress, encodeAgentMessage, decodeAgentMessage, KINDS } = require('../src/agent-message');
 
 const source = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
 const target = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222', generation: 2 };
@@ -85,7 +85,7 @@ test('explicit sender posts one authenticated packet to recipient and retains so
     fs.writeFileSync(textFile, packet.text);
     const requests = [];
     const input = { state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId, provider: source.provider,
-      textFile, dedupeKey: 'send-1', agentTarget: destination,
+      textFile, dedupeKey: 'send-1', agentTarget: issueAgentAddress(destination, token),
       fetchImpl: async (url, options) => {
         requests.push({ url, body: options.method === 'GET' ? null : JSON.parse(options.body) });
         return { ok: true, status: 200, json: async () => options.method === 'GET'
@@ -109,35 +109,51 @@ test('explicit sender posts one authenticated packet to recipient and retains so
     assert.equal(state.acceptDiscordMessage({ ...inbound, id: '5001' }, { agentToken: token }).accepted, false);
 
     assert.equal((await runDirectPost(input)).duplicate, true);
-    assert.equal((await runDirectPost({ ...input, token: 'rotated-test-credential' })).duplicate, true);
-    assert.equal((await runDirectPost({ ...input, agentTarget: Object.fromEntries(Object.entries(destination).reverse()) })).duplicate, true);
+    assert.equal((await runDirectPost({ ...input, token: 'rotated-test-credential', agentTarget: issueAgentAddress(destination, 'rotated-test-credential') })).duplicate, true);
+    assert.equal((await runDirectPost({ ...input, agentTarget: issueAgentAddress(Object.fromEntries(Object.entries(destination).reverse()), token) })).duplicate, true);
     assert.equal(requests.length, 2);
     assert.equal(state.directPostRows('send-1')[0].detail.channelId, source.channelId);
-    await assert.rejects(runDirectPost({ ...input, agentTarget: { ...target, generation: 3 } }), /identity conflicts/);
+    await assert.rejects(runDirectPost({ ...input, agentTarget: issueAgentAddress({ ...target, generation: 3 }, token) }), /identity conflicts/);
     assert.equal(requests.length, 2);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('explicit sender can address a destination owned by another installation', async () => {
+test('public destination export routes across separate installation databases', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-remote-target-'));
-  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  const state = new SurfaceState(path.join(dir, 'sender.sqlite'));
+  const receiver = new SurfaceState(path.join(dir, 'receiver.sqlite'));
   try {
-    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
+    const secretFile = path.join(dir, 'secret');
+    fs.writeFileSync(secretFile, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
+    for (const store of [state, receiver]) store.setConfig({ operatorId: '900', guildId: source.guildId, secretFile });
+    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' });
+    receiver.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock'), conductorId: 'target-conductor', repoKey: 'repo:target' });
+    const binding = receiver.getBinding(target.channelId);
+    const cli = path.resolve(__dirname, '../src/cli.js');
+    const args = [cli, 'agent-address', '--db', path.join(dir, 'receiver.sqlite'), '--provider', target.provider,
+      '--channel-id', target.channelId, '--native-id', target.nativeId, '--generation', String(binding.generation)];
+    const exported = require('node:child_process').spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 5000 });
+    assert.equal(exported.status, 0, exported.stderr);
+    const envelope = JSON.parse(exported.stdout);
+    assert.equal(state.getBinding(target.channelId), null);
+    const refused = require('node:child_process').spawnSync(process.execPath, [...args.slice(0, -1), '999'], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(refused.status, 1);
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
-    const requests = [];
+    let wire;
     const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
-      channelId: source.channelId, provider: source.provider, textFile, dedupeKey: 'remote-target', agentTarget: target,
-      fetchImpl: async (url, options) => {
-        requests.push({ url, method: options.method });
+      channelId: source.channelId, provider: source.provider, textFile, dedupeKey: 'remote-target', agentTarget: envelope,
+      fetchImpl: async (_url, options) => {
+        if (options.method === 'POST') wire = JSON.parse(options.body).content;
         return { ok: true, status: 200, json: async () => options.method === 'GET'
-          ? { id: target.channelId, guild_id: target.guildId }
-          : { id: '5100' } };
+          ? { id: target.channelId, guild_id: target.guildId } : { id: '5100' } };
       } });
     assert.equal(result.status, 'sent');
-    assert.deepEqual(requests.map(request => request.method), ['GET', 'POST']);
-  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+    const event = { id: '5100', guildId: target.guildId, channelId: target.channelId, authorId: '901', isBot: true, content: wire, attachments: [] };
+    assert.equal(receiver.acceptDiscordMessage(event, { agentToken: token }).accepted, true);
+    assert.equal(receiver.acceptDiscordMessage({ ...event, id: '5101' }, { agentToken: token }).accepted, false);
+    assert.equal(receiver.listMessages().length, 1);
+  } finally { state.close(); receiver.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('agent sender rejects a channel outside the declared destination guild before posting', async () => {
@@ -151,7 +167,7 @@ test('agent sender rejects a channel outside the declared destination guild befo
     fs.writeFileSync(textFile, packet.text);
     const calls = [];
     const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId,
-      provider: source.provider, textFile, dedupeKey: 'guild-check', agentTarget: target,
+      provider: source.provider, textFile, dedupeKey: 'guild-check', agentTarget: issueAgentAddress(target, token),
       fetchImpl: async (url, options) => {
         calls.push({ url, method: options.method });
         return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: '999' }) };
@@ -171,7 +187,7 @@ test('agent sender retries after a destination lookup failure classified as unse
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
     const input = { state, token, nativeId: source.nativeId, generation: source.generation, channelId: source.channelId,
-      provider: source.provider, textFile, dedupeKey: 'lookup-retry', agentTarget: target };
+      provider: source.provider, textFile, dedupeKey: 'lookup-retry', agentTarget: issueAgentAddress(target, token) };
     const first = await runDirectPost({ ...input, fetchImpl: async () => { throw new Error('temporary lookup outage'); } });
     assert.equal(first.status, 'not_sent');
     assert.equal(state.directPostRows('lookup-retry').find(row => row.kind === 'direct-post-outcome').detail.outcome, 'not_sent');
@@ -202,7 +218,7 @@ test('agent nonces include source and destination identity', async () => {
       fs.writeFileSync(textFile, packet.text);
       const result = await runDirectPost({ state, token, nativeId: testCase.source.nativeId, generation: testCase.source.generation,
         channelId: testCase.source.channelId, provider: testCase.source.provider, textFile, dedupeKey: 'same-key',
-        agentTarget: destination, fetchImpl: async (url, options) => {
+        agentTarget: issueAgentAddress(destination, token), fetchImpl: async (url, options) => {
           if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: destination.channelId, guild_id: destination.guildId }) };
           nonces.push(JSON.parse(options.body).nonce);
           return { ok: true, status: 200, json: async () => ({ id: '5000' }) };
@@ -232,27 +248,6 @@ test('history consumer verifies credential before durable intake', async () => {
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('agent intake retains an earlier credential across restart and rotation', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-credential-rotation-'));
-  const db = path.join(dir, 'surface.sqlite');
-  const oldToken = 'old-rotation-credential';
-  const newToken = 'new-rotation-credential';
-  let state = new SurfaceState(db);
-  try {
-    state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-rotate.sock' });
-    state.rememberAgentCredential(oldToken);
-    state.close();
-    state = new SurfaceState(db);
-    state.rememberAgentCredential(newToken);
-    const destination = { ...target, generation: state.getBinding(target.channelId).generation };
-    const addressed = { ...packet, target: destination };
-    const event = { id: '7100', guildId: destination.guildId, channelId: destination.channelId, authorId: '901', isBot: true,
-      attachments: [], content: encodeAgentMessage(addressed, oldToken) };
-    assert.equal(state.acceptDiscordMessage(event, { agentToken: newToken }).accepted, true);
-  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
 test('public agent-send command reaches authenticated outbound transport', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-cli-'));
   const db = path.join(dir, 'surface.sqlite');
@@ -265,7 +260,7 @@ test('public agent-send command reaches authenticated outbound transport', () =>
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') });
     const destination = path.join(dir, 'destination.json');
     const textFile = path.join(dir, 'text.txt');
-    fs.writeFileSync(destination, JSON.stringify(target));
+    fs.writeFileSync(destination, JSON.stringify(issueAgentAddress(target, token)));
     fs.writeFileSync(textFile, 'CLI task');
     const cli = path.resolve(__dirname, '../src/cli.js');
     const argv = [process.execPath, cli, 'agent-send', '--db', db, '--provider', source.provider,
@@ -289,7 +284,7 @@ test('public agent-send command reaches authenticated outbound transport', () =>
       assert.equal(state.directPostRows('cli-1').length, 0);
       assert.match(refused.stderr, /complete binding address/);
     }
-    fs.writeFileSync(destination, JSON.stringify(target));
+    fs.writeFileSync(destination, JSON.stringify(issueAgentAddress(target, token)));
     const child = require('node:child_process').spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 5000 });
     assert.equal(child.status, 0, child.stderr);
     assert.equal(JSON.parse(child.stdout).status, 'sent');
@@ -313,5 +308,34 @@ test('public agent-send command reaches authenticated outbound transport', () =>
     const directoryTarget = require('node:child_process').spawnSync(process.execPath, ['-e', directoryScript], { encoding: 'utf8', timeout: 5000 });
     assert.equal(directoryTarget.status, 1);
     assert.match(directoryTarget.stderr, /agent target file must be a regular file/);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test('invalid destination proof refuses before custody and source revocation during lookup prevents POST', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-proof-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const textFile = path.join(dir, 'task.txt');
+    fs.writeFileSync(textFile, packet.text);
+    let posts = 0;
+    const input = { state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId,
+      provider: source.provider, textFile, dedupeKey: 'proof-check', agentTarget: issueAgentAddress(target, token),
+      fetchImpl: async (_url, options) => {
+        if (options.method === 'POST') posts++;
+        state.unbind(source.channelId);
+        return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+      } };
+    for (const change of [{ guildId: '200' }, { channelId: '103' }, { provider: 'codex' }, { nativeId: source.nativeId }, { generation: 3 }]) {
+      await assert.rejects(runDirectPost({ ...input, agentTarget: { ...input.agentTarget, address: { ...target, ...change } } }), /signature/);
+    }
+    await assert.rejects(runDirectPost({ ...input, agentTarget: target }), /proof/);
+    assert.equal(state.directPostRows('proof-check').length, 0);
+    const result = await runDirectPost(input);
+    assert.equal(result.status, 'stale');
+    assert.equal(posts, 0);
+    assert.equal(state.directPostRows('proof-check').at(-1).detail.outcome, 'stale');
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

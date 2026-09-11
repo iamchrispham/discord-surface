@@ -1077,7 +1077,6 @@ class DiscordGateway {
     this.started = false;
     const startPromise = (async () => {
       const token = readSecret(secretFile);
-      this.state.rememberAgentCredential?.(token);
       this.discordToken = token;
       await this.client.login(token);
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord startup was stopped during login');

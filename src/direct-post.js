@@ -1,4 +1,4 @@
-const { encodeAgentMessage, KINDS } = require('./agent-message');
+const { encodeAgentMessage, verifyAgentAddress, KINDS } = require('./agent-message');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -149,7 +149,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   if (agentTarget !== null) {
     if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
     const address = canonicalAddress(binding);
-    agentTarget = canonicalAddress(agentTarget);
+    agentTarget = verifyAgentAddress(agentTarget, token);
     const packet = { id: explicitRequestId, kind: agentKind, source: address, target: agentTarget, replyTo: agentReplyTo, text: source.text };
     const wire = encodeAgentMessage(packet, token);
     source = { ...source, textHash: hash(JSON.stringify(packet)), parts: [wire] };
@@ -186,6 +186,11 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     }
     try {
       if (agentTarget !== null) await verifyAgentDestination({ token, agentTarget, fetchImpl, signal, timeoutMs });
+      if (!state.directPostBindingCurrent(binding, operatorId)) {
+        const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before send' });
+        parts.push({ index: partIndex, status: stale.outcome });
+        break;
+      }
       const sent = await sendDiscordMessage({ token, channelId: agentTarget?.channelId || binding.channelId, content: source.parts[partIndex], nonce: claim.nonce,
         messageReference: replyTarget === null ? null : { message_id: replyTarget, channel_id: binding.channelId, fail_if_not_exists: true },
         signal, fetchImpl, timeoutMs });

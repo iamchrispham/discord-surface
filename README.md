@@ -304,8 +304,15 @@ belong to the same trusted operator fleet and use the same Discord bot credentia
 The signature proves possession of that credential, not independent native-session
 identity. Agent input is explicitly labeled and grants no operator authority.
 
-Write the exact destination address from its binding into a JSON file containing
-`guildId`, `channelId`, `provider`, `nativeId`, and numeric `generation`. Then run:
+On the receiving installation, export an authenticated address from its active
+binding. This uses the existing ordinary-session or conductor owner checks:
+
+```sh
+node src/cli.js agent-address --provider claude --channel-id TARGET_CHANNEL \
+  --native-id TARGET_NATIVE_UUID --generation TARGET_GENERATION > destination.json
+```
+
+Transfer that file to the sender, then run:
 
 ```sh
 node src/cli.js agent-send --provider codex --channel-id SOURCE_CHANNEL \

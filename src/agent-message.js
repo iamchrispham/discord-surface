@@ -72,4 +72,21 @@ function decodeAgentMessage(wire, token, target) {
   return packet;
 }
 
-module.exports = { KINDS, PREFIX, encodeAgentMessage, decodeAgentMessage, sameAddress, validAddress };
+function issueAgentAddress(binding, token) {
+  const address = Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation'].map(key => [key, binding[key]]));
+  if (!validAddress(address)) throw new Error('invalid agent address');
+  const proof = crypto.createHmac('sha256', signingKey(token)).update('address/v1\0' + JSON.stringify(address)).digest('base64url');
+  return { address, proof };
+}
+
+function verifyAgentAddress(envelope, token) {
+  if (!exactKeys(envelope, ['address', 'proof']) || !validAddress(envelope.address) ||
+      typeof envelope.proof !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(envelope.proof)) {
+    throw new Error('agent target file must contain a complete binding address and proof');
+  }
+  const expected = issueAgentAddress(envelope.address, token);
+  if (!crypto.timingSafeEqual(Buffer.from(envelope.proof), Buffer.from(expected.proof))) throw new Error('invalid agent address signature');
+  return expected.address;
+}
+
+module.exports = { issueAgentAddress, verifyAgentAddress, KINDS, PREFIX, encodeAgentMessage, decodeAgentMessage, sameAddress, validAddress };

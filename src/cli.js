@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-const { validAddress } = require('./agent-message');
+const { issueAgentAddress, verifyAgentAddress } = require('./agent-message');
 
 const fs = require('node:fs');
-const { resolveDedupeKey, runDirectPost } = require('./direct-post');
+const { resolveDedupeKey, resolveDirectBinding, runDirectPost } = require('./direct-post');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
@@ -1580,7 +1580,11 @@ async function agentSend(args) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('invalid agent provider');
   const { state } = openState(args);
   let ordinary;
-  try { ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id'))); }
+  let agentCredential;
+  try {
+    ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id')));
+    agentCredential = readSecret(state.requireConfig().secretFile);
+  }
   finally { state.close(); }
   const targetPath = required(args, 'target-file');
   const stat = fs.statSync(targetPath);
@@ -1599,7 +1603,7 @@ async function agentSend(args) {
     }
   } finally { fs.closeSync(fd); }
   const agentTarget = JSON.parse(Buffer.concat(chunks, bytesRead).toString('utf8'));
-  if (!validAddress(agentTarget)) throw new Error('agent target file must contain a complete binding address');
+  verifyAgentAddress(agentTarget, agentCredential);
   return directPost(args, provider, ordinary, { agentTarget });
 }
 
@@ -1616,7 +1620,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
   process.once('SIGTERM', handleSignal);
   try {
     const config = state.requireConfig();
-    const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: true });
+    const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: !dependencies.exportAddress });
     const hasAgentReplyTo = Object.hasOwn(args, 'agent-reply-to');
     if (hasAgentReplyTo && !args['agent-reply-to']) throw new Error('agent reply correlation must not be empty');
     const nativeId = required(args, 'native-id');
@@ -1638,6 +1642,12 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
         Number(binding.generation) !== Number(generation)) {
         throw new Error(`ordinary post identity does not match the active ${provider === PROVIDERS.CLAUDE ? 'Claude' : 'Codex'} binding`);
       }
+    }
+    if (dependencies.exportAddress) {
+      const binding = resolveDirectBinding(state, { nativeId, generation: Number(generation), channelId, provider, ordinary });
+      const envelope = issueAgentAddress(binding, readSecret(config.secretFile));
+      print(envelope);
+      return envelope;
     }
     const result = await runDirectPost({
       state,
@@ -1805,6 +1815,15 @@ async function main() {
       } finally { state.close(); }
     }
     case 'claude-reply': return claudeReply(args);
+    case 'agent-address': {
+      const provider = required(args, 'provider');
+      if (!['codex', 'claude'].includes(provider)) throw new Error('invalid agent provider');
+      const { state } = openState(args);
+      let ordinary;
+      try { ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id'))); }
+      finally { state.close(); }
+      return directPost(args, provider, ordinary, { exportAddress: true });
+    }
     case 'agent-send': return agentSend(args);
     case 'post': return directPost(args);
     case 'ordinary-post': return directPost(args, 'codex', true);
@@ -1813,7 +1832,7 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
   }
 }
 
