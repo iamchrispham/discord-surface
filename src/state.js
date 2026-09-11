@@ -71,6 +71,8 @@ const ACTIVE_STATES = new Set([
 ]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REPLY_LIMIT = 2000;
+const AGENT_VERIFICATION_KEYS_META = 'agent-verification-keys';
+const MAX_AGENT_VERIFICATION_KEYS = 4;
 
 class StateCorruptError extends Error {}
 class BindingError extends Error {}
@@ -965,6 +967,18 @@ class SurfaceState {
     return Object.fromEntries(rows.map(row => [row.key, row.value]));
   }
 
+  rememberAgentCredential(credential) {
+    if (typeof credential !== 'string' || credential.length === 0) return [];
+    const row = this.db.prepare('SELECT value FROM meta WHERE key=?').get(AGENT_VERIFICATION_KEYS_META);
+    const saved = parseJson(row?.value, []);
+    const keys = [credential, ...(Array.isArray(saved) ? saved : [])]
+      .filter((value, index, values) => typeof value === 'string' && value.length > 0 && values.indexOf(value) === index)
+      .slice(0, MAX_AGENT_VERIFICATION_KEYS);
+    this.db.prepare('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+      .run(AGENT_VERIFICATION_KEYS_META, JSON.stringify(keys));
+    return keys;
+  }
+
   requireConfig() {
     const config = this.getConfig();
     for (const key of ['operatorId', 'guildId', 'secretFile']) {
@@ -1829,6 +1843,9 @@ class SurfaceState {
       return this.reject('invalid-event');
     }
     const directPost = this.excludeDirectPost(event);
+    const agentCredentials = event.isBot && event.content.startsWith(AGENT_PREFIX)
+      ? this.rememberAgentCredential(agentToken)
+      : [];
     return this.transaction(() => {
       const binding = this.getBinding(event.channelId);
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
@@ -1844,7 +1861,12 @@ class SurfaceState {
       if (event.isBot && event.content.startsWith(AGENT_PREFIX)) {
         try {
           const target = binding && Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation'].map(key => [key, binding[key]]));
-          agent = decodeAgentMessage(event.content, agentToken, target);
+          for (const credential of agentCredentials) {
+            try {
+              agent = decodeAgentMessage(event.content, credential, target);
+              break;
+            } catch {}
+          }
           if (attachments.length) throw new BindingError('agent attachments are not supported');
         } catch { invalidAgent = true; }
       }

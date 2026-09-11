@@ -118,6 +118,28 @@ test('explicit sender posts one authenticated packet to recipient and retains so
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('explicit sender can address a destination owned by another installation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-remote-target-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
+    const textFile = path.join(dir, 'task.txt');
+    fs.writeFileSync(textFile, packet.text);
+    const requests = [];
+    const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
+      channelId: source.channelId, provider: source.provider, textFile, dedupeKey: 'remote-target', agentTarget: target,
+      fetchImpl: async (url, options) => {
+        requests.push({ url, method: options.method });
+        return { ok: true, status: 200, json: async () => options.method === 'GET'
+          ? { id: target.channelId, guild_id: target.guildId }
+          : { id: '5100' } };
+      } });
+    assert.equal(result.status, 'sent');
+    assert.deepEqual(requests.map(request => request.method), ['GET', 'POST']);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('agent sender rejects a channel outside the declared destination guild before posting', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-channel-check-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
@@ -137,6 +159,25 @@ test('agent sender rejects a channel outside the declared destination guild befo
     assert.equal(result.status, 'not_sent');
     assert.equal(calls.length, 1);
     assert.equal(calls[0].method, 'GET');
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('agent sender retries after a destination lookup failure classified as unsent', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-lookup-retry-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
+    const textFile = path.join(dir, 'task.txt');
+    fs.writeFileSync(textFile, packet.text);
+    const input = { state, token, nativeId: source.nativeId, generation: source.generation, channelId: source.channelId,
+      provider: source.provider, textFile, dedupeKey: 'lookup-retry', agentTarget: target };
+    const first = await runDirectPost({ ...input, fetchImpl: async () => { throw new Error('temporary lookup outage'); } });
+    assert.equal(first.status, 'not_sent');
+    assert.equal(state.directPostRows('lookup-retry').find(row => row.kind === 'direct-post-outcome').detail.outcome, 'not_sent');
+    const second = await runDirectPost({ ...input, fetchImpl: async (url, options) => ({ ok: true, status: 200, json: async () => options.method === 'GET'
+      ? { id: target.channelId, guild_id: target.guildId } : { id: '5200' } }) });
+    assert.equal(second.status, 'sent');
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -188,6 +229,27 @@ test('history consumer verifies credential before durable intake', async () => {
     assert.deepEqual(accepted.message.agentMessage.source, source);
     assert.equal((await consumer.intakeMessage({ ...incoming, id: '7001' }, false)).accepted, false);
     assert.equal(state.listMessages().length, 1);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('agent intake retains an earlier credential across restart and rotation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-credential-rotation-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const oldToken = 'old-rotation-credential';
+  const newToken = 'new-rotation-credential';
+  let state = new SurfaceState(db);
+  try {
+    state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-rotate.sock' });
+    state.rememberAgentCredential(oldToken);
+    state.close();
+    state = new SurfaceState(db);
+    state.rememberAgentCredential(newToken);
+    const destination = { ...target, generation: state.getBinding(target.channelId).generation };
+    const addressed = { ...packet, target: destination };
+    const event = { id: '7100', guildId: destination.guildId, channelId: destination.channelId, authorId: '901', isBot: true,
+      attachments: [], content: encodeAgentMessage(addressed, oldToken) };
+    assert.equal(state.acceptDiscordMessage(event, { agentToken: newToken }).accepted, true);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

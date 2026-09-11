@@ -226,9 +226,7 @@ async function fetchDiscordChannel({ token, channelId, signal, timeoutMs = RECOV
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
   let timer;
-  let started = false;
   const operation = (async () => {
-    started = true;
     let response;
     try {
       response = await fetchImpl(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}`, {
@@ -240,19 +238,19 @@ async function fetchDiscordChannel({ token, channelId, signal, timeoutMs = RECOV
         signal: controller.signal
       });
     } catch (error) {
-      if (!error.outcome) error.outcome = started ? 'unknown' : 'not_sent';
+      if (!error.outcome) error.outcome = 'not_sent';
       throw error;
     }
     if (!response?.ok) {
       await cancelResponseBody(response);
       const error = new Error('Discord channel lookup request rejected');
       error.status = response?.status;
-      error.outcome = response?.status === 429 ? 'rate_limited' : [400, 401, 403, 404].includes(response?.status) ? 'not_sent' : 'unknown';
+      error.outcome = response?.status === 429 ? 'rate_limited' : 'not_sent';
       throw error;
     }
     let body;
     try { body = await response.json(); }
-    catch (error) { await cancelResponseBody(response); error.outcome = 'unknown'; throw error; }
+    catch (error) { await cancelResponseBody(response); error.outcome = 'not_sent'; throw error; }
     if (typeof body?.id !== 'string' || typeof body?.guild_id !== 'string') {
       throw Object.assign(new Error('Discord channel response lacks destination identity'), { outcome: 'not_sent' });
     }
@@ -261,7 +259,7 @@ async function fetchDiscordChannel({ token, channelId, signal, timeoutMs = RECOV
   const deadline = new Promise((_, reject) => {
     timer = setTimeout(() => {
       controller.abort();
-      reject(Object.assign(new Error('Discord channel lookup deadline exceeded'), { outcome: 'unknown' }));
+      reject(Object.assign(new Error('Discord channel lookup deadline exceeded'), { outcome: 'not_sent' }));
     }, Math.max(1, Number(timeoutMs)));
   });
   try {
@@ -1079,6 +1077,7 @@ class DiscordGateway {
     this.started = false;
     const startPromise = (async () => {
       const token = readSecret(secretFile);
+      this.state.rememberAgentCredential?.(token);
       this.discordToken = token;
       await this.client.login(token);
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord startup was stopped during login');
