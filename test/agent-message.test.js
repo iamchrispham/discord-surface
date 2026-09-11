@@ -339,3 +339,34 @@ test('invalid destination proof refuses before custody and source revocation dur
     assert.equal(state.directPostRows('proof-check').at(-1).detail.outcome, 'stale');
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('results reverse an accepted request and reject unrelated or unknown correlation before custody', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-result-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const request = { ...packet, source: target, target: source };
+    const intake = state.acceptDiscordMessage({ id: '8100', guildId: source.guildId, channelId: source.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token });
+    assert.equal(intake.accepted, true);
+    const textFile = path.join(dir, 'result.txt');
+    fs.writeFileSync(textFile, 'Useful result');
+    let calls = 0;
+    const input = { state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId,
+      provider: source.provider, textFile, dedupeKey: 'result-check', agentTarget: issueAgentAddress(target, token),
+      agentKind: KINDS.RESULT, agentReplyTo: request.id,
+      fetchImpl: async (_url, options) => {
+        calls++;
+        return { ok: true, status: 200, json: async () => options.method === 'GET'
+          ? { id: target.channelId, guild_id: target.guildId } : { id: '8200' } };
+      } };
+    await assert.rejects(runDirectPost({ ...input, agentTarget: issueAgentAddress({ ...target, channelId: '103' }, token) }), /does not match/);
+    await assert.rejects(runDirectPost({ ...input, agentReplyTo: 'missing' }), /unknown/);
+    assert.equal(calls, 0);
+    assert.equal(state.directPostRows('result-check').length, 0);
+    assert.equal((await runDirectPost(input)).status, 'sent');
+    assert.equal((await runDirectPost(input)).duplicate, true);
+    assert.equal(calls, 2);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});

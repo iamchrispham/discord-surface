@@ -1,4 +1,4 @@
-const { encodeAgentMessage, verifyAgentAddress, KINDS } = require('./agent-message');
+const { encodeAgentMessage, sameAddress, verifyAgentAddress, KINDS } = require('./agent-message');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -105,6 +105,19 @@ async function verifyAgentDestination({ token, agentTarget, fetchImpl, signal, t
   }
 }
 
+function resolveAgentReplyRequest(state, replyTo, source, target) {
+  const matches = state.listReceipts()
+    .filter(row => row.kind === 'agent-message')
+    .map(row => {
+      try { return JSON.parse(row.detail)?.packet || null; }
+      catch { return null; }
+    })
+    .filter(packet => packet?.id === replyTo && packet.kind === KINDS.REQUEST &&
+      sameAddress(packet.source, target) && sameAddress(packet.target, source));
+  if (matches.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
+  return matches[0];
+}
+
 function agentNonceScope(source, destination, requestId, partIndex) {
   return hash(['agent-post-v1', canonicalAddress(source), canonicalAddress(destination), requestId, partIndex]);
 }
@@ -150,6 +163,11 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
     const address = canonicalAddress(binding);
     agentTarget = verifyAgentAddress(agentTarget, token);
+    if (agentKind === KINDS.RESULT) {
+      const replyTo = requiredString(agentReplyTo, 'agent-reply-to', 128);
+      resolveAgentReplyRequest(state, replyTo, address, agentTarget);
+      agentReplyTo = replyTo;
+    }
     const packet = { id: explicitRequestId, kind: agentKind, source: address, target: agentTarget, replyTo: agentReplyTo, text: source.text };
     const wire = encodeAgentMessage(packet, token);
     source = { ...source, textHash: hash(JSON.stringify(packet)), parts: [wire] };
