@@ -1583,8 +1583,22 @@ async function agentSend(args) {
   try { ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id'))); }
   finally { state.close(); }
   const targetPath = required(args, 'target-file');
-  if (fs.statSync(targetPath).size > 2048) throw new Error('agent target file is too large');
-  const agentTarget = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
+  const stat = fs.statSync(targetPath);
+  if (!stat.isFile()) throw new Error('agent target file must be a regular file');
+  const fd = fs.openSync(targetPath, 'r');
+  const chunks = [];
+  let bytesRead = 0;
+  try {
+    const buffer = Buffer.alloc(1024);
+    while (bytesRead <= 2048) {
+      const length = fs.readSync(fd, buffer, 0, Math.min(buffer.length, 2049 - bytesRead), bytesRead);
+      if (length === 0) break;
+      chunks.push(Buffer.from(buffer.subarray(0, length)));
+      bytesRead += length;
+      if (bytesRead > 2048) throw new Error('agent target file is too large');
+    }
+  } finally { fs.closeSync(fd); }
+  const agentTarget = JSON.parse(Buffer.concat(chunks, bytesRead).toString('utf8'));
   if (!validAddress(agentTarget)) throw new Error('agent target file must contain a complete binding address');
   return directPost(args, provider, ordinary, { agentTarget });
 }
@@ -1603,6 +1617,8 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
   try {
     const config = state.requireConfig();
     const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: true });
+    const hasAgentReplyTo = Object.hasOwn(args, 'agent-reply-to');
+    if (hasAgentReplyTo && !args['agent-reply-to']) throw new Error('agent reply correlation must not be empty');
     const nativeId = required(args, 'native-id');
     const generation = required(args, 'generation');
     const channelId = ordinary ? required(args, 'channel-id') : (args['channel-id'] || null);
@@ -1632,8 +1648,8 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       provider,
       textFile: required(args, 'text-file'),
       agentTarget: dependencies.agentTarget ?? null,
-      agentKind: args['agent-reply-to'] ? 'result' : 'request',
-      agentReplyTo: args['agent-reply-to'] || null,
+      agentKind: hasAgentReplyTo ? 'result' : 'request',
+      agentReplyTo: hasAgentReplyTo ? args['agent-reply-to'] : null,
       dedupeKey,
       inReplyTo: args['in-reply-to'] === undefined ? null : args['in-reply-to'],
       signal: controller.signal,

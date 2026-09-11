@@ -1,4 +1,4 @@
-const { encodeAgentMessage, KINDS } = require('./agent-message');
+const { encodeAgentMessage, KINDS, sameAddress } = require('./agent-message');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -11,7 +11,7 @@ const {
   splitReply,
   validateNativeId
 } = require('./state');
-const { sendDiscordMessage } = require('./discord');
+const { fetchDiscordChannel, sendDiscordMessage } = require('./discord');
 
 function hash(value) {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -98,6 +98,21 @@ function canonicalAddress(address) {
   return Object.fromEntries(ADDRESS_KEYS.map(key => [key, address[key]]));
 }
 
+function assertAgentDestinationBinding(state, agentTarget) {
+  const binding = state.getBinding(agentTarget.channelId);
+  if (!binding?.active || !sameAddress(canonicalAddress(binding), agentTarget)) {
+    throw Object.assign(new BindingError('agent target does not match an active destination binding'), { outcome: 'not_sent' });
+  }
+}
+
+async function verifyAgentDestination({ state, token, agentTarget, fetchImpl, signal, timeoutMs }) {
+  assertAgentDestinationBinding(state, agentTarget);
+  const channel = await fetchDiscordChannel({ token, channelId: agentTarget.channelId, fetchImpl, signal, timeoutMs });
+  if (channel.id !== agentTarget.channelId || channel.guild_id !== agentTarget.guildId) {
+    throw Object.assign(new BindingError('agent target channel does not match its declared guild'), { outcome: 'not_sent' });
+  }
+}
+
 function agentNonceScope(source, destination, requestId, partIndex) {
   return hash(['agent-post-v1', canonicalAddress(source), canonicalAddress(destination), requestId, partIndex]);
 }
@@ -178,6 +193,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       break;
     }
     try {
+      if (agentTarget !== null) await verifyAgentDestination({ state, token, agentTarget, fetchImpl, signal, timeoutMs });
       const sent = await sendDiscordMessage({ token, channelId: agentTarget?.channelId || binding.channelId, content: source.parts[partIndex], nonce: claim.nonce,
         messageReference: replyTarget === null ? null : { message_id: replyTarget, channel_id: binding.channelId, fail_if_not_exists: true },
         signal, fetchImpl, timeoutMs });

@@ -219,6 +219,61 @@ async function sendDiscordMessage({ token, channelId, content, nonce, signal, ti
   }
 }
 
+async function fetchDiscordChannel({ token, channelId, signal, timeoutMs = RECOVERY_LIMITS.timeoutMs, fetchImpl = globalThis.fetch }) {
+  if (typeof fetchImpl !== 'function') throw Object.assign(new Error('Discord channel fetch is unavailable'), { outcome: 'not_sent' });
+  if (signal?.aborted) throw Object.assign(new Error('Discord channel lookup stopped before request'), { outcome: 'not_sent' });
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  let timer;
+  let started = false;
+  const operation = (async () => {
+    started = true;
+    let response;
+    try {
+      response = await fetchImpl(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bot ${token}`,
+          'User-Agent': 'DiscordBot (discord-surface, 0.1.0)'
+        },
+        signal: controller.signal
+      });
+    } catch (error) {
+      if (!error.outcome) error.outcome = started ? 'unknown' : 'not_sent';
+      throw error;
+    }
+    if (!response?.ok) {
+      await cancelResponseBody(response);
+      const error = new Error('Discord channel lookup request rejected');
+      error.status = response?.status;
+      error.outcome = response?.status === 429 ? 'rate_limited' : [400, 401, 403, 404].includes(response?.status) ? 'not_sent' : 'unknown';
+      throw error;
+    }
+    let body;
+    try { body = await response.json(); }
+    catch (error) { await cancelResponseBody(response); error.outcome = 'unknown'; throw error; }
+    if (typeof body?.id !== 'string' || typeof body?.guild_id !== 'string') {
+      throw Object.assign(new Error('Discord channel response lacks destination identity'), { outcome: 'not_sent' });
+    }
+    return body;
+  })();
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(Object.assign(new Error('Discord channel lookup deadline exceeded'), { outcome: 'unknown' }));
+    }, Math.max(1, Number(timeoutMs)));
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+    controller.abort();
+    operation.catch(() => {});
+  }
+}
+
 function transportReceiptText(message, attempt) {
   if (attempt.readiness === 'ready') return 'Receipt: saved for this conductor.';
   return 'Receipt: saved. Delivery was paused when this receipt was prepared.';
@@ -1776,6 +1831,7 @@ module.exports = {
   createSurfaceConsumer,
   discordIdAfter,
   eventToInput,
+  fetchDiscordChannel,
   readSecret,
   requireInstalled,
   sendDiscordMessage,
