@@ -105,7 +105,7 @@ async function verifyAgentDestination({ token, agentTarget, fetchImpl, signal, t
   }
 }
 
-function resolveAgentReplyRequest(state, replyTo, source, target) {
+function resolveAgentReplyRequest(state, replyTo, source, target = null) {
   const matches = state.listReceipts()
     .filter(row => row.kind === 'agent-message')
     .map(row => {
@@ -113,7 +113,7 @@ function resolveAgentReplyRequest(state, replyTo, source, target) {
       catch { return null; }
     })
     .filter(packet => packet?.id === replyTo && packet.kind === KINDS.REQUEST &&
-      sameAddress(packet.source, target) && sameAddress(packet.target, source));
+      (target === null || sameAddress(packet.source, target)) && sameAddress(packet.target, source));
   if (matches.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
   return matches[0];
 }
@@ -158,15 +158,19 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   const operatorId = state.requireConfig().operatorId;
   let source = readTextFile(textFile);
   const replyTarget = inReplyToValue(inReplyTo);
-  const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: agentTarget !== null });
-  if (agentTarget !== null) {
+  const isAgentMessage = agentTarget !== null || agentKind === KINDS.RESULT;
+  const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: isAgentMessage });
+  if (isAgentMessage) {
     if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
     const address = canonicalAddress(binding);
-    agentTarget = verifyAgentAddress(agentTarget, token);
     if (agentKind === KINDS.RESULT) {
       const replyTo = requiredString(agentReplyTo, 'agent-reply-to', 128);
-      resolveAgentReplyRequest(state, replyTo, address, agentTarget);
+      const hasProof = agentTarget !== null && typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
+      if (hasProof) agentTarget = verifyAgentAddress(agentTarget, token);
+      agentTarget = resolveAgentReplyRequest(state, replyTo, address, agentTarget).source;
       agentReplyTo = replyTo;
+    } else {
+      agentTarget = verifyAgentAddress(agentTarget, token);
     }
     const packet = { id: explicitRequestId, kind: agentKind, source: address, target: agentTarget, replyTo: agentReplyTo, text: source.text };
     const wire = encodeAgentMessage(packet, token);

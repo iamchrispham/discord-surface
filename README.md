@@ -328,8 +328,10 @@ not supported for this first slice.
 
 Only authenticated addressed packets enter agent delivery. Ordinary bot replies
 and milestone posts remain excluded. A result may be explicitly sent with
-`--agent-reply-to task-123` and a new dedupe key, using the original source as its
-destination. Receiving a packet does not automatically send another packet.
+`--agent-reply-to task-123` and a new dedupe key, using the accepted request
+receipt to recover the original source as its destination. The result command
+may omit `--target-file`; a supplied target file is still checked when present.
+Receiving a packet does not automatically send another packet.
 Existing native acknowledgment and reply delivery remain separate from intake.
 
 Receiving installations pin the exact destination generation and deduplicate the

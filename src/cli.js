@@ -1586,24 +1586,30 @@ async function agentSend(args) {
     agentCredential = readSecret(state.requireConfig().secretFile);
   }
   finally { state.close(); }
-  const targetPath = required(args, 'target-file');
-  const stat = fs.statSync(targetPath);
-  if (!stat.isFile()) throw new Error('agent target file must be a regular file');
-  const fd = fs.openSync(targetPath, 'r');
-  const chunks = [];
-  let bytesRead = 0;
-  try {
-    const buffer = Buffer.alloc(1024);
-    while (bytesRead <= 2048) {
-      const length = fs.readSync(fd, buffer, 0, Math.min(buffer.length, 2049 - bytesRead), bytesRead);
-      if (length === 0) break;
-      chunks.push(Buffer.from(buffer.subarray(0, length)));
-      bytesRead += length;
-      if (bytesRead > 2048) throw new Error('agent target file is too large');
-    }
-  } finally { fs.closeSync(fd); }
-  const agentTarget = JSON.parse(Buffer.concat(chunks, bytesRead).toString('utf8'));
-  verifyAgentAddress(agentTarget, agentCredential);
+  const isReply = Object.hasOwn(args, 'agent-reply-to');
+  const targetPath = Object.hasOwn(args, 'target-file') ? required(args, 'target-file') : null;
+  let agentTarget = null;
+  if (targetPath !== null) {
+    const stat = fs.statSync(targetPath);
+    if (!stat.isFile()) throw new Error('agent target file must be a regular file');
+    const fd = fs.openSync(targetPath, 'r');
+    const chunks = [];
+    let bytesRead = 0;
+    try {
+      const buffer = Buffer.alloc(1024);
+      while (bytesRead <= 2048) {
+        const length = fs.readSync(fd, buffer, 0, Math.min(buffer.length, 2049 - bytesRead), bytesRead);
+        if (length === 0) break;
+        chunks.push(Buffer.from(buffer.subarray(0, length)));
+        bytesRead += length;
+        if (bytesRead > 2048) throw new Error('agent target file is too large');
+      }
+    } finally { fs.closeSync(fd); }
+    agentTarget = JSON.parse(Buffer.concat(chunks, bytesRead).toString('utf8'));
+    if (!isReply) verifyAgentAddress(agentTarget, agentCredential);
+  } else if (!isReply) {
+    required(args, 'target-file');
+  }
   return directPost(args, provider, ordinary, { agentTarget });
 }
 

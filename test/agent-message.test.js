@@ -297,6 +297,20 @@ test('public agent-send command reaches authenticated outbound transport', () =>
     assert.equal(JSON.parse(child.stdout).status, 'sent');
     assert.equal(state.directPostRows('cli-1').at(-1).detail.messageId, '8000');
 
+    const request = { ...packet, id: 'cli-request', source: target, target: source };
+    assert.equal(state.acceptDiscordMessage({ id: '8050', guildId: source.guildId, channelId: source.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token }).accepted, true);
+    const replyText = path.join(dir, 'reply.txt');
+    fs.writeFileSync(replyText, 'CLI result');
+    const replyArgv = [process.execPath, cli, 'agent-send', '--db', db, '--provider', source.provider,
+      '--channel-id', source.channelId, '--native-id', source.nativeId, '--generation', '1',
+      '--text-file', replyText, '--dedupe-key', 'cli-result', '--agent-reply-to', request.id];
+    const replyScript = script.replace(JSON.stringify(argv), JSON.stringify(replyArgv));
+    const reply = require('node:child_process').spawnSync(process.execPath, ['-e', replyScript], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(reply.status, 0, reply.stderr);
+    assert.equal(JSON.parse(reply.stdout).status, 'sent');
+    assert.equal(state.directPostRows('cli-result').at(-1).detail.messageId, '8000');
+
     const emptyReplyArgv = [...argv, '--dedupe-key', 'cli-empty-reply', '--agent-reply-to='];
     const emptyReplyScript = script.replace(JSON.stringify(argv), JSON.stringify(emptyReplyArgv));
     const emptyReply = require('node:child_process').spawnSync(process.execPath, ['-e', emptyReplyScript], { encoding: 'utf8', timeout: 5000 });
@@ -361,7 +375,7 @@ test('results reverse an accepted request and reject unrelated or unknown correl
     fs.writeFileSync(textFile, 'Useful result');
     let calls = 0;
     const input = { state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId,
-      provider: source.provider, textFile, dedupeKey: 'result-check', agentTarget: issueAgentAddress(target, token),
+      provider: source.provider, textFile, dedupeKey: 'result-check', agentTarget: request.source,
       agentKind: KINDS.RESULT, agentReplyTo: request.id,
       fetchImpl: async (_url, options) => {
         calls++;
@@ -374,6 +388,7 @@ test('results reverse an accepted request and reject unrelated or unknown correl
     assert.equal(state.directPostRows('result-check').length, 0);
     assert.equal((await runDirectPost(input)).status, 'sent');
     assert.equal((await runDirectPost(input)).duplicate, true);
-    assert.equal(calls, 2);
+    assert.equal((await runDirectPost({ ...input, dedupeKey: 'result-no-target', agentTarget: null })).status, 'sent');
+    assert.equal(calls, 4);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
