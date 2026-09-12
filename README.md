@@ -294,3 +294,51 @@ The CLI requires `--dedupe-key`. Existing callers may use `--request-id` as a le
 Repeat the same key, target and unchanged file to inspect or resume the same milestone, not create a duplicate. A new successful send returns `recorded: true, duplicate: false, state: "sent"`. A repeated confirmed send returns `recorded: false, duplicate: true, state: "sent"`. Partial, unknown, in-flight and stale results retain their existing `status`, `requestId`, `messageIds` and `parts` fields and expose the same value as `state`. Confirmed parts are skipped on retry. A request interrupted after its durable attempt stays uncertain and is never blindly resent. Definite unsent failures can be retried explicitly. Each part's attempt and delivery result are recorded in the existing receipts table.
 
 No native session, channel binding, automatic publication selection or phone configuration is changed. A successful receipt means Discord accepted the returned message IDs, not that the operator read them.
+
+
+## Addressed agent messages
+
+`agent-send` sends bounded task/context to another existing session. It does not
+transfer a binding or create a session. Source and destination installations must
+belong to the same trusted operator fleet and use the same Discord bot credential.
+The signature proves possession of that credential, not independent native-session
+identity. Agent input is explicitly labeled and grants no operator authority.
+
+On the receiving installation, export an authenticated address from its active
+binding. This uses the existing ordinary-session or conductor owner checks:
+
+```sh
+node src/cli.js agent-address --provider claude --channel-id TARGET_CHANNEL \
+  --native-id TARGET_NATIVE_UUID --generation TARGET_GENERATION > destination.json
+```
+
+Transfer that file to the sender, then run:
+
+```sh
+node src/cli.js agent-send --provider codex --channel-id SOURCE_CHANNEL \
+  --native-id SOURCE_NATIVE_UUID --generation SOURCE_GENERATION \
+  --target-file destination.json --text-file task.txt --dedupe-key task-123
+```
+
+The source uses existing ordinary-session or conductor post checks. Repeating the
+same key and content reuses custody. Changing the destination or content under
+that key is refused. A packet must fit in one Discord message, including its
+signed address envelope. Oversized input fails before posting. Attachments are
+not supported for this first slice.
+
+Only authenticated addressed packets enter agent delivery. Ordinary bot replies
+and milestone posts remain excluded. A result may be explicitly sent with
+`--agent-reply-to task-123` and a new dedupe key, using the accepted request
+receipt to recover the original source as its destination. The result command
+may omit `--target-file`; a supplied target file is still checked when present.
+Receiving a packet does not automatically send another packet.
+Existing native acknowledgment and reply delivery remain separate from intake.
+
+Receiving installations pin the exact destination generation and deduplicate the
+packet identity. Reconnecting the same native owner preserves accepted custody.
+Changing owners still requires the existing explicit binding handoff. Drain
+unaccepted packets before rotating the shared bot credential, because an old
+signature cannot be verified with a replacement credential.
+
+This slice is under local validation. No cross-OS or live agent delivery claim is
+made by these examples.

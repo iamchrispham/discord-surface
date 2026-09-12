@@ -8,6 +8,7 @@ const { SurfaceState } = require('../src/state');
 const { main } = require('../src/cli');
 const { createSurfaceConsumer } = require('../src/discord');
 const { runDirectPost } = require('../src/direct-post');
+const { decodeAgentMessage, encodeAgentMessage, KINDS } = require('../src/agent-message');
 
 const CODEX = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CLAUDE = '79e3da8e-94b4-4aff-8f88-b45b3a451dd1';
@@ -385,4 +386,47 @@ test('actual CLI repeats safely, refuses stale owners and exits nonzero for unce
   assert.equal(JSON.parse(unknown.stdout).status, 'unknown');
   assert.equal(JSON.parse(retry.stdout).status, 'unknown');
   assert.equal(f.state.listMessages().length, 0);
+});
+
+test('agent reply can correlate by accepted Discord message ID across duplicate request keys', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-reply-correlation-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  const token = 'fixture-token';
+  const local = { guildId: '123', channelId: '456', provider: 'codex', nativeId: CODEX, generation: 1 };
+  const sourceA = { guildId: '123', channelId: '901', provider: 'claude', nativeId: CLAUDE, generation: 1 };
+  const sourceB = { guildId: '123', channelId: '902', provider: 'codex', nativeId: 'd6d5bd73-17e0-4d87-9eb7-84544b93b4f1', generation: 1 };
+  state.setConfig({ operatorId: 'operator', guildId: local.guildId, secretFile: path.join(dir, 'discord.env') });
+  fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  state.bind({ ...local, workspace: dir, conductorId: 'conductor', repoKey: 'repo:fixture' });
+  const textFile = path.join(dir, 'reply.txt');
+  fs.writeFileSync(textFile, 'reply');
+  t.after(() => { state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+
+  const accept = (id, source, key = 'shared-key') => state.acceptDiscordMessage({
+    id, guildId: local.guildId, channelId: local.channelId, authorId: 'discord-bot', isBot: true,
+    content: encodeAgentMessage({ id: key, kind: KINDS.REQUEST, source, target: local, replyTo: null, text: 'request' }, token)
+  }, { agentToken: token });
+  assert.equal(accept('1001', sourceA).accepted, true);
+  assert.equal(accept('1002', sourceB).accepted, true);
+
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    if (options.method === 'GET') return { ok: true, status: 200, body: { cancel() {} }, json: async () => ({ id: sourceA.channelId, guild_id: sourceA.guildId }) };
+    return response('reply-1');
+  };
+  const result = await runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
+    textFile, dedupeKey: 'result-key', agentKind: KINDS.RESULT, agentReplyTo: '1001', fetchImpl });
+  assert.equal(result.parts[0].status, 'sent');
+  assert.match(calls[0].url, /\/channels\/901$/);
+  const packet = decodeAgentMessage(JSON.parse(calls[1].options.body).content, token, sourceA);
+  assert.equal(packet.target.channelId, sourceA.channelId);
+  assert.equal(packet.replyTo, '1001');
+  await assert.rejects(runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
+    textFile, dedupeKey: 'result-key-ambiguous', agentKind: KINDS.RESULT, agentReplyTo: 'shared-key', fetchImpl }), /unknown or does not match/);
+  assert.equal(accept('1003', sourceB, '1001').accepted, true);
+  const priorCalls = calls.length;
+  await assert.rejects(runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
+    textFile, dedupeKey: 'result-key-cross-collision', agentKind: KINDS.RESULT, agentReplyTo: '1001', fetchImpl }), /unknown or does not match/);
+  assert.equal(calls.length, priorCalls);
 });

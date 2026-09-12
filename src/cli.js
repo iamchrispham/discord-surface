@@ -1,7 +1,8 @@
 #!/usr/bin/env node
+const { issueAgentAddress, verifyAgentAddress } = require('./agent-message');
 
 const fs = require('node:fs');
-const { resolveDedupeKey, runDirectPost } = require('./direct-post');
+const { resolveDedupeKey, resolveDirectBinding, runDirectPost } = require('./direct-post');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
@@ -1574,6 +1575,44 @@ function claudeReply(args) {
   } finally { state.close(); }
 }
 
+async function agentSend(args) {
+  const provider = required(args, 'provider');
+  if (!['codex', 'claude'].includes(provider)) throw new Error('invalid agent provider');
+  const { state } = openState(args);
+  let ordinary;
+  let agentCredential;
+  try {
+    ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id')));
+    agentCredential = readSecret(state.requireConfig().secretFile);
+  }
+  finally { state.close(); }
+  const isReply = Object.hasOwn(args, 'agent-reply-to');
+  const targetPath = Object.hasOwn(args, 'target-file') ? required(args, 'target-file') : null;
+  let agentTarget = null;
+  if (targetPath !== null) {
+    const stat = fs.statSync(targetPath);
+    if (!stat.isFile()) throw new Error('agent target file must be a regular file');
+    const fd = fs.openSync(targetPath, 'r');
+    const chunks = [];
+    let bytesRead = 0;
+    try {
+      const buffer = Buffer.alloc(1024);
+      while (bytesRead <= 2048) {
+        const length = fs.readSync(fd, buffer, 0, Math.min(buffer.length, 2049 - bytesRead), bytesRead);
+        if (length === 0) break;
+        chunks.push(Buffer.from(buffer.subarray(0, length)));
+        bytesRead += length;
+        if (bytesRead > 2048) throw new Error('agent target file is too large');
+      }
+    } finally { fs.closeSync(fd); }
+    agentTarget = JSON.parse(Buffer.concat(chunks, bytesRead).toString('utf8'));
+    if (!isReply) verifyAgentAddress(agentTarget, agentCredential);
+  } else if (!isReply) {
+    required(args, 'target-file');
+  }
+  return directPost(args, provider, ordinary, { agentTarget });
+}
+
 async function directPost(args, provider = null, ordinary = false, dependencies = {}) {
   const { state } = openState(args);
   const controller = new AbortController();
@@ -1587,7 +1626,9 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
   process.once('SIGTERM', handleSignal);
   try {
     const config = state.requireConfig();
-    const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: true });
+    const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: !dependencies.exportAddress });
+    const hasAgentReplyTo = Object.hasOwn(args, 'agent-reply-to');
+    if (hasAgentReplyTo && !args['agent-reply-to']) throw new Error('agent reply correlation must not be empty');
     const nativeId = required(args, 'native-id');
     const generation = required(args, 'generation');
     const channelId = ordinary ? required(args, 'channel-id') : (args['channel-id'] || null);
@@ -1608,6 +1649,12 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
         throw new Error(`ordinary post identity does not match the active ${provider === PROVIDERS.CLAUDE ? 'Claude' : 'Codex'} binding`);
       }
     }
+    if (dependencies.exportAddress) {
+      const binding = resolveDirectBinding(state, { nativeId, generation: Number(generation), channelId, provider, ordinary });
+      const envelope = issueAgentAddress(binding, readSecret(config.secretFile));
+      print(envelope);
+      return envelope;
+    }
     const result = await runDirectPost({
       state,
       token: readSecret(config.secretFile),
@@ -1616,6 +1663,9 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       channelId,
       provider,
       textFile: required(args, 'text-file'),
+      agentTarget: dependencies.agentTarget ?? null,
+      agentKind: hasAgentReplyTo ? 'result' : 'request',
+      agentReplyTo: hasAgentReplyTo ? args['agent-reply-to'] : null,
       dedupeKey,
       inReplyTo: args['in-reply-to'] === undefined ? null : args['in-reply-to'],
       signal: controller.signal,
@@ -1771,6 +1821,16 @@ async function main() {
       } finally { state.close(); }
     }
     case 'claude-reply': return claudeReply(args);
+    case 'agent-address': {
+      const provider = required(args, 'provider');
+      if (!['codex', 'claude'].includes(provider)) throw new Error('invalid agent provider');
+      const { state } = openState(args);
+      let ordinary;
+      try { ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id'))); }
+      finally { state.close(); }
+      return directPost(args, provider, ordinary, { exportAddress: true });
+    }
+    case 'agent-send': return agentSend(args);
     case 'post': return directPost(args);
     case 'ordinary-post': return directPost(args, 'codex', true);
     case 'ordinary-claude-post': return directPost(args, 'claude', true);
@@ -1778,7 +1838,7 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
   }
 }
 
