@@ -249,6 +249,7 @@ setInterval(() => {}, 1000);
   await waitForEvent(event => event.phase === 'provider-observe' && event.messageId === '200', 'held message observation');
 
   state = new SurfaceState(db);
+  await waitFor(() => state.getMessage('200')?.state === 'replied', 'held message delivery');
   const finalBinding = state.getBinding('ordinary-registered-wake');
   const finalWatermark = state.getIntakeWatermark('ordinary-registered-wake');
   const finalMessage = state.getMessage('200');

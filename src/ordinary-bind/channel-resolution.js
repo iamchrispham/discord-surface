@@ -1,30 +1,8 @@
-const { resolveExistingChannel } = require('../ordinary-codex');
+'use strict';
 
-async function resolveDiscordChannel(guild, selection, configuredGuildId) {
-  const mentionId = selection.match(/^<#([^>]+)>$/)?.[1] || (/^\d+$/.test(selection) ? selection : null);
-  let fetchedChannels;
-  let fetchedChannelObjects;
-  if (mentionId) {
-    const channel = await guild.channels.fetch(mentionId);
-    fetchedChannelObjects = channel ? [channel] : [];
-    fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
-      messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];
-  } else {
-    const fetched = await guild.channels.fetch();
-    const values = Array.isArray(fetched) ? fetched : typeof fetched?.values === 'function' ? [...fetched.values()] : [];
-    fetchedChannelObjects = values;
-    fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
-      messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
-  }
-  const channel = resolveExistingChannel(selection, configuredGuildId, fetchedChannels);
-  const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
-  return { channel, discordChannel, fetchedChannels };
+try {
+  module.exports = require('../../dist/ordinary-bind/channel-resolution.js');
+} catch (error) {
+  if (error?.code !== 'MODULE_NOT_FOUND' || !String(error?.message || '').includes("Cannot find module '../../dist/ordinary-bind/channel-resolution.js'")) throw error;
+  throw new Error('discord-surface channel resolution build is missing; run npm run build before starting', { cause: error });
 }
-
-function assertSameChannelSelection(channel, alternateSelection, configuredGuildId, fetchedChannels) {
-  if (!alternateSelection) return;
-  const alternate = resolveExistingChannel(alternateSelection, configuredGuildId, fetchedChannels);
-  if (channel.id !== alternate.id) throw new Error('--channel and --channel-id must identify the same channel');
-}
-
-module.exports = { assertSameChannelSelection, resolveDiscordChannel };
