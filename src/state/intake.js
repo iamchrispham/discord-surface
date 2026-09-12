@@ -160,9 +160,10 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
       const row = state.db.prepare(`SELECT 1 FROM messages WHERE discord_id=?
         UNION ALL SELECT 1 FROM receipts WHERE kind='intake-rejected'
           AND json_extract(detail, '$.discordId')=?
-          AND json_extract(detail, '$.reason') IN ('bot-source', 'automatic-publication', 'unauthorized-sender', 'invalid-event')
+          AND json_extract(detail, '$.reason') IN ('bot-source', 'automatic-publication', 'unauthorized-sender', 'invalid-event', 'agent-message-duplicate')
         UNION ALL SELECT 1 FROM receipts WHERE kind='direct-post-outcome'
           AND json_extract(detail, '$.messageId')=?
+          AND json_extract(detail, '$.deliveryChannelId') IS NULL
           AND json_extract(detail, '$.outcome')='sent'
         LIMIT 1`).get(discordId, discordId, discordId);
       return Boolean(row);

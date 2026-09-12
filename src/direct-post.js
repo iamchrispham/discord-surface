@@ -1,3 +1,4 @@
+const { encodeAgentMessage, sameAddress, verifyAgentAddress, KINDS } = require('./agent-message');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -10,7 +11,7 @@ const {
   splitReply,
   validateNativeId
 } = require('./state');
-const { sendDiscordMessage } = require('./discord');
+const { fetchDiscordChannel, sendDiscordMessage } = require('./discord');
 
 function hash(value) {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -91,7 +92,44 @@ function requestIdFor(binding, _operatorId, sourcePath, textHash, explicitReques
   return hash(identity);
 }
 
-function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHash, parts, partIndex) {
+const ADDRESS_KEYS = Object.freeze(['guildId', 'channelId', 'provider', 'nativeId', 'generation']);
+
+function canonicalAddress(address) {
+  return Object.fromEntries(ADDRESS_KEYS.map(key => [key, address[key]]));
+}
+
+async function verifyAgentDestination({ token, agentTarget, fetchImpl, signal, timeoutMs }) {
+  const channel = await fetchDiscordChannel({ token, channelId: agentTarget.channelId, fetchImpl, signal, timeoutMs });
+  if (channel.id !== agentTarget.channelId || channel.guild_id !== agentTarget.guildId) {
+    throw Object.assign(new BindingError('agent target channel does not match its declared guild'), { outcome: 'not_sent' });
+  }
+}
+
+function resolveAgentReplyRequest(state, replyTo, source, target = null) {
+  const candidates = state.listReceipts()
+    .filter(row => row.kind === 'agent-message')
+    .map(row => {
+      try {
+        const detail = JSON.parse(row.detail);
+        const packet = detail?.packet || null;
+        return packet ? { packet, discordId: row.discord_id } : null;
+      } catch { return null; }
+    })
+    .filter(candidate => candidate?.packet.kind === KINDS.REQUEST &&
+      (target === null || sameAddress(candidate.packet.source, target)) && sameAddress(candidate.packet.target, source));
+  const matches = candidates.filter(candidate => candidate.discordId === replyTo || candidate.packet.id === replyTo);
+  if (matches.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
+  return matches[0].packet;
+}
+
+function agentNonceScope(source, destination, requestId, partIndex) {
+  return hash(['agent-post-v1', canonicalAddress(source), canonicalAddress(destination), requestId, partIndex]);
+}
+
+function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHash, parts, partIndex, agentTarget = null) {
+  const nonceScope = agentTarget === null
+    ? `direct:${requestId}:${partIndex}`
+    : agentNonceScope(binding, agentTarget, requestId, partIndex);
   return {
     requestId,
     inReplyTo,
@@ -109,7 +147,7 @@ function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHas
     repoKey: binding.repoKey,
     partIndex,
     partCount: parts.length,
-    nonce: discordNonce(`direct:${requestId}:${partIndex}`),
+    nonce: discordNonce(nonceScope),
     binding
   };
 }
@@ -119,12 +157,29 @@ function outcomeFor(error) {
 }
 
 async function runDirectPost({ state, token, nativeId, generation, channelId = null, provider = null, textFile,
-  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs, ordinary = false }) {
+  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs, ordinary = false, agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null }) {
   const binding = resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
   const operatorId = state.requireConfig().operatorId;
-  const source = readTextFile(textFile);
+  let source = readTextFile(textFile);
   const replyTarget = inReplyToValue(inReplyTo);
-  const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId });
+  const isAgentMessage = agentTarget !== null || agentKind === KINDS.RESULT;
+  const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: isAgentMessage });
+  if (isAgentMessage) {
+    if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
+    const address = canonicalAddress(binding);
+    if (agentKind === KINDS.RESULT) {
+      const replyTo = requiredString(agentReplyTo, 'agent-reply-to', 128);
+      const hasProof = agentTarget !== null && typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
+      if (hasProof) agentTarget = verifyAgentAddress(agentTarget, token);
+      agentTarget = resolveAgentReplyRequest(state, replyTo, address, agentTarget).source;
+      agentReplyTo = replyTo;
+    } else {
+      agentTarget = verifyAgentAddress(agentTarget, token);
+    }
+    const packet = { id: explicitRequestId, kind: agentKind, source: address, target: agentTarget, replyTo: agentReplyTo, text: source.text };
+    const wire = encodeAgentMessage(packet, token);
+    source = { ...source, textHash: hash(JSON.stringify(packet)), parts: [wire] };
+  }
   const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, replyTarget);
   state.recoverDirectPostReceipts();
   const parts = [];
@@ -135,12 +190,51 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
       break;
     }
-    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex);
+    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex, agentTarget);
+    if (agentTarget !== null) meta.deliveryChannelId = agentTarget.channelId;
+    if (agentTarget !== null) {
+      let existing;
+      try { existing = state.inspectDirectPostPart(meta); }
+      catch (error) {
+        if (!(error instanceof StaleGenerationError)) throw error;
+        parts.push({ index: partIndex, status: 'stale', messageId: null });
+        break;
+      }
+      if (existing) {
+        parts.push({ index: partIndex, status: existing.status, messageId: existing.outcome?.messageId || null });
+        if (existing.status !== 'sent') break;
+        continue;
+      }
+      try {
+        await verifyAgentDestination({ token, agentTarget, fetchImpl, signal, timeoutMs });
+      } catch (error) {
+        const preflight = state.recordDirectPostPreflight(meta, outcomeFor(error), {
+          status: error.status || null, error: String(error.message || error).slice(0, 300)
+        });
+        parts.push({ index: partIndex, status: preflight.outcome, messageId: null });
+        break;
+      }
+      if (!state.directPostBindingCurrent(binding, operatorId)) {
+        const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
+        parts.push({ index: partIndex, status: stale.outcome, messageId: null });
+        break;
+      }
+      if (signal?.aborted) {
+        const stopped = state.recordDirectPostPreflight(meta, 'not_sent', { reason: 'direct post stopped before custody' });
+        parts.push({ index: partIndex, status: stopped.outcome, messageId: null });
+        break;
+      }
+    }
     let claim;
     try { claim = state.beginDirectPostPart(meta); }
     catch (error) {
       if (!(error instanceof StaleGenerationError)) throw error;
-      parts.push({ index: partIndex, status: 'stale', messageId: null });
+      if (agentTarget !== null) {
+        const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed before custody' });
+        parts.push({ index: partIndex, status: stale.outcome, messageId: null });
+      } else {
+        parts.push({ index: partIndex, status: 'stale', messageId: null });
+      }
       break;
     }
     if (!claim.claimed) {
@@ -155,7 +249,12 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       break;
     }
     try {
-      const sent = await sendDiscordMessage({ token, channelId: binding.channelId, content: source.parts[partIndex], nonce: claim.nonce,
+      if (!state.directPostBindingCurrent(binding, operatorId)) {
+        const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before send' });
+        parts.push({ index: partIndex, status: stale.outcome });
+        break;
+      }
+      const sent = await sendDiscordMessage({ token, channelId: agentTarget?.channelId || binding.channelId, content: source.parts[partIndex], nonce: claim.nonce,
         messageReference: replyTarget === null ? null : { message_id: replyTarget, channel_id: binding.channelId, fail_if_not_exists: true },
         signal, fetchImpl, timeoutMs });
       const outcome = state.recordDirectPostOutcome(requestId, claim.attemptId, 'sent', { messageId: String(sent.id), status: 200 });
@@ -170,7 +269,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   }
   const status = parts.every(part => part.status === 'sent') ? 'sent' : parts.find(part => part.status !== 'sent')?.status || 'not_sent';
   const duplicate = !claimedAny && parts.length > 0 && parts.every(part => part.status === 'sent');
-  return { requestId, dedupeKey: requestId, inReplyTo: replyTarget, channelId: binding.channelId, provider: binding.provider,
+  return { requestId, dedupeKey: requestId, inReplyTo: replyTarget, channelId: agentTarget?.channelId || binding.channelId, provider: binding.provider,
     nativeId: binding.nativeId, generation: binding.generation, status, state: status, recorded, duplicate,
     messageIds: parts.filter(part => part.messageId).map(part => part.messageId), parts };
 }

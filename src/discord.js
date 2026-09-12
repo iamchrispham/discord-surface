@@ -1,3 +1,4 @@
+const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const fs = require('node:fs');
 const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
@@ -218,12 +219,65 @@ async function sendDiscordMessage({ token, channelId, content, nonce, signal, ti
   }
 }
 
+async function fetchDiscordChannel({ token, channelId, signal, timeoutMs = RECOVERY_LIMITS.timeoutMs, fetchImpl = globalThis.fetch }) {
+  if (typeof fetchImpl !== 'function') throw Object.assign(new Error('Discord channel fetch is unavailable'), { outcome: 'not_sent' });
+  if (signal?.aborted) throw Object.assign(new Error('Discord channel lookup stopped before request'), { outcome: 'not_sent' });
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  let timer;
+  const operation = (async () => {
+    let response;
+    try {
+      response = await fetchImpl(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bot ${token}`,
+          'User-Agent': 'DiscordBot (discord-surface, 0.1.0)'
+        },
+        signal: controller.signal
+      });
+    } catch (error) {
+      if (!error.outcome) error.outcome = 'not_sent';
+      throw error;
+    }
+    if (!response?.ok) {
+      await cancelResponseBody(response);
+      const error = new Error('Discord channel lookup request rejected');
+      error.status = response?.status;
+      error.outcome = response?.status === 429 ? 'rate_limited' : 'not_sent';
+      throw error;
+    }
+    let body;
+    try { body = await response.json(); }
+    catch (error) { await cancelResponseBody(response); error.outcome = 'not_sent'; throw error; }
+    if (typeof body?.id !== 'string' || typeof body?.guild_id !== 'string') {
+      throw Object.assign(new Error('Discord channel response lacks destination identity'), { outcome: 'not_sent' });
+    }
+    return body;
+  })();
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(Object.assign(new Error('Discord channel lookup deadline exceeded'), { outcome: 'not_sent' }));
+    }, Math.max(1, Number(timeoutMs)));
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+    controller.abort();
+    operation.catch(() => {});
+  }
+}
+
 function transportReceiptText(message, attempt) {
   if (attempt.readiness === 'ready') return 'Receipt: saved for this conductor.';
   return 'Receipt: saved. Delivery was paused when this receipt was prepared.';
 }
 
-function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {} }) {
+function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {}, agentCredential = () => null }) {
   const receiptWork = new Set();
   const nativeWork = new Map();
   const ownerQueues = new Map();
@@ -666,7 +720,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleMessage(message, signal, expectedBinding = null, onIntake = null) {
-    const intake = state.acceptDiscordMessage(eventToInput(message), { expectedBinding });
+    const intake = state.acceptDiscordMessage(eventToInput(message), { expectedBinding, agentToken: message.author?.bot && message.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null });
     if (!intake.stale) onIntake?.(message, intake);
     if (!intake.accepted) return intake;
     launchTransportReceipt(message);
@@ -674,7 +728,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false) {
-    const intake = await state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding });
+    const intake = await state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding, agentToken: message.author?.bot && message.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null });
     if (emitReceipt && intake.accepted) launchTransportReceipt(message);
     return intake;
   }
@@ -785,6 +839,7 @@ class DiscordGateway {
     this.consumer = createSurfaceConsumer({
       state,
       providers: this.providers,
+      agentCredential: () => this.discordToken,
       sendReply: (message, reply) => this.sendReply(message, reply),
       prepareReply: (messageId, signal) => this.prepareReply(messageId, signal),
       sendTransportReceipt: (message, receipt) => this.sendTransportReceipt(message, receipt),
@@ -1774,6 +1829,7 @@ module.exports = {
   createSurfaceConsumer,
   discordIdAfter,
   eventToInput,
+  fetchDiscordChannel,
   readSecret,
   requireInstalled,
   sendDiscordMessage,
