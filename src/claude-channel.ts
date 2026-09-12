@@ -43,11 +43,14 @@ export interface ClaudeMessage {
   channel?: unknown;
 }
 
-export interface ClaudeChannelState extends AcknowledgmentState {
+export interface ClaudeChannelState {
   findNativeBinding(nativeId: string, provider: NativeAcknowledgmentInput['provider']): ClaudeBinding | null | undefined;
   getBinding(channelId: string): ClaudeBinding | null | undefined;
   getMessage(messageId: string): ClaudeMessage | null | undefined;
   assertMessageCurrent(messageId: string, phase: string): ClaudeMessage;
+}
+
+export interface ClaudeAcknowledgmentState extends ClaudeChannelState, AcknowledgmentState {
   recordNativeReply(input: NativeAcknowledgmentInput & { text: string }): {
     duplicate: boolean;
     message: ClaudeMessage | null | undefined;
@@ -92,28 +95,36 @@ interface ClaudeChannelMcpBase {
 
 export interface ClaudeDefaultMcp<TTransport = unknown> extends ClaudeChannelMcpBase {
   setRequestHandler(schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>): void;
-  connect(transport: TTransport): Promise<void>;
-  transportFactory(): TTransport;
+  connect: (transport: TTransport) => Promise<void>;
+  transportFactory: () => TTransport;
 }
 
 export type ClaudeChannelMcp<TTransport = unknown> =
   | (ClaudeChannelMcpBase & {
-      connect(transport: TTransport): Promise<void>;
-      transportFactory(): TTransport;
+      connect: (transport: TTransport) => Promise<void>;
+      transportFactory: () => TTransport;
     })
   | (ClaudeChannelMcpBase & {
       connect?: undefined;
       transportFactory?: () => TTransport;
     });
 
-export interface ClaudeChannelOptions<TTransport = unknown> {
-  state: ClaudeChannelState;
+interface ClaudeChannelOptionsBase {
   nativeId: string;
   socketPath: string;
-  mcp?: ClaudeChannelMcp<TTransport>;
   onTransportClose?: (() => void) | null;
   logger?: (message: string) => void;
 }
+
+export type ClaudeChannelOptions<TTransport = unknown> =
+  | (ClaudeChannelOptionsBase & {
+      state: ClaudeAcknowledgmentState;
+      mcp?: undefined;
+    })
+  | (ClaudeChannelOptionsBase & {
+      state: ClaudeChannelState;
+      mcp: ClaudeChannelMcp<TTransport>;
+    });
 
 interface ClaudeBindingIdentity {
   channelId: string;
@@ -169,7 +180,7 @@ export function prepareSocket(socketPath: string): void {
   }
 }
 
-export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeChannelState }): ClaudeDefaultMcp {
+export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeAcknowledgmentState }): ClaudeDefaultMcp {
   const { Server } = requireInstalled('@modelcontextprotocol/sdk/server/index.js') as {
     Server: new (...args: unknown[]) => ClaudeDefaultMcp;
   };
@@ -233,12 +244,12 @@ export function createDefaultMcp({ nativeId, state }: { nativeId: string; state:
   return mcp;
 }
 
-export class ClaudeChannel {
+export class ClaudeChannel<TTransport = unknown> {
   declare bindingIdentity: ClaudeBindingIdentity;
   declare state: ClaudeChannelState;
   declare nativeId: string;
   declare socketPath: string;
-  declare mcp: ClaudeChannelMcp;
+  declare mcp: ClaudeChannelMcp<TTransport>;
   declare server: http.Server | null;
   declare ownsSocket: boolean;
   declare started: boolean;
@@ -249,8 +260,8 @@ export class ClaudeChannel {
   declare onTransportClose: (() => void) | null;
   declare logger: (message: string) => void;
 
-  constructor(options: ClaudeChannelOptions) {
-    const { state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} } = options || {} as ClaudeChannelOptions;
+  constructor(options: ClaudeChannelOptions<TTransport>) {
+    const { state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} } = options || {} as ClaudeChannelOptions<TTransport>;
     if (!state) throw new TypeError('state is required');
     validateNativeId(nativeId);
     assertSocketPath(socketPath);
@@ -270,7 +281,7 @@ export class ClaudeChannel {
     this.state = state;
     this.nativeId = nativeId;
     this.socketPath = socketPath;
-    this.mcp = mcp || createDefaultMcp({ nativeId, state });
+    this.mcp = mcp || createDefaultMcp({ nativeId, state: state as ClaudeAcknowledgmentState }) as ClaudeChannelMcp<TTransport>;
     this.server = null;
     this.ownsSocket = false;
     this.started = false;
