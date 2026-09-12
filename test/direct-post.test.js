@@ -9,7 +9,8 @@ const { main } = require('../src/cli');
 const { createSurfaceConsumer } = require('../src/discord');
 const { runDirectPost } = require('../src/direct-post');
 const { decodeAgentMessage, encodeAgentMessage, issueAgentAddress, KINDS } = require('../src/agent-message');
-const { AGENT_ATTACHMENT_CONTENT_TYPE, AGENT_ATTACHMENT_FILENAME, AGENT_PRESENTATIONS } = require('../src/agent-presentation');
+const { AGENT_ATTACHMENT_CONTENT_TYPE, AGENT_ATTACHMENT_FILENAME } = require('../src/agent-attachment');
+const { AGENT_PRESENTATIONS } = require('../src/agent-presentation');
 
 const CODEX = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CLAUDE = '79e3da8e-94b4-4aff-8f88-b45b3a451dd1';

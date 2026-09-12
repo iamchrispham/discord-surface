@@ -321,7 +321,8 @@ test('agent sender retries after a destination lookup failure classified as unse
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-const { createSurfaceConsumer, DiscordGateway } = require('../src/discord');
+const { createSurfaceConsumer, DiscordGateway, fetchAgentAttachment } = require('../src/discord');
+const { attachmentUrlAllowed } = require('../src/agent-attachment');
 
 test('agent nonces include source and destination identity', async () => {
   const nonces = [];
@@ -370,6 +371,90 @@ test('history consumer verifies credential before durable intake', async () => {
     assert.equal((await consumer.intakeMessage({ ...incoming, id: '7001' }, false)).accepted, false);
     assert.equal(state.listMessages().length, 1);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('malformed reserved attachment follows ordinary bot coverage without waking native work', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-metadata-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const state = new SurfaceState(db);
+  t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-attachment-metadata.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  const binding = state.getBinding(target.channelId);
+  state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
+  state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
+  let fetchCalls = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: {},
+    agentCredential: () => { throw new Error('malformed metadata must not request credentials'); },
+    agentAttachmentFetch: async () => { fetchCalls += 1; throw new Error('malformed metadata must not fetch'); }
+  });
+  const malformed = await consumer.intakeMessage({
+    id: '7000', guildId: target.guildId, channelId: target.channelId,
+    author: { id: '901', bot: true }, content: 'Agent request from codex to claude: readable preview',
+    attachments: [{ url: 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether', filename: 'agent-message.tether', contentType: 'text/plain', size: 12 }]
+  }, true, null, binding);
+  assert.equal(malformed.accepted, false);
+  assert.equal(malformed.reason, 'bot-source');
+  assert.equal(state.hasIntakeEvidence('7000'), true);
+  assert.equal(state.getIntakeWatermark(target.channelId).last_seen_id, '7000');
+  assert.equal(fetchCalls, 0);
+  const ordinary = await consumer.intakeMessage({
+    id: '7001', guildId: target.guildId, channelId: target.channelId,
+    author: { id: '900', bot: false }, content: 'healthy ordinary event'
+  }, true, null, binding);
+  assert.equal(ordinary.accepted, true);
+  assert.equal(state.getIntakeWatermark(target.channelId).last_seen_id, '7001');
+});
+
+test('attachment fetch bounds pre-abort, cleanup, deadline, and URL path', async () => {
+  const attachment = {
+    url: 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether',
+    filename: 'agent-message.tether', contentType: 'application/octet-stream', size: 1
+  };
+  assert.equal(attachmentUrlAllowed(attachment.url), true);
+  assert.equal(attachmentUrlAllowed('https://cdn.discordapp.com/not-an-attachment'), false);
+  const preAborted = new AbortController();
+  preAborted.abort();
+  let fetchCalls = 0;
+  await assert.rejects(
+    fetchAgentAttachment(attachment, { signal: preAborted.signal, fetchImpl: async () => { fetchCalls += 1; throw new Error('must not fetch'); } }),
+    error => error.recoveryKind === 'stopped'
+  );
+  assert.equal(fetchCalls, 0);
+
+  let cancelCalls = 0;
+  let releaseCalls = 0;
+  const hangingReader = {
+    read: () => new Promise(() => {}),
+    cancel: () => { cancelCalls += 1; return new Promise(() => {}); },
+    releaseLock: () => { releaseCalls += 1; }
+  };
+  const timedOut = fetchAgentAttachment(attachment, {
+    timeoutMs: 10,
+    fetchImpl: async () => ({ ok: true, status: 200, url: attachment.url, headers: { get: () => null }, body: { getReader: () => hangingReader } })
+  });
+  const timeoutError = await Promise.race([
+    timedOut.then(() => null, error => error),
+    new Promise(resolve => setTimeout(() => resolve(new Error('cleanup exceeded test bound')), 200))
+  ]);
+  assert.equal(timeoutError?.recoveryKind, 'deadline');
+  assert.equal(cancelCalls, 1);
+  assert.equal(releaseCalls, 1);
+
+  const deadline = Date.now() + 10;
+  const deadlineError = await assert.rejects(
+    fetchAgentAttachment(attachment, {
+      deadline,
+      fetchImpl: async () => {
+        await new Promise(resolve => setTimeout(resolve, 40));
+        return { ok: true, status: 200, url: attachment.url, headers: { get: () => null }, body: { getReader: () => ({ read: async () => ({ done: true }), cancel() {} }) } };
+      }
+    }),
+    error => error.recoveryKind === 'deadline'
+  );
+  assert.equal(deadlineError, undefined);
 });
 
 test('attachment intake stays outside coverage until refreshed recovery, then native restart needs no CDN', async t => {

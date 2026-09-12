@@ -8,10 +8,6 @@ export const AGENT_PRESENTATIONS = Object.freeze({
 
 export type AgentPresentation = typeof AGENT_PRESENTATIONS[keyof typeof AGENT_PRESENTATIONS];
 
-export const AGENT_ATTACHMENT_FILENAME = 'agent-message.tether';
-export const AGENT_ATTACHMENT_CONTENT_TYPE = 'application/octet-stream';
-export const AGENT_ATTACHMENT_MAX_BYTES = 2000;
-
 const PREVIEW_EXCERPT_LIMIT = 240;
 
 function previewExcerpt(text: string): string {
