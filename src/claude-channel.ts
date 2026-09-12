@@ -7,6 +7,7 @@ import type {
   NativeAcknowledgmentInput
 } from './acknowledgment';
 import type { Attachment } from './attachments';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import type { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 const { recordNativeAcknowledgment } = require('./acknowledgment') as typeof import('./acknowledgment');
@@ -50,12 +51,12 @@ export interface ClaudeChannelReadState {
   findNativeBinding(nativeId: string, provider: NativeAcknowledgmentInput['provider']): ClaudeBinding | null | undefined;
   getBinding(channelId: string): ClaudeBinding | null | undefined;
   getMessage(messageId: string): ClaudeChannelReadMessage | null | undefined;
-  assertMessageCurrent: (messageId: string, phase: string) => ClaudeChannelReadMessage | void;
+  assertMessageCurrent: (messageId: string, phase: 'native-dispatch') => ClaudeChannelReadMessage | void;
 }
 
 export interface ClaudeChannelState extends ClaudeChannelReadState {
   getMessage(messageId: string): ClaudeMessage | null | undefined;
-  assertMessageCurrent: (messageId: string, phase: string) => ClaudeMessage;
+  assertMessageCurrent: (messageId: string, phase: 'native-dispatch') => ClaudeMessage;
 }
 
 export type ClaudeAcknowledgmentState = ClaudeChannelState & AcknowledgmentState & {
@@ -92,29 +93,23 @@ export interface ClaudeChannelNotification {
   };
 }
 
-interface ClaudeMcpRequest {
-  params: {
-    name: string;
-    arguments?: Record<string, unknown>;
-  };
-}
-
 interface ClaudeChannelMcpBase {
   notification: (notification: ClaudeChannelNotification) => Promise<unknown> | unknown;
-  close?: () => Promise<void> | void;
+  close?: () => unknown;
   onclose?: (() => void) | null;
   onerror?: ((error: Error) => void) | null;
 }
 
-export interface ClaudeDefaultMcp<TTransport = unknown> extends ClaudeChannelMcpBase {
-  setRequestHandler(schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>): void;
+export interface ClaudeDefaultMcp<TTransport = unknown> extends Omit<ClaudeChannelMcpBase, 'close'> {
+  close: Server['close'];
+  setRequestHandler: Server['setRequestHandler'];
   connect: (transport: TTransport) => Promise<void>;
   transportFactory: () => TTransport;
 }
 
 export type ClaudeChannelMcp<TTransport = unknown> =
   | (ClaudeChannelMcpBase & {
-      connect: (transport: TTransport) => void | Promise<void>;
+      connect: (transport: TTransport) => unknown;
       transportFactory: () => TTransport;
     })
   | (ClaudeChannelMcpBase & {
@@ -195,14 +190,14 @@ export function prepareSocket(socketPath: string): void {
 
 export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeDefaultMcpState }): ClaudeDefaultMcp<StdioServerTransport> {
   const { Server } = requireInstalled('@modelcontextprotocol/sdk/server/index.js') as {
-    Server: new (...args: unknown[]) => ClaudeDefaultMcp<StdioServerTransport>;
+    Server: new (...args: ConstructorParameters<typeof import('@modelcontextprotocol/sdk/server/index.js').Server>) => ClaudeDefaultMcp<StdioServerTransport>;
   };
   const { StdioServerTransport } = requireInstalled('@modelcontextprotocol/sdk/server/stdio.js') as {
     StdioServerTransport: new () => StdioServerTransport;
   };
   const { ListToolsRequestSchema, CallToolRequestSchema } = requireInstalled('@modelcontextprotocol/sdk/types.js') as {
-    ListToolsRequestSchema: unknown;
-    CallToolRequestSchema: unknown;
+    ListToolsRequestSchema: typeof import('@modelcontextprotocol/sdk/types.js').ListToolsRequestSchema;
+    CallToolRequestSchema: typeof import('@modelcontextprotocol/sdk/types.js').CallToolRequestSchema;
   };
   const mcp = new Server(
     { name: 'discord-surface-claude-channel', version: '0.1.0' },

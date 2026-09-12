@@ -10,6 +10,8 @@ import {
   createDefaultMcp
 } from '../src/claude-channel';
 import type { AcknowledgmentState, NativeAcknowledgmentInput } from '../src/acknowledgment';
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import type { ListToolsRequest } from '@modelcontextprotocol/sdk/types.js';
 
 declare const state: ClaudeChannelReadState;
 
@@ -40,6 +42,20 @@ const asyncAssertionState = {
 // @ts-expect-error read-state assertions are synchronous because handleEvent does not await them
 const invalidAsyncAssertionState: ClaudeChannelReadState = asyncAssertionState;
 void invalidAsyncAssertionState;
+
+const literalPhaseReadState: ClaudeChannelReadState = {
+  ...synchronousAssertionState,
+  assertMessageCurrent: (_messageId: string, phase: 'native-dispatch') => {
+    phase satisfies 'native-dispatch';
+  }
+};
+void literalPhaseReadState;
+
+const literalPhaseRichAssertion: ClaudeChannelState['assertMessageCurrent'] = (_messageId, phase: 'native-dispatch') => {
+  phase satisfies 'native-dispatch';
+  throw new Error('type fixture');
+};
+void literalPhaseRichAssertion;
 
 const injectedMcpWithOwnHandler = {
   notification: async () => {},
@@ -87,6 +103,33 @@ new ClaudeChannel({
   nativeId: event.nativeId,
   socketPath: '/tmp/claude-channel-concrete.sock',
   mcp: concreteTransportMcp
+});
+
+const ignoredSynchronousResultMcp: ClaudeChannelMcp<{ marker: string }> = {
+  notification: async () => {},
+  connect: transport => ({ connected: transport.marker }),
+  close: () => ({ closed: true }),
+  transportFactory: () => ({ marker: 'sync-result' })
+};
+new ClaudeChannel({
+  state,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-sync-result.sock',
+  mcp: ignoredSynchronousResultMcp
+});
+
+const ignoredThenableResult: PromiseLike<{ closed: boolean }> = Promise.resolve({ closed: true });
+const ignoredPromiseResultMcp: ClaudeChannelMcp<{ marker: string }> = {
+  notification: async () => {},
+  connect: async transport => ({ connected: transport.marker }),
+  close: () => ignoredThenableResult,
+  transportFactory: () => ({ marker: 'promise-result' })
+};
+new ClaudeChannel({
+  state,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-promise-result.sock',
+  mcp: ignoredPromiseResultMcp
 });
 
 const inferredValidMcp = {
@@ -176,6 +219,13 @@ const minimalDefaultState: MinimalDefaultMcpState = {
 };
 const defaultMcp = createDefaultMcp({ nativeId: event.nativeId, state: minimalDefaultState });
 void defaultMcp.connect(defaultMcp.transportFactory());
+void defaultMcp.close();
+defaultMcp.setRequestHandler(ListToolsRequestSchema, async (request: ListToolsRequest) => {
+  void request.params?.cursor;
+  return { tools: [] };
+});
+// @ts-expect-error request handlers accept only installed SDK schemas
+defaultMcp.setRequestHandler({ kind: 'invalid-schema' }, async () => ({ tools: [] }));
 // @ts-expect-error the default helper always creates a StdioServerTransport
 void defaultMcp.connect({});
 
