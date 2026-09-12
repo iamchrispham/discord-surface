@@ -27,9 +27,11 @@ const {
   validateNativeId: (value: unknown) => unknown;
 };
 
-export type NativeProvider = 'codex' | 'claude';
+export const NATIVE_PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' } as const);
+export type NativeProvider = typeof NATIVE_PROVIDERS[keyof typeof NATIVE_PROVIDERS];
 export type MessageState = typeof MESSAGE_STATES[keyof typeof MESSAGE_STATES];
-export type AcknowledgmentOutcome = 'sent' | 'stale' | 'failed' | 'unknown';
+export const ACK_OUTCOMES = Object.freeze({ SENT: 'sent', STALE: 'stale', FAILED: 'failed', UNKNOWN: 'unknown' } as const);
+export type AcknowledgmentOutcome = typeof ACK_OUTCOMES[keyof typeof ACK_OUTCOMES];
 
 interface SqlRow {
   [key: string]: unknown;
@@ -76,6 +78,13 @@ export interface NativeAcknowledgmentInput {
   generation: number;
 }
 
+export interface AcknowledgmentCommandInput {
+  id: string;
+  provider: NativeProvider;
+  nativeId: string;
+  generation: number;
+}
+
 export interface NativeAcknowledgmentResult {
   recorded: boolean;
   duplicate: boolean;
@@ -105,7 +114,6 @@ export interface AcknowledgmentWatchOptions {
 }
 
 export const ACK = Object.freeze({ RECEIVED: NATIVE_ACK_RECEIPT, OUTCOME: 'native-ack-reaction' } as const);
-const ACK_OUTCOMES = Object.freeze({ SENT: 'sent', STALE: 'stale', FAILED: 'failed', UNKNOWN: 'unknown' } as const);
 export const ACK_WAITING = Symbol('native-acknowledgment-waiting');
 export const REACTION = Object.freeze({ SAVED: '📥', ACKNOWLEDGED: '👀' } as const);
 const ACK_RETRY = Object.freeze({ BASE_MS: 250, MAX_MS: 60000, MAX_ATTEMPTS: 8 } as const);
@@ -156,7 +164,7 @@ function retryableUnknown(detail: unknown): detail is Record<string, unknown> & 
   return isRecord(detail) && detail.outcome === ACK_OUTCOMES.UNKNOWN && !detail.terminal && Number.isFinite(detail.retryAt);
 }
 
-function acknowledgmentCommand(message: AcknowledgmentMessage, dbPath: string, cliPath = path.join(__dirname, 'cli.js')): string[] {
+function acknowledgmentCommand(message: AcknowledgmentCommandInput, dbPath: string, cliPath = path.join(__dirname, '..', 'src', 'cli.js')): string[] {
   return [process.execPath, cliPath, 'native-ack', '--db', dbPath,
     '--provider', message.provider, '--message-id', message.id,
     '--native-id', message.nativeId, '--generation', String(message.generation)];
@@ -167,7 +175,7 @@ function recordNativeAcknowledgment(
   { provider, messageId, nativeId, generation }: NativeAcknowledgmentInput
 ): NativeAcknowledgmentResult {
   validateNativeId(nativeId);
-  if (!['codex', 'claude'].includes(provider) || !Number.isInteger(generation) || generation < 1) {
+  if (!Object.values(NATIVE_PROVIDERS).includes(provider) || !Number.isInteger(generation) || generation < 1) {
     throw new Error('invalid native acknowledgment identity');
   }
   return state.transaction(() => {
