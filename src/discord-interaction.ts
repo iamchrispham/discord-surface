@@ -25,7 +25,7 @@ export const CS_COMMAND = Object.freeze({
   }])
 } as const);
 
-export const SAVED_CALLBACK_CONTENT = 'Receipt: saved for this conductor.';
+export const SAVED_CALLBACK_CONTENT = '/cs received';
 
 interface InteractionOption {
   name?: unknown;

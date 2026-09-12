@@ -143,6 +143,7 @@ export function createInteractionHandlers(): {
       return state.transaction(() => {
         const binding = state.getBinding(input.channelId);
         if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
+        if (!binding?.active) return { accepted: false, reason: 'inactive-binding' };
         if (input.guildId !== config.guildId || input.userId !== config.operatorId) return { accepted: false, reason: 'unauthorized-interaction' };
         if (state.ordinaryHandoffPauses?.has(input.channelId) || state.getIntakeWatermark?.(input.channelId)?.detail === 'ordinary handoff fence') {
           return { accepted: false, reason: 'handoff-intake-paused' };

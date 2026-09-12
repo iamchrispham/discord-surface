@@ -102,6 +102,91 @@ test('strict /cs parser and single-command guild upsert preserve command scope',
   assert.deepEqual(created, { command: CS_COMMAND, guildId: 'guild' });
 });
 
+test('command registration failure is reported without taking down the ordinary Gateway path', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-cs-startup-'));
+  const secretFile = path.join(dir, 'discord.secret');
+  fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile });
+  state.bind({ channelId: 'channel', guildId: 'guild', provider: 'codex', nativeId: NATIVE_ID, workspace: dir });
+  state.setBindingReadiness('channel', 'ready');
+
+  const listeners = new Map();
+  const logs = [];
+  let destroyCalls = 0;
+  const client = {
+    application: {
+      id: 'application',
+      commands: {
+        async fetch() { throw Object.assign(new Error('registration transport unavailable'), { status: 503 }); }
+      }
+    },
+    on(name, listener) { listeners.set(name, listener); },
+    off(name, listener) { if (listeners.get(name) === listener) listeners.delete(name); },
+    async login() {},
+    async destroy() { destroyCalls += 1; }
+  };
+  const gateway = new DiscordGateway({ state, client, providers: {}, logger: message => logs.push(message) });
+  gateway.recoverTransport = async () => {
+    gateway.ready = true;
+    return { ready: true, state: 'ready' };
+  };
+  let ordinaryCalls = 0;
+  gateway.consumer.handleMessage = async message => {
+    ordinaryCalls += 1;
+    return { accepted: true, message };
+  };
+
+  try {
+    await gateway.start(secretFile);
+    assert.equal(gateway.started, true);
+    assert.equal(gateway.transportReady, true);
+    assert.equal(destroyCalls, 0);
+    assert.equal(typeof listeners.get('messageCreate'), 'function');
+    assert.deepEqual(logs, ['Discord application command registration failed: registration transport unavailable']);
+
+    listeners.get('messageCreate')({
+      id: 'ordinary-after-registration-failure',
+      guildId: 'guild',
+      channelId: 'channel',
+      author: { id: 'operator', bot: false },
+      content: 'ordinary path',
+      channel: { id: 'channel' }
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ordinaryCalls, 1);
+  } finally {
+    await gateway.stop();
+    state.close();
+  }
+  assert.equal(destroyCalls, 1);
+});
+
+test('inactive binding rejects interaction admission while active binding control succeeds', () => {
+  const inactiveFixture = fixture();
+  try {
+    inactiveFixture.state.unbind('channel');
+    const parsed = parseCsInteraction(interaction('inactive-binding'), 'application');
+    const rejected = inactiveFixture.state.acceptInteraction(parsed, inactiveFixture.state.getBinding('channel'));
+    assert.equal(rejected.accepted, false);
+    assert.equal(rejected.reason, 'inactive-binding');
+    assert.equal(inactiveFixture.state.getMessage('inactive-binding'), null);
+    assert.equal(inactiveFixture.state.listReceipts().filter(row => row.discord_id === 'inactive-binding' && row.kind === 'interaction-origin').length, 0);
+  } finally {
+    closeFixture(inactiveFixture);
+  }
+
+  const activeFixture = fixture();
+  try {
+    const parsed = parseCsInteraction(interaction('active-binding'), 'application');
+    const accepted = activeFixture.state.acceptInteraction(parsed, activeFixture.state.getBinding('channel'));
+    assert.equal(accepted.accepted, true);
+    assert.equal(activeFixture.state.getMessage('active-binding').content, '/cs');
+  } finally {
+    closeFixture(activeFixture);
+  }
+});
+
 test('interaction admission is atomic, duplicate-safe, and outside history evidence', () => {
   const fixtureState = fixture();
   const { state } = fixtureState;
@@ -151,6 +236,7 @@ test('type-4 callback is one-shot, non-ephemeral, and records the documented res
   assert.equal(captured.init.method, 'POST');
   assert.match(captured.url, /\/interactions\/callback-1\/token-callback-1\/callback\?with_response=true$/);
   const body = JSON.parse(captured.init.body);
+  assert.equal(body.data.content, '/cs received');
   assert.deepEqual(body, { type: 4, data: { content: SAVED_CALLBACK_CONTENT, allowed_mentions: { parse: [] } } });
   assert.equal('flags' in body.data, false);
 });

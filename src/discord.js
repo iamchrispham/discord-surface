@@ -1143,7 +1143,11 @@ class DiscordGateway {
       this.discordToken = token;
       await this.client.login(token);
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord startup was stopped during login');
-      await this.registerApplicationCommand();
+      try {
+        await this.registerApplicationCommand();
+      } catch (error) {
+        this.logger(`Discord application command registration failed: ${error.message}`);
+      }
       for (const binding of this.state.listBindings().filter(binding => binding.active)) {
         this.state.recoverInterruptedOrdinaryHandoffIntake?.(binding.channelId, binding);
       }
