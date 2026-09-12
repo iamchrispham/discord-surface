@@ -157,7 +157,8 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
   return {
     hasIntakeEvidence(state, discordId) {
       assertText(discordId, 'discordId', 128);
-      const row = state.db.prepare(`SELECT 1 FROM messages WHERE discord_id=?
+      const row = state.db.prepare(`SELECT 1 FROM messages message WHERE message.discord_id=?
+        AND NOT EXISTS (SELECT 1 FROM receipts origin WHERE origin.discord_id=message.discord_id AND origin.kind='interaction-origin')
         UNION ALL SELECT 1 FROM receipts WHERE kind='intake-rejected'
           AND json_extract(detail, '$.discordId')=?
           AND json_extract(detail, '$.reason') IN ('bot-source', 'automatic-publication', 'unauthorized-sender', 'invalid-event', 'agent-message-duplicate')
@@ -165,7 +166,12 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
           AND json_extract(detail, '$.messageId')=?
           AND json_extract(detail, '$.deliveryChannelId') IS NULL
           AND json_extract(detail, '$.outcome')='sent'
-        LIMIT 1`).get(discordId, discordId, discordId);
+        UNION ALL SELECT 1 FROM receipts callback
+          WHERE callback.kind='transport-receipt-outcome'
+            AND json_extract(callback.detail, '$.transport')='interaction-callback'
+            AND json_extract(callback.detail, '$.responseMessageId')=?
+            AND callback.discord_id<>?
+        LIMIT 1`).get(discordId, discordId, discordId, discordId, discordId);
       return Boolean(row);
     },
 

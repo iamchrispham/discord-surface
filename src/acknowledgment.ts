@@ -287,9 +287,24 @@ function createAcknowledgmentDelivery({ state, send }: { state: AcknowledgmentSt
       try { message = acknowledgedMessage(state, id); }
       catch { outcome(id, ACK_OUTCOMES.STALE); return; }
       try {
-        await send(message, REACTION.ACKNOWLEDGED);
-        outcome(id, ACK_OUTCOMES.SENT, { reaction: REACTION.ACKNOWLEDGED, targetMessageId: id });
+        const sent = await send(message, REACTION.ACKNOWLEDGED);
+        const targetMessageId = property(sent, 'targetMessageId');
+        outcome(id, ACK_OUTCOMES.SENT, {
+          reaction: REACTION.ACKNOWLEDGED,
+          targetMessageId: typeof targetMessageId === 'string' && targetMessageId.length > 0 ? targetMessageId : id
+        });
       } catch (error: unknown) {
+        const visibility = property(error, 'visibility');
+        if (visibility === 'local' || property(error, 'outcome') === 'local_visibility_failure') {
+          const targetMessageId = property(error, 'targetMessageId');
+          outcome(id, ACK_OUTCOMES.FAILED, {
+            error: String(property(error, 'message') || error).slice(0, 200),
+            ...(typeof targetMessageId === 'string' ? { targetMessageId } : {}),
+            visibility: 'local',
+            terminal: true
+          });
+          return;
+        }
         if (error instanceof StaleGenerationError || error instanceof AuthorizationError) {
           outcome(id, ACK_OUTCOMES.STALE, { error: String(property(error, 'message') || error).slice(0, 200) });
           return;
