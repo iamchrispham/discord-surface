@@ -16,7 +16,17 @@ const channel: HandoffChannel = {
   }
 };
 
-const binding: HandoffBinding = { channelId: '123456789012345678' };
+const binding: HandoffBinding = {
+  active: true,
+  channelId: '123456789012345678',
+  guildId: 'guild',
+  provider: 'codex',
+  nativeId: '79e3da8e-94b4-4aff-8f88-b45b3a451dd1',
+  generation: 1,
+  sessionRoot: null,
+  conductorId: 'conductor',
+  repoKey: 'github.com/example/repo'
+};
 const state: HandoffState = {
   checkpointIntake: () => ({ state: 'ready' }),
   hasIntakeEvidence: () => true

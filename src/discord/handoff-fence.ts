@@ -20,7 +20,15 @@ export interface HandoffChannel {
 }
 
 export interface HandoffBinding {
+  active: boolean;
   channelId: string;
+  guildId: string;
+  provider: string;
+  nativeId: string;
+  generation: number;
+  sessionRoot: string | null;
+  conductorId: string | null;
+  repoKey: string | null;
 }
 
 export interface HandoffState {
