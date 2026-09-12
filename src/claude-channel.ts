@@ -90,27 +90,27 @@ interface ClaudeChannelMcpBase {
   onerror?: ((error: unknown) => void) | null;
 }
 
-export interface ClaudeDefaultMcp extends ClaudeChannelMcpBase {
+export interface ClaudeDefaultMcp<TTransport = unknown> extends ClaudeChannelMcpBase {
   setRequestHandler(schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>): void;
-  connect: (transport: unknown) => Promise<void>;
-  transportFactory: () => unknown;
+  connect(transport: TTransport): Promise<void>;
+  transportFactory(): TTransport;
 }
 
-export type ClaudeChannelMcp =
+export type ClaudeChannelMcp<TTransport = unknown> =
   | (ClaudeChannelMcpBase & {
-      connect: (transport: unknown) => Promise<void>;
-      transportFactory: () => unknown;
+      connect(transport: TTransport): Promise<void>;
+      transportFactory(): TTransport;
     })
   | (ClaudeChannelMcpBase & {
       connect?: undefined;
-      transportFactory?: () => unknown;
+      transportFactory?: () => TTransport;
     });
 
-export interface ClaudeChannelOptions {
+export interface ClaudeChannelOptions<TTransport = unknown> {
   state: ClaudeChannelState;
   nativeId: string;
   socketPath: string;
-  mcp?: ClaudeChannelMcp;
+  mcp?: ClaudeChannelMcp<TTransport>;
   onTransportClose?: (() => void) | null;
   logger?: (message: string) => void;
 }
