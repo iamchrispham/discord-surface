@@ -82,15 +82,23 @@ interface ClaudeMcpRequest {
   };
 }
 
-export interface ClaudeChannelMcp {
+interface ClaudeChannelMcpBase {
   setRequestHandler(schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>): void;
   notification(notification: ClaudeChannelNotification): Promise<unknown> | unknown;
-  transportFactory?: () => unknown;
-  connect?: (transport: unknown) => Promise<void>;
   close?: () => Promise<void> | void;
   onclose?: (() => void) | null;
   onerror?: ((error: unknown) => void) | null;
 }
+
+export type ClaudeChannelMcp =
+  | (ClaudeChannelMcpBase & {
+      connect: (transport: unknown) => Promise<void>;
+      transportFactory: () => unknown;
+    })
+  | (ClaudeChannelMcpBase & {
+      connect?: undefined;
+      transportFactory?: () => unknown;
+    });
 
 export interface ClaudeChannelOptions {
   state: ClaudeChannelState;
