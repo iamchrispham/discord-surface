@@ -4,8 +4,24 @@ type AgentMessage = import('./agent-message').AgentMessage;
 type AgentMessageKind = import('./agent-message').AgentMessageKind;
 type AgentProvider = import('./agent-message').AgentProvider;
 
-export type DirectPostOutcome = 'sent' | 'not_sent' | 'rejected' | 'rate_limited' | 'unknown' | 'stale';
-export type DirectPostPartStatus = DirectPostOutcome | 'claimed' | 'in_flight';
+export const DIRECT_POST_OUTCOMES = {
+  SENT: 'sent',
+  NOT_SENT: 'not_sent',
+  REJECTED: 'rejected',
+  RATE_LIMITED: 'rate_limited',
+  UNKNOWN: 'unknown',
+  STALE: 'stale'
+} as const;
+
+export type DirectPostOutcome = (typeof DIRECT_POST_OUTCOMES)[keyof typeof DIRECT_POST_OUTCOMES];
+
+export const DIRECT_POST_PART_STATUSES = {
+  ...DIRECT_POST_OUTCOMES,
+  CLAIMED: 'claimed',
+  IN_FLIGHT: 'in_flight'
+} as const;
+
+export type DirectPostPartStatus = (typeof DIRECT_POST_PART_STATUSES)[keyof typeof DIRECT_POST_PART_STATUSES];
 
 export interface DirectPostBinding {
   active: boolean;
@@ -115,11 +131,19 @@ export interface DirectPostResult {
   parts: DirectPostPartResult[];
 }
 
-export interface FetchResponse {
-  ok?: boolean;
+export interface FetchSuccessResponse {
+  ok: true;
+  status?: number;
+  json: () => Promise<unknown>;
+}
+
+export interface FetchFailureResponse {
+  ok?: false;
   status?: number;
   json?: () => Promise<unknown>;
 }
+
+export type FetchResponse = FetchSuccessResponse | FetchFailureResponse;
 
 export interface FetchOptions {
   [key: string]: unknown;
@@ -167,7 +191,6 @@ const fs = require('node:fs') as typeof import('node:fs');
 const path = require('node:path') as typeof import('node:path');
 const {
   BindingError,
-  DIRECT_POST_OUTCOMES,
   PROVIDERS,
   StaleGenerationError,
   discordNonce,
@@ -175,7 +198,6 @@ const {
   validateNativeId
 } = require('../src/state') as {
   BindingError: new (message?: string) => Error;
-  DIRECT_POST_OUTCOMES: readonly DirectPostOutcome[];
   PROVIDERS: Readonly<Record<string, string>>;
   StaleGenerationError: new (message?: string) => Error;
   discordNonce: (scope: string) => string;
@@ -370,7 +392,7 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
 
 function outcomeFor(error: unknown): DirectPostOutcome {
   const outcome = (error as { outcome?: unknown } | null | undefined)?.outcome;
-  return typeof outcome === 'string' && DIRECT_POST_OUTCOMES.includes(outcome as DirectPostOutcome)
+  return typeof outcome === 'string' && Object.values(DIRECT_POST_OUTCOMES).includes(outcome as DirectPostOutcome)
     ? outcome as DirectPostOutcome
     : 'unknown';
 }

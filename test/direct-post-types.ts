@@ -41,6 +41,9 @@ const fetchImpl: FetchImplementation = async (_url, _options) => ({
   json: async () => ({ id: 'message' })
 });
 
+// @ts-expect-error successful responses must provide JSON decoding
+const incompleteFetchImpl: FetchImplementation = async (_url, _options) => ({ ok: true, status: 200 });
+
 const input: DirectPostInput = {
   state,
   token: 'token',
@@ -63,6 +66,7 @@ const resolvedBinding: DirectPostBinding = resolveDirectBinding(state, {
 const invalidBinding: DirectPostBinding = { ...binding, provider: 'other' };
 
 void result;
+void incompleteFetchImpl;
 void requestId;
 void resolvedBinding;
 void invalidBinding;
