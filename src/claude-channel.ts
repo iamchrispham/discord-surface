@@ -90,7 +90,7 @@ interface ClaudeChannelMcpBase {
   onerror?: ((error: unknown) => void) | null;
 }
 
-interface ClaudeDefaultMcp extends ClaudeChannelMcpBase {
+export interface ClaudeDefaultMcp extends ClaudeChannelMcpBase {
   setRequestHandler(schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>): void;
   connect: (transport: unknown) => Promise<void>;
   transportFactory: () => unknown;
@@ -169,7 +169,7 @@ export function prepareSocket(socketPath: string): void {
   }
 }
 
-export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeChannelState }): ClaudeChannelMcp {
+export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeChannelState }): ClaudeDefaultMcp {
   const { Server } = requireInstalled('@modelcontextprotocol/sdk/server/index.js') as {
     Server: new (...args: unknown[]) => ClaudeDefaultMcp;
   };
@@ -249,7 +249,8 @@ export class ClaudeChannel {
   declare onTransportClose: (() => void) | null;
   declare logger: (message: string) => void;
 
-  constructor({ state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} }: ClaudeChannelOptions = {} as ClaudeChannelOptions) {
+  constructor(options: ClaudeChannelOptions) {
+    const { state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} } = options || {} as ClaudeChannelOptions;
     if (!state) throw new TypeError('state is required');
     validateNativeId(nativeId);
     assertSocketPath(socketPath);
