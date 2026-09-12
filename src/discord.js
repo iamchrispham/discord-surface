@@ -5,6 +5,7 @@ const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvide
 const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
+const { parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 
 const requireInstalled = require;
 const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
@@ -734,12 +735,12 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleStoredMessage(message, signal, { continueUntilFinal = false, handoff = false, awaitDispatchOutcome = false } = {}) {
-    launchTransportReceipt(message);
+    if (!state.isInteractionMessage?.(message.id)) launchTransportReceipt(message);
     return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff, awaitDispatchOutcome });
   }
 
   function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false } = {}) {
-    launchTransportReceipt(message);
+    if (!state.isInteractionMessage?.(message.id)) launchTransportReceipt(message);
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) {
       releaseAcknowledged(message.id);
@@ -777,10 +778,11 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
 }
 
 class DiscordGateway {
-  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null } = {}) {
+  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null, interactionFetch = globalThis.fetch } = {}) {
     this.state = state;
     this.logger = logger;
     this.onReady = typeof onReady === 'function' ? onReady : null;
+    this.interactionFetch = interactionFetch;
     this.client = client || this.createClient();
     this.discordToken = null;
     this.acknowledgments = null;
@@ -881,6 +883,16 @@ class DiscordGateway {
       this.inFlight.add(work);
       work.finally(() => this.inFlight.delete(work));
     };
+    this.boundInteraction = interaction => {
+      if (this.stopping) return;
+      const controller = new AbortController();
+      this.controllers.add(controller);
+      const work = this.handleInteraction(interaction, controller.signal)
+        .catch(error => this.logger(`interaction handling failed: ${error.message}`))
+        .finally(() => this.controllers.delete(controller));
+      this.inFlight.add(work);
+      work.finally(() => this.inFlight.delete(work));
+    };
     this.boundResume = () => {
       return this.beginReconnectRecovery('resume');
     };
@@ -891,11 +903,44 @@ class DiscordGateway {
       return this.beginReconnectRecovery(`shard-ready${shardId === undefined ? '' : ` (${shardId})`}`);
     };
     this.client.on('messageCreate', this.boundMessage);
+    this.client.on?.('interactionCreate', this.boundInteraction);
     this.client.on?.('shardResume', this.boundResume);
     this.client.on?.('resume', this.boundResume);
     this.client.on?.('shardDisconnect', this.boundDisconnect);
     this.client.on?.('shardReconnecting', this.boundReconnecting);
     this.client.on?.('shardReady', this.boundShardReady);
+  }
+
+  async handleInteraction(interaction, signal) {
+    const expectedApplicationId = this.client.application?.id || null;
+    const parsed = parseCsInteraction(interaction, expectedApplicationId);
+    if (!parsed) return { accepted: false, reason: 'invalid-interaction' };
+    const binding = this.state.getBinding(parsed.channelId);
+    const accepted = this.state.acceptInteraction(parsed, binding);
+    if (!accepted.accepted || accepted.duplicate) return accepted;
+    const callback = this.state.beginInteractionCallback(parsed.id);
+    if (callback.started) {
+      let result;
+      try {
+        result = await sendInteractionCallback(parsed, { signal, fetchImpl: this.interactionFetch });
+      } catch (error) {
+        result = { outcome: 'unknown', reason: String(error?.message || error).slice(0, 200) };
+      }
+      this.state.recordInteractionCallbackOutcome(parsed.id, result.outcome, {
+        ...(result.responseMessageId ? { responseMessageId: result.responseMessageId } : {}),
+        ...(result.statusCode === undefined ? {} : { statusCode: result.statusCode }),
+        ...(result.reason ? { reason: result.reason } : {}),
+        ...(result.visibility ? { visibility: result.visibility } : {}),
+        ...(result.terminal ? { terminal: true } : {})
+      });
+    }
+    const message = this.state.getMessage(parsed.id);
+    if (!message) return { accepted: false, reason: 'interaction-custody-missing' };
+    return this.consumer.processAccepted(message, signal);
+  }
+
+  async registerApplicationCommand() {
+    return upsertGuildCsCommand(this.client.application?.commands, this.state.requireConfig().guildId);
   }
 
   createClient() {
@@ -931,6 +976,13 @@ class DiscordGateway {
   async sendAcknowledgment(message, reaction) {
     if (this.stopping) throw new Error('Discord acknowledgment stopped');
     this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
+    const interaction = this.state.isInteractionMessage?.(message.id);
+    const targetMessageId = interaction ? this.state.interactionResponseTarget?.(message.id) : message.id;
+    if (interaction && !targetMessageId) {
+      throw Object.assign(new Error('interaction callback response target is unavailable'), {
+        outcome: 'local_visibility_failure', visibility: 'local', targetMessageId: null
+      });
+    }
     let source = message;
     if (!source.channel && !(this.discordToken && this.client?.rest)) {
       const channel = await this.client.channels?.fetch?.(message.channelId);
@@ -938,7 +990,15 @@ class DiscordGateway {
       source = { ...message, channel };
     }
     this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
-    return this.sendTransportReceipt(source, { reaction });
+    try {
+      return await this.sendTransportReceipt(source, { reaction, targetMessageId: targetMessageId || message.id });
+    } catch (error) {
+      if ([400, 401, 403, 404].includes(Number(error?.status))) {
+        error.visibility = 'local';
+        error.targetMessageId = targetMessageId || message.id;
+      }
+      throw error;
+    }
   }
 
   async sendTransportReceipt(message, receipt) {
@@ -951,7 +1011,8 @@ class DiscordGateway {
         if (this.discordToken && this.client?.rest && typeof globalThis.fetch === 'function') {
           if (receipt.reaction) {
             const channelId = message.channelId || message.channel.id;
-            const url = `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(message.id)}/reactions/${encodeURIComponent(receipt.reaction)}/@me`;
+            const targetMessageId = receipt.targetMessageId || message.id;
+            const url = `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(targetMessageId)}/reactions/${encodeURIComponent(receipt.reaction)}/@me`;
             sendPromise = globalThis.fetch(url, {
               method: 'PUT',
               headers: {
@@ -973,7 +1034,7 @@ class DiscordGateway {
                 throw error;
               }
               await cancelResponseBody(response);
-              return { id: message.id, reaction: receipt.reaction };
+              return { id: targetMessageId, targetMessageId, reaction: receipt.reaction };
             });
           } else {
             sendPromise = sendDiscordMessage({
@@ -987,13 +1048,15 @@ class DiscordGateway {
           throw new Error('Discord transport receipt fetch is unavailable');
         } else {
           const reactToFetchedMessage = async () => {
-            const source = await message.channel.messages.fetch(message.id);
+            const targetMessageId = receipt.targetMessageId || message.id;
+            const source = await message.channel.messages.fetch(targetMessageId);
             this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
             return source.react(receipt.reaction);
           };
+          const targetMessageId = receipt.targetMessageId || message.id;
           sendPromise = receipt.reaction
-            ? Promise.resolve(message.react ? message.react(receipt.reaction) : reactToFetchedMessage())
-              .then(() => ({ id: message.id, reaction: receipt.reaction }))
+            ? Promise.resolve(message.react && targetMessageId === message.id ? message.react(receipt.reaction) : reactToFetchedMessage())
+              .then(() => ({ id: targetMessageId, targetMessageId, reaction: receipt.reaction }))
             : message.channel.send({
               content: receipt.content,
               nonce: receipt.nonce,
@@ -1080,6 +1143,7 @@ class DiscordGateway {
       this.discordToken = token;
       await this.client.login(token);
       if (!this.isCurrentLifecycle(epoch)) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord startup was stopped during login');
+      await this.registerApplicationCommand();
       for (const binding of this.state.listBindings().filter(binding => binding.active)) {
         this.state.recoverInterruptedOrdinaryHandoffIntake?.(binding.channelId, binding);
       }
@@ -1804,6 +1868,7 @@ class DiscordGateway {
       await this.consumer.waitForReceipts();
       await acknowledgmentStop;
       this.client.off?.('messageCreate', this.boundMessage);
+      this.client.off?.('interactionCreate', this.boundInteraction);
       this.client.off?.('shardResume', this.boundResume);
       this.client.off?.('resume', this.boundResume);
       this.client.off?.('shardDisconnect', this.boundDisconnect);
