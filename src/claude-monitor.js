@@ -3,9 +3,10 @@ const { acknowledgmentCommand } = require('./acknowledgment');
 const fs = require('node:fs');
 const path = require('node:path');
 const { ClaudeChannel } = require('./claude-channel');
+const { messageRequest } = require('./native');
 const { MESSAGE_STATES, normalizeAttachments } = require('./state');
 
-const PAYLOAD_SCHEMA_VERSION = 2;
+const PAYLOAD_SCHEMA_VERSION = 3;
 const MONITOR_DEDUPE_CLEANUP_INTERVAL_MS = 1000;
 const MONITOR_DEDUPE_STATES = new Set([MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED]);
 
@@ -187,7 +188,7 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
       try {
         payload = monitorEvent({
           ...values,
-          content: message.content,
+          content: messageRequest(message),
           attachments: message.attachments,
           stateDir: path.resolve(stateDir),
           dbPath: path.resolve(dbPath),

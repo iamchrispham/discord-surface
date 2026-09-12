@@ -679,6 +679,7 @@ module.exports = {
   dispatchAndObserve,
   findCodexSessionFile,
   finalText,
+  messageRequest,
   observeCodexReply,
   observeSubmitted,
   postUnixJson,
