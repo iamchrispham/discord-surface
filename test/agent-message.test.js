@@ -388,6 +388,7 @@ test('malformed reserved attachment follows ordinary bot coverage without waking
     state,
     providers: {},
     agentCredential: () => { throw new Error('malformed metadata must not request credentials'); },
+    agentBotId: '901',
     agentAttachmentFetch: async () => { fetchCalls += 1; throw new Error('malformed metadata must not fetch'); }
   });
   const malformed = await consumer.intakeMessage({
@@ -406,6 +407,112 @@ test('malformed reserved attachment follows ordinary bot coverage without waking
   }, true, null, binding);
   assert.equal(ordinary.accepted, true);
   assert.equal(state.getIntakeWatermark(target.channelId).last_seen_id, '7001');
+});
+
+test('foreign bot attachments do not trigger agent CDN fetches', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-foreign-bot-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-foreign-bot.sock' });
+  const binding = state.getBinding(target.channelId);
+  state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
+  state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
+  let fetchCalls = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: {},
+    agentBotId: 'connected-bot',
+    agentCredential: () => token,
+    agentAttachmentFetch: async () => { fetchCalls += 1; throw new Error('foreign bot must not fetch'); }
+  });
+  const intake = await consumer.intakeMessage({
+    id: '7000', guildId: target.guildId, channelId: target.channelId,
+    author: { id: 'foreign-bot', bot: true }, content: 'unrelated bot message',
+    attachments: [{ url: 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether', filename: 'agent-message.tether', contentType: 'application/octet-stream', size: 1 }]
+  }, true, null, binding);
+  assert.equal(intake.reason, 'bot-source');
+  assert.equal(fetchCalls, 0);
+});
+
+test('live attachment fetch failures leave a durable gap receipt', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-live-gap-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-live-gap.sock' });
+  const binding = state.getBinding(target.channelId);
+  state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
+  state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
+  const client = {
+    user: { id: 'connected-bot' },
+    channels: { fetch: async () => ({ id: target.channelId, guildId: target.guildId, permissionsFor: () => ({ has: () => true }), messages: { fetch: async () => [] } }) },
+    on() {}, off() {}, async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {},
+    fetchHistory: async () => [],
+    recoveryOptions: { agentAttachmentFetch: async () => { throw new Error('CDN unavailable'); } }
+  });
+  gateway.ready = true;
+  gateway.boundMessage({
+    id: '7000', guildId: target.guildId, channelId: target.channelId,
+    author: { id: 'connected-bot', bot: true }, content: 'readable preview',
+    attachments: [{ url: 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether', filename: 'agent-message.tether', contentType: 'application/octet-stream', size: 1 }]
+  });
+  await Promise.all([...gateway.inFlight]);
+  assert.equal(state.hasIntakeEvidence('7000'), false);
+  assert.equal(state.listReceipts().some(row => row.kind === 'intake-boundary' && JSON.parse(row.detail).state === 'gap'), true);
+  await gateway.stop();
+});
+
+test('live attachment normalization preserves channel order', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-order-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-order.sock' });
+  const binding = state.getBinding(target.channelId);
+  state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
+  state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
+  const destination = { ...target, generation: binding.generation };
+  const wireOne = encodeAgentMessage({ ...packet, target: destination }, token);
+  const wireTwo = encodeAgentMessage({ ...packet, id: 'work-2', target: destination }, token);
+  let firstStarted;
+  const firstStartedPromise = new Promise(resolve => { firstStarted = resolve; });
+  let releaseFirst;
+  const firstReleased = new Promise(resolve => { releaseFirst = resolve; });
+  let fetchCalls = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: {},
+    agentBotId: 'connected-bot',
+    agentCredential: () => token,
+    agentAttachmentFetch: async url => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        firstStarted();
+        await firstReleased;
+        return new Response(Buffer.from(wireOne), { status: 200, headers: { 'content-length': String(Buffer.byteLength(wireOne)) } });
+      }
+      return new Response(Buffer.from(wireTwo), { status: 200, headers: { 'content-length': String(Buffer.byteLength(wireTwo)) } });
+    }
+  });
+  const makeMessage = (id, url) => ({ id, guildId: target.guildId, channelId: target.channelId, author: { id: 'connected-bot', bot: true }, content: 'preview', attachments: [{ url, filename: 'agent-message.tether', contentType: 'application/octet-stream', size: Buffer.byteLength(wireOne) }] });
+  const first = consumer.intakeMessage(makeMessage('7000', 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether'), true, null, binding);
+  await firstStartedPromise;
+  const second = consumer.intakeMessage(makeMessage('7001', 'https://cdn.discordapp.com/attachments/100/103/agent-message.tether'), true, null, binding);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fetchCalls, 1);
+  releaseFirst();
+  const [firstIntake, secondIntake] = await Promise.all([first, second]);
+  assert.equal(firstIntake.accepted, true);
+  assert.equal(secondIntake.accepted, true);
+  assert.equal(state.getMessage('7000') !== null, true);
+  assert.equal(state.getMessage('7001') !== null, true);
+  assert.equal(state.getIntakeWatermark(target.channelId).last_accepted_id, '7001');
 });
 
 test('attachment fetch bounds pre-abort, cleanup, deadline, and URL path', async () => {
@@ -482,6 +589,7 @@ test('accepted attachment duplicate skips CDN fetch and advances intake coverage
     state,
     providers: {},
     agentCredential: () => token,
+    agentBotId: '901',
     agentAttachmentFetch: async () => {
       fetchCalls += 1;
       if (fetchCalls > 1) throw new Error('duplicate must not fetch the CDN');
@@ -534,7 +642,7 @@ test('attachment intake stays outside coverage until refreshed recovery, then na
       headers: { 'content-length': String(Buffer.byteLength(wire)) }
     });
   };
-  const consumer = createSurfaceConsumer({ state, providers: {}, agentCredential: () => token, agentAttachmentFetch: fetchAttachment });
+  const consumer = createSurfaceConsumer({ state, providers: {}, agentCredential: () => token, agentBotId: '901', agentAttachmentFetch: fetchAttachment });
   await assert.rejects(
     consumer.intakeMessage(agentMessage, false, agentMessage.id, binding, false, new AbortController().signal),
     /agent attachment fetch failed/
@@ -561,7 +669,7 @@ test('attachment intake stays outside coverage until refreshed recovery, then na
     throw new Error(`unexpected history cursor ${options.after}`);
   };
   const client = {
-    user: { id: 'bot' },
+    user: { id: '901' },
     channels: { fetch: async () => channel },
     on() {}, off() {}, async destroy() {}
   };

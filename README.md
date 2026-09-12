@@ -224,7 +224,7 @@ This path is currently qualified only by local simulated tests and package smoke
 
 Accepted input is durable before a Discord handler returns. After authorized intake commits, a ready binding gets one 📥 reaction on the source message. A binding that is unavailable when the receipt is prepared gets one reply: `Receipt: saved. Delivery was paused when this receipt was prepared.` Ready bindings do not get a text receipt. Text receipts are replies with mentions disabled and a stable nonce. Neither receipt claims that the native agent has read, acted on, or answered the input. Receipt delivery is independent of native forwarding and never retries an uncertain send. Duplicate or rejected input gets no receipt attempt.
 
-Discord attachments are retained as validated URL metadata with the message, including filename, MIME type, and size. The adapter never downloads or archives attachment bytes. CDN URLs can expire, so native sessions receive the references as untrusted user data and decide whether they need to read them.
+Ordinary Discord attachments are retained as validated URL metadata with the message, including filename, MIME type, and size. They are not downloaded or archived. The explicit `agent-message.tether` transport is the exception: with `--agent-presentation attachment-v1`, the adapter performs a bounded CDN fetch to recover the exact signed packet before durable intake and does not archive a separate copy of the bytes. CDN URLs can expire, so native sessions receive ordinary attachment references as untrusted user data and decide whether they need to read them.
 
 An operator may request one manual Spark preview from an existing durable receipt. The command reads one persisted source message and its transport receipt, keeps that raw evidence beside the result, and sends only code-derived facts to the isolated read-only Spark subprocess. The result is labeled `liaison draft`; it is never posted to Discord and never changes forwarding or custody. Missing receipts, unavailable Spark, invalid output, quota failure, timeout, and cancellation return `draft: null`.
 
@@ -326,11 +326,12 @@ same key and content reuses custody. Changing the destination or content under
 that key is refused. A packet must fit in one Discord message, including its
 signed address envelope. Oversized input fails before posting. The optional
 `--agent-presentation` flag accepts `legacy` (the default) or `attachment-v1`.
-With `attachment-v1`, Discord receives a short readable preview and the exact
-signed packet as one `agent-message.tether` attachment. The native Discord
-rendering of that attachment still needs verification with a real Discord
-client before enabling the mode for a receiver. Legacy posting remains the
-default.
+Use `--agent-presentation attachment-v1` only when the receiver has opted into
+the attachment transport. Discord then receives a short readable preview and
+the exact signed packet as one `agent-message.tether` attachment. The native
+Discord rendering of that attachment still needs verification with a real
+Discord client before enabling the mode for a receiver. Legacy JSON posting
+remains the release default and is used when the flag is omitted.
 
 Only authenticated addressed packets enter agent delivery. Ordinary bot replies
 and milestone posts remain excluded. A result may be explicitly sent with

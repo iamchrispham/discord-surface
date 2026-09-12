@@ -65,6 +65,7 @@ export interface AgentAttachmentOptions {
   signal?: AbortSignal | null;
   timeoutMs?: number;
   deadline?: number | null;
+  botId?: string | null;
 }
 
 function attachmentError(detail: string, cause: unknown = null, recoveryKind: RecoveryKind = 'agent-attachment'): AgentAttachmentFailure {
@@ -263,6 +264,12 @@ function isBotMessage(message: unknown): boolean {
   return Boolean(author && typeof author === 'object' && (author as { bot?: unknown }).bot === true);
 }
 
+function isConnectedBotMessage(message: unknown, botId: string | null | undefined): boolean {
+  if (!isBotMessage(message) || typeof botId !== 'string' || botId.length === 0) return false;
+  const author = (message as { author?: unknown }).author;
+  return Boolean(author && typeof author === 'object' && (author as { id?: unknown }).id === botId);
+}
+
 function isPermanentMetadataValid(attachment: AttachmentRecord): boolean {
   return typeof attachment.contentType === 'string' && attachment.contentType.toLowerCase() === AGENT_ATTACHMENT_CONTENT_TYPE &&
     Number.isSafeInteger(attachment.size) && Number(attachment.size) >= 1 && Number(attachment.size) <= AGENT_ATTACHMENT_MAX_BYTES &&
@@ -270,7 +277,7 @@ function isPermanentMetadataValid(attachment: AttachmentRecord): boolean {
 }
 
 export async function normalizeAgentMessage(message: unknown, input: AgentInput, options: AgentAttachmentOptions = {}): Promise<AgentInput> {
-  if (!isBotMessage(message) || (typeof input.content === 'string' && input.content.startsWith(AGENT_PREFIX))) return input;
+  if (!isConnectedBotMessage(message, options.botId) || (typeof input.content === 'string' && input.content.startsWith(AGENT_PREFIX))) return input;
   const attachments = Array.isArray(input.attachments) ? input.attachments : [];
   const candidates = attachments.filter(attachment => attachment && typeof attachment === 'object' &&
     (attachment as AttachmentRecord).filename === AGENT_ATTACHMENT_FILENAME) as AttachmentRecord[];

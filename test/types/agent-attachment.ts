@@ -29,12 +29,13 @@ const options: AgentAttachmentOptions = {
   fetchImpl,
   signal: null,
   timeoutMs: 1000,
-  deadline: null
+  deadline: null,
+  botId: 'bot-1'
 };
 const allowed: boolean = attachmentUrlAllowed(attachment.url);
 const wire: Promise<string> = fetchAgentAttachment(attachment, options);
 const normalized = normalizeAgentMessage(
-  { author: { bot: true } },
+  { author: { id: 'bot-1', bot: true } },
   { content: '', attachments: [attachment] },
   options
 );

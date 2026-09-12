@@ -313,12 +313,29 @@ function transportReceiptText(message, attempt) {
 
 function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {},
   agentCredential = () => null, agentAttachmentFetch = globalThis.fetch,
-  agentAttachmentTimeoutMs = RECOVERY_LIMITS.timeoutMs }) {
+  agentAttachmentTimeoutMs = RECOVERY_LIMITS.timeoutMs, agentBotId = () => null }) {
   const receiptWork = new Set();
   const nativeWork = new Map();
   const ownerQueues = new Map();
   const queuedNativeWork = new Map();
+  const intakeQueues = new Map();
   let queueSequence = 0;
+
+  function serializeIntake(message, operation) {
+    const channelId = message?.channelId;
+    if (typeof channelId !== 'string') return operation();
+    const previous = intakeQueues.get(channelId) || Promise.resolve();
+    const current = previous.catch(() => {}).then(operation);
+    intakeQueues.set(channelId, current);
+    current.finally(() => {
+      if (intakeQueues.get(channelId) === current) intakeQueues.delete(channelId);
+    }).catch(() => {});
+    return current;
+  }
+
+  function connectedBotId() {
+    return typeof agentBotId === 'function' ? agentBotId() : agentBotId;
+  }
 
   function trackReceiptWork(work) {
     const tracked = Promise.resolve(work).catch(() => null);
@@ -765,33 +782,40 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleMessage(message, signal, expectedBinding = null, onIntake = null) {
-    const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
-        fetchImpl: agentAttachmentFetch,
-        signal,
-        timeoutMs: agentAttachmentTimeoutMs
+    const intake = await serializeIntake(message, async () => {
+      const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
+          fetchImpl: agentAttachmentFetch,
+          signal,
+          timeoutMs: agentAttachmentTimeoutMs,
+          botId: connectedBotId()
+        });
+      const result = state.acceptDiscordMessage(input, {
+        expectedBinding,
+        agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
       });
-    const intake = state.acceptDiscordMessage(input, {
-      expectedBinding,
-      agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
+      if (!result.stale) onIntake?.(message, result);
+      return result;
     });
-    if (!intake.stale) onIntake?.(message, intake);
     if (!intake.accepted) return intake;
     launchTransportReceipt(message);
     return processAccepted(message, signal);
   }
 
   async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false, signal = null, deadline = null) {
-    const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
-        fetchImpl: agentAttachmentFetch,
-        signal,
-        timeoutMs: agentAttachmentTimeoutMs,
-        deadline
+    const intake = await serializeIntake(message, async () => {
+      const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
+          fetchImpl: agentAttachmentFetch,
+          signal,
+          timeoutMs: agentAttachmentTimeoutMs,
+          deadline,
+          botId: connectedBotId()
+        });
+      return state.acceptDiscordMessage(input, {
+        ready,
+        coverageId,
+        expectedBinding,
+        agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
       });
-    const intake = await state.acceptDiscordMessage(input, {
-      ready,
-      coverageId,
-      expectedBinding,
-      agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
     });
     if (emitReceipt && intake.accepted) launchTransportReceipt(message);
     return intake;
@@ -864,6 +888,7 @@ class DiscordGateway {
     this.liveCheckpointController = null;
     this.liveCheckpointPromise = null;
     this.liveIntakeCounts = new Map();
+    this.liveAttachmentRecoveryTimers = new Set();
     this.reconnectPromise = null;
     this.deferredHandoffRecoveryTimer = null;
     this.pendingHandoffRecoveryPollTimer = null;
@@ -911,6 +936,7 @@ class DiscordGateway {
       state,
       providers: this.providers,
       agentCredential: () => this.discordToken,
+      agentBotId: () => this.client.user?.id || null,
       agentAttachmentFetch: recoveryOptions.agentAttachmentFetch,
       agentAttachmentTimeoutMs: this.recoveryTimeoutMs,
       sendReply: (message, reply) => this.sendReply(message, reply),
@@ -947,7 +973,16 @@ class DiscordGateway {
           if (heldReady && !intake?.stale) this.noteLiveIntake(message);
           return intake;
         }))
-        .catch(error => this.logger(`message handling failed: ${error.message}`))
+        .catch(async error => {
+          if (this.isAttachmentIntakeFailure(error)) {
+            try {
+              await this.recordLiveAttachmentGap(message, binding, error, controller.signal);
+            } catch (recoveryError) {
+              this.logger(`live attachment gap recovery failed: ${recoveryError.message}`);
+            }
+          }
+          this.logger(`message handling failed: ${error.message}`);
+        })
         .finally(() => {
           this.controllers.delete(controller);
         });
@@ -1394,6 +1429,35 @@ class DiscordGateway {
     }
     if (!watermark) return null;
     return { watermark, topicPublished: true, publication: null };
+  }
+
+  isAttachmentIntakeFailure(error) {
+    return ['agent-attachment', CODEX_VALIDATION_KINDS.DEADLINE].includes(recoveryKind(error));
+  }
+
+  async recordLiveAttachmentGap(message, binding, error, signal = null) {
+    if (signal?.aborted || this.stopping || !binding?.active || !this.isCurrentBinding(binding)) return null;
+    const watermark = this.state.getIntakeWatermark(binding.channelId);
+    const gapFrom = watermark?.recovered_through_id || watermark?.last_seen_id || null;
+    const detail = `live attachment intake failed for ${message?.id || 'unknown message'}: ${String(error?.message || error).slice(0, 900)}`;
+    const boundary = await this.recordBoundary(binding, null, 'gap', detail, gapFrom, message?.id || null, signal);
+    if (!boundary?.watermark || signal?.aborted || this.stopping) return boundary;
+    const recoveryTimer = setImmediate(() => {
+      this.liveAttachmentRecoveryTimers.delete(recoveryTimer);
+      if (this.stopping || !this.isCurrentBinding(binding)) return;
+      let reconciled;
+      try { reconciled = this.state.reconcileIntake(binding.channelId, binding); }
+      catch (recoveryError) {
+        this.logger(`live attachment gap reconciliation failed: ${recoveryError.message}`);
+        return;
+      }
+      if (!reconciled) return;
+      this.recoverTransport('live-attachment-gap', this.lifecycleEpoch, [binding.channelId]).catch(recoveryError => {
+        this.logger(`live attachment recovery failed: ${recoveryError.message}`);
+      });
+    });
+    this.liveAttachmentRecoveryTimers.add(recoveryTimer);
+    return boundary;
   }
 
   noteLiveIntake(message) {
@@ -1997,6 +2061,8 @@ class DiscordGateway {
     this.started = false;
     this.transportReady = false;
     this.resolveInteractionRecovery(false);
+    for (const timer of this.liveAttachmentRecoveryTimers) clearImmediate(timer);
+    this.liveAttachmentRecoveryTimers.clear();
     if (this.deferredHandoffRecoveryTimer) clearTimeout(this.deferredHandoffRecoveryTimer);
     this.deferredHandoffRecoveryTimer = null;
     if (this.pendingHandoffRecoveryPollTimer) clearTimeout(this.pendingHandoffRecoveryPollTimer);
