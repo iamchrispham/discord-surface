@@ -83,11 +83,17 @@ interface ClaudeMcpRequest {
 }
 
 interface ClaudeChannelMcpBase {
-  setRequestHandler(schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>): void;
+  setRequestHandler?: (schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>) => void;
   notification(notification: ClaudeChannelNotification): Promise<unknown> | unknown;
   close?: () => Promise<void> | void;
   onclose?: (() => void) | null;
   onerror?: ((error: unknown) => void) | null;
+}
+
+interface ClaudeDefaultMcp extends ClaudeChannelMcpBase {
+  setRequestHandler(schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>): void;
+  connect: (transport: unknown) => Promise<void>;
+  transportFactory: () => unknown;
 }
 
 export type ClaudeChannelMcp =
@@ -165,7 +171,7 @@ export function prepareSocket(socketPath: string): void {
 
 export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeChannelState }): ClaudeChannelMcp {
   const { Server } = requireInstalled('@modelcontextprotocol/sdk/server/index.js') as {
-    Server: new (...args: unknown[]) => ClaudeChannelMcp;
+    Server: new (...args: unknown[]) => ClaudeDefaultMcp;
   };
   const { StdioServerTransport } = requireInstalled('@modelcontextprotocol/sdk/server/stdio.js') as {
     StdioServerTransport: new () => unknown;
