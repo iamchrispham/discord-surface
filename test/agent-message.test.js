@@ -36,10 +36,13 @@ test('packet grammar prevents self-targeting, uncorrelated results and oversized
 });
 
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
 const { SurfaceState } = require('../src/state');
-const { codexPrompt, claudeEvent } = require('../src/native');
+const { codexPrompt, claudeEvent, messageRequest } = require('../src/native');
+const { createMonitorMcp, monitorEvent } = require('../src/claude-monitor');
 
 test('durable agent intake survives reopen, preserves provenance and deduplicates replay', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-packet-'));
@@ -69,6 +72,119 @@ test('durable agent intake survives reopen, preserves provenance and deduplicate
     assert.ok(codexPrompt(restored).includes(packet.text));
     assert.equal(state.acceptDiscordMessage({ ...event, id: '1003', content: 'Ordinary bot milestone' }, { agentToken: token }).accepted, false);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Claude Monitor persists authenticated agent context and preserves human content', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-monitor-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const state = new SurfaceState(db);
+  const stdout = new EventEmitter();
+  const events = [];
+  stdout.write = (chunk, callback) => {
+    events.push(JSON.parse(String(chunk)));
+    callback?.();
+    return true;
+  };
+  try {
+    state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
+    const destination = { ...target, generation: state.getBinding(target.channelId).generation };
+    const resultPacket = {
+      ...packet,
+      id: 'result-1',
+      kind: KINDS.RESULT,
+      target: destination,
+      replyTo: packet.id,
+      text: 'Result body from the authenticated sender.'
+    };
+    const agentId = 'agent-monitor-result';
+    const agentEvent = {
+      id: agentId,
+      guildId: destination.guildId,
+      channelId: destination.channelId,
+      authorId: '901',
+      isBot: true,
+      attachments: [],
+      content: encodeAgentMessage(resultPacket, token)
+    };
+    assert.equal(state.acceptDiscordMessage(agentEvent, { agentToken: token }).accepted, true);
+    assert.equal(state.claimDispatch(agentId).claimed, true);
+    state.markSubmitted(agentId);
+
+    const oldPayloadPath = path.join(dir, '.cm-e', `${crypto.createHash('sha256')
+      .update(`2\0${path.resolve(db)}\0${agentId}\0${destination.nativeId}\0${destination.generation}`)
+      .digest('hex').slice(0, 32)}.json`);
+    const oldPayload = monitorEvent({
+      content: agentEvent.content,
+      messageId: agentId,
+      nativeId: destination.nativeId,
+      generation: destination.generation,
+      stateDir: path.resolve(dir),
+      dbPath: path.resolve(db),
+      cliPath: path.resolve(path.join(__dirname, '../src/cli.js')),
+      textFile: path.join(dir, 'old-reply.txt')
+    });
+    oldPayload.version = 2;
+    const oldPayloadText = JSON.stringify(oldPayload);
+    fs.mkdirSync(path.dirname(oldPayloadPath), { recursive: true, mode: 0o700 });
+    fs.chmodSync(path.dirname(oldPayloadPath), 0o700);
+    fs.writeFileSync(oldPayloadPath, oldPayloadText, { mode: 0o600 });
+
+    const humanId = 'human-monitor';
+    assert.equal(state.acceptDiscordMessage({
+      id: humanId,
+      guildId: destination.guildId,
+      channelId: destination.channelId,
+      authorId: '900',
+      isBot: false,
+      attachments: [],
+      content: 'Human request from custody.'
+    }, { agentToken: token }).accepted, true);
+    assert.equal(state.claimDispatch(humanId).claimed, true);
+    state.markSubmitted(humanId);
+
+    const monitor = createMonitorMcp({ state, stateDir: dir, dbPath: db, stdout });
+    try {
+      await monitor.notification({
+        method: 'notifications/claude/channel',
+        params: { content: 'forged event content', meta: { messageId: agentId, nativeId: destination.nativeId, generation: String(destination.generation) } }
+      });
+      assert.equal(events.length, 1);
+      const firstPointer = events[0];
+      const firstPayloadText = fs.readFileSync(firstPointer.payloadPath, 'utf8');
+      const firstPayload = JSON.parse(firstPayloadText);
+      assert.notEqual(firstPointer.payloadPath, oldPayloadPath);
+      assert.equal(firstPayload.version, 3);
+      assert.equal(firstPayload.content, messageRequest(state.getMessage(agentId)));
+      assert.match(firstPayload.content, /Agent result result-1 from codex/);
+      assert.match(firstPayload.content, /Correlates to agent message work-1/);
+      assert.match(firstPayload.content, /Result body from the authenticated sender\./);
+      assert.doesNotMatch(firstPayload.content, /forged event content/);
+      assert.equal(fs.readFileSync(oldPayloadPath, 'utf8'), oldPayloadText);
+
+      await monitor.notification({
+        method: 'notifications/claude/channel',
+        params: { content: 'forged retry content', meta: { messageId: agentId, nativeId: destination.nativeId, generation: String(destination.generation) } }
+      });
+      assert.equal(events.length, 1);
+      assert.equal(fs.readFileSync(firstPointer.payloadPath, 'utf8'), firstPayloadText);
+      assert.equal(fs.readFileSync(oldPayloadPath, 'utf8'), oldPayloadText);
+
+      await monitor.notification({
+        method: 'notifications/claude/channel',
+        params: { content: 'forged human content', meta: { messageId: humanId, nativeId: destination.nativeId, generation: String(destination.generation) } }
+      });
+      assert.equal(events.length, 2);
+      const humanPayload = JSON.parse(fs.readFileSync(events[1].payloadPath, 'utf8'));
+      assert.equal(humanPayload.content, 'Human request from custody.');
+      assert.doesNotMatch(humanPayload.content, /forged human content/);
+    } finally {
+      await monitor.close();
+    }
+  } finally {
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 const { runDirectPost } = require('../src/direct-post');
