@@ -4,11 +4,12 @@ const PREFIX = 'discord-tether:agent:v1:';
 const DOMAIN = 'discord-tether/agent-message/v1';
 
 export const KINDS = Object.freeze({ REQUEST: 'request', RESULT: 'result' } as const);
+export const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' } as const);
 export type AgentMessageKind = typeof KINDS[keyof typeof KINDS];
 
 const LIMIT = 2000;
 
-export type AgentProvider = 'codex' | 'claude';
+export type AgentProvider = typeof PROVIDERS[keyof typeof PROVIDERS];
 
 export interface AgentAddress {
   guildId: string;
@@ -43,7 +44,7 @@ export function validAddress(value: unknown): value is AgentAddress {
   if (!exactKeys(value, ['guildId', 'channelId', 'provider', 'nativeId', 'generation'])) return false;
   return /^\d{1,20}$/.test(value.guildId as string) && typeof value.guildId === 'string' &&
     /^\d{1,20}$/.test(value.channelId as string) && typeof value.channelId === 'string' &&
-    ['codex', 'claude'].includes(value.provider as string) &&
+    Object.values(PROVIDERS).includes(value.provider as AgentProvider) &&
     typeof value.nativeId === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.nativeId as string) &&
     Number.isSafeInteger(value.generation) && value.generation as number > 0;
 }
