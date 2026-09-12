@@ -306,6 +306,11 @@ function validateOutcome(value: unknown): BoardOutcome {
   return outcome as BoardOutcome;
 }
 
+function boardContent(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.length > 2000) throw new Error(`${field} is invalid`);
+  return value;
+}
+
 function operationEndedAt(value: unknown): string {
   return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : new Date().toISOString();
 }
@@ -315,8 +320,8 @@ function validateMeta(meta: BoardRefreshMeta): BoardRefreshMeta {
   const target = assertTarget(meta?.target);
   const binding = assertBinding(meta?.binding);
   if (binding.channelId !== target.channelId || binding.guildId !== target.guildId) throw new Error('board target does not match the bound guild and channel');
-  text(meta.content, 'content', 2000);
-  if (!meta.content.trim()) throw new Error('content must contain non-whitespace text');
+  const content = boardContent(meta.content, 'content');
+  if (!content.trim()) throw new Error('content must contain non-whitespace text');
   if (typeof meta.preEditContent !== 'string' || meta.preEditContent.length > 2000) throw new Error('preEditContent is invalid');
   text(meta.payloadHash, 'payloadHash', 128);
   text(meta.targetAuthorId, 'targetAuthorId', 128);
@@ -596,7 +601,7 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
   const scope = text(evidence?.evidenceScope, 'evidenceScope', 2000);
   const observedAt = text(evidence?.observedAt, 'observedAt', 64);
   if (!Number.isFinite(Date.parse(observedAt))) throw new Error('observedAt must be an ISO timestamp');
-  text(evidence?.readbackContent, 'readbackContent', 2000);
+  boardContent(evidence?.readbackContent, 'readbackContent');
   if (!evidence.soleWriter || !evidence.singleAttempt || !evidence.noHiddenRetry) {
     throw new Error('positive board readback requires sole-writer, single-attempt, and no-hidden-retry evidence');
   }

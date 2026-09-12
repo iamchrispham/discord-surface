@@ -627,7 +627,7 @@ async function boardRefresh(args) {
       })
     });
     print(result);
-    if (![BOARD_OUTCOMES.APPLIED, BOARD_OUTCOMES.NO_OP].includes(result.status) && !result.historical) process.exitCode = 1;
+    if (![BOARD_OUTCOMES.APPLIED, BOARD_OUTCOMES.NO_OP].includes(result.status)) process.exitCode = 1;
     if (receivedSignal) process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
     return result;
   } finally {
