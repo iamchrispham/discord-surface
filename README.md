@@ -222,6 +222,44 @@ This command resolves the current Claude caller again and requires the active or
 
 This path is currently qualified only by local simulated tests and package smoke. The adapter requires Node 22.13.x through 22.x. Claude attachment uses an owner-only Unix socket with a short absolute path, so Windows support is not established by this text. macOS, Linux, and Windows Claude host and provider rows, native session opt-in, Discord permissions, approval behavior, endpoint recovery, and a live instruction/reply/milestone round trip require separate direct verification.
 
+### Explicit live board refresh
+
+`board-refresh` updates one already bound status-board message from a compact rendered text file. It requires the exact active native UUID and generation, bound channel ID, target message ID, text file, and dedupe key. `--request-id` is accepted as the legacy alias for `--dedupe-key`; if both are supplied they must match.
+
+```sh
+node src/cli.js board-refresh \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id CURRENT_NATIVE_UUID \
+  --generation CURRENT_GENERATION \
+  --channel-id BOUND_CHANNEL_ID \
+  --message-id STATUS_BOARD_MESSAGE_ID \
+  --text-file /absolute/path/to/compact-board.txt \
+  --dedupe-key BOARD_REFRESH_KEY
+```
+
+The text file must contain non-empty text no longer than Discord's 2,000-character message limit. Before admission, the command reads the installation identity and target message, verifies the configured guild, bound channel, exact target ID, bot author, and sent-message provenance already recorded for that target. An already matching target is an honest no-op. Otherwise the command makes one PATCH with mentions suppressed. It does not POST, split, retry, delete, pin, or fall back to another target.
+
+Board custody has one unresolved edit fence per target message across dedupe keys and native generations. The command captures the target revision before its asynchronous reads and compares it atomically at admission. A stale prepared request refuses before PATCH. After admission, a timeout, abort, process stop, or malformed response remains unknown and blocks a newer edit for that target. A pre-aborted request refuses before admission and creates no attempt. Handoff, readiness, intake, topic publication, and ordinary-post custody remain separate. A settled duplicate returns historical receipt evidence without requiring a fresh target read.
+
+Reconcile a board attempt recorded as unknown only after direct evidence establishes that the desired content was applied:
+
+```sh
+node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
+  --board-guild-id GUILD_ID \
+  --board-channel-id BOUND_CHANNEL_ID \
+  --board-message-id STATUS_BOARD_MESSAGE_ID \
+  --board-attempt-id BOARD_ATTEMPT_ID \
+  --board-resolution applied \
+  --board-evidence-scope EVIDENCE_DESCRIPTION \
+  --board-readback-at 2026-09-12T19:00:00.000Z \
+  --board-readback 'EXACT_DESIRED_BOARD_TEXT' \
+  --board-sole-writer true \
+  --board-single-attempt true \
+  --board-no-hidden-retry true
+```
+
+`--board-readback` is the exact desired board text, not a filename. Reconciliation requires a post-operation readback with the exact desired content, different from the pre-edit content, and explicit sole-writer, single-attempt, and no-hidden-retry evidence. An old response or a GET of prior content does not prove that the PATCH was unsent. The local suite uses disposable SQLite and controlled HTTP, so it does not prove that a real Discord target exists, that the configured token can access it, or that live Discord applies a disconnected PATCH. Those facts require separate direct verification.
+
 Accepted input is durable before a Discord handler returns. After authorized intake commits, a ready binding gets one 📥 reaction on the source message. A binding that is unavailable when the receipt is prepared gets one reply: `Receipt: saved. Delivery was paused when this receipt was prepared.` Ready bindings do not get a text receipt. Text receipts are replies with mentions disabled and a stable nonce. Neither receipt claims that the native agent has read, acted on, or answered the input. Receipt delivery is independent of native forwarding and never retries an uncertain send. Duplicate or rejected input gets no receipt attempt.
 
 Discord attachments are retained as validated URL metadata with the message, including filename, MIME type, and size. The adapter never downloads or archives attachment bytes. CDN URLs can expire, so native sessions receive the references as untrusted user data and decide whether they need to read them.
