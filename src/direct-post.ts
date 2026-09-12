@@ -175,14 +175,14 @@ interface OrdinaryDirectPostInput extends DirectPostInputBase {
 }
 
 interface AgentRequestDirectPostInput extends DirectPostInputBase {
-  agentKind: Extract<AgentMessageKind, 'request'>;
+  agentKind?: Extract<AgentMessageKind, 'request'>;
   agentTarget: AgentAddressEnvelope;
   agentReplyTo?: never;
 }
 
 interface AgentResultDirectPostInput extends DirectPostInputBase {
   agentKind: Extract<AgentMessageKind, 'result'>;
-  agentTarget: AgentAddress | AgentAddressEnvelope;
+  agentTarget?: AgentAddress | AgentAddressEnvelope | null;
   agentReplyTo: string;
 }
 
