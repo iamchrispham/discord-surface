@@ -370,6 +370,15 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return trackReceiptWork(issueTransportReceipt(message));
   }
 
+  function storedAttachmentInput(message) {
+    const input = eventToInput(message);
+    if (!message?.author?.bot || !Array.isArray(input.attachments) || input.attachments.length !== 1 ||
+      input.attachments[0]?.filename !== AGENT_ATTACHMENT_FILENAME) return null;
+    const stored = state.getMessage(message.id);
+    if (!stored) return null;
+    return { ...input, content: stored.content, attachments: stored.attachments };
+  }
+
   function nativeOwnerKey(message) {
     const durable = message.provider && message.nativeId ? message : state.getMessage(message.id) || message;
     return `${durable.provider}:${durable.nativeId}`;
@@ -756,11 +765,11 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleMessage(message, signal, expectedBinding = null, onIntake = null) {
-    const input = await normalizeAgentMessage(message, eventToInput(message), {
-      fetchImpl: agentAttachmentFetch,
-      signal,
-      timeoutMs: agentAttachmentTimeoutMs
-    });
+    const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
+        fetchImpl: agentAttachmentFetch,
+        signal,
+        timeoutMs: agentAttachmentTimeoutMs
+      });
     const intake = state.acceptDiscordMessage(input, {
       expectedBinding,
       agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
@@ -772,12 +781,12 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false, signal = null, deadline = null) {
-    const input = await normalizeAgentMessage(message, eventToInput(message), {
-      fetchImpl: agentAttachmentFetch,
-      signal,
-      timeoutMs: agentAttachmentTimeoutMs,
-      deadline
-    });
+    const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
+        fetchImpl: agentAttachmentFetch,
+        signal,
+        timeoutMs: agentAttachmentTimeoutMs,
+        deadline
+      });
     const intake = await state.acceptDiscordMessage(input, {
       ready,
       coverageId,

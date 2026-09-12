@@ -457,6 +457,45 @@ test('attachment fetch bounds pre-abort, cleanup, deadline, and URL path', async
   assert.equal(deadlineError, undefined);
 });
 
+test('accepted attachment duplicate skips CDN fetch and advances intake coverage', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-duplicate-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const state = new SurfaceState(db);
+  t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-attachment-duplicate.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  const binding = state.getBinding(target.channelId);
+  const destination = { ...target, generation: binding.generation };
+  state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
+  state.markIntakeBoundary(destination.channelId, 'ready', null, null, null, binding);
+  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const message = {
+    id: '7000', guildId: destination.guildId, channelId: destination.channelId,
+    author: { id: '901', bot: true }, content: 'Agent request from codex to claude: Inspect the reported failure.',
+    attachments: [{
+      url: 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether',
+      filename: 'agent-message.tether', contentType: 'application/octet-stream', size: Buffer.byteLength(wire)
+    }]
+  };
+  let fetchCalls = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: {},
+    agentCredential: () => token,
+    agentAttachmentFetch: async () => {
+      fetchCalls += 1;
+      if (fetchCalls > 1) throw new Error('duplicate must not fetch the CDN');
+      return new Response(Buffer.from(wire), { status: 200, headers: { 'content-length': String(Buffer.byteLength(wire)) } });
+    }
+  });
+  const first = await consumer.intakeMessage(message, true, null, binding);
+  assert.equal(first.accepted, true);
+  const duplicate = await consumer.intakeMessage(message, true, null, binding);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(fetchCalls, 1);
+  assert.equal(state.getIntakeWatermark(destination.channelId).last_seen_id, message.id);
+});
+
 test('attachment intake stays outside coverage until refreshed recovery, then native restart needs no CDN', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-recovery-'));
   const db = path.join(dir, 'surface.sqlite');
@@ -548,6 +587,12 @@ test('attachment intake stays outside coverage until refreshed recovery, then na
   assert.deepEqual(state.getMessage(agentMessage.id).agentMessage, { ...packet, target: destination });
   assert.equal(state.listReceipts().filter(row => row.kind === 'agent-message').length, 1);
   assert.ok(messageRequest(state.getMessage(agentMessage.id)).includes(packet.text));
+
+  const fetchAttemptsAfterAcceptance = fetchAttempts;
+  attachmentAvailable = false;
+  const duplicate = await consumer.intakeMessage(agentMessage, true, null, binding);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(fetchAttempts, fetchAttemptsAfterAcceptance);
 
   await gateway.stop();
   state.close();

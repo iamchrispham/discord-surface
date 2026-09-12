@@ -317,14 +317,20 @@ Transfer that file to the sender, then run:
 ```sh
 node src/cli.js agent-send --provider codex --channel-id SOURCE_CHANNEL \
   --native-id SOURCE_NATIVE_UUID --generation SOURCE_GENERATION \
-  --target-file destination.json --text-file task.txt --dedupe-key task-123
+  --target-file destination.json --text-file task.txt --dedupe-key task-123 \
+  --agent-presentation attachment-v1
 ```
 
 The source uses existing ordinary-session or conductor post checks. Repeating the
 same key and content reuses custody. Changing the destination or content under
 that key is refused. A packet must fit in one Discord message, including its
-signed address envelope. Oversized input fails before posting. Attachments are
-not supported for this first slice.
+signed address envelope. Oversized input fails before posting. The optional
+`--agent-presentation` flag accepts `legacy` (the default) or `attachment-v1`.
+With `attachment-v1`, Discord receives a short readable preview and the exact
+signed packet as one `agent-message.tether` attachment. The native Discord
+rendering of that attachment still needs verification with a real Discord
+client before enabling the mode for a receiver. Legacy posting remains the
+default.
 
 Only authenticated addressed packets enter agent delivery. Ordinary bot replies
 and milestone posts remain excluded. A result may be explicitly sent with
