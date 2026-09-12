@@ -15,6 +15,7 @@ const {
   restoreOrdinaryHandoffIntake,
   recoverInterruptedOrdinaryHandoffIntake
 } = require('./state/intake');
+const { createInteractionHandlers, INTERACTION_ORIGIN, INTERACTION_TRANSPORT } = require('./state/interaction');
 
 const SCHEMA_VERSION = '1.6';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -112,6 +113,8 @@ const intakeHandlers = createIntakeHandlers({
   compareDiscordIds,
   now
 });
+
+const interactionHandlers = createInteractionHandlers();
 
 function assertText(value, name, max = 512) {
   if (typeof value !== 'string' || value.length === 0 || value.length > max) {
@@ -1896,7 +1899,32 @@ class SurfaceState {
     });
   }
 
-  getTransportReceipt(messageId) {
+  acceptInteraction(input, expectedBinding = null, options = {}) {
+    return interactionHandlers.acceptInteraction(this, input, expectedBinding, options);
+  }
+
+  isInteractionMessage(messageId) {
+    assertText(messageId, 'messageId', 128);
+    return interactionHandlers.isInteractionMessage(this, messageId);
+  }
+
+  beginInteractionCallback(messageId) {
+    return interactionHandlers.beginCallback(this, messageId);
+  }
+
+  recordInteractionCallbackOutcome(messageId, outcome, detail = {}) {
+    return interactionHandlers.recordCallbackOutcome(this, messageId, outcome, detail);
+  }
+
+  interactionResponseTarget(messageId) {
+    return interactionHandlers.responseTarget(this, messageId);
+  }
+
+  recoverInteractionCallbacksInTransaction(ownerAlive = null) {
+    return interactionHandlers.recoverCallbacksInTransaction(this, ownerAlive || undefined);
+  }
+
+  getTransportReceipt(messageId, transport = null) {
     assertText(messageId, 'messageId', 128);
     const rows = this.db.prepare('SELECT kind, detail, created_at FROM receipts WHERE discord_id=? AND kind IN (?, ?) ORDER BY id')
       .all(messageId, TRANSPORT_RECEIPT_ATTEMPT, TRANSPORT_RECEIPT_OUTCOME);
@@ -1904,6 +1932,7 @@ class SurfaceState {
     let outcome = null;
     for (const row of rows) {
       const detail = parseJson(row.detail, {});
+      if (transport !== null && detail.transport !== transport) continue;
       if (row.kind === TRANSPORT_RECEIPT_ATTEMPT) attempt = { ...detail, recordedAt: row.created_at };
       if (row.kind === TRANSPORT_RECEIPT_OUTCOME) outcome = { ...detail, recordedAt: row.created_at };
     }
@@ -1911,14 +1940,17 @@ class SurfaceState {
     return { messageId, attempt, outcome };
   }
 
-  beginTransportReceipt(messageId) {
+  beginTransportReceipt(messageId, { transport = null, ownerPid = null, ownerIdentity = null, inTransaction = false } = {}) {
     assertText(messageId, 'messageId', 128);
-    return this.transaction(() => {
-      const existing = this.getTransportReceipt(messageId);
+    const begin = () => {
+      const existing = this.getTransportReceipt(messageId, transport);
       if (existing) return { started: false, ...existing, reason: 'already-attempted' };
       const message = this.getMessage(messageId);
       if (!message) throw new BindingError('message is unknown');
       if (message.state !== MESSAGE_STATES.ACCEPTED) return { started: false, message, reason: 'message-not-accepted' };
+      if (transport === INTERACTION_TRANSPORT && !this.isInteractionMessage(messageId)) {
+        throw new BindingError('interaction callback origin is unknown');
+      }
       const check = this.currentMessageBinding(message);
       if (!check.current) {
         const detail = { nonce: transportReceiptNonce(messageId), outcome: 'stale', reason: 'authorization revoked before receipt attempt' };
@@ -1935,9 +1967,13 @@ class SurfaceState {
         readiness: check.binding.readiness,
         status: 'attempted'
       };
+      if (transport !== null) detail.transport = transport;
+      if (ownerPid !== null) detail.ownerPid = ownerPid;
+      if (ownerIdentity !== null) detail.ownerIdentity = ownerIdentity;
       this.receipt(messageId, TRANSPORT_RECEIPT_ATTEMPT, detail);
       return { started: true, message, binding: check.binding, attempt: detail, nonce: detail.nonce };
-    });
+    };
+    return inTransaction ? begin() : this.transaction(begin);
   }
 
   authorizeTransportReceipt(messageId, expectedBinding) {
@@ -1952,11 +1988,11 @@ class SurfaceState {
     });
   }
 
-  recordTransportReceiptOutcome(messageId, outcome, detail = {}) {
+  recordTransportReceiptOutcome(messageId, outcome, detail = {}, transport = null) {
     assertText(messageId, 'messageId', 128);
     if (!TRANSPORT_RECEIPT_OUTCOMES.includes(outcome)) throw new BindingError('invalid transport receipt outcome');
     return this.transaction(() => {
-      const record = this.getTransportReceipt(messageId);
+      const record = this.getTransportReceipt(messageId, transport);
       if (!record?.attempt) throw new BindingError('transport receipt attempt is unknown');
       if (record.outcome) return record;
       const next = { ...detail, nonce: record.attempt.nonce, outcome };
@@ -2278,7 +2314,7 @@ class SurfaceState {
     });
   }
 
-  recoverAfterRestart() {
+  recoverAfterRestart(ownerAlive = null) {
     return this.transaction(() => {
       this.recoverDirectPostReceiptsInternal();
       const topicPublications = this.db.prepare('SELECT * FROM topic_publications WHERE status=?').all(TOPIC_PUBLICATION_STATES.IN_FLIGHT);
@@ -2299,8 +2335,9 @@ class SurfaceState {
          AND outcome.kind = ?
          AND outcome.id > attempt.id
         WHERE attempt.kind = ? AND outcome.id IS NULL
+          AND COALESCE(json_extract(attempt.detail, '$.transport'), '') <> ?
         ORDER BY attempt.id
-      `).all(TRANSPORT_RECEIPT_OUTCOME, TRANSPORT_RECEIPT_ATTEMPT);
+      `).all(TRANSPORT_RECEIPT_OUTCOME, TRANSPORT_RECEIPT_ATTEMPT, INTERACTION_TRANSPORT);
       for (const row of transportAttempts) {
         this.receipt(row.discord_id, TRANSPORT_RECEIPT_OUTCOME, {
           ...parseJson(row.detail, {}),
@@ -2308,6 +2345,7 @@ class SurfaceState {
           reason: 'process stopped before transport receipt outcome'
         });
       }
+      const interactionCallbacks = this.recoverInteractionCallbacksInTransaction(ownerAlive);
       const dispatching = this.db.prepare('SELECT discord_id FROM messages WHERE state=?').all(MESSAGE_STATES.DISPATCHING);
       for (const row of dispatching) {
         const message = this.getMessage(row.discord_id);
@@ -2329,7 +2367,7 @@ class SurfaceState {
         this.receipt(row.discord_id, 'reply-unknown-after-restart', {});
       }
       const candidates = this.recoveryCandidates();
-      return { dispatching: dispatching.length, replying: replying.length, candidates: candidates.map(row => row.id) };
+      return { dispatching: dispatching.length, replying: replying.length, interactionCallbacks, candidates: candidates.map(row => row.id) };
     });
   }
 
@@ -2639,6 +2677,8 @@ module.exports = {
   TRANSPORT_RECEIPT_ATTEMPT,
   TRANSPORT_RECEIPT_OUTCOME,
   TRANSPORT_RECEIPT_OUTCOMES,
+  INTERACTION_ORIGIN,
+  INTERACTION_TRANSPORT,
   NATIVE_ACK_RECEIPT,
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
