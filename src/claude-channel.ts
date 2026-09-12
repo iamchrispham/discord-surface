@@ -50,12 +50,12 @@ export interface ClaudeChannelState {
   assertMessageCurrent(messageId: string, phase: string): ClaudeMessage;
 }
 
-export interface ClaudeAcknowledgmentState extends ClaudeChannelState, AcknowledgmentState {
+export type ClaudeAcknowledgmentState = ClaudeChannelState & AcknowledgmentState & {
   recordNativeReply(input: NativeAcknowledgmentInput & { text: string }): {
     duplicate: boolean;
     message: ClaudeMessage | null | undefined;
   };
-}
+};
 
 export interface ClaudeChannelEvent {
   nativeId: string;
