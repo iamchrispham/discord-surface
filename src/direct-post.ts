@@ -151,7 +151,7 @@ export interface FetchOptions {
 
 export type FetchImplementation = (url: string, options: FetchOptions) => Promise<FetchResponse>;
 
-export interface DirectPostInput {
+interface DirectPostInputBase {
   state: DirectPostState;
   token: string;
   nativeId: unknown;
@@ -166,10 +166,30 @@ export interface DirectPostInput {
   fetchImpl?: FetchImplementation;
   timeoutMs?: number;
   ordinary?: boolean;
-  agentTarget?: AgentAddress | AgentAddressEnvelope | null;
-  agentKind?: AgentMessageKind;
-  agentReplyTo?: unknown;
 }
+
+interface OrdinaryDirectPostInput extends DirectPostInputBase {
+  agentKind?: undefined;
+  agentTarget?: null;
+  agentReplyTo?: never;
+}
+
+interface AgentRequestDirectPostInput extends DirectPostInputBase {
+  agentKind: Extract<AgentMessageKind, 'request'>;
+  agentTarget: AgentAddressEnvelope;
+  agentReplyTo?: never;
+}
+
+interface AgentResultDirectPostInput extends DirectPostInputBase {
+  agentKind: Extract<AgentMessageKind, 'result'>;
+  agentTarget: AgentAddress | AgentAddressEnvelope;
+  agentReplyTo: string;
+}
+
+export type DirectPostInput =
+  | OrdinaryDirectPostInput
+  | AgentRequestDirectPostInput
+  | AgentResultDirectPostInput;
 
 interface DiscordChannel {
   id: string;
@@ -407,7 +427,7 @@ function errorMessage(error: unknown): string {
 
 async function runDirectPost({ state, token, nativeId, generation, channelId = null, provider = null, textFile,
   dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs, ordinary = false,
-  agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null }: DirectPostInput): Promise<DirectPostResult> {
+  agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = undefined }: DirectPostInput): Promise<DirectPostResult> {
   const binding = resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
   const operatorId = state.requireConfig().operatorId;
   let source = readTextFile(textFile);
@@ -436,7 +456,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       kind: agentKind,
       source: address,
       target: packetTarget,
-      replyTo: agentReplyTo as string | null,
+      replyTo: (agentReplyTo ?? null) as string | null,
       text: source.text
     } as unknown as AgentMessage;
     const wire = encodeAgentMessage(packet, token);
