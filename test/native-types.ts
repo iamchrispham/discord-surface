@@ -33,7 +33,7 @@ const state: NativeState = {
   markNotSubmitted: () => message,
   markUncertain: () => message,
   markObservationUnavailable: () => message,
-  recordNativeReply: () => message,
+  recordNativeReply: () => ({ duplicate: false, message }),
   setObserverCursor: () => message,
   currentMessageBinding: () => ({ current: true, binding: { sessionRoot: message.sessionRoot } })
 };

@@ -57,12 +57,17 @@ const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('../src/state') 
 export type NativeProviderName = typeof PROVIDERS[keyof typeof PROVIDERS];
 export type MessageState = typeof MESSAGE_STATES[keyof typeof MESSAGE_STATES];
 
-export interface ObserverCursor {
+export interface PersistedObserverCursor {
   file: string | null;
   offset: number;
+  since?: number;
+  tail?: string;
+  tailBytes?: string;
+}
+
+export interface ObserverCursor extends PersistedObserverCursor {
   since: number;
   tail: string;
-  tailBytes?: string;
 }
 
 export interface NativeMessage {
@@ -80,7 +85,7 @@ export interface NativeMessage {
   agentMessage?: AgentMessage | null;
   state: MessageState;
   replyText?: string | null;
-  observerCursor?: ObserverCursor | null;
+  observerCursor?: PersistedObserverCursor | null;
 }
 
 export interface NativeBinding {
@@ -110,21 +115,32 @@ export interface NativeReplyInput {
 export interface NativeState {
   getMessage: (messageId: string) => NativeMessage | null | undefined;
   claimDispatch: (messageId: string) => DispatchClaim;
-  markSubmitted: (messageId: string, cursor?: ObserverCursor | null, marker?: string | null) => NativeMessage | null | undefined;
+  markSubmitted: (messageId: string, cursor?: PersistedObserverCursor | null, marker?: string | null) => NativeMessage | null | undefined;
   markNotSubmitted: (messageId: string, error?: unknown) => NativeMessage | null | undefined;
   markUncertain: (messageId: string, error?: unknown) => NativeMessage | null | undefined;
   markObservationUnavailable: (messageId: string, detail?: unknown) => NativeMessage | null | undefined;
-  recordNativeReply: (input: NativeReplyInput) => NativeMessage | null | undefined;
-  setObserverCursor: (messageId: string, cursor: ObserverCursor, marker?: string | null) => NativeMessage | null | undefined;
+  recordNativeReply: (input: NativeReplyInput) => NativeReplyReceipt;
+  setObserverCursor: (messageId: string, cursor: PersistedObserverCursor, marker?: string | null) => NativeMessage | null | undefined;
   currentMessageBinding?: (message: NativeMessage) => CurrentBinding | null | undefined;
 }
 
-export type DispatchStatus = 'submitted' | 'not_submitted' | 'uncertain';
+export interface NativeReplyReceipt {
+  duplicate: boolean;
+  message: NativeMessage | null | undefined;
+}
+
+export const DISPATCH_STATUSES = {
+  SUBMITTED: 'submitted',
+  NOT_SUBMITTED: 'not_submitted',
+  UNCERTAIN: 'uncertain'
+} as const;
+
+export type DispatchStatus = typeof DISPATCH_STATUSES[keyof typeof DISPATCH_STATUSES];
 
 export interface DispatchOutcome {
   status: DispatchStatus;
   error?: Error;
-  cursor?: ObserverCursor | null;
+  cursor?: PersistedObserverCursor | null;
   endpointUnavailable?: boolean;
 }
 
@@ -138,8 +154,8 @@ export interface CodexRunOptions {
 }
 
 export type CodexRunResult =
-  | { status: 'submitted'; stdout: string; stderr: string }
-  | { status: 'not_submitted' | 'uncertain'; error: Error };
+  | { status: typeof DISPATCH_STATUSES.SUBMITTED; stdout?: string; stderr?: string }
+  | { status: typeof DISPATCH_STATUSES.NOT_SUBMITTED | typeof DISPATCH_STATUSES.UNCERTAIN; error: Error };
 
 export interface ObserveCodexOptions {
   marker?: string;
@@ -170,18 +186,18 @@ export interface WaitForReplyOptions {
 export interface WaitForReplyResult {
   text?: string | null;
   stopped?: boolean;
-  cursor?: ObserverCursor | null;
+  cursor?: PersistedObserverCursor | null;
 }
 
 export interface ObserveOutcome {
-  cursor?: ObserverCursor | null;
+  cursor?: PersistedObserverCursor | null;
   status?: DispatchStatus;
 }
 
 export interface ProviderObservation {
   text?: string | null;
   stopped?: boolean;
-  cursor?: ObserverCursor | null;
+  cursor?: PersistedObserverCursor | null;
 }
 
 export interface NativeProvider {
@@ -258,7 +274,12 @@ export interface TranscriptRow {
 }
 
 function asNativeError(error: unknown): NativeError {
-  return error instanceof Error ? error as NativeError : Object.assign(new Error(String(error)), { cause: error }) as NativeError;
+  if (error instanceof Error) return error as NativeError;
+  const typed = Object.assign(new Error(String(error)), { cause: error }) as NativeError;
+  if (error && typeof error === 'object' && typeof (error as { wrote?: unknown }).wrote === 'boolean') {
+    typed.wrote = (error as { wrote: boolean }).wrote;
+  }
+  return typed;
 }
 
 function errorCode(error: unknown): string | number | undefined {
@@ -379,7 +400,7 @@ export function finalText(row: TranscriptRow, marker: string): string | null {
   return reply || null;
 }
 
-function cursorTailBytes(cursor: ObserverCursor | null | undefined): Buffer {
+function cursorTailBytes(cursor: PersistedObserverCursor | null | undefined): Buffer {
   if (typeof cursor?.tailBytes === 'string') {
     try { return Buffer.from(cursor.tailBytes, 'base64'); } catch {}
   }
@@ -600,7 +621,7 @@ function readTranscriptTail(fd: number, size: number): Buffer<ArrayBufferLike> {
 
 export async function observeCodexReply(
   nativeId: string,
-  cursor: ObserverCursor | null | undefined,
+  cursor: PersistedObserverCursor | null | undefined,
   {
     marker,
     timeoutMs = 120000,
@@ -729,20 +750,20 @@ export function runCodex(command: string, args: readonly string[], options: Code
   return new Promise<CodexRunResult>(resolve => {
     let spawned = false;
     const child = execFile(command, args, { cwd: options.cwd, env: options.env || process.env, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      if (!error) return resolve({ status: 'submitted', stdout, stderr });
+      if (!error) return resolve({ status: DISPATCH_STATUSES.SUBMITTED, stdout, stderr });
       const text = `${error.message} ${stderr || ''}`;
-      if (!spawned || errorCode(error) === 'ENOENT') return resolve({ status: 'not_submitted', error: new Error(text) });
+      if (!spawned || errorCode(error) === 'ENOENT') return resolve({ status: DISPATCH_STATUSES.NOT_SUBMITTED, error: new Error(text) });
       if (/not found|does not exist|unknown thread|no such thread|missing thread|no rollout found for thread id/i.test(text)) {
-        return resolve({ status: 'not_submitted', error: new Error(text) });
+        return resolve({ status: DISPATCH_STATUSES.NOT_SUBMITTED, error: new Error(text) });
       }
-      resolve({ status: 'uncertain', error: new Error(text) });
+      resolve({ status: DISPATCH_STATUSES.UNCERTAIN, error: new Error(text) });
     });
     spawned = true;
     child.once('error', error => {
       const code = errorCode(error);
       const typed = asNativeError(error);
-      if (code === 'ENOENT') resolve({ status: 'not_submitted', error: typed });
-      else resolve({ status: 'uncertain', error: typed });
+      if (code === 'ENOENT') resolve({ status: DISPATCH_STATUSES.NOT_SUBMITTED, error: typed });
+      else resolve({ status: DISPATCH_STATUSES.UNCERTAIN, error: typed });
     });
   });
 }
@@ -772,12 +793,12 @@ export class CodexProvider implements NativeProvider {
 
   async dispatch(message: NativeMessage, { onCursor }: DispatchOptions = {}): Promise<DispatchOutcome> {
     try { validateNativeId(message.nativeId); } catch (error) {
-      return { status: 'not_submitted', error: asNativeError(error) };
+      return { status: DISPATCH_STATUSES.NOT_SUBMITTED, error: asNativeError(error) };
     }
     const root = message.sessionRoot || this.root;
     let codexHome;
     try { codexHome = codexHomeForSessionRoot(root); } catch (error) {
-      return { status: 'not_submitted', error: asNativeError(error) };
+      return { status: DISPATCH_STATUSES.NOT_SUBMITTED, error: asNativeError(error) };
     }
     const cursor = readInitialCursor(message.nativeId, root);
     onCursor?.(cursor);
@@ -838,17 +859,17 @@ export class ClaudeProvider implements NativeProvider {
 
   async dispatch(message: NativeMessage): Promise<DispatchOutcome> {
     try { validateNativeId(message.nativeId); } catch (error) {
-      return { status: 'not_submitted', error: asNativeError(error) };
+      return { status: DISPATCH_STATUSES.NOT_SUBMITTED, error: asNativeError(error) };
     }
-    if (!message.endpoint) return { status: 'not_submitted', endpointUnavailable: true, error: new Error('Claude binding has no native channel endpoint') };
+    if (!message.endpoint) return { status: DISPATCH_STATUSES.NOT_SUBMITTED, endpointUnavailable: true, error: new Error('Claude binding has no native channel endpoint') };
     try {
       const result = await this.post(message.endpoint, claudeEvent(message));
-      if (result.statusCode === 202) return { status: 'submitted' };
-      if (result.statusCode !== undefined && result.statusCode >= 400 && result.statusCode < 500) return { status: 'not_submitted', error: new Error(`Claude channel rejected event: ${result.statusCode}`) };
-      return { status: 'uncertain', error: new Error(`Claude channel returned ${result.statusCode}`) };
+      if (result.statusCode === 202) return { status: DISPATCH_STATUSES.SUBMITTED };
+      if (result.statusCode !== undefined && result.statusCode >= 400 && result.statusCode < 500) return { status: DISPATCH_STATUSES.NOT_SUBMITTED, error: new Error(`Claude channel rejected event: ${result.statusCode}`) };
+      return { status: DISPATCH_STATUSES.UNCERTAIN, error: new Error(`Claude channel returned ${result.statusCode}`) };
     } catch (error) {
       const typed = asNativeError(error);
-      return { status: typed.wrote ? 'uncertain' : 'not_submitted', endpointUnavailable: !typed.wrote, error: typed };
+      return { status: typed.wrote ? DISPATCH_STATUSES.UNCERTAIN : DISPATCH_STATUSES.NOT_SUBMITTED, endpointUnavailable: !typed.wrote, error: typed };
     }
   }
 
@@ -941,8 +962,8 @@ function providerMessageForBinding(state: NativeState, message: NativeMessage): 
 }
 
 function isDispatchOutcome(value: unknown): value is DispatchOutcome {
-  return Boolean(value &&
-    ['submitted', 'not_submitted', 'uncertain'].includes((value as { status?: unknown }).status as string));
+  const status = value && typeof value === 'object' ? (value as { status?: unknown }).status : undefined;
+  return typeof status === 'string' && (Object.values(DISPATCH_STATUSES) as readonly string[]).includes(status);
 }
 
 export async function dispatchAndObserve(
@@ -971,7 +992,7 @@ export async function dispatchAndObserve(
   if (!provider) {
     const error = new Error(`provider is not configured: ${message.provider}`);
     state.markUncertain(message.id, error);
-    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error });
+    return reportOutcome({ status: DISPATCH_STATUSES.UNCERTAIN, message: state.getMessage(message.id), error });
   }
   const marker = `[[discord-surface:${message.id}]]`;
   let outcome: unknown;
@@ -981,24 +1002,24 @@ export async function dispatchAndObserve(
     });
   } catch (error) {
     state.markUncertain(message.id, error);
-    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error });
+    return reportOutcome({ status: DISPATCH_STATUSES.UNCERTAIN, message: state.getMessage(message.id), error });
   }
   if (!isDispatchOutcome(outcome)) {
     const error = new Error('native dispatcher returned an invalid outcome');
     state.markUncertain(message.id, error);
-    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error });
+    return reportOutcome({ status: DISPATCH_STATUSES.UNCERTAIN, message: state.getMessage(message.id), error });
   }
-  if (outcome.status === 'not_submitted') {
+  if (outcome.status === DISPATCH_STATUSES.NOT_SUBMITTED) {
     try { options.onNativeUnavailable?.(message, outcome.error, outcome); } catch {}
     state.markNotSubmitted(message.id, outcome.error);
-    return reportOutcome({ status: 'not_submitted', message: state.getMessage(message.id), error: outcome.error });
+    return reportOutcome({ status: DISPATCH_STATUSES.NOT_SUBMITTED, message: state.getMessage(message.id), error: outcome.error });
   }
-  if (outcome.status === 'uncertain') {
+  if (outcome.status === DISPATCH_STATUSES.UNCERTAIN) {
     state.markUncertain(message.id, outcome.error);
-    return reportOutcome({ status: 'uncertain', message: state.getMessage(message.id), error: outcome.error });
+    return reportOutcome({ status: DISPATCH_STATUSES.UNCERTAIN, message: state.getMessage(message.id), error: outcome.error });
   }
   state.markSubmitted(message.id, outcome.cursor || null, marker);
-  reportOutcome({ status: 'submitted', message: state.getMessage(message.id) });
+  reportOutcome({ status: DISPATCH_STATUSES.SUBMITTED, message: state.getMessage(message.id) });
   try { options.onSubmitted?.(state.getMessage(message.id)); } catch {}
   const observation = await observeSubmitted(state, state.getMessage(message.id) as NativeMessage, provider, options);
   return observation;
