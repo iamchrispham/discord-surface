@@ -3,6 +3,7 @@ import {
   type ClaudeChannelEvent,
   type ClaudeChannelMcp,
   type ClaudeChannelNotification,
+  type ClaudeChannelState,
   type ClaudeAcknowledgmentState,
   type ClaudeChannelReadState,
   type ClaudeChannelOptions,
@@ -25,6 +26,20 @@ const mcp: ClaudeChannelMcp = {
     notification.params.content satisfies string;
   }
 };
+
+const synchronousAssertionState: ClaudeChannelReadState = {
+  findNativeBinding: () => undefined,
+  getBinding: () => undefined,
+  getMessage: () => undefined,
+  assertMessageCurrent: () => undefined
+};
+const asyncAssertionState = {
+  ...synchronousAssertionState,
+  assertMessageCurrent: async () => {}
+};
+// @ts-expect-error read-state assertions are synchronous because handleEvent does not await them
+const invalidAsyncAssertionState: ClaudeChannelReadState = asyncAssertionState;
+void invalidAsyncAssertionState;
 
 const injectedMcpWithOwnHandler = {
   notification: async () => {},
@@ -51,6 +66,9 @@ const channel = new ClaudeChannel({
   socketPath: '/tmp/claude-channel.sock',
   mcp
 });
+
+declare const richChannelState: ClaudeChannelState;
+richChannelState.assertMessageCurrent('id', 'native-dispatch').channelId satisfies string;
 
 void channel.handleEvent(event);
 void channel.stop();
@@ -123,8 +141,7 @@ const errorAwareMcp: ClaudeChannelMcp = {
   }
 };
 const optionalMcp: ClaudeChannelMcp | undefined = Math.random() > 0.5 ? errorAwareMcp : undefined;
-type AcknowledgmentOptions = Extract<ClaudeChannelOptions, { state: ClaudeAcknowledgmentState }>;
-const optionalAcknowledgmentOptions: AcknowledgmentOptions = {
+const optionalAcknowledgmentOptions: ClaudeChannelOptions = {
   state: acknowledgmentState,
   nativeId: event.nativeId,
   socketPath: '/tmp/claude-channel-optional-options.sock',
@@ -157,7 +174,23 @@ const minimalDefaultState: MinimalDefaultMcpState = {
   receipt: () => {},
   recordNativeReply: () => ({ duplicate: false })
 };
-createDefaultMcp({ nativeId: event.nativeId, state: minimalDefaultState });
+const defaultMcp = createDefaultMcp({ nativeId: event.nativeId, state: minimalDefaultState });
+void defaultMcp.connect(defaultMcp.transportFactory());
+// @ts-expect-error the default helper always creates a StdioServerTransport
+void defaultMcp.connect({});
+
+const minimalDefaultChannelState: ClaudeChannelReadState & MinimalDefaultMcpState = {
+  ...minimalDefaultState,
+  findNativeBinding: () => undefined,
+  getBinding: () => undefined,
+  getMessage: () => undefined,
+  assertMessageCurrent: () => undefined
+};
+new ClaudeChannel({
+  state: minimalDefaultChannelState,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-minimal-default.sock'
+});
 
 new ClaudeChannel({
   state: acknowledgmentState,

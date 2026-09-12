@@ -7,6 +7,7 @@ import type {
   NativeAcknowledgmentInput
 } from './acknowledgment';
 import type { Attachment } from './attachments';
+import type { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 const { recordNativeAcknowledgment } = require('./acknowledgment') as typeof import('./acknowledgment');
 
@@ -49,12 +50,12 @@ export interface ClaudeChannelReadState {
   findNativeBinding(nativeId: string, provider: NativeAcknowledgmentInput['provider']): ClaudeBinding | null | undefined;
   getBinding(channelId: string): ClaudeBinding | null | undefined;
   getMessage(messageId: string): ClaudeChannelReadMessage | null | undefined;
-  assertMessageCurrent(messageId: string, phase: string): void;
+  assertMessageCurrent: (messageId: string, phase: string) => ClaudeChannelReadMessage | void;
 }
 
 export interface ClaudeChannelState extends ClaudeChannelReadState {
   getMessage(messageId: string): ClaudeMessage | null | undefined;
-  assertMessageCurrent(messageId: string, phase: string): ClaudeMessage;
+  assertMessageCurrent: (messageId: string, phase: string) => ClaudeMessage;
 }
 
 export type ClaudeAcknowledgmentState = ClaudeChannelState & AcknowledgmentState & {
@@ -130,7 +131,7 @@ interface ClaudeChannelOptionsBase {
 
 export type ClaudeChannelOptions<TTransport = unknown> =
   | (ClaudeChannelOptionsBase & {
-      state: ClaudeAcknowledgmentState;
+      state: ClaudeChannelReadState & ClaudeDefaultMcpState;
       mcp?: ClaudeChannelMcp<TTransport>;
     })
   | (ClaudeChannelOptionsBase & {
@@ -192,12 +193,12 @@ export function prepareSocket(socketPath: string): void {
   }
 }
 
-export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeDefaultMcpState }): ClaudeDefaultMcp {
+export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeDefaultMcpState }): ClaudeDefaultMcp<StdioServerTransport> {
   const { Server } = requireInstalled('@modelcontextprotocol/sdk/server/index.js') as {
-    Server: new (...args: unknown[]) => ClaudeDefaultMcp;
+    Server: new (...args: unknown[]) => ClaudeDefaultMcp<StdioServerTransport>;
   };
   const { StdioServerTransport } = requireInstalled('@modelcontextprotocol/sdk/server/stdio.js') as {
-    StdioServerTransport: new () => unknown;
+    StdioServerTransport: new () => StdioServerTransport;
   };
   const { ListToolsRequestSchema, CallToolRequestSchema } = requireInstalled('@modelcontextprotocol/sdk/types.js') as {
     ListToolsRequestSchema: unknown;
@@ -293,7 +294,7 @@ export class ClaudeChannel<TTransport = unknown> {
     this.state = state;
     this.nativeId = nativeId;
     this.socketPath = socketPath;
-    this.mcp = mcp || createDefaultMcp({ nativeId, state: state as ClaudeDefaultMcpState }) as ClaudeChannelMcp<TTransport>;
+    this.mcp = mcp || createDefaultMcp({ nativeId, state: state as ClaudeDefaultMcpState }) as unknown as ClaudeChannelMcp<TTransport>;
     this.server = null;
     this.ownsSocket = false;
     this.started = false;
