@@ -1,4 +1,9 @@
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
+const {
+  AGENT_ATTACHMENT_CONTENT_TYPE,
+  AGENT_ATTACHMENT_FILENAME,
+  AGENT_ATTACHMENT_MAX_BYTES
+} = require('./agent-presentation');
 const fs = require('node:fs');
 const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
@@ -117,6 +122,142 @@ function eventToInput(message) {
   };
 }
 
+const AGENT_ATTACHMENT_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
+
+function agentAttachmentError(detail, cause = null, recoveryKind = 'agent-attachment') {
+  const error = new Error(`agent attachment ${detail}`, cause ? { cause } : undefined);
+  error.recoveryKind = recoveryKind;
+  return error;
+}
+
+function attachmentUrlAllowed(value) {
+  let parsed;
+  try { parsed = new URL(value); } catch { return false; }
+  return parsed.protocol === 'https:' && !parsed.username && !parsed.password && AGENT_ATTACHMENT_HOSTS.has(parsed.hostname.toLowerCase());
+}
+
+function readAttachmentHeader(response, name) {
+  if (typeof response?.headers?.get === 'function') return response.headers.get(name);
+  return response?.headers?.[name] ?? response?.headers?.[name.toLowerCase()] ?? null;
+}
+
+function readWithAbort(reader, signal) {
+  if (signal?.aborted) return Promise.reject(new Error('agent attachment read stopped'));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener('abort', onAbort);
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onAbort = () => finish(reject, new Error('agent attachment read stopped'));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(reader.read()).then(
+      value => finish(resolve, value),
+      error => finish(reject, error)
+    );
+  });
+}
+
+async function readBoundedAttachment(response, signal) {
+  const reader = response?.body?.getReader?.();
+  if (!reader) throw agentAttachmentError('response body is not a bounded stream');
+  const chunks = [];
+  let bytesRead = 0;
+  try {
+    while (true) {
+      const next = await readWithAbort(reader, signal);
+      if (next.done) break;
+      const chunk = Buffer.from(next.value || []);
+      bytesRead += chunk.length;
+      if (bytesRead > AGENT_ATTACHMENT_MAX_BYTES) throw agentAttachmentError('exceeds the bounded wire limit');
+      chunks.push(chunk);
+    }
+  } catch (error) {
+    try { await reader.cancel?.(); } catch {}
+    throw error;
+  } finally {
+    try { reader.releaseLock?.(); } catch {}
+  }
+  return Buffer.concat(chunks, bytesRead);
+}
+
+async function fetchAgentAttachment(attachment, { fetchImpl = globalThis.fetch, signal = null, timeoutMs = RECOVERY_LIMITS.timeoutMs } = {}) {
+  if (typeof fetchImpl !== 'function') throw agentAttachmentError('fetch is unavailable');
+  if (!attachmentUrlAllowed(attachment?.url)) throw agentAttachmentError('URL is not an allowed Discord CDN URL');
+  const controller = new AbortController();
+  let abortedByCaller = false;
+  let timedOut = false;
+  const relayAbort = () => {
+    abortedByCaller = true;
+    controller.abort();
+  };
+  signal?.addEventListener('abort', relayAbort, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, Math.max(1, Number(timeoutMs)));
+  try {
+    let response;
+    try {
+      response = await fetchImpl(attachment.url, { method: 'GET', redirect: 'manual', signal: controller.signal });
+    } catch (error) {
+      if (abortedByCaller) throw agentAttachmentError('fetch was stopped', error, CODEX_VALIDATION_KINDS.STOPPED);
+      if (timedOut) throw agentAttachmentError('fetch deadline exceeded', error);
+      throw agentAttachmentError('fetch failed', error);
+    }
+    if (typeof response?.url === 'string' && response.url && !attachmentUrlAllowed(response.url)) {
+      await cancelResponseBody(response);
+      throw agentAttachmentError('redirected away from the Discord CDN');
+    }
+    if (!response?.ok) {
+      await cancelResponseBody(response);
+      throw agentAttachmentError(`fetch returned HTTP ${response?.status || 'error'}`);
+    }
+    const contentLength = Number(readAttachmentHeader(response, 'content-length'));
+    if (Number.isSafeInteger(contentLength) && contentLength > AGENT_ATTACHMENT_MAX_BYTES) {
+      await cancelResponseBody(response);
+      throw agentAttachmentError('declared size exceeds the bounded wire limit');
+    }
+    let bytes;
+    try {
+      bytes = await readBoundedAttachment(response, controller.signal);
+    } catch (error) {
+      if (abortedByCaller) throw agentAttachmentError('read was stopped', error, CODEX_VALIDATION_KINDS.STOPPED);
+      if (timedOut) throw agentAttachmentError('read deadline exceeded', error);
+      throw error?.recoveryKind ? error : agentAttachmentError('read failed', error);
+    }
+    let wire;
+    try { wire = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+    catch (error) { throw agentAttachmentError('body is not valid UTF-8', error); }
+    if (!Buffer.from(wire, 'utf8').equals(bytes)) throw agentAttachmentError('body is not canonical UTF-8');
+    return wire;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', relayAbort);
+    controller.abort();
+  }
+}
+
+async function normalizeAgentMessage(message, input, options = {}) {
+  if (!message?.author?.bot || input.content?.startsWith(AGENT_PREFIX)) return input;
+  const attachments = Array.isArray(input.attachments) ? input.attachments : [];
+  const candidates = attachments.filter(attachment => attachment?.filename === AGENT_ATTACHMENT_FILENAME);
+  if (!candidates.length) return input;
+  if (candidates.length !== 1 || attachments.length !== 1) {
+    throw agentAttachmentError('must be the only attachment on a bot message');
+  }
+  const [attachment] = candidates;
+  if (attachment.contentType?.toLowerCase() !== AGENT_ATTACHMENT_CONTENT_TYPE ||
+    !Number.isSafeInteger(attachment.size) || attachment.size < 1 || attachment.size > AGENT_ATTACHMENT_MAX_BYTES) {
+    throw agentAttachmentError('metadata is outside the supported wire format');
+  }
+  const wire = await fetchAgentAttachment(attachment, options);
+  return { ...input, content: wire, attachments: [] };
+}
+
 function classifyReplyError(error) {
   if (error?.outcome) return error.outcome;
   if (/authorization|stale|custody|generation/i.test(error?.message || '')) return 'failed';
@@ -158,9 +299,12 @@ async function readRetryAfter(response) {
 }
 
 async function sendDiscordMessage({ token, channelId, content, nonce, signal, timeoutMs = RECOVERY_LIMITS.timeoutMs,
-  fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] } }) {
+  fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] }, agentAttachment = null }) {
   if (typeof fetchImpl !== 'function') throw Object.assign(new Error('Discord message fetch is unavailable'), { outcome: 'not_sent' });
   if (signal?.aborted) throw Object.assign(new Error('Discord message send stopped before request'), { outcome: 'not_sent' });
+  if (agentAttachment !== null && (!Buffer.isBuffer(agentAttachment) || agentAttachment.length === 0 || agentAttachment.length > AGENT_ATTACHMENT_MAX_BYTES)) {
+    throw Object.assign(new Error('agent attachment is outside the bounded wire limit'), { outcome: 'not_sent' });
+  }
   const controller = new AbortController();
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
@@ -170,19 +314,31 @@ async function sendDiscordMessage({ token, channelId, content, nonce, signal, ti
     started = true;
     let response;
     try {
-      response = await fetchImpl(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, {
+      const payload = {
+        content, nonce, enforce_nonce: true, allowed_mentions: allowedMentions,
+        ...(messageReference ? { message_reference: messageReference } : {})
+      };
+      const request = {
         method: 'POST',
         headers: {
           Authorization: `Bot ${token}`,
-          'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
-          'Content-Type': 'application/json'
+          'User-Agent': 'DiscordBot (discord-surface, 0.1.0)'
         },
-        body: JSON.stringify({
-          content, nonce, enforce_nonce: true, allowed_mentions: allowedMentions,
-          ...(messageReference ? { message_reference: messageReference } : {})
-        }),
         signal: controller.signal
-      });
+      };
+      if (agentAttachment === null) {
+        request.headers['Content-Type'] = 'application/json';
+        request.body = JSON.stringify(payload);
+      } else {
+        if (typeof FormData !== 'function' || typeof Blob !== 'function') {
+          throw Object.assign(new Error('multipart Discord message support is unavailable'), { outcome: 'not_sent' });
+        }
+        const form = new FormData();
+        form.append('payload_json', JSON.stringify(payload));
+        form.append('files[0]', new Blob([agentAttachment], { type: AGENT_ATTACHMENT_CONTENT_TYPE }), AGENT_ATTACHMENT_FILENAME);
+        request.body = form;
+      }
+      response = await fetchImpl(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, request);
     } catch (error) {
       if (!error.outcome) error.outcome = started ? 'unknown' : 'not_sent';
       throw error;
@@ -277,7 +433,9 @@ function transportReceiptText(message, attempt) {
   return 'Receipt: saved. Delivery was paused when this receipt was prepared.';
 }
 
-function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {}, agentCredential = () => null }) {
+function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {},
+  agentCredential = () => null, agentAttachmentFetch = globalThis.fetch,
+  agentAttachmentTimeoutMs = RECOVERY_LIMITS.timeoutMs }) {
   const receiptWork = new Set();
   const nativeWork = new Map();
   const ownerQueues = new Map();
@@ -720,15 +878,33 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleMessage(message, signal, expectedBinding = null, onIntake = null) {
-    const intake = state.acceptDiscordMessage(eventToInput(message), { expectedBinding, agentToken: message.author?.bot && message.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null });
+    const input = await normalizeAgentMessage(message, eventToInput(message), {
+      fetchImpl: agentAttachmentFetch,
+      signal,
+      timeoutMs: agentAttachmentTimeoutMs
+    });
+    const intake = state.acceptDiscordMessage(input, {
+      expectedBinding,
+      agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
+    });
     if (!intake.stale) onIntake?.(message, intake);
     if (!intake.accepted) return intake;
     launchTransportReceipt(message);
     return processAccepted(message, signal);
   }
 
-  async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false) {
-    const intake = await state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding, agentToken: message.author?.bot && message.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null });
+  async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false, signal = null) {
+    const input = await normalizeAgentMessage(message, eventToInput(message), {
+      fetchImpl: agentAttachmentFetch,
+      signal,
+      timeoutMs: agentAttachmentTimeoutMs
+    });
+    const intake = await state.acceptDiscordMessage(input, {
+      ready,
+      coverageId,
+      expectedBinding,
+      agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
+    });
     if (emitReceipt && intake.accepted) launchTransportReceipt(message);
     return intake;
   }
@@ -840,6 +1016,8 @@ class DiscordGateway {
       state,
       providers: this.providers,
       agentCredential: () => this.discordToken,
+      agentAttachmentFetch: recoveryOptions.agentAttachmentFetch,
+      agentAttachmentTimeoutMs: this.recoveryTimeoutMs,
       sendReply: (message, reply) => this.sendReply(message, reply),
       prepareReply: (messageId, signal) => this.prepareReply(messageId, signal),
       sendTransportReceipt: (message, receipt) => this.sendTransportReceipt(message, receipt),
@@ -870,7 +1048,7 @@ class DiscordGateway {
       this.controllers.add(controller);
       const work = (readyLive
         ? this.consumer.handleMessage(message, controller.signal, binding, () => this.noteLiveIntake(message))
-        : this.consumer.intakeMessage(message, bindingReady, null, null, true).then(intake => {
+        : this.consumer.intakeMessage(message, bindingReady, null, binding, true, controller.signal).then(intake => {
           if (heldReady && !intake?.stale) this.noteLiveIntake(message);
           return intake;
         }))
@@ -1617,7 +1795,7 @@ class DiscordGateway {
             if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
             if (Date.now() >= deadline) throw recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Discord recovery deadline exceeded while admitting history');
             attemptedId = message.id;
-            const admitted = await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id, binding);
+            const admitted = await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id, binding, false, signal);
             if (admitted?.stale) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
             if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
             total += 1;
@@ -1829,7 +2007,9 @@ module.exports = {
   createSurfaceConsumer,
   discordIdAfter,
   eventToInput,
+  fetchAgentAttachment,
   fetchDiscordChannel,
+  normalizeAgentMessage,
   readSecret,
   requireInstalled,
   sendDiscordMessage,

@@ -8,7 +8,8 @@ const { SurfaceState } = require('../src/state');
 const { main } = require('../src/cli');
 const { createSurfaceConsumer } = require('../src/discord');
 const { runDirectPost } = require('../src/direct-post');
-const { decodeAgentMessage, encodeAgentMessage, KINDS } = require('../src/agent-message');
+const { decodeAgentMessage, encodeAgentMessage, issueAgentAddress, KINDS } = require('../src/agent-message');
+const { AGENT_ATTACHMENT_CONTENT_TYPE, AGENT_ATTACHMENT_FILENAME, AGENT_PRESENTATIONS } = require('../src/agent-presentation');
 
 const CODEX = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CLAUDE = '79e3da8e-94b4-4aff-8f88-b45b3a451dd1';
@@ -24,6 +25,18 @@ function fixture(t, provider = 'codex') {
   const textFile = path.join(dir, 'milestone.txt');
   t.after(() => { state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   return { dir, state, nativeId, textFile };
+}
+
+function agentFixture(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-direct-post-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  state.setConfig({ operatorId: '900', guildId: '100', secretFile: path.join(dir, 'discord.env') });
+  fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture\n', { mode: 0o600 });
+  state.bind({ channelId: '101', guildId: '100', provider: 'codex', nativeId: CODEX, workspace: dir,
+    conductorId: 'conductor', repoKey: 'repo:fixture' });
+  const textFile = path.join(dir, 'milestone.txt');
+  t.after(() => { state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  return { dir, state, nativeId: CODEX, textFile };
 }
 
 function response(id, status = 200) {
@@ -58,6 +71,75 @@ test('post sends multipart text in order and records durable per-part outcomes',
   assert.equal(result.duplicate, false);
   assert.equal(result.state, 'sent');
   assert.equal(f.state.listReceipts().filter(row => row.kind === 'direct-post-outcome').length, recorder.calls.length);
+});
+
+test('opt-in agent attachment carries the exact wire beside a deterministic preview', async t => {
+  const f = agentFixture(t);
+  const destination = { guildId: '100', channelId: '102', provider: 'claude', nativeId: CLAUDE, generation: 1 };
+  const text = 'Read the task and preserve its addressed destination.';
+  fs.writeFileSync(f.textFile, text);
+  const calls = [];
+  let multipartBody;
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: destination.channelId, guild_id: destination.guildId }) };
+    multipartBody = options.body;
+    return response('attachment-message');
+  };
+  const result = await runDirectPost({
+    state: f.state,
+    token: 'fixture',
+    nativeId: f.nativeId,
+    generation: 1,
+    textFile: f.textFile,
+    dedupeKey: 'attachment-request',
+    agentTarget: issueAgentAddress(destination, 'fixture'),
+    agentPresentation: AGENT_PRESENTATIONS.ATTACHMENT,
+    fetchImpl
+  });
+  assert.equal(result.status, 'sent');
+  assert.equal(calls.length, 2);
+  assert.ok(multipartBody instanceof FormData);
+  const payload = JSON.parse(multipartBody.get('payload_json'));
+  const file = multipartBody.get('files[0]');
+  const wire = Buffer.from(await file.arrayBuffer()).toString('utf8');
+  const packet = decodeAgentMessage(wire, 'fixture', destination);
+  assert.equal(packet.text, text);
+  assert.equal(file.name, AGENT_ATTACHMENT_FILENAME);
+  assert.equal(file.type, AGENT_ATTACHMENT_CONTENT_TYPE);
+  assert.equal(payload.content, 'Agent request from codex to claude: Read the task and preserve its addressed destination.');
+  assert.doesNotMatch(payload.content, /discord-tether:agent:v1:|attachment-request|9caa5d21/);
+  assert.equal(calls[1].options.headers['Content-Type'], undefined);
+  const attempt = f.state.directPostRows('attachment-request').find(row => row.kind === 'direct-post-attempt').detail;
+  assert.equal(attempt.presentation, AGENT_PRESENTATIONS.ATTACHMENT);
+  assert.equal(attempt.partHash, crypto.createHash('sha256').update(JSON.stringify(wire)).digest('hex'));
+  assert.equal(attempt.textHash, crypto.createHash('sha256').update(JSON.stringify(JSON.stringify(packet))).digest('hex'));
+});
+
+test('changing carrier after an unknown attachment POST does not bypass custody', async t => {
+  const f = agentFixture(t);
+  const destination = { guildId: '100', channelId: '102', provider: 'claude', nativeId: CLAUDE, generation: 1 };
+  fs.writeFileSync(f.textFile, 'uncertain attachment request');
+  let postCalls = 0;
+  const firstFetch = async (_url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: destination.channelId, guild_id: destination.guildId }) };
+    postCalls += 1;
+    throw Object.assign(new Error('connection closed after write'), { name: 'TypeError' });
+  };
+  const input = {
+    state: f.state,
+    token: 'fixture',
+    nativeId: f.nativeId,
+    generation: 1,
+    textFile: f.textFile,
+    dedupeKey: 'uncertain-attachment-request',
+    agentTarget: issueAgentAddress(destination, 'fixture')
+  };
+  const first = await runDirectPost({ ...input, agentPresentation: AGENT_PRESENTATIONS.ATTACHMENT, fetchImpl: firstFetch });
+  assert.equal(first.status, 'unknown');
+  const second = await runDirectPost({ ...input, fetchImpl: async () => { throw new Error('carrier switch must not POST'); } });
+  assert.equal(second.status, 'unknown');
+  assert.equal(postCalls, 1);
 });
 
 test('reply target uses the bound channel and participates in explicit identity', async t => {

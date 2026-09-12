@@ -42,6 +42,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { SurfaceState } = require('../src/state');
 const { codexPrompt, claudeEvent, messageRequest } = require('../src/native');
+const { staticConductorMarker } = require('../src/topic');
 const { createMonitorMcp, monitorEvent } = require('../src/claude-monitor');
 
 test('durable agent intake survives reopen, preserves provenance and deduplicates replay', () => {
@@ -320,7 +321,7 @@ test('agent sender retries after a destination lookup failure classified as unse
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-const { createSurfaceConsumer } = require('../src/discord');
+const { createSurfaceConsumer, DiscordGateway } = require('../src/discord');
 
 test('agent nonces include source and destination identity', async () => {
   const nonces = [];
@@ -369,6 +370,124 @@ test('history consumer verifies credential before durable intake', async () => {
     assert.equal((await consumer.intakeMessage({ ...incoming, id: '7001' }, false)).accepted, false);
     assert.equal(state.listMessages().length, 1);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('attachment intake stays outside coverage until refreshed recovery, then native restart needs no CDN', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-recovery-'));
+  const db = path.join(dir, 'surface.sqlite');
+  let state = new SurfaceState(db);
+  t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-attachment-recovery.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  const binding = state.getBinding(target.channelId);
+  const destination = { ...target, generation: binding.generation };
+  state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
+  state.markIntakeBoundary(destination.channelId, 'ready', null, null, null, binding);
+  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const attachment = {
+    url: 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether',
+    filename: 'agent-message.tether',
+    contentType: 'application/octet-stream',
+    size: Buffer.byteLength(wire)
+  };
+  const agentMessage = {
+    id: '7000', guildId: destination.guildId, channelId: destination.channelId,
+    author: { id: '901', bot: true }, content: 'Agent request from codex to claude: Inspect the reported failure.',
+    attachments: [attachment]
+  };
+  const ordinaryMessage = {
+    id: '7001', guildId: destination.guildId, channelId: destination.channelId,
+    author: { id: '901', bot: true }, content: 'ordinary event'
+  };
+  let fetchAttempts = 0;
+  let attachmentAvailable = false;
+  const fetchAttachment = async (_url, options) => {
+    fetchAttempts += 1;
+    assert.equal(options.headers, undefined);
+    if (!attachmentAvailable) throw new Error('CDN unavailable');
+    return new Response(Buffer.from(wire), {
+      status: 200,
+      headers: { 'content-length': String(Buffer.byteLength(wire)) }
+    });
+  };
+  const consumer = createSurfaceConsumer({ state, providers: {}, agentCredential: () => token, agentAttachmentFetch: fetchAttachment });
+  await assert.rejects(
+    consumer.intakeMessage(agentMessage, false, agentMessage.id, binding, false, new AbortController().signal),
+    /agent attachment fetch failed/
+  );
+  assert.equal(state.getMessage(agentMessage.id), null);
+  assert.equal(state.getIntakeWatermark(destination.channelId).recovered_through_id, '6999');
+  assert.equal(state.hasIntakeEvidence(agentMessage.id), false);
+
+  const ordinary = await consumer.intakeMessage(ordinaryMessage, true, null, binding);
+  assert.equal(ordinary.accepted, false);
+  assert.equal(ordinary.reason, 'bot-source');
+  assert.equal(state.getIntakeWatermark(destination.channelId).last_seen_id, ordinaryMessage.id);
+
+  const channel = {
+    id: destination.channelId,
+    guildId: destination.guildId,
+    topic: staticConductorMarker({ provider: destination.provider, conductorId: binding.conductorId, repoKey: binding.repoKey }),
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
+  const history = async (_channel, options) => {
+    if (options.after === '6999') return [agentMessage, ordinaryMessage];
+    if (options.after === '7001') return [];
+    throw new Error(`unexpected history cursor ${options.after}`);
+  };
+  const client = {
+    user: { id: 'bot' },
+    channels: { fetch: async () => channel },
+    on() {}, off() {}, async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {},
+    fetchHistory: history,
+    recoveryOptions: { pageLimit: 2, agentAttachmentFetch: fetchAttachment }
+  });
+  gateway.discordToken = token;
+  const checkpoint = await gateway.checkpointHealthyIntake(new AbortController().signal, gateway.lifecycleEpoch, new Map([[destination.channelId, 1]]));
+  assert.equal(checkpoint.size, 0);
+  assert.equal(state.getIntakeWatermark(destination.channelId).recovered_through_id, '6999');
+
+  attachmentAvailable = true;
+  state.reconcileIntake(destination.channelId, binding);
+  const recovered = await gateway.recoverTransport('explicit-reconcile');
+  assert.equal(recovered.ready, true);
+  assert.equal(fetchAttempts, 2);
+  assert.equal(state.getMessage(agentMessage.id).content, wire);
+  assert.deepEqual(state.getMessage(agentMessage.id).attachments, []);
+  assert.deepEqual(state.getMessage(agentMessage.id).agentMessage, { ...packet, target: destination });
+  assert.equal(state.listReceipts().filter(row => row.kind === 'agent-message').length, 1);
+  assert.ok(messageRequest(state.getMessage(agentMessage.id)).includes(packet.text));
+
+  await gateway.stop();
+  state.close();
+  state = new SurfaceState(db);
+  const nativePrompts = [];
+  const restartedConsumer = createSurfaceConsumer({
+    state,
+    agentAttachmentFetch: async () => { throw new Error('CDN must not be used after acceptance'); },
+    providers: {
+      claude: {
+        async dispatch(message) {
+          nativePrompts.push(messageRequest(message));
+          return { status: 'submitted' };
+        },
+        async observe() { return { text: 'native recovery reply' }; }
+      }
+    },
+    sendReply: async () => ({ id: 'native-recovery-reply' }),
+    sendTransportReceipt: async () => ({ id: 'transport-receipt' })
+  });
+  const native = await restartedConsumer.handleStoredMessage(state.getMessage(agentMessage.id), new AbortController().signal);
+  assert.equal(native.message.state, 'replied');
+  assert.equal(nativePrompts.length, 1);
+  assert.ok(nativePrompts[0].includes(packet.text));
+  assert.equal(state.listReceipts().filter(row => row.kind === 'agent-message').length, 1);
 });
 
 test('public agent-send command reaches authenticated outbound transport', () => {

@@ -1,4 +1,5 @@
 const { encodeAgentMessage, sameAddress, verifyAgentAddress, KINDS } = require('./agent-message');
+const { AGENT_PRESENTATIONS, agentMessagePreview } = require('./agent-presentation');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -126,7 +127,8 @@ function agentNonceScope(source, destination, requestId, partIndex) {
   return hash(['agent-post-v1', canonicalAddress(source), canonicalAddress(destination), requestId, partIndex]);
 }
 
-function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHash, parts, partIndex, agentTarget = null) {
+function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHash, parts, partIndex, agentTarget = null,
+  presentation = AGENT_PRESENTATIONS.LEGACY) {
   const nonceScope = agentTarget === null
     ? `direct:${requestId}:${partIndex}`
     : agentNonceScope(binding, agentTarget, requestId, partIndex);
@@ -147,6 +149,7 @@ function partMeta(binding, operatorId, requestId, inReplyTo, sourcePath, textHas
     repoKey: binding.repoKey,
     partIndex,
     partCount: parts.length,
+    presentation,
     nonce: discordNonce(nonceScope),
     binding
   };
@@ -157,12 +160,19 @@ function outcomeFor(error) {
 }
 
 async function runDirectPost({ state, token, nativeId, generation, channelId = null, provider = null, textFile,
-  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs, ordinary = false, agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null }) {
+  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs, ordinary = false, agentTarget = null,
+  agentKind = KINDS.REQUEST, agentReplyTo = null, agentPresentation = AGENT_PRESENTATIONS.LEGACY }) {
   const binding = resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
   const operatorId = state.requireConfig().operatorId;
   let source = readTextFile(textFile);
   const replyTarget = inReplyToValue(inReplyTo);
   const isAgentMessage = agentTarget !== null || agentKind === KINDS.RESULT;
+  if (!Object.values(AGENT_PRESENTATIONS).includes(agentPresentation)) {
+    throw new BindingError(`unsupported agent presentation: ${agentPresentation}`);
+  }
+  if (!isAgentMessage && agentPresentation !== AGENT_PRESENTATIONS.LEGACY) {
+    throw new BindingError('attachment presentation is only supported for agent messages');
+  }
   const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: isAgentMessage });
   if (isAgentMessage) {
     if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
@@ -178,7 +188,12 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     }
     const packet = { id: explicitRequestId, kind: agentKind, source: address, target: agentTarget, replyTo: agentReplyTo, text: source.text };
     const wire = encodeAgentMessage(packet, token);
-    source = { ...source, textHash: hash(JSON.stringify(packet)), parts: [wire] };
+    source = {
+      ...source,
+      textHash: hash(JSON.stringify(packet)),
+      parts: [wire],
+      displayParts: [agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT ? agentMessagePreview(packet) : wire]
+    };
   }
   const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, replyTarget);
   state.recoverDirectPostReceipts();
@@ -190,7 +205,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
       break;
     }
-    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex, agentTarget);
+    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex, agentTarget, agentPresentation);
     if (agentTarget !== null) meta.deliveryChannelId = agentTarget.channelId;
     if (agentTarget !== null) {
       let existing;
@@ -254,7 +269,12 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
         parts.push({ index: partIndex, status: stale.outcome });
         break;
       }
-      const sent = await sendDiscordMessage({ token, channelId: agentTarget?.channelId || binding.channelId, content: source.parts[partIndex], nonce: claim.nonce,
+      const sent = await sendDiscordMessage({ token, channelId: agentTarget?.channelId || binding.channelId,
+        content: source.displayParts?.[partIndex] ?? source.parts[partIndex],
+        agentAttachment: isAgentMessage && agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT
+          ? Buffer.from(source.parts[partIndex], 'utf8')
+          : null,
+        nonce: claim.nonce,
         messageReference: replyTarget === null ? null : { message_id: replyTarget, channel_id: binding.channelId, fail_if_not_exists: true },
         signal, fetchImpl, timeoutMs });
       const outcome = state.recordDirectPostOutcome(requestId, claim.attemptId, 'sent', { messageId: String(sent.id), status: 200 });
