@@ -157,7 +157,7 @@ interface DirectPostInputBase {
   nativeId: unknown;
   generation: unknown;
   channelId?: string | null;
-  provider?: string | null;
+  provider?: AgentProvider | null;
   textFile: unknown;
   dedupeKey?: unknown;
   requestId?: unknown;
@@ -169,15 +169,15 @@ interface DirectPostInputBase {
 }
 
 interface OrdinaryDirectPostInput extends DirectPostInputBase {
-  agentKind?: undefined;
+  agentKind?: Extract<AgentMessageKind, 'request'>;
   agentTarget?: null;
-  agentReplyTo?: never;
+  agentReplyTo?: null;
 }
 
 interface AgentRequestDirectPostInput extends DirectPostInputBase {
   agentKind?: Extract<AgentMessageKind, 'request'>;
   agentTarget: AgentAddressEnvelope;
-  agentReplyTo?: never;
+  agentReplyTo?: null;
 }
 
 interface AgentResultDirectPostInput extends DirectPostInputBase {
@@ -332,7 +332,7 @@ function inReplyToValue(value: unknown): string | null {
 }
 
 function requestIdFor(binding: DirectPostBinding, _operatorId: unknown, sourcePath: string, textHash: string,
-  explicitRequestId: unknown, inReplyTo: string | null = null): string {
+  explicitRequestId?: unknown, inReplyTo: string | null = null): string {
   if (explicitRequestId !== undefined) return requiredString(explicitRequestId, 'request-id', 256);
   const identity = ['direct-post-v1', binding.channelId, binding.guildId, binding.provider, binding.nativeId, binding.generation,
     binding.conductorId, binding.repoKey, sourcePath, textHash];
