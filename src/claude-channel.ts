@@ -64,7 +64,11 @@ export type ClaudeAcknowledgmentState = ClaudeChannelState & AcknowledgmentState
   };
 };
 
-type ClaudeDefaultMcpState = AcknowledgmentState & Pick<ClaudeAcknowledgmentState, 'recordNativeReply'>;
+type ClaudeDefaultMcpState = AcknowledgmentState & {
+  recordNativeReply(input: NativeAcknowledgmentInput & { text: string }): {
+    duplicate: boolean;
+  };
+};
 
 export interface ClaudeChannelEvent {
   nativeId: string;
@@ -95,7 +99,6 @@ interface ClaudeMcpRequest {
 }
 
 interface ClaudeChannelMcpBase {
-  setRequestHandler?: (schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>) => void;
   notification: (notification: ClaudeChannelNotification) => Promise<unknown> | unknown;
   close?: () => Promise<void> | void;
   onclose?: (() => void) | null;

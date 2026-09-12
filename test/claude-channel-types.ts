@@ -8,7 +8,7 @@ import {
   type ClaudeChannelOptions,
   createDefaultMcp
 } from '../src/claude-channel';
-import type { AcknowledgmentState } from '../src/acknowledgment';
+import type { AcknowledgmentState, NativeAcknowledgmentInput } from '../src/acknowledgment';
 
 declare const state: ClaudeChannelReadState;
 
@@ -20,12 +20,23 @@ const narrowedNotificationMcp: ClaudeChannelMcp = {
 };
 
 const mcp: ClaudeChannelMcp = {
-  setRequestHandler: () => {},
   notification: async notification => {
     notification.method satisfies 'notifications/claude/channel';
     notification.params.content satisfies string;
   }
 };
+
+const injectedMcpWithOwnHandler = {
+  notification: async () => {},
+  setRequestHandler: (
+    schema: { kind: 'narrow' },
+    handler: (request: { params: { name: string } }) => void
+  ) => {
+    schema.kind satisfies 'narrow';
+    void handler;
+  }
+};
+const injectedMcpWithOwnHandlerContract: ClaudeChannelMcp = injectedMcpWithOwnHandler;
 
 const event: ClaudeChannelEvent = {
   nativeId: '11111111-1111-1111-1111-111111111111',
@@ -74,6 +85,13 @@ new ClaudeChannel({
   mcp: inferredValidMcp
 });
 
+new ClaudeChannel({
+  state,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-own-handler.sock',
+  mcp: injectedMcpWithOwnHandlerContract
+});
+
 const inferredStringNumberMcp = {
   notification: () => {},
   connect: (transport: number) => {
@@ -120,7 +138,11 @@ new ClaudeChannel({
   mcp: optionalMcp
 });
 
-const minimalDefaultState: AcknowledgmentState & Pick<ClaudeAcknowledgmentState, 'recordNativeReply'> = {
+type MinimalDefaultMcpState = AcknowledgmentState & {
+  recordNativeReply(input: NativeAcknowledgmentInput & { text: string }): { duplicate: boolean };
+};
+
+const minimalDefaultState: MinimalDefaultMcpState = {
   db: {
     prepare: () => ({
       all: () => [],
@@ -133,7 +155,7 @@ const minimalDefaultState: AcknowledgmentState & Pick<ClaudeAcknowledgmentState,
   getMessage: () => undefined,
   currentMessageBinding: () => undefined,
   receipt: () => {},
-  recordNativeReply: () => ({ duplicate: false, message: undefined })
+  recordNativeReply: () => ({ duplicate: false })
 };
 createDefaultMcp({ nativeId: event.nativeId, state: minimalDefaultState });
 
