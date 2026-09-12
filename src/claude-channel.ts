@@ -96,7 +96,7 @@ interface ClaudeMcpRequest {
 
 interface ClaudeChannelMcpBase {
   setRequestHandler?: (schema: unknown, handler: (request: ClaudeMcpRequest) => Promise<unknown>) => void;
-  notification(notification: ClaudeChannelNotification): Promise<unknown> | unknown;
+  notification: (notification: ClaudeChannelNotification) => Promise<unknown> | unknown;
   close?: () => Promise<void> | void;
   onclose?: (() => void) | null;
   onerror?: ((error: Error) => void) | null;

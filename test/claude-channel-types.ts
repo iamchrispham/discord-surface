@@ -2,6 +2,7 @@ import {
   ClaudeChannel,
   type ClaudeChannelEvent,
   type ClaudeChannelMcp,
+  type ClaudeChannelNotification,
   type ClaudeAcknowledgmentState,
   type ClaudeChannelReadState,
   type ClaudeChannelOptions,
@@ -10,6 +11,13 @@ import {
 import type { AcknowledgmentState } from '../src/acknowledgment';
 
 declare const state: ClaudeChannelReadState;
+
+type NarrowNotification = ClaudeChannelNotification & { requiredField: string };
+
+const narrowedNotificationMcp: ClaudeChannelMcp = {
+  // @ts-expect-error notification callback must accept every channel notification
+  notification: (notification: NarrowNotification) => notification.requiredField
+};
 
 const mcp: ClaudeChannelMcp = {
   setRequestHandler: () => {},
