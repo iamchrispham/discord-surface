@@ -43,9 +43,16 @@ export interface ClaudeMessage {
   channel?: unknown;
 }
 
-export interface ClaudeChannelState {
+export type ClaudeChannelReadMessage = Pick<ClaudeMessage, 'provider' | 'nativeId' | 'generation' | 'state'>;
+
+export interface ClaudeChannelReadState {
   findNativeBinding(nativeId: string, provider: NativeAcknowledgmentInput['provider']): ClaudeBinding | null | undefined;
   getBinding(channelId: string): ClaudeBinding | null | undefined;
+  getMessage(messageId: string): ClaudeChannelReadMessage | null | undefined;
+  assertMessageCurrent(messageId: string, phase: string): void;
+}
+
+export interface ClaudeChannelState extends ClaudeChannelReadState {
   getMessage(messageId: string): ClaudeMessage | null | undefined;
   assertMessageCurrent(messageId: string, phase: string): ClaudeMessage;
 }
@@ -101,7 +108,7 @@ export interface ClaudeDefaultMcp<TTransport = unknown> extends ClaudeChannelMcp
 
 export type ClaudeChannelMcp<TTransport = unknown> =
   | (ClaudeChannelMcpBase & {
-      connect: (transport: TTransport) => Promise<void>;
+      connect: (transport: TTransport) => void | Promise<void>;
       transportFactory: () => TTransport;
     })
   | (ClaudeChannelMcpBase & {
@@ -122,7 +129,7 @@ export type ClaudeChannelOptions<TTransport = unknown> =
       mcp?: undefined;
     })
   | (ClaudeChannelOptionsBase & {
-      state: ClaudeChannelState;
+      state: ClaudeChannelReadState;
       mcp: ClaudeChannelMcp<TTransport>;
     });
 
@@ -246,7 +253,7 @@ export function createDefaultMcp({ nativeId, state }: { nativeId: string; state:
 
 export class ClaudeChannel<TTransport = unknown> {
   declare bindingIdentity: ClaudeBindingIdentity;
-  declare state: ClaudeChannelState;
+  declare state: ClaudeChannelReadState;
   declare nativeId: string;
   declare socketPath: string;
   declare mcp: ClaudeChannelMcp<TTransport>;
