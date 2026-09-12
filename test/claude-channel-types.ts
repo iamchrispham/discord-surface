@@ -3,8 +3,11 @@ import {
   type ClaudeChannelEvent,
   type ClaudeChannelMcp,
   type ClaudeAcknowledgmentState,
-  type ClaudeChannelReadState
+  type ClaudeChannelReadState,
+  type ClaudeChannelOptions,
+  createDefaultMcp
 } from '../src/claude-channel';
+import type { AcknowledgmentState } from '../src/acknowledgment';
 
 declare const state: ClaudeChannelReadState;
 
@@ -86,6 +89,46 @@ const inferredNumberStringMcp = {
   transportFactory: () => 1
 };
 declare const acknowledgmentState: ClaudeAcknowledgmentState;
+
+const errorAwareMcp: ClaudeChannelMcp = {
+  notification: async () => {},
+  onerror: error => {
+    error.message satisfies string;
+  }
+};
+const optionalMcp: ClaudeChannelMcp | undefined = Math.random() > 0.5 ? errorAwareMcp : undefined;
+type AcknowledgmentOptions = Extract<ClaudeChannelOptions, { state: ClaudeAcknowledgmentState }>;
+const optionalAcknowledgmentOptions: AcknowledgmentOptions = {
+  state: acknowledgmentState,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-optional-options.sock',
+  mcp: optionalMcp
+};
+new ClaudeChannel(optionalAcknowledgmentOptions);
+new ClaudeChannel({
+  state: acknowledgmentState,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-optional-mcp.sock',
+  mcp: optionalMcp
+});
+
+const minimalDefaultState: AcknowledgmentState & Pick<ClaudeAcknowledgmentState, 'recordNativeReply'> = {
+  db: {
+    prepare: () => ({
+      all: () => [],
+      get: () => undefined,
+      run: () => undefined
+    })
+  },
+  dbPath: '/tmp/discord-surface-ack.db',
+  transaction: <T>(operation: () => T): T => operation(),
+  getMessage: () => undefined,
+  currentMessageBinding: () => undefined,
+  receipt: () => {},
+  recordNativeReply: () => ({ duplicate: false, message: undefined })
+};
+createDefaultMcp({ nativeId: event.nativeId, state: minimalDefaultState });
+
 new ClaudeChannel({
   state: acknowledgmentState,
   nativeId: event.nativeId,

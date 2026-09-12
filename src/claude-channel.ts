@@ -64,6 +64,8 @@ export type ClaudeAcknowledgmentState = ClaudeChannelState & AcknowledgmentState
   };
 };
 
+type ClaudeDefaultMcpState = AcknowledgmentState & Pick<ClaudeAcknowledgmentState, 'recordNativeReply'>;
+
 export interface ClaudeChannelEvent {
   nativeId: string;
   messageId: string;
@@ -97,7 +99,7 @@ interface ClaudeChannelMcpBase {
   notification(notification: ClaudeChannelNotification): Promise<unknown> | unknown;
   close?: () => Promise<void> | void;
   onclose?: (() => void) | null;
-  onerror?: ((error: unknown) => void) | null;
+  onerror?: ((error: Error) => void) | null;
 }
 
 export interface ClaudeDefaultMcp<TTransport = unknown> extends ClaudeChannelMcpBase {
@@ -126,7 +128,7 @@ interface ClaudeChannelOptionsBase {
 export type ClaudeChannelOptions<TTransport = unknown> =
   | (ClaudeChannelOptionsBase & {
       state: ClaudeAcknowledgmentState;
-      mcp?: undefined;
+      mcp?: ClaudeChannelMcp<TTransport>;
     })
   | (ClaudeChannelOptionsBase & {
       state: ClaudeChannelReadState;
@@ -187,7 +189,7 @@ export function prepareSocket(socketPath: string): void {
   }
 }
 
-export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeAcknowledgmentState }): ClaudeDefaultMcp {
+export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeDefaultMcpState }): ClaudeDefaultMcp {
   const { Server } = requireInstalled('@modelcontextprotocol/sdk/server/index.js') as {
     Server: new (...args: unknown[]) => ClaudeDefaultMcp;
   };
@@ -288,7 +290,7 @@ export class ClaudeChannel<TTransport = unknown> {
     this.state = state;
     this.nativeId = nativeId;
     this.socketPath = socketPath;
-    this.mcp = mcp || createDefaultMcp({ nativeId, state: state as ClaudeAcknowledgmentState }) as ClaudeChannelMcp<TTransport>;
+    this.mcp = mcp || createDefaultMcp({ nativeId, state: state as ClaudeDefaultMcpState }) as ClaudeChannelMcp<TTransport>;
     this.server = null;
     this.ownsSocket = false;
     this.started = false;
