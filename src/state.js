@@ -1899,8 +1899,8 @@ class SurfaceState {
     });
   }
 
-  acceptInteraction(input, expectedBinding = null) {
-    return interactionHandlers.acceptInteraction(this, input, expectedBinding);
+  acceptInteraction(input, expectedBinding = null, options = {}) {
+    return interactionHandlers.acceptInteraction(this, input, expectedBinding, options);
   }
 
   isInteractionMessage(messageId) {
@@ -1940,9 +1940,9 @@ class SurfaceState {
     return { messageId, attempt, outcome };
   }
 
-  beginTransportReceipt(messageId, { transport = null, ownerPid = null, ownerIdentity = null } = {}) {
+  beginTransportReceipt(messageId, { transport = null, ownerPid = null, ownerIdentity = null, inTransaction = false } = {}) {
     assertText(messageId, 'messageId', 128);
-    return this.transaction(() => {
+    const begin = () => {
       const existing = this.getTransportReceipt(messageId, transport);
       if (existing) return { started: false, ...existing, reason: 'already-attempted' };
       const message = this.getMessage(messageId);
@@ -1972,7 +1972,8 @@ class SurfaceState {
       if (ownerIdentity !== null) detail.ownerIdentity = ownerIdentity;
       this.receipt(messageId, TRANSPORT_RECEIPT_ATTEMPT, detail);
       return { started: true, message, binding: check.binding, attempt: detail, nonce: detail.nonce };
-    });
+    };
+    return inTransaction ? begin() : this.transaction(begin);
   }
 
   authorizeTransportReceipt(messageId, expectedBinding) {

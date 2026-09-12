@@ -51,7 +51,12 @@ interface InteractionState {
   getIntakeWatermark?(channelId: string): { detail?: string | null } | null;
   currentMessageBinding(message: InteractionMessage): { current: boolean; binding?: InteractionBinding | null };
   getTransportReceipt(messageId: string, transport?: string | null): InteractionTransportRecord | null;
-  beginTransportReceipt(messageId: string, options: { transport: typeof INTERACTION_TRANSPORT; ownerPid: number; ownerIdentity: unknown }): InteractionTransportRecord & { started: boolean };
+  beginTransportReceipt(messageId: string, options: {
+    transport: typeof INTERACTION_TRANSPORT;
+    ownerPid: number;
+    ownerIdentity: unknown;
+    inTransaction?: boolean;
+  }): InteractionTransportRecord & { started: boolean };
   recordTransportReceiptOutcome(messageId: string, outcome: string, detail: Record<string, unknown>, transport?: string | null): InteractionTransportRecord | null;
   receipt(discordId: string | null, kind: string, detail: unknown): void;
   directPostOwnerIdentity?(pid: number): unknown;
@@ -83,6 +88,13 @@ export interface InteractionAcceptance {
   stale?: boolean;
   reason?: string;
   message?: InteractionMessage | null;
+  callback?: InteractionTransportRecord & { started: boolean };
+}
+
+export interface InteractionAcceptanceOptions {
+  claimCallback?: boolean;
+  ownerPid?: number;
+  ownerIdentity?: unknown;
 }
 
 function parseJson(value: unknown): Record<string, unknown> {
@@ -129,7 +141,7 @@ function validInput(input: InteractionInput): boolean {
 }
 
 export function createInteractionHandlers(): {
-  acceptInteraction(state: InteractionState, input: InteractionInput, expectedBinding?: InteractionBinding | null): InteractionAcceptance;
+  acceptInteraction(state: InteractionState, input: InteractionInput, expectedBinding?: InteractionBinding | null, options?: InteractionAcceptanceOptions): InteractionAcceptance;
   beginCallback(state: InteractionState, messageId: string): InteractionTransportRecord & { started: boolean };
   recordCallbackOutcome(state: InteractionState, messageId: string, outcome: string, detail?: Record<string, unknown>): InteractionTransportRecord | null;
   isInteractionMessage(state: InteractionState, messageId: string): boolean;
@@ -137,7 +149,7 @@ export function createInteractionHandlers(): {
   recoverCallbacksInTransaction(state: InteractionState, ownerAlive?: (pid: number, identity: unknown) => boolean): number;
 } {
   return {
-    acceptInteraction(state, input, expectedBinding = null) {
+    acceptInteraction(state, input, expectedBinding = null, options = {}) {
       if (!validInput(input)) return { accepted: false, reason: 'invalid-interaction' };
       const config = state.requireConfig();
       return state.transaction(() => {
@@ -160,7 +172,19 @@ export function createInteractionHandlers(): {
           binding.generation, 'accepted', timestamp, timestamp
         );
         state.receipt(input.id, INTERACTION_ORIGIN, originDetail(input, binding));
-        return { accepted: true, message: state.getMessage(input.id) };
+        const callback = options.claimCallback
+          ? state.beginTransportReceipt(input.id, {
+            transport: INTERACTION_TRANSPORT,
+            ownerPid: options.ownerPid ?? process.pid,
+            ownerIdentity: options.ownerIdentity ?? null,
+            inTransaction: true
+          })
+          : null;
+        return {
+          accepted: true,
+          message: state.getMessage(input.id),
+          ...(callback ? { callback } : {})
+        };
       });
     },
 
@@ -211,6 +235,28 @@ export function createInteractionHandlers(): {
           terminal: true,
           visibility: 'unknown',
           reason: 'process stopped before interaction callback outcome'
+        });
+        recovered += 1;
+      }
+      const missingAttempts = state.db.prepare(`SELECT origin.discord_id AS discord_id
+        FROM receipts origin
+        LEFT JOIN receipts attempt ON attempt.discord_id=origin.discord_id
+          AND attempt.kind='transport-receipt-attempt'
+          AND json_extract(attempt.detail, '$.transport')=?
+          AND attempt.id>origin.id
+        LEFT JOIN receipts outcome ON outcome.discord_id=origin.discord_id
+          AND outcome.kind='transport-receipt-outcome'
+          AND json_extract(outcome.detail, '$.transport')=?
+          AND outcome.id>origin.id
+        WHERE origin.kind=? AND attempt.id IS NULL AND outcome.id IS NULL
+        ORDER BY origin.id`).all<{ discord_id: string }>(INTERACTION_TRANSPORT, INTERACTION_TRANSPORT, INTERACTION_ORIGIN);
+      for (const row of missingAttempts) {
+        state.receipt(row.discord_id, 'transport-receipt-outcome', {
+          transport: INTERACTION_TRANSPORT,
+          outcome: 'unknown',
+          terminal: true,
+          visibility: 'unknown',
+          reason: 'process stopped before interaction callback attempt'
         });
         recovered += 1;
       }

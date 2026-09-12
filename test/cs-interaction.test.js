@@ -282,6 +282,169 @@ test('Gateway claims callback before HTTP, preserves accepted work on visibility
   }
 });
 
+test('Gateway admission persists the callback claim with accepted custody', async () => {
+  const fixtureState = fixture();
+  const { state } = fixtureState;
+  let callbackAttempt;
+  const client = {
+    application: { id: 'application', commands: null },
+    on() {},
+    off() {},
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {},
+    interactionFetch: async () => {
+      callbackAttempt = state.getTransportReceipt('atomic-claim', 'interaction-callback')?.attempt;
+      return { ok: true, status: 200, async json() { return { interaction: { response_message_id: 'atomic-response' } }; } };
+    }
+  });
+  gateway.consumer.processAccepted = async message => ({ message });
+  try {
+    const result = await gateway.handleInteraction(interaction('atomic-claim'), new AbortController().signal);
+    assert.equal(result.message.id, 'atomic-claim');
+    assert.equal(callbackAttempt.transport, 'interaction-callback');
+    assert.equal(state.getTransportReceipt('atomic-claim', 'interaction-callback').outcome.responseMessageId, 'atomic-response');
+  } finally {
+    await gateway.stop();
+    closeFixture(fixtureState);
+  }
+});
+
+test('valid rejected interaction receives a non-custodial ephemeral callback', async () => {
+  const fixtureState = fixture();
+  const { state } = fixtureState;
+  state.unbind('channel');
+  let body;
+  const client = {
+    application: { id: 'application', commands: null },
+    on() {},
+    off() {},
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {},
+    interactionFetch: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return { ok: true, status: 200, async json() { return { interaction: { response_message_id: 'rejection-response' } }; } };
+    }
+  });
+  try {
+    const result = await gateway.handleInteraction(interaction('rejected-callback'), new AbortController().signal);
+    assert.equal(result.accepted, false);
+    assert.equal(result.reason, 'inactive-binding');
+    assert.equal(body.data.flags, 64);
+    assert.match(body.data.content, /status session/i);
+    assert.equal(state.getMessage('rejected-callback'), null);
+    assert.equal(state.listReceipts().some(row => row.discord_id === 'rejected-callback'), false);
+  } finally {
+    await gateway.stop();
+    closeFixture(fixtureState);
+  }
+});
+
+test('callback deadline records unknown and still processes accepted custody', async () => {
+  const fixtureState = fixture();
+  const { state } = fixtureState;
+  let processed = 0;
+  const client = {
+    application: { id: 'application', commands: null },
+    on() {},
+    off() {},
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {},
+    recoveryOptions: { interactionCallbackTimeoutMs: 10 },
+    interactionFetch: async (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted by deadline'), { name: 'AbortError' })), { once: true });
+    })
+  });
+  gateway.consumer.processAccepted = async message => {
+    processed += 1;
+    return { message };
+  };
+  try {
+    const startedAt = Date.now();
+    const result = await gateway.handleInteraction(interaction('deadline-callback'), new AbortController().signal);
+    assert.ok(Date.now() - startedAt < 1000);
+    assert.equal(result.message.id, 'deadline-callback');
+    assert.equal(processed, 1);
+    assert.equal(callbackOutcome(state, 'deadline-callback').outcome, 'unknown');
+    assert.match(callbackOutcome(state, 'deadline-callback').reason, /deadline/);
+  } finally {
+    await gateway.stop();
+    closeFixture(fixtureState);
+  }
+});
+
+test('accepted interaction waits for Gateway recovery before native processing', async () => {
+  const fixtureState = fixture();
+  const { state } = fixtureState;
+  state.setBindingReadiness('channel', 'ready');
+  let releaseRecovery;
+  let processed = 0;
+  const client = {
+    application: { id: 'application', commands: null },
+    on() {},
+    off() {},
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {},
+    interactionFetch: async () => ({ ok: true, status: 200, async json() { return { interaction: { response_message_id: 'recovery-response' } }; } })
+  });
+  gateway.started = true;
+  gateway.transportReady = false;
+  gateway.ready = false;
+  gateway.recoveryPromise = new Promise(resolve => {
+    releaseRecovery = () => {
+      gateway.ready = true;
+      gateway.transportReady = true;
+      resolve({ ready: true, state: 'ready' });
+    };
+  });
+  gateway.consumer.processAccepted = async message => {
+    processed += 1;
+    return { message };
+  };
+  try {
+    const work = gateway.handleInteraction(interaction('recovery-order'), new AbortController().signal);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(processed, 0);
+    releaseRecovery();
+    const result = await work;
+    assert.equal(result.message.id, 'recovery-order');
+    assert.equal(processed, 1);
+  } finally {
+    await gateway.stop();
+    closeFixture(fixtureState);
+  }
+});
+
+test('restart recovery settles an interaction origin that predates callback claiming', () => {
+  const fixtureState = fixture();
+  const { state } = fixtureState;
+  try {
+    const parsed = parseCsInteraction(interaction('legacy-missing-attempt'), 'application');
+    assert.equal(state.acceptInteraction(parsed, state.getBinding('channel')).accepted, true);
+    const recovered = state.recoverAfterRestart(() => false);
+    assert.equal(recovered.interactionCallbacks, 1);
+    assert.equal(callbackOutcome(state, 'legacy-missing-attempt').outcome, 'unknown');
+    assert.equal(callbackOutcome(state, 'legacy-missing-attempt').terminal, true);
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
 test('expired callback token settles once and native custody continues without token recovery', async () => {
   const fixtureState = fixture();
   const { state } = fixtureState;

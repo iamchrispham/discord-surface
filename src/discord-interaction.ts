@@ -2,6 +2,8 @@ const CALLBACK_TYPE = 4;
 const APPLICATION_COMMAND_INTERACTION_TYPE = 2;
 const CHAT_INPUT_COMMAND_TYPE = 1;
 const BOOLEAN_OPTION_TYPE = 5;
+const EPHEMERAL_MESSAGE_FLAG = 64;
+const DEFAULT_CALLBACK_TIMEOUT_MS = 2500;
 
 export const INTERACTION_OUTCOMES = Object.freeze({
   SENT: 'sent',
@@ -162,57 +164,88 @@ function responseStatus(response: InteractionCallbackFetchResponse): number | nu
 
 export async function sendInteractionCallback(
   interaction: Pick<ParsedCsInteraction, 'id' | 'token'>,
-  { signal, fetchImpl = globalThis.fetch as unknown as InteractionFetch, content = SAVED_CALLBACK_CONTENT }: {
+  { signal, fetchImpl = globalThis.fetch as unknown as InteractionFetch, content = SAVED_CALLBACK_CONTENT,
+    ephemeral = false, timeoutMs = DEFAULT_CALLBACK_TIMEOUT_MS }: {
     signal?: AbortSignal;
     fetchImpl?: InteractionFetch;
     content?: string;
+    ephemeral?: boolean;
+    timeoutMs?: number;
   } = {}
 ): Promise<InteractionCallbackResult> {
   if (signal?.aborted) return { outcome: INTERACTION_OUTCOMES.NOT_SENT, reason: 'callback stopped before request' };
   if (typeof fetchImpl !== 'function') return { outcome: INTERACTION_OUTCOMES.NOT_SENT, reason: 'Discord interaction callback fetch is unavailable' };
   let started = false;
+  let timedOut = false;
+  const callbackController = new AbortController();
+  const relayAbort = () => callbackController.abort();
+  signal?.addEventListener('abort', relayAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let response: InteractionCallbackFetchResponse;
   try {
     started = true;
-    response = await fetchImpl(`https://discord.com/api/v10/interactions/${encodeURIComponent(interaction.id)}/${encodeURIComponent(interaction.token)}/callback?with_response=true`, {
+    const request = Promise.resolve().then(() => fetchImpl(`https://discord.com/api/v10/interactions/${encodeURIComponent(interaction.id)}/${encodeURIComponent(interaction.token)}/callback?with_response=true`, {
       method: 'POST',
       headers: {
         'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ type: CALLBACK_TYPE, data: { content, allowed_mentions: { parse: [] } } }),
-      signal
+      body: JSON.stringify({
+        type: CALLBACK_TYPE,
+        data: {
+          content,
+          allowed_mentions: { parse: [] },
+          ...(ephemeral ? { flags: EPHEMERAL_MESSAGE_FLAG } : {})
+        }
+      }),
+      signal: callbackController.signal
+    }));
+    const timeout = Number(timeoutMs);
+    const boundedTimeout = Number.isFinite(timeout) && timeout > 0
+      ? Math.min(timeout, 3000)
+      : DEFAULT_CALLBACK_TIMEOUT_MS;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        callbackController.abort();
+        reject(new Error('Discord interaction callback deadline exceeded'));
+      }, boundedTimeout);
     });
+    response = await Promise.race([request, deadline]);
+    const status = responseStatus(response);
+    if (response?.ok !== true) {
+      await Promise.race([cancelBody(response), deadline]);
+      return {
+        outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
+        ...(status === null ? {} : { statusCode: status }),
+        reason: 'Discord interaction callback request rejected'
+      };
+    }
+    let body: unknown = null;
+    try { body = await Promise.race([response.json?.() || Promise.resolve(null), deadline]); }
+    catch (error) { if (timedOut) throw error; }
+    const id = responseMessageId(body);
+    if (!id) {
+      await Promise.race([cancelBody(response), deadline]);
+      return {
+        outcome: INTERACTION_OUTCOMES.UNKNOWN,
+        ...(status === null ? {} : { statusCode: status }),
+        reason: 'Discord interaction callback response lacks response-message id',
+        visibility: 'unknown',
+        terminal: true
+      };
+    }
+    await Promise.race([cancelBody(response), deadline]);
+    return { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }), responseMessageId: id, visibility: 'available' };
   } catch (error) {
     return {
       outcome: started ? INTERACTION_OUTCOMES.UNKNOWN : INTERACTION_OUTCOMES.NOT_SENT,
-      reason: String((error as { message?: unknown })?.message || error).slice(0, 200)
+      reason: timedOut ? 'Discord interaction callback deadline exceeded' : String((error as { message?: unknown })?.message || error).slice(0, 200)
     };
+  } finally {
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener('abort', relayAbort);
   }
-  const status = responseStatus(response);
-  if (response?.ok !== true) {
-    await cancelBody(response);
-    return {
-      outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
-      ...(status === null ? {} : { statusCode: status }),
-      reason: 'Discord interaction callback request rejected'
-    };
-  }
-  let body: unknown = null;
-  try { body = await response.json?.(); } catch {}
-  const id = responseMessageId(body);
-  if (!id) {
-    await cancelBody(response);
-    return {
-      outcome: INTERACTION_OUTCOMES.UNKNOWN,
-      ...(status === null ? {} : { statusCode: status }),
-      reason: 'Discord interaction callback response lacks response-message id',
-      visibility: 'unknown',
-      terminal: true
-    };
-  }
-  await cancelBody(response);
-  return { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }), responseMessageId: id, visibility: 'available' };
 }
 
 export { responseMessageId };
