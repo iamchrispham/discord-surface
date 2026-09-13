@@ -7,6 +7,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { SurfaceState, BOARD_OUTCOMES, READINESS } = require('../src/state');
 const { runBoardRefresh } = require('../src/board-refresh');
+const { hashBoardText } = require('../src/discord/board-refresh');
 const STATE_PATH = path.resolve(__dirname, '../src/state');
 const DISCORD_PATH = path.resolve(__dirname, '../src/discord');
 
@@ -199,6 +200,16 @@ function seedBoardAttempt(f, requestId, content = 'new board') {
   return { target, attemptId: admission.attemptId };
 }
 
+function rewriteBoardAttemptContent(f, attemptId, content) {
+  const row = f.state.db.prepare("SELECT id, detail FROM receipts WHERE kind='board-refresh-attempt' AND json_extract(detail, '$.attemptId')=?").get(attemptId);
+  assert.ok(row);
+  const detail = JSON.parse(row.detail);
+  f.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(
+    JSON.stringify({ ...detail, content, payloadHash: hashBoardText(content) }),
+    row.id
+  );
+}
+
 function seedBoardOutcome(f, requestId, outcome) {
   const seeded = seedBoardAttempt(f, requestId);
   const recorded = f.state.recordBoardRefreshOutcome(seeded.target, seeded.attemptId, outcome, {
@@ -353,6 +364,40 @@ test('multiline board content reaches one mention-suppressed PATCH', async t => 
   assert.deepEqual(JSON.parse(patches[0].init.body), { content, allowed_mentions: { parse: [] } });
 });
 
+test('board refresh canonicalizes terminal line endings while retaining raw evidence', async t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  const calls = [];
+  const rawContent = '  first line\nsecond line \nthird\t\n\n';
+  const canonicalContent = '  first line\nsecond line \nthird\t';
+  const board = { content: 'old board\r\n' };
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url, init });
+    if (url.endsWith('/users/@me')) return response({ id: 'bot-1' });
+    if (init.method === 'GET' && url.endsWith('/channels/channel-1')) return boardChannelResponse();
+    if (init.method === 'GET') return boardMessageResponse(board.content);
+    if (init.method === 'PATCH') {
+      const body = JSON.parse(init.body);
+      board.content = `${body.content.replace(/[\r\n]+$/u, '')}\n`;
+      return boardMessageResponse(board.content);
+    }
+    throw new Error(`unexpected board request ${init.method} ${url}`);
+  };
+
+  const result = await refresh(f, rawContent, 'refresh-terminal-line-endings', fetchImpl);
+  assert.equal(result.status, BOARD_OUTCOMES.APPLIED);
+  const patches = calls.filter(call => call.init.method === 'PATCH');
+  assert.equal(patches.length, 1);
+  assert.equal(JSON.parse(patches[0].init.body).content, canonicalContent);
+  const rows = f.state.listReceipts().map(row => ({ kind: row.kind, detail: JSON.parse(row.detail) }));
+  const attempt = rows.find(row => row.kind === 'board-refresh-attempt' && row.detail.requestId === 'refresh-terminal-line-endings').detail;
+  const outcome = rows.find(row => row.kind === 'board-refresh-outcome' && row.detail.requestId === 'refresh-terminal-line-endings').detail;
+  assert.equal(attempt.content, canonicalContent);
+  assert.equal(attempt.preEditContent, 'old board\r\n');
+  assert.equal(attempt.payloadHash, hashBoardText(canonicalContent));
+  assert.equal(outcome.observedContent, `${canonicalContent}\n`);
+});
+
 test('installation preflight failure does not start the target read', async t => {
   const f = fixture();
   t.after(() => f.state.close());
@@ -369,9 +414,9 @@ test('installation preflight failure does not start the target read', async t =>
 test('already desired board is an honest no-op and target qualification rejects wrong authors', async t => {
   const f = fixture();
   t.after(() => f.state.close());
-  const board = { content: 'same board' };
+  const board = { content: 'same board\r\n' };
   const sameCalls = [];
-  const same = await refresh(f, 'same board', 'refresh-noop', fakeFetch(board, sameCalls));
+  const same = await refresh(f, 'same board\n\n', 'refresh-noop', fakeFetch(board, sameCalls));
   assert.equal(same.status, BOARD_OUTCOMES.NO_OP);
   assert.equal(sameCalls.filter(call => call.init.method === 'PATCH').length, 0);
   const noopAttempt = f.state.listReceipts()
@@ -398,6 +443,31 @@ test('already desired board is an honest no-op and target qualification rejects 
   };
   await assert.rejects(() => refresh(f, 'other board', 'refresh-wrong-author', wrongFetch), /not authored by this Discord installation/);
   assert.equal(wrongCalls.filter(call => call.init.method === 'PATCH').length, 0);
+});
+
+test('same-key replay accepts legacy terminal line endings but refuses changed content', async t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  const seeded = seedBoardAttempt(f, 'replay-legacy-terminal-line-endings', 'new board\n\n');
+  f.state.recordBoardRefreshOutcome(seeded.target, seeded.attemptId, BOARD_OUTCOMES.APPLIED, {
+    operationEndedAt: '2026-01-01T00:00:00.000Z'
+  });
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url, init });
+    throw new Error(`unexpected replay request ${init.method} ${url}`);
+  };
+
+  const replay = await refresh(f, 'new board\n\n', 'replay-legacy-terminal-line-endings', fetchImpl);
+  assert.equal(replay.status, BOARD_OUTCOMES.APPLIED);
+  assert.equal(replay.historical, true);
+  assert.equal(calls.length, 0);
+
+  await assert.rejects(
+    () => refresh(f, 'changed board', 'replay-legacy-terminal-line-endings', fetchImpl),
+    /dedupe key is already used for another board payload/
+  );
+  assert.equal(calls.length, 0);
 });
 
 test('no-op admission and outcome roll back together when the outcome receipt fails', async t => {
@@ -590,6 +660,61 @@ test('board recovery preserves in-flight refusal and unknown evidence reconcilia
   const duplicate = unknown.state.reconcileBoardRefresh(unknownSeed.target, unknownSeed.attemptId, BOARD_OUTCOMES.APPLIED, recoveryEvidence());
   assert.equal(duplicate.historical, true);
   assert.deepEqual(unknown.state.listReceipts(), beforeDuplicate);
+});
+
+test('board recovery accepts actual terminal-line-ending loss and rejects whitespace-only changes', async t => {
+  const recovered = fixture();
+  const ambiguous = fixture();
+  t.after(() => recovered.state.close());
+  t.after(() => ambiguous.state.close());
+
+  const recoveredSeed = seedBoardAttempt(recovered, 'recover-terminal-line-endings', 'new board\n\n');
+  recovered.state.recordBoardRefreshOutcome(recoveredSeed.target, recoveredSeed.attemptId, BOARD_OUTCOMES.UNKNOWN, {
+    operationEndedAt: '2026-01-01T00:00:00.000Z',
+    error: 'fixture unknown'
+  });
+  const recoveredAttemptBefore = JSON.parse(recovered.state.listReceipts()
+    .find(row => row.kind === 'board-refresh-attempt' && JSON.parse(row.detail).attemptId === recoveredSeed.attemptId).detail);
+  const reconciled = recovered.state.reconcileBoardRefresh(
+    recoveredSeed.target,
+    recoveredSeed.attemptId,
+    BOARD_OUTCOMES.APPLIED,
+    recoveryEvidence('new board')
+  );
+  assert.equal(reconciled.status, BOARD_OUTCOMES.APPLIED);
+  assert.equal(reconciled.reconciledFrom, BOARD_OUTCOMES.UNKNOWN);
+  const recoveredOutcome = JSON.parse(recovered.state.listReceipts().at(-1).detail);
+  assert.equal(recoveredOutcome.content, 'new board\n\n');
+  assert.equal(recoveredOutcome.preEditContent, 'old board');
+  assert.equal(recoveredOutcome.readbackContent, 'new board');
+  const recoveredAttemptAfter = JSON.parse(recovered.state.listReceipts()
+    .find(row => row.kind === 'board-refresh-attempt' && JSON.parse(row.detail).attemptId === recoveredSeed.attemptId).detail);
+  assert.equal(recoveredAttemptAfter.content, recoveredAttemptBefore.content);
+  assert.equal(recoveredAttemptAfter.payloadHash, recoveredAttemptBefore.payloadHash);
+
+  const ambiguousSeed = seedBoardAttempt(ambiguous, 'recover-terminal-line-endings-only', 'new board');
+  rewriteBoardAttemptContent(ambiguous, ambiguousSeed.attemptId, 'old board\n\n');
+  ambiguous.state.recordBoardRefreshOutcome(ambiguousSeed.target, ambiguousSeed.attemptId, BOARD_OUTCOMES.UNKNOWN, {
+    operationEndedAt: '2026-01-01T00:00:00.000Z',
+    error: 'fixture unknown'
+  });
+  const ambiguousAttemptBefore = JSON.parse(ambiguous.state.listReceipts()
+    .find(row => row.kind === 'board-refresh-attempt' && JSON.parse(row.detail).attemptId === ambiguousSeed.attemptId).detail);
+  const before = ambiguous.state.listReceipts();
+  assert.throws(
+    () => ambiguous.state.reconcileBoardRefresh(
+      ambiguousSeed.target,
+      ambiguousSeed.attemptId,
+      BOARD_OUTCOMES.APPLIED,
+      recoveryEvidence('old board')
+    ),
+    /positive board readback requires desired content different from the pre-edit content/
+  );
+  assert.deepEqual(ambiguous.state.listReceipts(), before);
+  const ambiguousAttemptAfter = JSON.parse(ambiguous.state.listReceipts()
+    .find(row => row.kind === 'board-refresh-attempt' && JSON.parse(row.detail).attemptId === ambiguousSeed.attemptId).detail);
+  assert.equal(ambiguousAttemptAfter.content, ambiguousAttemptBefore.content);
+  assert.equal(ambiguousAttemptAfter.payloadHash, ambiguousAttemptBefore.payloadHash);
 });
 
 test('preflight signal stop exits with signal status and sends no PATCH', async t => {

@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { boardTextEquivalent } from './board-text';
 import {
   BOARD_OUTCOMES,
   type BoardAdmission,
@@ -160,7 +161,8 @@ export async function runBoardRefresh({
   const ownerAlive = (pid: number, identity: unknown) => state.directPostOwnerAlive?.(pid, identity) || false;
   state.recoverBoardRefreshReceipts(ownerAlive);
   const existing = state.inspectBoardRequest(requestId, target);
-  if (existing?.attempt?.payloadHash && existing.attempt.payloadHash !== payloadHash) {
+  if (existing?.attempt?.payloadHash && existing.attempt.payloadHash !== payloadHash &&
+      (typeof existing.attempt.content !== 'string' || !boardTextEquivalent(existing.attempt.content, content))) {
     throw new Error('dedupe key is already used for another board payload');
   }
   if (existing && (existing.historical || existing.duplicate)) return resultFromAdmission(existing);
@@ -195,7 +197,7 @@ export async function runBoardRefresh({
   try {
     const patched = await patchBoardMessage({ token, channelId, messageId, content, signal, timeoutMs, fetchImpl });
     targetMatches(patched, target);
-    if (patched.content !== content) {
+    if (!boardTextEquivalent(patched.content, content)) {
       const mismatch = new Error('Discord board PATCH response did not confirm the desired content') as Error & { outcome: string };
       mismatch.outcome = BOARD_OUTCOMES.UNKNOWN;
       throw mismatch;
