@@ -66,8 +66,14 @@ export interface DirectPostState {
   transaction<T>(operation: () => T): T;
   directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
   directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null): boolean;
-  directPostOwnerIdentity(pid: number): Record<string, unknown> | null;
+  directPostOwnerIdentity(pid: number): DirectPostOwnerIdentity | null;
   receipt(discordId: string | null, kind: string, detail: Record<string, unknown>): void;
+}
+
+export interface DirectPostOwnerIdentity {
+  ownerPid: number;
+  ownerStartTime: string | null;
+  ownerCommand: string | null;
 }
 
 export interface DirectPostInspection {
@@ -95,6 +101,14 @@ export interface DirectPostEvent {
 
 type DirectPostOutcomeKey = 'messageId' | 'nonce';
 type DirectPostReconciliationResolution = 'sent' | 'not_sent';
+type DirectPostMatchEvent = Omit<DirectPostEvent, 'channelId' | 'guildId'> & {
+  channelId: string;
+  guildId: string;
+};
+type DirectPostCustodyKey = keyof DirectPostPartMeta | keyof DirectPostOwnerIdentity | 'journal';
+type DirectPostOutcomeDetail = Record<string, unknown> & {
+  [key in DirectPostCustodyKey]?: never;
+};
 
 export interface DirectPostOutcomeRecord extends DirectPostReceiptDetail {
   outcome: DirectPostOutcome;
@@ -105,9 +119,9 @@ export interface DirectPostHandlers {
   inspectDirectPostPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null;
   recordDirectPostPreflight(state: DirectPostState, meta: DirectPostPartMeta, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostOutcomeRecord;
   beginDirectPostPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostClaim | DirectPostInspection;
-  recordDirectPostOutcome(state: DirectPostState, requestId: string, attemptId: string, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostOutcomeRecord;
+  recordDirectPostOutcome(state: DirectPostState, requestId: string, attemptId: string, outcome: DirectPostOutcome, detail?: DirectPostOutcomeDetail): DirectPostOutcomeRecord;
   reconcileDirectPostOutcome(state: DirectPostState, requestId: string, attemptId: string, resolution: DirectPostReconciliationResolution, evidence: Record<string, unknown>): DirectPostOutcomeRecord;
-  directPostOutcomeMatches(state: DirectPostState, event: DirectPostEvent, key: DirectPostOutcomeKey, value: string): boolean;
+  directPostOutcomeMatches(state: DirectPostState, event: DirectPostMatchEvent, key: DirectPostOutcomeKey, value: string): boolean;
   excludeDirectPost(this: DirectPostHandlers, state: DirectPostState, event: DirectPostEvent | null | undefined): boolean;
 }
 
@@ -398,8 +412,8 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
 
     excludeDirectPost(this: DirectPostHandlers, state, event) {
       if (!event || typeof event.id !== 'string' || typeof event.channelId !== 'string' || typeof event.guildId !== 'string') return false;
-      if (this.directPostOutcomeMatches(state, event, 'messageId', event.id)) return true;
-      return Boolean(event.isBot && typeof event.nonce === 'string' && this.directPostOutcomeMatches(state, event, 'nonce', event.nonce));
+      if (this.directPostOutcomeMatches(state, event as DirectPostMatchEvent, 'messageId', event.id)) return true;
+      return Boolean(event.isBot && typeof event.nonce === 'string' && this.directPostOutcomeMatches(state, event as DirectPostMatchEvent, 'nonce', event.nonce));
     }
   };
   return handlers;

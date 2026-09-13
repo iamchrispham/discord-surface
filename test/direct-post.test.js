@@ -8,7 +8,7 @@ const { SurfaceState } = require('../src/state');
 const { main } = require('../src/cli');
 const { createSurfaceConsumer } = require('../src/discord');
 const { runDirectPost } = require('../src/direct-post');
-const { createDirectPostHandlers } = require('../src/state/direct-post');
+const { createDirectPostHandlers, DIRECT_POST_OUTCOMES } = require('../src/state/direct-post');
 const { decodeAgentMessage, encodeAgentMessage, KINDS } = require('../src/agent-message');
 
 const CODEX = '9caa5d21-2169-429d-918b-5f08651b5dbd';
@@ -124,6 +124,15 @@ test('direct post inspection preserves captured dependency kinds after factory c
     outcome
   });
   assert.deepEqual(receipts, []);
+});
+
+test('direct post facade exposes the frozen owner outcome vocabulary', () => {
+  const owner = require('../dist/state/direct-post.js');
+  assert.strictEqual(DIRECT_POST_OUTCOMES, owner.DIRECT_POST_OUTCOMES);
+  assert.deepEqual(DIRECT_POST_OUTCOMES, ['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
+  assert.equal(Object.isFrozen(DIRECT_POST_OUTCOMES), true);
+  assert.throws(() => DIRECT_POST_OUTCOMES.push('bogus'), TypeError);
+  assert.deepEqual(DIRECT_POST_OUTCOMES, owner.DIRECT_POST_OUTCOMES);
 });
 
 test('post sends multipart text in order and records durable per-part outcomes', async t => {
