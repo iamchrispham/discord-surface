@@ -66,15 +66,24 @@ function response(body, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body, body: { cancel() {} } };
 }
 
+function boardChannelResponse() {
+  return response({ id: 'channel-1', guild_id: 'guild-1' });
+}
+
+function boardMessageResponse(content, authorId = 'bot-1') {
+  return response({ id: 'target-1', channel_id: 'channel-1', author: { id: authorId, bot: true }, content });
+}
+
 function fakeFetch(board, calls) {
   return async (url, init = {}) => {
     calls.push({ url, init });
     if (url.endsWith('/users/@me')) return response({ id: 'bot-1' });
-    if (init.method === 'GET') return response({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content });
+    if (init.method === 'GET' && url.endsWith('/channels/channel-1')) return boardChannelResponse();
+    if (init.method === 'GET') return boardMessageResponse(board.content);
     if (init.method === 'PATCH') {
       const body = JSON.parse(init.body);
       board.content = body.content;
-      return response({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content });
+      return boardMessageResponse(board.content);
     }
     throw new Error(`unexpected board request ${init.method} ${url}`);
   };
@@ -248,13 +257,19 @@ function runRecoverChild(f, attemptId, evidence = recoveryEvidence()) {
   }, { timeoutMs: 7000 }).then(child => ({ child, marker, deadlineMarker }));
 }
 
-test('board refresh patches one proven target with mention suppression and no POST', async t => {
+test('board refresh accepts Discord message REST shape without guild_id', async t => {
   const f = fixture();
   t.after(() => f.state.close());
   const calls = [];
   const board = { content: 'old board' };
   const result = await refresh(f, 'new board', 'refresh-1', fakeFetch(board, calls));
   assert.equal(result.status, BOARD_OUTCOMES.APPLIED);
+  assert.deepEqual(calls.map(call => [call.init.method, call.url]), [
+    ['GET', 'https://discord.com/api/v10/users/@me'],
+    ['GET', 'https://discord.com/api/v10/channels/channel-1'],
+    ['GET', 'https://discord.com/api/v10/channels/channel-1/messages/target-1'],
+    ['PATCH', 'https://discord.com/api/v10/channels/channel-1/messages/target-1']
+  ]);
   const patches = calls.filter(call => call.init.method === 'PATCH');
   assert.equal(patches.length, 1);
   assert.equal(patches[0].url, 'https://discord.com/api/v10/channels/channel-1/messages/target-1');
@@ -262,6 +277,67 @@ test('board refresh patches one proven target with mention suppression and no PO
   assert.equal(calls.some(call => call.init.method === 'POST'), false);
   assert.equal(f.state.listReceipts().filter(row => row.kind === 'board-designation').length, 1);
   assert.equal(JSON.parse(f.state.listReceipts().filter(row => row.kind === 'board-refresh-outcome').at(-1).detail).outcome, BOARD_OUTCOMES.APPLIED);
+});
+
+test('board refresh rejects untrusted channel and message identity before admission or PATCH', async () => {
+  const cases = [
+    {
+      name: 'wrong channel guild',
+      channel: { id: 'channel-1', guild_id: 'guild-other' },
+      messageChannelId: 'channel-1',
+      error: /bound guild and channel/,
+      expectedCalls: 2
+    },
+    {
+      name: 'wrong channel id',
+      channel: { id: 'channel-other', guild_id: 'guild-1' },
+      messageChannelId: 'channel-1',
+      error: /bound guild and channel/,
+      expectedCalls: 2
+    },
+    {
+      name: 'missing channel guild',
+      channel: { id: 'channel-1' },
+      messageChannelId: 'channel-1',
+      error: /channel\.guild_id must be a non-empty string/,
+      expectedCalls: 2
+    },
+    {
+      name: 'wrong message channel after valid channel authority',
+      channel: { id: 'channel-1', guild_id: 'guild-1' },
+      messageChannelId: 'channel-other',
+      error: /board target message does not belong to the bound channel/,
+      expectedCalls: 3
+    }
+  ];
+
+  for (const scenario of cases) {
+    const f = fixture();
+    try {
+      const calls = [];
+      const fetchImpl = async (url, init = {}) => {
+        calls.push({ url, init });
+        if (url.endsWith('/users/@me')) return response({ id: 'bot-1' });
+        if (init.method === 'GET' && url.endsWith('/channels/channel-1')) return response(scenario.channel);
+        if (init.method === 'GET') return response({
+          id: 'target-1',
+          channel_id: scenario.messageChannelId,
+          author: { id: 'bot-1', bot: true },
+          content: 'old board'
+        });
+        if (init.method === 'PATCH') return boardMessageResponse('new board');
+        throw new Error(`unexpected board request ${init.method} ${url}`);
+      };
+
+      await assert.rejects(() => refresh(f, 'new board', `refresh-${scenario.name.replaceAll(' ', '-')}`, fetchImpl), scenario.error, scenario.name);
+      assert.equal(calls.length, scenario.expectedCalls, scenario.name);
+      assert.equal(calls.some(call => call.init.method === 'PATCH'), false, scenario.name);
+      assert.equal(f.state.listReceipts().some(row => row.kind === 'board-refresh-attempt'), false, scenario.name);
+      assert.equal(f.state.listReceipts().some(row => row.kind === 'board-refresh-outcome'), false, scenario.name);
+    } finally {
+      f.state.close();
+    }
+  }
 });
 
 test('multiline board content reaches one mention-suppressed PATCH', async t => {
@@ -317,7 +393,8 @@ test('already desired board is an honest no-op and target qualification rejects 
   const wrongFetch = async (url, init = {}) => {
     wrongCalls.push({ url, init });
     if (url.endsWith('/users/@me')) return response({ id: 'bot-1' });
-    return response({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'other-bot', bot: true }, content: 'same board' });
+    if (url.endsWith('/channels/channel-1')) return boardChannelResponse();
+    return boardMessageResponse('same board', 'other-bot');
   };
   await assert.rejects(() => refresh(f, 'other board', 'refresh-wrong-author', wrongFetch), /not authored by this Discord installation/);
   assert.equal(wrongCalls.filter(call => call.init.method === 'PATCH').length, 0);
@@ -345,7 +422,8 @@ test('historical board failure exits nonzero without a retry', async t => {
   const board = { content: 'old board' };
   const failedFetch = async (url, init = {}) => {
     if (url.endsWith('/users/@me')) return response({ id: 'bot-1' });
-    if (init.method === 'GET') return response({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content });
+    if (init.method === 'GET' && url.endsWith('/channels/channel-1')) return boardChannelResponse();
+    if (init.method === 'GET') return boardMessageResponse(board.content);
     if (init.method === 'PATCH') return response({ message: 'rate limited' }, 429);
     throw new Error(`unexpected board request ${init.method} ${url}`);
   };
@@ -584,9 +662,14 @@ test('late PATCH stays fenced across handoff, ordinary readiness, and successor 
       reply.end(JSON.stringify({ id: 'bot-1' }));
       return;
     }
+    if (request.method === 'GET' && requestUrl.pathname === '/api/v10/channels/channel-1') {
+      reply.writeHead(200, { 'content-type': 'application/json' });
+      reply.end(JSON.stringify({ id: 'channel-1', guild_id: 'guild-1' }));
+      return;
+    }
     if (request.method === 'GET' && requestUrl.pathname.endsWith('/messages/target-1')) {
       reply.writeHead(200, { 'content-type': 'application/json' });
-      reply.end(JSON.stringify({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
+      reply.end(JSON.stringify({ id: 'target-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
       return;
     }
     if (request.method === 'PATCH' && requestUrl.pathname.endsWith('/messages/target-1')) {
@@ -607,7 +690,7 @@ test('late PATCH stays fenced across handoff, ordinary readiness, and successor 
             oldApplied.resolve();
             if (!reply.destroyed) {
               reply.writeHead(200, { 'content-type': 'application/json' });
-              reply.end(JSON.stringify({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
+              reply.end(JSON.stringify({ id: 'target-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
             }
           });
           return;
@@ -620,7 +703,7 @@ test('late PATCH stays fenced across handoff, ordinary readiness, and successor 
         controlApplied.resolve();
         if (!reply.destroyed) {
           reply.writeHead(200, { 'content-type': 'application/json' });
-          reply.end(JSON.stringify({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
+          reply.end(JSON.stringify({ id: 'target-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
         }
       });
       return;
@@ -724,9 +807,14 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
       reply.end(JSON.stringify({ id: 'bot-1' }));
       return;
     }
+    if (request.method === 'GET' && requestUrl.pathname === '/api/v10/channels/channel-1') {
+      reply.writeHead(200, { 'content-type': 'application/json' });
+      reply.end(JSON.stringify({ id: 'channel-1', guild_id: 'guild-1' }));
+      return;
+    }
     if (request.method === 'GET' && requestUrl.pathname.endsWith('/messages/target-1')) {
       reply.writeHead(200, { 'content-type': 'application/json' });
-      reply.end(JSON.stringify({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
+      reply.end(JSON.stringify({ id: 'target-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
       return;
     }
     if (request.method === 'POST') {
@@ -751,7 +839,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
             oldApplied.resolve();
             if (!reply.destroyed) {
               reply.writeHead(200, { 'content-type': 'application/json' });
-              reply.end(JSON.stringify({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
+              reply.end(JSON.stringify({ id: 'target-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
             }
           });
           return;
@@ -769,7 +857,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
         }
         if (!reply.destroyed) {
           reply.writeHead(200, { 'content-type': 'application/json' });
-          reply.end(JSON.stringify({ id: 'target-1', guild_id: 'guild-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
+          reply.end(JSON.stringify({ id: 'target-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }));
         }
       });
       return;
