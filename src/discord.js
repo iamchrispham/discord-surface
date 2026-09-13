@@ -1493,7 +1493,14 @@ class DiscordGateway {
   }
 
   async recordLiveAttachmentGap(message, binding, error, signal = null) {
-    if (signal?.aborted || this.stopping || !binding?.active || !this.isCurrentBinding(binding)) return null;
+    const currentBinding = binding?.channelId ? this.state.getBinding(binding.channelId) : null;
+    const bindingIsCurrent = Boolean(binding?.active && currentBinding?.active &&
+      bindingIdentityMatches(binding, currentBinding));
+    if (!bindingIsCurrent) {
+      if (binding?.channelId) this.consumer.releaseIntake(binding.channelId);
+      return null;
+    }
+    if (signal?.aborted || this.stopping) return null;
     this.attachmentIntakeBlockedChannels.add(binding.channelId);
     const watermark = this.state.getIntakeWatermark(binding.channelId);
     const gapFrom = watermark?.recovered_through_id || watermark?.last_seen_id || null;
@@ -2028,7 +2035,7 @@ class DiscordGateway {
 
   async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-    this.ready = false;
+    if (channelIds === null || channelIds === undefined) this.ready = false;
     if (channelIds) {
       for (const channelId of channelIds) {
         if (typeof channelId === 'string') this.pendingRecoveryChannels.add(channelId);
