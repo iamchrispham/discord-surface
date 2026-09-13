@@ -655,6 +655,102 @@ test('live attachment recovery reconciles accepted packet to native provider', a
   await gateway.stop();
 });
 
+test('held-ready attachment recovery fences later same-channel admission until history custody exists', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-held-ready-order-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  let gateway = null;
+  const recoveryGate = createTestGate('held-ready attachment recovery', 10000);
+  t.after(async () => {
+    recoveryGate.resolve();
+    try { await gateway?.stop(); } catch {}
+    try { state.close(); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-held-ready-order.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  const binding = state.getBinding(target.channelId);
+  const destination = { ...target, generation: binding.generation };
+  state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
+  state.markIntakeBoundary(destination.channelId, 'ready', null, null, null, binding);
+  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const message = {
+    id: '7000', guildId: destination.guildId, channelId: destination.channelId,
+    author: { id: '901', bot: true }, content: 'readable preview',
+    attachments: [{
+      url: 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether',
+      filename: 'agent-message.tether', contentType: 'application/octet-stream', size: Buffer.byteLength(wire)
+    }]
+  };
+  const laterMessage = {
+    id: '7001', guildId: destination.guildId, channelId: destination.channelId,
+    author: { id: '900', bot: false }, content: 'later same-channel request'
+  };
+  let fetchAttempts = 0;
+  const nativePrompts = [];
+  const nativeDispatches = [];
+  const fetchAttachment = async () => {
+    fetchAttempts += 1;
+    if (fetchAttempts === 1) throw new Error('CDN unavailable');
+    return new Response(Buffer.from(wire), { status: 200, headers: { 'content-length': String(Buffer.byteLength(wire)) } });
+  };
+  const channel = {
+    id: destination.channelId,
+    guildId: destination.guildId,
+    topic: staticConductorMarker({ provider: destination.provider, conductorId: binding.conductorId, repoKey: binding.repoKey }),
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
+  const history = async (_channel, options) => {
+    if (options.after === '6999') return [message, laterMessage];
+    if (options.after === laterMessage.id) return [];
+    throw new Error(`unexpected history cursor ${options.after}`);
+  };
+  gateway = new DiscordGateway({
+    state,
+    client: { user: { id: '901' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
+    providers: {
+      claude: {
+        async dispatch(storedMessage) {
+          nativeDispatches.push(storedMessage.id);
+          nativePrompts.push(messageRequest(storedMessage));
+          return { status: 'submitted' };
+        },
+        async observe() { return { text: 'recovered response' }; }
+      }
+    },
+    fetchHistory: history,
+    sendReply: async () => ({ id: 'native-recovery-reply' }),
+    sendTransportReceipt: async () => ({ id: 'transport-receipt' }),
+    recoveryOptions: { pageLimit: 2, agentAttachmentFetch: fetchAttachment }
+  });
+  let recoveryStarted = false;
+  const originalRecoverTransport = gateway.recoverTransport.bind(gateway);
+  gateway.recoverTransport = async (...args) => {
+    recoveryStarted = true;
+    await recoveryGate.promise;
+    return originalRecoverTransport(...args);
+  };
+  gateway.discordToken = token;
+  gateway.ready = false;
+  gateway.boundMessage(message);
+  await waitForCondition(() => recoveryStarted, 'timed out waiting for held-ready attachment recovery to pause');
+  assert.equal(fetchAttempts, 1);
+  gateway.boundMessage(laterMessage);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.getMessage(laterMessage.id), null, 'later same-channel intake bypassed attachment recovery barrier');
+  assert.deepEqual(nativeDispatches, [], 'later intake dispatched while attachment recovery was held');
+  recoveryGate.resolve();
+  await waitForCondition(() => nativeDispatches.length >= 1, 'recovered packet did not dispatch after attachment recovery');
+  await waitForCondition(() => nativeDispatches.length >= 2, 'later same-channel packet did not dispatch after recovery');
+  assert.deepEqual(nativeDispatches.slice(0, 2), [message.id, laterMessage.id]);
+  assert.equal(fetchAttempts, 2);
+  assert.equal(nativePrompts.length, 2);
+  assert.ok(nativePrompts[0].includes(packet.text));
+  assert.ok(nativePrompts[1].includes(laterMessage.content));
+  await gateway.stop();
+});
+
+
 test('live attachment readiness drop during download holds durable intake and skips native dispatch', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-readiness-drop-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));

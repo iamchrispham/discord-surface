@@ -863,8 +863,12 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
           deadline,
           botId: connectedBotId()
         });
+      const currentBinding = expectedBinding ? state.getBinding(expectedBinding.channelId) : null;
+      const effectiveReady = !bypassBarrier && expectedBinding
+        ? currentBinding?.readiness === READINESS.READY
+        : ready;
       return state.acceptDiscordMessage(input, {
-        ready,
+        ready: effectiveReady,
         coverageId,
         expectedBinding,
           agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
