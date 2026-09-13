@@ -54,12 +54,9 @@ const state: DirectPostState = {
 };
 
 const handlers = createDirectPostHandlers({
-  db: state.db,
   assertText: value => String(value),
   parseJson: () => null,
   StateCorruptError: class extends Error {},
-  attemptKind: 'direct-post-attempt',
-  outcomeKind: 'direct-post-outcome',
   BindingError: class extends Error {},
   StaleGenerationError: class extends Error {},
   DIRECT_POST_ATTEMPT: 'direct-post-attempt',
