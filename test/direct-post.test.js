@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { SurfaceState } = require('../src/state');
+const { SurfaceState, DIRECT_POST_OUTCOMES: stateOutcomes } = require('../src/state');
 const { main } = require('../src/cli');
 const { createSurfaceConsumer } = require('../src/discord');
 const { runDirectPost } = require('../src/direct-post');
@@ -128,6 +128,7 @@ test('direct post inspection preserves captured dependency kinds after factory c
 
 test('direct post facade exposes the frozen owner outcome vocabulary', () => {
   const owner = require('../dist/state/direct-post.js');
+  assert.strictEqual(stateOutcomes, DIRECT_POST_OUTCOMES);
   assert.strictEqual(DIRECT_POST_OUTCOMES, owner.DIRECT_POST_OUTCOMES);
   assert.deepEqual(DIRECT_POST_OUTCOMES, ['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
   assert.equal(Object.isFrozen(DIRECT_POST_OUTCOMES), true);

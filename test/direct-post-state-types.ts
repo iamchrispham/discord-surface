@@ -91,6 +91,12 @@ handlers.excludeDirectPost(state, malformedEvent);
 handlers.directPostOutcomeMatches(state, event, 'messageId', 'message');
 const detachedExclude = handlers.excludeDirectPost;
 
+// @ts-expect-error direct-post binding provider uses the existing agent provider vocabulary
+const invalidBindingProvider: DirectPostBinding = { ...binding, provider: 'discord' };
+
+// @ts-expect-error direct-post metadata provider uses the existing agent provider vocabulary
+const invalidMetaProvider: DirectPostPartMeta = { ...meta, provider: 'discord' };
+
 // @ts-expect-error direct-post outcome matching requires channel and guild identity
 handlers.directPostOutcomeMatches(state, malformedEvent, 'messageId', 'message');
 
@@ -136,6 +142,8 @@ handlers.recordDirectPostOutcome(state, meta.requestId, meta.attemptId, outcome,
 detachedExclude(state, event);
 
 void rows;
+void invalidBindingProvider;
+void invalidMetaProvider;
 
 // @ts-expect-error direct-post outcomes use the persisted finite vocabulary
 const invalidOutcome: DirectPostOutcome = 'delivered';

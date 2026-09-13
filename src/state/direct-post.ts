@@ -1,3 +1,5 @@
+import type { AgentProvider } from '../agent-message';
+
 export const DIRECT_POST_OUTCOMES = Object.freeze([
   'sent',
   'not_sent',
@@ -15,7 +17,7 @@ export interface DirectPostBinding {
   active: boolean;
   channelId: string;
   guildId: string;
-  provider: string;
+  provider: AgentProvider;
   nativeId: string;
   generation: number;
   conductorId?: string | null;
@@ -32,7 +34,7 @@ export interface DirectPostPartMeta {
   partHash: string;
   channelId: string;
   guildId: string;
-  provider: string;
+  provider: AgentProvider;
   nativeId: string;
   generation: number;
   conductorId?: string | null;
