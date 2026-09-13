@@ -182,6 +182,12 @@ interface ReceiptRow {
   createdAt: string;
 }
 
+interface ReceiptFilter {
+  target?: BoardTarget;
+  requestId?: string;
+  attemptIds?: readonly string[];
+}
+
 function text(value: unknown, name: string, max = 512): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`${name} must be a non-empty string`);
@@ -211,11 +217,30 @@ function parseDetail(value: unknown): Record<string, unknown> {
   }
 }
 
-function readReceipts(state: BoardState, kinds: readonly string[] = Object.values(BOARD_RECEIPT_KINDS)): ReceiptRow[] {
+function readReceipts(state: BoardState, kinds: readonly string[] = Object.values(BOARD_RECEIPT_KINDS), filter: ReceiptFilter = {}): ReceiptRow[] {
   if (kinds.some(kind => !RECEIPT_VALUES.has(kind))) throw new Error('invalid board receipt kind');
   const placeholders = kinds.map(() => '?').join(', ');
-  return state.db.prepare(`SELECT id, kind, detail, created_at FROM receipts WHERE kind IN (${placeholders}) ORDER BY id`)
-    .all(...kinds)
+  const predicates = [`kind IN (${placeholders})`];
+  const parameters: unknown[] = [...kinds];
+  if (filter.target) {
+    predicates.push(
+      "json_extract(detail, '$.guildId')=?",
+      "json_extract(detail, '$.channelId')=?",
+      "json_extract(detail, '$.targetMessageId')=?"
+    );
+    parameters.push(filter.target.guildId, filter.target.channelId, filter.target.messageId);
+  }
+  if (filter.requestId !== undefined) {
+    predicates.push("json_extract(detail, '$.requestId')=?");
+    parameters.push(filter.requestId);
+  }
+  if (filter.attemptIds !== undefined) {
+    if (filter.attemptIds.length === 0) return [];
+    predicates.push(`json_extract(detail, '$.attemptId') IN (${filter.attemptIds.map(() => '?').join(', ')})`);
+    parameters.push(...filter.attemptIds);
+  }
+  return state.db.prepare(`SELECT id, kind, detail, created_at FROM receipts WHERE ${predicates.join(' AND ')} ORDER BY id`)
+    .all(...parameters)
     .map(row => ({
       id: Number(row.id),
       kind: String(row.kind),
@@ -299,6 +324,15 @@ function rowRecord(row: ReceiptRow, historical = false): BoardRefreshRecord {
 
 function requestRows(rows: readonly ReceiptRow[], requestId: string): ReceiptRow[] {
   return rows.filter(row => row.kind === BOARD_RECEIPT_KINDS.ATTEMPT && row.detail.requestId === requestId);
+}
+
+function readBoardRequestReceipts(state: BoardState, requestId: string): ReceiptRow[] {
+  const attempts = readReceipts(state, [BOARD_RECEIPT_KINDS.ATTEMPT], { requestId });
+  if (attempts.length === 0) return [];
+  const outcomes = readReceipts(state, [BOARD_RECEIPT_KINDS.OUTCOME], {
+    attemptIds: attempts.map(row => String(row.detail.attemptId || ''))
+  });
+  return [...attempts, ...outcomes].sort((left, right) => left.id - right.id);
 }
 
 function validateOutcome(value: unknown): BoardOutcome {
@@ -395,14 +429,14 @@ function duplicateRecord(rows: readonly ReceiptRow[], requestId: string, target:
 
 function captureBoardRevision(state: BoardState, rawTarget: BoardTarget): BoardRevisionSnapshot {
   const target = assertTarget(rawTarget);
-  const rows = readReceipts(state);
+  const rows = readReceipts(state, Object.values(BOARD_RECEIPT_KINDS), { target });
   return { target, revision: currentRevision(rows, target) };
 }
 
 function inspectBoardRequest(state: BoardState, requestId: string, rawTarget: BoardTarget): BoardAdmission | null {
   const target = assertTarget(rawTarget);
   text(requestId, 'requestId', 256);
-  return duplicateRecord(readReceipts(state), requestId, target);
+  return duplicateRecord(readBoardRequestReceipts(state, requestId), requestId, target);
 }
 
 function boardMessageProvenance(state: BoardState, rawTarget: BoardTarget): BoardProvenance[] {
@@ -477,7 +511,7 @@ function recoverBoardRefreshAttempt(state: BoardState, targetInput: BoardTarget,
   const target = assertTarget(targetInput);
   const attemptId = text(attemptIdInput, 'attemptId', 128);
   return state.transaction(() => {
-    const rows = readReceipts(state, [BOARD_RECEIPT_KINDS.ATTEMPT, BOARD_RECEIPT_KINDS.OUTCOME]);
+    const rows = readReceipts(state, [BOARD_RECEIPT_KINDS.ATTEMPT, BOARD_RECEIPT_KINDS.OUTCOME], { target });
     const attempt = rows.find(row => row.kind === BOARD_RECEIPT_KINDS.ATTEMPT && String(row.detail.attemptId) === attemptId && targetMatches(row.detail, target));
     if (!attempt || latestOutcome(rows, attemptId)) return 0;
     return recoverOrphanBoardRefreshAttempt(state, attempt, ownerAlive);
@@ -498,8 +532,8 @@ function beginBoardRefresh(state: BoardState, metaInput: BoardRefreshMeta, captu
         reason: 'binding changed before board refresh admission'
       };
     }
-    const rows = readReceipts(state);
-    const duplicate = duplicateRecord(rows, meta.requestId, meta.target);
+    const rows = readReceipts(state, Object.values(BOARD_RECEIPT_KINDS), { target: meta.target });
+    const duplicate = duplicateRecord(readBoardRequestReceipts(state, meta.requestId), meta.requestId, meta.target);
     if (duplicate) {
       if (duplicate.attempt && duplicate.attempt.payloadHash !== meta.payloadHash) throw new Error('dedupe key is already used for another board payload');
       return duplicate;
@@ -612,7 +646,7 @@ function recordBoardRefreshOutcome(state: BoardState, targetInput: BoardTarget, 
   const outcome = validateOutcome(outcomeInput);
   if (outcome === BOARD_OUTCOMES.IN_FLIGHT) throw new Error('board refresh outcome must be terminal or unknown');
   return state.transaction(() => {
-    const rows = readReceipts(state);
+    const rows = readReceipts(state, Object.values(BOARD_RECEIPT_KINDS), { target });
     const attempts = rows.filter(row => row.kind === BOARD_RECEIPT_KINDS.ATTEMPT && row.detail.attemptId === attemptId);
     const attempt = attempts.at(-1);
     if (!attempt || !targetMatches(attempt.detail, target)) throw new Error('board refresh attempt is unknown');
@@ -643,7 +677,7 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
     throw new Error('positive board readback requires sole-writer, single-attempt, and no-hidden-retry evidence');
   }
   return state.transaction(() => {
-    const rows = readReceipts(state);
+    const rows = readReceipts(state, Object.values(BOARD_RECEIPT_KINDS), { target });
     const attempt = rows.filter(row => row.kind === BOARD_RECEIPT_KINDS.ATTEMPT && row.detail.attemptId === attemptId).at(-1);
     if (!attempt || !targetMatches(attempt.detail, target)) throw new Error('board refresh attempt is unknown');
     const existing = latestOutcome(rows, attemptId);

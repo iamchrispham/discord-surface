@@ -403,6 +403,25 @@ test('board recovery returns applied history without writing a receipt', async t
   assert.deepEqual(f.state.getBinding('channel-1'), binding);
 });
 
+test('incomplete board recovery rejects the missing message selector', async t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  f.state.close();
+  const child = await runChild([
+    CLI_PATH,
+    'recover',
+    '--db', f.dbPath,
+    '--board-guild-id', 'guild-1',
+    '--board-channel-id', 'channel-1',
+    '--board-attempt-id', 'missing-attempt'
+  ], { NODE_NO_WARNINGS: '1' }, { timeoutMs: 3000 });
+  assert.equal(child.timedOut, false);
+  assert.equal(child.code, 1, `incomplete recovery exited ${child.code} signal=${child.signal} stderr=${child.stderr} stdout=${child.stdout}`);
+  assert.equal(child.signal, null);
+  assert.equal(child.stdout, '');
+  assert.equal(child.stderr, 'discord-surface: missing --board-message-id\n');
+});
+
 test('board recovery refuses every terminal outcome except applied', async t => {
   for (const outcome of [
     BOARD_OUTCOMES.NO_OP,

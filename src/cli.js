@@ -541,7 +541,8 @@ async function liaisonDraft(args) {
 function recover(args) {
   const { state } = openState(args);
   try {
-    if (args['board-message-id']) {
+    const boardRequested = Object.keys(args).some(key => key.startsWith('board-') && args[key] !== undefined);
+    if (boardRequested) {
       const boardTarget = {
         guildId: required(args, 'board-guild-id'),
         channelId: required(args, 'board-channel-id'),
