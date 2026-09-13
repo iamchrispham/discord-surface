@@ -1397,6 +1397,7 @@ test('pre-timer stale rebind releases old barrier', async t => {
     'successor was not admitted after pre-timer stale cleanup');
   await waitForCondition(() => scenario.nativeDispatches.length === 1,
     'successor did not dispatch after pre-timer cleanup');
+  assert.deepEqual(scenario.nativeDispatches, [{ id: message.id, nativeId: successor.nativeId, generation: successor.generation }]);
   assert.equal(scenario.gateway.attachmentIntakeRetryMessages.has(successor.channelId), false);
   assert.equal(scenario.gateway.attachmentIntakeBlockedChannels.has(successor.channelId), false);
 });
@@ -1417,6 +1418,7 @@ test('during-recovery stale rebind releases old barrier', async t => {
     'successor was not admitted after during-recovery stale cleanup');
   await waitForCondition(() => scenario.nativeDispatches.length === 1,
     'successor did not dispatch after during-recovery cleanup');
+  assert.deepEqual(scenario.nativeDispatches, [{ id: message.id, nativeId: successor.nativeId, generation: successor.generation }]);
   assert.equal(scenario.gateway.attachmentIntakeRetryMessages.has(successor.channelId), false);
   assert.equal(scenario.gateway.attachmentIntakeBlockedChannels.has(successor.channelId), false);
 });
