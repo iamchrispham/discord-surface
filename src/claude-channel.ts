@@ -48,14 +48,14 @@ export interface ClaudeMessage {
 export type ClaudeChannelReadMessage = Pick<ClaudeMessage, 'provider' | 'nativeId' | 'generation' | 'state'>;
 
 export interface ClaudeChannelReadState {
-  findNativeBinding(nativeId: string, provider: NativeAcknowledgmentInput['provider']): ClaudeBinding | null | undefined;
-  getBinding(channelId: string): ClaudeBinding | null | undefined;
-  getMessage(messageId: string): ClaudeChannelReadMessage | null | undefined;
+  findNativeBinding: (nativeId: string, provider: 'claude') => ClaudeBinding | null | undefined;
+  getBinding: (channelId: string) => ClaudeBinding | null | undefined;
+  getMessage: (messageId: string) => ClaudeChannelReadMessage | null | undefined;
   assertMessageCurrent: (messageId: string, phase: 'native-dispatch') => ClaudeChannelReadMessage | void;
 }
 
 export interface ClaudeChannelState extends ClaudeChannelReadState {
-  getMessage(messageId: string): ClaudeMessage | null | undefined;
+  getMessage: (messageId: string) => ClaudeMessage | null | undefined;
   assertMessageCurrent: (messageId: string, phase: 'native-dispatch') => ClaudeMessage;
 }
 
@@ -127,11 +127,13 @@ interface ClaudeChannelOptionsBase {
   logger?: (message: string) => void;
 }
 
-export type ClaudeChannelOptions<TTransport = unknown> =
-  | (ClaudeChannelOptionsBase & {
-      state: ClaudeChannelReadState & ClaudeDefaultMcpState;
-      mcp?: ClaudeChannelMcp<TTransport>;
-    })
+export type ClaudeChannelOptions<TTransport = StdioServerTransport> =
+  | (StdioServerTransport extends TTransport
+      ? ClaudeChannelOptionsBase & {
+          state: ClaudeChannelReadState & ClaudeDefaultMcpState;
+          mcp?: ClaudeChannelMcp<TTransport>;
+        }
+      : never)
   | (ClaudeChannelOptionsBase & {
       state: ClaudeChannelReadState;
       mcp: ClaudeChannelMcp<TTransport>;
@@ -255,7 +257,7 @@ export function createDefaultMcp({ nativeId, state }: { nativeId: string; state:
   return mcp;
 }
 
-export class ClaudeChannel<TTransport = unknown> {
+export class ClaudeChannel<TTransport = StdioServerTransport> {
   declare bindingIdentity: ClaudeBindingIdentity;
   declare state: ClaudeChannelReadState;
   declare nativeId: string;

@@ -13,8 +13,10 @@ import type { AcknowledgmentState, NativeAcknowledgmentInput } from '../src/ackn
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { ListToolsRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import type { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 declare const state: ClaudeChannelReadState;
+declare const richChannelState: ClaudeChannelState;
 
 type NarrowNotification = ClaudeChannelNotification & { requiredField: string };
 
@@ -58,6 +60,56 @@ const literalPhaseRichAssertion: ClaudeChannelState['assertMessageCurrent'] = (_
 };
 void literalPhaseRichAssertion;
 
+const arbitraryStringReadState: ClaudeChannelReadState = {
+  findNativeBinding: (nativeId: string, provider: 'claude') => {
+    nativeId satisfies string;
+    provider satisfies 'claude';
+    return undefined;
+  },
+  getBinding: (channelId: string) => {
+    channelId satisfies string;
+    return undefined;
+  },
+  getMessage: (messageId: string) => {
+    messageId satisfies string;
+    return undefined;
+  },
+  assertMessageCurrent: () => undefined
+};
+void arbitraryStringReadState;
+
+const broadProviderFindNativeBinding: ClaudeChannelReadState['findNativeBinding'] = (
+  _nativeId: string,
+  _provider: NativeAcknowledgmentInput['provider']
+) => undefined;
+void broadProviderFindNativeBinding;
+
+const narrowedFindNativeBinding = (_nativeId: 'fixed', _provider: NativeAcknowledgmentInput['provider']) => undefined;
+const narrowedGetBinding = (_channelId: 'fixed') => undefined;
+const narrowedGetMessage = (_messageId: 'fixed') => undefined;
+const invalidNarrowedReadState: ClaudeChannelReadState = {
+  ...synchronousAssertionState,
+  // @ts-expect-error read-state binding callbacks must accept arbitrary native IDs
+  findNativeBinding: narrowedFindNativeBinding,
+  // @ts-expect-error read-state binding callbacks must accept arbitrary channel IDs
+  getBinding: narrowedGetBinding,
+  // @ts-expect-error read-state message callbacks must accept arbitrary message IDs
+  getMessage: narrowedGetMessage
+};
+void invalidNarrowedReadState;
+
+const arbitraryStringRichGetMessage: ClaudeChannelState['getMessage'] = (messageId: string) => {
+  messageId satisfies string;
+  return undefined;
+};
+void arbitraryStringRichGetMessage;
+const invalidNarrowedRichState: ClaudeChannelState = {
+  ...richChannelState,
+  // @ts-expect-error rich message callbacks must accept arbitrary message IDs
+  getMessage: narrowedGetMessage
+};
+void invalidNarrowedRichState;
+
 const injectedMcpWithOwnHandler = {
   notification: async () => {},
   setRequestHandler: (
@@ -84,13 +136,13 @@ const channel = new ClaudeChannel({
   mcp
 });
 
-declare const richChannelState: ClaudeChannelState;
 richChannelState.assertMessageCurrent('id', 'native-dispatch').channelId satisfies string;
 
 void channel.handleEvent(event);
 void channel.stop();
 
-const concreteTransportMcp: ClaudeChannelMcp<{ marker: string }> = {
+type CustomTransport = { marker: string };
+const concreteTransportMcp: ClaudeChannelMcp<CustomTransport> = {
   notification: async notification => {
     notification.params.content satisfies string;
   },
@@ -99,12 +151,15 @@ const concreteTransportMcp: ClaudeChannelMcp<{ marker: string }> = {
   },
   transportFactory: () => ({ marker: 'transport' })
 };
-new ClaudeChannel({
+const concreteTransportChannel = new ClaudeChannel({
   state,
   nativeId: event.nativeId,
   socketPath: '/tmp/claude-channel-concrete.sock',
   mcp: concreteTransportMcp
 });
+const concreteTransport = concreteTransportChannel.mcp.transportFactory!();
+concreteTransport.marker satisfies string;
+void concreteTransportChannel;
 
 const ignoredSynchronousResultMcp: ClaudeChannelMcp<{ marker: string }> = {
   notification: async () => {},
@@ -192,13 +247,13 @@ const invalidRichReplyState: ClaudeAcknowledgmentState = {
 };
 void invalidRichReplyState;
 
-const errorAwareMcp: ClaudeChannelMcp = {
+const errorAwareMcp: ClaudeChannelMcp<StdioServerTransport> = {
   notification: async () => {},
   onerror: error => {
     error.message satisfies string;
   }
 };
-const optionalMcp: ClaudeChannelMcp | undefined = Math.random() > 0.5 ? errorAwareMcp : undefined;
+const optionalMcp: ClaudeChannelMcp<StdioServerTransport> | undefined = Math.random() > 0.5 ? errorAwareMcp : undefined;
 const optionalAcknowledgmentOptions: ClaudeChannelOptions = {
   state: acknowledgmentState,
   nativeId: event.nativeId,
@@ -211,6 +266,32 @@ new ClaudeChannel({
   nativeId: event.nativeId,
   socketPath: '/tmp/claude-channel-optional-mcp.sock',
   mcp: optionalMcp
+});
+
+const defaultTransportChannel = new ClaudeChannel({
+  state: acknowledgmentState,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-default-transport.sock'
+});
+const defaultTransport = defaultTransportChannel.mcp.transportFactory!();
+defaultTransport satisfies StdioServerTransport;
+void defaultTransportChannel;
+
+type CompatibleDefaultTransport = CustomTransport | StdioServerTransport;
+const compatibleDefaultTransportChannel = new ClaudeChannel<CompatibleDefaultTransport>({
+  state: acknowledgmentState,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-compatible-default-transport.sock'
+});
+const compatibleDefaultTransport = compatibleDefaultTransportChannel.mcp.transportFactory!();
+compatibleDefaultTransport satisfies CompatibleDefaultTransport;
+void compatibleDefaultTransportChannel;
+
+// @ts-expect-error an incompatible custom transport requires an injected MCP
+new ClaudeChannel<CustomTransport>({
+  state: acknowledgmentState,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-incompatible-default-transport.sock'
 });
 
 type MinimalDefaultMcpState = AcknowledgmentState & {
