@@ -634,7 +634,8 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
     const existing = latestOutcome(rows, attemptId);
     if (!existing) throw new Error('board refresh attempt has no outcome to reconcile');
     const current = validateOutcome(existing.detail.outcome);
-    if (!UNRESOLVED_OUTCOMES.has(current)) return rowRecord(existing, true);
+    if (current === BOARD_OUTCOMES.APPLIED) return rowRecord(existing, true);
+    if (!UNRESOLVED_OUTCOMES.has(current)) throw new Error(`board refresh attempt has terminal outcome ${current}`);
     const endedAt = typeof existing.detail.operationEndedAt === 'string' ? existing.detail.operationEndedAt : null;
     if (!endedAt) throw new Error('board refresh operation end is unknown');
     if (Date.parse(observedAt) < Date.parse(endedAt)) throw new Error('board readback predates operation termination');

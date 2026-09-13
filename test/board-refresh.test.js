@@ -138,6 +138,100 @@ function boardRefreshArgs(f, requestId) {
   ];
 }
 
+function boardTarget() {
+  return { guildId: 'guild-1', channelId: 'channel-1', messageId: 'target-1' };
+}
+
+function recoveryEvidence(content = 'new board') {
+  return {
+    evidenceScope: 'local fixture readback',
+    observedAt: '2026-01-01T00:00:01.000Z',
+    readbackContent: content,
+    soleWriter: true,
+    singleAttempt: true,
+    noHiddenRetry: true
+  };
+}
+
+function seedBoardAttempt(f, requestId, content = 'new board') {
+  const target = boardTarget();
+  const binding = f.state.getBinding(target.channelId);
+  const provenance = f.state.boardMessageProvenance(target)[0];
+  assert.ok(binding);
+  assert.ok(provenance);
+  const admission = f.state.beginBoardRefresh({
+    requestId,
+    target,
+    content,
+    preEditContent: 'old board',
+    payloadHash: `hash-${requestId}`,
+    binding,
+    targetAuthorId: 'bot-1',
+    provenance
+  }, f.state.captureBoardRevision(target).revision);
+  assert.equal(admission.status, 'admitted');
+  assert.ok(admission.attemptId);
+  return { target, attemptId: admission.attemptId };
+}
+
+function seedBoardOutcome(f, requestId, outcome) {
+  const seeded = seedBoardAttempt(f, requestId);
+  const recorded = f.state.recordBoardRefreshOutcome(seeded.target, seeded.attemptId, outcome, {
+    operationEndedAt: '2026-01-01T00:00:00.000Z',
+    error: `fixture ${outcome}`
+  });
+  assert.equal(recorded.outcome, outcome);
+  return seeded;
+}
+
+function boardRecoverArgs(f, attemptId, evidence = recoveryEvidence()) {
+  return [
+    CLI_PATH,
+    'recover',
+    '--db', f.dbPath,
+    '--board-guild-id', 'guild-1',
+    '--board-channel-id', 'channel-1',
+    '--board-message-id', 'target-1',
+    '--board-attempt-id', attemptId,
+    '--board-resolution', BOARD_OUTCOMES.APPLIED,
+    '--board-evidence-scope', evidence.evidenceScope,
+    '--board-readback-at', evidence.observedAt,
+    '--board-readback', evidence.readbackContent,
+    '--board-sole-writer', 'true',
+    '--board-single-attempt', 'true',
+    '--board-no-hidden-retry', 'true'
+  ];
+}
+
+function runRecoverChild(f, attemptId, evidence = recoveryEvidence()) {
+  const marker = path.join(f.dir, 'unexpected-recover-fetch.marker');
+  const deadlineMarker = path.join(f.dir, 'recover-fixture-deadline.marker');
+  const childScript = `
+    const fs = require('node:fs');
+    const { main } = require(${JSON.stringify(CLI_PATH)});
+    global.fetch = async () => {
+      fs.writeFileSync(process.env.DISCORD_SURFACE_UNEXPECTED_FETCH_MARKER, 'unexpected');
+      throw new Error('unexpected fetch during board recovery');
+    };
+    process.argv = [process.execPath, ...JSON.parse(process.env.DISCORD_SURFACE_RECOVER_ARGS)];
+    const fixtureDeadline = setTimeout(() => {
+      fs.writeFileSync(process.env.DISCORD_SURFACE_FIXTURE_DEADLINE_MARKER, 'deadline');
+      process.exit(99);
+    }, 4000);
+    main().then(() => clearTimeout(fixtureDeadline), error => {
+      clearTimeout(fixtureDeadline);
+      process.stderr.write(error.message + '\\n');
+      process.exitCode = 1;
+    });
+  `;
+  return runChild(['-e', childScript], {
+    DISCORD_SURFACE_RECOVER_ARGS: JSON.stringify(boardRecoverArgs(f, attemptId, evidence)),
+    DISCORD_SURFACE_UNEXPECTED_FETCH_MARKER: marker,
+    DISCORD_SURFACE_FIXTURE_DEADLINE_MARKER: deadlineMarker,
+    NODE_NO_WARNINGS: '1'
+  }, { timeoutMs: 7000 }).then(child => ({ child, marker, deadlineMarker }));
+}
+
 test('board refresh patches one proven target with mention suppression and no POST', async t => {
   const f = fixture();
   t.after(() => f.state.close());
@@ -264,6 +358,87 @@ test('historical board failure exits nonzero without a retry', async t => {
   assert.equal(fs.existsSync(marker), false);
   assert.equal(fs.existsSync(path.join(f.dir, 'fixture-deadline.marker')), false);
   assert.equal(child.stderr, '');
+});
+
+test('board recovery returns applied history without writing a receipt', async t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  const seeded = seedBoardOutcome(f, 'recover-applied', BOARD_OUTCOMES.APPLIED);
+  const evidence = recoveryEvidence();
+  const before = f.state.listReceipts();
+  const binding = f.state.getBinding('channel-1');
+  const recovered = f.state.reconcileBoardRefresh(seeded.target, seeded.attemptId, BOARD_OUTCOMES.APPLIED, evidence);
+  assert.equal(recovered.status, BOARD_OUTCOMES.APPLIED);
+  assert.equal(recovered.historical, true);
+  assert.deepEqual(f.state.listReceipts(), before);
+  assert.deepEqual(f.state.getBinding('channel-1'), binding);
+});
+
+test('board recovery refuses every terminal outcome except applied', async t => {
+  for (const outcome of [
+    BOARD_OUTCOMES.NO_OP,
+    BOARD_OUTCOMES.STALE,
+    BOARD_OUTCOMES.REJECTED,
+    BOARD_OUTCOMES.RATE_LIMITED,
+    BOARD_OUTCOMES.NOT_SENT
+  ]) {
+    const f = fixture();
+    t.after(() => f.state.close());
+    const seeded = seedBoardOutcome(f, `recover-${outcome}`, outcome);
+    const evidence = recoveryEvidence();
+    const before = f.state.listReceipts();
+    const binding = f.state.getBinding('channel-1');
+    assert.throws(
+      () => f.state.reconcileBoardRefresh(seeded.target, seeded.attemptId, BOARD_OUTCOMES.APPLIED, evidence),
+      new RegExp(`terminal outcome ${outcome}`)
+    );
+    assert.deepEqual(f.state.listReceipts(), before);
+    assert.deepEqual(f.state.getBinding('channel-1'), binding);
+
+    if ([BOARD_OUTCOMES.REJECTED, BOARD_OUTCOMES.RATE_LIMITED, BOARD_OUTCOMES.NOT_SENT].includes(outcome)) {
+      f.state.close();
+      const { child, marker, deadlineMarker } = await runRecoverChild(f, seeded.attemptId, evidence);
+      assert.equal(child.timedOut, false);
+      assert.equal(child.code, 1, `${outcome} child exited ${child.code} signal=${child.signal} stderr=${child.stderr} stdout=${child.stdout}`);
+      assert.equal(child.signal, null);
+      assert.equal(child.stdout, '');
+      assert.equal(child.stderr, `board refresh attempt has terminal outcome ${outcome}\n`);
+      assert.equal(fs.existsSync(marker), false);
+      assert.equal(fs.existsSync(deadlineMarker), false);
+      f.state = new SurfaceState(f.dbPath);
+      assert.deepEqual(f.state.listReceipts(), before);
+      assert.deepEqual(f.state.getBinding('channel-1'), binding);
+    }
+  }
+});
+
+test('board recovery preserves in-flight refusal and unknown evidence reconciliation', async t => {
+  const missing = fixture();
+  const unknown = fixture();
+  t.after(() => missing.state.close());
+  t.after(() => unknown.state.close());
+
+  const missingSeed = seedBoardAttempt(missing, 'recover-missing');
+  const missingBefore = missing.state.listReceipts();
+  assert.equal(missing.state.inspectBoardRequest('recover-missing', missingSeed.target).status, BOARD_OUTCOMES.IN_FLIGHT);
+  assert.throws(
+    () => missing.state.reconcileBoardRefresh(missingSeed.target, missingSeed.attemptId, BOARD_OUTCOMES.APPLIED, recoveryEvidence()),
+    /has no outcome to reconcile/
+  );
+  assert.deepEqual(missing.state.listReceipts(), missingBefore);
+
+  const unknownSeed = seedBoardOutcome(unknown, 'recover-unknown', BOARD_OUTCOMES.UNKNOWN);
+  const unknownBefore = unknown.state.listReceipts();
+  const reconciled = unknown.state.reconcileBoardRefresh(unknownSeed.target, unknownSeed.attemptId, BOARD_OUTCOMES.APPLIED, recoveryEvidence());
+  assert.equal(reconciled.status, BOARD_OUTCOMES.APPLIED);
+  assert.equal(reconciled.reconciledFrom, BOARD_OUTCOMES.UNKNOWN);
+  const afterReconcile = unknown.state.listReceipts();
+  assert.equal(afterReconcile.length, unknownBefore.length + 1);
+  assert.equal(JSON.parse(afterReconcile.at(-1).detail).outcome, BOARD_OUTCOMES.APPLIED);
+  const beforeDuplicate = unknown.state.listReceipts();
+  const duplicate = unknown.state.reconcileBoardRefresh(unknownSeed.target, unknownSeed.attemptId, BOARD_OUTCOMES.APPLIED, recoveryEvidence());
+  assert.equal(duplicate.historical, true);
+  assert.deepEqual(unknown.state.listReceipts(), beforeDuplicate);
 });
 
 test('preflight signal stop exits with signal status and sends no PATCH', async t => {
