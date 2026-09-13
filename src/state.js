@@ -589,14 +589,6 @@ class SurfaceState {
         ON receipts(kind, discord_id, id);
       CREATE INDEX IF NOT EXISTS receipts_channel_kind_idx
         ON receipts(json_extract(detail, '$.channelId'), kind);
-      CREATE INDEX IF NOT EXISTS board_refresh_target_idx
-        ON receipts(
-          kind,
-          json_extract(detail, '$.guildId'),
-          json_extract(detail, '$.channelId'),
-          json_extract(detail, '$.targetMessageId'),
-          id
-        ) WHERE kind IN ('board-designation', 'board-refresh-attempt', 'board-refresh-outcome');
       CREATE INDEX IF NOT EXISTS ordinary_bound_identity_idx
         ON receipts(
           json_extract(detail, '$.channelId'),

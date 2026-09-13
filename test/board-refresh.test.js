@@ -403,10 +403,16 @@ test('board recovery returns applied history without writing a receipt', async t
   assert.deepEqual(f.state.getBinding('channel-1'), binding);
 });
 
-test('incomplete board recovery rejects the missing message selector', async t => {
+test('incomplete board recovery rejects the missing message selector without mutating custody', async t => {
   const f = fixture();
-  t.after(() => f.state.close());
-  f.state.close();
+  let state = f.state;
+  t.after(() => state.close());
+  seedBoardAttempt(f, 'recover-guard-pending');
+  const beforeCustody = {
+    bindings: state.listBindings(),
+    receipts: state.listReceipts()
+  };
+  state.close();
   const child = await runChild([
     CLI_PATH,
     'recover',
@@ -420,6 +426,9 @@ test('incomplete board recovery rejects the missing message selector', async t =
   assert.equal(child.signal, null);
   assert.equal(child.stdout, '');
   assert.equal(child.stderr, 'discord-surface: missing --board-message-id\n');
+  state = new SurfaceState(f.dbPath);
+  assert.deepEqual(state.listBindings(), beforeCustody.bindings);
+  assert.deepEqual(state.listReceipts(), beforeCustody.receipts);
 });
 
 test('board recovery refuses every terminal outcome except applied', async t => {
