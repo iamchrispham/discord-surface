@@ -11,12 +11,14 @@ import {
   type BoardOutcome
 } from './state/board-refresh';
 import {
+  fetchBoardChannel,
   fetchBoardInstallation,
   fetchBoardTarget,
   hashBoardText,
   patchBoardMessage,
   readBoardText,
   type BoardFetch,
+  type BoardChannel,
   type BoardMessage
 } from './discord/board-refresh';
 
@@ -103,9 +105,15 @@ function resultFromAdmission(admission: BoardAdmission, binding?: BoardBinding):
   };
 }
 
+function channelMatches(channel: BoardChannel, expected: BoardTarget): void {
+  if (channel.id !== expected.channelId || channel.guildId !== expected.guildId) {
+    throw new Error('board target channel does not belong to the bound guild and channel');
+  }
+}
+
 function targetMatches(target: BoardMessage, expected: BoardTarget): void {
-  if (target.id !== expected.messageId || target.guildId !== expected.guildId || target.channelId !== expected.channelId) {
-    throw new Error('board target message does not belong to the bound guild and channel');
+  if (target.id !== expected.messageId || target.channelId !== expected.channelId) {
+    throw new Error('board target message does not belong to the bound channel');
   }
 }
 
@@ -159,9 +167,11 @@ export async function runBoardRefresh({
 
   const binding = resolveBinding(state, { nativeId, generation: ownerGeneration, channelId });
 
-  // Capture before the two asynchronous GETs. Admission compares this value inside BEGIN IMMEDIATE.
+  // Capture before the asynchronous preflight GETs. Admission compares this value inside BEGIN IMMEDIATE.
   const prepared = state.captureBoardRevision(target);
   const installation = await fetchBoardInstallation({ token, signal, timeoutMs, fetchImpl });
+  const remoteChannel = await fetchBoardChannel({ token, channelId, signal, timeoutMs, fetchImpl });
+  channelMatches(remoteChannel, target);
   const remoteTarget = await fetchBoardTarget({ token, channelId, messageId, signal, timeoutMs, fetchImpl });
   targetMatches(remoteTarget, target);
   targetAuthorMatches(remoteTarget, installation.id);
