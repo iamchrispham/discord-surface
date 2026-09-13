@@ -1,6 +1,5 @@
 import * as crypto from 'node:crypto';
-
-const BOARD_MESSAGE_LIMIT = 2000;
+import { BOARD_MESSAGE_LIMIT, readBoardText } from '../board-text';
 
 export interface BoardFetchResponse {
   ok?: boolean;
@@ -42,13 +41,6 @@ interface BoardTransportError extends Error {
 function text(value: unknown, name: string, max = 2048): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > max || /[\u0000\u007f]/.test(value)) {
     throw new Error(`${name} must be a non-empty string`);
-  }
-  return value;
-}
-
-export function readBoardText(value: unknown): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > BOARD_MESSAGE_LIMIT || !value.trim() || /[\u0000\u007f]/.test(value)) {
-    throw new Error('board text must be non-empty and at most 2000 characters');
   }
   return value;
 }
@@ -240,4 +232,4 @@ export async function patchBoardMessage({ token, channelId, messageId, content, 
   return messageRecord(result);
 }
 
-export { BOARD_MESSAGE_LIMIT };
+export { BOARD_MESSAGE_LIMIT, readBoardText };

@@ -1,4 +1,5 @@
 import * as crypto from 'node:crypto';
+import { boardTextEquivalent } from '../board-text';
 
 export const BOARD_RECEIPT_KINDS = Object.freeze({
   DESIGNATION: 'board-designation',
@@ -501,7 +502,10 @@ function beginBoardRefresh(state: BoardState, metaInput: BoardRefreshMeta, captu
     const rows = readReceipts(state);
     const duplicate = duplicateRecord(rows, meta.requestId, meta.target);
     if (duplicate) {
-      if (duplicate.attempt && duplicate.attempt.payloadHash !== meta.payloadHash) throw new Error('dedupe key is already used for another board payload');
+      if (duplicate.attempt && duplicate.attempt.payloadHash !== meta.payloadHash &&
+          (typeof duplicate.attempt.content !== 'string' || !boardTextEquivalent(duplicate.attempt.content, meta.content))) {
+        throw new Error('dedupe key is already used for another board payload');
+      }
       return duplicate;
     }
     const revision = currentRevision(rows, meta.target);
@@ -574,7 +578,7 @@ function beginBoardRefresh(state: BoardState, metaInput: BoardRefreshMeta, captu
       });
     }
     state.receipt(null, BOARD_RECEIPT_KINDS.ATTEMPT, attempt);
-    if (meta.content === meta.preEditContent) {
+    if (boardTextEquivalent(meta.content, meta.preEditContent)) {
       const ended = new Date().toISOString();
       state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, {
         ...attempt,
@@ -638,7 +642,7 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
   const scope = text(evidence?.evidenceScope, 'evidenceScope', 2000);
   const observedAt = text(evidence?.observedAt, 'observedAt', 64);
   if (!Number.isFinite(Date.parse(observedAt))) throw new Error('observedAt must be an ISO timestamp');
-  boardContent(evidence?.readbackContent, 'readbackContent');
+  const readbackContent = boardContent(evidence?.readbackContent, 'readbackContent');
   if (!evidence.soleWriter || !evidence.singleAttempt || !evidence.noHiddenRetry) {
     throw new Error('positive board readback requires sole-writer, single-attempt, and no-hidden-retry evidence');
   }
@@ -654,8 +658,12 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
     const endedAt = typeof existing.detail.operationEndedAt === 'string' ? existing.detail.operationEndedAt : null;
     if (!endedAt) throw new Error('board refresh operation end is unknown');
     if (Date.parse(observedAt) < Date.parse(endedAt)) throw new Error('board readback predates operation termination');
-    if (attempt.detail.content === attempt.detail.preEditContent) throw new Error('positive board readback requires desired content different from the pre-edit content');
-    if (evidence.readbackContent !== attempt.detail.content) throw new Error('board readback does not confirm the desired content');
+    const desiredContent = attempt.detail.content;
+    const preEditContent = attempt.detail.preEditContent;
+    if (typeof desiredContent !== 'string' || typeof preEditContent !== 'string' || boardTextEquivalent(desiredContent, preEditContent)) {
+      throw new Error('positive board readback requires desired content different from the pre-edit content');
+    }
+    if (!boardTextEquivalent(readbackContent, desiredContent)) throw new Error('board readback does not confirm the desired content');
     const next = {
       ...attempt.detail,
       outcome: BOARD_OUTCOMES.APPLIED,
@@ -663,7 +671,7 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
       reconciledFrom: current,
       evidenceScope: scope,
       readbackAt: observedAt,
-      readbackContent: evidence.readbackContent,
+      readbackContent,
       soleWriter: true,
       singleAttempt: true,
       noHiddenRetry: true,
