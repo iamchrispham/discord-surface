@@ -1578,7 +1578,16 @@ class DiscordGateway {
         if (!baseline) return;
       }
       this.recoverTransport('live-attachment-gap', this.lifecycleEpoch, [binding.channelId]).then(async recovery => {
-        if (this.stopping || !this.isCurrentBinding(binding)) return;
+        if (this.stopping || !this.isCurrentBinding(binding)) {
+          const pending = this.attachmentIntakeRetryMessages.get(binding.channelId);
+          if (!pending || bindingIdentityMatches(pending.binding, binding)) {
+            this.attachmentIntakeRetryPendingChannels.delete(binding.channelId);
+            this.attachmentIntakeRetryMessages.delete(binding.channelId);
+            this.consumer.releaseIntake(binding.channelId);
+            this.attachmentIntakeBlockedChannels.delete(binding.channelId);
+          }
+          return;
+        }
         if (!this.state.getMessage(message.id)) {
           const retry = await this.retryPendingLiveAttachment(binding.channelId);
           if (!retry.attempted) return;
