@@ -3,12 +3,13 @@ const { issueAgentAddress, verifyAgentAddress } = require('./agent-message');
 
 const fs = require('node:fs');
 const { resolveDedupeKey, resolveDirectBinding, runDirectPost } = require('./direct-post');
+const { runBoardRefresh } = require('./board-refresh');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
-const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
+const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
 const { DiscordGateway, discordIdAfter, readSecret, requireInstalled } = require('./discord');
 const {
   assertOrdinaryIntakeRange,
@@ -540,7 +541,25 @@ async function liaisonDraft(args) {
 function recover(args) {
   const { state } = openState(args);
   try {
-    if (args['topic-channel-id']) {
+    if (args['board-message-id']) {
+      print(state.reconcileBoardRefresh(
+        {
+          guildId: required(args, 'board-guild-id'),
+          channelId: required(args, 'board-channel-id'),
+          messageId: required(args, 'board-message-id')
+        },
+        required(args, 'board-attempt-id'),
+        required(args, 'board-resolution'),
+        {
+          evidenceScope: required(args, 'board-evidence-scope'),
+          observedAt: required(args, 'board-readback-at'),
+          readbackContent: required(args, 'board-readback'),
+          soleWriter: args['board-sole-writer'] === true || args['board-sole-writer'] === 'true',
+          singleAttempt: args['board-single-attempt'] === true || args['board-single-attempt'] === 'true',
+          noHiddenRetry: args['board-no-hidden-retry'] === true || args['board-no-hidden-retry'] === 'true'
+        }
+      ));
+    } else if (args['topic-channel-id']) {
       const resolution = required(args, 'resolution');
       if (!['published', 'not_published'].includes(resolution)) throw new Error('--resolution must be published or not_published for topic reconciliation');
       print(state.reconcileTopicPublication(
@@ -574,6 +593,51 @@ function recover(args) {
     else print(state.recoverAfterRestart());
   }
   finally { state.close(); }
+}
+
+async function boardRefresh(args) {
+  const { state } = openState(args);
+  const controller = new AbortController();
+  let receivedSignal = null;
+  const handleSignal = signal => {
+    if (receivedSignal) return;
+    receivedSignal = signal;
+    controller.abort();
+  };
+  process.once('SIGINT', handleSignal);
+  process.once('SIGTERM', handleSignal);
+  try {
+    const config = state.requireConfig();
+    const result = await runBoardRefresh({
+      state,
+      token: readSecret(config.secretFile),
+      nativeId: required(args, 'native-id'),
+      generation: required(args, 'generation'),
+      channelId: required(args, 'channel-id'),
+      messageId: required(args, 'message-id'),
+      textFile: required(args, 'text-file'),
+      dedupeKey: resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: true }),
+      signal: controller.signal,
+      resolveBinding: (surfaceState, input) => resolveDirectBinding(surfaceState, {
+        nativeId: input.nativeId,
+        generation: input.generation,
+        channelId: input.channelId,
+        provider: null,
+        ordinary: false
+      })
+    });
+    print(result);
+    if (![BOARD_OUTCOMES.APPLIED, BOARD_OUTCOMES.NO_OP].includes(result.status)) process.exitCode = 1;
+    if (receivedSignal) process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
+    return result;
+  } catch (error) {
+    if (!receivedSignal || !controller.signal.aborted) throw error;
+    process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
+  } finally {
+    process.removeListener('SIGINT', handleSignal);
+    process.removeListener('SIGTERM', handleSignal);
+    state.close();
+  }
 }
 
 function provisionMarker(provider, nativeId) {
@@ -1793,6 +1857,7 @@ async function main() {
     case 'unbind': return unbind(args);
     case 'status': return status(args);
     case 'recover': return recover(args);
+    case 'board-refresh': return boardRefresh(args);
     case 'provision': return provision(args);
     case 'provision-run':
       if (process.env.DISCORD_SURFACE_PROVISION_LOCK_HELD !== '1') throw new Error('provision-run is internal; use provision so the singleton lock is held');
@@ -1838,11 +1903,11 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
   }
 }
 
-module.exports = { bindingArgs, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, unbind };
+module.exports = { bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, unbind };
 
 if (require.main === module) {
   main().catch(error => {

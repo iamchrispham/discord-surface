@@ -7,6 +7,7 @@ const { normalizeAttachments } = require('./attachments');
 const { ORDINARY_RECEIPT_KINDS } = require('./ordinary/constants');
 const { createOrdinaryRepository } = require('./ordinary');
 const { createDirectPostHandlers, queryDirectPostRows } = require('./state/direct-post');
+const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = require('./state/board-refresh');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
 const {
   createIntakeHandlers,
@@ -104,6 +105,8 @@ const directPostHandlers = createDirectPostHandlers({
   parseJson,
   now
 });
+
+const boardRefreshHandlers = createBoardRefreshHandlers();
 
 const intakeHandlers = createIntakeHandlers({
   BindingError,
@@ -2316,6 +2319,7 @@ class SurfaceState {
 
   recoverAfterRestart(ownerAlive = null) {
     return this.transaction(() => {
+      boardRefreshHandlers.recoverBoardRefreshReceipts(this, ownerAlive || ((pid, identity) => this.directPostOwnerAlive(pid, identity)), true);
       this.recoverDirectPostReceiptsInternal();
       const topicPublications = this.db.prepare('SELECT * FROM topic_publications WHERE status=?').all(TOPIC_PUBLICATION_STATES.IN_FLIGHT);
       for (const row of topicPublications) {
@@ -2454,6 +2458,34 @@ class SurfaceState {
     const current = this.getBinding(binding?.channelId);
     return Boolean(binding && current && bindingMatchesExpected(current, binding) && current.guildId === config.guildId &&
       (operatorId === null || config.operatorId === operatorId));
+  }
+
+  captureBoardRevision(target) {
+    return boardRefreshHandlers.captureBoardRevision(this, target);
+  }
+
+  inspectBoardRequest(requestId, target) {
+    return boardRefreshHandlers.inspectBoardRequest(this, requestId, target);
+  }
+
+  boardMessageProvenance(target) {
+    return boardRefreshHandlers.boardMessageProvenance(this, target);
+  }
+
+  recoverBoardRefreshReceipts(ownerAlive = (pid, identity) => this.directPostOwnerAlive(pid, identity)) {
+    return boardRefreshHandlers.recoverBoardRefreshReceipts(this, ownerAlive);
+  }
+
+  beginBoardRefresh(meta, capturedRevision) {
+    return boardRefreshHandlers.beginBoardRefresh(this, meta, capturedRevision);
+  }
+
+  recordBoardRefreshOutcome(target, attemptId, outcome, detail = {}) {
+    return boardRefreshHandlers.recordBoardRefreshOutcome(this, target, attemptId, outcome, detail);
+  }
+
+  reconcileBoardRefresh(target, attemptId, resolution, evidence) {
+    return boardRefreshHandlers.reconcileBoardRefresh(this, target, attemptId, resolution, evidence);
   }
 
   beginDirectPostPart(meta) {
@@ -2683,6 +2715,8 @@ module.exports = {
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
   DIRECT_POST_OUTCOMES,
+  BOARD_OUTCOMES,
+  BOARD_RECEIPT_KINDS,
   DISPATCH_OUTCOMES,
   TOPIC_PUBLICATION_STATES,
   UnresolvedWorkError,
