@@ -1,6 +1,13 @@
-type DirectPostOutcome = 'sent' | 'not_sent' | 'rejected' | 'rate_limited' | 'unknown' | 'stale';
+export const DIRECT_POST_OUTCOMES = [
+  'sent',
+  'not_sent',
+  'rejected',
+  'rate_limited',
+  'unknown',
+  'stale'
+] as const;
 
-export type { DirectPostOutcome };
+export type DirectPostOutcome = typeof DIRECT_POST_OUTCOMES[number];
 
 export type DirectPostPartStatus = DirectPostOutcome | 'claimed' | 'in_flight';
 
@@ -99,7 +106,7 @@ export interface DirectPostHandlers {
   recordDirectPostPreflight(state: DirectPostState, meta: DirectPostPartMeta, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostOutcomeRecord;
   beginDirectPostPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostClaim | DirectPostInspection;
   recordDirectPostOutcome(state: DirectPostState, requestId: string, attemptId: string, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostOutcomeRecord;
-  reconcileDirectPostOutcome(state: DirectPostState, requestId: string, attemptId: string, resolution: DirectPostReconciliationResolution, evidence?: Record<string, unknown>): DirectPostOutcomeRecord;
+  reconcileDirectPostOutcome(state: DirectPostState, requestId: string, attemptId: string, resolution: DirectPostReconciliationResolution, evidence: Record<string, unknown>): DirectPostOutcomeRecord;
   directPostOutcomeMatches(state: DirectPostState, event: DirectPostEvent, key: DirectPostOutcomeKey, value: string): boolean;
   excludeDirectPost(state: DirectPostState, event: DirectPostEvent | null | undefined): boolean;
 }
@@ -146,11 +153,11 @@ interface DirectPostDependencies {
   StateCorruptError: DirectPostErrorConstructor;
   DIRECT_POST_ATTEMPT: string;
   DIRECT_POST_OUTCOME: string;
-  DIRECT_POST_OUTCOMES: readonly DirectPostOutcome[];
   assertText(value: unknown, name: string, max?: number): string;
   bindingMatchesExpected(binding: DirectPostBinding | null, expected: DirectPostBinding | null): boolean;
   parseJson(value: unknown, fallback: null): DirectPostReceiptDetail | null;
   now(): string;
+  DIRECT_POST_OUTCOMES?: typeof DIRECT_POST_OUTCOMES;
 }
 
 const identityKeys: readonly (keyof DirectPostPartMeta)[] = [
@@ -201,7 +208,6 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     StateCorruptError,
     DIRECT_POST_ATTEMPT,
     DIRECT_POST_OUTCOME,
-    DIRECT_POST_OUTCOMES,
     assertText,
     bindingMatchesExpected,
     parseJson,
