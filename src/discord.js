@@ -3,6 +3,7 @@ const {
   AGENT_ATTACHMENT_CONTENT_TYPE,
   AGENT_ATTACHMENT_FILENAME,
   AGENT_ATTACHMENT_MAX_BYTES,
+  AGENT_ATTACHMENT_RECOVERY_KINDS,
   fetchAgentAttachment,
   normalizeAgentMessage
 } = require('./agent-attachment');
@@ -313,19 +314,66 @@ function transportReceiptText(message, attempt) {
 
 function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {},
   agentCredential = () => null, agentAttachmentFetch = globalThis.fetch,
-  agentAttachmentTimeoutMs = RECOVERY_LIMITS.timeoutMs, agentBotId = () => null }) {
+  agentAttachmentTimeoutMs = RECOVERY_LIMITS.timeoutMs, agentBotId = () => null, readyForLiveIntake = null }) {
   const receiptWork = new Set();
   const nativeWork = new Map();
   const ownerQueues = new Map();
   const queuedNativeWork = new Map();
   const intakeQueues = new Map();
+  const intakeBarriers = new Map();
   let queueSequence = 0;
 
-  function serializeIntake(message, operation) {
+  function attachmentIntakeFailure(error) {
+    return [AGENT_ATTACHMENT_RECOVERY_KINDS.INTAKE, CODEX_VALIDATION_KINDS.DEADLINE].includes(recoveryKind(error));
+  }
+
+  function blockIntake(channelId) {
+    if (intakeBarriers.has(channelId)) return;
+    let release;
+    const promise = new Promise(resolve => { release = resolve; });
+    intakeBarriers.set(channelId, { promise, release });
+  }
+
+  function releaseIntake(channelId) {
+    const barrier = intakeBarriers.get(channelId);
+    if (!barrier) return;
+    intakeBarriers.delete(channelId);
+    barrier.release();
+  }
+
+  async function waitForIntakeBarrier(channelId, signal) {
+    const barrier = intakeBarriers.get(channelId);
+    if (!barrier) return;
+    if (signal?.aborted) throw recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord intake was stopped while awaiting attachment recovery');
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => signal?.removeEventListener('abort', onAbort);
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+      const onAbort = () => finish(reject, recoveryError(CODEX_VALIDATION_KINDS.STOPPED, 'Discord intake was stopped while awaiting attachment recovery'));
+      signal?.addEventListener('abort', onAbort, { once: true });
+      barrier.promise.then(value => finish(resolve, value), error => finish(reject, error));
+    });
+  }
+
+  function serializeIntake(message, operation, { signal = null, bypassBarrier = false } = {}) {
     const channelId = message?.channelId;
     if (typeof channelId !== 'string') return operation();
+    if (bypassBarrier && intakeBarriers.has(channelId)) return operation();
     const previous = intakeQueues.get(channelId) || Promise.resolve();
-    const current = previous.catch(() => {}).then(operation);
+    const current = previous.catch(() => {}).then(async () => {
+      if (!bypassBarrier) await waitForIntakeBarrier(channelId, signal);
+      try {
+        return await operation();
+      } catch (error) {
+        if (!bypassBarrier && attachmentIntakeFailure(error)) blockIntake(channelId);
+        throw error;
+      }
+    });
     intakeQueues.set(channelId, current);
     current.finally(() => {
       if (intakeQueues.get(channelId) === current) intakeQueues.delete(channelId);
@@ -789,14 +837,19 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
           timeoutMs: agentAttachmentTimeoutMs,
           botId: connectedBotId()
         });
+      const readyForLive = typeof readyForLiveIntake === 'function' ? readyForLiveIntake(message, expectedBinding) : true;
+      const currentBinding = expectedBinding ? state.getBinding(expectedBinding.channelId) : null;
+      const ready = readyForLive && (!expectedBinding || currentBinding?.readiness === READINESS.READY);
       const result = state.acceptDiscordMessage(input, {
+        ready,
         expectedBinding,
         agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
       });
       if (!result.stale) onIntake?.(message, result);
-      return result;
-    });
+      return ready ? result : { ...result, held: true };
+    }, { signal });
     if (!intake.accepted) return intake;
+    if (intake.held) return intake;
     launchTransportReceipt(message);
     return processAccepted(message, signal);
   }
@@ -814,9 +867,9 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
         ready,
         coverageId,
         expectedBinding,
-        agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
+          agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
       });
-    });
+    }, { signal, bypassBarrier: true });
     if (emitReceipt && intake.accepted) launchTransportReceipt(message);
     return intake;
   }
@@ -861,7 +914,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     await Promise.allSettled([...receiptWork]);
   }
 
-  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, releaseAcknowledged, resumeSubmitted, waitForNativeWork, waitForReceipts };
+  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, releaseAcknowledged, releaseIntake, resumeSubmitted, waitForNativeWork, waitForReceipts };
 }
 
 class DiscordGateway {
@@ -885,10 +938,13 @@ class DiscordGateway {
     this.connectionEpoch = 0;
     this.recoveryController = null;
     this.recoveryPromise = null;
+    this.recoveryFollowupPromise = null;
+    this.pendingRecoveryChannels = new Set();
     this.liveCheckpointController = null;
     this.liveCheckpointPromise = null;
     this.liveIntakeCounts = new Map();
     this.liveAttachmentRecoveryTimers = new Set();
+    this.attachmentIntakeBlockedChannels = new Set();
     this.reconnectPromise = null;
     this.deferredHandoffRecoveryTimer = null;
     this.pendingHandoffRecoveryPollTimer = null;
@@ -939,6 +995,7 @@ class DiscordGateway {
       agentBotId: () => this.client.user?.id || null,
       agentAttachmentFetch: recoveryOptions.agentAttachmentFetch,
       agentAttachmentTimeoutMs: this.recoveryTimeoutMs,
+      readyForLiveIntake: () => this.ready,
       sendReply: (message, reply) => this.sendReply(message, reply),
       prepareReply: (messageId, signal) => this.prepareReply(messageId, signal),
       sendTransportReceipt: (message, receipt) => this.sendTransportReceipt(message, receipt),
@@ -1432,11 +1489,12 @@ class DiscordGateway {
   }
 
   isAttachmentIntakeFailure(error) {
-    return ['agent-attachment', CODEX_VALIDATION_KINDS.DEADLINE].includes(recoveryKind(error));
+    return [AGENT_ATTACHMENT_RECOVERY_KINDS.INTAKE, CODEX_VALIDATION_KINDS.DEADLINE].includes(recoveryKind(error));
   }
 
   async recordLiveAttachmentGap(message, binding, error, signal = null) {
     if (signal?.aborted || this.stopping || !binding?.active || !this.isCurrentBinding(binding)) return null;
+    this.attachmentIntakeBlockedChannels.add(binding.channelId);
     const watermark = this.state.getIntakeWatermark(binding.channelId);
     const gapFrom = watermark?.recovered_through_id || watermark?.last_seen_id || null;
     const detail = `live attachment intake failed for ${message?.id || 'unknown message'}: ${String(error?.message || error).slice(0, 900)}`;
@@ -1452,12 +1510,33 @@ class DiscordGateway {
         return;
       }
       if (!reconciled) return;
-      this.recoverTransport('live-attachment-gap', this.lifecycleEpoch, [binding.channelId]).catch(recoveryError => {
+      if (!reconciled.recovered_through_id) {
+        const baseline = this.state.setIntakeBaseline(binding.channelId, gapFrom || '0', 'live attachment gap recovery cursor', binding);
+        if (!baseline) return;
+      }
+      this.recoverTransport('live-attachment-gap', this.lifecycleEpoch, [binding.channelId]).then(async recovery => {
+        if (recovery.ready) {
+          await this.reconcilePending(undefined, { channelIds: [binding.channelId] });
+        } else if (this.ready) {
+          await this.reconcilePending(undefined, { readyOnly: true, channelIds: [binding.channelId] });
+        }
+        this.releaseRecoveredAttachmentIntake(binding.channelId);
+      }).catch(recoveryError => {
         this.logger(`live attachment recovery failed: ${recoveryError.message}`);
       });
     });
     this.liveAttachmentRecoveryTimers.add(recoveryTimer);
     return boundary;
+  }
+
+  releaseRecoveredAttachmentIntake(channelId = null) {
+    const candidates = channelId ? [channelId] : [...this.attachmentIntakeBlockedChannels];
+    for (const blockedChannelId of candidates) {
+      const binding = this.state.getBinding(blockedChannelId);
+      if (!binding?.active || binding.readiness !== READINESS.READY) continue;
+      this.consumer.releaseIntake(blockedChannelId);
+      this.attachmentIntakeBlockedChannels.delete(blockedChannelId);
+    }
   }
 
   noteLiveIntake(message) {
@@ -1950,20 +2029,47 @@ class DiscordGateway {
   async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
     this.ready = false;
-    if (this.recoveryPromise) return this.recoveryPromise;
+    if (channelIds) {
+      for (const channelId of channelIds) {
+        if (typeof channelId === 'string') this.pendingRecoveryChannels.add(channelId);
+      }
+    }
+    if (this.recoveryPromise) {
+      if (!this.pendingRecoveryChannels.size) return this.recoveryPromise;
+      if (!this.recoveryFollowupPromise) {
+        const activeRecovery = this.recoveryPromise;
+        this.recoveryFollowupPromise = activeRecovery.then(result => {
+          this.recoveryFollowupPromise = null;
+          if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+          const queuedChannels = new Set(this.pendingRecoveryChannels);
+          this.pendingRecoveryChannels.clear();
+          return queuedChannels.size
+            ? this.recoverTransport(`${reason} follow-up`, lifecycleEpoch, queuedChannels)
+            : result;
+        }, error => {
+          this.recoveryFollowupPromise = null;
+          throw error;
+        });
+      }
+      return this.recoveryFollowupPromise;
+    }
+    const selectedChannels = this.pendingRecoveryChannels.size ? new Set(this.pendingRecoveryChannels) : channelIds;
+    this.pendingRecoveryChannels.clear();
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
     this.recoveryPromise = (async () => {
-      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch, channelIds);
+      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch, selectedChannels);
       const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
       if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
+      this.releaseRecoveredAttachmentIntake();
       return result;
     })();
     try { return await this.recoveryPromise; }
     finally {
       this.recoveryPromise = null;
       this.recoveryController = null;
+      this.releaseRecoveredAttachmentIntake();
       this.scheduleHeldLiveCheckpoints();
     }
   }
@@ -2069,6 +2175,7 @@ class DiscordGateway {
     this.pendingHandoffRecoveryPollTimer = null;
     this.deferredHandoffRecoveryChannels.clear();
     this.pendingHandoffRecoveryChannels.clear();
+    this.pendingRecoveryChannels.clear();
     this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.stopPromise = (async () => {
       this.ready = false;

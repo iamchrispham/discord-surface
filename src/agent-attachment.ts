@@ -4,11 +4,17 @@ import { CODEX_VALIDATION_KINDS } from './native-transcript';
 export const AGENT_ATTACHMENT_FILENAME = 'agent-message.tether';
 export const AGENT_ATTACHMENT_CONTENT_TYPE = 'application/octet-stream';
 export const AGENT_ATTACHMENT_MAX_BYTES = 2000;
+export const AGENT_ATTACHMENT_RECOVERY_KINDS = Object.freeze({
+  INTAKE: 'agent-attachment',
+  STOPPED: CODEX_VALIDATION_KINDS.STOPPED,
+  DEADLINE: CODEX_VALIDATION_KINDS.DEADLINE
+} as const);
+export type AgentAttachmentRecoveryKind = typeof AGENT_ATTACHMENT_RECOVERY_KINDS[keyof typeof AGENT_ATTACHMENT_RECOVERY_KINDS];
 
 const AGENT_ATTACHMENT_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
 const DEFAULT_ATTACHMENT_TIMEOUT_MS = 30000;
 
-type RecoveryKind = string;
+type RecoveryKind = AgentAttachmentRecoveryKind;
 
 interface AgentAttachmentFailure extends Error {
   recoveryKind?: RecoveryKind;
@@ -68,7 +74,7 @@ export interface AgentAttachmentOptions {
   botId?: string | null;
 }
 
-function attachmentError(detail: string, cause: unknown = null, recoveryKind: RecoveryKind = 'agent-attachment'): AgentAttachmentFailure {
+function attachmentError(detail: string, cause: unknown = null, recoveryKind: RecoveryKind = AGENT_ATTACHMENT_RECOVERY_KINDS.INTAKE): AgentAttachmentFailure {
   const error = new Error(`agent attachment ${detail}`) as AgentAttachmentFailure;
   if (cause !== null) error.cause = cause;
   error.recoveryKind = recoveryKind;
