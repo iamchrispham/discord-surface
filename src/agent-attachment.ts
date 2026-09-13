@@ -252,6 +252,9 @@ export async function fetchAgentAttachment(attachment: AttachmentRecord, options
     if (options.deadline !== null && options.deadline !== undefined && Date.now() >= options.deadline) {
       throw attachmentError('deadline exceeded', null, CODEX_VALIDATION_KINDS.DEADLINE);
     }
+    if (bytes.length !== Number(attachment.size)) {
+      throw attachmentError(`body size ${bytes.length} does not match declared size ${Number(attachment.size)}`);
+    }
     let wire: string;
     try { wire = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
     catch (error) { throw attachmentError('body is not valid UTF-8', error); }

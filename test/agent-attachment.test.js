@@ -83,6 +83,39 @@ test('malformed reserved attachment follows ordinary bot coverage without waking
   assert.equal(state.getIntakeWatermark(target.channelId).last_seen_id, '7001');
 });
 
+test('declared attachment size mismatch is a retryable intake failure', async () => {
+  const url = 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether';
+  const body = Buffer.from('short body', 'utf8');
+  let released = false;
+  const error = await assert.rejects(
+    fetchAgentAttachment({ url, size: body.length + 4 }, {
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        url,
+        headers: { get: () => null },
+        body: {
+          getReader: () => ({
+            read: async () => {
+              if (released) return { done: true };
+              released = true;
+              return { done: false, value: body };
+            },
+            cancel: async () => {},
+            releaseLock: () => {}
+          })
+        }
+      })
+    }),
+    failure => {
+      assert.equal(failure.recoveryKind, 'agent-attachment');
+      assert.match(failure.message, /body size 10 does not match declared size 14/);
+      return true;
+    }
+  );
+  assert.equal(error, undefined);
+});
+
 test('live attachment failure with no cursor recovers the failed packet', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-no-cursor-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
@@ -796,6 +829,37 @@ test('concurrent attachment recovery retains channels for a follow-up pass', asy
   await gateway.stop();
 });
 
+test('unscoped recovery survives a scoped follow-up', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-recovery-full-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  const gateway = new DiscordGateway({
+    state,
+    client: { channels: { fetch: async () => null }, on() {}, off() {}, async destroy() {} },
+    providers: {},
+    fetchHistory: async () => []
+  });
+  const started = [];
+  const firstGate = createTestGate('first recovery');
+  const secondGate = createTestGate('second recovery');
+  gateway.recoverInbound = async (_signal, _reason, _epoch, channelIds) => {
+    started.push(channelIds ? [...channelIds] : null);
+    if (started.length === 1) await firstGate.promise;
+    if (started.length === 2) await secondGate.promise;
+    return { ready: true, state: 'ready' };
+  };
+  const first = gateway.recoverTransport('first', gateway.lifecycleEpoch, ['channel-a']);
+  await waitForCondition(() => started.length === 1, 'timed out waiting for first recovery to start');
+  const second = gateway.recoverTransport('second', gateway.lifecycleEpoch, ['channel-b']);
+  firstGate.resolve();
+  await waitForCondition(() => started.length === 2, 'timed out waiting for scoped follow-up to start');
+  const reconnect = gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+  secondGate.resolve();
+  await Promise.all([first, second, reconnect]);
+  assert.deepEqual(started, [['channel-a'], ['channel-b'], null]);
+  await gateway.stop();
+});
+
 test('live stale attachment failure releases obsolete generation barrier before successor intake', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsa-sg-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
@@ -1030,11 +1094,16 @@ test('targeted attachment recovery preserves one ready sibling native dispatch',
   gateway.sendReply = async () => ({ id: 'reply' });
   gateway.sendTransportReceipt = async () => ({ id: 'receipt' });
   gateway.discordToken = token;
-  gateway.ready = true;
+  gateway.ready = false;
 
-  const recovery = gateway.recoverTransport('targeted attachment recovery', gateway.lifecycleEpoch, [channelA]);
+  const boundary = await gateway.recordLiveAttachmentGap(
+    { id: '7000', channelId: channelA },
+    bindingA,
+    Object.assign(new Error('attachment gap'), { recoveryKind: 'agent-attachment' })
+  );
+  assert.equal(boundary.watermark.state, 'gap');
   await waitForCondition(() => historyStarted, 'channel-A recovery did not reach injected history');
-  assert.equal(gateway.ready, true);
+  assert.equal(gateway.ready, false);
   assert.equal(state.getBinding(channelA).readiness, 'recovering');
   assert.equal(state.getBinding(channelB).readiness, 'ready');
 
@@ -1046,19 +1115,19 @@ test('targeted attachment recovery preserves one ready sibling native dispatch',
     content: 'ready sibling request'
   };
   gateway.boundMessage(siblingMessage);
+  await waitForCondition(() => state.getMessage(siblingMessage.id)?.state === 'accepted',
+    'ready sibling was not durably accepted while gateway recovery was held');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(nativeDispatches, []);
+  releaseRecovery();
   await waitForCondition(() => nativeDispatches.length === 1,
-    'ready sibling did not dispatch while channel-A recovery was held');
+    'ready sibling did not dispatch after channel-A recovery completed');
   assert.deepEqual(nativeDispatches, [{
     id: siblingMessage.id,
     nativeId: nativeB,
     generation: bindingB.generation
   }]);
   assert.equal(state.getMessage(siblingMessage.id).state, 'accepted');
-  assert.equal(state.getBinding(channelA).readiness, 'recovering');
-
-  releaseRecovery();
-  const recovered = await recovery;
-  assert.equal(recovered.ready, true);
   assert.equal(state.getBinding(channelA).readiness, 'ready');
   assert.equal(nativeDispatches.some(dispatch => dispatch.nativeId === nativeA), false);
   assert.equal(recoveryGate.isSettled(), true);

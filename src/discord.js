@@ -940,6 +940,7 @@ class DiscordGateway {
     this.recoveryPromise = null;
     this.recoveryFollowupPromise = null;
     this.pendingRecoveryChannels = new Set();
+    this.pendingFullRecovery = false;
     this.liveCheckpointController = null;
     this.liveCheckpointPromise = null;
     this.liveIntakeCounts = new Map();
@@ -1523,9 +1524,9 @@ class DiscordGateway {
       }
       this.recoverTransport('live-attachment-gap', this.lifecycleEpoch, [binding.channelId]).then(async recovery => {
         if (recovery.ready) {
-          await this.reconcilePending(undefined, { channelIds: [binding.channelId] });
+          await this.reconcilePending(undefined, { readyOnly: true });
         } else if (this.ready) {
-          await this.reconcilePending(undefined, { readyOnly: true, channelIds: [binding.channelId] });
+          await this.reconcilePending(undefined, { readyOnly: true });
         }
         this.releaseRecoveredAttachmentIntake(binding.channelId);
       }).catch(recoveryError => {
@@ -2035,24 +2036,29 @@ class DiscordGateway {
 
   async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-    if (channelIds === null || channelIds === undefined) this.ready = false;
+    const fullRecovery = channelIds === null || channelIds === undefined;
+    if (fullRecovery) {
+      this.ready = false;
+      if (this.recoveryPromise) this.pendingFullRecovery = true;
+    }
     if (channelIds) {
       for (const channelId of channelIds) {
         if (typeof channelId === 'string') this.pendingRecoveryChannels.add(channelId);
       }
     }
     if (this.recoveryPromise) {
-      if (!this.pendingRecoveryChannels.size) return this.recoveryPromise;
+      if (!this.pendingRecoveryChannels.size && !this.pendingFullRecovery) return this.recoveryPromise;
       if (!this.recoveryFollowupPromise) {
         const activeRecovery = this.recoveryPromise;
         this.recoveryFollowupPromise = activeRecovery.then(result => {
           this.recoveryFollowupPromise = null;
           if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+          const runFullRecovery = this.pendingFullRecovery;
           const queuedChannels = new Set(this.pendingRecoveryChannels);
+          this.pendingFullRecovery = false;
           this.pendingRecoveryChannels.clear();
-          return queuedChannels.size
-            ? this.recoverTransport(`${reason} follow-up`, lifecycleEpoch, queuedChannels)
-            : result;
+          if (runFullRecovery) return this.recoverTransport(`${reason} follow-up`, lifecycleEpoch);
+          return queuedChannels.size ? this.recoverTransport(`${reason} follow-up`, lifecycleEpoch, queuedChannels) : result;
         }, error => {
           this.recoveryFollowupPromise = null;
           throw error;
@@ -2060,7 +2066,9 @@ class DiscordGateway {
       }
       return this.recoveryFollowupPromise;
     }
-    const selectedChannels = this.pendingRecoveryChannels.size ? new Set(this.pendingRecoveryChannels) : channelIds;
+    const selectedChannels = this.pendingFullRecovery ? null :
+      (this.pendingRecoveryChannels.size ? new Set(this.pendingRecoveryChannels) : channelIds);
+    this.pendingFullRecovery = false;
     this.pendingRecoveryChannels.clear();
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
@@ -2182,6 +2190,7 @@ class DiscordGateway {
     this.pendingHandoffRecoveryPollTimer = null;
     this.deferredHandoffRecoveryChannels.clear();
     this.pendingHandoffRecoveryChannels.clear();
+    this.pendingFullRecovery = false;
     this.pendingRecoveryChannels.clear();
     this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.stopPromise = (async () => {
