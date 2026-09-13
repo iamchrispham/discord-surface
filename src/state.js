@@ -2476,6 +2476,10 @@ class SurfaceState {
     return boardRefreshHandlers.recoverBoardRefreshReceipts(this, ownerAlive);
   }
 
+  recoverBoardRefreshAttempt(target, attemptId, ownerAlive = (pid, identity) => this.directPostOwnerAlive(pid, identity)) {
+    return boardRefreshHandlers.recoverBoardRefreshAttempt(this, target, attemptId, ownerAlive);
+  }
+
   beginBoardRefresh(meta, capturedRevision) {
     return boardRefreshHandlers.beginBoardRefresh(this, meta, capturedRevision);
   }

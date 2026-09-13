@@ -444,6 +444,21 @@ function boardMessageProvenance(state: BoardState, rawTarget: BoardTarget): Boar
   return [...directProvenance, ...replyProvenance];
 }
 
+function recoverOrphanBoardRefreshAttempt(state: BoardState, attempt: ReceiptRow, ownerAlive: ((pid: number, identity: unknown) => boolean) | null): number {
+  const pid = Number(attempt.detail.ownerPid);
+  const identity = attempt.detail.ownerIdentity;
+  if (ownerAlive && Number.isInteger(pid) && pid > 0 && ownerAlive(pid, identity)) return 0;
+  const ended = new Date().toISOString();
+  state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, {
+    ...attempt.detail,
+    outcome: BOARD_OUTCOMES.UNKNOWN,
+    status: BOARD_OUTCOMES.UNKNOWN,
+    operationEndedAt: ended,
+    reason: 'process stopped before board refresh outcome'
+  });
+  return 1;
+}
+
 function recoverBoardRefreshReceipts(state: BoardState, ownerAlive: ((pid: number, identity: unknown) => boolean) | null = null, inTransaction = false): number {
   const recover = (): number => {
     const rows = readReceipts(state, [BOARD_RECEIPT_KINDS.ATTEMPT, BOARD_RECEIPT_KINDS.OUTCOME]);
@@ -451,22 +466,22 @@ function recoverBoardRefreshReceipts(state: BoardState, ownerAlive: ((pid: numbe
     for (const attempt of rows.filter(row => row.kind === BOARD_RECEIPT_KINDS.ATTEMPT)) {
       const attemptId = String(attempt.detail.attemptId || '');
       if (!attemptId || latestOutcome(rows, attemptId)) continue;
-      const pid = Number(attempt.detail.ownerPid);
-      const identity = attempt.detail.ownerIdentity;
-      if (ownerAlive && Number.isInteger(pid) && pid > 0 && ownerAlive(pid, identity)) continue;
-      const ended = new Date().toISOString();
-      state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, {
-        ...attempt.detail,
-        outcome: BOARD_OUTCOMES.UNKNOWN,
-        status: BOARD_OUTCOMES.UNKNOWN,
-        operationEndedAt: ended,
-        reason: 'process stopped before board refresh outcome'
-      });
-      count += 1;
+      count += recoverOrphanBoardRefreshAttempt(state, attempt, ownerAlive);
     }
     return count;
   };
   return inTransaction ? recover() : state.transaction(recover);
+}
+
+function recoverBoardRefreshAttempt(state: BoardState, targetInput: BoardTarget, attemptIdInput: string, ownerAlive: ((pid: number, identity: unknown) => boolean) | null = null): number {
+  const target = assertTarget(targetInput);
+  const attemptId = text(attemptIdInput, 'attemptId', 128);
+  return state.transaction(() => {
+    const rows = readReceipts(state, [BOARD_RECEIPT_KINDS.ATTEMPT, BOARD_RECEIPT_KINDS.OUTCOME]);
+    const attempt = rows.find(row => row.kind === BOARD_RECEIPT_KINDS.ATTEMPT && String(row.detail.attemptId) === attemptId && targetMatches(row.detail, target));
+    if (!attempt || latestOutcome(rows, attemptId)) return 0;
+    return recoverOrphanBoardRefreshAttempt(state, attempt, ownerAlive);
+  });
 }
 
 function beginBoardRefresh(state: BoardState, metaInput: BoardRefreshMeta, capturedRevision: number): BoardAdmission {
@@ -665,6 +680,7 @@ export function createBoardRefreshHandlers() {
     inspectBoardRequest,
     boardMessageProvenance,
     recoverBoardRefreshReceipts,
+    recoverBoardRefreshAttempt,
     beginBoardRefresh,
     recordBoardRefreshOutcome,
     reconcileBoardRefresh

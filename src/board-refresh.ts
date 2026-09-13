@@ -161,10 +161,8 @@ export async function runBoardRefresh({
 
   // Capture before the two asynchronous GETs. Admission compares this value inside BEGIN IMMEDIATE.
   const prepared = state.captureBoardRevision(target);
-  const [installation, remoteTarget] = await Promise.all([
-    fetchBoardInstallation({ token, signal, timeoutMs, fetchImpl }),
-    fetchBoardTarget({ token, channelId, messageId, signal, timeoutMs, fetchImpl })
-  ]);
+  const installation = await fetchBoardInstallation({ token, signal, timeoutMs, fetchImpl });
+  const remoteTarget = await fetchBoardTarget({ token, channelId, messageId, signal, timeoutMs, fetchImpl });
   targetMatches(remoteTarget, target);
   targetAuthorMatches(remoteTarget, installation.id);
   const provenance = state.boardMessageProvenance(target);

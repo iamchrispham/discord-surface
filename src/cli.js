@@ -542,13 +542,16 @@ function recover(args) {
   const { state } = openState(args);
   try {
     if (args['board-message-id']) {
+      const boardTarget = {
+        guildId: required(args, 'board-guild-id'),
+        channelId: required(args, 'board-channel-id'),
+        messageId: required(args, 'board-message-id')
+      };
+      const boardAttemptId = required(args, 'board-attempt-id');
+      state.recoverBoardRefreshAttempt(boardTarget, boardAttemptId);
       print(state.reconcileBoardRefresh(
-        {
-          guildId: required(args, 'board-guild-id'),
-          channelId: required(args, 'board-channel-id'),
-          messageId: required(args, 'board-message-id')
-        },
-        required(args, 'board-attempt-id'),
+        boardTarget,
+        boardAttemptId,
         required(args, 'board-resolution'),
         {
           evidenceScope: required(args, 'board-evidence-scope'),
