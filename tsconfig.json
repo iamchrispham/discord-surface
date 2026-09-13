@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/topic.ts", "src/attachments.ts", "src/ordinary-codex.ts", "src/ordinary-bind/channel-resolution.ts", "src/ordinary-bind/gateway-capability.ts", "src/native-transcript.ts", "src/agent-message.ts", "src/acknowledgment.ts", "src/discord/handoff-fence.ts", "src/discord-interaction.ts", "src/state/interaction.ts"]
+  "include": ["src/topic.ts", "src/attachments.ts", "src/ordinary-codex.ts", "src/ordinary-bind/channel-resolution.ts", "src/ordinary-bind/gateway-capability.ts", "src/native-transcript.ts", "src/agent-message.ts", "src/agent-presentation.ts", "src/agent-attachment.ts", "src/acknowledgment.ts", "src/discord/handoff-fence.ts", "src/discord-interaction.ts", "src/state/interaction.ts"]
 }

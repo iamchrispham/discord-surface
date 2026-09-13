@@ -1934,6 +1934,7 @@ test('simulated: stopping the gateway settles an uncertain receipt without touch
     client,
     providers: { codex: { async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } }
   });
+  gateway.ready = true;
   const message = { id: 'receipt-stop-input', guildId: 'guild-1', channelId: 'receipt-stop', content: 'hello', author: { id: 'operator-1', bot: false }, channel };
   const result = await gateway.consumer.handleMessage(message);
   assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
@@ -1988,6 +1989,7 @@ test('simulated: real-client receipt uses one abortable request without SDK send
     providers: { codex: { async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } }
   });
   gateway.discordToken = 'fake-token';
+  gateway.ready = true;
   try {
     const result = await gateway.consumer.handleMessage({ id: 'receipt-http-input', guildId: 'guild-1', channelId: 'receipt-http', content: 'hello', author: { id: 'operator-1', bot: false }, channel });
     assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
@@ -2039,6 +2041,7 @@ test('simulated: rejected receipt response cancels its body before dropping the 
     providers: { codex: { async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } }
   });
   gateway.discordToken = 'fake-token';
+  gateway.ready = true;
   try {
     const result = await gateway.consumer.handleMessage({ id: 'receipt-body-input', guildId: 'guild-1', channelId: 'receipt-body', content: 'hello', author: { id: 'operator-1', bot: false }, channel });
     assert.equal(result.message.state, MESSAGE_STATES.REPLIED);

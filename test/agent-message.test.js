@@ -42,6 +42,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { SurfaceState } = require('../src/state');
 const { codexPrompt, claudeEvent, messageRequest } = require('../src/native');
+const { staticConductorMarker } = require('../src/topic');
 const { createMonitorMcp, monitorEvent } = require('../src/claude-monitor');
 
 test('durable agent intake survives reopen, preserves provenance and deduplicates replay', () => {
