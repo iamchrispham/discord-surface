@@ -18,11 +18,15 @@ export type BoardFetch = (url: string, init: {
 
 export interface BoardMessage {
   id: string;
-  guildId: string;
   channelId: string;
   authorId: string;
   authorIsBot: boolean;
   content: string;
+}
+
+export interface BoardChannel {
+  id: string;
+  guildId: string;
 }
 
 interface BoardUser {
@@ -154,11 +158,19 @@ function messageRecord(value: unknown): BoardMessage {
   const authorRecord = author as Record<string, unknown>;
   return {
     id: text(record.id, 'message.id', 128),
-    guildId: text(record.guild_id, 'message.guild_id', 128),
     channelId: text(record.channel_id, 'message.channel_id', 128),
     authorId: text(authorRecord.id, 'message.author.id', 128),
     authorIsBot: authorRecord.bot === true,
     content: typeof record.content === 'string' ? record.content : ''
+  };
+}
+
+function channelRecord(value: unknown): BoardChannel {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Discord board channel response is malformed');
+  const record = value as Record<string, unknown>;
+  return {
+    id: text(record.id, 'channel.id', 128),
+    guildId: text(record.guild_id, 'channel.guild_id', 128)
   };
 }
 
@@ -172,6 +184,21 @@ function endpoint(channelId: string, messageId?: string): string {
   return messageId === undefined
     ? `https://discord.com/api/v10/channels/${channel}/messages`
     : `https://discord.com/api/v10/channels/${channel}/messages/${encodeURIComponent(text(messageId, 'messageId', 128))}`;
+}
+
+function channelEndpoint(channelId: string): string {
+  return `https://discord.com/api/v10/channels/${encodeURIComponent(text(channelId, 'channelId', 128))}`;
+}
+
+export async function fetchBoardChannel({ token, channelId, signal, timeoutMs = 30000, fetchImpl = globalThis.fetch as unknown as BoardFetch }: {
+  token: string;
+  channelId: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  fetchImpl?: BoardFetch;
+}): Promise<BoardChannel> {
+  const result = await requestJson(token, channelEndpoint(channelId), 'GET', undefined, signal, timeoutMs, fetchImpl);
+  return channelRecord(result);
 }
 
 export async function fetchBoardTarget({ token, channelId, messageId, signal, timeoutMs = 30000, fetchImpl = globalThis.fetch as unknown as BoardFetch }: {

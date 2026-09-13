@@ -13,6 +13,7 @@ import {
 } from '../src/state/board-refresh';
 import {
   BOARD_MESSAGE_LIMIT,
+  fetchBoardChannel,
   fetchBoardInstallation,
   fetchBoardTarget,
   hashBoardText,
@@ -97,7 +98,6 @@ const fetchImpl: BoardFetch = async (_url, init) => {
 
 const boardMessage: BoardMessage = {
   id: target.messageId,
-  guildId: target.guildId,
   channelId: target.channelId,
   authorId: 'bot-1',
   authorIsBot: true,
@@ -107,6 +107,11 @@ const readText: string = readBoardText(meta.content);
 const textHash: string = hashBoardText(readText);
 const boardLimit: number = BOARD_MESSAGE_LIMIT;
 const installation: Promise<{ id: string }> = fetchBoardInstallation({ token: 'fixture-token', fetchImpl });
+const fetchedChannel: Promise<{ id: string; guildId: string }> = fetchBoardChannel({
+  token: 'fixture-token',
+  channelId: target.channelId,
+  fetchImpl
+});
 const fetchedTarget: Promise<BoardMessage> = fetchBoardTarget({
   token: 'fixture-token',
   channelId: target.channelId,
@@ -166,6 +171,7 @@ void boardMessage;
 void textHash;
 void boardLimit;
 void installation;
+void fetchedChannel;
 void fetchedTarget;
 void patchedTarget;
 void refresh;
