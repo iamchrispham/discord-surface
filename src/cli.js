@@ -630,6 +630,9 @@ async function boardRefresh(args) {
     if (![BOARD_OUTCOMES.APPLIED, BOARD_OUTCOMES.NO_OP].includes(result.status)) process.exitCode = 1;
     if (receivedSignal) process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
     return result;
+  } catch (error) {
+    if (!receivedSignal || !controller.signal.aborted) throw error;
+    process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
   } finally {
     process.removeListener('SIGINT', handleSignal);
     process.removeListener('SIGTERM', handleSignal);

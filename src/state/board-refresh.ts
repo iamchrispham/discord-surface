@@ -153,7 +153,7 @@ export interface BoardRevisionSnapshot {
 }
 
 export interface BoardAdmission {
-  status: 'admitted' | 'stale' | 'blocked' | BoardOutcome;
+  status: 'admitted' | BoardOutcome;
   requestId: string;
   targetMessageId: string;
   revision?: number;
@@ -162,6 +162,7 @@ export interface BoardAdmission {
   outcome?: BoardOutcome;
   historical?: boolean;
   duplicate?: boolean;
+  noOp?: boolean;
   reason?: string;
 }
 
@@ -558,6 +559,27 @@ function beginBoardRefresh(state: BoardState, metaInput: BoardRefreshMeta, captu
       });
     }
     state.receipt(null, BOARD_RECEIPT_KINDS.ATTEMPT, attempt);
+    if (meta.content === meta.preEditContent) {
+      const ended = new Date().toISOString();
+      state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, {
+        ...attempt,
+        outcome: BOARD_OUTCOMES.NO_OP,
+        status: BOARD_OUTCOMES.NO_OP,
+        observedContent: meta.preEditContent,
+        targetAuthorId: meta.targetAuthorId,
+        operationEndedAt: ended
+      });
+      return {
+        status: BOARD_OUTCOMES.NO_OP,
+        requestId: meta.requestId,
+        targetMessageId: meta.target.messageId,
+        revision: nextRevision,
+        attemptId: attempt.attemptId,
+        attempt,
+        outcome: BOARD_OUTCOMES.NO_OP,
+        noOp: true
+      };
+    }
     return {
       status: 'admitted',
       requestId: meta.requestId,

@@ -80,6 +80,9 @@ const revision = handlers.captureBoardRevision(state, target);
 const admission = handlers.beginBoardRefresh(state, meta, revision.revision);
 const outcome: BoardOutcome = BOARD_OUTCOMES.UNKNOWN;
 const terminal: BoardTerminalOutcome = BOARD_OUTCOMES.APPLIED;
+const resultContract = null as unknown as BoardRefreshResult;
+const resultStatus: BoardOutcome = resultContract.status;
+const resultOutcome: BoardOutcome | undefined = resultContract.outcome;
 const receiptKind: typeof BOARD_RECEIPT_KINDS.ATTEMPT = BOARD_RECEIPT_KINDS.ATTEMPT;
 const reconciler = handlers.reconcileBoardRefresh;
 
@@ -139,6 +142,10 @@ const refresh: Promise<BoardRefreshResult> = runBoardRefresh({
 
 // @ts-expect-error Board outcomes are closed and do not accept a fabricated transport label.
 const invalidOutcome: BoardOutcome = 'sent';
+// @ts-expect-error Board refresh results expose only registered outcomes.
+const invalidResultStatus: BoardRefreshResult['status'] = 'sent';
+// @ts-expect-error Board refresh results expose only registered outcomes.
+const invalidResultOutcome: BoardRefreshResult['outcome'] = 'sent';
 // @ts-expect-error A target must name the exact message that may be patched.
 const incompleteTarget: BoardTarget = { guildId: 'guild-1', channelId: 'channel-1' };
 const invalidFetch: BoardFetch = async (_url, init) => {
@@ -150,6 +157,8 @@ const invalidFetch: BoardFetch = async (_url, init) => {
 void admission;
 void outcome;
 void terminal;
+void resultStatus;
+void resultOutcome;
 void receiptKind;
 void reconciler;
 void evidence;
@@ -161,5 +170,7 @@ void fetchedTarget;
 void patchedTarget;
 void refresh;
 void invalidOutcome;
+void invalidResultStatus;
+void invalidResultOutcome;
 void incompleteTarget;
 void invalidFetch;

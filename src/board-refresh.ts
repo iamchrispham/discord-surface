@@ -7,7 +7,8 @@ import {
   type BoardRefreshMeta,
   type BoardRefreshRecord,
   type BoardState,
-  type BoardTarget
+  type BoardTarget,
+  type BoardOutcome
 } from './state/board-refresh';
 import {
   fetchBoardInstallation,
@@ -25,7 +26,7 @@ interface BoardStateRuntime extends BoardState {
   boardMessageProvenance(target: BoardTarget): BoardProvenance[];
   recoverBoardRefreshReceipts(ownerAlive?: (pid: number, identity: unknown) => boolean): number;
   beginBoardRefresh(meta: BoardRefreshMeta, capturedRevision: number): BoardAdmission;
-  recordBoardRefreshOutcome(target: BoardTarget, attemptId: string, outcome: string, detail?: Record<string, unknown>): BoardRefreshRecord;
+  recordBoardRefreshOutcome(target: BoardTarget, attemptId: string, outcome: BoardOutcome, detail?: Record<string, unknown>): BoardRefreshRecord;
 }
 
 export interface BoardRefreshResult {
@@ -34,8 +35,8 @@ export interface BoardRefreshResult {
   channelId: string;
   nativeId: string;
   generation: number;
-  status: string;
-  outcome?: string;
+  status: BoardOutcome;
+  outcome?: BoardOutcome;
   revision?: number;
   attemptId?: string;
   duplicate?: boolean;
@@ -72,7 +73,7 @@ function readBoardFile(file: unknown): string {
   return readBoardText(content);
 }
 
-function transportOutcome(error: unknown): string {
+function transportOutcome(error: unknown): BoardOutcome {
   const candidate = error as { outcome?: unknown; status?: unknown } | null;
   if (candidate?.outcome === 'rate_limited') return BOARD_OUTCOMES.RATE_LIMITED;
   if (candidate?.outcome === 'rejected') return BOARD_OUTCOMES.REJECTED;
@@ -87,6 +88,9 @@ function resultFromAdmission(admission: BoardAdmission, binding?: BoardBinding):
   const channelId = binding?.channelId || String(historicalAttempt?.channelId || '');
   const nativeId = binding?.nativeId || String(historicalAttempt?.nativeId || '');
   const generation = binding?.generation || Number(historicalAttempt?.generation || 0);
+  const status = admission.status === 'admitted'
+    ? (admission.outcome || BOARD_OUTCOMES.IN_FLIGHT)
+    : admission.status;
   return {
     ...admission,
     requestId: admission.requestId,
@@ -94,8 +98,8 @@ function resultFromAdmission(admission: BoardAdmission, binding?: BoardBinding):
     channelId,
     nativeId,
     generation,
-    status: admission.status,
-    outcome: admission.outcome || admission.status
+    status,
+    outcome: admission.outcome || status
   };
 }
 
@@ -180,18 +184,6 @@ export async function runBoardRefresh({
   const admission = state.beginBoardRefresh(meta, prepared.revision);
   if (admission.status !== 'admitted') return resultFromAdmission(admission, binding);
   if (!admission.attemptId) throw new Error('board refresh admission lacks an attempt ID');
-  if (remoteTarget.content === content) {
-    const noOp = state.recordBoardRefreshOutcome(target, admission.attemptId, BOARD_OUTCOMES.NO_OP, {
-      observedContent: remoteTarget.content,
-      targetAuthorId: remoteTarget.authorId
-    });
-    return {
-      ...resultFromAdmission(admission, binding),
-      status: noOp.outcome,
-      outcome: noOp.outcome,
-      noOp: true
-    };
-  }
   try {
     const patched = await patchBoardMessage({ token, channelId, messageId, content, signal, timeoutMs, fetchImpl });
     targetMatches(patched, target);
