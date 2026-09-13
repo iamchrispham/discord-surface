@@ -854,7 +854,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return processAccepted(message, signal);
   }
 
-  async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false, signal = null, deadline = null) {
+  async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false, signal = null, deadline = null, bypassBarrier = false) {
     const intake = await serializeIntake(message, async () => {
       const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
           fetchImpl: agentAttachmentFetch,
@@ -869,7 +869,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
         expectedBinding,
           agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
       });
-    }, { signal, bypassBarrier: true });
+    }, { signal, bypassBarrier });
     if (emitReceipt && intake.accepted) launchTransportReceipt(message);
     return intake;
   }
@@ -1986,7 +1986,7 @@ class DiscordGateway {
             if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
             if (Date.now() >= deadline) throw recoveryError(CODEX_VALIDATION_KINDS.DEADLINE, 'Discord recovery deadline exceeded while admitting history');
             attemptedId = message.id;
-            const admitted = await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id, binding, false, signal, deadline);
+            const admitted = await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id, binding, false, signal, deadline, true);
             if (admitted?.stale) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
             if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
             total += 1;

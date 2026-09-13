@@ -464,7 +464,7 @@ test('attachment intake stays outside coverage until refreshed recovery, then na
   };
   const consumer = createSurfaceConsumer({ state, providers: {}, agentCredential: () => token, agentBotId: '901', agentAttachmentFetch: fetchAttachment });
   await assert.rejects(
-    consumer.intakeMessage(agentMessage, false, agentMessage.id, binding, false, new AbortController().signal),
+    consumer.intakeMessage(agentMessage, false, agentMessage.id, binding, false, new AbortController().signal, null, true),
     /agent attachment fetch failed/
   );
   assert.equal(state.getMessage(agentMessage.id), null);
