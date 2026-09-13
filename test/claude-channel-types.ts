@@ -7,9 +7,12 @@ import {
   type ClaudeAcknowledgmentState,
   type ClaudeChannelReadState,
   type ClaudeChannelOptions,
+  type ClaudeDefaultMcp,
+  parseBody,
   createDefaultMcp
 } from '../src/claude-channel';
 import type { AcknowledgmentState, NativeAcknowledgmentInput } from '../src/acknowledgment';
+import { Readable } from 'node:stream';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { ListToolsRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -141,6 +144,9 @@ richChannelState.assertMessageCurrent('id', 'native-dispatch').channelId satisfi
 void channel.handleEvent(event);
 void channel.stop();
 
+// @ts-expect-error injected MCPs do not expose the default SDK surface
+void channel.mcp.ping();
+
 type CustomTransport = { marker: string };
 const concreteTransportMcp: ClaudeChannelMcp<CustomTransport> = {
   notification: async notification => {
@@ -159,6 +165,8 @@ const concreteTransportChannel = new ClaudeChannel({
 });
 const concreteTransport = concreteTransportChannel.mcp.transportFactory!();
 concreteTransport.marker satisfies string;
+const concreteResolvedMcp: ClaudeChannelMcp<CustomTransport> = concreteTransportChannel.mcp;
+void concreteResolvedMcp;
 void concreteTransportChannel;
 
 const ignoredSynchronousResultMcp: ClaudeChannelMcp<{ marker: string }> = {
@@ -202,6 +210,20 @@ new ClaudeChannel({
   mcp: inferredValidMcp
 });
 
+const inferredWiderConnectMcp = {
+  notification: () => {},
+  connect: (transport: { marker?: string }) => {
+    transport.marker satisfies string | undefined;
+  },
+  transportFactory: () => ({ marker: 'transport' })
+};
+new ClaudeChannel({
+  state,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-inferred-wider-connect.sock',
+  mcp: inferredWiderConnectMcp
+});
+
 new ClaudeChannel({
   state,
   nativeId: event.nativeId,
@@ -239,6 +261,12 @@ const exactRichReply: ClaudeAcknowledgmentState['recordNativeReply'] = () => ({
   message: undefined
 });
 void exactRichReply;
+const broadRichReply = (_input: NativeAcknowledgmentInput & { text: string }) => ({ duplicate: false, message: undefined });
+const broadRichReplyState: ClaudeAcknowledgmentState = {
+  ...acknowledgmentState,
+  recordNativeReply: broadRichReply
+};
+void broadRichReplyState;
 const narrowedRichReply = (_input: NarrowReplyInput) => ({ duplicate: false, message: undefined });
 const invalidRichReplyState: ClaudeAcknowledgmentState = {
   ...acknowledgmentState,
@@ -247,6 +275,30 @@ const invalidRichReplyState: ClaudeAcknowledgmentState = {
 };
 void invalidRichReplyState;
 
+type ClaudeReplyInput = NativeAcknowledgmentInput & { provider: 'claude'; text: string };
+const claudeOnlyRichReply = (_input: ClaudeReplyInput) => ({ duplicate: false, message: undefined });
+const claudeOnlyRichReplyState: ClaudeAcknowledgmentState = {
+  ...acknowledgmentState,
+  recordNativeReply: claudeOnlyRichReply
+};
+void claudeOnlyRichReplyState;
+
+const optionalCustomMcp: ClaudeChannelMcp<CustomTransport> | undefined = Math.random() > 0.5 ? concreteTransportMcp : undefined;
+const optionalCustomChannel = new ClaudeChannel({
+  state: acknowledgmentState,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-optional-custom-mcp.sock',
+  mcp: optionalCustomMcp
+});
+const optionalCustomResolvedMcp: ClaudeChannelMcp<CustomTransport> | ClaudeDefaultMcp<StdioServerTransport> = optionalCustomChannel.mcp;
+void optionalCustomResolvedMcp;
+// @ts-expect-error optional MCP output cannot be treated as custom-only
+const optionalCustomOnlyMcp: ClaudeChannelMcp<CustomTransport> = optionalCustomChannel.mcp;
+void optionalCustomOnlyMcp;
+// @ts-expect-error optional MCP output cannot be treated as default-only
+const optionalDefaultOnlyMcp: ClaudeDefaultMcp<StdioServerTransport> = optionalCustomChannel.mcp;
+void optionalDefaultOnlyMcp;
+
 const errorAwareMcp: ClaudeChannelMcp<StdioServerTransport> = {
   notification: async () => {},
   onerror: error => {
@@ -254,7 +306,7 @@ const errorAwareMcp: ClaudeChannelMcp<StdioServerTransport> = {
   }
 };
 const optionalMcp: ClaudeChannelMcp<StdioServerTransport> | undefined = Math.random() > 0.5 ? errorAwareMcp : undefined;
-const optionalAcknowledgmentOptions: ClaudeChannelOptions = {
+const optionalAcknowledgmentOptions: ClaudeChannelOptions<typeof optionalMcp> = {
   state: acknowledgmentState,
   nativeId: event.nativeId,
   socketPath: '/tmp/claude-channel-optional-options.sock',
@@ -273,29 +325,19 @@ const defaultTransportChannel = new ClaudeChannel({
   nativeId: event.nativeId,
   socketPath: '/tmp/claude-channel-default-transport.sock'
 });
+const defaultChannelMcp: ClaudeDefaultMcp<StdioServerTransport> = defaultTransportChannel.mcp;
+void defaultChannelMcp.ping();
+void defaultChannelMcp.close();
+defaultChannelMcp.setRequestHandler(ListToolsRequestSchema, async (request: ListToolsRequest) => {
+  void request.params?.cursor;
+  return { tools: [] };
+});
 const defaultTransport = defaultTransportChannel.mcp.transportFactory!();
 defaultTransport satisfies StdioServerTransport;
 void defaultTransportChannel;
 
-type CompatibleDefaultTransport = CustomTransport | StdioServerTransport;
-const compatibleDefaultTransportChannel = new ClaudeChannel<CompatibleDefaultTransport>({
-  state: acknowledgmentState,
-  nativeId: event.nativeId,
-  socketPath: '/tmp/claude-channel-compatible-default-transport.sock'
-});
-const compatibleDefaultTransport = compatibleDefaultTransportChannel.mcp.transportFactory!();
-compatibleDefaultTransport satisfies CompatibleDefaultTransport;
-void compatibleDefaultTransportChannel;
-
-// @ts-expect-error an incompatible custom transport requires an injected MCP
-new ClaudeChannel<CustomTransport>({
-  state: acknowledgmentState,
-  nativeId: event.nativeId,
-  socketPath: '/tmp/claude-channel-incompatible-default-transport.sock'
-});
-
 type MinimalDefaultMcpState = AcknowledgmentState & {
-  recordNativeReply: (input: NativeAcknowledgmentInput & { text: string }) => { duplicate: boolean };
+  recordNativeReply: (input: NativeAcknowledgmentInput & { provider: 'claude'; text: string }) => { duplicate: boolean };
 };
 
 const minimalDefaultState: MinimalDefaultMcpState = {
@@ -313,6 +355,17 @@ const minimalDefaultState: MinimalDefaultMcpState = {
   receipt: () => {},
   recordNativeReply: () => ({ duplicate: false })
 };
+const claudeOnlyDefaultState: MinimalDefaultMcpState = {
+  ...minimalDefaultState,
+  recordNativeReply: claudeOnlyRichReply
+};
+void createDefaultMcp({ nativeId: event.nativeId, state: claudeOnlyDefaultState });
+const broadDefaultReply = (_input: NativeAcknowledgmentInput & { text: string }) => ({ duplicate: false });
+const broadDefaultState: MinimalDefaultMcpState = {
+  ...minimalDefaultState,
+  recordNativeReply: broadDefaultReply
+};
+void createDefaultMcp({ nativeId: event.nativeId, state: broadDefaultState });
 const defaultMcp = createDefaultMcp({ nativeId: event.nativeId, state: minimalDefaultState });
 void defaultMcp.connect(defaultMcp.transportFactory());
 void defaultMcp.close();
@@ -352,6 +405,20 @@ createDefaultMcp({
   state: narrowedDefaultState
 });
 
+void parseBody(Readable.from(['{}']));
+const parsedBodyDouble: Parameters<typeof parseBody>[0] = {
+  setEncoding: () => {},
+  on: () => {},
+  destroy: () => {}
+};
+void parseBody(parsedBodyDouble);
+const incompleteBodyDouble = {
+  setEncoding: () => {},
+  on: () => {}
+};
+// @ts-expect-error parseBody requires every consumed request capability
+void parseBody(incompleteBodyDouble);
+
 declare const injectedMinimalMcp: ClaudeChannelMcp;
 // @ts-expect-error injected MCPs expose only the channel notification shape
 void injectedMinimalMcp.notification(sdkNotification, { relatedRequestId: event.messageId });
@@ -375,8 +442,8 @@ new ClaudeChannel({
   socketPath: '/tmp/claude-channel-default.sock'
 });
 
-// @ts-expect-error notification-only state cannot select the default acknowledgment path
 new ClaudeChannel({
+  // @ts-expect-error notification-only state cannot select the default acknowledgment path
   state,
   nativeId: event.nativeId,
   socketPath: '/tmp/claude-channel-default-invalid.sock'

@@ -59,15 +59,19 @@ export interface ClaudeChannelState extends ClaudeChannelReadState {
   assertMessageCurrent: (messageId: string, phase: 'native-dispatch') => ClaudeMessage;
 }
 
+type ClaudeNativeReplyInput = Omit<NativeAcknowledgmentInput, 'provider'> & {
+  provider: 'claude';
+};
+
 export type ClaudeAcknowledgmentState = ClaudeChannelState & AcknowledgmentState & {
-  recordNativeReply: (input: NativeAcknowledgmentInput & { text: string }) => {
+  recordNativeReply: (input: ClaudeNativeReplyInput & { text: string }) => {
     duplicate: boolean;
     message: ClaudeMessage | null | undefined;
   };
 };
 
 type ClaudeDefaultMcpState = AcknowledgmentState & {
-  recordNativeReply: (input: NativeAcknowledgmentInput & { text: string }) => {
+  recordNativeReply: (input: ClaudeNativeReplyInput & { text: string }) => {
     duplicate: boolean;
   };
 };
@@ -91,6 +95,14 @@ export interface ClaudeChannelNotification {
     };
     attachments?: Attachment[];
   };
+}
+
+interface ClaudeBodyRequest {
+  setEncoding(encoding: BufferEncoding): void;
+  on(event: 'data', listener: (chunk: string | Buffer) => void): void;
+  on(event: 'end', listener: () => void): void;
+  on(event: 'error', listener: (error: Error) => void): void;
+  destroy(error?: Error): void;
 }
 
 interface ClaudeChannelMcpBase {
@@ -120,6 +132,41 @@ export type ClaudeChannelMcp<TTransport = unknown> =
       transportFactory?: () => TTransport;
     });
 
+type ClaudeMcpValidationMember<TProvidedMcp> =
+  TProvidedMcp extends ClaudeDefaultMcp<StdioServerTransport>
+    ? unknown
+    : TProvidedMcp extends ClaudeChannelMcpBase
+      ? TProvidedMcp extends {
+          connect: (transport: infer TConnect) => unknown;
+          transportFactory: () => infer TFactory;
+        }
+        ? [TFactory] extends [TConnect]
+          ? unknown
+          : never
+        : TProvidedMcp extends {
+            connect?: undefined;
+            transportFactory?: (() => unknown) | undefined;
+          }
+          ? unknown
+          : never
+      : never;
+
+type ClaudeMcpValidation<TProvidedMcp> =
+  [TProvidedMcp] extends [undefined]
+    ? unknown
+    : ClaudeMcpValidationMember<Exclude<TProvidedMcp, undefined>>;
+
+type ClaudeResolvedMcp<TProvidedMcp> = NonNullable<[TProvidedMcp] extends [undefined]
+  ? ClaudeDefaultMcp<StdioServerTransport>
+  : undefined extends TProvidedMcp
+    ? Exclude<TProvidedMcp, undefined> | ClaudeDefaultMcp<StdioServerTransport>
+    : TProvidedMcp>;
+
+type ClaudeRuntimeMcp = ClaudeChannelMcpBase & {
+  connect?: (transport: unknown) => unknown;
+  transportFactory?: () => unknown;
+};
+
 interface ClaudeChannelOptionsBase {
   nativeId: string;
   socketPath: string;
@@ -127,17 +174,16 @@ interface ClaudeChannelOptionsBase {
   logger?: (message: string) => void;
 }
 
-export type ClaudeChannelOptions<TTransport = StdioServerTransport> =
-  | (StdioServerTransport extends TTransport
-      ? ClaudeChannelOptionsBase & {
-          state: ClaudeChannelReadState & ClaudeDefaultMcpState;
-          mcp?: ClaudeChannelMcp<TTransport>;
-        }
-      : never)
-  | (ClaudeChannelOptionsBase & {
-      state: ClaudeChannelReadState;
-      mcp: ClaudeChannelMcp<TTransport>;
-    });
+type ClaudeMcpInput<TProvidedMcp> =
+  [TProvidedMcp] extends [undefined]
+    ? { mcp?: undefined }
+    : { mcp: TProvidedMcp & ClaudeMcpValidation<TProvidedMcp> };
+
+export type ClaudeChannelOptions<TProvidedMcp = undefined> = ClaudeChannelOptionsBase & {
+  state: undefined extends TProvidedMcp
+    ? ClaudeChannelReadState & ClaudeDefaultMcpState
+    : ClaudeChannelReadState;
+} & ClaudeMcpInput<TProvidedMcp>;
 
 interface ClaudeBindingIdentity {
   channelId: string;
@@ -162,7 +208,7 @@ function potentiallyDelivered(error: unknown): unknown {
   return (error as { potentiallyDelivered?: unknown }).potentiallyDelivered;
 }
 
-export function parseBody(request: http.IncomingMessage): Promise<unknown> {
+export function parseBody(request: ClaudeBodyRequest): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let body = '';
     request.setEncoding('utf8');
@@ -257,12 +303,14 @@ export function createDefaultMcp({ nativeId, state }: { nativeId: string; state:
   return mcp;
 }
 
-export class ClaudeChannel<TTransport = StdioServerTransport> {
+export class ClaudeChannel<
+  TProvidedMcp = undefined
+> {
   declare bindingIdentity: ClaudeBindingIdentity;
   declare state: ClaudeChannelReadState;
   declare nativeId: string;
   declare socketPath: string;
-  declare mcp: ClaudeChannelMcp<TTransport>;
+  declare mcp: ClaudeResolvedMcp<TProvidedMcp>;
   declare server: http.Server | null;
   declare ownsSocket: boolean;
   declare started: boolean;
@@ -273,8 +321,8 @@ export class ClaudeChannel<TTransport = StdioServerTransport> {
   declare onTransportClose: (() => void) | null;
   declare logger: (message: string) => void;
 
-  constructor(options: ClaudeChannelOptions<TTransport>) {
-    const { state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} } = options || {} as ClaudeChannelOptions<TTransport>;
+  constructor(options: ClaudeChannelOptions<TProvidedMcp>) {
+    const { state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} } = options || {} as ClaudeChannelOptions<TProvidedMcp>;
     if (!state) throw new TypeError('state is required');
     validateNativeId(nativeId);
     assertSocketPath(socketPath);
@@ -294,7 +342,7 @@ export class ClaudeChannel<TTransport = StdioServerTransport> {
     this.state = state;
     this.nativeId = nativeId;
     this.socketPath = socketPath;
-    this.mcp = mcp || createDefaultMcp({ nativeId, state: state as ClaudeDefaultMcpState }) as unknown as ClaudeChannelMcp<TTransport>;
+    this.mcp = (mcp || createDefaultMcp({ nativeId, state: state as ClaudeDefaultMcpState })) as unknown as ClaudeResolvedMcp<TProvidedMcp>;
     this.server = null;
     this.ownsSocket = false;
     this.started = false;
@@ -304,11 +352,11 @@ export class ClaudeChannel<TTransport = StdioServerTransport> {
     this.transportClosed = false;
     this.onTransportClose = typeof onTransportClose === 'function' ? onTransportClose : null;
     this.logger = logger;
-    this.mcp.onclose = () => {
+    (this.mcp as unknown as ClaudeRuntimeMcp).onclose = () => {
       this.transportClosed = true;
       if (this.started && !this.stopPromise) this.stop().catch(() => {}).finally(() => this.onTransportClose?.());
     };
-    this.mcp.onerror = () => {
+    (this.mcp as unknown as ClaudeRuntimeMcp).onerror = () => {
       this.transportClosed = true;
       if (this.started && !this.stopPromise) this.stop().catch(() => {}).finally(() => this.onTransportClose?.());
     };
@@ -337,7 +385,7 @@ export class ClaudeChannel<TTransport = StdioServerTransport> {
         meta: { messageId: body.messageId, generation: String(body.generation), nativeId: body.nativeId }
       };
       if (attachments.length) params.attachments = attachments;
-      await this.mcp.notification({ method: 'notifications/claude/channel', params });
+      await (this.mcp as unknown as ClaudeRuntimeMcp).notification({ method: 'notifications/claude/channel', params });
     } catch (error) {
       markPotentiallyDelivered(error);
       throw error;
@@ -350,7 +398,7 @@ export class ClaudeChannel<TTransport = StdioServerTransport> {
     this.transportClosed = false;
     prepareSocket(this.socketPath);
     try {
-      if (typeof this.mcp.connect === 'function') await this.mcp.connect(this.mcp.transportFactory!());
+      if (typeof (this.mcp as unknown as ClaudeRuntimeMcp).connect === 'function') await (this.mcp as unknown as ClaudeRuntimeMcp).connect!((this.mcp as unknown as ClaudeRuntimeMcp).transportFactory!());
       this.server = http.createServer(async (request, response) => {
         if (request.method === 'GET' && request.url === '/identity') {
           let current: ClaudeBinding | null | undefined;
@@ -421,7 +469,7 @@ export class ClaudeChannel<TTransport = StdioServerTransport> {
       this.started = true;
     } catch (error) {
       this.ready = false;
-      try { await this.mcp.close?.(); } catch {}
+      try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
       try { this.server?.close(); } catch {}
       this.server = null;
       if (this.ownsSocket) {
@@ -438,7 +486,7 @@ export class ClaudeChannel<TTransport = StdioServerTransport> {
     this.stopPromise = (async () => {
       this.ready = false;
       const errors: unknown[] = [];
-      try { await this.mcp.close?.(); } catch (error) { errors.push(error); }
+      try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch (error) { errors.push(error); }
       try {
         if (this.server) await new Promise<void>((resolve, reject) => {
           this.server!.close(error => error ? reject(error) : resolve());
