@@ -236,6 +236,11 @@ export async function fetchAgentAttachment(attachment: AttachmentRecord, options
       cancelWithoutWaiting(response.body);
       throw attachmentError(`fetch returned HTTP ${response.status || 'error'}`);
     }
+    const declaredSize = Number(attachment.size);
+    if (!Number.isSafeInteger(declaredSize) || declaredSize < 0 || declaredSize > AGENT_ATTACHMENT_MAX_BYTES) {
+      cancelWithoutWaiting(response.body);
+      throw attachmentError('declared attachment size is invalid or exceeds the bounded wire limit');
+    }
     const contentLength = Number(readAttachmentHeader(response, 'content-length'));
     if (Number.isSafeInteger(contentLength) && contentLength > AGENT_ATTACHMENT_MAX_BYTES) {
       cancelWithoutWaiting(response.body);
@@ -252,8 +257,8 @@ export async function fetchAgentAttachment(attachment: AttachmentRecord, options
     if (options.deadline !== null && options.deadline !== undefined && Date.now() >= options.deadline) {
       throw attachmentError('deadline exceeded', null, CODEX_VALIDATION_KINDS.DEADLINE);
     }
-    if (bytes.length !== Number(attachment.size)) {
-      throw attachmentError(`body size ${bytes.length} does not match declared size ${Number(attachment.size)}`);
+    if (bytes.length !== declaredSize) {
+      throw attachmentError(`body size ${bytes.length} does not match declared size ${declaredSize}`);
     }
     let wire: string;
     try { wire = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }

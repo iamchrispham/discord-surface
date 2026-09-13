@@ -829,7 +829,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     }, awaitExisting, handoff);
   }
 
-  async function handleMessage(message, signal, expectedBinding = null, onIntake = null) {
+  async function handleMessage(message, signal, expectedBinding = null, onIntake = null, bypassBarrier = false) {
     const intake = await serializeIntake(message, async () => {
       const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
           fetchImpl: agentAttachmentFetch,
@@ -839,7 +839,9 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
         });
       const readyForLive = typeof readyForLiveIntake === 'function' ? readyForLiveIntake(message, expectedBinding) : true;
       const currentBinding = expectedBinding ? state.getBinding(expectedBinding.channelId) : null;
-      const ready = readyForLive && (!expectedBinding || currentBinding?.readiness === READINESS.READY);
+      const ready = readyForLive && (!expectedBinding || (
+        currentBinding?.readiness === READINESS.READY && bindingIdentityMatches(expectedBinding, currentBinding)
+      ));
       const result = state.acceptDiscordMessage(input, {
         ready,
         expectedBinding,
@@ -847,10 +849,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       });
       if (!result.stale) onIntake?.(message, result);
       return ready ? result : { ...result, held: true };
-    }, { signal });
+    }, { signal, bypassBarrier });
     if (!intake.accepted) return intake;
-    if (intake.held) return intake;
     launchTransportReceipt(message);
+    if (intake.held) return intake;
     return processAccepted(message, signal);
   }
 
@@ -950,6 +952,9 @@ class DiscordGateway {
     this.liveIntakeCounts = new Map();
     this.liveAttachmentRecoveryTimers = new Set();
     this.attachmentIntakeBlockedChannels = new Set();
+    this.attachmentIntakeRetryPendingChannels = new Set();
+    this.attachmentIntakeRetryMessages = new Map();
+    this.attachmentIntakeRetryInFlight = new Map();
     this.reconnectPromise = null;
     this.deferredHandoffRecoveryTimer = null;
     this.pendingHandoffRecoveryPollTimer = null;
@@ -1497,16 +1502,62 @@ class DiscordGateway {
     return [AGENT_ATTACHMENT_RECOVERY_KINDS.INTAKE, CODEX_VALIDATION_KINDS.DEADLINE].includes(recoveryKind(error));
   }
 
+  async retryLiveAttachment(message, binding) {
+    const currentBinding = binding?.channelId ? this.state.getBinding(binding.channelId) : null;
+    if (!this.ready || !currentBinding?.active || currentBinding.readiness !== READINESS.READY ||
+      !bindingIdentityMatches(binding, currentBinding)) return { attempted: false };
+    const controller = new AbortController();
+    this.controllers.add(controller);
+    try {
+      return { attempted: true, result: await this.consumer.handleMessage(message, controller.signal, currentBinding, null, true) };
+    } finally {
+      this.controllers.delete(controller);
+      controller.abort();
+    }
+  }
+
+  retryPendingLiveAttachment(channelId) {
+    const existing = this.attachmentIntakeRetryInFlight.get(channelId);
+    if (existing) return existing;
+    const pending = this.attachmentIntakeRetryMessages.get(channelId);
+    if (!pending) return Promise.resolve({ attempted: true });
+    const work = (async () => {
+      try {
+        const retry = await this.retryLiveAttachment(pending.message, pending.binding);
+        if (!retry.attempted) return retry;
+        this.attachmentIntakeRetryPendingChannels.delete(channelId);
+        this.attachmentIntakeRetryMessages.delete(channelId);
+        this.releaseRecoveredAttachmentIntake(channelId);
+        return retry;
+      } catch (error) {
+        this.logger(`live attachment retry failed: ${error.message}`);
+        await this.recordLiveAttachmentGap(pending.message, pending.binding, error);
+        return { attempted: false };
+      }
+    })();
+    this.attachmentIntakeRetryInFlight.set(channelId, work);
+    work.finally(() => this.attachmentIntakeRetryInFlight.delete(channelId)).catch(() => {});
+    return work;
+  }
+
   async recordLiveAttachmentGap(message, binding, error, signal = null) {
     const currentBinding = binding?.channelId ? this.state.getBinding(binding.channelId) : null;
     const bindingIsCurrent = Boolean(binding?.active && currentBinding?.active &&
       bindingIdentityMatches(binding, currentBinding));
     if (!bindingIsCurrent) {
-      if (binding?.channelId) this.consumer.releaseIntake(binding.channelId);
+      if (binding?.channelId) {
+        const pending = this.attachmentIntakeRetryMessages.get(binding.channelId);
+        if (!pending || bindingIdentityMatches(pending.binding, binding)) {
+          this.attachmentIntakeRetryPendingChannels.delete(binding.channelId);
+          this.attachmentIntakeRetryMessages.delete(binding.channelId);
+        }
+        this.consumer.releaseIntake(binding.channelId);
+      }
       return null;
     }
     if (signal?.aborted || this.stopping) return null;
     this.attachmentIntakeBlockedChannels.add(binding.channelId);
+    this.attachmentIntakeRetryMessages.set(binding.channelId, { message, binding });
     const watermark = this.state.getIntakeWatermark(binding.channelId);
     const gapFrom = watermark?.recovered_through_id || watermark?.last_seen_id || null;
     const detail = `live attachment intake failed for ${message?.id || 'unknown message'}: ${String(error?.message || error).slice(0, 900)}`;
@@ -1527,17 +1578,26 @@ class DiscordGateway {
         if (!baseline) return;
       }
       this.recoverTransport('live-attachment-gap', this.lifecycleEpoch, [binding.channelId]).then(async recovery => {
+        if (this.stopping || !this.isCurrentBinding(binding)) return;
+        if (!this.state.getMessage(message.id)) {
+          const retry = await this.retryPendingLiveAttachment(binding.channelId);
+          if (!retry.attempted) return;
+        } else {
+          this.attachmentIntakeRetryPendingChannels.delete(binding.channelId);
+          this.attachmentIntakeRetryMessages.delete(binding.channelId);
+        }
+        this.releaseRecoveredAttachmentIntake(binding.channelId);
         if (recovery.ready) {
           await this.reconcilePending(undefined, { readyOnly: true });
         } else if (this.ready) {
           await this.reconcilePending(undefined, { readyOnly: true });
         }
-        this.releaseRecoveredAttachmentIntake(binding.channelId);
       }).catch(recoveryError => {
         this.logger(`live attachment recovery failed: ${recoveryError.message}`);
       });
     });
     this.liveAttachmentRecoveryTimers.add(recoveryTimer);
+    this.attachmentIntakeRetryPendingChannels.add(binding.channelId);
     return boundary;
   }
 
@@ -1546,6 +1606,18 @@ class DiscordGateway {
     for (const blockedChannelId of candidates) {
       const binding = this.state.getBinding(blockedChannelId);
       if (!binding?.active || binding.readiness !== READINESS.READY) continue;
+      if (this.attachmentIntakeRetryPendingChannels.has(blockedChannelId)) {
+        const pending = this.attachmentIntakeRetryMessages.get(blockedChannelId);
+        if (pending && this.state.getMessage(pending.message.id)) {
+          this.attachmentIntakeRetryPendingChannels.delete(blockedChannelId);
+          this.attachmentIntakeRetryMessages.delete(blockedChannelId);
+        } else {
+          void this.retryPendingLiveAttachment(blockedChannelId).catch(error => {
+            this.logger(`live attachment retry scheduling failed: ${error.message}`);
+          });
+          continue;
+        }
+      }
       this.consumer.releaseIntake(blockedChannelId);
       this.attachmentIntakeBlockedChannels.delete(blockedChannelId);
     }
@@ -2188,6 +2260,11 @@ class DiscordGateway {
     this.resolveInteractionRecovery(false);
     for (const timer of this.liveAttachmentRecoveryTimers) clearImmediate(timer);
     this.liveAttachmentRecoveryTimers.clear();
+    for (const channelId of this.attachmentIntakeBlockedChannels) this.consumer.releaseIntake(channelId);
+    this.attachmentIntakeBlockedChannels.clear();
+    this.attachmentIntakeRetryPendingChannels.clear();
+    this.attachmentIntakeRetryMessages.clear();
+    this.attachmentIntakeRetryInFlight.clear();
     if (this.deferredHandoffRecoveryTimer) clearTimeout(this.deferredHandoffRecoveryTimer);
     this.deferredHandoffRecoveryTimer = null;
     if (this.pendingHandoffRecoveryPollTimer) clearTimeout(this.pendingHandoffRecoveryPollTimer);
