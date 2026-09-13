@@ -253,7 +253,42 @@ const inferredNumberStringMcp = {
   },
   transportFactory: () => 1
 };
+
+type ValidUnionMcp = {
+  notification: () => void;
+  connect: (transport: string) => void;
+  transportFactory: () => string;
+};
+type InvalidUnionMcp = {
+  notification: () => void;
+  connect: (transport: number) => void;
+  transportFactory: () => string;
+};
+declare const mixedMcpUnion: ValidUnionMcp | InvalidUnionMcp;
+new ClaudeChannel({
+  state,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-invalid-union.sock',
+  // @ts-expect-error every MCP union member must pair factory and connect
+  mcp: mixedMcpUnion
+});
+
 declare const acknowledgmentState: ClaudeAcknowledgmentState;
+
+const richStateChannel = new ClaudeChannel({
+  state: acknowledgmentState,
+  nativeId: event.nativeId,
+  socketPath: '/tmp/claude-channel-rich-state.sock',
+  mcp
+});
+richStateChannel.state.recordNativeReply({
+  provider: 'claude',
+  messageId: event.messageId,
+  nativeId: event.nativeId,
+  generation: event.generation,
+  text: 'reply'
+});
+void richStateChannel;
 
 type NarrowReplyInput = NativeAcknowledgmentInput & { text: string; requiredField: string };
 const exactRichReply: ClaudeAcknowledgmentState['recordNativeReply'] = () => ({
@@ -418,6 +453,16 @@ const incompleteBodyDouble = {
 };
 // @ts-expect-error parseBody requires every consumed request capability
 void parseBody(incompleteBodyDouble);
+
+const narrowedEncodingBody = {
+  setEncoding: (encoding: 'ascii') => {
+    encoding satisfies 'ascii';
+  },
+  on: () => {},
+  destroy: () => {}
+};
+// @ts-expect-error parseBody always supplies utf8 to the encoding callback
+void parseBody(narrowedEncodingBody);
 
 declare const injectedMinimalMcp: ClaudeChannelMcp;
 // @ts-expect-error injected MCPs expose only the channel notification shape

@@ -98,7 +98,7 @@ export interface ClaudeChannelNotification {
 }
 
 interface ClaudeBodyRequest {
-  setEncoding(encoding: BufferEncoding): void;
+  setEncoding: (encoding: BufferEncoding) => void;
   on(event: 'data', listener: (chunk: string | Buffer) => void): void;
   on(event: 'end', listener: () => void): void;
   on(event: 'error', listener: (error: Error) => void): void;
@@ -151,10 +151,16 @@ type ClaudeMcpValidationMember<TProvidedMcp> =
           : never
       : never;
 
+type ClaudeMcpInvalidMember<TProvidedMcp> = TProvidedMcp extends unknown
+  ? ClaudeMcpValidationMember<TProvidedMcp> extends never ? TProvidedMcp : never
+  : never;
+
 type ClaudeMcpValidation<TProvidedMcp> =
   [TProvidedMcp] extends [undefined]
     ? unknown
-    : ClaudeMcpValidationMember<Exclude<TProvidedMcp, undefined>>;
+    : [ClaudeMcpInvalidMember<Exclude<TProvidedMcp, undefined>>] extends [never]
+      ? unknown
+      : never;
 
 type ClaudeResolvedMcp<TProvidedMcp> = NonNullable<[TProvidedMcp] extends [undefined]
   ? ClaudeDefaultMcp<StdioServerTransport>
@@ -179,10 +185,11 @@ type ClaudeMcpInput<TProvidedMcp> =
     ? { mcp?: undefined }
     : { mcp: TProvidedMcp & ClaudeMcpValidation<TProvidedMcp> };
 
-export type ClaudeChannelOptions<TProvidedMcp = undefined> = ClaudeChannelOptionsBase & {
-  state: undefined extends TProvidedMcp
-    ? ClaudeChannelReadState & ClaudeDefaultMcpState
-    : ClaudeChannelReadState;
+export type ClaudeChannelOptions<
+  TProvidedMcp = undefined,
+  TState extends ClaudeChannelReadState = ClaudeChannelReadState
+> = ClaudeChannelOptionsBase & {
+  state: undefined extends TProvidedMcp ? TState & ClaudeDefaultMcpState : TState;
 } & ClaudeMcpInput<TProvidedMcp>;
 
 interface ClaudeBindingIdentity {
@@ -304,10 +311,11 @@ export function createDefaultMcp({ nativeId, state }: { nativeId: string; state:
 }
 
 export class ClaudeChannel<
-  TProvidedMcp = undefined
+  TProvidedMcp = undefined,
+  TState extends ClaudeChannelReadState = ClaudeChannelReadState
 > {
   declare bindingIdentity: ClaudeBindingIdentity;
-  declare state: ClaudeChannelReadState;
+  declare state: TState;
   declare nativeId: string;
   declare socketPath: string;
   declare mcp: ClaudeResolvedMcp<TProvidedMcp>;
@@ -321,7 +329,7 @@ export class ClaudeChannel<
   declare onTransportClose: (() => void) | null;
   declare logger: (message: string) => void;
 
-  constructor(options: ClaudeChannelOptions<TProvidedMcp>) {
+  constructor(options: ClaudeChannelOptions<TProvidedMcp, TState>) {
     const { state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} } = options || {} as ClaudeChannelOptions<TProvidedMcp>;
     if (!state) throw new TypeError('state is required');
     validateNativeId(nativeId);
