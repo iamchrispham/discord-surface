@@ -1,11 +1,11 @@
-export const DIRECT_POST_OUTCOMES = [
+export const DIRECT_POST_OUTCOMES = Object.freeze([
   'sent',
   'not_sent',
   'rejected',
   'rate_limited',
   'unknown',
   'stale'
-] as const;
+] as const);
 
 export type DirectPostOutcome = typeof DIRECT_POST_OUTCOMES[number];
 
@@ -108,7 +108,7 @@ export interface DirectPostHandlers {
   recordDirectPostOutcome(state: DirectPostState, requestId: string, attemptId: string, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostOutcomeRecord;
   reconcileDirectPostOutcome(state: DirectPostState, requestId: string, attemptId: string, resolution: DirectPostReconciliationResolution, evidence: Record<string, unknown>): DirectPostOutcomeRecord;
   directPostOutcomeMatches(state: DirectPostState, event: DirectPostEvent, key: DirectPostOutcomeKey, value: string): boolean;
-  excludeDirectPost(state: DirectPostState, event: DirectPostEvent | null | undefined): boolean;
+  excludeDirectPost(this: DirectPostHandlers, state: DirectPostState, event: DirectPostEvent | null | undefined): boolean;
 }
 
 interface SqlRow {
@@ -396,7 +396,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       });
     },
 
-    excludeDirectPost(state, event) {
+    excludeDirectPost(this: DirectPostHandlers, state, event) {
       if (!event || typeof event.id !== 'string' || typeof event.channelId !== 'string' || typeof event.guildId !== 'string') return false;
       if (this.directPostOutcomeMatches(state, event, 'messageId', event.id)) return true;
       return Boolean(event.isBot && typeof event.nonce === 'string' && this.directPostOutcomeMatches(state, event, 'nonce', event.nonce));
