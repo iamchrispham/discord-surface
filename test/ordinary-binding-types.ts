@@ -34,7 +34,7 @@ const state: OrdinaryBindingState = {
   rebind: value => ({ ...binding, ...value }),
   getBinding: () => binding,
   isOrdinaryBindingRecord: () => true,
-  isOrdinaryBinding: (_value): _value is OrdinaryBindingRecord => true,
+  isOrdinaryBinding: (_value: OrdinaryBindingRecord | null): boolean => true,
   transaction: operation => operation(),
   hasUnresolved: () => false,
   hasUnresolvedOrdinaryPost: () => false,
@@ -87,8 +87,13 @@ const preflight = handlers.recordOrdinaryPreflight(state, binding, {
   file: '/tmp/session.jsonl', sessionId: nativeId, threadId: nativeId, workspace: binding.workspace
 });
 const transferred = handlers.handoffOrdinary(state, { ...handoff, nativeId: 'b8f0d4f6-b26a-4f96-8d37-6d7df4f1d4a0' });
+const preflightViaHandler: boolean = handlers.hasOrdinaryPreflight(state, binding);
 const bindingReceipt: boolean = hasOrdinaryBindingReceipt(state, binding);
 const preflightReceipt: boolean = hasOrdinaryPreflightReceipt(state, binding);
+
+const detachedPreflight = handlers.hasOrdinaryPreflight;
+// @ts-expect-error hasOrdinaryPreflight requires its owning handler receiver
+detachedPreflight(state, binding);
 
 bound.generation satisfies number;
 rebound.provider satisfies string;
@@ -96,3 +101,4 @@ preflight?.active satisfies boolean | undefined;
 transferred.workspace satisfies string;
 void bindingReceipt;
 void preflightReceipt;
+void preflightViaHandler;

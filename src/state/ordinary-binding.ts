@@ -77,7 +77,7 @@ export interface OrdinaryBindingState {
   rebind(binding: OrdinaryBindingInput, options?: OrdinaryRebindOptions): OrdinaryBindingRecord;
   getBinding(channelId: string | undefined): OrdinaryBindingRecord | null;
   isOrdinaryBindingRecord(binding: OrdinaryBindingRecord | null): boolean;
-  isOrdinaryBinding(binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
+  isOrdinaryBinding(binding: OrdinaryBindingRecord | null): boolean;
   transaction<T>(operation: () => T): T;
   hasUnresolved(channelId: string): boolean;
   hasUnresolvedOrdinaryPost(channelId: string): boolean;
@@ -154,7 +154,7 @@ export interface OrdinaryBindingHandlers {
   ): OrdinaryBindingRecord;
   isOrdinaryBindingRecord(state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): boolean;
   isOrdinaryBinding(state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): boolean;
-  hasOrdinaryPreflight(state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): boolean;
+  hasOrdinaryPreflight(this: OrdinaryBindingHandlers, state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): boolean;
   recordOrdinaryPreflight(
     state: OrdinaryBindingState,
     binding: OrdinaryBindingRecord | null,
@@ -307,7 +307,7 @@ export function createOrdinaryBindingHandlers(
       return Boolean(binding?.active) && hasOrdinaryBindingReceipt(state, binding as OrdinaryBindingRecord);
     },
 
-    hasOrdinaryPreflight(state, binding) {
+    hasOrdinaryPreflight(this: OrdinaryBindingHandlers, state, binding) {
       if (!this.isOrdinaryBinding(state, binding)) return false;
       return hasOrdinaryPreflightReceipt(state, binding as OrdinaryBindingRecord);
     },
@@ -318,17 +318,21 @@ export function createOrdinaryBindingHandlers(
         if (!bindingMatchesExpected(current, binding)) return null;
         if (!state.isOrdinaryBinding(current)) throw new BindingError('binding is not an ordinary Codex binding');
         if (!detail || typeof detail !== 'object' || typeof detail.file !== 'string' || !path.isAbsolute(detail.file) ||
-          detail.sessionId !== current.nativeId || detail.threadId !== current.nativeId || detail.workspace !== current.workspace) {
+          detail.sessionId !== (current as OrdinaryBindingRecord).nativeId ||
+          detail.threadId !== (current as OrdinaryBindingRecord).nativeId ||
+          detail.workspace !== (current as OrdinaryBindingRecord).workspace) {
           throw new BindingError('ordinary Codex native preflight proof does not match the binding');
         }
         state.receipt(null, 'ordinary-native-preflight', {
           ...detail,
-          channelId: current.channelId, guildId: current.guildId, provider: current.provider,
-          nativeId: current.nativeId, workspace: current.workspace, generation: current.generation,
-          sessionRoot: current.sessionRoot || null,
+          channelId: (current as OrdinaryBindingRecord).channelId, guildId: (current as OrdinaryBindingRecord).guildId,
+          provider: (current as OrdinaryBindingRecord).provider,
+          nativeId: (current as OrdinaryBindingRecord).nativeId, workspace: (current as OrdinaryBindingRecord).workspace,
+          generation: (current as OrdinaryBindingRecord).generation,
+          sessionRoot: (current as OrdinaryBindingRecord).sessionRoot || null,
           outcome: 'verified'
         });
-        return current;
+        return current as OrdinaryBindingRecord;
       });
     },
 
