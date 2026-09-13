@@ -1,4 +1,8 @@
 import * as path from 'node:path';
+import type { MessageState } from '../acknowledgment';
+import type { AgentProvider } from '../agent-message';
+import type { Readiness } from '../topic';
+import { ORDINARY_RECEIPT_KINDS, type OrdinaryReceiptKind } from '../ordinary/constants';
 
 export interface OrdinaryBindingSqlStatement {
   get<T extends Record<string, unknown> = Record<string, unknown>>(...parameters: unknown[]): T | undefined;
@@ -10,30 +14,50 @@ export interface OrdinaryBindingDatabase {
 }
 
 export interface OrdinaryBindingIdentity {
-  sessionId?: unknown;
-  threadId?: unknown;
+  sessionId: string;
+  threadId: string;
   [key: string]: unknown;
 }
 
 export interface OrdinaryNativeProof {
-  file?: unknown;
-  sessionId?: unknown;
-  threadId?: unknown;
-  workspace?: unknown;
+  file: string;
+  sessionId: string;
+  threadId: string;
+  workspace: string;
   sessionRoot?: string | null;
   [key: string]: unknown;
 }
+
+export type OrdinaryMessageState = Extract<MessageState, 'dispatching' | 'uncertain' | 'submitted'>;
+export type OrdinaryProvider = Extract<AgentProvider, 'codex'>;
+export type OrdinaryReadiness = Extract<Readiness, 'pending'>;
+
+type OrdinaryMessageStates = {
+  DISPATCHING: Extract<MessageState, 'dispatching'>;
+  UNCERTAIN: Extract<MessageState, 'uncertain'>;
+  SUBMITTED: Extract<MessageState, 'submitted'>;
+};
+
+type OrdinaryProviders = {
+  CODEX: OrdinaryProvider;
+};
+
+type OrdinaryReadinessValues = {
+  PENDING: OrdinaryReadiness;
+};
+
+type OrdinaryHandoffHistory = Record<string, unknown>;
 
 export interface OrdinaryBindingInput {
   channelId: string;
   guildId: string;
   nativeId: string;
   workspace: string;
-  provider?: string;
+  provider?: AgentProvider;
   sessionRoot?: string | null;
   conductorId?: string | null;
   repoKey?: string | null;
-  readiness?: string;
+  readiness?: Readiness;
   ordinaryIdentity?: OrdinaryBindingIdentity | null;
   [key: string]: unknown;
 }
@@ -41,12 +65,12 @@ export interface OrdinaryBindingInput {
 export interface OrdinaryBindingRecord extends OrdinaryBindingInput {
   active: boolean;
   generation: number;
-  provider: string;
+  provider: AgentProvider;
 }
 
 export interface OrdinaryHandoffRecord {
   channelId: string;
-  provider: string;
+  provider: AgentProvider;
   fromNativeId: string;
   fromGeneration: number;
   nativeId: string;
@@ -66,27 +90,26 @@ export interface OrdinaryRebindOptions {
   sessionRootOverride?: string | null;
   intakeCutoff?: string | null;
   beforeMutation?: (() => void) | undefined;
-  rejectUnresolvedOrdinaryPost?: boolean;
 }
 
 export interface OrdinaryBindingState {
   db: OrdinaryBindingDatabase;
   ordinaryHandoffPauses: { delete(channelId: string): unknown };
   ordinaryHandoffPauseSnapshots?: { delete(channelId: string): unknown };
-  bind(binding: OrdinaryBindingInput, options?: OrdinaryBindOptions): OrdinaryBindingRecord;
-  rebind(binding: OrdinaryBindingInput, options?: OrdinaryRebindOptions): OrdinaryBindingRecord;
+  bind(binding: OrdinaryBindingInput, options?: OrdinaryBindOptions): OrdinaryBindingRecord | null;
+  rebind(binding: OrdinaryBindingInput, options?: OrdinaryRebindOptions): OrdinaryBindingRecord | null;
   getBinding(channelId: string | undefined): OrdinaryBindingRecord | null;
-  isOrdinaryBindingRecord(binding: OrdinaryBindingRecord | null): boolean;
-  isOrdinaryBinding(binding: OrdinaryBindingRecord | null): boolean;
+  isOrdinaryBindingRecord(binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
+  isOrdinaryBinding(binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
   transaction<T>(operation: () => T): T;
   hasUnresolved(channelId: string): boolean;
   hasUnresolvedOrdinaryPost(channelId: string): boolean;
   bindingInput(binding: OrdinaryBindingInput, existing?: OrdinaryBindingRecord | null): OrdinaryBindingInput;
   assertLegacyMigrationSafe(channelId: string): void;
-  receipt(discordId: string | null, kind: string, detail: Record<string, unknown>): void;
-  findOrdinaryHandoff(handoffId: string): OrdinaryHandoffRecord | null;
+  receipt(discordId: string | null, kind: OrdinaryReceiptKind, detail: Record<string, unknown>): void;
+  _findOrdinaryHandoff(handoffId: string): OrdinaryHandoffHistory | null;
   hasUnboundReceipt(channelId: string, generation: number): boolean;
-  assertNativeOwnerFree(provider: string, nativeId: string, channelId?: string): void;
+  assertNativeOwnerFree(provider: AgentProvider, nativeId: string, channelId?: string): void;
   setIntakeCutoffInTransaction(
     channelId: string,
     guildId: string,
@@ -103,17 +126,9 @@ interface OrdinaryErrorConstructor {
 export interface OrdinaryBindingDependencies {
   BindingError: OrdinaryErrorConstructor;
   StaleGenerationError: OrdinaryErrorConstructor;
-  MESSAGE_STATES: {
-    DISPATCHING: string;
-    UNCERTAIN: string;
-    SUBMITTED: string;
-  };
-  PROVIDERS: {
-    CODEX: string;
-  };
-  READINESS: {
-    PENDING: string;
-  };
+  MESSAGE_STATES: OrdinaryMessageStates;
+  PROVIDERS: OrdinaryProviders;
+  READINESS: OrdinaryReadinessValues;
   UnresolvedWorkError: OrdinaryErrorConstructor;
   assertText(value: unknown, name: string, max?: number): string;
   assertUuid(value: unknown, name?: string): string;
@@ -126,16 +141,21 @@ export interface OrdinaryBindingDependencies {
 
 export interface OrdinaryHandoffInput {
   channelId: string;
-  provider: string;
+  provider: AgentProvider;
   fromNativeId: string;
   fromGeneration: number;
   nativeId: string;
   workspace: string;
   sessionRoot?: string | null;
   handoffId: string;
-  identity?: OrdinaryBindingIdentity | null;
-  nativeProof?: OrdinaryNativeProof | null;
+  identity: OrdinaryBindingIdentity;
+  nativeProof: OrdinaryNativeProof;
   intakeCutoff?: string | null;
+  beforeMutation?: () => void;
+}
+
+export interface OrdinaryHandoffResult extends OrdinaryBindingRecord {
+  handoffReconciled?: boolean;
 }
 
 export interface OrdinaryBindingHandlers {
@@ -143,24 +163,26 @@ export interface OrdinaryBindingHandlers {
     state: OrdinaryBindingState,
     binding: OrdinaryBindingInput,
     identity: OrdinaryBindingIdentity | null | undefined,
-    adoptionCutoff?: string | null
-  ): OrdinaryBindingRecord;
+    adoptionCutoff?: string | null,
+    options?: OrdinaryBindOptions
+  ): OrdinaryBindingRecord | null;
   rebindOrdinary(
     state: OrdinaryBindingState,
     binding: OrdinaryBindingInput,
     identity: OrdinaryBindingIdentity | null | undefined,
     nativeProof?: OrdinaryNativeProof | null,
-    intakeCutoff?: string | null
-  ): OrdinaryBindingRecord;
-  isOrdinaryBindingRecord(state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): boolean;
-  isOrdinaryBinding(state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): boolean;
+    intakeCutoff?: string | null,
+    options?: OrdinaryRebindOptions
+  ): OrdinaryBindingRecord | null;
+  isOrdinaryBindingRecord(state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
+  isOrdinaryBinding(state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
   hasOrdinaryPreflight(this: OrdinaryBindingHandlers, state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): boolean;
   recordOrdinaryPreflight(
     state: OrdinaryBindingState,
     binding: OrdinaryBindingRecord | null,
     detail?: Record<string, unknown>
   ): OrdinaryBindingRecord | null;
-  handoffOrdinary(state: OrdinaryBindingState, input: OrdinaryHandoffInput): OrdinaryBindingRecord;
+  handoffOrdinary(state: OrdinaryBindingState, input: OrdinaryHandoffInput): OrdinaryHandoffResult | null;
 }
 
 export function hasOrdinaryBindingReceipt(
@@ -168,12 +190,13 @@ export function hasOrdinaryBindingReceipt(
   binding: OrdinaryBindingRecord
 ): boolean {
   return Boolean(db.prepare(`SELECT 1 FROM receipts
-    WHERE kind='ordinary-bound'
+    WHERE kind='${ORDINARY_RECEIPT_KINDS.BOUND}'
       AND json_extract(detail, '$.channelId')=?
+      AND json_extract(detail, '$.provider')=?
       AND json_extract(detail, '$.nativeId')=?
       AND json_extract(detail, '$.workspace')=?
       AND json_extract(detail, '$.generation')=?
-    LIMIT 1`).get(binding.channelId, binding.nativeId, binding.workspace, binding.generation));
+    LIMIT 1`).get(binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation));
 }
 
 export function hasOrdinaryPreflightReceipt(
@@ -181,14 +204,15 @@ export function hasOrdinaryPreflightReceipt(
   binding: OrdinaryBindingRecord
 ): boolean {
   return Boolean(db.prepare(`SELECT 1 FROM receipts
-    WHERE kind='ordinary-native-preflight'
+    WHERE kind='${ORDINARY_RECEIPT_KINDS.NATIVE_PREFLIGHT}'
       AND json_extract(detail, '$.channelId')=?
+      AND json_extract(detail, '$.provider')=?
       AND json_extract(detail, '$.nativeId')=?
       AND json_extract(detail, '$.workspace')=?
       AND json_extract(detail, '$.generation')=?
       AND json_extract(detail, '$.sessionRoot') IS ?
       AND json_extract(detail, '$.outcome')='verified'
-    LIMIT 1`).get(binding.channelId, binding.nativeId, binding.workspace, binding.generation, binding.sessionRoot || null));
+    LIMIT 1`).get(binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation, binding.sessionRoot || null));
 }
 
 export function createOrdinaryBindingHandlers(
@@ -206,7 +230,7 @@ export function createOrdinaryBindingHandlers(
   }: OrdinaryBindingDependencies
 ): OrdinaryBindingHandlers {
   const handlers: OrdinaryBindingHandlers = {
-    bindOrdinary(state, binding, identity, adoptionCutoff = null) {
+    bindOrdinary(state, binding, identity, adoptionCutoff = null, options = {}) {
       if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
       if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {
         throw new BindingError('ordinary Codex identity is missing or conflicting');
@@ -216,13 +240,14 @@ export function createOrdinaryBindingHandlers(
       if (identity.sessionId !== binding.nativeId || identity.threadId !== binding.nativeId) {
         throw new BindingError('ordinary Codex identity does not match the native session');
       }
-      return state.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? undefined : {
+      return state.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? options : {
         intakeCutoff: adoptionCutoff,
-        intakeCutoffDetail: 'ordinary binding adoption cutoff'
+        intakeCutoffDetail: 'ordinary binding adoption cutoff',
+        beforeMutation: options.beforeMutation
       });
     },
 
-    rebindOrdinary(state, binding, identity, nativeProof = null, intakeCutoff = null) {
+    rebindOrdinary(state, binding, identity, nativeProof = null, intakeCutoff = null, options = {}) {
       if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
       if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {
         throw new BindingError('ordinary Codex identity is missing or conflicting');
@@ -274,15 +299,16 @@ export function createOrdinaryBindingHandlers(
             throw new BindingError('ordinary binding root relocation has unresolved post custody');
           }
           state.assertLegacyMigrationSafe(binding.channelId);
+          if (typeof options.beforeMutation === 'function') options.beforeMutation();
           const updatedAt = now();
           state.db.prepare('UPDATE bindings SET session_root=?, readiness=?, updated_at=? WHERE channel_id=?')
             .run(input.sessionRoot, READINESS.PENDING, updatedAt, binding.channelId);
           state.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
             .run('ordinary transcript root relocated; intake recovery reopened', updatedAt, binding.channelId);
-          state.receipt(null, 'ordinary-root-relocated', {
+          state.receipt(null, ORDINARY_RECEIPT_KINDS.ROOT_RELOCATED, {
             channelId: binding.channelId, generation: existing.generation, sessionRoot: input.sessionRoot
           });
-          return state.getBinding(binding.channelId) as OrdinaryBindingRecord;
+          return state.getBinding(binding.channelId);
         });
       }
       const rebound = {
@@ -292,51 +318,53 @@ export function createOrdinaryBindingHandlers(
       };
       return state.rebind(rebound, {
         intakeCutoff,
-        rejectUnresolvedOrdinaryPost: existing.active && !sessionRootMatches,
         resetIntake: !sessionRootMatches,
-        sessionRootOverride: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : undefined
+        sessionRootOverride: !existing.active && binding.sessionRoot === undefined ? requestedSessionRoot : undefined,
+        beforeMutation: options.beforeMutation
       });
     },
 
-    isOrdinaryBindingRecord(state, binding) {
+    isOrdinaryBindingRecord(state, binding): binding is OrdinaryBindingRecord {
       if (!binding || binding.provider !== PROVIDERS.CODEX || binding.conductorId || binding.repoKey) return false;
       return hasOrdinaryBindingReceipt(state, binding);
     },
 
-    isOrdinaryBinding(state, binding) {
-      return Boolean(binding?.active) && hasOrdinaryBindingReceipt(state, binding as OrdinaryBindingRecord);
+    isOrdinaryBinding(state, binding): binding is OrdinaryBindingRecord {
+      if (!binding || !binding.active || binding.provider !== PROVIDERS.CODEX || binding.conductorId || binding.repoKey) return false;
+      return hasOrdinaryBindingReceipt(state, binding);
     },
 
     hasOrdinaryPreflight(this: OrdinaryBindingHandlers, state, binding) {
       if (!this.isOrdinaryBinding(state, binding)) return false;
-      return hasOrdinaryPreflightReceipt(state, binding as OrdinaryBindingRecord);
+      return hasOrdinaryPreflightReceipt(state, binding);
     },
 
     recordOrdinaryPreflight(state, binding, detail = {}) {
       return state.transaction(() => {
         const current = state.getBinding(binding?.channelId);
         if (!bindingMatchesExpected(current, binding)) return null;
-        if (!state.isOrdinaryBinding(current)) throw new BindingError('binding is not an ordinary Codex binding');
+        const currentProvider = current?.provider || 'native';
+        if (!state.isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${currentProvider} binding`);
         if (!detail || typeof detail !== 'object' || typeof detail.file !== 'string' || !path.isAbsolute(detail.file) ||
-          detail.sessionId !== (current as OrdinaryBindingRecord).nativeId ||
-          detail.threadId !== (current as OrdinaryBindingRecord).nativeId ||
-          detail.workspace !== (current as OrdinaryBindingRecord).workspace) {
-          throw new BindingError('ordinary Codex native preflight proof does not match the binding');
+          detail.sessionId !== current.nativeId ||
+          detail.threadId !== current.nativeId ||
+          detail.workspace !== current.workspace) {
+          throw new BindingError(`ordinary ${current.provider} native preflight proof does not match the binding`);
         }
-        state.receipt(null, 'ordinary-native-preflight', {
+        state.receipt(null, ORDINARY_RECEIPT_KINDS.NATIVE_PREFLIGHT, {
           ...detail,
-          channelId: (current as OrdinaryBindingRecord).channelId, guildId: (current as OrdinaryBindingRecord).guildId,
-          provider: (current as OrdinaryBindingRecord).provider,
-          nativeId: (current as OrdinaryBindingRecord).nativeId, workspace: (current as OrdinaryBindingRecord).workspace,
-          generation: (current as OrdinaryBindingRecord).generation,
-          sessionRoot: (current as OrdinaryBindingRecord).sessionRoot || null,
+          channelId: current.channelId, guildId: current.guildId,
+          provider: current.provider,
+          nativeId: current.nativeId, workspace: current.workspace,
+          generation: current.generation,
+          sessionRoot: current.sessionRoot || null,
           outcome: 'verified'
         });
-        return current as OrdinaryBindingRecord;
+        return current;
       });
     },
 
-    handoffOrdinary(state, { channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null }) {
+    handoffOrdinary(state, { channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, beforeMutation = undefined }) {
       if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
       if (provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff requires the Codex provider');
       assertUuid(fromNativeId, 'fromNativeId');
@@ -366,7 +394,7 @@ export function createOrdinaryBindingHandlers(
         (nativeProof.sessionRoot || null) !== (input.sessionRoot || null)) {
         throw new BindingError('ordinary handoff requires a matching Codex transcript proof');
       }
-      const previous = state.findOrdinaryHandoff(handoffId);
+      const previous = state._findOrdinaryHandoff(handoffId);
       if (previous) {
         const sameRequest = previous.channelId === channelId && previous.provider === PROVIDERS.CODEX &&
           previous.fromNativeId === fromNativeId && previous.fromGeneration === fromGeneration &&
@@ -376,17 +404,10 @@ export function createOrdinaryBindingHandlers(
           (existing.sessionRoot || null) === (input.sessionRoot || null);
         if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
         const retryResult = state.transaction(() => {
-          const current = state.getBinding(channelId);
-          if (!current || !bindingMatchesExpected(current, existing) || !current.active ||
-            current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
-            current.nativeId !== nativeId || current.generation !== fromGeneration + 1 ||
-            current.workspace !== input.workspace || (current.sessionRoot || null) !== (input.sessionRoot || null)) {
-            throw new StaleGenerationError('ordinary handoff retry binding identity is stale');
-          }
-          state.receipt(null, 'ordinary-handoff-retry', {
-            channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: current.generation
+          state.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF_RETRY, {
+            channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: existing.generation
           });
-          return { ...current, handoffReconciled: true };
+          return { ...existing, handoffReconciled: true };
         });
         state.ordinaryHandoffPauses.delete(channelId);
         state.ordinaryHandoffPauseSnapshots?.delete(channelId);
@@ -404,48 +425,77 @@ export function createOrdinaryBindingHandlers(
         throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       }
       state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
-      const handoffResult = state.transaction(() => {
-        const current = state.getBinding(channelId);
-        if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary handoff source identity is stale');
-        if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
-          current.nativeId !== fromNativeId || current.generation !== fromGeneration) {
-          throw new StaleGenerationError('ordinary handoff source identity is stale');
-        }
-        if (!current.active && !state.hasUnboundReceipt(channelId, fromGeneration)) {
-          throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
-        }
-        if (state.hasUnresolved(channelId) || state.hasUnresolvedOrdinaryPost(channelId)) {
-          throw new UnresolvedWorkError('cannot handoff while work is unresolved');
-        }
-        state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
-        state.assertLegacyMigrationSafe(channelId);
-        if (intakeCutoff !== null) {
-          state.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
-        }
-        const generation = existing.generation + 1;
-        const updatedAt = now();
-        state.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
-          WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
-          .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,
-            PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
-        state.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
-          .run('ordinary handoff; intake recovery reopened', updatedAt, channelId);
-        state.receipt(null, 'ordinary-handoff', {
-          channelId, provider: PROVIDERS.CODEX, handoffId,
-          fromNativeId, fromGeneration, fromActive: existing.active,
-          nativeId: input.nativeId, generation, workspace: input.workspace, sessionRoot: input.sessionRoot,
-          sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
+      try {
+        const handoffResult = state.transaction(() => {
+          const current = state.getBinding(channelId);
+          if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('ordinary handoff source identity is stale');
+          if (!current || current.provider !== PROVIDERS.CODEX || current.conductorId || current.repoKey ||
+            current.nativeId !== fromNativeId || current.generation !== fromGeneration) {
+            throw new StaleGenerationError('ordinary handoff source identity is stale');
+          }
+          if (!current.active && !state.hasUnboundReceipt(channelId, fromGeneration)) {
+            throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
+          }
+          if (state.hasUnresolved(channelId) || state.hasUnresolvedOrdinaryPost(channelId)) {
+            throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+          }
+          state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+          state.assertLegacyMigrationSafe(channelId);
+          if (typeof beforeMutation === 'function') beforeMutation();
+          if (intakeCutoff !== null) {
+            state.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
+          }
+          const generation = existing.generation + 1;
+          const updatedAt = now();
+          state.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
+            WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
+            .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,
+              PROVIDERS.CODEX, fromGeneration, fromNativeId, existing.active ? 1 : 0);
+          state.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
+            .run('ordinary handoff; intake recovery reopened', updatedAt, channelId);
+          state.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF, {
+            channelId, provider: PROVIDERS.CODEX, handoffId,
+            fromNativeId, fromGeneration, fromActive: existing.active,
+            nativeId: input.nativeId, generation, workspace: input.workspace, sessionRoot: input.sessionRoot,
+            sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
+          });
+          state.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
+            channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId: input.nativeId,
+            workspace: input.workspace, generation, sessionRoot: input.sessionRoot,
+            sessionId: identity.sessionId, threadId: identity.threadId
+          });
+          return state.getBinding(channelId);
         });
-        state.receipt(null, 'ordinary-bound', {
-          channelId, guildId: existing.guildId, provider: PROVIDERS.CODEX, nativeId: input.nativeId,
-          workspace: input.workspace, generation, sessionRoot: input.sessionRoot,
-          sessionId: identity.sessionId, threadId: identity.threadId
+        state.ordinaryHandoffPauses.delete(channelId);
+        state.ordinaryHandoffPauseSnapshots?.delete(channelId);
+        return handoffResult;
+      } catch (error) {
+        if (!(error instanceof StaleGenerationError)) throw error;
+        const committed = state._findOrdinaryHandoff(handoffId);
+        const successor = state.getBinding(channelId);
+        const reconciled = committed && successor && successor.active && successor.provider === PROVIDERS.CODEX &&
+          !successor.conductorId && !successor.repoKey && successor.nativeId === nativeId &&
+          successor.generation === fromGeneration + 1 && successor.workspace === input.workspace &&
+          (successor.sessionRoot || null) === (input.sessionRoot || null) &&
+          committed.channelId === channelId && committed.provider === PROVIDERS.CODEX &&
+          committed.fromNativeId === fromNativeId && committed.fromGeneration === fromGeneration &&
+          committed.nativeId === nativeId && committed.generation === successor.generation &&
+          committed.workspace === input.workspace && (committed.sessionRoot || null) === (input.sessionRoot || null);
+        if (!reconciled) throw error;
+        const retryResult = state.transaction(() => {
+          const current = state.getBinding(channelId);
+          const latest = state._findOrdinaryHandoff(handoffId);
+          if (!latest || !bindingMatchesExpected(current, successor) || latest.nativeId !== nativeId ||
+            latest.generation !== current?.generation) throw error;
+          state.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF_RETRY, {
+            channelId, provider: PROVIDERS.CODEX, handoffId, nativeId, generation: current!.generation
+          });
+          return { ...current!, handoffReconciled: true };
         });
-        return state.getBinding(channelId) as OrdinaryBindingRecord;
-      });
-      state.ordinaryHandoffPauses.delete(channelId);
-      state.ordinaryHandoffPauseSnapshots?.delete(channelId);
-      return handoffResult;
+        state.ordinaryHandoffPauses.delete(channelId);
+        state.ordinaryHandoffPauseSnapshots?.delete(channelId);
+        return retryResult;
+      }
     }
   };
   return handlers;

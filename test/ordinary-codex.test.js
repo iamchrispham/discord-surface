@@ -10,9 +10,12 @@ const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordi
 const { DiscordGateway } = require('../src/discord');
 const { CodexProvider, readCodexSessionIdentityAsync, sessionRoot, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
 const { SurfaceState, PROVIDERS, READINESS, StaleGenerationError } = require('../src/state');
+const { ORDINARY_RECEIPT_KINDS } = require('../src/ordinary/constants');
 const { runDirectPost } = require('../src/direct-post');
 const facade = require('../src/ordinary-codex');
 const emitted = require('../dist/ordinary-codex');
+const ordinaryConstantsFacade = require('../src/ordinary/constants');
+const ordinaryConstantsEmitted = require('../dist/ordinary/constants');
 
 const CODEX = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CODEX_V7 = '01a0701c-5714-7671-a455-db7d67f9fa78';
@@ -117,6 +120,13 @@ test('ordinary CommonJS facade exposes emitted code and fails closed when output
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('ordinary constants CommonJS facade preserves emitted values and identity', () => {
+  assert.deepEqual(Object.keys(ordinaryConstantsFacade).sort(), ['CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX', 'ORDINARY_RECEIPT_KINDS']);
+  assert.equal(ordinaryConstantsFacade.CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX, ordinaryConstantsEmitted.CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX);
+  assert.equal(ordinaryConstantsFacade.ORDINARY_RECEIPT_KINDS, ordinaryConstantsEmitted.ORDINARY_RECEIPT_KINDS);
+  assert.equal(Object.isFrozen(ordinaryConstantsFacade.ORDINARY_RECEIPT_KINDS), true);
 });
 
 test('channel resolution accepts exact ID, mention, and one name only in the configured guild', () => {
@@ -884,6 +894,20 @@ test('ordinary bind starts pending with paired null conductor identity and holds
   assert.throws(() => f.state.bindOrdinary({
     channelId: 'identity-mismatch', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX, workspace: f.dir
   }, { sessionId: OTHER, threadId: OTHER }), /does not match the native session/);
+});
+
+test('ordinary classification excludes a conductor-owned Codex binding', t => {
+  const f = fixture(t);
+  const binding = f.state.bind({
+    channelId: 'conductor-owned', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
+    workspace: f.dir, conductorId: 'conductor', repoKey: 'repo:test'
+  });
+  f.state.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
+    channelId: binding.channelId, provider: binding.provider, nativeId: binding.nativeId,
+    workspace: binding.workspace, generation: binding.generation
+  });
+  assert.equal(f.state.isOrdinaryBindingRecord(binding), false);
+  assert.equal(f.state.isOrdinaryBinding(binding), false);
 });
 
 test('ordinary binding permits a verified transcript-root relocation', t => {
@@ -1965,7 +1989,7 @@ test('ordinary readiness requires native proof before the intake boundary can be
   const f = fixture(t);
   const binding = ordinary(f);
   assert.throws(() => f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'history complete', null, null, binding), /preflight/);
-  assert.throws(() => f.state.recordOrdinaryPreflight(binding, { file: '/tmp/exact.jsonl', sessionId: OTHER, threadId: OTHER, workspace: f.dir }), /does not match/);
+  assert.throws(() => f.state.recordOrdinaryPreflight(binding, { file: '/tmp/exact.jsonl', sessionId: OTHER, threadId: OTHER, workspace: f.dir }), /ordinary codex native preflight proof does not match the binding/);
   f.state.recordOrdinaryPreflight(binding, { file: '/tmp/exact.jsonl', sessionId: CODEX, threadId: CODEX, workspace: f.dir });
   f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'history complete', null, null, binding);
   assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.READY);
