@@ -1565,7 +1565,16 @@ class DiscordGateway {
     if (!boundary?.watermark || signal?.aborted || this.stopping) return boundary;
     const recoveryTimer = setImmediate(() => {
       this.liveAttachmentRecoveryTimers.delete(recoveryTimer);
-      if (this.stopping || !this.isCurrentBinding(binding)) return;
+      if (this.stopping || !this.isCurrentBinding(binding)) {
+        const pending = this.attachmentIntakeRetryMessages.get(binding.channelId);
+        if (!pending || bindingIdentityMatches(pending.binding, binding)) {
+          this.attachmentIntakeRetryPendingChannels.delete(binding.channelId);
+          this.attachmentIntakeRetryMessages.delete(binding.channelId);
+          this.consumer.releaseIntake(binding.channelId);
+          this.attachmentIntakeBlockedChannels.delete(binding.channelId);
+        }
+        return;
+      }
       let reconciled;
       try { reconciled = this.state.reconcileIntake(binding.channelId, binding); }
       catch (recoveryError) {
