@@ -60,14 +60,14 @@ export interface ClaudeChannelState extends ClaudeChannelReadState {
 }
 
 export type ClaudeAcknowledgmentState = ClaudeChannelState & AcknowledgmentState & {
-  recordNativeReply(input: NativeAcknowledgmentInput & { text: string }): {
+  recordNativeReply: (input: NativeAcknowledgmentInput & { text: string }) => {
     duplicate: boolean;
     message: ClaudeMessage | null | undefined;
   };
 };
 
 type ClaudeDefaultMcpState = AcknowledgmentState & {
-  recordNativeReply(input: NativeAcknowledgmentInput & { text: string }): {
+  recordNativeReply: (input: NativeAcknowledgmentInput & { text: string }) => {
     duplicate: boolean;
   };
 };
@@ -100,9 +100,12 @@ interface ClaudeChannelMcpBase {
   onerror?: ((error: Error) => void) | null;
 }
 
-export interface ClaudeDefaultMcp<TTransport = unknown> extends Omit<ClaudeChannelMcpBase, 'close'> {
-  close: Server['close'];
-  setRequestHandler: Server['setRequestHandler'];
+type ClaudeDefaultMcpNotification =
+  Server['notification'] &
+  ((notification: ClaudeChannelNotification, options?: Parameters<Server['notification']>[1]) => ReturnType<Server['notification']>);
+
+export interface ClaudeDefaultMcp<TTransport = unknown> extends Omit<Server, 'connect' | 'notification'> {
+  notification: ClaudeDefaultMcpNotification;
   connect: (transport: TTransport) => Promise<void>;
   transportFactory: () => TTransport;
 }

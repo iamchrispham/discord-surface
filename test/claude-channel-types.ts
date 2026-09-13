@@ -12,6 +12,7 @@ import {
 import type { AcknowledgmentState, NativeAcknowledgmentInput } from '../src/acknowledgment';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { ListToolsRequest } from '@modelcontextprotocol/sdk/types.js';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 
 declare const state: ClaudeChannelReadState;
 
@@ -177,6 +178,20 @@ const inferredNumberStringMcp = {
 };
 declare const acknowledgmentState: ClaudeAcknowledgmentState;
 
+type NarrowReplyInput = NativeAcknowledgmentInput & { text: string; requiredField: string };
+const exactRichReply: ClaudeAcknowledgmentState['recordNativeReply'] = () => ({
+  duplicate: false,
+  message: undefined
+});
+void exactRichReply;
+const narrowedRichReply = (_input: NarrowReplyInput) => ({ duplicate: false, message: undefined });
+const invalidRichReplyState: ClaudeAcknowledgmentState = {
+  ...acknowledgmentState,
+  // @ts-expect-error narrowed reply callbacks must be rejected under strictFunctionTypes
+  recordNativeReply: narrowedRichReply
+};
+void invalidRichReplyState;
+
 const errorAwareMcp: ClaudeChannelMcp = {
   notification: async () => {},
   onerror: error => {
@@ -199,7 +214,7 @@ new ClaudeChannel({
 });
 
 type MinimalDefaultMcpState = AcknowledgmentState & {
-  recordNativeReply(input: NativeAcknowledgmentInput & { text: string }): { duplicate: boolean };
+  recordNativeReply: (input: NativeAcknowledgmentInput & { text: string }) => { duplicate: boolean };
 };
 
 const minimalDefaultState: MinimalDefaultMcpState = {
@@ -220,6 +235,24 @@ const minimalDefaultState: MinimalDefaultMcpState = {
 const defaultMcp = createDefaultMcp({ nativeId: event.nativeId, state: minimalDefaultState });
 void defaultMcp.connect(defaultMcp.transportFactory());
 void defaultMcp.close();
+const customNotificationResult: ReturnType<Server['notification']> = defaultMcp.notification({
+  method: 'notifications/claude/channel',
+  params: {
+    content: 'reply',
+    meta: { messageId: event.messageId, generation: String(event.generation), nativeId: event.nativeId }
+  }
+});
+void customNotificationResult;
+const sdkNotification: Parameters<Server['notification']>[0] = {
+  method: 'notifications/cancelled',
+  params: { requestId: event.messageId, reason: 'superseded' }
+};
+const sdkNotificationResult: ReturnType<Server['notification']> = defaultMcp.notification(sdkNotification, {
+  relatedRequestId: event.messageId
+});
+void sdkNotificationResult;
+const pingResult: ReturnType<Server['ping']> = defaultMcp.ping();
+void pingResult;
 defaultMcp.setRequestHandler(ListToolsRequestSchema, async (request: ListToolsRequest) => {
   void request.params?.cursor;
   return { tools: [] };
@@ -228,6 +261,19 @@ defaultMcp.setRequestHandler(ListToolsRequestSchema, async (request: ListToolsRe
 defaultMcp.setRequestHandler({ kind: 'invalid-schema' }, async () => ({ tools: [] }));
 // @ts-expect-error the default helper always creates a StdioServerTransport
 void defaultMcp.connect({});
+const narrowedDefaultState = {
+  ...minimalDefaultState,
+  recordNativeReply: narrowedRichReply
+};
+createDefaultMcp({
+  nativeId: event.nativeId,
+  // @ts-expect-error the default state callback must accept the runtime reply input
+  state: narrowedDefaultState
+});
+
+declare const injectedMinimalMcp: ClaudeChannelMcp;
+// @ts-expect-error injected MCPs expose only the channel notification shape
+void injectedMinimalMcp.notification(sdkNotification, { relatedRequestId: event.messageId });
 
 const minimalDefaultChannelState: ClaudeChannelReadState & MinimalDefaultMcpState = {
   ...minimalDefaultState,
