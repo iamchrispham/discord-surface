@@ -62,6 +62,20 @@ export interface OrdinaryBindingInput {
   [key: string]: unknown;
 }
 
+export interface OrdinaryBindingHandlerInput {
+  channelId: string;
+  guildId: string;
+  nativeId: string;
+  workspace: string;
+  provider?: OrdinaryProvider;
+  sessionRoot?: string | null;
+  conductorId?: string | null;
+  repoKey?: string | null;
+  readiness?: Readiness;
+  ordinaryIdentity?: OrdinaryBindingIdentity | null;
+  [key: string]: unknown;
+}
+
 export interface OrdinaryBindingRecord extends OrdinaryBindingInput {
   active: boolean;
   generation: number;
@@ -91,6 +105,8 @@ export interface OrdinaryRebindOptions {
   intakeCutoff?: string | null;
   beforeMutation?: (() => void) | undefined;
 }
+
+export type OrdinaryRebindHandlerOptions = Pick<OrdinaryRebindOptions, 'beforeMutation'>;
 
 export interface OrdinaryBindingState {
   db: OrdinaryBindingDatabase;
@@ -141,7 +157,7 @@ export interface OrdinaryBindingDependencies {
 
 export interface OrdinaryHandoffInput {
   channelId: string;
-  provider: AgentProvider;
+  provider: OrdinaryProvider;
   fromNativeId: string;
   fromGeneration: number;
   nativeId: string;
@@ -161,18 +177,18 @@ export interface OrdinaryHandoffResult extends OrdinaryBindingRecord {
 export interface OrdinaryBindingHandlers {
   bindOrdinary(
     state: OrdinaryBindingState,
-    binding: OrdinaryBindingInput,
-    identity: OrdinaryBindingIdentity | null | undefined,
+    binding: OrdinaryBindingHandlerInput,
+    identity: OrdinaryBindingIdentity,
     adoptionCutoff?: string | null,
     options?: OrdinaryBindOptions
   ): OrdinaryBindingRecord | null;
   rebindOrdinary(
     state: OrdinaryBindingState,
-    binding: OrdinaryBindingInput,
-    identity: OrdinaryBindingIdentity | null | undefined,
+    binding: OrdinaryBindingHandlerInput,
+    identity: OrdinaryBindingIdentity,
     nativeProof?: OrdinaryNativeProof | null,
     intakeCutoff?: string | null,
-    options?: OrdinaryRebindOptions
+    options?: OrdinaryRebindHandlerOptions
   ): OrdinaryBindingRecord | null;
   isOrdinaryBindingRecord(state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
   isOrdinaryBinding(state: OrdinaryBindingState, binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
@@ -180,7 +196,7 @@ export interface OrdinaryBindingHandlers {
   recordOrdinaryPreflight(
     state: OrdinaryBindingState,
     binding: OrdinaryBindingRecord | null,
-    detail?: Record<string, unknown>
+    detail: OrdinaryNativeProof
   ): OrdinaryBindingRecord | null;
   handoffOrdinary(state: OrdinaryBindingState, input: OrdinaryHandoffInput): OrdinaryHandoffResult | null;
 }
@@ -339,7 +355,7 @@ export function createOrdinaryBindingHandlers(
       return hasOrdinaryPreflightReceipt(state, binding);
     },
 
-    recordOrdinaryPreflight(state, binding, detail = {}) {
+    recordOrdinaryPreflight(state, binding, detail) {
       return state.transaction(() => {
         const current = state.getBinding(binding?.channelId);
         if (!bindingMatchesExpected(current, binding)) return null;

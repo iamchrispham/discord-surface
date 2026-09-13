@@ -96,7 +96,7 @@ const handlers = createOrdinaryBindingHandlers({
 const identity = { sessionId: nativeId, threadId: nativeId };
 const handoff: OrdinaryHandoffInput = {
   channelId: binding.channelId,
-  provider: binding.provider,
+  provider: 'codex',
   fromNativeId: binding.nativeId,
   fromGeneration: binding.generation,
   nativeId,
@@ -114,11 +114,26 @@ const handoff: OrdinaryHandoffInput = {
   intakeCutoff: null
 };
 
-const bound = handlers.bindOrdinary(state, { ...binding }, identity);
-const rebound = handlers.rebindOrdinary(state, { ...binding }, identity);
+// @ts-expect-error ordinary handoffs accept the Codex provider only
+const invalidHandoffProvider: OrdinaryHandoffInput = { ...handoff, provider: 'claude' };
+
+const bound = handlers.bindOrdinary(state, { ...binding, provider: 'codex' }, identity);
+const rebound = handlers.rebindOrdinary(state, { ...binding, provider: 'codex' }, identity);
 const preflight = handlers.recordOrdinaryPreflight(state, binding, {
   file: '/tmp/session.jsonl', sessionId: nativeId, threadId: nativeId, workspace: binding.workspace
 });
+// @ts-expect-error ordinary bind requests accept the Codex provider only
+handlers.bindOrdinary(state, { ...binding, provider: 'claude' }, identity);
+// @ts-expect-error ordinary rebind requests accept the Codex provider only
+handlers.rebindOrdinary(state, { ...binding, provider: 'claude' }, identity);
+// @ts-expect-error ordinary bind handlers require a validated identity
+handlers.bindOrdinary(state, { ...binding }, null);
+// @ts-expect-error ordinary rebind handlers require a validated identity
+handlers.rebindOrdinary(state, { ...binding }, undefined);
+// @ts-expect-error ordinary preflight requires a native proof
+handlers.recordOrdinaryPreflight(state, binding, {});
+// @ts-expect-error rebind handler options expose only the mutation hook
+handlers.rebindOrdinary(state, { ...binding }, identity, null, null, { intakeCutoff: 'cutoff' });
 const transferred = handlers.handoffOrdinary(state, { ...handoff, nativeId: 'b8f0d4f6-b26a-4f96-8d37-6d7df4f1d4a0' });
 const preflightViaHandler: boolean = handlers.hasOrdinaryPreflight(state, binding);
 const bindingReceipt: boolean = hasOrdinaryBindingReceipt(state, binding);
