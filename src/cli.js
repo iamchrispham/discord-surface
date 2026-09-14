@@ -1775,7 +1775,10 @@ async function agentSend(args) {
   } else if (!isReply) {
     required(args, 'target-file');
   }
-  return directPost(args, provider, ordinary, { agentTarget });
+  return directPost(args, provider, ordinary, {
+    agentTarget,
+    agentPresentation: args['agent-presentation']
+  });
 }
 
 async function directPost(args, provider = null, ordinary = false, dependencies = {}) {
@@ -1829,6 +1832,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       provider,
       textFile: required(args, 'text-file'),
       agentTarget: dependencies.agentTarget ?? null,
+      agentPresentation: dependencies.agentPresentation,
       agentKind: hasAgentReplyTo ? 'result' : 'request',
       agentReplyTo: hasAgentReplyTo ? args['agent-reply-to'] : null,
       dedupeKey,

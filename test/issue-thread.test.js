@@ -14,7 +14,7 @@ const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const SUCCESSOR = 'f8296579-092b-4503-bf98-1f3c2b6d4913';
 
-function fixture(t) {
+function fixture(t, gatewayRecoveryOptions = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-issue-thread-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused.secret') });
@@ -47,7 +47,7 @@ function fixture(t) {
       return { status: 'submitted' };
     },
     async observe() { return { text: 'thread answer' }; }
-  } }, recoveryOptions: { ordinaryNativePreflight: async () => true } });
+  } }, recoveryOptions: { ordinaryNativePreflight: async () => true, ...gatewayRecoveryOptions } });
   t.after(async () => { await gateway.stop(); state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   const message = (id, channel = child) => ({ id, guildId: 'guild', channelId: channel.id, content: 'thread question', author: { id: 'operator', bot: false }, channel });
   function ready(baseline = null) {
@@ -116,6 +116,51 @@ test('live enrolled thread keeps native owner and sends receipt, eyes and answer
   assert.ok(f.reactions.some(reaction => reaction.reaction === '👀'));
   assert.ok([...f.sends, ...f.reactions].every(send => send.channelId === f.child.id));
   assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
+});
+
+test('enrolled child bot attachment failure is rejected without parent gap recovery', async t => {
+  let fetchCalls = 0;
+  const f = fixture(t, {
+    agentAttachmentFetch: async () => {
+      fetchCalls += 1;
+      throw new Error('CDN unavailable');
+    }
+  });
+  f.ready();
+  const message = {
+    ...f.message('101'),
+    content: 'readable child bot attachment preview',
+    author: { id: 'bot', bot: true },
+    attachments: [{
+      url: 'https://cdn.discordapp.com/attachments/1000/2000/agent-message.tether',
+      filename: 'agent-message.tether',
+      contentType: 'application/octet-stream',
+      size: 64
+    }]
+  };
+
+  f.gateway.boundMessage(message);
+  await Promise.all([...f.gateway.inFlight]);
+
+  assert.equal(fetchCalls, 0);
+  assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
+  assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+  const rejection = f.state.listReceipts()
+    .filter(row => row.kind === 'intake-rejected')
+    .map(row => ({ row, detail: JSON.parse(row.detail) }))
+    .find(({ detail }) => detail.discordId === message.id);
+  assert.ok(rejection);
+  assert.equal(rejection.detail.reason, 'bot-source');
+  assert.equal(rejection.detail.channelId, f.parent.id);
+  assert.equal(rejection.detail.deliveryChannelId, f.child.id);
+  assert.equal(f.state.getMessage(message.id), null);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).lastSeenId, message.id);
+  assert.deepEqual(f.dispatched, []);
+  assert.deepEqual(f.sends, []);
+  assert.deepEqual(f.reactions, []);
+  assert.equal(f.gateway.attachmentIntakeRetryMessages.size, 0);
+  assert.equal(f.gateway.attachmentIntakeBlockedChannels.size, 0);
 });
 
 test('pending child holds live work, recovery deduplicates it and replies after child readiness', async t => {
@@ -938,6 +983,7 @@ test('live child accepted while checkpoint reconciliation waits reaches native d
     await recoveryReached; releaseCheckpoint(); await waitingReached;
     await new Promise(r => setTimeout(r, 20));
     f.gateway.boundMessage(f.message('102'));
+    await new Promise(resolve => setImmediate(resolve));
     assert.ok(f.state.getMessage('102'));
     releaseRecovery();
     await Promise.all([checkpoint, recovery]);
