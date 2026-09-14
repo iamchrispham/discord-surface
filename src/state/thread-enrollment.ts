@@ -208,12 +208,17 @@ export function createThreadEnrollmentHandlers({
       if (enrollment?.active) {
         const binding = enrollment ? state.getBinding(enrollment.parentChannelId) : null;
         if (!binding || !binding.active || binding.guildId !== enrollment.guildId) return null;
+        const handoffCutoffId = maxId(
+          compareDiscordIds,
+          enrollment.recoveredThroughId,
+          currentParentHandoffCutoff(state, binding)
+        );
         return {
           binding,
           enrollment,
           deliveryChannelId,
           ready: routeReady(binding, enrollment),
-          handoffCutoffId: currentParentHandoffCutoff(state, binding)
+          handoffCutoffId
         };
       }
       if (!direct) return null;

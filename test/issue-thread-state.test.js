@@ -319,6 +319,7 @@ test('child handoff fence rejects delayed predecessor events under the successor
     nativeProof: { file: transcriptFile, sessionId: SUCCESSOR, threadId: SUCCESSOR, workspace: f.dir, sessionRoot: null }
   });
   assert.equal(successor.generation, predecessor.generation + 1);
+  assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, '150');
 
   const delayed = f.state.acceptDiscordMessage(event('120'), { expectedBinding: successor });
   assert.equal(delayed.accepted, false);

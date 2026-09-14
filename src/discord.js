@@ -380,6 +380,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return state.currentMessageBinding(message).current;
   }
 
+  function ownerMessageIsTerminal(message) {
+    return Boolean(message && [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state));
+  }
+
   function ownerCanAdvance(messageId) {
     const message = state.getMessage(messageId);
     return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state) ||
@@ -389,6 +393,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function ownerBindingReady(messageId) {
     const message = state.getMessage(messageId);
     if (!message) return true;
+    if (ownerMessageIsTerminal(message)) return true;
     const route = state.getMessageRoute(message.deliveryChannelId || message.channelId);
     if (route) return route.ready;
     const binding = state.getBinding(message.channelId);
@@ -451,6 +456,13 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function finishOwner(entry) {
     const queue = ownerQueues.get(entry.ownerKey);
     if (!queue || queue.active !== entry) return;
+    if (ownerMessageIsTerminal(state.getMessage(entry.message.id))) {
+      queue.blockedMessageId = null;
+      queue.blockedReason = null;
+      queue.active = null;
+      pumpOwner(entry.ownerKey);
+      return;
+    }
     if (entry.dispatchBlocked) {
       queue.blockedMessageId = entry.message.id;
       queue.blockedReason = 'not_submitted';
@@ -1432,6 +1444,12 @@ class DiscordGateway {
     const heldChannels = [...this.liveIntakeCounts.entries()]
       .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getMessageRoute(channelId)?.binding.active);
     if (!heldChannels.length) return;
+    if (this.liveCheckpointRetryTimer) {
+      const retryChannels = this.liveCheckpointRetryChannels || new Set();
+      for (const [channelId] of heldChannels) retryChannels.add(channelId);
+      this.liveCheckpointRetryChannels = retryChannels;
+      return;
+    }
     const triggeredCounts = new Map(heldChannels);
     for (const [channelId] of heldChannels) this.liveIntakeCounts.set(channelId, 0);
     this.beginLiveCheckpoint(triggeredCounts);

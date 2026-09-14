@@ -169,6 +169,33 @@ test('unavailable child does not demote parent or send accepted work to it', asy
   assert.equal(f.state.getMessage('100').state, MESSAGE_STATES.ACCEPTED);
 });
 
+test('terminal child work releases its native owner after route demotion', { timeout: 3000 }, async t => {
+  const f = fixture(t); f.ready();
+  let observeStarted;
+  let releaseObserve;
+  const started = new Promise(resolve => { observeStarted = resolve; });
+  const gate = new Promise(resolve => { releaseObserve = resolve; });
+  f.gateway.providers.codex.observe = async message => {
+    if (message.id === '100') {
+      observeStarted();
+      await gate;
+    }
+    return { text: 'thread answer' };
+  };
+
+  f.gateway.boundMessage(f.message('100'));
+  await started;
+  f.gateway.boundMessage(f.message('101', f.parent));
+  f.state.markThreadBoundary(f.child.id, THREAD_STATES.UNAVAILABLE, 'child route demoted during native work', null, null, f.state.getBinding(f.parent.id));
+  releaseObserve();
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForNativeWork();
+
+  assert.deepEqual(f.dispatched.map(message => message.id), ['100', '101']);
+  assert.equal(f.state.getMessage('100').state, MESSAGE_STATES.REPLIED);
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
+});
+
 test('thread checkpoint delivers recovered custody without an unrelated wake', async t => {
   const f = fixture(t); f.ready('100');
   f.histories.set(f.child.id, [f.message('101')]);
@@ -1092,5 +1119,7 @@ test('live arrivals respect an existing checkpoint retry timer', { timeout: 3000
     f.gateway.noteLiveIntake(f.message(String(101 + index)));
     if (f.gateway.liveCheckpointPromise) await f.gateway.liveCheckpointPromise;
   }
+  f.gateway.liveIntakeCounts.set(f.child.id, f.gateway.liveCheckpointThreshold);
+  f.gateway.scheduleHeldLiveCheckpoints();
   assert.equal(calls, initialCalls, 'arrivals must not bypass the pending retry delay');
 });

@@ -5,6 +5,7 @@ import type { Readiness } from '../topic';
 import { ORDINARY_RECEIPT_KINDS, type OrdinaryReceiptKind } from '../ordinary/constants';
 
 export interface OrdinaryBindingSqlStatement {
+  all<T extends Record<string, unknown> = Record<string, unknown>>(...parameters: unknown[]): T[];
   get<T extends Record<string, unknown> = Record<string, unknown>>(...parameters: unknown[]): T | undefined;
   run(...parameters: unknown[]): unknown;
 }
@@ -229,6 +230,31 @@ export function hasOrdinaryPreflightReceipt(
       AND json_extract(detail, '$.sessionRoot') IS ?
       AND json_extract(detail, '$.outcome')='verified'
     LIMIT 1`).get(binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation, binding.sessionRoot || null));
+}
+
+function maxDiscordId(current: string | null, candidate: string): string {
+  if (!current) return candidate;
+  if (/^\d+$/.test(current) && /^\d+$/.test(candidate)) {
+    return BigInt(current) < BigInt(candidate) ? candidate : current;
+  }
+  return current;
+}
+
+function advanceEnrolledThreadCutoffs(
+  state: OrdinaryBindingState,
+  parentChannelId: string,
+  intakeCutoff: string,
+  updatedAt: string
+): void {
+  const rows = state.db.prepare(`SELECT thread_id, recovered_through_id
+    FROM thread_enrollments
+    WHERE parent_channel_id=? AND active=1`).all<{ thread_id: string; recovered_through_id: string | null }>(parentChannelId);
+  for (const row of rows) {
+    const next = maxDiscordId(row.recovered_through_id, intakeCutoff);
+    if (next === row.recovered_through_id) continue;
+    state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=?, updated_at=? WHERE thread_id=? AND active=1')
+      .run(next, updatedAt, row.thread_id);
+  }
 }
 
 export function createOrdinaryBindingHandlers(
@@ -458,11 +484,12 @@ export function createOrdinaryBindingHandlers(
           state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
           state.assertLegacyMigrationSafe(channelId);
           if (typeof beforeMutation === 'function') beforeMutation();
+          const updatedAt = now();
           if (intakeCutoff !== null) {
             state.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
+            advanceEnrolledThreadCutoffs(state, channelId, intakeCutoff, updatedAt);
           }
           const generation = existing.generation + 1;
-          const updatedAt = now();
           state.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
             WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
             .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,

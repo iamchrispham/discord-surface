@@ -57,6 +57,7 @@ const binding: OrdinaryBindingRecord = {
 const state: OrdinaryBindingState = {
   db: {
     prepare: () => ({
+      all: <T extends Record<string, unknown> = Record<string, unknown>>(..._parameters: unknown[]) => [] as T[],
       get: <T extends Record<string, unknown> = Record<string, unknown>>(..._parameters: unknown[]) => undefined as T | undefined,
       run: (..._parameters: unknown[]) => undefined
     })
