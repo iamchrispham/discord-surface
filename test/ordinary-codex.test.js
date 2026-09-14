@@ -2730,10 +2730,14 @@ test('live intake checkpoints retain demand after a failed pass', async t => {
   assert.equal(gateway.liveCheckpointPromise, null);
   assert.equal(gateway.liveIntakeCounts.get(binding.channelId), gateway.liveCheckpointThreshold);
 
+  const fetchesBeforeBackoffArrival = historyFetches;
   await send(103);
-  const retryCheckpoint = gateway.liveCheckpointPromise;
-  assert.ok(retryCheckpoint);
-  await retryCheckpoint;
+  assert.equal(gateway.liveCheckpointPromise, null);
+  assert.equal(historyFetches, fetchesBeforeBackoffArrival);
+  assert.equal(gateway.liveIntakeCounts.get(binding.channelId), gateway.liveCheckpointThreshold + 1);
+
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  if (gateway.liveCheckpointPromise) await gateway.liveCheckpointPromise;
 
   assert.equal(historyFetches >= 2, true);
   assert.equal(f.state.getIntakeWatermark(binding.channelId).recovered_through_id, '103');

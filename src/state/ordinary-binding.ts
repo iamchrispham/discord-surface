@@ -472,7 +472,7 @@ export function createOrdinaryBindingHandlers(
           state.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF, {
             channelId, provider: PROVIDERS.CODEX, handoffId,
             fromNativeId, fromGeneration, fromActive: existing.active,
-            nativeId: input.nativeId, generation, workspace: input.workspace, sessionRoot: input.sessionRoot,
+            nativeId: input.nativeId, generation, intakeCutoff, workspace: input.workspace, sessionRoot: input.sessionRoot,
             sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
           });
           state.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {

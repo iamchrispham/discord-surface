@@ -1417,6 +1417,12 @@ class DiscordGateway {
     const count = (this.liveIntakeCounts.get(channelId) || 0) + 1;
     this.liveIntakeCounts.set(channelId, count);
     if (count < this.liveCheckpointThreshold || this.liveCheckpointPromise || this.recoveryPromise) return;
+    if (this.liveCheckpointRetryTimer) {
+      const retryChannels = this.liveCheckpointRetryChannels || new Set();
+      retryChannels.add(channelId);
+      this.liveCheckpointRetryChannels = retryChannels;
+      return;
+    }
     this.liveIntakeCounts.set(channelId, 0);
     this.beginLiveCheckpoint(new Map([[channelId, count]]));
   }

@@ -305,6 +305,31 @@ test('paused child intake preserves source custody without claiming recovery cov
   assert.equal(f.state.acceptDiscordMessage(event('401'), { expectedBinding: parent }).duplicate, true);
 });
 
+test('child handoff fence rejects delayed predecessor events under the successor', t => {
+  const f = fixture(t, { ordinary: true });
+  adoptReady(f, '100');
+  const predecessor = f.state.getBinding('parent');
+  const transcriptFile = path.join(f.dir, 'successor.jsonl');
+  fs.writeFileSync(transcriptFile, '');
+
+  const successor = f.state.handoffOrdinary({
+    channelId: 'parent', provider: PROVIDERS.CODEX, fromNativeId: NATIVE, fromGeneration: predecessor.generation,
+    nativeId: SUCCESSOR, workspace: f.dir, sessionRoot: null, handoffId: 'child-fence-handoff', intakeCutoff: '150',
+    identity: { sessionId: SUCCESSOR, threadId: SUCCESSOR },
+    nativeProof: { file: transcriptFile, sessionId: SUCCESSOR, threadId: SUCCESSOR, workspace: f.dir, sessionRoot: null }
+  });
+  assert.equal(successor.generation, predecessor.generation + 1);
+
+  const delayed = f.state.acceptDiscordMessage(event('120'), { expectedBinding: successor });
+  assert.equal(delayed.accepted, false);
+  assert.equal(delayed.reason, 'before-intake-cutoff');
+  assert.equal(f.state.getMessage('120'), null);
+
+  const current = f.state.acceptDiscordMessage(event('151'), { expectedBinding: successor });
+  assert.equal(current.accepted, true);
+  assert.equal(current.message.generation, successor.generation);
+});
+
 test('accepted child custody blocks parent handoff and unbind during a pause', t => {
   const f = fixture(t, { ordinary: true });
   adoptReady(f, '100');

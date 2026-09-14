@@ -1,5 +1,6 @@
 import type { AgentProvider } from '../agent-message';
 import type { Readiness } from '../topic';
+import { ORDINARY_RECEIPT_KINDS } from '../ordinary/constants';
 
 export const THREAD_STATES = Object.freeze({
   PENDING: 'pending',
@@ -67,6 +68,7 @@ export interface ThreadRoute {
   enrollment: ThreadEnrollment | null;
   deliveryChannelId: string;
   ready: boolean;
+  handoffCutoffId: string | null;
 }
 
 export interface ThreadEnrollmentInput {
@@ -137,6 +139,16 @@ function maxId(compareDiscordIds: ThreadEnrollmentDependencies['compareDiscordId
   return current;
 }
 
+function currentParentHandoffCutoff(state: ThreadEnrollmentState, binding: ThreadBinding): string | null {
+  const row = state.db.prepare(`SELECT json_extract(detail, '$.intakeCutoff') AS intake_cutoff
+    FROM receipts
+    WHERE kind=?
+      AND json_extract(detail, '$.channelId')=?
+      AND CAST(json_extract(detail, '$.generation') AS INTEGER)=?
+    ORDER BY id DESC LIMIT 1`).get(ORDINARY_RECEIPT_KINDS.HANDOFF, binding.channelId, binding.generation);
+  return row?.intake_cutoff == null ? null : String(row.intake_cutoff);
+}
+
 export interface ThreadEnrollmentHandlers {
   getMessageRoute(state: ThreadEnrollmentState, deliveryChannelId: string): ThreadRoute | null;
   enrollThread(state: ThreadEnrollmentState, input: ThreadEnrollmentInput, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
@@ -200,7 +212,8 @@ export function createThreadEnrollmentHandlers({
           binding,
           enrollment,
           deliveryChannelId,
-          ready: routeReady(binding, enrollment)
+          ready: routeReady(binding, enrollment),
+          handoffCutoffId: currentParentHandoffCutoff(state, binding)
         };
       }
       if (!direct) return null;
@@ -208,7 +221,8 @@ export function createThreadEnrollmentHandlers({
         binding: direct,
         enrollment: null,
         deliveryChannelId,
-        ready: routeReady(direct, null)
+        ready: routeReady(direct, null),
+        handoffCutoffId: null
       };
     },
 

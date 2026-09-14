@@ -1816,9 +1816,13 @@ class SurfaceState {
         ready = false;
         coverageId = null;
       }
-      const intakeCutoff = enrollment
+      const parentCutoff = route?.handoffCutoffId || null;
+      let intakeCutoff = enrollment
         ? enrollment.recoveredThroughId
         : this.getIntakeWatermark(authorityChannelId)?.recovered_through_id || null;
+      if (enrollment && parentCutoff && (!intakeCutoff || compareDiscordIds(intakeCutoff, parentCutoff) < 0)) {
+        intakeCutoff = parentCutoff;
+      }
       if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, false, coverageId);
       else this.upsertIntakeWatermark(event, ready, coverageId);
       let agent = null;

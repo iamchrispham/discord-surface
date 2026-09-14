@@ -1007,3 +1007,90 @@ test('checkpoint deadline before recursive fetch retains a bounded recovery wake
   assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
   for (const id of ['101', '102']) assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLIED);
 });
+
+async function pendingScenario(t, secondDeadline) {
+  const f = fixture(t);
+  let checkpointStarts = 0;
+  const checkpointEntries = [];
+  const originalBegin = f.gateway.beginLiveCheckpoint.bind(f.gateway);
+  let capped = null;
+  f.gateway.beginLiveCheckpoint = function(counts = new Map(), ...options) {
+    checkpointStarts++;
+    const entry = { start: checkpointStarts, at: performance.now(), channels: [...counts.keys()] };
+    if (checkpointStarts <= 4 || checkpointStarts === 64) checkpointEntries.push(entry);
+    if (checkpointStarts === 64) {
+      capped = { counts: [...counts], live: [...this.liveIntakeCounts], recovery: Boolean(this.recoveryPromise) };
+      return;
+    }
+    return originalBegin(counts, ...options);
+  };
+  f.gateway.recoveryTimeoutMs = 30;
+  const slowChild = f.makeChannel('1500', ChannelType.PublicThread);
+  if (secondDeadline) {
+    f.channels.set(slowChild.id, slowChild);
+    f.histories.set(slowChild.id, []);
+    f.state.enrollThread({ threadId: slowChild.id, parentChannelId: f.parent.id, guildId: 'guild' }, f.state.getBinding(f.parent.id));
+  }
+  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild' }, f.state.getBinding(f.parent.id));
+  f.state.setThreadBaseline(f.child.id, '100', f.state.getBinding(f.parent.id));
+  f.histories.set(f.child.id, [f.message('101')]);
+  f.gateway.boundMessage(f.message('101'));
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForReceipts();
+  const slowParent = f.makeChannel('3000', ChannelType.GuildText);
+  f.channels.set(slowParent.id, slowParent);
+  f.histories.set(slowParent.id, []);
+  f.state.bind({ channelId: slowParent.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  const fetch = f.client.channels.fetch;
+  let slowParentCalls = 0;
+  let slowChildCalls = 0;
+  f.client.channels.fetch = async id => {
+    if (id === slowParent.id) { slowParentCalls++; await new Promise(resolve => setTimeout(resolve, 60)); }
+    if (secondDeadline && id === slowChild.id && slowChildCalls++ === 0) await new Promise(resolve => setTimeout(resolve, 60));
+    return fetch(id);
+  };
+  await f.gateway.recoverTransport('reconnect');
+  const firstRetry = f.gateway.liveCheckpointPromise;
+  if (firstRetry) await firstRetry;
+  await new Promise(resolve => setTimeout(resolve, 120));
+  await f.gateway.consumer.waitForReceipts();
+  await f.gateway.consumer.waitForNativeWork();
+  const snapshot = {
+    secondDeadline, checkpointStarts, checkpointEntries, capped, slowParentCalls, slowChildCalls, firstRetryStarted: Boolean(firstRetry),
+    parentState: f.state.getBinding(f.parent.id).readiness,
+    childState: f.state.getThreadEnrollment(f.child.id).state,
+    messageState: f.state.getMessage('101').state,
+    dispatched: f.dispatched.map(message => message.id),
+    checkpointActive: Boolean(f.gateway.liveCheckpointPromise),
+    recoveryActive: Boolean(f.gateway.recoveryPromise),
+    heldCount: f.gateway.liveIntakeCounts.get(f.child.id)
+  };
+  assert.equal(capped, null, 'checkpoint recursion exceeded fixed 64-entry observation cap');
+  assert.equal(snapshot.childState, THREAD_STATES.READY);
+  assert.equal(snapshot.messageState, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(snapshot.dispatched, ['101']);
+}
+
+test('untouched pending child resumes after one shared deadline without arrival', { timeout: 3000 }, async t => {
+  await pendingScenario(t, false);
+});
+
+test('healthy pending child is not stranded after an earlier retry consumes the deadline', { timeout: 3000 }, async t => {
+  await pendingScenario(t, true);
+});
+
+test('live arrivals respect an existing checkpoint retry timer', { timeout: 3000 }, async t => {
+  const f = fixture(t);
+  f.ready('100');
+  let calls = 0;
+  f.gateway.checkpointHealthyIntake = async () => { calls++; return new Set(); };
+  f.gateway.beginLiveCheckpoint(new Map([[f.child.id, f.gateway.liveCheckpointThreshold]]));
+  await f.gateway.liveCheckpointPromise;
+  assert.ok(f.gateway.liveCheckpointRetryTimer);
+  const initialCalls = calls;
+  for (let index = 0; index < 5; index++) {
+    f.gateway.noteLiveIntake(f.message(String(101 + index)));
+    if (f.gateway.liveCheckpointPromise) await f.gateway.liveCheckpointPromise;
+  }
+  assert.equal(calls, initialCalls, 'arrivals must not bypass the pending retry delay');
+});

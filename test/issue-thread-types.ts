@@ -79,7 +79,8 @@ const route: ThreadRoute = {
   binding,
   enrollment,
   deliveryChannelId: enrollment.threadId,
-  ready: false
+  ready: false,
+  handoffCutoffId: null
 };
 const stateValue: ThreadState = THREAD_STATES.READY;
 const routeValue = handlers.getMessageRoute(state, binding.channelId);
