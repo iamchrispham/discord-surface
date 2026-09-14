@@ -1910,7 +1910,12 @@ class DiscordGateway {
     }
     for (const enrollment of this.state.listThreadEnrollments()) {
       if (!enrollment.active || (selectedChannels && !selectedChannels.has(enrollment.parentChannelId) && !selectedChannels.has(enrollment.threadId))) continue;
-      await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, false, deadline);
+      const recovered = await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, false, deadline);
+      const currentEnrollment = this.state.getThreadEnrollment(enrollment.threadId);
+      if (!recovered && currentEnrollment?.active && currentEnrollment.state === THREAD_STATES.PENDING) {
+        const currentCount = this.liveIntakeCounts.get(enrollment.threadId) || 0;
+        this.liveIntakeCounts.set(enrollment.threadId, Math.max(currentCount, this.liveCheckpointThreshold));
+      }
     }
     return failure || { ready: true, state: 'ready' };
   }
