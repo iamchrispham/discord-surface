@@ -1554,6 +1554,11 @@ class DiscordGateway {
           if (deferredCount === undefined) this.liveIntakeCounts.set(channelId, currentCount + count);
           else deferredCounts.set(channelId, deferredCount + count);
         }
+        for (const [channelId, count] of this.liveIntakeCounts) {
+          if (count < this.liveCheckpointThreshold || !this.state.getMessageRoute(channelId)?.binding.active) continue;
+          deferredCounts.set(channelId, count);
+          this.liveIntakeCounts.set(channelId, 0);
+        }
         if (this.recoveryPromise) {
           for (const [channelId, count] of deferredCounts) {
             const currentCount = this.liveIntakeCounts.get(channelId) || 0;
