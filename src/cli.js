@@ -119,10 +119,31 @@ function bindingArgs(args) {
   };
 }
 
-function bind(args, rebind = false) {
+async function bind(args, rebind = false) {
   const { state } = openState(args);
-  try { print(rebind ? state.rebind(bindingArgs(args)) : state.bind(bindingArgs(args))); }
-  finally { state.close(); }
+  let client;
+  let handoffFence;
+  try {
+    const input = bindingArgs(args);
+    const hasActiveThreads = rebind && state.listThreadEnrollments(input.channelId).some(enrollment => enrollment.active);
+    let intakeCutoff = null;
+    if (hasActiveThreads) {
+      const config = state.requireConfig();
+      if (config.guildId !== input.guildId) throw new Error('rebind channel is outside the configured guild');
+      const { Client, GatewayIntentBits } = requireInstalled('discord.js');
+      client = new Client({ intents: [GatewayIntentBits.Guilds] });
+      await client.login(readSecret(config.secretFile));
+      const guild = await client.guilds.fetch(input.guildId);
+      const channel = await guild.channels.fetch(input.channelId);
+      handoffFence = await createHandoffFence(channel, 'parent rebind');
+      intakeCutoff = handoffFence.id;
+    }
+    print(rebind ? state.rebind(input, { intakeCutoff }) : state.bind(input));
+  } finally {
+    await deleteHandoffFence(handoffFence);
+    await client?.destroy();
+    state.close();
+  }
 }
 
 function ordinaryBindingArgs(args, environment = process.env, channelId = null, guildId = null, workspace = undefined, sessionRoot = undefined) {
@@ -1192,6 +1213,7 @@ async function handoffInternal(args, dependencies = {}) {
   const handoffId = required(args, 'handoff-id');
   const { state } = openState(args);
   let client;
+  let handoffFence;
   try {
     const config = state.requireConfig();
     const categoryId = categoryFor(provider, args, config);
@@ -1208,9 +1230,14 @@ async function handoffInternal(args, dependencies = {}) {
     if (!current || current.provider !== provider || current.conductorId !== conductorId || current.repoKey !== repoKey || channel.topic !== expectedMarker) {
       throw new Error('handoff channel topic does not match the locally bound conductor address');
     }
-    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
+    const previous = state.findConductorHandoff(handoffId);
+    const hasActiveThreads = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
+    if (!previous && hasActiveThreads) handoffFence = await createHandoffFence(channel, 'conductor handoff');
+    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId,
+      intakeCutoff: handoffFence?.id || null });
     print({ handedOff: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
   } finally {
+    await deleteHandoffFence(handoffFence);
     await client?.destroy();
     state.close();
   }
@@ -1253,6 +1280,7 @@ function localHandoff(args) {
   if (provider === PROVIDERS.CLAUDE && !endpoint) throw new Error('Claude handoff requires --endpoint');
   const reuse = args.reuse === true || args.reuse === 'true';
   const handoffId = reuse ? null : required(args, 'handoff-id');
+  const intakeCutoff = args['intake-cutoff'] || null;
   const { state } = openState(args);
   try {
     const config = state.requireConfig();
@@ -1263,12 +1291,12 @@ function localHandoff(args) {
       print({ handedOff: false, reused: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding: current, readiness: current.readiness });
       return;
     }
-    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
+    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff });
     print({ handedOff: true, reused: false, conductorId, repoKey, channelId, handoffId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
   } finally { state.close(); }
 }
 
-function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace, endpoint }) {
+function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff = null }) {
   const paths = pathsFor(args);
   const helperArgs = [
     path.join(__dirname, 'conductor-lock-gate.py'),
@@ -1280,6 +1308,7 @@ function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace,
   ];
   if (current.endpoint) helperArgs.push('--from-endpoint', current.endpoint);
   if (endpoint) helperArgs.push('--endpoint', endpoint);
+  if (intakeCutoff) helperArgs.push('--intake-cutoff', intakeCutoff);
   if (reuse) helperArgs.push('--reuse');
   const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', helperArgs, {
     encoding: 'utf8', timeout: 35000, env: { ...process.env }
@@ -1305,6 +1334,7 @@ async function handoffFromLockInternal(args) {
   if (args['channel-id'] || args['from-native-id'] || args['from-generation'] || args['handoff-id']) throw new Error('--from-lock derives the existing binding and handoff authority');
   let state = openState(args).state;
   let client;
+  let handoffFence;
   try {
     const config = state.requireConfig();
     const current = state.findConductorBinding(conductorId, provider);
@@ -1318,13 +1348,15 @@ async function handoffFromLockInternal(args) {
     const marker = staticConductorMarker({ provider, conductorId, repoKey });
     if (!channel || channel.id !== current.channelId || channel.parentId !== categoryId || channel.topic !== marker) throw new Error('handoff channel does not match the static conductor address');
     const reuse = current.nativeId === nativeId;
-    await client.destroy();
-    client = null;
+    if (!reuse && state.listThreadEnrollments(current.channelId).some(enrollment => enrollment.active)) {
+      handoffFence = await createHandoffFence(channel, 'conductor handoff');
+    }
     state.close();
     state = null;
-    handoffGate({ ...args, repo }, current, { reuse, sessionFile, workerFile, workspace, endpoint });
+    handoffGate({ ...args, repo }, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff: handoffFence?.id || null });
     return;
   } finally {
+    await deleteHandoffFence(handoffFence);
     await client?.destroy();
     state?.close();
   }

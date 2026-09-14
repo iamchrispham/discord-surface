@@ -1261,6 +1261,9 @@ class SurfaceState {
     const existing = this.getBinding(channelId);
     if (!existing) throw new BindingError('channel is not bound');
     if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
+    if (this._hasActiveThreadEnrollments(channelId) && intakeCutoff === null) {
+      throw new BindingError('active thread enrollments require an observed intake cutoff');
+    }
     const ordinaryIdentity = binding.ordinaryIdentity || null;
     if (ordinaryIdentity) {
       if (binding.conductorId || binding.repoKey) throw new BindingError(`ordinary ${binding.provider} bindings cannot carry conductor identity`);
@@ -1291,6 +1294,9 @@ class SurfaceState {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
+      if (this._hasActiveThreadEnrollments(channelId) && intakeCutoff === null) {
+        throw new BindingError('active thread enrollments require an observed intake cutoff');
+      }
       if (rejectUnresolvedOrdinaryPost && ordinary && this.hasUnresolvedOrdinaryPost(channelId)) {
         throw new UnresolvedWorkError('cannot rebind while an ordinary post is unresolved');
       }
@@ -1298,12 +1304,13 @@ class SurfaceState {
       this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
       if (typeof beforeMutation === 'function') beforeMutation();
       if (intakeCutoff !== null) {
-        this.setIntakeCutoffInTransaction(channelId, input.guildId, intakeCutoff, 'ordinary binding adoption cutoff', current);
+        const updatedAt = now();
+        this.setIntakeCutoffInTransaction(channelId, input.guildId, intakeCutoff, 'parent rebind intake fence', current);
+        ordinaryBindingHandlers.advanceEnrolledThreadCutoffs(this, channelId, intakeCutoff, updatedAt);
       }
-      threadEnrollmentHandlers.deactivateThreadEnrollments(this, channelId, current, THREAD_DEACTIVATION_DETAILS.GENERATION_CHANGED);
       this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, session_root=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
         .run(input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
-      this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
+      this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation, intakeCutoff: intakeCutoff || undefined });
       if (ordinary && !input.conductorId && !input.repoKey) {
         this.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
           channelId, guildId: input.guildId, provider: input.provider, nativeId: input.nativeId,
@@ -1388,6 +1395,10 @@ class SurfaceState {
     return threadEnrollmentHandlers.deactivateThreadEnrollments(this, parentChannelId, expectedBinding);
   }
 
+  _hasActiveThreadEnrollments(parentChannelId) {
+    return Boolean(this.db.prepare('SELECT 1 FROM thread_enrollments WHERE parent_channel_id=? AND active=1 LIMIT 1').get(parentChannelId));
+  }
+
   setThreadBaseline(threadId, latestId, expectedBinding = null) {
     return threadEnrollmentHandlers.setThreadBaseline(this, threadId, latestId, expectedBinding);
   }
@@ -1464,10 +1475,11 @@ class SurfaceState {
     return ordinaryBindingHandlers.handoffOrdinary(this, input);
   }
 
-  handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId }) {
+  handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff = null }) {
     assertUuid(fromNativeId, 'fromNativeId');
     if (!Number.isInteger(fromGeneration) || fromGeneration < 1) throw new BindingError('fromGeneration must be a positive integer');
     assertText(handoffId, 'handoffId', 256);
+    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     const existing = this.getBinding(channelId);
     if (!existing || !existing.active) throw new BindingError('channel is not actively bound');
     const input = this.bindingInput({ channelId, provider, conductorId, repoKey, nativeId, workspace, endpoint }, existing);
@@ -1487,6 +1499,9 @@ class SurfaceState {
     if (existing.provider !== provider || existing.conductorId !== conductorId || existing.repoKey !== repoKey || existing.nativeId !== fromNativeId || existing.generation !== fromGeneration) {
       throw new StaleGenerationError('handoff source identity is stale');
     }
+    if (this._hasActiveThreadEnrollments(channelId) && intakeCutoff === null) {
+      throw new BindingError('active thread enrollments require an observed intake cutoff');
+    }
     if (nativeId === fromNativeId) throw new BindingError('successor handoff requires a different native session UUID');
     if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
     this.assertNativeOwnerFree(provider, nativeId, channelId);
@@ -1494,14 +1509,21 @@ class SurfaceState {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('handoff source identity is stale');
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+      if (this._hasActiveThreadEnrollments(channelId) && intakeCutoff === null) {
+        throw new BindingError('active thread enrollments require an observed intake cutoff');
+      }
       this.assertLegacyMigrationSafe(channelId);
       const generation = existing.generation + 1;
-      threadEnrollmentHandlers.deactivateThreadEnrollments(this, channelId, current, THREAD_DEACTIVATION_DETAILS.GENERATION_CHANGED);
+      const updatedAt = now();
+      if (intakeCutoff !== null) {
+        this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'conductor handoff intake fence', current);
+        ordinaryBindingHandlers.advanceEnrolledThreadCutoffs(this, channelId, intakeCutoff, updatedAt);
+      }
       this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
-        .run(input.nativeId, input.workspace, input.sessionRoot, input.endpoint, READINESS.PENDING, generation, now(), channelId, provider, conductorId, fromGeneration, fromNativeId);
+        .run(input.nativeId, input.workspace, input.sessionRoot, input.endpoint, READINESS.PENDING, generation, updatedAt, channelId, provider, conductorId, fromGeneration, fromNativeId);
       this.receipt(null, 'conductor-handoff', {
         channelId, conductorId, repoKey, provider, handoffId,
-        fromNativeId, fromGeneration, nativeId: input.nativeId, generation
+        fromNativeId, fromGeneration, nativeId: input.nativeId, generation, intakeCutoff: intakeCutoff || undefined
       });
       return this.getBinding(channelId);
     });

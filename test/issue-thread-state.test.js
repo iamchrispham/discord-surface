@@ -132,14 +132,24 @@ test('unbound child stays dark then re-enrolls under the same parent with a fres
   assert.equal(f.state.getMessageRoute('child').ready, false);
 });
 
-test('parent generation changes retire active thread enrollments', t => {
+test('authorized parent generation changes preserve active thread routes behind a cutoff', t => {
   const f = fixture(t);
-  f.enroll();
+  adoptReady(f, '100');
   const predecessor = f.state.getBinding('parent');
-  const successor = f.state.rebind({ ...predecessor, nativeId: SUCCESSOR });
+  const successor = f.state.rebind({ ...predecessor, nativeId: SUCCESSOR }, { intakeCutoff: '150' });
   assert.equal(successor.generation, predecessor.generation + 1);
-  assert.equal(f.state.getThreadEnrollment('child').active, false);
-  assert.equal(f.state.getThreadEnrollment('child').state, THREAD_STATES.UNAVAILABLE);
+  assert.equal(f.state.getThreadEnrollment('child').active, true);
+  assert.equal(f.state.getThreadEnrollment('child').state, THREAD_STATES.READY);
+  assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, '150');
+  assert.equal(f.state.getMessageRoute('child').handoffCutoffId, '150');
+  const delayed = f.state.acceptDiscordMessage(event('120'), { expectedBinding: successor });
+  assert.equal(delayed.accepted, false);
+  assert.equal(delayed.reason, 'before-intake-cutoff');
+  f.state.setBindingReadiness('parent', READINESS.READY, 'successor ready', successor);
+  const current = f.state.acceptDiscordMessage(event('151'), { expectedBinding: successor });
+  assert.equal(current.accepted, true);
+  assert.equal(current.message.generation, successor.generation);
+  assert.equal(current.message.deliveryChannelId, 'child');
 
   const conductorBinding = f.state.bind({
     channelId: 'conductor-parent',
@@ -154,6 +164,8 @@ test('parent generation changes retire active thread enrollments', t => {
     { threadId: 'conductor-child', parentChannelId: conductorBinding.channelId, guildId: 'guild' },
     conductorBinding
   );
+  f.state.setThreadBaseline('conductor-child', '200', conductorBinding);
+  f.state.markThreadBoundary('conductor-child', THREAD_STATES.READY, 'test adoption', null, null, conductorBinding);
   const conductorSuccessor = f.state.handoffConductor({
     channelId: conductorBinding.channelId,
     provider: PROVIDERS.CODEX,
@@ -163,11 +175,22 @@ test('parent generation changes retire active thread enrollments', t => {
     fromGeneration: conductorBinding.generation,
     nativeId: CONDUCTOR_SUCCESSOR,
     workspace: f.dir,
-    handoffId: 'conductor-enrollment-fence'
+    handoffId: 'conductor-enrollment-fence',
+    intakeCutoff: '250'
   });
   assert.equal(conductorSuccessor.generation, conductorBinding.generation + 1);
-  assert.equal(f.state.getThreadEnrollment('conductor-child').active, false);
-  assert.equal(f.state.getThreadEnrollment('conductor-child').state, THREAD_STATES.UNAVAILABLE);
+  assert.equal(f.state.getThreadEnrollment('conductor-child').active, true);
+  assert.equal(f.state.getThreadEnrollment('conductor-child').state, THREAD_STATES.READY);
+  assert.equal(f.state.getThreadEnrollment('conductor-child').recoveredThroughId, '250');
+  assert.equal(f.state.getMessageRoute('conductor-child').handoffCutoffId, '250');
+  const delayedConductor = f.state.acceptDiscordMessage(event('220', 'conductor-child'), { expectedBinding: conductorSuccessor });
+  assert.equal(delayedConductor.accepted, false);
+  assert.equal(delayedConductor.reason, 'before-intake-cutoff');
+  f.state.setBindingReadiness(conductorBinding.channelId, READINESS.READY, 'successor ready', conductorSuccessor);
+  const currentConductor = f.state.acceptDiscordMessage(event('251', 'conductor-child'), { expectedBinding: conductorSuccessor });
+  assert.equal(currentConductor.accepted, true);
+  assert.equal(currentConductor.message.generation, conductorSuccessor.generation);
+  assert.equal(currentConductor.message.deliveryChannelId, 'conductor-child');
 });
 
 test('child intake records parent authority and child delivery while preserving custody', t => {

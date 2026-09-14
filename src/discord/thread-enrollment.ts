@@ -175,7 +175,11 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
         after = message.id;
         total += 1;
       }
-      if (total >= gateway.historyMaxMessages) break;
+      if (total >= gateway.historyMaxMessages) {
+        const consumedPage = after === fresh[fresh.length - 1].id;
+        if (page.length < gateway.historyPageLimit && consumedPage) complete = true;
+        break;
+      }
       if (fresh.length < page.length && page.length === gateway.historyPageLimit) throw new Error('Thread history overlapped cursor without complete coverage');
       if (page.length < gateway.historyPageLimit) { complete = true; break; }
     }

@@ -176,6 +176,12 @@ export interface OrdinaryHandoffResult extends OrdinaryBindingRecord {
 }
 
 export interface OrdinaryBindingHandlers {
+  advanceEnrolledThreadCutoffs(
+    state: OrdinaryBindingState,
+    parentChannelId: string,
+    intakeCutoff: string,
+    updatedAt: string
+  ): void;
   bindOrdinary(
     state: OrdinaryBindingState,
     binding: OrdinaryBindingHandlerInput,
@@ -272,6 +278,10 @@ export function createOrdinaryBindingHandlers(
   }: OrdinaryBindingDependencies
 ): OrdinaryBindingHandlers {
   const handlers: OrdinaryBindingHandlers = {
+    advanceEnrolledThreadCutoffs(state, parentChannelId, intakeCutoff, updatedAt) {
+      advanceEnrolledThreadCutoffs(state, parentChannelId, intakeCutoff, updatedAt);
+    },
+
     bindOrdinary(state, binding, identity, adoptionCutoff = null, options = {}) {
       if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
       if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {

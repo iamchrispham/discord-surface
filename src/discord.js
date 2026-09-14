@@ -1689,7 +1689,11 @@ class DiscordGateway {
             total += 1;
           }
           if (!complete && total < this.historyMaxMessages && fresh.some(message => !this.state.hasIntakeEvidence(message.id))) break;
-          if (total >= this.historyMaxMessages) break;
+          if (total >= this.historyMaxMessages) {
+            const consumedPage = after === fresh[fresh.length - 1].id;
+            if (page.length < this.historyPageLimit && consumedPage) complete = true;
+            break;
+          }
           if (page.length < this.historyPageLimit) { complete = true; break; }
         }
         if (!complete || !after) continue;

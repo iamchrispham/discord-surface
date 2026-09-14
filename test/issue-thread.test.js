@@ -599,7 +599,7 @@ test('child transport receipt preserves a definite not-sent lookup outcome', asy
   assert.equal(f.state.getTransportReceipt('100').outcome.outcome, 'not_sent');
 });
 
-test('late child delivery failure cannot resurrect a retired enrollment', async t => {
+test('late child delivery failure cannot finish under a successor generation', async t => {
   const f = fixture(t); f.ready();
   f.gateway.boundMessage(f.message('100'));
   await Promise.all([...f.gateway.inFlight]);
@@ -624,14 +624,14 @@ test('late child delivery failure cannot resurrect a retired enrollment', async 
     await fetchStarted;
 
     const original = f.state.getBinding(f.parent.id);
-    const successor = f.state.rebind({ ...original, nativeId: SUCCESSOR, readiness: READINESS.READY });
+    const successor = f.state.rebind({ ...original, nativeId: SUCCESSOR, readiness: READINESS.READY }, { intakeCutoff: '100' });
     assert.equal(successor.generation, original.generation + 1);
-    assert.equal(f.state.getThreadEnrollment(f.child.id).active, false);
-    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
+    assert.equal(f.state.getThreadEnrollment(f.child.id).active, true);
+    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
 
     rejectFetch(new Error('late child lookup failed'));
     await assert.rejects(receipt, /late child lookup failed/);
-    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
+    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
   } finally {
     f.client.channels.fetch = originalFetch;
   }
@@ -827,7 +827,7 @@ test('recovery preserves owner order when another owner is interleaved', async t
   for (const id of ['101', '102', '900']) assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLIED);
 });
 
-test('parent handoff waits for child custody then new child work inherits successor', async t => {
+test('parent handoff waits for child custody then preserves successor child route', async t => {
   const f = fixture(t); f.ready('100');
   await f.gateway.consumer.intakeMessage(f.message('101'), true);
   const successor = { channelId: f.parent.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir };
@@ -837,10 +837,9 @@ test('parent handoff waits for child custody then new child work inherits succes
   await f.gateway._reconcilePending(null, signal, true);
   await f.gateway.consumer.waitForNativeWork();
   assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
-  const rebound = f.state.rebind(successor);
-  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild' }, rebound);
-  f.state.setThreadBaseline(f.child.id, '101', rebound);
-  f.state.markThreadBoundary(f.child.id, THREAD_STATES.READY, 'successor ready', null, null, rebound);
+  const rebound = f.state.rebind(successor, { intakeCutoff: '101' });
+  assert.equal(f.state.getThreadEnrollment(f.child.id).active, true);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
   f.state.setBindingReadiness(f.parent.id, READINESS.READY, 'successor ready');
   f.gateway.boundMessage(f.message('102'));
   await Promise.all([...f.gateway.inFlight]);
@@ -1037,6 +1036,69 @@ test('checkpoint deadline before recursive fetch retains a bounded recovery wake
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
   assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
   for (const id of ['101', '102']) assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLIED);
+});
+
+test('bounded child checkpoint retains a retry for an unseen tail', { timeout: 5000 }, async t => {
+  const f = fixture(t); f.ready('100');
+  f.gateway.historyPageLimit = 2;
+  f.gateway.historyMaxMessages = 1;
+  f.gateway.liveCheckpointThreshold = 1;
+  f.gateway.liveCheckpointRetryDelayMs = 10;
+  f.histories.set(f.child.id, [f.message('101'), f.message('102')]);
+  const binding = f.state.getBinding(f.parent.id);
+  for (const id of ['101']) {
+    const accepted = f.state.acceptDiscordMessage({
+      id, guildId: 'guild', channelId: f.child.id, authorId: 'operator', isBot: false,
+      content: 'checkpointed child work', attachments: []
+    }, { ready: true, expectedBinding: binding });
+    assert.equal(accepted.accepted, true);
+  }
+  f.state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=? WHERE thread_id=?').run('100', f.child.id);
+  assert.equal(f.state.hasIntakeEvidence('101'), true);
+  assert.equal(f.state.getMessage('102'), null);
+  assert.equal(f.state.hasIntakeEvidence('102'), false);
+
+  f.gateway.beginLiveCheckpoint(new Map([[f.child.id, 1]]));
+  await f.gateway.liveCheckpointPromise;
+  assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '101');
+  assert.ok(f.gateway.liveCheckpointRetryTimer);
+
+  for (let attempt = 0; attempt < 100 && f.state.getMessage('102')?.state !== MESSAGE_STATES.REPLIED; attempt += 1) {
+    if (f.gateway.liveCheckpointPromise) await f.gateway.liveCheckpointPromise;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '102');
+  assert.equal(f.state.getMessage('102').state, MESSAGE_STATES.REPLIED);
+  assert.ok(f.dispatched.some(message => message.id === '102'));
+  assert.ok(f.sends.some(send => send.channelId === f.child.id));
+});
+
+test('bounded child checkpoint does not complete a short page before its tail', { timeout: 5000 }, async t => {
+  const f = fixture(t); f.ready('100');
+  f.gateway.historyPageLimit = 3;
+  f.gateway.historyMaxMessages = 1;
+  f.gateway.liveCheckpointThreshold = 1;
+  f.gateway.liveCheckpointRetryDelayMs = 10;
+  f.histories.set(f.child.id, [f.message('101'), f.message('102')]);
+  const binding = f.state.getBinding(f.parent.id);
+  const accepted = f.state.acceptDiscordMessage({
+    id: '101', guildId: 'guild', channelId: f.child.id, authorId: 'operator', isBot: false,
+    content: 'checkpointed child work', attachments: []
+  }, { ready: true, expectedBinding: binding });
+  assert.equal(accepted.accepted, true);
+  f.state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=? WHERE thread_id=?').run('100', f.child.id);
+  assert.equal(f.state.hasIntakeEvidence('101'), true);
+  assert.equal(f.state.getMessage('102'), null);
+  assert.equal(f.state.hasIntakeEvidence('102'), false);
+
+  f.gateway.beginLiveCheckpoint(new Map([[f.child.id, 1]]));
+  await f.gateway.liveCheckpointPromise;
+  assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '101');
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+  assert.equal(f.state.getMessage('102'), null);
+  assert.equal(f.state.hasIntakeEvidence('102'), false);
+  assert.ok(f.gateway.liveCheckpointRetryTimer);
 });
 
 async function pendingScenario(t, secondDeadline) {
