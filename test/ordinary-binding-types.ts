@@ -57,6 +57,7 @@ const binding: OrdinaryBindingRecord = {
 const state: OrdinaryBindingState = {
   db: {
     prepare: () => ({
+      all: <T extends Record<string, unknown> = Record<string, unknown>>(..._parameters: unknown[]) => [] as T[],
       get: <T extends Record<string, unknown> = Record<string, unknown>>(..._parameters: unknown[]) => undefined as T | undefined,
       run: (..._parameters: unknown[]) => undefined
     })
@@ -71,6 +72,7 @@ const state: OrdinaryBindingState = {
   transaction: operation => operation(),
   hasUnresolved: () => false,
   hasUnresolvedOrdinaryPost: () => false,
+  listThreadEnrollments: () => [],
   bindingInput: value => value,
   assertLegacyMigrationSafe: () => undefined,
   receipt: () => undefined,
@@ -89,6 +91,7 @@ const handlers = createOrdinaryBindingHandlers({
   READINESS: readinessValues,
   assertText: value => String(value),
   assertUuid: value => String(value),
+  compareDiscordIds: (left, right) => left.localeCompare(right),
   bindingMatchesExpected: () => true,
   now: () => '2026-09-13T00:00:00.000Z'
 });

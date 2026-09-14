@@ -3,8 +3,10 @@ import type { MessageState } from '../acknowledgment';
 import type { AgentProvider } from '../agent-message';
 import type { Readiness } from '../topic';
 import { ORDINARY_RECEIPT_KINDS, type OrdinaryReceiptKind } from '../ordinary/constants';
+import type { ThreadEnrollment, ThreadEnrollmentCoverageProof } from './thread-enrollment';
 
 export interface OrdinaryBindingSqlStatement {
+  all<T extends Record<string, unknown> = Record<string, unknown>>(...parameters: unknown[]): T[];
   get<T extends Record<string, unknown> = Record<string, unknown>>(...parameters: unknown[]): T | undefined;
   run(...parameters: unknown[]): unknown;
 }
@@ -103,6 +105,7 @@ export interface OrdinaryRebindOptions {
   resetIntake?: boolean;
   sessionRootOverride?: string | null;
   intakeCutoff?: string | null;
+  enrollmentProof?: ThreadEnrollmentCoverageProof | null;
   beforeMutation?: (() => void) | undefined;
 }
 
@@ -120,6 +123,8 @@ export interface OrdinaryBindingState {
   transaction<T>(operation: () => T): T;
   hasUnresolved(channelId: string): boolean;
   hasUnresolvedOrdinaryPost(channelId: string): boolean;
+  listThreadEnrollments(parentChannelId?: string | null): ThreadEnrollment[];
+  assertThreadEnrollmentCoverage?(parentChannelId: string, proof: ThreadEnrollmentCoverageProof): void;
   bindingInput(binding: OrdinaryBindingInput, existing?: OrdinaryBindingRecord | null): OrdinaryBindingInput;
   assertLegacyMigrationSafe(channelId: string): void;
   receipt(discordId: string | null, kind: OrdinaryReceiptKind, detail: Record<string, unknown>): void;
@@ -148,6 +153,7 @@ export interface OrdinaryBindingDependencies {
   UnresolvedWorkError: OrdinaryErrorConstructor;
   assertText(value: unknown, name: string, max?: number): string;
   assertUuid(value: unknown, name?: string): string;
+  compareDiscordIds(left: string, right: string): number;
   bindingMatchesExpected(
     binding: OrdinaryBindingRecord | null,
     expectedBinding: OrdinaryBindingRecord | null
@@ -167,6 +173,7 @@ export interface OrdinaryHandoffInput {
   identity: OrdinaryBindingIdentity;
   nativeProof: OrdinaryNativeProof;
   intakeCutoff?: string | null;
+  enrollmentProof?: ThreadEnrollmentCoverageProof | null;
   beforeMutation?: () => void;
 }
 
@@ -175,6 +182,12 @@ export interface OrdinaryHandoffResult extends OrdinaryBindingRecord {
 }
 
 export interface OrdinaryBindingHandlers {
+  advanceEnrolledThreadCutoffs(
+    state: OrdinaryBindingState,
+    parentChannelId: string,
+    intakeCutoff: string,
+    updatedAt: string
+  ): void;
   bindOrdinary(
     state: OrdinaryBindingState,
     binding: OrdinaryBindingHandlerInput,
@@ -231,6 +244,33 @@ export function hasOrdinaryPreflightReceipt(
     LIMIT 1`).get(binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation, binding.sessionRoot || null));
 }
 
+function maxDiscordId(
+  compareDiscordIds: OrdinaryBindingDependencies['compareDiscordIds'],
+  current: string | null,
+  candidate: string
+): string {
+  if (!current) return candidate;
+  return compareDiscordIds(current, candidate) < 0 ? candidate : current;
+}
+
+function advanceEnrolledThreadCutoffs(
+  compareDiscordIds: OrdinaryBindingDependencies['compareDiscordIds'],
+  state: OrdinaryBindingState,
+  parentChannelId: string,
+  intakeCutoff: string,
+  updatedAt: string
+): void {
+  const rows = state.db.prepare(`SELECT thread_id, recovered_through_id
+    FROM thread_enrollments
+    WHERE parent_channel_id=? AND active=1`).all<{ thread_id: string; recovered_through_id: string | null }>(parentChannelId);
+  for (const row of rows) {
+    const next = maxDiscordId(compareDiscordIds, row.recovered_through_id, intakeCutoff);
+    if (next === row.recovered_through_id) continue;
+    state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=?, updated_at=? WHERE thread_id=? AND active=1')
+      .run(next, updatedAt, row.thread_id);
+  }
+}
+
 export function createOrdinaryBindingHandlers(
   {
     BindingError,
@@ -241,11 +281,16 @@ export function createOrdinaryBindingHandlers(
     UnresolvedWorkError,
     assertText,
     assertUuid,
+    compareDiscordIds,
     bindingMatchesExpected,
     now
   }: OrdinaryBindingDependencies
 ): OrdinaryBindingHandlers {
   const handlers: OrdinaryBindingHandlers = {
+    advanceEnrolledThreadCutoffs(state, parentChannelId, intakeCutoff, updatedAt) {
+      advanceEnrolledThreadCutoffs(compareDiscordIds, state, parentChannelId, intakeCutoff, updatedAt);
+    },
+
     bindOrdinary(state, binding, identity, adoptionCutoff = null, options = {}) {
       if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
       if (!identity || typeof identity.sessionId !== 'string' || typeof identity.threadId !== 'string' || identity.sessionId !== identity.threadId) {
@@ -380,7 +425,7 @@ export function createOrdinaryBindingHandlers(
       });
     },
 
-    handoffOrdinary(state, { channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, beforeMutation = undefined }) {
+    handoffOrdinary(state, { channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, enrollmentProof = null, beforeMutation = undefined }) {
       if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
       if (provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff requires the Codex provider');
       assertUuid(fromNativeId, 'fromNativeId');
@@ -441,6 +486,10 @@ export function createOrdinaryBindingHandlers(
         throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       }
       state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+      const hasActiveEnrollments = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
+      if (hasActiveEnrollments && intakeCutoff === null) {
+        throw new BindingError('active thread enrollments require an observed intake cutoff');
+      }
       try {
         const handoffResult = state.transaction(() => {
           const current = state.getBinding(channelId);
@@ -456,13 +505,24 @@ export function createOrdinaryBindingHandlers(
             throw new UnresolvedWorkError('cannot handoff while work is unresolved');
           }
           state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+          const hasCurrentActiveEnrollments = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
+          if (hasCurrentActiveEnrollments && intakeCutoff === null) {
+            throw new BindingError('active thread enrollments require an observed intake cutoff');
+          }
           state.assertLegacyMigrationSafe(channelId);
           if (typeof beforeMutation === 'function') beforeMutation();
+          const updatedAt = now();
           if (intakeCutoff !== null) {
+            if (enrollmentProof) {
+              if (typeof state.assertThreadEnrollmentCoverage !== 'function') {
+                throw new BindingError('handoff enrollment proof cannot be validated');
+              }
+              state.assertThreadEnrollmentCoverage(channelId, enrollmentProof);
+            }
             state.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
+            advanceEnrolledThreadCutoffs(compareDiscordIds, state, channelId, intakeCutoff, updatedAt);
           }
           const generation = existing.generation + 1;
-          const updatedAt = now();
           state.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?
             WHERE channel_id=? AND provider=? AND generation=? AND native_id=? AND active=?`)
             .run(input.nativeId, input.workspace, input.sessionRoot, READINESS.PENDING, generation, updatedAt, channelId,
@@ -472,7 +532,7 @@ export function createOrdinaryBindingHandlers(
           state.receipt(null, ORDINARY_RECEIPT_KINDS.HANDOFF, {
             channelId, provider: PROVIDERS.CODEX, handoffId,
             fromNativeId, fromGeneration, fromActive: existing.active,
-            nativeId: input.nativeId, generation, workspace: input.workspace, sessionRoot: input.sessionRoot,
+            nativeId: input.nativeId, generation, intakeCutoff, workspace: input.workspace, sessionRoot: input.sessionRoot,
             sessionId: identity.sessionId, threadId: identity.threadId, transcriptFile: nativeProof.file
           });
           state.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {

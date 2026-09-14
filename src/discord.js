@@ -2,14 +2,18 @@ const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const fs = require('node:fs');
 const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
-const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, TRANSPORT_RECEIPT_OUTCOMES, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
+const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
+const { THREAD_STATES } = require('./state/thread-enrollment');
 const { parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 
 const requireInstalled = require;
 const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
 const DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS = 5000;
+const LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS = 1000;
+const LIVE_CHECKPOINT_RETRY_MAX_DELAY_MS = 30_000;
 const PENDING_HANDOFF_RECOVERY_POLL_MS = 100;
 const INTERACTION_CALLBACK_TIMEOUT_MS = 2500;
 const INTERACTION_REJECTION_MESSAGES = Object.freeze({
@@ -72,6 +76,22 @@ function compareDiscordIds(left, right) {
   } catch {
     return String(left).localeCompare(String(right));
   }
+}
+
+function isDiscordId(value) {
+  return typeof value === 'string' && /^\d+$/.test(value);
+}
+
+function sameNativeOwner(left, right) {
+  return left.provider === right.provider && left.nativeId === right.nativeId;
+}
+
+function compareRecoveryCandidates(left, right) {
+  if (sameNativeOwner(left, right) && isDiscordId(left.id) && isDiscordId(right.id)) {
+    const byDiscordId = compareDiscordIds(left.id, right.id);
+    if (byDiscordId !== 0) return byDiscordId;
+  }
+  return left.createdAt.localeCompare(right.createdAt);
 }
 
 function discordIdAfter(left, right) {
@@ -141,6 +161,8 @@ function classifyReplyError(error) {
 }
 
 function classifyTransportReceiptError(error) {
+  if (error?.outcome === 'not_sent') return 'not_sent';
+  if (error?.outcome !== 'sent' && TRANSPORT_RECEIPT_OUTCOMES.includes(error?.outcome)) return error.outcome;
   if (error?.status === 429 || error?.code === 429 || /^RateLimitError(?:\[|$)/.test(String(error?.name || '')) || /^RateLimitError(?:\[|$)/.test(String(error?.message || ''))) return 'rate_limited';
   if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
   return 'unknown';
@@ -358,6 +380,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return state.currentMessageBinding(message).current;
   }
 
+  function ownerMessageIsTerminal(message) {
+    return Boolean(message && [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state));
+  }
+
   function ownerCanAdvance(messageId) {
     const message = state.getMessage(messageId);
     return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state) ||
@@ -367,6 +393,9 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function ownerBindingReady(messageId) {
     const message = state.getMessage(messageId);
     if (!message) return true;
+    if (ownerMessageIsTerminal(message)) return true;
+    const route = state.getMessageRoute(message.deliveryChannelId || message.channelId);
+    if (route) return route.ready;
     const binding = state.getBinding(message.channelId);
     return !binding || !binding.active || binding.readiness === READINESS.READY;
   }
@@ -374,7 +403,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function releaseReadyOwnerBlock(message) {
     const ownerKey = nativeOwnerKey(message);
     const queue = ownerQueues.get(ownerKey);
-    if (!queue?.blockedMessageId || !ownerBindingReady(message.id)) return;
+    if (!queue?.blockedMessageId || !ownerBindingReady(queue.blockedMessageId)) return;
     const blocked = state.getMessage(queue.blockedMessageId);
     if (!blocked || ![MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(blocked.state)) return;
     if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
@@ -398,6 +427,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   function compareOwnerEntries(left, right) {
+    const discordOrder = compareRecoveryCandidates(left.queueMessage, right.queueMessage);
+    if (discordOrder) return discordOrder;
     const createdAtOrder = left.queueMessage.createdAt.localeCompare(right.queueMessage.createdAt);
     if (createdAtOrder) return createdAtOrder;
     const leftAdmissionOrder = Number.isInteger(left.admissionOrder) ? left.admissionOrder : Number.MAX_SAFE_INTEGER;
@@ -409,7 +440,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const messages = state.listMessages();
     const currentIndex = messages.findIndex(candidate => candidate.id === message.id);
     if (currentIndex < 0) return null;
-    return messages.slice(0, currentIndex).find(candidate => nativeOwnerKey(candidate) === nativeOwnerKey(message) &&
+    return messages.find((candidate, candidateIndex) => sameNativeOwner(candidate, message) &&
+      (isDiscordId(candidate.id) && isDiscordId(message.id)
+        ? compareDiscordIds(candidate.id, message.id) < 0
+        : candidateIndex < currentIndex) &&
       [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLYING].includes(candidate.state) &&
       !(candidate.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(candidate))) || null;
   }
@@ -422,6 +456,13 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function finishOwner(entry) {
     const queue = ownerQueues.get(entry.ownerKey);
     if (!queue || queue.active !== entry) return;
+    if (ownerMessageIsTerminal(state.getMessage(entry.message.id))) {
+      queue.blockedMessageId = null;
+      queue.blockedReason = null;
+      queue.active = null;
+      pumpOwner(entry.ownerKey);
+      return;
+    }
     if (entry.dispatchBlocked) {
       queue.blockedMessageId = entry.message.id;
       queue.blockedReason = 'not_submitted';
@@ -454,7 +495,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       finishOwner(active);
       return queue.active !== active;
     }
-    if (queue.blockedMessageId !== messageId) return false;
+    if (queue.blockedMessageId !== messageId || !ownerBindingReady(queue.blockedMessageId)) return false;
     queue.blockedMessageId = null;
     queue.blockedReason = null;
     pumpOwner(nativeOwnerKey(message));
@@ -525,7 +566,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const queue = ownerQueueFor(ownerKey);
     const queueMessage = state.getMessage(message.id) || message;
     const dispatchBlocked = queue.blockedReason === 'not_submitted';
-    if (queue.blockedMessageId && ownerCanAdvance(queue.blockedMessageId) &&
+    if (queue.blockedMessageId && ownerBindingReady(queue.blockedMessageId) && ownerCanAdvance(queue.blockedMessageId) &&
       (!dispatchBlocked || queue.blockedMessageId === message.id)) {
       if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
       queue.blockedMessageId = null;
@@ -554,7 +595,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       dispatchBlocked: false,
       onAbort: null
     };
-    if (!queue.active && queue.blockedMessageId === message.id) {
+    if (!queue.active && queue.blockedMessageId === message.id && ownerBindingReady(queue.blockedMessageId)) {
       queue.blockedMessageId = null;
       queue.active = entry;
       startOwnerEntry(entry);
@@ -814,6 +855,9 @@ class DiscordGateway {
     this.liveCheckpointController = null;
     this.liveCheckpointPromise = null;
     this.liveIntakeCounts = new Map();
+    this.liveCheckpointRetryTimer = null;
+    this.liveCheckpointRetryChannels = null;
+    this.liveCheckpointRetryDelayMs = LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS;
     this.reconnectPromise = null;
     this.deferredHandoffRecoveryTimer = null;
     this.pendingHandoffRecoveryPollTimer = null;
@@ -875,23 +919,33 @@ class DiscordGateway {
     this.boundMessage = message => {
       if (this.stopping) return;
       let handoffRecovery = null;
-      if (typeof message?.channelId === 'string') {
-        handoffRecovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(message.channelId);
+      let route = this.state.getMessageRoute(message?.channelId);
+      const authorityId = route?.binding.channelId || message?.channelId;
+      if (typeof authorityId === 'string') {
+        handoffRecovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(authorityId);
       }
-      const binding = this.state.getBinding(message?.channelId);
-      if (handoffRecovery?.deferred) this.scheduleDeferredHandoffRecovery(message.channelId);
+      route = this.state.getMessageRoute(message?.channelId);
+      const binding = route?.binding;
+      if (route?.enrollment) {
+        try { assertPublicThread(message.channel, binding, route.deliveryChannelId, this.client.user); }
+        catch (error) {
+          this.state.markThreadBoundary(route.deliveryChannelId, THREAD_STATES.UNAVAILABLE, error.message, null, null, binding);
+          return;
+        }
+      }
+      if (handoffRecovery?.deferred) this.scheduleDeferredHandoffRecovery(authorityId);
       else if (!handoffRecovery && binding?.active && binding.readiness === READINESS.PENDING &&
         this.state.isOrdinaryBinding?.(binding)) {
-        this.scheduleDeferredHandoffRecovery(message.channelId, { pendingGeneration: true });
+        this.scheduleDeferredHandoffRecovery(authorityId, { pendingGeneration: true });
       }
-      const bindingReady = binding?.readiness === READINESS.READY;
+      const bindingReady = binding?.readiness === READINESS.READY && (!route?.enrollment || route.enrollment.state === THREAD_STATES.READY);
       const readyLive = this.ready && bindingReady;
       const heldReady = !this.ready && bindingReady;
       const controller = new AbortController();
       this.controllers.add(controller);
       const work = (readyLive
         ? this.consumer.handleMessage(message, controller.signal, binding, () => this.noteLiveIntake(message))
-        : this.consumer.intakeMessage(message, bindingReady, null, null, true).then(intake => {
+        : this.consumer.intakeMessage(message, bindingReady, null, binding, true).then(intake => {
           if (heldReady && !intake?.stale) this.noteLiveIntake(message);
           return intake;
         }))
@@ -1041,11 +1095,44 @@ class DiscordGateway {
     return new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
   }
 
+  markThreadDeliveryUnavailable(message, error) {
+    const stored = this.state.getMessage(message.id);
+    if (!stored?.deliveryChannelId || stored.deliveryChannelId === stored.channelId) return;
+    const binding = this.state.getBinding(stored.channelId);
+    if (!bindingIdentityMatches(stored, binding)) return;
+    this.state.markThreadBoundary(stored.deliveryChannelId, THREAD_STATES.UNAVAILABLE,
+      error.message, null, null, binding);
+  }
+
+  async threadDeliveryMessage(message) {
+    const stored = this.state.getMessage(message.id);
+    if (!stored?.deliveryChannelId || stored.deliveryChannelId === stored.channelId) return message;
+    const binding = this.state.getBinding(stored.channelId);
+    const route = this.state.getMessageRoute(stored.deliveryChannelId);
+    if (!route) throw Object.assign(new Error('Thread delivery has no active parent route'), { outcome: 'not_sent' });
+    let channel;
+    try {
+      channel = message.channel?.id === stored.deliveryChannelId ? message.channel :
+        await this.client.channels.fetch(stored.deliveryChannelId);
+      assertPublicThread(channel, binding, stored.deliveryChannelId, this.client.user);
+    }
+    catch (error) {
+      const deliveryError = error instanceof Error ? error : new Error(String(error));
+      this.markThreadDeliveryUnavailable(stored, deliveryError);
+      deliveryError.outcome = 'not_sent';
+      throw deliveryError;
+    }
+    return { ...message, channelId: stored.deliveryChannelId, channel };
+  }
+
   async sendReply(message, reply) {
+    const stored = this.state.getMessage(message.id);
+    const isThreadDelivery = Boolean(stored?.deliveryChannelId && stored.deliveryChannelId !== stored.channelId);
+    message = await this.threadDeliveryMessage(message);
     this.state.assertMessageCurrent(reply.id, 'reply-send');
     if (typeof reply.replyText !== 'string' || reply.replyText.length > 2000) throw new Error('Discord reply must be at most 2000 characters per message');
     if (typeof reply.replyNonce !== 'string' || reply.replyNonce.length > 25) throw new Error('Discord reply nonce must be at most 25 characters');
-    const channel = message.channel || await this.client.channels?.fetch?.(message.channelId);
+    const channel = message.channel || await this.client.channels?.fetch?.(message.deliveryChannelId || message.channelId);
     if (!channel?.send) throw new Error('Discord reply channel is unavailable');
     this.state.assertMessageCurrent(reply.id, 'reply-send');
     try {
@@ -1056,6 +1143,12 @@ class DiscordGateway {
         allowedMentions: { parse: [] }
       });
     } catch (error) {
+      const definitiveThreadRejection = isThreadDelivery &&
+        ([403, 404].includes(Number(error?.status)) || error?.code === 50013);
+      if (definitiveThreadRejection) {
+        const deliveryError = error instanceof Error ? error : new Error(String(error));
+        this.markThreadDeliveryUnavailable(message, deliveryError);
+      }
       if (!error.outcome) error.outcome = classifyReplyError(error);
       throw error;
     }
@@ -1078,7 +1171,7 @@ class DiscordGateway {
     }
     let source = message;
     if (!source.channel && !(this.discordToken && this.client?.rest)) {
-      const channel = await this.client.channels?.fetch?.(message.channelId);
+      const channel = await this.client.channels?.fetch?.(message.deliveryChannelId || message.channelId);
       if (!channel) throw new Error('Discord acknowledgment channel is unavailable');
       source = { ...message, channel };
     }
@@ -1100,6 +1193,11 @@ class DiscordGateway {
     try {
       let sendPromise;
       try {
+        const stored = this.state.getMessage(message.id);
+        if (stored?.deliveryChannelId && stored.deliveryChannelId !== stored.channelId) {
+          message = await waitForRecoveryOperation(() => this.threadDeliveryMessage(message), controller.signal, Date.now() + this.recoveryTimeoutMs);
+          this.state.assertMessageCurrent(message.id, 'transport-receipt-send');
+        }
         // discord.js channel.send drops the signal and uses the shared REST retry queue.
         if (this.discordToken && this.client?.rest && typeof globalThis.fetch === 'function') {
           if (receipt.reaction) {
@@ -1307,26 +1405,7 @@ class DiscordGateway {
   }
 
   historyPermission(channel, { requireSend = false } = {}) {
-    if (!this.client.user || typeof channel?.permissionsFor !== 'function') return { known: false, allowed: false };
-    try {
-      const { PermissionFlagsBits } = requireInstalled('discord.js');
-      const permissions = channel.permissionsFor(this.client.user);
-      if (!permissions || typeof permissions.has !== 'function') return { known: false, allowed: false };
-      const historyAllowed = permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory);
-      const replyPermission = typeof channel.isThread === 'function' && channel.isThread()
-        ? PermissionFlagsBits.SendMessagesInThreads
-        : PermissionFlagsBits.SendMessages;
-      const threadStateBlocksSend = typeof channel.isThread === 'function' && channel.isThread() &&
-        channel.locked === true && !permissions.has(PermissionFlagsBits.ManageThreads) &&
-        !permissions.has(PermissionFlagsBits.Administrator);
-      const sendAllowed = !requireSend || (replyPermission !== undefined && permissions.has(replyPermission) && !threadStateBlocksSend);
-      return {
-        known: true,
-        allowed: historyAllowed && sendAllowed
-      };
-    } catch {
-      return { known: false, allowed: false };
-    }
+    return historyPermission(channel, this.client.user, requireSend);
   }
 
   async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null) {
@@ -1346,10 +1425,16 @@ class DiscordGateway {
 
   noteLiveIntake(message) {
     const channelId = typeof message?.channelId === 'string' ? message.channelId : null;
-    if (!channelId || this.stopping || !this.state.getBinding(channelId)?.active) return;
+    if (!channelId || this.stopping || !this.state.getMessageRoute(channelId)?.binding.active) return;
     const count = (this.liveIntakeCounts.get(channelId) || 0) + 1;
     this.liveIntakeCounts.set(channelId, count);
     if (count < this.liveCheckpointThreshold || this.liveCheckpointPromise || this.recoveryPromise) return;
+    if (this.liveCheckpointRetryTimer) {
+      const retryChannels = this.liveCheckpointRetryChannels || new Set();
+      retryChannels.add(channelId);
+      this.liveCheckpointRetryChannels = retryChannels;
+      return;
+    }
     this.liveIntakeCounts.set(channelId, 0);
     this.beginLiveCheckpoint(new Map([[channelId, count]]));
   }
@@ -1357,8 +1442,14 @@ class DiscordGateway {
   scheduleHeldLiveCheckpoints() {
     if (this.stopping || this.recoveryPromise || this.liveCheckpointPromise) return;
     const heldChannels = [...this.liveIntakeCounts.entries()]
-      .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getBinding(channelId)?.active);
+      .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getMessageRoute(channelId)?.binding.active);
     if (!heldChannels.length) return;
+    if (this.liveCheckpointRetryTimer) {
+      const retryChannels = this.liveCheckpointRetryChannels || new Set();
+      for (const [channelId] of heldChannels) retryChannels.add(channelId);
+      this.liveCheckpointRetryChannels = retryChannels;
+      return;
+    }
     const triggeredCounts = new Map(heldChannels);
     for (const [channelId] of heldChannels) this.liveIntakeCounts.set(channelId, 0);
     this.beginLiveCheckpoint(triggeredCounts);
@@ -1457,15 +1548,21 @@ class DiscordGateway {
     this.pendingHandoffRecoveryPollTimer = timer;
   }
 
-  beginLiveCheckpoint(triggeredCounts = new Map()) {
+  beginLiveCheckpoint(triggeredCounts = new Map(), { allowPendingRecovery = true } = {}) {
     if (this.liveCheckpointPromise || this.stopping || this.recoveryPromise) return;
     const controller = new AbortController();
     const epoch = this.lifecycleEpoch;
     this.liveCheckpointController = controller;
     let advancedChannels = new Set();
     const checkpoint = this.checkpointHealthyIntake(controller.signal, epoch, triggeredCounts)
-      .then(result => {
+      .then(async result => {
         advancedChannels = result instanceof Set ? result : new Set();
+        const threads = [...advancedChannels].filter(channelId => this.state.getThreadEnrollment(channelId)?.active);
+        if (threads.length) {
+          if (!controller.signal.aborted && this.isCurrentLifecycle(epoch)) {
+            await this.reconcilePending(undefined, { readyOnly: true, channelIds: threads });
+          }
+        }
         return result;
       })
       .catch(error => {
@@ -1476,15 +1573,20 @@ class DiscordGateway {
         if (this.liveCheckpointController === controller) this.liveCheckpointController = null;
         if (this.stopping) return;
         const deferredChannels = [...this.liveIntakeCounts.entries()]
-          .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getBinding(channelId)?.active);
+          .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getMessageRoute(channelId)?.binding.active);
         const deferredCounts = new Map(deferredChannels);
         for (const [channelId] of deferredChannels) this.liveIntakeCounts.set(channelId, 0);
         for (const [channelId, count] of triggeredCounts) {
-          if (advancedChannels.has(channelId) || !this.state.getBinding(channelId)?.active) continue;
+          if (advancedChannels.has(channelId) || !this.state.getMessageRoute(channelId)?.binding.active) continue;
           const currentCount = this.liveIntakeCounts.get(channelId) || 0;
           const deferredCount = deferredCounts.get(channelId);
           if (deferredCount === undefined) this.liveIntakeCounts.set(channelId, currentCount + count);
           else deferredCounts.set(channelId, deferredCount + count);
+        }
+        for (const [channelId, count] of this.liveIntakeCounts) {
+          if (count < this.liveCheckpointThreshold || !this.state.getMessageRoute(channelId)?.binding.active) continue;
+          deferredCounts.set(channelId, count);
+          this.liveIntakeCounts.set(channelId, 0);
         }
         if (this.recoveryPromise) {
           for (const [channelId, count] of deferredCounts) {
@@ -1493,9 +1595,53 @@ class DiscordGateway {
           }
           return;
         }
-        if (deferredCounts.size) this.beginLiveCheckpoint(deferredCounts);
+        if (!deferredCounts.size) {
+          this.liveCheckpointRetryDelayMs = LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS;
+          return;
+        }
+        const immediateCounts = new Map();
+        for (const [channelId, count] of deferredCounts) {
+          const pendingRecovery = allowPendingRecovery && this.state.getThreadEnrollment(channelId)?.state === THREAD_STATES.PENDING;
+          if (!advancedChannels.has(channelId) && !pendingRecovery) continue;
+          immediateCounts.set(channelId, count);
+          deferredCounts.delete(channelId);
+        }
+        if (deferredCounts.size) this.scheduleLiveCheckpointRetry(deferredCounts);
+        else this.liveCheckpointRetryDelayMs = LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS;
+        if (immediateCounts.size) this.beginLiveCheckpoint(immediateCounts, { allowPendingRecovery: false });
       });
     this.liveCheckpointPromise = checkpoint;
+  }
+
+  scheduleLiveCheckpointRetry(deferredCounts) {
+    if (!deferredCounts?.size || this.stopping) return;
+    const retryChannels = this.liveCheckpointRetryChannels || new Set();
+    for (const [channelId, count] of deferredCounts) {
+      const currentCount = this.liveIntakeCounts.get(channelId) || 0;
+      this.liveIntakeCounts.set(channelId, Math.max(currentCount, count));
+      retryChannels.add(channelId);
+    }
+    this.liveCheckpointRetryChannels = retryChannels;
+    if (this.liveCheckpointRetryTimer) return;
+    const retryDelay = Math.min(this.liveCheckpointRetryDelayMs || LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS, LIVE_CHECKPOINT_RETRY_MAX_DELAY_MS);
+    this.liveCheckpointRetryDelayMs = Math.min(retryDelay * 2, LIVE_CHECKPOINT_RETRY_MAX_DELAY_MS);
+    const timer = setTimeout(() => {
+      if (this.liveCheckpointRetryTimer === timer) this.liveCheckpointRetryTimer = null;
+      const channels = this.liveCheckpointRetryChannels || new Set();
+      this.liveCheckpointRetryChannels = null;
+      if (this.stopping || this.recoveryPromise || this.liveCheckpointPromise) return;
+      const retryCounts = new Map();
+      for (const channelId of channels) {
+        if (!this.state.getMessageRoute(channelId)?.binding.active) continue;
+        const count = this.liveIntakeCounts.get(channelId) || 0;
+        if (count < this.liveCheckpointThreshold) continue;
+        retryCounts.set(channelId, count);
+        this.liveIntakeCounts.set(channelId, 0);
+      }
+      if (retryCounts.size) this.beginLiveCheckpoint(retryCounts, { allowPendingRecovery: false });
+    }, retryDelay);
+    timer.unref?.();
+    this.liveCheckpointRetryTimer = timer;
   }
 
   async checkpointHealthyIntake(signal, lifecycleEpoch, triggeredCounts = new Map()) {
@@ -1543,7 +1689,11 @@ class DiscordGateway {
             total += 1;
           }
           if (!complete && total < this.historyMaxMessages && fresh.some(message => !this.state.hasIntakeEvidence(message.id))) break;
-          if (total >= this.historyMaxMessages) break;
+          if (total >= this.historyMaxMessages) {
+            const consumedPage = after === fresh[fresh.length - 1].id;
+            if (page.length < this.historyPageLimit && consumedPage) complete = true;
+            break;
+          }
           if (page.length < this.historyPageLimit) { complete = true; break; }
         }
         if (!complete || !after) continue;
@@ -1553,6 +1703,18 @@ class DiscordGateway {
         }
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) throw error;
+      }
+    }
+    for (const enrollment of this.state.listThreadEnrollments()) {
+      if (!enrollment.active || ![THREAD_STATES.READY, THREAD_STATES.PENDING].includes(enrollment.state) ||
+          (triggeredChannels.size && !triggeredChannels.has(enrollment.threadId))) continue;
+      const checkpointOnly = enrollment.state === THREAD_STATES.READY;
+      const recovered = await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, checkpointOnly, deadline);
+      if (recovered) {
+        advancedChannels.add(enrollment.threadId);
+      } else if (checkpointOnly && this.state.getThreadEnrollment(enrollment.threadId)?.state === THREAD_STATES.PENDING) {
+        const currentCount = this.liveIntakeCounts.get(enrollment.threadId) || 0;
+        this.liveIntakeCounts.set(enrollment.threadId, Math.max(currentCount, this.liveCheckpointThreshold));
       }
     }
     return advancedChannels;
@@ -1828,6 +1990,15 @@ class DiscordGateway {
         failure ||= { ready: false, state: 'gap' };
       }
     }
+    for (const enrollment of this.state.listThreadEnrollments()) {
+      if (!enrollment.active || (selectedChannels && !selectedChannels.has(enrollment.parentChannelId) && !selectedChannels.has(enrollment.threadId))) continue;
+      const recovered = await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, false, deadline);
+      const currentEnrollment = this.state.getThreadEnrollment(enrollment.threadId);
+      if (!recovered && currentEnrollment?.active && currentEnrollment.state === THREAD_STATES.PENDING) {
+        const currentCount = this.liveIntakeCounts.get(enrollment.threadId) || 0;
+        this.liveIntakeCounts.set(enrollment.threadId, Math.max(currentCount, this.liveCheckpointThreshold));
+      }
+    }
     return failure || { ready: true, state: 'ready' };
   }
 
@@ -1852,15 +2023,22 @@ class DiscordGateway {
     }
   }
 
-  async reconcilePending(before = new Date().toISOString(), { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
+  async reconcilePending(before = undefined, { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
+    const lifecycleEpoch = this.lifecycleEpoch;
+    const connectionEpoch = this.connectionEpoch;
+    while (this.recoveryPromise) {
+      await this.recoveryPromise.catch(() => {});
+      if (!this.isCurrentLifecycle(lifecycleEpoch) || connectionEpoch !== this.connectionEpoch) return [];
+    }
+    if (!this.isCurrentLifecycle(lifecycleEpoch)) return [];
+    const cutoff = before === undefined ? new Date().toISOString() : before;
     const hasReadyBinding = this.state.listBindings().some(binding => {
       return binding.active && binding.readiness === READINESS.READY;
     });
     if (!this.ready && !allowPaused && !hasReadyBinding) throw new Error('Discord gateway is not ready for recovery');
-    if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
-    this.recoveryPromise = this._reconcilePending(before, controller.signal, readyOnly || allowPaused, channelIds);
+    this.recoveryPromise = this._reconcilePending(cutoff, controller.signal, readyOnly || allowPaused, channelIds);
     try { return await this.recoveryPromise; }
     finally {
       this.recoveryPromise = null;
@@ -1872,8 +2050,8 @@ class DiscordGateway {
   async _reconcilePending(before, signal, readyOnly = false, channelIds = null) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const selectedChannels = channelIds ? new Set(channelIds) : null;
-    const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId)) &&
-      (!readyOnly || this.state.getBinding(message.channelId)?.readiness === READINESS.READY);
+    const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
+      (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready);
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const blockedOwners = new Set();
@@ -1882,27 +2060,38 @@ class DiscordGateway {
       const key = `${message.provider}:${message.nativeId}`;
       if (blockedOwners.has(key)) continue;
       let channel;
-      try { channel = await waitForRecoveryOperation(() => this.client.channels.fetch(message.channelId), signal, deadline); } catch (error) {
+      try { channel = await waitForRecoveryOperation(() => this.client.channels.fetch(message.deliveryChannelId || message.channelId), signal, deadline); } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
+        this.markThreadDeliveryUnavailable(message, error);
         this.state.markObservationUnavailable(message.id, error);
         continue;
       }
       if (!channel) {
         blockedOwners.add(key);
-        this.state.markObservationUnavailable(message.id, new Error('Discord channel is unavailable during recovery'));
+        const error = new Error('Discord channel is unavailable during recovery');
+        this.markThreadDeliveryUnavailable(message, error);
+        this.state.markObservationUnavailable(message.id, error);
         continue;
+      }
+      if (message.deliveryChannelId && message.deliveryChannelId !== message.channelId) {
+        try { assertPublicThread(channel, this.state.getBinding(message.channelId), message.deliveryChannelId, this.client.user); }
+        catch (error) {
+          this.markThreadDeliveryUnavailable(message, error);
+          blockedOwners.add(key);
+          continue;
+        }
       }
       const storedMessage = {
         ...message,
         id: message.id,
         guildId: message.guildId,
-        channelId: message.channelId,
+        channelId: message.deliveryChannelId || message.channelId,
         content: message.content,
         author: { id: message.authorId, bot: false },
         channel
       };
-      if (this.state.getBinding(message.channelId)?.readiness !== READINESS.READY) {
+      if (!this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready) {
         blockedOwners.add(key);
         continue;
       }
@@ -1960,6 +2149,10 @@ class DiscordGateway {
       const reconnect = this.reconnectPromise;
       const liveCheckpoint = this.liveCheckpointPromise;
       await Promise.allSettled([recovery, reconnect, liveCheckpoint].filter(Boolean));
+      if (this.liveCheckpointRetryTimer) clearTimeout(this.liveCheckpointRetryTimer);
+      this.liveCheckpointRetryTimer = null;
+      this.liveCheckpointRetryChannels = null;
+      this.liveCheckpointRetryDelayMs = LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS;
       this.liveIntakeCounts.clear();
       for (const controller of this.controllers) controller.abort();
       for (const controller of this.receiptControllers) controller.abort();
@@ -2001,4 +2194,5 @@ module.exports = {
   readSecret,
   requireInstalled,
   sendDiscordMessage,
+  waitForRecoveryOperation,
 };
