@@ -192,12 +192,10 @@ export function createThreadEnrollmentHandlers({
     getMessageRoute(state, deliveryChannelId) {
       assertText(deliveryChannelId, 'deliveryChannelId', 128);
       const direct = state.getBinding(deliveryChannelId);
-      const enrollmentRow = state.db.prepare('SELECT * FROM thread_enrollments WHERE thread_id=?').get(deliveryChannelId);
-      const enrollment = rowEnrollment(enrollmentRow);
-      if (enrollmentRow) {
-        if (!enrollment?.active) return null;
+      const enrollment = rowEnrollment(state.db.prepare('SELECT * FROM thread_enrollments WHERE thread_id=?').get(deliveryChannelId));
+      if (enrollment?.active) {
         const binding = enrollment ? state.getBinding(enrollment.parentChannelId) : null;
-        if (!binding || binding.guildId !== enrollment?.guildId) return null;
+        if (!binding || !binding.active || binding.guildId !== enrollment.guildId) return null;
         return {
           binding,
           enrollment,

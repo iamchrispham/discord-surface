@@ -152,6 +152,34 @@ test('child intake records parent authority and child delivery while preserving 
   assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, '101');
 });
 
+test('pending child transport receipts expose paused route readiness', t => {
+  const f = fixture(t);
+  f.enroll();
+  const accepted = f.state.acceptDiscordMessage(event('111'), {
+    expectedBinding: f.state.getBinding('parent')
+  });
+  assert.equal(accepted.accepted, true);
+  const attempt = f.state.beginTransportReceipt('111');
+  assert.equal(attempt.attempt.readiness, READINESS.PENDING);
+});
+
+test('inactive enrollment tombstones do not shadow direct bindings', t => {
+  const f = fixture(t);
+  f.enroll();
+  f.state.unbind('parent', { expectedBinding: f.state.getBinding('parent') });
+  f.state.bind({
+    channelId: 'child',
+    guildId: 'guild',
+    provider: PROVIDERS.CODEX,
+    nativeId: SUCCESSOR,
+    workspace: f.dir
+  });
+  const route = f.state.getMessageRoute('child');
+  assert.equal(route.enrollment, null);
+  assert.equal(route.binding.channelId, 'child');
+  assert.equal(route.ready, true);
+});
+
 test('pending and failed child routes never demote or substitute the parent', t => {
   const f = fixture(t);
   f.enroll();

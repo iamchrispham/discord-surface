@@ -182,8 +182,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
     const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
     if (!currentEnrollment?.active) return false;
     const liveCustodyAhead = Boolean(currentEnrollment.lastSeenId &&
-      (!after || compareIds(currentEnrollment.lastSeenId, after) > 0) &&
-      (!startingLastSeenId || compareIds(currentEnrollment.lastSeenId, startingLastSeenId) > 0));
+      (!after || compareIds(currentEnrollment.lastSeenId, after) > 0));
     if (liveCustodyAhead) {
       gateway.state.markThreadBoundary(
         enrollment.threadId,

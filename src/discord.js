@@ -2,7 +2,7 @@ const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const fs = require('node:fs');
 const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
-const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, TRANSPORT_RECEIPT_OUTCOMES, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
@@ -76,6 +76,22 @@ function compareDiscordIds(left, right) {
   }
 }
 
+function isDiscordId(value) {
+  return typeof value === 'string' && /^\d+$/.test(value);
+}
+
+function sameNativeOwner(left, right) {
+  return left.provider === right.provider && left.nativeId === right.nativeId;
+}
+
+function compareRecoveryCandidates(left, right) {
+  if (sameNativeOwner(left, right) && isDiscordId(left.id) && isDiscordId(right.id)) {
+    const byDiscordId = compareDiscordIds(left.id, right.id);
+    if (byDiscordId !== 0) return byDiscordId;
+  }
+  return left.createdAt.localeCompare(right.createdAt);
+}
+
 function discordIdAfter(left, right) {
   if (!left || !right) return false;
   return compareDiscordIds(left, right) > 0;
@@ -143,6 +159,7 @@ function classifyReplyError(error) {
 }
 
 function classifyTransportReceiptError(error) {
+  if (error?.outcome !== 'sent' && TRANSPORT_RECEIPT_OUTCOMES.includes(error?.outcome)) return error.outcome;
   if (error?.status === 429 || error?.code === 429 || /^RateLimitError(?:\[|$)/.test(String(error?.name || '')) || /^RateLimitError(?:\[|$)/.test(String(error?.message || ''))) return 'rate_limited';
   if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
   return 'unknown';
@@ -400,6 +417,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   function compareOwnerEntries(left, right) {
+    const discordOrder = compareRecoveryCandidates(left.queueMessage, right.queueMessage);
+    if (discordOrder) return discordOrder;
     const createdAtOrder = left.queueMessage.createdAt.localeCompare(right.queueMessage.createdAt);
     if (createdAtOrder) return createdAtOrder;
     const leftAdmissionOrder = Number.isInteger(left.admissionOrder) ? left.admissionOrder : Number.MAX_SAFE_INTEGER;
@@ -411,7 +430,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const messages = state.listMessages();
     const currentIndex = messages.findIndex(candidate => candidate.id === message.id);
     if (currentIndex < 0) return null;
-    return messages.slice(0, currentIndex).find(candidate => nativeOwnerKey(candidate) === nativeOwnerKey(message) &&
+    return messages.find((candidate, candidateIndex) => sameNativeOwner(candidate, message) &&
+      (isDiscordId(candidate.id) && isDiscordId(message.id)
+        ? compareDiscordIds(candidate.id, message.id) < 0
+        : candidateIndex < currentIndex) &&
       [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLYING].includes(candidate.state) &&
       !(candidate.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(candidate))) || null;
   }

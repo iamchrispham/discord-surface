@@ -56,7 +56,7 @@ function fixture(t) {
     state.markThreadBoundary(child.id, THREAD_STATES.READY, 'fixture adoption', null, null, state.getBinding(parent.id));
     gateway.ready = true;
   }
-  return { dir, state, parent, child, channels, client, gateway, histories, sends, reactions, dispatched, fetched, message, ready };
+  return { dir, state, parent, child, channels, client, gateway, histories, sends, reactions, dispatched, fetched, message, ready, makeChannel };
 }
 
 test('public enrollment command keeps parent owner and pending child until Gateway recovery', async t => {
@@ -254,6 +254,30 @@ test('closing recovery refuses READY when live child custody overtakes its final
   assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
 });
 
+test('thread recovery keeps pre-existing custody ahead fenced until history catches up', async t => {
+  const f = fixture(t); f.ready('100');
+  const accepted = f.state.acceptDiscordMessage({
+    id: '102', guildId: 'guild', channelId: f.child.id, authorId: 'operator', isBot: false,
+    content: 'thread question', attachments: []
+  }, {
+    ready: false,
+    expectedBinding: f.state.getBinding(f.parent.id)
+  });
+  assert.equal(accepted.accepted, true);
+  f.gateway.fetchHistory = async () => [];
+  const result = await recoverThread(
+    f.gateway,
+    f.state.getThreadEnrollment(f.child.id),
+    new AbortController().signal,
+    f.gateway.lifecycleEpoch,
+    waitForRecoveryOperation
+  );
+  const enrollment = f.state.getThreadEnrollment(f.child.id);
+  assert.equal(result, false);
+  assert.equal(enrollment.state, THREAD_STATES.GAP);
+  assert.equal(enrollment.gapTo, '102');
+});
+
 test('checkpoint-only recovery reports no advancement when history has no new messages', async t => {
   const f = fixture(t);
   f.ready('100');
@@ -403,6 +427,23 @@ test('persisted child receipt uses child REST destination even when authority fi
   }
 });
 
+test('child transport receipt preserves a definite not-sent lookup outcome', async t => {
+  const f = fixture(t); f.ready();
+  f.gateway.sendTransportReceipt = async () => {
+    throw Object.assign(new Error('child lookup failed'), { outcome: 'not_sent' });
+  };
+  const intake = await f.gateway.consumer.intakeMessage(
+    f.message('100'),
+    true,
+    null,
+    f.state.getBinding(f.parent.id),
+    true
+  );
+  assert.equal(intake.accepted, true);
+  await f.gateway.consumer.waitForReceipts();
+  assert.equal(f.state.getTransportReceipt('100').outcome.outcome, 'not_sent');
+});
+
 test('unbound Gateway traffic does not throw or dispatch native work', async t => {
   const f = fixture(t); f.gateway.ready = true;
   const unbound = { ...f.parent, id: '3000' };
@@ -457,6 +498,7 @@ test('missing or invalid history reader cannot falsely prove an empty ready thre
 test('reopened custody dispatches once and reconciles the stored child destination', async t => {
   const f = fixture(t); f.ready('100');
   await f.gateway.consumer.intakeMessage(f.message('101'), true);
+  f.histories.set(f.child.id, [f.message('101')]);
   await f.gateway.consumer.waitForReceipts();
   await f.gateway.stop();
   const reopened = new SurfaceState(f.state.dbPath);
@@ -486,6 +528,51 @@ test('reopened custody dispatches once and reconciles the stored child destinati
     await restarted.stop();
     reopened.close();
   }
+});
+
+test('recovery admits same-owner parent and child history in Discord order', async t => {
+  const f = fixture(t); f.ready('100');
+  const binding = f.state.getBinding(f.parent.id);
+  f.state.setBindingReadiness(f.parent.id, READINESS.READY, 'fixture ready', binding);
+  const parentMessage = f.state.acceptDiscordMessage({
+    id: '102', guildId: 'guild', channelId: f.parent.id, authorId: 'operator', isBot: false,
+    content: 'parent question', attachments: []
+  }, {
+    ready: true,
+    expectedBinding: binding
+  });
+  const childMessage = f.state.acceptDiscordMessage({
+    id: '101', guildId: 'guild', channelId: f.child.id, authorId: 'operator', isBot: false,
+    content: 'child question', attachments: []
+  }, {
+    ready: true,
+    expectedBinding: binding
+  });
+  assert.equal(parentMessage.accepted, true);
+  assert.equal(childMessage.accepted, true);
+  await f.gateway._reconcilePending(null, new AbortController().signal, true);
+  await f.gateway.consumer.waitForNativeWork();
+  assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
+});
+
+test('recovery preserves owner order when another owner is interleaved', async t => {
+  const f = fixture(t); f.ready('100');
+  const other = f.makeChannel('3000', ChannelType.GuildText);
+  f.channels.set(other.id, other);
+  f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  for (const [id, channel] of [['102', f.parent], ['900', other], ['101', f.child]]) {
+    const binding = f.state.getMessageRoute(channel.id).binding;
+    const accepted = f.state.acceptDiscordMessage({
+      id, guildId: 'guild', channelId: channel.id, authorId: 'operator', isBot: false,
+      content: 'ordered recovery question', attachments: []
+    }, { ready: true, expectedBinding: binding });
+    assert.equal(accepted.accepted, true);
+  }
+  await f.gateway._reconcilePending(null, new AbortController().signal, true);
+  await f.gateway.consumer.waitForNativeWork();
+  assert.deepEqual(f.dispatched.filter(message => message.nativeId === NATIVE).map(message => message.id), ['101', '102']);
+  assert.deepEqual(f.dispatched.filter(message => message.nativeId === SUCCESSOR).map(message => message.id), ['900']);
+  for (const id of ['101', '102', '900']) assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLIED);
 });
 
 test('parent handoff waits for child custody then new child work inherits successor', async t => {

@@ -1331,7 +1331,10 @@ class SurfaceState {
       const current = this.getBinding(channelId);
       const expected = expectedBinding === undefined ? binding : expectedBinding;
       if (!bindingMatchesExpected(current, expected)) throw new StaleGenerationError('unbind source identity is stale');
-      if (!current.active) return true;
+      if (!current.active) {
+        threadEnrollmentHandlers.deactivateThreadEnrollments(this, channelId, current);
+        return true;
+      }
       if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
         throw new UnresolvedWorkError('cannot unbind while work is unresolved');
       }
@@ -1740,7 +1743,7 @@ class SurfaceState {
 
   reconcileIntake(channelId, expectedBinding = null) {
     const childEnrollment = typeof channelId === 'string' && channelId.length > 0 && channelId.length <= 128
-      ? this.db.prepare('SELECT 1 FROM thread_enrollments WHERE thread_id=?').get(channelId)
+      ? this.db.prepare('SELECT 1 FROM thread_enrollments WHERE thread_id=? AND active=1').get(channelId)
       : null;
     if (childEnrollment) {
       return threadEnrollmentHandlers.reconcileThread(this, channelId, expectedBinding);
@@ -1966,7 +1969,9 @@ class SurfaceState {
         conductorId: check.binding.conductorId,
         repoKey: check.binding.repoKey,
         generation: check.binding.generation,
-        readiness: check.binding.readiness,
+        readiness: check.binding.readiness === READINESS.READY
+          ? (check.enrollment?.state || READINESS.READY)
+          : check.binding.readiness,
         status: 'attempted'
       };
       if (check.enrollment) detail.deliveryChannelId = check.deliveryChannelId;
