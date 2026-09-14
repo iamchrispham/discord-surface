@@ -387,6 +387,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function ownerBindingReady(messageId) {
     const message = state.getMessage(messageId);
     if (!message) return true;
+    const route = state.getMessageRoute(message.deliveryChannelId || message.channelId);
+    if (route) return route.ready;
     const binding = state.getBinding(message.channelId);
     return !binding || !binding.active || binding.readiness === READINESS.READY;
   }
@@ -1929,7 +1931,7 @@ class DiscordGateway {
     }
   }
 
-  async reconcilePending(before = new Date().toISOString(), { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
+  async reconcilePending(before = undefined, { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
     const lifecycleEpoch = this.lifecycleEpoch;
     const connectionEpoch = this.connectionEpoch;
     while (this.recoveryPromise) {
@@ -1937,13 +1939,14 @@ class DiscordGateway {
       if (!this.isCurrentLifecycle(lifecycleEpoch) || connectionEpoch !== this.connectionEpoch) return [];
     }
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return [];
+    const cutoff = before === undefined ? new Date().toISOString() : before;
     const hasReadyBinding = this.state.listBindings().some(binding => {
       return binding.active && binding.readiness === READINESS.READY;
     });
     if (!this.ready && !allowPaused && !hasReadyBinding) throw new Error('Discord gateway is not ready for recovery');
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
-    this.recoveryPromise = this._reconcilePending(before, controller.signal, readyOnly || allowPaused, channelIds);
+    this.recoveryPromise = this._reconcilePending(cutoff, controller.signal, readyOnly || allowPaused, channelIds);
     try { return await this.recoveryPromise; }
     finally {
       this.recoveryPromise = null;
