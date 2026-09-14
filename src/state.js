@@ -1801,15 +1801,20 @@ class SurfaceState {
       const enrollment = route?.enrollment || null;
       const authorityChannelId = binding?.channelId || event.channelId;
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
-      if (this.ordinaryHandoffPauses.has(authorityChannelId) || this.getIntakeWatermark(authorityChannelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
-        if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, false);
-        else this.upsertIntakeWatermark(event, false, null);
+      const handoffPaused = this.ordinaryHandoffPauses.has(authorityChannelId) ||
+        this.getIntakeWatermark(authorityChannelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF;
+      if (handoffPaused && !enrollment) {
+        this.upsertIntakeWatermark(event, false, null);
         this.receipt(null, 'intake-rejected', {
           discordId: event.id, channelId: authorityChannelId,
           ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
           reason: 'handoff-intake-paused', ready
         });
         return this.reject('handoff-intake-paused');
+      }
+      if (handoffPaused) {
+        ready = false;
+        coverageId = null;
       }
       const intakeCutoff = enrollment
         ? enrollment.recoveredThroughId

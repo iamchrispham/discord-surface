@@ -11,18 +11,21 @@ const { THREAD_INTAKE_REASONS, THREAD_RECEIPT_KINDS, THREAD_STATES } = require('
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const SUCCESSOR = 'f8296579-092b-4503-bf98-1f3c2b6d4913';
 
-function fixture(t) {
+function fixture(t, { ordinary = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-thread-state-'));
   const db = path.join(dir, 'surface.sqlite');
   let state = new SurfaceState(db);
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused.secret') });
-  const binding = state.bind({
+  const input = {
     channelId: 'parent',
     guildId: 'guild',
     provider: PROVIDERS.CODEX,
     nativeId: NATIVE,
     workspace: dir
-  });
+  };
+  const binding = ordinary
+    ? state.bindOrdinary(input, { sessionId: NATIVE, threadId: NATIVE })
+    : state.bind(input);
   t.after(() => {
     try { state.close(); } catch {}
     fs.rmSync(dir, { recursive: true, force: true });
@@ -272,31 +275,54 @@ test('child route readiness fences dispatch claims without demoting the parent',
   assert.equal(f.state.getMessage('301').state, MESSAGE_STATES.DISPATCHING);
 });
 
-test('paused child intake does not checkpoint rejected coverage before replay', t => {
+test('paused child intake preserves source custody without claiming recovery coverage', t => {
   const f = fixture(t);
   adoptReady(f, '100');
   const parent = f.state.getBinding('parent');
   f.state.pauseOrdinaryHandoffIntake('parent', parent);
-
-  const validPaused = f.state.acceptDiscordMessage(event('401'), {
-    coverageId: '401',
-    expectedBinding: parent
-  });
-  assert.equal(validPaused.accepted, false);
-  assert.equal(validPaused.reason, 'handoff-intake-paused');
+  const held = f.state.acceptDiscordMessage(event('401'), { coverageId: '401', expectedBinding: parent });
+  assert.equal(held.accepted, true);
+  assert.equal(held.message.nativeId, NATIVE);
+  assert.equal(held.message.generation, parent.generation);
+  assert.equal(held.message.channelId, 'parent');
+  assert.equal(held.message.deliveryChannelId, 'child');
   assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, '100');
-
-  const invalidPaused = f.state.acceptDiscordMessage(event('402', 'child', { content: '' }), {
-    coverageId: '402',
-    expectedBinding: parent
-  });
-  assert.equal(invalidPaused.accepted, false);
-  assert.equal(invalidPaused.reason, 'invalid-event');
+  assert.equal(f.state.claimDispatch('401').claimed, false);
+  for (const [id, overrides, reason] of [
+    ['402', { content: '' }, 'invalid-event'],
+    ['403', { authorId: 'other' }, 'unauthorized-sender'],
+    ['404', { isBot: true }, 'bot-source']
+  ]) {
+    const rejected = f.state.acceptDiscordMessage(event(id, 'child', overrides), { expectedBinding: parent });
+    assert.equal(rejected.accepted, false);
+    assert.equal(rejected.reason, reason);
+    assert.equal(f.state.getMessage(id), null);
+  }
   assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, '100');
-
   f.state.restoreOrdinaryHandoffIntake('parent', parent);
-  const replay = f.state.acceptDiscordMessage(event('401'), { expectedBinding: parent });
-  assert.equal(replay.accepted, true);
+  assert.equal(f.state.claimDispatch('401').claimed, true);
+  assert.equal(f.state.claimDispatch('401').claimed, false);
+  assert.equal(f.state.acceptDiscordMessage(event('401'), { expectedBinding: parent }).duplicate, true);
+});
+
+test('accepted child custody blocks parent handoff and unbind during a pause', t => {
+  const f = fixture(t, { ordinary: true });
+  adoptReady(f, '100');
+  const parent = f.state.getBinding('parent');
+  f.state.pauseOrdinaryHandoffIntake('parent', parent);
+  assert.equal(f.state.acceptDiscordMessage(event('401'), { expectedBinding: parent }).accepted, true);
+  const file = path.join(f.dir, 'successor.jsonl');
+  fs.writeFileSync(file, '');
+  assert.throws(() => f.state.handoffOrdinary({
+    channelId: 'parent', provider: PROVIDERS.CODEX, fromNativeId: NATIVE, fromGeneration: parent.generation,
+    nativeId: SUCCESSOR, workspace: f.dir, sessionRoot: null, handoffId: 'child-pause-handoff',
+    identity: { sessionId: SUCCESSOR, threadId: SUCCESSOR },
+    nativeProof: { file, sessionId: SUCCESSOR, threadId: SUCCESSOR, workspace: f.dir, sessionRoot: null }
+  }), /unresolved/);
+  assert.throws(() => f.state.unbind('parent', { expectedBinding: parent }), /unresolved/);
+  assert.equal(f.state.getBinding('parent').generation, parent.generation);
+  assert.equal(f.state.getThreadEnrollment('child').active, true);
+  assert.equal(f.state.getMessage('401').state, MESSAGE_STATES.ACCEPTED);
 });
 
 test('schema 1.6 rows migrate additively to 1.7 on reopen', t => {

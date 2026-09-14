@@ -219,6 +219,25 @@ test('child recovery attempts share one deadline across sequential children', as
   assert.equal(f.state.getThreadEnrollment(second.id).recoveredThroughId, '100');
 });
 
+test('thread recovery keeps an untouched child pending after deadline exhaustion', async t => {
+  const f = fixture(t); f.ready('100');
+  const result = await recoverThread(
+    f.gateway,
+    f.state.getThreadEnrollment(f.child.id),
+    new AbortController().signal,
+    f.gateway.lifecycleEpoch,
+    waitForRecoveryOperation,
+    false,
+    Date.now() - 1
+  );
+  assert.equal(result, false);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.PENDING);
+  assert.equal(f.fetched.length, 0);
+  assert.equal(f.dispatched.length, 0);
+  await recoverThread(f.gateway, f.state.getThreadEnrollment(f.child.id), new AbortController().signal, f.gateway.lifecycleEpoch, waitForRecoveryOperation);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+});
+
 test('closing recovery refuses READY when live child custody overtakes its final page', async t => {
   const f = fixture(t);
   f.ready('100');
@@ -478,6 +497,29 @@ test('initial adoption excludes old thread backlog without executing it', async 
   assert.equal(f.dispatched.length, 0);
 });
 
+test('empty adoption baseline retains live child custody as the history cursor', async t => {
+  const f = fixture(t);
+  await enrollPublicThread(f.state, f.client, f.parent.id, f.child.id);
+  const binding = f.state.getBinding(f.parent.id);
+  let calls = 0;
+  f.gateway.fetchHistory = async () => {
+    calls += 1;
+    if (calls === 1) {
+      const live = f.state.acceptDiscordMessage({
+        id: '101', guildId: 'guild', channelId: f.child.id, authorId: 'operator', isBot: false,
+        content: 'live child question', attachments: []
+      }, { ready: false, expectedBinding: binding });
+      assert.equal(live.accepted, true);
+      return [];
+    }
+    return [f.message('50')];
+  };
+  await recoverThread(f.gateway, f.state.getThreadEnrollment(f.child.id), new AbortController().signal, f.gateway.lifecycleEpoch, waitForRecoveryOperation);
+  assert.equal(f.state.getMessage('50'), null);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '101');
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+});
+
 test('missing or invalid history reader cannot falsely prove an empty ready thread', async t => {
   const f = fixture(t);
   await enrollPublicThread(f.state, f.client, f.parent.id, f.child.id);
@@ -596,4 +638,62 @@ test('parent handoff waits for child custody then new child work inherits succes
   assert.equal(f.state.getMessage('102').state, MESSAGE_STATES.REPLIED);
   assert.equal(f.state.listBindings().length, 1);
   assert.ok(f.sends.every(send => send.channelId === f.child.id));
+});
+
+
+test('public recovery preserves a direct binding after its enrollment is retired', async t => {
+  const f = fixture(t); f.ready('100');
+  f.state.unbind(f.parent.id);
+  const direct = f.state.bind({ channelId: f.child.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  f.state.markIntakeBoundary(f.child.id, READINESS.PENDING, 'fixture recovery', null, null, direct);
+  const originalArgv = process.argv;
+  const originalWrite = process.stdout.write;
+  let output = '';
+  process.argv = [process.execPath, require.resolve('../src/cli'), 'recover', '--state-dir', f.dir,
+    '--db', f.state.dbPath, '--intake-channel-id', f.child.id];
+  process.stdout.write = chunk => { output += String(chunk); return true; };
+  try { await main(); } finally { process.argv = originalArgv; process.stdout.write = originalWrite; }
+  const result = JSON.parse(output);
+  assert.equal(result.channel_id, f.child.id);
+  assert.equal(Object.hasOwn(result, 'enrollment'), false);
+  assert.equal(Object.hasOwn(result, 'gatewayWake'), false);
+  assert.equal(f.state.getBinding(f.child.id).nativeId, SUCCESSOR);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).active, false);
+});
+
+test('restoring a parent pause dispatches its held child once to the original owner', async t => {
+  const f = fixture(t); f.ready('100');
+  const binding = f.state.getBinding(f.parent.id);
+  f.state.pauseOrdinaryHandoffIntake(f.parent.id, binding);
+  f.gateway.boundMessage(f.message('101'));
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForReceipts();
+  assert.equal(f.dispatched.length, 0);
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+  f.state.restoreOrdinaryHandoffIntake(f.parent.id, binding);
+  await f.gateway._reconcilePending(null, new AbortController().signal, true);
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.dispatched.length, 1);
+  assert.equal(f.dispatched[0].nativeId, NATIVE);
+  assert.equal(f.dispatched[0].generation, binding.generation);
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
+  assert.ok(f.sends.every(send => send.channelId === f.child.id));
+  await f.gateway._reconcilePending(null, new AbortController().signal, true);
+  assert.equal(f.dispatched.length, 1);
+  assert.equal(f.state.unbind(f.parent.id, { expectedBinding: binding }), true);
+});
+
+test('deadline expiring before the first fetch leaves unattempted child custody pending', async t => {
+  const f = fixture(t); f.ready('100');
+  const deadline = Date.now() + 60000;
+  const waitAtDeadline = async (operation, signal, until) => {
+    const originalNow = Date.now;
+    Date.now = () => until;
+    try { return await waitForRecoveryOperation(operation, signal, until); }
+    finally { Date.now = originalNow; }
+  };
+  await recoverThread(f.gateway, f.state.getThreadEnrollment(f.child.id), new AbortController().signal,
+    f.gateway.lifecycleEpoch, waitAtDeadline, false, deadline);
+  assert.equal(f.fetched.length, 0);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.PENDING);
 });

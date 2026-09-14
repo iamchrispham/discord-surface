@@ -615,9 +615,10 @@ function recover(args) {
     } else if (args['intake-channel-id']) {
       const channelId = required(args, 'intake-channel-id');
       const thread = state.getThreadEnrollment(channelId);
+      const activeThread = thread?.active ? thread : null;
       const recovered = state.reconcileIntake(channelId);
-      if (thread && !recovered) throw new Error('Thread recovery requires the current active parent binding');
-      print(thread ? {
+      if (activeThread && !recovered) throw new Error('Thread recovery requires the current active parent binding');
+      print(activeThread ? {
         enrollment: recovered,
         gatewayWake: requestGatewayRecovery(paths, {
           requiredCapability: GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake

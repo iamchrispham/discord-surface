@@ -118,8 +118,12 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   let after = enrollment.recoveredThroughId;
   const startingAfter = after;
   const startingLastSeenId = enrollment.lastSeenId;
+  let recoveryAttempted = false;
   try {
-    const channel = await wait(() => gateway.client.channels.fetch(enrollment.threadId), signal, deadline);
+    const channel = await wait(() => {
+      recoveryAttempted = true;
+      return gateway.client.channels.fetch(enrollment.threadId);
+    }, signal, deadline);
     if (!current()) return false;
     assertPublicThread(channel, binding, enrollment.threadId, gateway.client.user);
     if (!gateway.fetchHistoryInjected && typeof channel.messages?.fetch !== 'function') throw new Error('Thread history fetch is unavailable');
@@ -135,7 +139,8 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       const baseline = await readHistory({ limit: 1, signal });
       if (!current()) return false;
       if (baseline.some(message => !/^\d+$/.test(message.id))) throw new Error('Thread history message has no stable ID');
-      const newest = baseline.sort((a, b) => compareIds(b.id, a.id))[0]?.id || null;
+      const newest = baseline.sort((a, b) => compareIds(b.id, a.id))[0]?.id ||
+        gateway.state.getThreadEnrollment(enrollment.threadId)?.lastSeenId || null;
       if (!gateway.state.setThreadBaseline(enrollment.threadId, newest, binding)) return false;
       after = gateway.state.getThreadEnrollment(enrollment.threadId)?.recoveredThroughId || null;
     }
@@ -200,6 +205,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
     if (!current()) return false;
     if (!checkpointOnly) {
       const deadlineReached = (error as { recoveryKind?: string }).recoveryKind === CODEX_VALIDATION_KINDS.DEADLINE;
+      if (deadlineReached && !recoveryAttempted) return false;
       boundary(deadlineReached ? THREAD_STATES.GAP : THREAD_STATES.UNAVAILABLE, error instanceof Error ? error.message : String(error), after);
     }
     return false;
