@@ -938,7 +938,7 @@ class DiscordGateway {
         this.state.isOrdinaryBinding?.(binding)) {
         this.scheduleDeferredHandoffRecovery(authorityId, { pendingGeneration: true });
       }
-      const bindingReady = binding?.readiness === READINESS.READY && (!route.enrollment || route.enrollment.state === THREAD_STATES.READY);
+      const bindingReady = binding?.readiness === READINESS.READY && (!route?.enrollment || route.enrollment.state === THREAD_STATES.READY);
       const readyLive = this.ready && bindingReady;
       const heldReady = !this.ready && bindingReady;
       const controller = new AbortController();
@@ -1425,6 +1425,7 @@ class DiscordGateway {
 
   noteLiveIntake(message) {
     const channelId = typeof message?.channelId === 'string' ? message.channelId : null;
+    if (this.liveCheckpointRetryTimer && this.liveCheckpointRetryChannels?.has(channelId)) return;
     if (!channelId || this.stopping || !this.state.getMessageRoute(channelId)?.binding.active) return;
     const count = (this.liveIntakeCounts.get(channelId) || 0) + 1;
     this.liveIntakeCounts.set(channelId, count);
