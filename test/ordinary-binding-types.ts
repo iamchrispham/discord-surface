@@ -72,6 +72,7 @@ const state: OrdinaryBindingState = {
   transaction: operation => operation(),
   hasUnresolved: () => false,
   hasUnresolvedOrdinaryPost: () => false,
+  listThreadEnrollments: () => [],
   bindingInput: value => value,
   assertLegacyMigrationSafe: () => undefined,
   receipt: () => undefined,

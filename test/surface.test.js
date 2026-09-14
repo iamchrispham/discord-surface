@@ -4442,6 +4442,8 @@ for (const operation of ['handoff', 'rebind']) test(`simulated: from-lock pickup
   state.enrollThread({ threadId: 'child', parentChannelId: predecessor.channelId, guildId: predecessor.guildId }, predecessor);
   state.setThreadBaseline('child', '100', predecessor);
   state.markThreadBoundary('child', THREAD_STATES.READY, 'fixture adoption', null, null, predecessor);
+  state.setIntakeCutoff(predecessor.channelId, predecessor.guildId, '100', 'fixture parent coverage');
+  state.markIntakeBoundary(predecessor.channelId, READINESS.READY, 'fixture parent ready', null, null, predecessor);
   state.setBindingReadiness(predecessor.channelId, READINESS.READY, 'fixture ready', predecessor);
   state.acceptDiscordMessage({ id: '150', channelId: 'child', guildId: 'guild-1', authorId: 'operator-1', content: 'accepted predecessor work' });
   const marker = conductorMarker({ provider: 'codex', conductorId, repoKey });
@@ -4455,22 +4457,39 @@ for (const operation of ['handoff', 'rebind']) test(`simulated: from-lock pickup
   const preload = path.join(dir, 'from-lock-discord-preload.cjs');
   const fenceLog = path.join(dir, 'observed-fences.jsonl');
   fs.writeFileSync(preload, `
+const fs = require('node:fs');
 const Module = require('node:module');
 const originalLoad = Module._load;
+const parentId = process.env.DISCORD_SURFACE_TEST_CHANNEL;
+const childId = 'child';
+const latestFenceId = () => {
+  const log = process.env.DISCORD_SURFACE_TEST_FENCES;
+  if (!log || !fs.existsSync(log)) return '0';
+  const lines = fs.readFileSync(log, 'utf8').trim().split('\\n').filter(Boolean);
+  return lines.length ? JSON.parse(lines.at(-1)).id : '0';
+};
+const parent = {
+  id: parentId, parentId: process.env.DISCORD_SURFACE_TEST_CATEGORY, topic: process.env.DISCORD_SURFACE_TEST_TOPIC,
+  messages: { async fetch() { return new Map([['fence', { id: latestFenceId() }]]); } },
+  async send(payload) {
+    const log = process.env.DISCORD_SURFACE_TEST_FENCES;
+    const count = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\\n').filter(Boolean).length : 0;
+    const id = String(200 + count);
+    fs.appendFileSync(log, JSON.stringify({ id, payload }) + '\\n');
+    return { id, async delete() {} };
+  }
+};
+const child = {
+  id: childId,
+  messages: { async fetch() { return new Map([['unrecorded', { id: '160' }]]); } }
+};
 const fake = {
   GatewayIntentBits: { Guilds: 1 },
   Client: class {
-    constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => ({
-      id: process.env.DISCORD_SURFACE_TEST_CHANNEL, parentId: process.env.DISCORD_SURFACE_TEST_CATEGORY, topic: process.env.DISCORD_SURFACE_TEST_TOPIC,
-      async send(payload) {
-        const fs = require('node:fs');
-        const log = process.env.DISCORD_SURFACE_TEST_FENCES;
-        const count = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\\n').length : 0;
-        const id = String(200 + count);
-        fs.appendFileSync(log, JSON.stringify({ id, payload }) + '\\n');
-        return { id, async delete() {} };
-      }
-    }) } }) }; }
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: { fetch: async () => parent } }) };
+      this.channels = { fetch: async id => id === childId ? child : parent };
+    }
     async login() {}
     async destroy() {}
   }
@@ -4509,6 +4528,23 @@ Module._load = (request, parent, isMain) => request === 'discord.js' ? fake : or
       held.beginReply('150');
       held.markReplySent('150', 'predecessor-reply');
     } finally { held.close(); }
+    const gap = runPickup();
+    assert.notEqual(gap.status, 0, 'unrecorded child history before the fence must refuse public transfer');
+    const gapState = new SurfaceState(db);
+    try {
+      const oldBinding = gapState.getBinding('from-lock-channel');
+      assert.equal(oldBinding.nativeId, oldNativeId);
+      assert.equal(oldBinding.generation, 1);
+      const acceptedGap = gapState.acceptDiscordMessage({
+        id: '160', channelId: 'child', guildId: 'guild-1', authorId: 'operator-1', content: 'recovered predecessor history'
+      }, { ready: true, coverageId: '160', expectedBinding: oldBinding });
+      assert.equal(acceptedGap.accepted, true);
+      gapState.claimDispatch('160');
+      gapState.markSubmitted('160');
+      gapState.recordNativeReply({ provider: 'codex', messageId: '160', nativeId: oldNativeId, generation: 1, text: 'predecessor answer' });
+      gapState.beginReply('160');
+      gapState.markReplySent('160', 'predecessor-gap-reply');
+    } finally { gapState.close(); }
     const result = runPickup();
     assert.equal(result.status, 0, result.stderr);
     const updated = new SurfaceState(db);

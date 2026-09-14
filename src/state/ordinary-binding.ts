@@ -3,6 +3,7 @@ import type { MessageState } from '../acknowledgment';
 import type { AgentProvider } from '../agent-message';
 import type { Readiness } from '../topic';
 import { ORDINARY_RECEIPT_KINDS, type OrdinaryReceiptKind } from '../ordinary/constants';
+import type { ThreadEnrollment, ThreadEnrollmentCoverageProof } from './thread-enrollment';
 
 export interface OrdinaryBindingSqlStatement {
   all<T extends Record<string, unknown> = Record<string, unknown>>(...parameters: unknown[]): T[];
@@ -104,6 +105,7 @@ export interface OrdinaryRebindOptions {
   resetIntake?: boolean;
   sessionRootOverride?: string | null;
   intakeCutoff?: string | null;
+  enrollmentProof?: ThreadEnrollmentCoverageProof | null;
   beforeMutation?: (() => void) | undefined;
 }
 
@@ -121,6 +123,8 @@ export interface OrdinaryBindingState {
   transaction<T>(operation: () => T): T;
   hasUnresolved(channelId: string): boolean;
   hasUnresolvedOrdinaryPost(channelId: string): boolean;
+  listThreadEnrollments(parentChannelId?: string | null): ThreadEnrollment[];
+  assertThreadEnrollmentCoverage?(parentChannelId: string, proof: ThreadEnrollmentCoverageProof): void;
   bindingInput(binding: OrdinaryBindingInput, existing?: OrdinaryBindingRecord | null): OrdinaryBindingInput;
   assertLegacyMigrationSafe(channelId: string): void;
   receipt(discordId: string | null, kind: OrdinaryReceiptKind, detail: Record<string, unknown>): void;
@@ -168,6 +172,7 @@ export interface OrdinaryHandoffInput {
   identity: OrdinaryBindingIdentity;
   nativeProof: OrdinaryNativeProof;
   intakeCutoff?: string | null;
+  enrollmentProof?: ThreadEnrollmentCoverageProof | null;
   beforeMutation?: () => void;
 }
 
@@ -416,7 +421,7 @@ export function createOrdinaryBindingHandlers(
       });
     },
 
-    handoffOrdinary(state, { channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, beforeMutation = undefined }) {
+    handoffOrdinary(state, { channelId, provider, fromNativeId, fromGeneration, nativeId, workspace, sessionRoot, handoffId, identity, nativeProof, intakeCutoff = null, enrollmentProof = null, beforeMutation = undefined }) {
       if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
       if (provider !== PROVIDERS.CODEX) throw new BindingError('ordinary handoff requires the Codex provider');
       assertUuid(fromNativeId, 'fromNativeId');
@@ -477,6 +482,10 @@ export function createOrdinaryBindingHandlers(
         throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       }
       state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+      const hasActiveEnrollments = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
+      if (hasActiveEnrollments && intakeCutoff === null) {
+        throw new BindingError('active thread enrollments require an observed intake cutoff');
+      }
       try {
         const handoffResult = state.transaction(() => {
           const current = state.getBinding(channelId);
@@ -492,10 +501,20 @@ export function createOrdinaryBindingHandlers(
             throw new UnresolvedWorkError('cannot handoff while work is unresolved');
           }
           state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
+          const hasCurrentActiveEnrollments = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
+          if (hasCurrentActiveEnrollments && intakeCutoff === null) {
+            throw new BindingError('active thread enrollments require an observed intake cutoff');
+          }
           state.assertLegacyMigrationSafe(channelId);
           if (typeof beforeMutation === 'function') beforeMutation();
           const updatedAt = now();
           if (intakeCutoff !== null) {
+            if (enrollmentProof) {
+              if (typeof state.assertThreadEnrollmentCoverage !== 'function') {
+                throw new BindingError('handoff enrollment proof cannot be validated');
+              }
+              state.assertThreadEnrollmentCoverage(channelId, enrollmentProof);
+            }
             state.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
             advanceEnrolledThreadCutoffs(state, channelId, intakeCutoff, updatedAt);
           }

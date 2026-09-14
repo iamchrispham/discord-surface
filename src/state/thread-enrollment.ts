@@ -84,6 +84,11 @@ export interface ThreadEnrollmentInput {
   guildId: string;
 }
 
+export interface ThreadEnrollmentCoverageProof {
+  parentChannelId: string;
+  enrollments: Array<Pick<ThreadEnrollment, 'threadId' | 'active' | 'recoveredThroughId' | 'updatedAt'>>;
+}
+
 interface SqlRow {
   [key: string]: unknown;
 }
@@ -161,6 +166,7 @@ export interface ThreadEnrollmentHandlers {
   enrollThread(state: ThreadEnrollmentState, input: ThreadEnrollmentInput, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
   getThreadEnrollment(state: ThreadEnrollmentState, threadId: string): ThreadEnrollment | null;
   listThreadEnrollments(state: ThreadEnrollmentState, parentChannelId?: string | null): ThreadEnrollment[];
+  assertEnrollmentCoverage(state: ThreadEnrollmentState, parentChannelId: string, proof: ThreadEnrollmentCoverageProof): void;
   deactivateThreadEnrollments(state: ThreadEnrollmentState, parentChannelId: string, expectedBinding?: ThreadBinding | null, detail?: ThreadDeactivationDetail): number;
   setThreadBaseline(state: ThreadEnrollmentState, threadId: string, latestId: string | null, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
   markThreadBoundary(
@@ -282,6 +288,34 @@ export function createThreadEnrollmentHandlers({
         ? state.db.prepare('SELECT * FROM thread_enrollments ORDER BY parent_channel_id, thread_id').all()
         : state.db.prepare('SELECT * FROM thread_enrollments WHERE parent_channel_id=? ORDER BY thread_id').all(parentChannelId);
       return rows.map(row => rowEnrollment(row)).filter((row): row is ThreadEnrollment => row !== null);
+    },
+
+    assertEnrollmentCoverage(state, parentChannelId, proof) {
+      const checkedParentChannelId = assertText(parentChannelId, 'parentChannelId', 128);
+      if (!proof || proof.parentChannelId !== checkedParentChannelId || !Array.isArray(proof.enrollments)) {
+        throw new BindingError('handoff enrollment proof is invalid');
+      }
+      const expected = new Map<string, { recoveredThroughId: string | null; updatedAt: string }>();
+      for (const enrollment of proof.enrollments) {
+        if (!enrollment || typeof enrollment.threadId !== 'string' || enrollment.active !== true ||
+          typeof enrollment.updatedAt !== 'string' || enrollment.updatedAt.length === 0 ||
+          (enrollment.recoveredThroughId !== null && typeof enrollment.recoveredThroughId !== 'string') ||
+          expected.has(enrollment.threadId)) {
+          throw new BindingError('handoff enrollment proof is invalid');
+        }
+        expected.set(enrollment.threadId, {
+          recoveredThroughId: enrollment.recoveredThroughId,
+          updatedAt: enrollment.updatedAt
+        });
+      }
+      const current = handlers.listThreadEnrollments(state, checkedParentChannelId).filter(enrollment => enrollment.active);
+      if (current.length !== expected.size || current.some(enrollment => {
+        const expectedEnrollment = expected.get(enrollment.threadId);
+        return !expectedEnrollment || expectedEnrollment.recoveredThroughId !== enrollment.recoveredThroughId ||
+          expectedEnrollment.updatedAt !== enrollment.updatedAt;
+      })) {
+        throw new BindingError('active thread enrollments changed during handoff proof');
+      }
     },
 
     deactivateThreadEnrollments(state, parentChannelId, expectedBinding = null, detail = THREAD_DEACTIVATION_DETAILS.UNBOUND) {

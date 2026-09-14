@@ -5,6 +5,7 @@ const { RECOVERY_LIMITS } = require('../../src/state') as {
     maxMessages: number;
   };
 };
+import type { ThreadEnrollmentCoverageProof } from '../state/thread-enrollment';
 
 export interface HandoffFenceMessage {
   id: string;
@@ -15,8 +16,19 @@ export interface HandoffChannel {
   id?: unknown;
   send?: (payload: { content: string; allowedMentions: { parse: string[] } }) => Promise<unknown>;
   messages?: {
-    fetch?: (options: { limit: number; after: string }) => Promise<unknown>;
+    fetch?: (options: { limit: number; after?: string }) => Promise<unknown>;
   };
+}
+
+export interface HandoffClient {
+  channels?: { fetch: (id: string) => Promise<HandoffChannel | null> };
+}
+
+export interface HandoffEnrollment {
+  threadId: string;
+  active: boolean;
+  recoveredThroughId: string | null;
+  updatedAt: string;
 }
 
 export interface HandoffBinding {
@@ -34,6 +46,11 @@ export interface HandoffBinding {
 export interface HandoffState {
   checkpointIntake: (channelId: string, coverageId: string, expectedBinding: HandoffBinding) => unknown;
   hasIntakeEvidence: (discordId: string) => unknown;
+}
+
+export interface HandoffCoverageState extends HandoffState {
+  getIntakeWatermark: (channelId: string) => { recovered_through_id?: string | null } | null;
+  listThreadEnrollments: (parentChannelId?: string | null) => HandoffEnrollment[];
 }
 
 interface HistoryMessage {
@@ -64,6 +81,21 @@ function historyMessages(result: unknown): unknown[] {
     return [...(result as Iterable<unknown>)];
   }
   return [];
+}
+
+function activeEnrollmentSnapshot(state: HandoffCoverageState, binding: HandoffBinding): HandoffEnrollment[] {
+  return state.listThreadEnrollments(binding.channelId).filter(enrollment => enrollment.active);
+}
+
+function sameEnrollmentSnapshot(expected: HandoffEnrollment[], current: HandoffEnrollment[]): boolean {
+  if (expected.length !== current.length) return false;
+  const currentByThreadId = new Map(current.map(enrollment => [enrollment.threadId, enrollment]));
+  return expected.every(enrollment => {
+    const currentEnrollment = currentByThreadId.get(enrollment.threadId);
+    if (!currentEnrollment) return false;
+    return currentEnrollment.recoveredThroughId === enrollment.recoveredThroughId &&
+      currentEnrollment.updatedAt === enrollment.updatedAt;
+  });
 }
 
 export async function createHandoffFence(
@@ -145,4 +177,96 @@ export async function assertOrdinaryIntakeRange(
     }
   }
   throw new Error(`${operation} requires Discord intake to be durably drained`);
+}
+
+export async function assertEnrolledThreadIntakeRange(
+  client: HandoffClient | null | undefined,
+  state: HandoffCoverageState,
+  binding: HandoffBinding,
+  fenceId: unknown,
+  operation: string
+): Promise<ThreadEnrollmentCoverageProof> {
+  const enrollments = activeEnrollmentSnapshot(state, binding);
+  if (!enrollments.length) {
+    return { parentChannelId: binding.channelId, enrollments: [] };
+  }
+  const fetchThreadChannel = client?.channels?.fetch?.bind(client.channels);
+  if (typeof fetchThreadChannel !== 'function') {
+    throw new Error(`${operation} requires Discord thread history access`);
+  }
+  for (const enrollment of enrollments) {
+    const channel = await fetchThreadChannel(enrollment.threadId);
+    if (!channel || channel.id !== enrollment.threadId || typeof channel.messages?.fetch !== 'function') {
+      throw new Error(`${operation} requires Discord history range access for enrolled thread ${enrollment.threadId}`);
+    }
+    let after = enrollment.recoveredThroughId || null;
+    let pages = 0;
+    let total = 0;
+    let complete = false;
+    while (pages < RECOVERY_LIMITS.maxPages && total < RECOVERY_LIMITS.maxMessages) {
+      const options: { limit: number; after?: string } = { limit: RECOVERY_LIMITS.pageSize };
+      if (after) options.after = after;
+      const page = historyMessages(await channel.messages.fetch(options));
+      pages += 1;
+      if (!page.length) {
+        complete = true;
+        break;
+      }
+      if (page.some(message => {
+        const candidate = message as { id?: unknown } | null | undefined;
+        return typeof candidate?.id !== 'string' || candidate.id.length === 0;
+      })) {
+        throw new Error(`${operation} encountered an enrolled thread message without a stable ID`);
+      }
+      const stablePage = page as HistoryMessage[];
+      stablePage.sort((left, right) => compareDiscordIds(left.id, right.id));
+      const reachedFence = stablePage.some(message => compareDiscordIds(message.id, fenceId) >= 0);
+      const fresh = stablePage.filter(message => (!after || compareDiscordIds(message.id, after) > 0) &&
+        compareDiscordIds(message.id, fenceId) < 0);
+      if (!fresh.length) {
+        if (reachedFence || stablePage.length < RECOVERY_LIMITS.pageSize) {
+          complete = true;
+          break;
+        }
+        throw new Error(`${operation} requires enrolled thread ${enrollment.threadId} intake to be durably drained`);
+      }
+      for (const message of fresh) {
+        if (total >= RECOVERY_LIMITS.maxMessages || !state.hasIntakeEvidence(message.id)) {
+          throw new Error(`${operation} requires enrolled thread ${enrollment.threadId} intake to be durably drained`);
+        }
+        after = message.id;
+        total += 1;
+      }
+      if (!enrollment.recoveredThroughId && stablePage.length >= RECOVERY_LIMITS.pageSize && !reachedFence) {
+        throw new Error(`${operation} requires a confirmed intake boundary for enrolled thread ${enrollment.threadId}`);
+      }
+      if (reachedFence || stablePage.length < RECOVERY_LIMITS.pageSize) {
+        complete = true;
+        break;
+      }
+    }
+    if (!complete) {
+      throw new Error(`${operation} requires enrolled thread ${enrollment.threadId} intake to be durably drained`);
+    }
+  }
+  if (!sameEnrollmentSnapshot(enrollments, activeEnrollmentSnapshot(state, binding))) {
+    throw new Error(`${operation} active thread enrollments changed during history proof`);
+  }
+  return {
+    parentChannelId: binding.channelId,
+    enrollments: enrollments.map(({ threadId, active, recoveredThroughId, updatedAt }) => ({ threadId, active, recoveredThroughId, updatedAt }))
+  };
+}
+
+export async function assertHandoffIntakeCoverage(
+  channel: HandoffChannel | null | undefined,
+  client: HandoffClient | null | undefined,
+  state: HandoffCoverageState,
+  binding: HandoffBinding,
+  fenceId: unknown,
+  operation: string
+): Promise<ThreadEnrollmentCoverageProof> {
+  const recoveredThrough = state.getIntakeWatermark(binding.channelId)?.recovered_through_id || null;
+  await assertOrdinaryIntakeRange(channel, state, binding, recoveredThrough, fenceId, operation);
+  return assertEnrolledThreadIntakeRange(client, state, binding, fenceId, operation);
 }

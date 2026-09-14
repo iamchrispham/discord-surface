@@ -1250,6 +1250,7 @@ class SurfaceState {
     resetIntake = false,
     sessionRootOverride = undefined,
     intakeCutoff = null,
+    enrollmentProof = null,
     beforeMutation = undefined,
     rejectUnresolvedOrdinaryPost = false
   } = {}) {
@@ -1304,6 +1305,7 @@ class SurfaceState {
       this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
       if (typeof beforeMutation === 'function') beforeMutation();
       if (intakeCutoff !== null) {
+        if (enrollmentProof) this.assertThreadEnrollmentCoverage(channelId, enrollmentProof);
         const updatedAt = now();
         this.setIntakeCutoffInTransaction(channelId, input.guildId, intakeCutoff, 'parent rebind intake fence', current);
         ordinaryBindingHandlers.advanceEnrolledThreadCutoffs(this, channelId, intakeCutoff, updatedAt);
@@ -1391,6 +1393,10 @@ class SurfaceState {
     return threadEnrollmentHandlers.listThreadEnrollments(this, parentChannelId);
   }
 
+  assertThreadEnrollmentCoverage(parentChannelId, proof) {
+    return threadEnrollmentHandlers.assertEnrollmentCoverage(this, parentChannelId, proof);
+  }
+
   deactivateThreadEnrollments(parentChannelId, expectedBinding = null) {
     return threadEnrollmentHandlers.deactivateThreadEnrollments(this, parentChannelId, expectedBinding);
   }
@@ -1475,7 +1481,7 @@ class SurfaceState {
     return ordinaryBindingHandlers.handoffOrdinary(this, input);
   }
 
-  handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff = null }) {
+  handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff = null, enrollmentProof = null }) {
     assertUuid(fromNativeId, 'fromNativeId');
     if (!Number.isInteger(fromGeneration) || fromGeneration < 1) throw new BindingError('fromGeneration must be a positive integer');
     assertText(handoffId, 'handoffId', 256);
@@ -1513,6 +1519,7 @@ class SurfaceState {
         throw new BindingError('active thread enrollments require an observed intake cutoff');
       }
       this.assertLegacyMigrationSafe(channelId);
+      if (enrollmentProof) this.assertThreadEnrollmentCoverage(channelId, enrollmentProof);
       const generation = existing.generation + 1;
       const updatedAt = now();
       if (intakeCutoff !== null) {

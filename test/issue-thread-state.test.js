@@ -394,6 +394,39 @@ test('child handoff fence rejects delayed predecessor events under the successor
   assert.equal(current.message.generation, successor.generation);
 });
 
+test('ordinary handoff with active thread enrollment requires an observed cutoff and keeps retry idempotent', t => {
+  const f = fixture(t, { ordinary: true });
+  f.enroll();
+  const predecessor = f.state.getBinding('parent');
+  const transcriptFile = path.join(f.dir, 'successor.jsonl');
+  fs.writeFileSync(transcriptFile, '');
+  const handoff = {
+    channelId: 'parent', provider: PROVIDERS.CODEX, fromNativeId: NATIVE, fromGeneration: predecessor.generation,
+    nativeId: SUCCESSOR, workspace: f.dir, sessionRoot: null, handoffId: 'ordinary-enrollment-cutoff',
+    identity: { sessionId: SUCCESSOR, threadId: SUCCESSOR },
+    nativeProof: { file: transcriptFile, sessionId: SUCCESSOR, threadId: SUCCESSOR, workspace: f.dir, sessionRoot: null }
+  };
+
+  const listThreadEnrollments = f.state.listThreadEnrollments.bind(f.state);
+  let enrollmentReads = 0;
+  f.state.listThreadEnrollments = parentChannelId => {
+    enrollmentReads += 1;
+    return enrollmentReads === 1 ? [] : listThreadEnrollments(parentChannelId);
+  };
+  assert.throws(() => f.state.handoffOrdinary(handoff), /active thread enrollments require an observed intake cutoff/);
+  assert.equal(enrollmentReads, 2);
+  f.state.listThreadEnrollments = listThreadEnrollments;
+  assert.equal(f.state.getBinding('parent').generation, predecessor.generation);
+  assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, null);
+
+  const successor = f.state.handoffOrdinary({ ...handoff, intakeCutoff: '150' });
+  assert.equal(successor.generation, predecessor.generation + 1);
+  assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, '150');
+  const retry = f.state.handoffOrdinary(handoff);
+  assert.equal(retry.handoffReconciled, true);
+  assert.equal(retry.generation, successor.generation);
+});
+
 test('accepted child custody blocks parent handoff and unbind during a pause', t => {
   const f = fixture(t, { ordinary: true });
   adoptReady(f, '100');

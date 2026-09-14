@@ -14,6 +14,7 @@ const { DiscordGateway, discordIdAfter, readSecret, requireInstalled, waitForRec
 const { enrollPublicThread } = require('./discord/thread-enrollment');
 const {
   assertOrdinaryIntakeRange,
+  assertHandoffIntakeCoverage,
   createHandoffFence,
   deleteHandoffFence,
   serverDerivedChannelCutoff
@@ -123,6 +124,7 @@ async function bind(args, rebind = false) {
   const { state } = openState(args);
   let client;
   let handoffFence;
+  let enrollmentProof = null;
   try {
     const input = bindingArgs(args);
     const hasActiveThreads = rebind && state.listThreadEnrollments(input.channelId).some(enrollment => enrollment.active);
@@ -136,9 +138,11 @@ async function bind(args, rebind = false) {
       const guild = await client.guilds.fetch(input.guildId);
       const channel = await guild.channels.fetch(input.channelId);
       handoffFence = await createHandoffFence(channel, 'parent rebind');
+      const current = state.getBinding(input.channelId);
+      if (current?.active) enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'parent rebind');
       intakeCutoff = handoffFence.id;
     }
-    print(rebind ? state.rebind(input, { intakeCutoff }) : state.bind(input));
+    print(rebind ? state.rebind(input, { intakeCutoff, enrollmentProof }) : state.bind(input));
   } finally {
     await deleteHandoffFence(handoffFence);
     await client?.destroy();
@@ -1053,6 +1057,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   let client;
   let runtimeInterlock;
   let handoffFence;
+  let enrollmentProof = null;
   let sourceBinding = null;
   let handoffCommitted = false;
   try {
@@ -1144,14 +1149,13 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     }
     handoffFence = await createHandoffFence(channel);
     if (handoffFence) {
-      if (current.active) {
-        await assertOrdinaryIntakeRange(channel, state, current, recoveredThrough, handoffFence.id, 'ordinary handoff');
-      }
+      if (current.active) enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'ordinary handoff');
       handoffCutoff = handoffFence.id;
     }
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
       sessionRoot: validationRoot, handoffId, intakeCutoff: handoffCutoff,
+      enrollmentProof,
       identity: { sessionId: nativeProof.sessionId, threadId: nativeProof.threadId },
       nativeProof: { ...nativeProof, sessionRoot: validationRoot },
       beforeMutation: assertGatewayCompatible
@@ -1214,6 +1218,7 @@ async function handoffInternal(args, dependencies = {}) {
   const { state } = openState(args);
   let client;
   let handoffFence;
+  let enrollmentProof = null;
   try {
     const config = state.requireConfig();
     const categoryId = categoryFor(provider, args, config);
@@ -1232,9 +1237,12 @@ async function handoffInternal(args, dependencies = {}) {
     }
     const previous = state.findConductorHandoff(handoffId);
     const hasActiveThreads = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
-    if (!previous && hasActiveThreads) handoffFence = await createHandoffFence(channel, 'conductor handoff');
+    if (!previous && hasActiveThreads) {
+      handoffFence = await createHandoffFence(channel, 'conductor handoff');
+      enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'conductor handoff');
+    }
     const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId,
-      intakeCutoff: handoffFence?.id || null });
+      intakeCutoff: handoffFence?.id || null, enrollmentProof });
     print({ handedOff: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
   } finally {
     await deleteHandoffFence(handoffFence);
@@ -1281,6 +1289,10 @@ function localHandoff(args) {
   const reuse = args.reuse === true || args.reuse === 'true';
   const handoffId = reuse ? null : required(args, 'handoff-id');
   const intakeCutoff = args['intake-cutoff'] || null;
+  let enrollmentProof = null;
+  if (args['enrollment-proof']) {
+    try { enrollmentProof = JSON.parse(args['enrollment-proof']); } catch { throw new Error('invalid --enrollment-proof JSON'); }
+  }
   const { state } = openState(args);
   try {
     const config = state.requireConfig();
@@ -1291,12 +1303,12 @@ function localHandoff(args) {
       print({ handedOff: false, reused: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding: current, readiness: current.readiness });
       return;
     }
-    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff });
+    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff, enrollmentProof });
     print({ handedOff: true, reused: false, conductorId, repoKey, channelId, handoffId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
   } finally { state.close(); }
 }
 
-function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff = null }) {
+function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff = null, enrollmentProof = null }) {
   const paths = pathsFor(args);
   const helperArgs = [
     path.join(__dirname, 'conductor-lock-gate.py'),
@@ -1309,6 +1321,7 @@ function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace,
   if (current.endpoint) helperArgs.push('--from-endpoint', current.endpoint);
   if (endpoint) helperArgs.push('--endpoint', endpoint);
   if (intakeCutoff) helperArgs.push('--intake-cutoff', intakeCutoff);
+  if (enrollmentProof) helperArgs.push('--enrollment-proof', JSON.stringify(enrollmentProof));
   if (reuse) helperArgs.push('--reuse');
   const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', helperArgs, {
     encoding: 'utf8', timeout: 35000, env: { ...process.env }
@@ -1335,6 +1348,7 @@ async function handoffFromLockInternal(args) {
   let state = openState(args).state;
   let client;
   let handoffFence;
+  let enrollmentProof = null;
   try {
     const config = state.requireConfig();
     const current = state.findConductorBinding(conductorId, provider);
@@ -1350,10 +1364,11 @@ async function handoffFromLockInternal(args) {
     const reuse = current.nativeId === nativeId;
     if (!reuse && state.listThreadEnrollments(current.channelId).some(enrollment => enrollment.active)) {
       handoffFence = await createHandoffFence(channel, 'conductor handoff');
+      enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'conductor handoff');
     }
     state.close();
     state = null;
-    handoffGate({ ...args, repo }, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff: handoffFence?.id || null });
+    handoffGate({ ...args, repo }, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff: handoffFence?.id || null, enrollmentProof });
     return;
   } finally {
     await deleteHandoffFence(handoffFence);
