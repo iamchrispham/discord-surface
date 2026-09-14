@@ -879,3 +879,131 @@ test('deadline expiring before the first fetch leaves unattempted child custody 
   assert.equal(f.fetched.length, 0);
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.PENDING);
 });
+
+test('live child accepted while checkpoint reconciliation waits reaches native delivery', { timeout: 5000 }, async t => {
+  const f = fixture(t); f.ready('100');
+  f.histories.set(f.child.id, [f.message('101')]);
+  const other = f.makeChannel('3000', ChannelType.GuildText);
+  f.channels.set(other.id, other);
+  f.histories.set(other.id, [f.message('901', other)]);
+  const binding = f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  f.state.acceptDiscordMessage({ id: '901', guildId: 'guild', channelId: other.id, authorId: 'operator', isBot: false, content: 'other' }, { ready: true, expectedBinding: binding });
+  let checkpointReady, releaseCheckpoint, recoveryStarted, releaseRecovery, waiting;
+  const checkpointReached = new Promise(r => { checkpointReady = r; });
+  const checkpointGate = new Promise(r => { releaseCheckpoint = r; });
+  const recoveryReached = new Promise(r => { recoveryStarted = r; });
+  const recoveryGate = new Promise(r => { releaseRecovery = r; });
+  const waitingReached = new Promise(r => { waiting = r; });
+  const checkpointHealthy = f.gateway.checkpointHealthyIntake.bind(f.gateway);
+  f.gateway.checkpointHealthyIntake = async (...args) => { const result = await checkpointHealthy(...args); checkpointReady(); await checkpointGate; return result; };
+  const reconcile = f.gateway.reconcilePending.bind(f.gateway);
+  f.gateway.reconcilePending = (...args) => { const promise = reconcile(...args); if(args[1]?.channelIds?.includes(f.child.id)) waiting(); return promise; };
+  const fetchChannel = f.client.channels.fetch;
+  f.client.channels.fetch = async id => { if(id === other.id) { recoveryStarted(); await recoveryGate; } return fetchChannel(id); };
+  f.gateway.beginLiveCheckpoint(new Map([[f.child.id, 1]]));
+  const checkpoint = f.gateway.liveCheckpointPromise;
+  await checkpointReached;
+  const recovery = (async () => { await f.gateway.recoverTransport('ordinary-handoff', f.gateway.lifecycleEpoch, new Set([other.id])); await f.gateway.reconcilePending(undefined, { channelIds: [other.id] }); })();
+  try {
+    await recoveryReached; releaseCheckpoint(); await waitingReached;
+    await new Promise(r => setTimeout(r, 20));
+    f.gateway.boundMessage(f.message('102'));
+    assert.ok(f.state.getMessage('102'));
+    releaseRecovery();
+    await Promise.all([checkpoint, recovery]);
+    await Promise.all([...f.gateway.inFlight]);
+    await f.gateway.consumer.waitForNativeWork();
+    assert.deepEqual(f.dispatched.filter(m => m.nativeId === NATIVE).map(m => m.id), ['101', '102']);
+    for (const id of ['101', '102', '901']) assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLIED);
+    assert.equal(f.sends.filter(m => m.channelId === f.child.id).length, 2);
+  } finally { releaseCheckpoint(); releaseRecovery(); await Promise.allSettled([checkpoint, recovery]); }
+});
+
+test('later parent arrival cannot release an already blocked child route', { timeout: 3000 }, async t => {
+ const f = fixture(t); f.ready('99');
+ const claim = f.state.claimDispatch.bind(f.state);
+ let changed = false;
+ f.state.claimDispatch = id => {
+   if(id === '100' && !changed) { changed = true; f.state.markThreadBoundary(f.child.id, THREAD_STATES.PENDING, 'concurrent boundary', null, null, f.state.getBinding(f.parent.id)); }
+   return claim(id);
+ };
+ f.gateway.boundMessage(f.message('100'));
+ f.gateway.boundMessage(f.message('101', f.parent));
+ const other = f.makeChannel('3000', ChannelType.GuildText);
+ f.channels.set(other.id, other); f.histories.set(other.id, []);
+ f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+ f.gateway.boundMessage(f.message('901', other));
+ await new Promise(r => setTimeout(r, 40));
+ await f.gateway.consumer.waitForNativeWork();
+ assert.equal(changed, true);
+ assert.deepEqual(f.dispatched.filter(m => m.nativeId === NATIVE).map(m=>m.id), []);
+ assert.deepEqual(f.dispatched.filter(m => m.nativeId === SUCCESSOR).map(m=>m.id), ['901']);
+ f.gateway.boundMessage(f.message('102', f.parent));
+ await new Promise(resolve => setTimeout(resolve, 40));
+ assert.deepEqual(f.dispatched.filter(m => m.nativeId === NATIVE).map(m=>m.id), []);
+ f.state.markThreadBoundary(f.child.id, THREAD_STATES.READY, 'explicit recovery complete', null, null, f.state.getBinding(f.parent.id));
+ await f.gateway.reconcilePending(undefined, { readyOnly: true, channelIds: [f.child.id] });
+ await Promise.all([...f.gateway.inFlight]);
+ await f.gateway.consumer.waitForNativeWork();
+ assert.deepEqual(f.dispatched.filter(m => m.nativeId === NATIVE).map(m=>m.id), ['100', '101', '102']);
+ for (const id of ['100','101','102','901']) assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLIED);
+ assert.equal(f.sends.filter(m => m.channelId === f.child.id).length, 1);
+ assert.equal(f.sends.filter(m => m.channelId === f.parent.id).length, 2);
+});
+
+test('old enrolled receipt cannot finish under a new direct binding', { timeout: 5000 }, async t => {
+  const f = fixture(t); f.ready('100');
+  f.gateway.boundMessage(f.message('101'));
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForNativeWork();
+  await f.gateway.consumer.waitForReceipts();
+  const stored = f.state.getMessage('101');
+  assert.equal(stored.state, MESSAGE_STATES.REPLIED);
+  const parent = f.state.getBinding(f.parent.id);
+  const before = f.reactions.length;
+  const fetch = f.client.channels.fetch;
+  let release, entered;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  f.client.channels.fetch = async id => { if (id === f.child.id) { entered(); await blocked; } return fetch(id); };
+  const pending = f.gateway.sendTransportReceipt(stored, { reaction: 'eyes-control', targetMessageId: stored.id });
+  try {
+    await started;
+    assert.equal(f.state.unbind(f.parent.id, { expectedBinding: parent }), true);
+    const direct = f.state.bind({ channelId: f.child.id, guildId: 'guild', provider: 'codex', nativeId: parent.nativeId, workspace: f.dir });
+    assert.equal(direct.generation, stored.generation);
+    release();
+    await assert.rejects(pending, /message binding generation is stale/);
+  } finally { release(); f.client.channels.fetch = fetch; }
+  assert.equal(f.reactions.length, before, 'old authority must not publish a receipt after parent retirement');
+});
+
+test('checkpoint deadline before recursive fetch retains a bounded recovery wake', { timeout: 5000 }, async t => {
+  const f = fixture(t); f.ready('100');
+  f.gateway.liveCheckpointThreshold = 50;
+  f.histories.set(f.child.id, [f.message('101')]);
+  const originalNow = Date.now;
+  const hasEvidence = f.state.hasIntakeEvidence.bind(f.state);
+  let expired = false;
+  f.state.hasIntakeEvidence = id => {
+    const exists = hasEvidence(id);
+    if (!exists && !expired) { expired = true; const later = originalNow() + f.gateway.recoveryTimeoutMs + 10; Date.now = () => later; }
+    return exists;
+  };
+  try {
+    f.gateway.beginLiveCheckpoint(new Map([[f.child.id, 50]]));
+    await f.gateway.liveCheckpointPromise;
+  } finally { Date.now = originalNow; f.state.hasIntakeEvidence = hasEvidence; }
+  assert.equal(expired, true);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.PENDING);
+  f.histories.set(f.child.id, [f.message('101'), f.message('102')]);
+  f.gateway.boundMessage(f.message('102'));
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForReceipts();
+  const retry = f.gateway.liveCheckpointPromise || f.gateway.recoveryPromise;
+  if (retry) await retry;
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+  assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
+  for (const id of ['101', '102']) assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLIED);
+});
