@@ -285,7 +285,9 @@ function isConnectedBotMessage(message: unknown, botId: string | null | undefine
 }
 
 function isPermanentMetadataValid(attachment: AttachmentRecord): boolean {
-  return typeof attachment.contentType === 'string' && attachment.contentType.toLowerCase() === AGENT_ATTACHMENT_CONTENT_TYPE &&
+  const contentTypeValid = attachment.contentType === null ||
+    (typeof attachment.contentType === 'string' && attachment.contentType.toLowerCase() === AGENT_ATTACHMENT_CONTENT_TYPE);
+  return contentTypeValid &&
     Number.isSafeInteger(attachment.size) && Number(attachment.size) >= 1 && Number(attachment.size) <= AGENT_ATTACHMENT_MAX_BYTES &&
     attachmentUrlAllowed(attachment.url);
 }

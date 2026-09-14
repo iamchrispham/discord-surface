@@ -83,6 +83,47 @@ test('malformed reserved attachment follows ordinary bot coverage without waking
   assert.equal(state.getIntakeWatermark(target.channelId).last_seen_id, '7001');
 });
 
+test('Discord omitted attachment MIME reaches signed packet intake', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-null-mime-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-null-mime.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  const binding = state.getBinding(target.channelId);
+  state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
+  const destination = { ...target, generation: binding.generation };
+  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  let fetchCalls = 0;
+  let credentialCalls = 0;
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: {},
+    agentCredential: () => { credentialCalls += 1; return token; },
+    agentBotId: '901',
+    agentAttachmentFetch: async () => {
+      fetchCalls += 1;
+      return new Response(Buffer.from(wire), {
+        status: 200,
+        headers: { 'content-length': String(Buffer.byteLength(wire)) }
+      });
+    }
+  });
+  const message = {
+    id: '7002', guildId: destination.guildId, channelId: destination.channelId,
+    author: { id: '901', bot: true }, content: 'readable preview',
+    attachments: [{ url: 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether', filename: 'agent-message.tether', size: Buffer.byteLength(wire) }]
+  };
+  const intake = await consumer.intakeMessage(message, true, null, binding);
+  const stored = state.getMessage(message.id);
+  assert.equal(intake.accepted, true);
+  assert.equal(fetchCalls, 1);
+  assert.equal(credentialCalls, 1);
+  assert.ok(stored);
+  assert.equal(stored.content, wire);
+  assert.deepEqual(stored.attachments, []);
+  assert.equal(stored.agentMessage.id, packet.id);
+});
+
 test('declared attachment size mismatch is a retryable intake failure', async () => {
   const url = 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether';
   const body = Buffer.from('short body', 'utf8');
