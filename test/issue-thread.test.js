@@ -8,7 +8,7 @@ const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { DiscordGateway, waitForRecoveryOperation } = require('../src/discord');
 const { enrollPublicThread, recoverThread } = require('../src/discord/thread-enrollment');
-const { threadEnroll } = require('../src/cli');
+const { GATEWAY_CAPABILITIES, gatewayProcessStatus, main, pathsFor, threadEnroll } = require('../src/cli');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
@@ -182,6 +182,176 @@ test('thread checkpoint leaves parent watermark alone and refuses unseen coverag
   assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '101');
   assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
 });
+
+test('child recovery attempts share one deadline across sequential children', async t => {
+  const f = fixture(t);
+  f.ready('100');
+  const second = { ...f.child, id: '2001', parentId: f.parent.id };
+  f.channels.set(second.id, second);
+  f.histories.set(second.id, []);
+  second.messages = { async fetch(options) {
+    const history = f.histories.get(second.id);
+    if (options.limit === 1 && !options.after) return history.slice(-1);
+    return history.filter(message => !options.after || BigInt(message.id) > BigInt(options.after)).slice(0, options.limit);
+  } };
+  const binding = f.state.getBinding(f.parent.id);
+  f.state.enrollThread({ threadId: second.id, parentChannelId: f.parent.id, guildId: 'guild' }, binding);
+  f.state.setThreadBaseline(second.id, '100', binding);
+  f.state.markThreadBoundary(second.id, THREAD_STATES.READY, 'fixture adoption', null, null, binding);
+  f.gateway.recoveryTimeoutMs = 1200;
+  const calls = [];
+  f.gateway.fetchHistory = async channel => {
+    calls.push(channel.id);
+    await new Promise(resolve => setTimeout(resolve, 1300));
+    return [];
+  };
+  const started = Date.now();
+  const advanced = await f.gateway.checkpointHealthyIntake(
+    new AbortController().signal,
+    f.gateway.lifecycleEpoch,
+    new Map([[f.child.id, 1], [second.id, 1]])
+  );
+  const elapsed = Date.now() - started;
+  assert.equal(advanced.size, 0);
+  assert.deepEqual(calls, [f.child.id]);
+  assert.ok(elapsed < 2200, `shared deadline elapsed ${elapsed}ms`);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '100');
+  assert.equal(f.state.getThreadEnrollment(second.id).recoveredThroughId, '100');
+});
+
+test('closing recovery refuses READY when live child custody overtakes its final page', async t => {
+  const f = fixture(t);
+  f.ready('100');
+  f.gateway.historyPageLimit = 1;
+  let calls = 0;
+  f.gateway.fetchHistory = async () => {
+    calls += 1;
+    if (calls === 1) return [f.message('101')];
+    const live = f.state.acceptDiscordMessage({
+      id: '102',
+      guildId: 'guild',
+      channelId: f.child.id,
+      authorId: 'operator',
+      isBot: false,
+      content: 'arrived during recovery',
+      attachments: []
+    }, { ready: false, expectedBinding: f.state.getBinding(f.parent.id) });
+    assert.equal(live.accepted, true);
+    return [];
+  };
+  const result = await recoverThread(
+    f.gateway,
+    f.state.getThreadEnrollment(f.child.id),
+    new AbortController().signal,
+    f.gateway.lifecycleEpoch,
+    waitForRecoveryOperation
+  );
+  const enrollment = f.state.getThreadEnrollment(f.child.id);
+  assert.equal(result, false);
+  assert.equal(enrollment.state, THREAD_STATES.GAP);
+  assert.equal(enrollment.gapTo, '102');
+  assert.equal(calls, 2);
+  assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
+});
+
+test('checkpoint-only recovery reports no advancement when history has no new messages', async t => {
+  const f = fixture(t);
+  f.ready('100');
+  f.gateway.fetchHistory = async () => [];
+  const advanced = await f.gateway.checkpointHealthyIntake(
+    new AbortController().signal,
+    f.gateway.lifecycleEpoch,
+    new Map([[f.child.id, 1]])
+  );
+  assert.equal(advanced.has(f.child.id), false);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '100');
+});
+
+test('failed child lookup leaves accepted reply definitely unsent and marks child unavailable', async t => {
+  const f = fixture(t);
+  f.ready();
+  const stored = f.state.acceptDiscordMessage({
+    id: '100',
+    guildId: 'guild',
+    channelId: f.child.id,
+    authorId: 'operator',
+    isBot: false,
+    content: 'thread question',
+    attachments: []
+  }, { expectedBinding: f.state.getBinding(f.parent.id) }).message;
+  const originalFetch = f.client.channels.fetch;
+  f.client.channels.fetch = async id => {
+    if (id === f.child.id) throw new Error('child fetch failed');
+    return originalFetch(id);
+  };
+  await assert.rejects(
+    f.gateway.sendReply(stored, { id: '100', replyText: 'answer', replyNonce: 'reply-100' }),
+    error => error.outcome === 'not_sent' && error.message === 'child fetch failed'
+  );
+  assert.equal(f.sends.length, 0);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
+  assert.equal(f.state.getMessage('100').state, MESSAGE_STATES.ACCEPTED);
+});
+
+test('recover child CLI wake requests the thread-specific Gateway capability', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-cli-thread-recover-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const state = new SurfaceState(db);
+  state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused.secret') });
+  const binding = state.bind({ channelId: 'parent', guildId: 'guild', provider: 'codex', nativeId: NATIVE, workspace: dir });
+  state.enrollThread({ threadId: 'child', parentChannelId: 'parent', guildId: 'guild' }, binding);
+  state.close();
+  const paths = pathsFor({ 'state-dir': dir, db });
+  const cliPath = path.resolve(__dirname, '..', 'src', 'cli.js');
+  const title = `${process.execPath} ${cliPath} run --state-dir ${paths.stateDir}`;
+  const fakeGateway = require('node:child_process').spawn(process.execPath, ['-e',
+    `process.title=${JSON.stringify(title)}; process.on('SIGUSR2', () => {}); setTimeout(() => process.exit(0), 5000);`
+  ], { stdio: 'ignore' });
+  fs.writeFileSync(paths.pid, JSON.stringify({
+    pid: fakeGateway.pid,
+    guildId: 'guild',
+    stateDir: paths.stateDir,
+    db: paths.db,
+    command: 'run',
+    startedAt: new Date().toISOString(),
+    capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake]
+  }), { mode: 0o600 });
+  t.after(async () => {
+    if (fakeGateway.exitCode === null && fakeGateway.signalCode === null) fakeGateway.kill('SIGTERM');
+    if (fakeGateway.exitCode === null && fakeGateway.signalCode === null) {
+      await new Promise(resolve => {
+        const timer = setTimeout(() => { try { fakeGateway.kill('SIGKILL'); } catch {} resolve(); }, 1000);
+        fakeGateway.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const statusDeadline = Date.now() + 1000;
+  while (Date.now() < statusDeadline && gatewayProcessStatus(paths).state !== 'running') {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(gatewayProcessStatus(paths).state, 'running');
+  const originalArgv = process.argv;
+  let output = '';
+  const originalWrite = process.stdout.write;
+  process.argv = [process.execPath, cliPath, 'recover', '--state-dir', dir, '--db', db, '--intake-channel-id', 'child'];
+  process.stdout.write = chunk => { output += String(chunk); return true; };
+  try {
+    await main();
+  } finally {
+    process.argv = originalArgv;
+    process.stdout.write = originalWrite;
+  }
+  const result = JSON.parse(output);
+  assert.deepEqual(result.gatewayWake, {
+    requested: false,
+    pid: fakeGateway.pid,
+    state: 'running',
+    reason: 'gateway-wake-unsupported',
+    capability: GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake
+  });
+});
+
 
 test('history bounds and cancellation preserve custody without touching parent', async t => {
   const f = fixture(t); f.ready('100');

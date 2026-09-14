@@ -1294,6 +1294,7 @@ class SurfaceState {
       if (intakeCutoff !== null) {
         this.setIntakeCutoffInTransaction(channelId, input.guildId, intakeCutoff, 'ordinary binding adoption cutoff', current);
       }
+      if (!current.active) threadEnrollmentHandlers.deactivateThreadEnrollments(this, channelId, current);
       this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, session_root=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
         .run(input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
       this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
@@ -1340,6 +1341,7 @@ class SurfaceState {
         this.db.prepare("UPDATE intake_watermarks SET state='ready', updated_at=? WHERE channel_id=?")
           .run(now(), channelId);
       }
+      threadEnrollmentHandlers.deactivateThreadEnrollments(this, channelId, current);
       this.db.prepare('UPDATE bindings SET active=0, updated_at=? WHERE channel_id=?').run(now(), channelId);
       this.receipt(null, 'unbound', {
         channelId, generation: current.generation,
@@ -1373,12 +1375,16 @@ class SurfaceState {
     return threadEnrollmentHandlers.listThreadEnrollments(this, parentChannelId);
   }
 
+  deactivateThreadEnrollments(parentChannelId, expectedBinding = null) {
+    return threadEnrollmentHandlers.deactivateThreadEnrollments(this, parentChannelId, expectedBinding);
+  }
+
   setThreadBaseline(threadId, latestId, expectedBinding = null) {
     return threadEnrollmentHandlers.setThreadBaseline(this, threadId, latestId, expectedBinding);
   }
 
-  markThreadBoundary(threadId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null) {
-    return threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding);
+  markThreadBoundary(threadId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined) {
+    return threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding, coverageId, lastSeenBaselineId);
   }
 
   checkpointThread(threadId, coverageId, expectedBinding = null) {

@@ -1,5 +1,6 @@
 const GATEWAY_CAPABILITIES = Object.freeze({
   ordinaryBindWake: 'ordinary-bind-wake-v1',
+  threadEnrollmentRecoveryWake: 'thread-enrollment-recovery-wake-v1',
   runtimeBindLock: 'runtime-bind-lock-v1',
   ordinaryClaudeBind: 'ordinary-claude-bind-v1'
 });

@@ -1066,13 +1066,17 @@ class DiscordGateway {
     const binding = this.state.getBinding(stored.channelId);
     const route = this.state.getMessageRoute(stored.deliveryChannelId);
     if (!route) throw Object.assign(new Error('Thread delivery has no active parent route'), { outcome: 'not_sent' });
-    const channel = message.channel?.id === stored.deliveryChannelId ? message.channel :
-      await this.client.channels.fetch(stored.deliveryChannelId);
-    try { assertPublicThread(channel, binding, stored.deliveryChannelId, this.client.user); }
+    let channel;
+    try {
+      channel = message.channel?.id === stored.deliveryChannelId ? message.channel :
+        await this.client.channels.fetch(stored.deliveryChannelId);
+      assertPublicThread(channel, binding, stored.deliveryChannelId, this.client.user);
+    }
     catch (error) {
-      this.markThreadDeliveryUnavailable(stored, error);
-      error.outcome = 'not_sent';
-      throw error;
+      const deliveryError = error instanceof Error ? error : new Error(String(error));
+      this.markThreadDeliveryUnavailable(stored, deliveryError);
+      deliveryError.outcome = 'not_sent';
+      throw deliveryError;
     }
     return { ...message, channelId: stored.deliveryChannelId, channel };
   }
@@ -1581,7 +1585,7 @@ class DiscordGateway {
     for (const enrollment of this.state.listThreadEnrollments()) {
       if (!enrollment.active || enrollment.state !== THREAD_STATES.READY ||
           (triggeredChannels.size && !triggeredChannels.has(enrollment.threadId))) continue;
-      if (await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, true)) {
+      if (await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, true, deadline)) {
         advancedChannels.add(enrollment.threadId);
       }
     }
@@ -1860,7 +1864,7 @@ class DiscordGateway {
     }
     for (const enrollment of this.state.listThreadEnrollments()) {
       if (!enrollment.active || (selectedChannels && !selectedChannels.has(enrollment.parentChannelId) && !selectedChannels.has(enrollment.threadId))) continue;
-      await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation);
+      await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, false, deadline);
     }
     return failure || { ready: true, state: 'ready' };
   }

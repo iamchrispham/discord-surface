@@ -45,7 +45,7 @@ interface ThreadStateOwner {
   getThreadEnrollment(id: string): ThreadEnrollment | null;
   enrollThread(input: { threadId: string; parentChannelId: string; guildId: string }, binding: ThreadBinding): unknown;
   setThreadBaseline(id: string, latestId: string | null, binding: ThreadBinding): unknown;
-  markThreadBoundary(id: string, state: ThreadState, detail: string, from: string | null, to: string | null, binding: ThreadBinding): unknown;
+  markThreadBoundary(id: string, state: ThreadState, detail: string, from: string | null, to: string | null, binding: ThreadBinding, coverageId?: string | null, lastSeenBaselineId?: string | null): ThreadEnrollment | null;
   checkpointThread(id: string, coverage: string, binding: ThreadBinding): unknown;
   hasIntakeEvidence(id: string): boolean;
 }
@@ -88,19 +88,36 @@ export async function enrollPublicThread(state: ThreadStateOwner, client: Thread
 }
 
 export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEnrollment, signal: AbortSignal,
-  epoch: number, wait: WaitOperation, checkpointOnly = false): Promise<boolean> {
+  epoch: number, wait: WaitOperation, checkpointOnly = false, deadline = Date.now() + gateway.recoveryTimeoutMs): Promise<boolean> {
   const parent = gateway.state.getMessageRoute(enrollment.parentChannelId);
   if (!parent?.ready) return false;
   const binding = parent.binding;
   if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state)) return false;
-  const deadline = Date.now() + gateway.recoveryTimeoutMs;
   const current = () => !signal.aborted && gateway.isCurrentLifecycle(epoch) && gateway.isCurrentBinding(binding);
-  const boundary = (state: ThreadState, detail: string, after: string | null) => {
-    if (current()) gateway.state.markThreadBoundary(enrollment.threadId, state, detail, enrollment.recoveredThroughId, after, binding);
+  const boundary = (
+    state: ThreadState,
+    detail: string,
+    after: string | null,
+    coverageId: string | null | undefined = undefined,
+    lastSeenBaselineId: string | null | undefined = undefined
+  ) => {
+    if (!current()) return null;
+    return gateway.state.markThreadBoundary(
+      enrollment.threadId,
+      state,
+      detail,
+      enrollment.recoveredThroughId,
+      after,
+      binding,
+      coverageId,
+      lastSeenBaselineId
+    );
   };
   if (!current()) return false;
   if (!checkpointOnly) boundary(THREAD_STATES.PENDING, 'Thread history recovery in progress', null);
   let after = enrollment.recoveredThroughId;
+  const startingAfter = after;
+  const startingLastSeenId = enrollment.lastSeenId;
   try {
     const channel = await wait(() => gateway.client.channels.fetch(enrollment.threadId), signal, deadline);
     if (!current()) return false;
@@ -157,9 +174,29 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       if (!checkpointOnly) boundary(THREAD_STATES.GAP, 'Thread history recovery bound reached', after);
       return false;
     }
-    if (checkpointOnly) return Boolean(after && gateway.state.checkpointThread(enrollment.threadId, after, binding));
-    boundary(THREAD_STATES.READY, 'Thread history recovered', null);
-    return gateway.state.getThreadEnrollment(enrollment.threadId)?.state === THREAD_STATES.READY;
+    if (checkpointOnly) {
+      const advanced = Boolean(after && (!startingAfter || compareIds(after, startingAfter) > 0));
+      const checkpointed = advanced ? gateway.state.checkpointThread(enrollment.threadId, after!, binding) as ThreadEnrollment | null : null;
+      return Boolean(checkpointed?.recoveredThroughId === after && checkpointed.recoveredThroughId !== startingAfter);
+    }
+    const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
+    if (!currentEnrollment?.active) return false;
+    const liveCustodyAhead = Boolean(currentEnrollment.lastSeenId &&
+      (!after || compareIds(currentEnrollment.lastSeenId, after) > 0) &&
+      (!startingLastSeenId || compareIds(currentEnrollment.lastSeenId, startingLastSeenId) > 0));
+    if (liveCustodyAhead) {
+      gateway.state.markThreadBoundary(
+        enrollment.threadId,
+        THREAD_STATES.GAP,
+        'live Discord custody arrived while thread recovery was closing',
+        currentEnrollment.recoveredThroughId,
+        currentEnrollment.lastSeenId,
+        binding
+      );
+      return false;
+    }
+    const readyBoundary = boundary(THREAD_STATES.READY, 'Thread history recovered', null, after, startingLastSeenId);
+    return readyBoundary?.state === THREAD_STATES.READY;
   } catch (error) {
     if (!current()) return false;
     if (!checkpointOnly) {

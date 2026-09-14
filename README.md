@@ -46,8 +46,12 @@ node src/cli.js thread-enroll --state-dir "$HOME/.config/discord-surface" \
 
 Enrollment keeps the parent's native session and generation. Messages, receipt reactions,
 read acknowledgments and replies stay in the enrolled thread. Each thread has a separate
-history cursor. Repeating enrollment preserves that cursor. The command records each new enrollment as pending and requests recovery from the running Gateway. `status` shows the enrollment's
+history cursor. Repeating an active enrollment preserves that cursor. The command records each new enrollment as pending and requests recovery from a Gateway that supports threads. `status` shows the enrollment's
 readiness. A requested wake does not prove recovery or delivery.
+
+Unbinding the parent retires its thread enrollments. After rebinding the parent, explicitly
+enroll the same thread again to establish a fresh adoption boundary. Messages posted while
+the parent was unbound are excluded from the new enrollment.
 
 The first history read establishes the adoption boundary. Existing backlog is excluded,
 while messages already accepted during recovery retain custody. Restart recovery backfills

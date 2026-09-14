@@ -9,6 +9,7 @@ const { SurfaceState, MESSAGE_STATES, PROVIDERS, READINESS } = require('../src/s
 const { THREAD_INTAKE_REASONS, THREAD_RECEIPT_KINDS, THREAD_STATES } = require('../src/state/thread-enrollment');
 
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
+const SUCCESSOR = 'f8296579-092b-4503-bf98-1f3c2b6d4913';
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-thread-state-'));
@@ -94,6 +95,36 @@ test('thread enrollment is durable, idempotent, parent-scoped, and readiness-gat
     { threadId: 'child', parentChannelId: 'other-parent', guildId: 'guild' },
     f.state.getBinding('parent')
   ), null);
+});
+
+test('unbound child stays dark then re-enrolls under the same parent with a fresh pending boundary', t => {
+  const f = fixture(t);
+  const original = f.state.getBinding('parent');
+  f.enroll();
+
+  assert.equal(f.state.unbind('parent', { expectedBinding: original }), true);
+  assert.equal(f.state.getMessageRoute('child'), null);
+  const during = f.state.acceptDiscordMessage(event('150'), { expectedBinding: original });
+  assert.equal(during.accepted, false);
+  assert.equal(during.reason, 'stale-binding');
+  assert.equal(f.state.getMessage('150'), null);
+
+  const successor = f.state.rebind({
+    channelId: 'parent',
+    guildId: 'guild',
+    provider: PROVIDERS.CODEX,
+    nativeId: SUCCESSOR,
+    workspace: f.dir
+  });
+  const reopened = f.state.enrollThread(
+    { threadId: 'child', parentChannelId: 'parent', guildId: 'guild' },
+    successor
+  );
+  assert.equal(reopened.active, true);
+  assert.equal(reopened.state, THREAD_STATES.PENDING);
+  assert.equal(reopened.adoptedAt, null);
+  assert.equal(reopened.recoveredThroughId, null);
+  assert.equal(f.state.getMessageRoute('child').ready, false);
 });
 
 test('child intake records parent authority and child delivery while preserving custody', t => {

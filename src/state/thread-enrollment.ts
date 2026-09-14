@@ -142,6 +142,7 @@ export interface ThreadEnrollmentHandlers {
   enrollThread(state: ThreadEnrollmentState, input: ThreadEnrollmentInput, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
   getThreadEnrollment(state: ThreadEnrollmentState, threadId: string): ThreadEnrollment | null;
   listThreadEnrollments(state: ThreadEnrollmentState, parentChannelId?: string | null): ThreadEnrollment[];
+  deactivateThreadEnrollments(state: ThreadEnrollmentState, parentChannelId: string, expectedBinding?: ThreadBinding | null): number;
   setThreadBaseline(state: ThreadEnrollmentState, threadId: string, latestId: string | null, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
   markThreadBoundary(
     state: ThreadEnrollmentState,
@@ -150,7 +151,9 @@ export interface ThreadEnrollmentHandlers {
     detail?: string | null,
     gapFrom?: string | null,
     gapTo?: string | null,
-    expectedBinding?: ThreadBinding | null
+    expectedBinding?: ThreadBinding | null,
+    coverageId?: string | null,
+    lastSeenBaselineId?: string | null
   ): ThreadEnrollment | null;
   checkpointThread(state: ThreadEnrollmentState, threadId: string, coverageId: string, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
   reconcileThread(state: ThreadEnrollmentState, threadId: string, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
@@ -225,15 +228,18 @@ export function createThreadEnrollmentHandlers({
           if (existing.parentChannelId !== parentChannelId || existing.guildId !== guildId) {
             throw new BindingError('thread is already enrolled under another parent');
           }
-          if (!existing.active) throw new BindingError('thread enrollment is inactive');
-          return existing;
+          if (existing.active) return existing;
         }
         const timestamp = now();
         state.db.prepare(`INSERT INTO thread_enrollments(
           thread_id, parent_channel_id, guild_id, state, active,
           adopted_through_id, adopted_at, last_seen_id, recovered_through_id, last_accepted_id,
           gap_from, gap_to, detail, created_at, updated_at
-        ) VALUES(?, ?, ?, ?, 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)`).run(
+        ) VALUES(?, ?, ?, ?, 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+          state=excluded.state, active=1, adopted_through_id=NULL, adopted_at=NULL,
+          last_seen_id=NULL, recovered_through_id=NULL, last_accepted_id=NULL,
+          gap_from=NULL, gap_to=NULL, detail=NULL, updated_at=excluded.updated_at`).run(
           threadId, parentChannelId, guildId, states.PENDING, timestamp, timestamp
         );
         state.receipt(null, THREAD_RECEIPT_KINDS.ENROLLED, { threadId, parentChannelId, guildId, state: states.PENDING });
@@ -252,6 +258,32 @@ export function createThreadEnrollmentHandlers({
         ? state.db.prepare('SELECT * FROM thread_enrollments ORDER BY parent_channel_id, thread_id').all()
         : state.db.prepare('SELECT * FROM thread_enrollments WHERE parent_channel_id=? ORDER BY thread_id').all(parentChannelId);
       return rows.map(row => rowEnrollment(row)).filter((row): row is ThreadEnrollment => row !== null);
+    },
+
+    deactivateThreadEnrollments(state, parentChannelId, expectedBinding = null) {
+      const checkedParentChannelId = assertText(parentChannelId, 'parentChannelId', 128);
+      const binding = state.getBinding(checkedParentChannelId);
+      if (!binding || !bindingMatchesExpected(binding, expectedBinding || null)) return 0;
+      const rows = state.db.prepare('SELECT thread_id FROM thread_enrollments WHERE parent_channel_id=? AND active=1 ORDER BY thread_id')
+        .all(checkedParentChannelId);
+      if (!rows.length) return 0;
+      const timestamp = now();
+      const detail = 'parent binding was unbound';
+      state.db.prepare(`UPDATE thread_enrollments
+        SET state=?, active=0, detail=?, updated_at=?
+        WHERE parent_channel_id=? AND active=1`).run(
+        states.UNAVAILABLE, detail, timestamp, checkedParentChannelId
+      );
+      for (const row of rows) {
+        state.receipt(null, THREAD_RECEIPT_KINDS.BOUNDARY, {
+          threadId: String(row.thread_id),
+          parentChannelId: checkedParentChannelId,
+          state: states.UNAVAILABLE,
+          detail,
+          generation: binding.generation
+        });
+      }
+      return rows.length;
     },
 
     setThreadBaseline(state, threadId, latestId, expectedBinding = null) {
@@ -278,7 +310,7 @@ export function createThreadEnrollmentHandlers({
       });
     },
 
-    markThreadBoundary(state, threadId, nextState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null) {
+    markThreadBoundary(state, threadId, nextState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined) {
       assertText(threadId, 'threadId', 128);
       if (!validStates.has(nextState)) throw new BindingError('invalid thread enrollment state');
       if (gapFrom !== null) assertText(gapFrom, 'gapFrom', 128);
@@ -288,12 +320,17 @@ export function createThreadEnrollmentHandlers({
         const existing = requireEnrollment(state, threadId);
         const binding = currentParent(state, existing, expectedBinding);
         if (!binding || !binding.active) return null;
+        if (nextState === states.READY && coverageId !== undefined && lastSeenBaselineId !== undefined && existing.lastSeenId &&
+          (!coverageId || compareDiscordIds(existing.lastSeenId, coverageId) > 0) &&
+          (!lastSeenBaselineId || compareDiscordIds(existing.lastSeenId, lastSeenBaselineId) > 0)) return existing;
         const timestamp = now();
+        const persistedGapFrom = nextState === states.READY ? null : gapFrom;
+        const persistedGapTo = nextState === states.READY ? null : gapTo;
         state.db.prepare('UPDATE thread_enrollments SET state=?, detail=?, gap_from=?, gap_to=?, updated_at=? WHERE thread_id=? AND active=1')
-          .run(nextState, boundedDetail, gapFrom, gapTo, timestamp, threadId);
+          .run(nextState, boundedDetail, persistedGapFrom, persistedGapTo, timestamp, threadId);
         state.receipt(null, THREAD_RECEIPT_KINDS.BOUNDARY, {
           threadId, parentChannelId: existing.parentChannelId, state: nextState,
-          detail: boundedDetail, gapFrom, gapTo
+          detail: boundedDetail, gapFrom: persistedGapFrom, gapTo: persistedGapTo
         });
         return handlers.getThreadEnrollment(state, threadId);
       });

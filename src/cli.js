@@ -174,7 +174,10 @@ async function threadEnroll(args, dependencies = {}) {
     const deadline = Date.now() + RECOVERY_LIMITS.timeoutMs;
     await waitForRecoveryOperation(() => client.login((dependencies.readSecret || readSecret)(config.secretFile)), controller.signal, deadline, stop);
     const enrollment = await waitForRecoveryOperation(() => enrollPublicThread(state, client, parentId, threadId, controller.signal), controller.signal, deadline, stop);
-    const gatewayWake = (dependencies.requestGatewayRecovery || requestGatewayRecovery)(paths);
+    const requestRecovery = dependencies.requestGatewayRecovery || requestGatewayRecovery;
+    const gatewayWake = requestRecovery(paths, {
+      requiredCapability: GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake
+    });
     const result = { enrollment, gatewayWake };
     (dependencies.print || print)(result);
     return result;
@@ -186,7 +189,12 @@ async function threadEnroll(args, dependencies = {}) {
   }
 }
 
-function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill, expectedPid } = {}) {
+function requestGatewayRecovery(paths, {
+  status = gatewayProcessStatus,
+  kill = process.kill,
+  expectedPid,
+  requiredCapability = GATEWAY_CAPABILITIES.ordinaryBindWake
+} = {}) {
   const runtime = status(paths);
   if (runtime?.state !== 'running' || !runtime.pid) {
     return { requested: false, state: runtime?.state || 'unknown', reason: 'gateway-not-running' };
@@ -194,13 +202,13 @@ function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = p
   if (expectedPid !== undefined && String(runtime.pid) !== String(expectedPid)) {
     return { requested: false, pid: runtime.pid, state: runtime.state, reason: 'gateway-changed' };
   }
-  if (!runtime.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryBindWake)) {
+  if (!runtime.capabilities?.includes(requiredCapability)) {
     return {
       requested: false,
       pid: runtime.pid,
       state: runtime.state,
       reason: 'gateway-wake-unsupported',
-      capability: GATEWAY_CAPABILITIES.ordinaryBindWake
+      capability: requiredCapability
     };
   }
   try {
@@ -609,7 +617,12 @@ function recover(args) {
       const thread = state.getThreadEnrollment(channelId);
       const recovered = state.reconcileIntake(channelId);
       if (thread && !recovered) throw new Error('Thread recovery requires the current active parent binding');
-      print(thread ? { enrollment: recovered, gatewayWake: requestGatewayRecovery(paths) } : recovered);
+      print(thread ? {
+        enrollment: recovered,
+        gatewayWake: requestGatewayRecovery(paths, {
+          requiredCapability: GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake
+        })
+      } : recovered);
     } else if (args['message-id'] && ['reply_sent', 'reply_not_sent'].includes(args.resolution)) {
       print(state.reconcileReplyDelivery(required(args, 'message-id'), args.resolution === 'reply_sent' ? 'sent' : 'not_sent', {
         partIndex: args['part-index'] === undefined ? null : Number(args['part-index']),
@@ -1327,6 +1340,7 @@ function writePid(pidFile, guildId, stateDir, db) {
     startedAt: new Date().toISOString(),
     capabilities: [
       GATEWAY_CAPABILITIES.ordinaryBindWake,
+      GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake,
       GATEWAY_CAPABILITIES.runtimeBindLock,
       GATEWAY_CAPABILITIES.ordinaryClaudeBind
     ]
