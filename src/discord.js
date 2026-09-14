@@ -12,6 +12,8 @@ const { parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = re
 const requireInstalled = require;
 const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
 const DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS = 5000;
+const LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS = 1000;
+const LIVE_CHECKPOINT_RETRY_MAX_DELAY_MS = 30_000;
 const PENDING_HANDOFF_RECOVERY_POLL_MS = 100;
 const INTERACTION_CALLBACK_TIMEOUT_MS = 2500;
 const INTERACTION_REJECTION_MESSAGES = Object.freeze({
@@ -841,6 +843,9 @@ class DiscordGateway {
     this.liveCheckpointController = null;
     this.liveCheckpointPromise = null;
     this.liveIntakeCounts = new Map();
+    this.liveCheckpointRetryTimer = null;
+    this.liveCheckpointRetryChannels = null;
+    this.liveCheckpointRetryDelayMs = LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS;
     this.reconnectPromise = null;
     this.deferredHandoffRecoveryTimer = null;
     this.pendingHandoffRecoveryPollTimer = null;
@@ -1519,7 +1524,7 @@ class DiscordGateway {
     this.pendingHandoffRecoveryPollTimer = timer;
   }
 
-  beginLiveCheckpoint(triggeredCounts = new Map()) {
+  beginLiveCheckpoint(triggeredCounts = new Map(), { allowPendingRecovery = true } = {}) {
     if (this.liveCheckpointPromise || this.stopping || this.recoveryPromise) return;
     const controller = new AbortController();
     const epoch = this.lifecycleEpoch;
@@ -1566,9 +1571,53 @@ class DiscordGateway {
           }
           return;
         }
-        if (deferredCounts.size) this.beginLiveCheckpoint(deferredCounts);
+        if (!deferredCounts.size) {
+          this.liveCheckpointRetryDelayMs = LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS;
+          return;
+        }
+        const immediateCounts = new Map();
+        for (const [channelId, count] of deferredCounts) {
+          const pendingRecovery = allowPendingRecovery && this.state.getThreadEnrollment(channelId)?.state === THREAD_STATES.PENDING;
+          if (!advancedChannels.has(channelId) && !pendingRecovery) continue;
+          immediateCounts.set(channelId, count);
+          deferredCounts.delete(channelId);
+        }
+        if (deferredCounts.size) this.scheduleLiveCheckpointRetry(deferredCounts);
+        else this.liveCheckpointRetryDelayMs = LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS;
+        if (immediateCounts.size) this.beginLiveCheckpoint(immediateCounts, { allowPendingRecovery: false });
       });
     this.liveCheckpointPromise = checkpoint;
+  }
+
+  scheduleLiveCheckpointRetry(deferredCounts) {
+    if (!deferredCounts?.size || this.stopping) return;
+    const retryChannels = this.liveCheckpointRetryChannels || new Set();
+    for (const [channelId, count] of deferredCounts) {
+      const currentCount = this.liveIntakeCounts.get(channelId) || 0;
+      this.liveIntakeCounts.set(channelId, Math.max(currentCount, count));
+      retryChannels.add(channelId);
+    }
+    this.liveCheckpointRetryChannels = retryChannels;
+    if (this.liveCheckpointRetryTimer) return;
+    const retryDelay = Math.min(this.liveCheckpointRetryDelayMs || LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS, LIVE_CHECKPOINT_RETRY_MAX_DELAY_MS);
+    this.liveCheckpointRetryDelayMs = Math.min(retryDelay * 2, LIVE_CHECKPOINT_RETRY_MAX_DELAY_MS);
+    const timer = setTimeout(() => {
+      if (this.liveCheckpointRetryTimer === timer) this.liveCheckpointRetryTimer = null;
+      const channels = this.liveCheckpointRetryChannels || new Set();
+      this.liveCheckpointRetryChannels = null;
+      if (this.stopping || this.recoveryPromise || this.liveCheckpointPromise) return;
+      const retryCounts = new Map();
+      for (const channelId of channels) {
+        if (!this.state.getMessageRoute(channelId)?.binding.active) continue;
+        const count = this.liveIntakeCounts.get(channelId) || 0;
+        if (count < this.liveCheckpointThreshold) continue;
+        retryCounts.set(channelId, count);
+        this.liveIntakeCounts.set(channelId, 0);
+      }
+      if (retryCounts.size) this.beginLiveCheckpoint(retryCounts, { allowPendingRecovery: false });
+    }, retryDelay);
+    timer.unref?.();
+    this.liveCheckpointRetryTimer = timer;
   }
 
   async checkpointHealthyIntake(signal, lifecycleEpoch, triggeredCounts = new Map()) {
@@ -2072,6 +2121,10 @@ class DiscordGateway {
       const reconnect = this.reconnectPromise;
       const liveCheckpoint = this.liveCheckpointPromise;
       await Promise.allSettled([recovery, reconnect, liveCheckpoint].filter(Boolean));
+      if (this.liveCheckpointRetryTimer) clearTimeout(this.liveCheckpointRetryTimer);
+      this.liveCheckpointRetryTimer = null;
+      this.liveCheckpointRetryChannels = null;
+      this.liveCheckpointRetryDelayMs = LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS;
       this.liveIntakeCounts.clear();
       for (const controller of this.controllers) controller.abort();
       for (const controller of this.receiptControllers) controller.abort();
