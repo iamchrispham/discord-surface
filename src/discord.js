@@ -403,6 +403,12 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return current;
   }
 
+  function rejectEnrolledChildBot(message, expectedBinding, ready, coverageId = null) {
+    const route = state.getMessageRoute(message?.channelId);
+    if (!route?.enrollment || !message?.author?.bot) return null;
+    return state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding });
+  }
+
   function connectedBotId() {
     return typeof agentBotId === 'function' ? agentBotId() : agentBotId;
   }
@@ -871,6 +877,11 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function handleMessage(message, signal, expectedBinding = null, onIntake = null, bypassBarrier = false) {
+    const childBotRejection = rejectEnrolledChildBot(message, expectedBinding, true);
+    if (childBotRejection) {
+      if (!childBotRejection.stale) onIntake?.(message, childBotRejection);
+      return childBotRejection;
+    }
     const intake = await serializeIntake(message, async () => {
       const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
           fetchImpl: agentAttachmentFetch,
@@ -898,6 +909,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   async function intakeMessage(message, ready = false, coverageId = null, expectedBinding = null, emitReceipt = false, signal = null, deadline = null, bypassBarrier = false) {
+    const childBotRejection = rejectEnrolledChildBot(message, expectedBinding, ready, coverageId);
+    if (childBotRejection) return childBotRejection;
     const intake = await serializeIntake(message, async () => {
       const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
           fetchImpl: agentAttachmentFetch,
