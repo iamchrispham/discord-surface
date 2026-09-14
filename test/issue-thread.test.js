@@ -461,6 +461,43 @@ test('child transport receipt preserves a definite not-sent lookup outcome', asy
   assert.equal(f.state.getTransportReceipt('100').outcome.outcome, 'not_sent');
 });
 
+test('late child delivery failure cannot demote a successor enrollment', async t => {
+  const f = fixture(t); f.ready();
+  f.gateway.boundMessage(f.message('100'));
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForNativeWork();
+  await f.gateway.consumer.waitForReceipts();
+  const stored = f.state.getMessage('100');
+  assert.equal(stored.state, MESSAGE_STATES.REPLIED);
+
+  let startFetch;
+  let rejectFetch;
+  const fetchStarted = new Promise(resolve => { startFetch = resolve; });
+  const originalFetch = f.client.channels.fetch;
+  f.client.channels.fetch = async id => {
+    if (id === f.child.id) {
+      startFetch();
+      return new Promise((_resolve, reject) => { rejectFetch = reject; });
+    }
+    return originalFetch(id);
+  };
+  try {
+    const receipt = f.gateway.sendTransportReceipt(stored, { reaction: '👀', targetMessageId: stored.id });
+    await fetchStarted;
+
+    const original = f.state.getBinding(f.parent.id);
+    const successor = f.state.rebind({ ...original, nativeId: SUCCESSOR, readiness: READINESS.READY });
+    assert.equal(successor.generation, original.generation + 1);
+    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+
+    rejectFetch(new Error('late child lookup failed'));
+    await assert.rejects(receipt, /late child lookup failed/);
+    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+  } finally {
+    f.client.channels.fetch = originalFetch;
+  }
+});
+
 test('unbound Gateway traffic does not throw or dispatch native work', async t => {
   const f = fixture(t); f.gateway.ready = true;
   const unbound = { ...f.parent, id: '3000' };

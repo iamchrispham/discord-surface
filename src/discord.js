@@ -1079,8 +1079,10 @@ class DiscordGateway {
   markThreadDeliveryUnavailable(message, error) {
     const stored = this.state.getMessage(message.id);
     if (!stored?.deliveryChannelId || stored.deliveryChannelId === stored.channelId) return;
+    const binding = this.state.getBinding(stored.channelId);
+    if (!bindingIdentityMatches(stored, binding)) return;
     this.state.markThreadBoundary(stored.deliveryChannelId, THREAD_STATES.UNAVAILABLE,
-      error.message, null, null, this.state.getBinding(stored.channelId));
+      error.message, null, null, binding);
   }
 
   async threadDeliveryMessage(message) {
