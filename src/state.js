@@ -9,7 +9,13 @@ const { createOrdinaryRepository } = require('./ordinary');
 const { createDirectPostHandlers, queryDirectPostRows } = require('./state/direct-post');
 const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = require('./state/board-refresh');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
-const { createThreadEnrollmentHandlers, THREAD_INTAKE_REASONS, THREAD_STATES, THREAD_RECEIPT_KINDS } = require('./state/thread-enrollment');
+const {
+  createThreadEnrollmentHandlers,
+  THREAD_DEACTIVATION_DETAILS,
+  THREAD_INTAKE_REASONS,
+  THREAD_STATES,
+  THREAD_RECEIPT_KINDS
+} = require('./state/thread-enrollment');
 const {
   createIntakeHandlers,
   intakeCutoffDecision,
@@ -1294,7 +1300,7 @@ class SurfaceState {
       if (intakeCutoff !== null) {
         this.setIntakeCutoffInTransaction(channelId, input.guildId, intakeCutoff, 'ordinary binding adoption cutoff', current);
       }
-      if (!current.active) threadEnrollmentHandlers.deactivateThreadEnrollments(this, channelId, current);
+      threadEnrollmentHandlers.deactivateThreadEnrollments(this, channelId, current, THREAD_DEACTIVATION_DETAILS.GENERATION_CHANGED);
       this.db.prepare(`UPDATE bindings SET guild_id=?, provider=?, native_id=?, workspace=?, session_root=?, endpoint=?, category_id=?, readiness=?, generation=?, active=1, updated_at=? WHERE channel_id=?`)
         .run(input.guildId, input.provider, input.nativeId, input.workspace, input.sessionRoot, input.endpoint, input.categoryId, READINESS.PENDING, generation, now(), channelId);
       this.receipt(null, 'rebound', { channelId, conductorId: input.conductorId, generation });
@@ -1490,6 +1496,7 @@ class SurfaceState {
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       this.assertLegacyMigrationSafe(channelId);
       const generation = existing.generation + 1;
+      threadEnrollmentHandlers.deactivateThreadEnrollments(this, channelId, current, THREAD_DEACTIVATION_DETAILS.GENERATION_CHANGED);
       this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
         .run(input.nativeId, input.workspace, input.sessionRoot, input.endpoint, READINESS.PENDING, generation, now(), channelId, provider, conductorId, fromGeneration, fromNativeId);
       this.receipt(null, 'conductor-handoff', {

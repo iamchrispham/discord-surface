@@ -10,6 +10,8 @@ const { THREAD_INTAKE_REASONS, THREAD_RECEIPT_KINDS, THREAD_STATES } = require('
 
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const SUCCESSOR = 'f8296579-092b-4503-bf98-1f3c2b6d4913';
+const CONDUCTOR_NATIVE = '2ccf0a8d-4d5e-4a0f-9a91-8b12f6e4c0d7';
+const CONDUCTOR_SUCCESSOR = 'f5f11e29-1d1e-4b8d-a8cc-03c65d26c9b4';
 
 function fixture(t, { ordinary = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-thread-state-'));
@@ -128,6 +130,44 @@ test('unbound child stays dark then re-enrolls under the same parent with a fres
   assert.equal(reopened.adoptedAt, null);
   assert.equal(reopened.recoveredThroughId, null);
   assert.equal(f.state.getMessageRoute('child').ready, false);
+});
+
+test('parent generation changes retire active thread enrollments', t => {
+  const f = fixture(t);
+  f.enroll();
+  const predecessor = f.state.getBinding('parent');
+  const successor = f.state.rebind({ ...predecessor, nativeId: SUCCESSOR });
+  assert.equal(successor.generation, predecessor.generation + 1);
+  assert.equal(f.state.getThreadEnrollment('child').active, false);
+  assert.equal(f.state.getThreadEnrollment('child').state, THREAD_STATES.UNAVAILABLE);
+
+  const conductorBinding = f.state.bind({
+    channelId: 'conductor-parent',
+    guildId: 'guild',
+    provider: PROVIDERS.CODEX,
+    nativeId: CONDUCTOR_NATIVE,
+    workspace: f.dir,
+    conductorId: 'conductor',
+    repoKey: 'repo'
+  });
+  f.state.enrollThread(
+    { threadId: 'conductor-child', parentChannelId: conductorBinding.channelId, guildId: 'guild' },
+    conductorBinding
+  );
+  const conductorSuccessor = f.state.handoffConductor({
+    channelId: conductorBinding.channelId,
+    provider: PROVIDERS.CODEX,
+    conductorId: 'conductor',
+    repoKey: 'repo',
+    fromNativeId: conductorBinding.nativeId,
+    fromGeneration: conductorBinding.generation,
+    nativeId: CONDUCTOR_SUCCESSOR,
+    workspace: f.dir,
+    handoffId: 'conductor-enrollment-fence'
+  });
+  assert.equal(conductorSuccessor.generation, conductorBinding.generation + 1);
+  assert.equal(f.state.getThreadEnrollment('conductor-child').active, false);
+  assert.equal(f.state.getThreadEnrollment('conductor-child').state, THREAD_STATES.UNAVAILABLE);
 });
 
 test('child intake records parent authority and child delivery while preserving custody', t => {

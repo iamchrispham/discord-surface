@@ -599,7 +599,7 @@ test('child transport receipt preserves a definite not-sent lookup outcome', asy
   assert.equal(f.state.getTransportReceipt('100').outcome.outcome, 'not_sent');
 });
 
-test('late child delivery failure cannot demote a successor enrollment', async t => {
+test('late child delivery failure cannot resurrect a retired enrollment', async t => {
   const f = fixture(t); f.ready();
   f.gateway.boundMessage(f.message('100'));
   await Promise.all([...f.gateway.inFlight]);
@@ -626,11 +626,12 @@ test('late child delivery failure cannot demote a successor enrollment', async t
     const original = f.state.getBinding(f.parent.id);
     const successor = f.state.rebind({ ...original, nativeId: SUCCESSOR, readiness: READINESS.READY });
     assert.equal(successor.generation, original.generation + 1);
-    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+    assert.equal(f.state.getThreadEnrollment(f.child.id).active, false);
+    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
 
     rejectFetch(new Error('late child lookup failed'));
     await assert.rejects(receipt, /late child lookup failed/);
-    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+    assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
   } finally {
     f.client.channels.fetch = originalFetch;
   }
@@ -836,7 +837,10 @@ test('parent handoff waits for child custody then new child work inherits succes
   await f.gateway._reconcilePending(null, signal, true);
   await f.gateway.consumer.waitForNativeWork();
   assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
-  f.state.rebind(successor);
+  const rebound = f.state.rebind(successor);
+  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild' }, rebound);
+  f.state.setThreadBaseline(f.child.id, '101', rebound);
+  f.state.markThreadBoundary(f.child.id, THREAD_STATES.READY, 'successor ready', null, null, rebound);
   f.state.setBindingReadiness(f.parent.id, READINESS.READY, 'successor ready');
   f.gateway.boundMessage(f.message('102'));
   await Promise.all([...f.gateway.inFlight]);

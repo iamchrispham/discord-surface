@@ -11,6 +11,13 @@ export const THREAD_STATES = Object.freeze({
 
 export type ThreadState = typeof THREAD_STATES[keyof typeof THREAD_STATES];
 
+export const THREAD_DEACTIVATION_DETAILS = Object.freeze({
+  UNBOUND: 'parent binding was unbound',
+  GENERATION_CHANGED: 'parent binding generation changed'
+} as const);
+
+export type ThreadDeactivationDetail = typeof THREAD_DEACTIVATION_DETAILS[keyof typeof THREAD_DEACTIVATION_DETAILS];
+
 export const THREAD_RECEIPT_KINDS = Object.freeze({
   ENROLLED: 'thread-enrolled',
   BASELINE: 'thread-baseline',
@@ -154,7 +161,7 @@ export interface ThreadEnrollmentHandlers {
   enrollThread(state: ThreadEnrollmentState, input: ThreadEnrollmentInput, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
   getThreadEnrollment(state: ThreadEnrollmentState, threadId: string): ThreadEnrollment | null;
   listThreadEnrollments(state: ThreadEnrollmentState, parentChannelId?: string | null): ThreadEnrollment[];
-  deactivateThreadEnrollments(state: ThreadEnrollmentState, parentChannelId: string, expectedBinding?: ThreadBinding | null): number;
+  deactivateThreadEnrollments(state: ThreadEnrollmentState, parentChannelId: string, expectedBinding?: ThreadBinding | null, detail?: ThreadDeactivationDetail): number;
   setThreadBaseline(state: ThreadEnrollmentState, threadId: string, latestId: string | null, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
   markThreadBoundary(
     state: ThreadEnrollmentState,
@@ -277,7 +284,7 @@ export function createThreadEnrollmentHandlers({
       return rows.map(row => rowEnrollment(row)).filter((row): row is ThreadEnrollment => row !== null);
     },
 
-    deactivateThreadEnrollments(state, parentChannelId, expectedBinding = null) {
+    deactivateThreadEnrollments(state, parentChannelId, expectedBinding = null, detail = THREAD_DEACTIVATION_DETAILS.UNBOUND) {
       const checkedParentChannelId = assertText(parentChannelId, 'parentChannelId', 128);
       const binding = state.getBinding(checkedParentChannelId);
       if (!binding || !bindingMatchesExpected(binding, expectedBinding || null)) return 0;
@@ -285,7 +292,6 @@ export function createThreadEnrollmentHandlers({
         .all(checkedParentChannelId);
       if (!rows.length) return 0;
       const timestamp = now();
-      const detail = 'parent binding was unbound';
       state.db.prepare(`UPDATE thread_enrollments
         SET state=?, active=0, detail=?, updated_at=?
         WHERE parent_channel_id=? AND active=1`).run(
