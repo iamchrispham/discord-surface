@@ -159,6 +159,7 @@ function classifyReplyError(error) {
 }
 
 function classifyTransportReceiptError(error) {
+  if (error?.outcome === 'not_sent') return 'not_sent';
   if (error?.outcome !== 'sent' && TRANSPORT_RECEIPT_OUTCOMES.includes(error?.outcome)) return error.outcome;
   if (error?.status === 429 || error?.code === 429 || /^RateLimitError(?:\[|$)/.test(String(error?.name || '')) || /^RateLimitError(?:\[|$)/.test(String(error?.message || ''))) return 'rate_limited';
   if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
@@ -1104,6 +1105,8 @@ class DiscordGateway {
   }
 
   async sendReply(message, reply) {
+    const stored = this.state.getMessage(message.id);
+    const isThreadDelivery = Boolean(stored?.deliveryChannelId && stored.deliveryChannelId !== stored.channelId);
     message = await this.threadDeliveryMessage(message);
     this.state.assertMessageCurrent(reply.id, 'reply-send');
     if (typeof reply.replyText !== 'string' || reply.replyText.length > 2000) throw new Error('Discord reply must be at most 2000 characters per message');
@@ -1119,6 +1122,12 @@ class DiscordGateway {
         allowedMentions: { parse: [] }
       });
     } catch (error) {
+      const definitiveThreadRejection = isThreadDelivery &&
+        ([403, 404].includes(Number(error?.status)) || error?.code === 50013);
+      if (definitiveThreadRejection) {
+        const deliveryError = error instanceof Error ? error : new Error(String(error));
+        this.markThreadDeliveryUnavailable(message, deliveryError);
+      }
       if (!error.outcome) error.outcome = classifyReplyError(error);
       throw error;
     }
@@ -1935,7 +1944,10 @@ class DiscordGateway {
     const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
       (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready);
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
-    const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const ordered = candidates.sort((a, b) => {
+      const discordOrder = compareDiscordIds(a.id, b.id);
+      return discordOrder || a.createdAt.localeCompare(b.createdAt);
+    });
     const blockedOwners = new Set();
     for (const message of ordered) {
       if (signal?.aborted) return this.state.recoveryCandidates(before).filter(allowed);

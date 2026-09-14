@@ -2666,6 +2666,12 @@ class SurfaceState {
     }
     const watermarkGap = watermarks.find(row => row.state === 'gap' || row.state === 'unavailable');
     const watermarkPending = watermarks.some(row => row.state === 'pending');
+    const activeThreadGap = threadEnrollments.find(row => row.active && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(row.state));
+    const activeThreadPending = threadEnrollments.some(row => row.active && row.state === THREAD_STATES.PENDING);
+    let connectionBackfill = watermarks.length ? 'bounded-by-discord-watermark' : 'pending';
+    if (watermarkPending || activeThreadPending) connectionBackfill = 'pending';
+    if (activeThreadGap) connectionBackfill = activeThreadGap.state === THREAD_STATES.GAP ? 'unrecoverable-gap' : 'unavailable';
+    if (watermarkGap) connectionBackfill = watermarkGap.state === 'gap' ? 'unrecoverable-gap' : 'unavailable';
     return {
       configured: Boolean(config.operatorId && config.guildId && config.secretFile),
       activeBindings: bindings.filter(binding => binding.active).length,
@@ -2679,7 +2685,7 @@ class SurfaceState {
         nativeApproval: 'unverified-live',
         quota: 'unverified-live',
         billing: 'unverified-live',
-        connectionBackfill: watermarkGap ? (watermarkGap.state === 'gap' ? 'unrecoverable-gap' : 'unavailable') : watermarkPending ? 'pending' : watermarks.length ? 'bounded-by-discord-watermark' : 'pending',
+        connectionBackfill,
         recovery: RECOVERY_LIMITS
       },
       intakeWatermarks: watermarks.map(row => ({ channelId: row.channel_id, lastSeenId: row.last_seen_id, recoveredThroughId: row.recovered_through_id, state: row.state, gapFrom: row.gap_from, gapTo: row.gap_to, detail: row.detail })),
