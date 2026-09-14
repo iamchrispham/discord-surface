@@ -1524,8 +1524,14 @@ class DiscordGateway {
     this.liveCheckpointController = controller;
     let advancedChannels = new Set();
     const checkpoint = this.checkpointHealthyIntake(controller.signal, epoch, triggeredCounts)
-      .then(result => {
+      .then(async result => {
         advancedChannels = result instanceof Set ? result : new Set();
+        const threads = [...advancedChannels].filter(channelId => this.state.getThreadEnrollment(channelId)?.active);
+        if (threads.length) {
+          if (!controller.signal.aborted && this.isCurrentLifecycle(epoch)) {
+            await this.reconcilePending(undefined, { readyOnly: true, channelIds: threads });
+          }
+        }
         return result;
       })
       .catch(error => {
@@ -1924,11 +1930,17 @@ class DiscordGateway {
   }
 
   async reconcilePending(before = new Date().toISOString(), { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
+    const lifecycleEpoch = this.lifecycleEpoch;
+    const connectionEpoch = this.connectionEpoch;
+    while (this.recoveryPromise) {
+      await this.recoveryPromise.catch(() => {});
+      if (!this.isCurrentLifecycle(lifecycleEpoch) || connectionEpoch !== this.connectionEpoch) return [];
+    }
+    if (!this.isCurrentLifecycle(lifecycleEpoch)) return [];
     const hasReadyBinding = this.state.listBindings().some(binding => {
       return binding.active && binding.readiness === READINESS.READY;
     });
     if (!this.ready && !allowPaused && !hasReadyBinding) throw new Error('Discord gateway is not ready for recovery');
-    if (this.recoveryPromise) return this.recoveryPromise;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
     this.recoveryPromise = this._reconcilePending(before, controller.signal, readyOnly || allowPaused, channelIds);
@@ -1946,10 +1958,7 @@ class DiscordGateway {
     const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
       (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready);
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
-    const ordered = candidates.sort((a, b) => {
-      const discordOrder = compareDiscordIds(a.id, b.id);
-      return discordOrder || a.createdAt.localeCompare(b.createdAt);
-    });
+    const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const blockedOwners = new Set();
     for (const message of ordered) {
       if (signal?.aborted) return this.state.recoveryCandidates(before).filter(allowed);

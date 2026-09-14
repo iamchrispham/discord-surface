@@ -169,16 +169,127 @@ test('unavailable child does not demote parent or send accepted work to it', asy
   assert.equal(f.state.getMessage('100').state, MESSAGE_STATES.ACCEPTED);
 });
 
-test('thread checkpoint fences and recovers unseen child custody without touching the parent watermark', async t => {
+test('thread checkpoint delivers recovered custody without an unrelated wake', async t => {
   const f = fixture(t); f.ready('100');
   f.histories.set(f.child.id, [f.message('101')]);
-  const controller = new AbortController();
-  let advanced = await f.gateway.checkpointHealthyIntake(controller.signal, f.gateway.lifecycleEpoch, new Map([[f.child.id, 1]]));
-  assert.equal(advanced.has(f.child.id), true);
+  f.gateway.beginLiveCheckpoint(new Map([[f.child.id, 1]]));
+  await f.gateway.liveCheckpointPromise;
+  await f.gateway.consumer.waitForNativeWork();
   assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '101');
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
-  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(f.dispatched.map(message => message.id), ['101']);
+  assert.deepEqual(f.sends.map(message => message.channelId), [f.child.id]);
   assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
+});
+
+test('child checkpoint preserves a concurrent scoped recovery', { timeout: 5000 }, async t => {
+  const f = fixture(t); f.ready('100');
+  f.histories.set(f.child.id, [f.message('101')]);
+  const other = f.makeChannel('3000', ChannelType.GuildText);
+  f.channels.set(other.id, other);
+  f.histories.set(other.id, [f.message('901', other)]);
+  const binding = f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  f.state.acceptDiscordMessage({ id: '901', guildId: 'guild', channelId: other.id, authorId: 'operator', isBot: false, content: 'other owner' }, { ready: true, expectedBinding: binding });
+  let checkpointReady, releaseCheckpoint, recoveryStarted, releaseRecovery;
+  const checkpointReached = new Promise(resolve => { checkpointReady = resolve; });
+  const checkpointGate = new Promise(resolve => { releaseCheckpoint = resolve; });
+  const recoveryReached = new Promise(resolve => { recoveryStarted = resolve; });
+  const recoveryGate = new Promise(resolve => { releaseRecovery = resolve; });
+  const checkpointHealthy = f.gateway.checkpointHealthyIntake.bind(f.gateway);
+  f.gateway.checkpointHealthyIntake = async (...args) => {
+    const result = await checkpointHealthy(...args);
+    checkpointReady();
+    await checkpointGate;
+    return result;
+  };
+  const fetchChannel = f.client.channels.fetch;
+  f.client.channels.fetch = async id => {
+    if (id === other.id) { recoveryStarted(); await recoveryGate; }
+    return fetchChannel(id);
+  };
+  f.gateway.beginLiveCheckpoint(new Map([[f.child.id, 1]]));
+  const checkpoint = f.gateway.liveCheckpointPromise;
+  await checkpointReached;
+  const recovery = (async () => {
+    await f.gateway.recoverTransport('concurrent owner recovery', f.gateway.lifecycleEpoch, new Set([other.id]));
+    await f.gateway.reconcilePending(undefined, { channelIds: [other.id] });
+  })();
+  try {
+    await recoveryReached;
+    releaseCheckpoint();
+    releaseRecovery();
+    await Promise.all([checkpoint, recovery]);
+    await f.gateway.consumer.waitForNativeWork();
+    assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
+    assert.equal(f.state.getMessage('901').state, MESSAGE_STATES.REPLIED);
+    assert.deepEqual(f.dispatched.map(message => message.id).sort(), ['101', '901']);
+  } finally {
+    releaseCheckpoint(); releaseRecovery();
+    await Promise.allSettled([checkpoint, recovery]);
+  }
+});
+
+test('cancelled child checkpoint preserves custody without dispatching late', async t => {
+  const f = fixture(t); f.ready('100');
+  f.histories.set(f.child.id, [f.message('101')]);
+  const checkpointHealthy = f.gateway.checkpointHealthyIntake.bind(f.gateway);
+  f.gateway.checkpointHealthyIntake = async (...args) => {
+    const result = await checkpointHealthy(...args);
+    f.gateway.pauseConnection('checkpoint cancellation control');
+    return result;
+  };
+  f.gateway.beginLiveCheckpoint(new Map([[f.child.id, 1]]));
+  await f.gateway.liveCheckpointPromise;
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(f.dispatched, []);
+  assert.deepEqual(f.sends, []);
+});
+
+for (const exit of ['disconnect', 'stop']) {
+  test(`waiting reconciliation preserves custody on ${exit}`, { timeout: 5000 }, async t => {
+    const f = fixture(t); f.ready('100');
+    f.state.acceptDiscordMessage({ id: '101', guildId: 'guild', channelId: f.child.id, authorId: 'operator', isBot: false, content: 'held custody' },
+      { ready: true, expectedBinding: f.state.getBinding(f.parent.id) });
+    let reached, release;
+    const fetching = new Promise(resolve => { reached = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const fetchChannel = f.client.channels.fetch;
+    f.client.channels.fetch = async id => { reached(); await gate; return fetchChannel(id); };
+    const first = f.gateway.reconcilePending(undefined, { channelIds: [f.child.id] });
+    await fetching;
+    const waiting = f.gateway.reconcilePending(undefined, { channelIds: [f.child.id] });
+    try {
+      if (exit === 'stop') await f.gateway.stop();
+      else f.gateway.pauseConnection('waiting recovery cancellation control');
+      await Promise.all([first, waiting]);
+      release();
+      await f.gateway.consumer.waitForNativeWork();
+      assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+      assert.deepEqual(f.dispatched, []);
+      assert.deepEqual(f.sends, []);
+    } finally {
+      release();
+      await Promise.allSettled([first, waiting]);
+    }
+  });
+}
+
+test('global recovery preserves admission order across separate native owners', async t => {
+  const f = fixture(t); f.ready('100');
+  const other = f.makeChannel('3000', ChannelType.GuildText);
+  f.channels.set(other.id, other);
+  f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  for (const [id, channel] of [['900', f.parent], ['101', other]]) {
+    f.state.acceptDiscordMessage({ id, guildId: 'guild', channelId: channel.id, authorId: 'operator', isBot: false, content: 'owner recovery' },
+      { ready: true, expectedBinding: f.state.getBinding(channel.id) });
+  }
+  await f.gateway.reconcilePending();
+  await f.gateway.consumer.waitForNativeWork();
+  assert.deepEqual(f.dispatched.map(message => message.id), ['900', '101']);
+  assert.equal(f.state.getMessage('900').state, MESSAGE_STATES.REPLIED);
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
 });
 
 test('child recovery attempts share one deadline across sequential children', async t => {
