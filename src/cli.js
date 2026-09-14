@@ -10,9 +10,11 @@ const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
-const { DiscordGateway, discordIdAfter, readSecret, requireInstalled } = require('./discord');
+const { DiscordGateway, discordIdAfter, readSecret, requireInstalled, waitForRecoveryOperation } = require('./discord');
+const { enrollPublicThread } = require('./discord/thread-enrollment');
 const {
   assertOrdinaryIntakeRange,
+  assertHandoffIntakeCoverage,
   createHandoffFence,
   deleteHandoffFence,
   serverDerivedChannelCutoff
@@ -118,10 +120,34 @@ function bindingArgs(args) {
   };
 }
 
-function bind(args, rebind = false) {
+async function bind(args, rebind = false) {
   const { state } = openState(args);
-  try { print(rebind ? state.rebind(bindingArgs(args)) : state.bind(bindingArgs(args))); }
-  finally { state.close(); }
+  let client;
+  let handoffFence;
+  let enrollmentProof = null;
+  try {
+    const input = bindingArgs(args);
+    const hasActiveThreads = rebind && state.listThreadEnrollments(input.channelId).some(enrollment => enrollment.active);
+    let intakeCutoff = null;
+    if (hasActiveThreads) {
+      const config = state.requireConfig();
+      if (config.guildId !== input.guildId) throw new Error('rebind channel is outside the configured guild');
+      const { Client, GatewayIntentBits } = requireInstalled('discord.js');
+      client = new Client({ intents: [GatewayIntentBits.Guilds] });
+      await client.login(readSecret(config.secretFile));
+      const guild = await client.guilds.fetch(input.guildId);
+      const channel = await guild.channels.fetch(input.channelId);
+      handoffFence = await createHandoffFence(channel, 'parent rebind');
+      const current = state.getBinding(input.channelId);
+      if (current?.active) enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'parent rebind');
+      intakeCutoff = handoffFence.id;
+    }
+    print(rebind ? state.rebind(input, { intakeCutoff, enrollmentProof }) : state.bind(input));
+  } finally {
+    await deleteHandoffFence(handoffFence);
+    await client?.destroy();
+    state.close();
+  }
 }
 
 function ordinaryBindingArgs(args, environment = process.env, channelId = null, guildId = null, workspace = undefined, sessionRoot = undefined) {
@@ -155,7 +181,45 @@ async function latestChannelMessageId(channel) {
   return typeof message?.id === 'string' && message.id.length > 0 ? message.id : cached;
 }
 
-function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill, expectedPid } = {}) {
+async function threadEnroll(args, dependencies = {}) {
+  const { paths, state } = openState(args);
+  const install = dependencies.requireInstalled || requireInstalled;
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  let client;
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+  try {
+    const parentId = required(args, 'channel-id');
+    const threadId = required(args, 'thread-id');
+    const config = state.requireConfig();
+    if (state.getBinding(parentId)?.guildId !== config.guildId) throw new Error('Thread parent is outside the configured guild');
+    const { Client, GatewayIntentBits } = install('discord.js');
+    client = new Client({ intents: [GatewayIntentBits.Guilds], rest: { timeout: RECOVERY_LIMITS.timeoutMs } });
+    const deadline = Date.now() + RECOVERY_LIMITS.timeoutMs;
+    await waitForRecoveryOperation(() => client.login((dependencies.readSecret || readSecret)(config.secretFile)), controller.signal, deadline, stop);
+    const enrollment = await waitForRecoveryOperation(() => enrollPublicThread(state, client, parentId, threadId, controller.signal), controller.signal, deadline, stop);
+    const requestRecovery = dependencies.requestGatewayRecovery || requestGatewayRecovery;
+    const gatewayWake = requestRecovery(paths, {
+      requiredCapability: GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake
+    });
+    const result = { enrollment, gatewayWake };
+    (dependencies.print || print)(result);
+    return result;
+  } finally {
+    controller.abort();
+    process.off('SIGINT', stop);
+    process.off('SIGTERM', stop);
+    try { await client?.destroy(); } finally { state.close(); }
+  }
+}
+
+function requestGatewayRecovery(paths, {
+  status = gatewayProcessStatus,
+  kill = process.kill,
+  expectedPid,
+  requiredCapability = GATEWAY_CAPABILITIES.ordinaryBindWake
+} = {}) {
   const runtime = status(paths);
   if (runtime?.state !== 'running' || !runtime.pid) {
     return { requested: false, state: runtime?.state || 'unknown', reason: 'gateway-not-running' };
@@ -163,13 +227,13 @@ function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = p
   if (expectedPid !== undefined && String(runtime.pid) !== String(expectedPid)) {
     return { requested: false, pid: runtime.pid, state: runtime.state, reason: 'gateway-changed' };
   }
-  if (!runtime.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryBindWake)) {
+  if (!runtime.capabilities?.includes(requiredCapability)) {
     return {
       requested: false,
       pid: runtime.pid,
       state: runtime.state,
       reason: 'gateway-wake-unsupported',
-      capability: GATEWAY_CAPABILITIES.ordinaryBindWake
+      capability: requiredCapability
     };
   }
   try {
@@ -539,7 +603,7 @@ async function liaisonDraft(args) {
 }
 
 function recover(args) {
-  const { state } = openState(args);
+  const { paths, state } = openState(args);
   try {
     const boardRequested = Object.keys(args).some(key => key.startsWith('board-') && args[key] !== undefined);
     if (boardRequested) {
@@ -574,7 +638,17 @@ function recover(args) {
         { topic: required(args, 'topic-readback'), observedAt: required(args, 'topic-readback-at') }
       ));
     } else if (args['intake-channel-id']) {
-      print(state.reconcileIntake(required(args, 'intake-channel-id')));
+      const channelId = required(args, 'intake-channel-id');
+      const thread = state.getThreadEnrollment(channelId);
+      const activeThread = thread?.active ? thread : null;
+      const recovered = state.reconcileIntake(channelId);
+      if (activeThread && !recovered) throw new Error('Thread recovery requires the current active parent binding');
+      print(activeThread ? {
+        enrollment: recovered,
+        gatewayWake: requestGatewayRecovery(paths, {
+          requiredCapability: GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake
+        })
+      } : recovered);
     } else if (args['message-id'] && ['reply_sent', 'reply_not_sent'].includes(args.resolution)) {
       print(state.reconcileReplyDelivery(required(args, 'message-id'), args.resolution === 'reply_sent' ? 'sent' : 'not_sent', {
         partIndex: args['part-index'] === undefined ? null : Number(args['part-index']),
@@ -983,6 +1057,7 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
   let client;
   let runtimeInterlock;
   let handoffFence;
+  let enrollmentProof = null;
   let sourceBinding = null;
   let handoffCommitted = false;
   try {
@@ -1074,14 +1149,13 @@ async function ordinaryHandoffInternal(args, dependencies = {}) {
     }
     handoffFence = await createHandoffFence(channel);
     if (handoffFence) {
-      if (current.active) {
-        await assertOrdinaryIntakeRange(channel, state, current, recoveredThrough, handoffFence.id, 'ordinary handoff');
-      }
+      if (current.active) enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'ordinary handoff');
       handoffCutoff = handoffFence.id;
     }
     const binding = state.handoffOrdinary({
       channelId, provider, fromNativeId, fromGeneration, nativeId, workspace,
       sessionRoot: validationRoot, handoffId, intakeCutoff: handoffCutoff,
+      enrollmentProof,
       identity: { sessionId: nativeProof.sessionId, threadId: nativeProof.threadId },
       nativeProof: { ...nativeProof, sessionRoot: validationRoot },
       beforeMutation: assertGatewayCompatible
@@ -1143,6 +1217,8 @@ async function handoffInternal(args, dependencies = {}) {
   const handoffId = required(args, 'handoff-id');
   const { state } = openState(args);
   let client;
+  let handoffFence;
+  let enrollmentProof = null;
   try {
     const config = state.requireConfig();
     const categoryId = categoryFor(provider, args, config);
@@ -1159,9 +1235,17 @@ async function handoffInternal(args, dependencies = {}) {
     if (!current || current.provider !== provider || current.conductorId !== conductorId || current.repoKey !== repoKey || channel.topic !== expectedMarker) {
       throw new Error('handoff channel topic does not match the locally bound conductor address');
     }
-    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
+    const previous = state.findConductorHandoff(handoffId);
+    const hasActiveThreads = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
+    if (!previous && hasActiveThreads) {
+      handoffFence = await createHandoffFence(channel, 'conductor handoff');
+      enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'conductor handoff');
+    }
+    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId,
+      intakeCutoff: handoffFence?.id || null, enrollmentProof });
     print({ handedOff: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
   } finally {
+    await deleteHandoffFence(handoffFence);
     await client?.destroy();
     state.close();
   }
@@ -1204,6 +1288,11 @@ function localHandoff(args) {
   if (provider === PROVIDERS.CLAUDE && !endpoint) throw new Error('Claude handoff requires --endpoint');
   const reuse = args.reuse === true || args.reuse === 'true';
   const handoffId = reuse ? null : required(args, 'handoff-id');
+  const intakeCutoff = args['intake-cutoff'] || null;
+  let enrollmentProof = null;
+  if (args['enrollment-proof']) {
+    try { enrollmentProof = JSON.parse(args['enrollment-proof']); } catch { throw new Error('invalid --enrollment-proof JSON'); }
+  }
   const { state } = openState(args);
   try {
     const config = state.requireConfig();
@@ -1214,12 +1303,12 @@ function localHandoff(args) {
       print({ handedOff: false, reused: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding: current, readiness: current.readiness });
       return;
     }
-    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId });
+    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff, enrollmentProof });
     print({ handedOff: true, reused: false, conductorId, repoKey, channelId, handoffId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
   } finally { state.close(); }
 }
 
-function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace, endpoint }) {
+function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff = null, enrollmentProof = null }) {
   const paths = pathsFor(args);
   const helperArgs = [
     path.join(__dirname, 'conductor-lock-gate.py'),
@@ -1231,6 +1320,8 @@ function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace,
   ];
   if (current.endpoint) helperArgs.push('--from-endpoint', current.endpoint);
   if (endpoint) helperArgs.push('--endpoint', endpoint);
+  if (intakeCutoff) helperArgs.push('--intake-cutoff', intakeCutoff);
+  if (enrollmentProof) helperArgs.push('--enrollment-proof', JSON.stringify(enrollmentProof));
   if (reuse) helperArgs.push('--reuse');
   const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', helperArgs, {
     encoding: 'utf8', timeout: 35000, env: { ...process.env }
@@ -1256,6 +1347,8 @@ async function handoffFromLockInternal(args) {
   if (args['channel-id'] || args['from-native-id'] || args['from-generation'] || args['handoff-id']) throw new Error('--from-lock derives the existing binding and handoff authority');
   let state = openState(args).state;
   let client;
+  let handoffFence;
+  let enrollmentProof = null;
   try {
     const config = state.requireConfig();
     const current = state.findConductorBinding(conductorId, provider);
@@ -1269,13 +1362,16 @@ async function handoffFromLockInternal(args) {
     const marker = staticConductorMarker({ provider, conductorId, repoKey });
     if (!channel || channel.id !== current.channelId || channel.parentId !== categoryId || channel.topic !== marker) throw new Error('handoff channel does not match the static conductor address');
     const reuse = current.nativeId === nativeId;
-    await client.destroy();
-    client = null;
+    if (!reuse && state.listThreadEnrollments(current.channelId).some(enrollment => enrollment.active)) {
+      handoffFence = await createHandoffFence(channel, 'conductor handoff');
+      enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'conductor handoff');
+    }
     state.close();
     state = null;
-    handoffGate({ ...args, repo }, current, { reuse, sessionFile, workerFile, workspace, endpoint });
+    handoffGate({ ...args, repo }, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff: handoffFence?.id || null, enrollmentProof });
     return;
   } finally {
+    await deleteHandoffFence(handoffFence);
     await client?.destroy();
     state?.close();
   }
@@ -1292,6 +1388,7 @@ function writePid(pidFile, guildId, stateDir, db) {
     startedAt: new Date().toISOString(),
     capabilities: [
       GATEWAY_CAPABILITIES.ordinaryBindWake,
+      GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake,
       GATEWAY_CAPABILITIES.runtimeBindLock,
       GATEWAY_CAPABILITIES.ordinaryClaudeBind
     ]
@@ -1426,7 +1523,6 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
 async function runRuntime(args) {
   const { paths, state } = openState(args);
   const config = state.requireConfig();
-  const recoveryCutoff = new Date().toISOString();
   let gateway;
   let gatewayReady = false;
   let stopping = false;
@@ -1464,6 +1560,7 @@ async function runRuntime(args) {
       onReady: () => bindingWake.start()
     });
     await gateway.start(config.secretFile);
+    const recoveryCutoff = new Date().toISOString();
     await gateway.reconcilePending(recoveryCutoff);
     gatewayReady = true;
     bindingWake.start();
@@ -1904,6 +2001,7 @@ async function main() {
       return directPost(args, provider, ordinary, { exportAddress: true });
     }
     case 'agent-send': return agentSend(args);
+    case 'thread-enroll': return threadEnroll(args);
     case 'post': return directPost(args);
     case 'ordinary-post': return directPost(args, 'codex', true);
     case 'ordinary-claude-post': return directPost(args, 'claude', true);
@@ -1911,11 +2009,11 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
   }
 }
 
-module.exports = { bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, unbind };
+module.exports = { bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, threadEnroll, unbind };
 
 if (require.main === module) {
   main().catch(error => {

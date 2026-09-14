@@ -1,11 +1,7 @@
-const CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX = 'Claude endpoint unavailable before event write:';
-
-const ORDINARY_RECEIPT_KINDS = Object.freeze({
-  BOUND: 'ordinary-bound',
-  NATIVE_PREFLIGHT: 'ordinary-native-preflight',
-  HANDOFF: 'ordinary-handoff',
-  HANDOFF_RETRY: 'ordinary-handoff-retry',
-  ROOT_RELOCATED: 'ordinary-root-relocated'
-});
-
-module.exports = { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX, ORDINARY_RECEIPT_KINDS };
+try {
+  const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX, ORDINARY_RECEIPT_KINDS } = require('../../dist/ordinary/constants.js');
+  module.exports = { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX, ORDINARY_RECEIPT_KINDS };
+} catch (error) {
+  if (error?.code !== 'MODULE_NOT_FOUND' || !String(error?.message || '').includes("Cannot find module '../../dist/ordinary/constants.js'")) throw error;
+  throw new Error('discord-surface ordinary constants build is missing; run npm run build before starting', { cause: error });
+}

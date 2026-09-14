@@ -2781,7 +2781,7 @@ test('simulated: v1.4 migration adds empty attachment metadata to legacy message
 
   const migrated = new SurfaceState(db);
   assert.deepEqual(migrated.getMessage('legacy-text').attachments, []);
-  assert.equal(migrated.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.6');
+  assert.equal(migrated.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.7');
   migrated.close();
 });
 
@@ -4407,7 +4407,7 @@ test('simulated: handoff changes local owner without a topic write', () => {
   state.close();
 });
 
-test('simulated: from-lock pickup verifies the successor and commits through the lock gate', async () => {
+for (const operation of ['handoff', 'rebind']) test(`simulated: from-lock pickup verifies the successor and commits through the lock gate (${operation})`, async () => {
   const { dir, db, state } = fixture('from-lock.sqlite');
   const repo = 'https://github.com/example/discord-pickup.git';
   const oldNativeId = CODEX_ID;
@@ -4440,22 +4440,59 @@ test('simulated: from-lock pickup verifies the successor and commits through the
   const categoryId = 'codex-category';
   state.setConfig({ codexCategoryId: categoryId });
   state.bind({ channelId: 'from-lock-channel', guildId: 'guild-1', provider: 'codex', nativeId: oldNativeId, workspace: dir, categoryId, conductorId, repoKey });
+  const { THREAD_STATES } = require('../src/state/thread-enrollment');
+  const predecessor = state.getBinding('from-lock-channel');
+  state.enrollThread({ threadId: 'child', parentChannelId: predecessor.channelId, guildId: predecessor.guildId }, predecessor);
+  state.setThreadBaseline('child', '100', predecessor);
+  state.markThreadBoundary('child', THREAD_STATES.READY, 'fixture adoption', null, null, predecessor);
+  state.setIntakeCutoff(predecessor.channelId, predecessor.guildId, '100', 'fixture parent coverage');
+  state.markIntakeBoundary(predecessor.channelId, READINESS.READY, 'fixture parent ready', null, null, predecessor);
+  state.setBindingReadiness(predecessor.channelId, READINESS.READY, 'fixture ready', predecessor);
+  state.acceptDiscordMessage({ id: '150', channelId: 'child', guildId: 'guild-1', authorId: 'operator-1', content: 'accepted predecessor work' });
   const marker = conductorMarker({ provider: 'codex', conductorId, repoKey });
   const secret = path.join(dir, 'discord.secret');
   fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
   const transcriptRoot = lockEnv.CONDUCTOR_CODEX_SESSIONS_DIR;
   const transcript = path.join(transcriptRoot, `rollout-test-${successorNativeId}.jsonl`);
   fs.writeFileSync(transcript, `${JSON.stringify({ type: 'session_meta', payload: { id: successorNativeId } })}\n`, { mode: 0o600 });
-  const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: dir, stdio: 'ignore' });
+  const worker = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 120000)'], { cwd: dir, stdio: 'ignore' });
   const workerManifest = path.join(lockDir, 'workers', `${successorOwner}.json`);
   const preload = path.join(dir, 'from-lock-discord-preload.cjs');
+  const fenceLog = path.join(dir, 'observed-fences.jsonl');
   fs.writeFileSync(preload, `
+const fs = require('node:fs');
 const Module = require('node:module');
 const originalLoad = Module._load;
+const parentId = process.env.DISCORD_SURFACE_TEST_CHANNEL;
+const childId = 'child';
+const latestFenceId = () => {
+  const log = process.env.DISCORD_SURFACE_TEST_FENCES;
+  if (!log || !fs.existsSync(log)) return '0';
+  const lines = fs.readFileSync(log, 'utf8').trim().split('\\n').filter(Boolean);
+  return lines.length ? JSON.parse(lines.at(-1)).id : '0';
+};
+const parent = {
+  id: parentId, parentId: process.env.DISCORD_SURFACE_TEST_CATEGORY, topic: process.env.DISCORD_SURFACE_TEST_TOPIC,
+  messages: { async fetch() { return new Map([['fence', { id: latestFenceId() }]]); } },
+  async send(payload) {
+    const log = process.env.DISCORD_SURFACE_TEST_FENCES;
+    const count = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\\n').filter(Boolean).length : 0;
+    const id = String(200 + count);
+    fs.appendFileSync(log, JSON.stringify({ id, payload }) + '\\n');
+    return { id, async delete() {} };
+  }
+};
+const child = {
+  id: childId,
+  messages: { async fetch() { return new Map([['unrecorded', { id: '160' }]]); } }
+};
 const fake = {
   GatewayIntentBits: { Guilds: 1 },
   Client: class {
-    constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => ({ id: process.env.DISCORD_SURFACE_TEST_CHANNEL, parentId: process.env.DISCORD_SURFACE_TEST_CATEGORY, topic: process.env.DISCORD_SURFACE_TEST_TOPIC }) } }) }; }
+    constructor() {
+      this.guilds = { fetch: async () => ({ channels: { fetch: async () => parent } }) };
+      this.channels = { fetch: async id => id === childId ? child : parent };
+    }
     async login() {}
     async destroy() {}
   }
@@ -4469,23 +4506,93 @@ Module._load = (request, parent, isMain) => request === 'discord.js' ? fake : or
       sessionId: successorNativeId, fullUUID: successorNativeId, pid: worker.pid,
       processStartTime: processStartTime(worker.pid), generation: 1
     }), { mode: 0o600 });
-    const result = spawnSync(process.execPath, [CLI_PATH, 'handoff', '--state-dir', dir, '--db', db,
-      '--from-lock', '--repo', repo, '--provider', 'codex', '--conductor-id', conductorId,
-      '--repo-key', repoKey, '--native-id', successorNativeId, '--workspace', dir,
-      '--session-file', transcript, '--worker-file', workerManifest], {
-      env: {
-        ...process.env, ...lockEnv, DISCORD_SURFACE_LOCK_SCRIPT: CONDUCTOR_LOCK,
-        DISCORD_SURFACE_TEST_CHANNEL: 'from-lock-channel', DISCORD_SURFACE_TEST_CATEGORY: categoryId, DISCORD_SURFACE_TEST_TOPIC: marker,
-        NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preload}`].filter(Boolean).join(' ')
-      }, stdio: 'inherit'
+    const pickupArgs = operation === 'handoff'
+      ? ['handoff', '--state-dir', dir, '--db', db, '--from-lock', '--repo', repo, '--provider', 'codex',
+        '--conductor-id', conductorId, '--repo-key', repoKey, '--native-id', successorNativeId, '--workspace', dir,
+        '--session-file', transcript, '--worker-file', workerManifest]
+      : ['rebind', '--state-dir', dir, '--db', db, '--channel-id', 'from-lock-channel', '--guild-id', 'guild-1',
+        '--provider', 'codex', '--conductor-id', conductorId, '--repo-key', repoKey,
+        '--native-id', successorNativeId, '--workspace', dir, '--category-id', categoryId];
+    const runPickup = () => spawnSync(process.execPath, [CLI_PATH, ...pickupArgs], {
+      env: { ...process.env, ...lockEnv, DISCORD_SURFACE_LOCK_SCRIPT: CONDUCTOR_LOCK,
+        DISCORD_SURFACE_TEST_FENCES: fenceLog, DISCORD_SURFACE_TEST_CHANNEL: 'from-lock-channel',
+        DISCORD_SURFACE_TEST_CATEGORY: categoryId, DISCORD_SURFACE_TEST_TOPIC: marker,
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preload}`].filter(Boolean).join(' ') },
+      timeout: 40000, encoding: 'utf8'
     });
-    assert.equal(result.status, 0);
+    const refused = runPickup();
+    assert.notEqual(refused.status, 0, 'accepted child work must refuse public transfer');
+    const held = new SurfaceState(db);
+    try {
+      assert.equal(held.getBinding('from-lock-channel').nativeId, oldNativeId);
+      assert.equal(held.getMessage('150').state, MESSAGE_STATES.ACCEPTED);
+      held.claimDispatch('150'); held.markSubmitted('150');
+      held.recordNativeReply({ provider: 'codex', messageId: '150', nativeId: oldNativeId, generation: 1, text: 'predecessor answer' });
+      held.beginReply('150');
+      held.markReplySent('150', 'predecessor-reply');
+    } finally { held.close(); }
+    const gap = runPickup();
+    assert.notEqual(gap.status, 0, 'unrecorded child history before the fence must refuse public transfer');
+    const gapState = new SurfaceState(db);
+    try {
+      const oldBinding = gapState.getBinding('from-lock-channel');
+      assert.equal(oldBinding.nativeId, oldNativeId);
+      assert.equal(oldBinding.generation, 1);
+      const acceptedGap = gapState.acceptDiscordMessage({
+        id: '160', channelId: 'child', guildId: 'guild-1', authorId: 'operator-1', content: 'recovered predecessor history'
+      }, { ready: true, coverageId: '160', expectedBinding: oldBinding });
+      assert.equal(acceptedGap.accepted, true);
+      gapState.claimDispatch('160');
+      gapState.markSubmitted('160');
+      gapState.recordNativeReply({ provider: 'codex', messageId: '160', nativeId: oldNativeId, generation: 1, text: 'predecessor answer' });
+      gapState.beginReply('160');
+      gapState.markReplySent('160', 'predecessor-gap-reply');
+    } finally { gapState.close(); }
+    const result = runPickup();
+    assert.equal(result.status, 0, result.stderr);
     const updated = new SurfaceState(db);
     const binding = updated.getBinding('from-lock-channel');
     assert.equal(binding.nativeId, successorNativeId);
     assert.equal(binding.generation, 2);
     assert.equal(binding.channelId, 'from-lock-channel');
-    updated.close();
+    const fences = fs.readFileSync(fenceLog, 'utf8').trim().split('\n').map(JSON.parse);
+    const cutoff = fences.at(-1).id;
+    assert.equal(updated.getThreadEnrollment('child').active, true);
+    assert.equal(updated.getThreadEnrollment('child').recoveredThroughId, cutoff);
+    assert.equal(updated.getMessageRoute('child').handoffCutoffId, cutoff);
+    const delayed = updated.acceptDiscordMessage({ id: '199', channelId: 'child', guildId: 'guild-1', authorId: 'operator-1', content: 'delayed predecessor' });
+    assert.equal(delayed.accepted, false);
+    assert.equal(delayed.reason, 'before-intake-cutoff');
+    const { ChannelType } = require('discord.js');
+    const delivered = [], sent = [];
+    const channel = { id: 'from-lock-channel', guildId: 'guild-1', parentId: categoryId, type: ChannelType.GuildText, topic: marker,
+      isThread: () => false, permissionsFor: () => historyPermissions(), async setTopic(topic) { this.topic = topic; },
+      messages: { async fetch() { return []; } } };
+    const child = { id: 'child', guildId: 'guild-1', parentId: channel.id, type: ChannelType.PublicThread, archived: false, locked: false,
+      isThread: () => true, permissionsFor: () => historyPermissions(),
+      async send(payload) { sent.push(payload); return { id: 'child-answer' }; },
+      messages: { async fetch(options) { return typeof options === 'string' ? { async react() {} } : (BigInt(options.after || '0') < 203n ? [later] : []); } } };
+    const later = { id: '203', channelId: child.id, guildId: 'guild-1', content: 'successor question', author: { id: 'operator-1', bot: false }, channel: child };
+    const client = { user: { id: 'bot' }, on() {}, off() {}, async login() {}, async destroy() {},
+      channels: { async fetch(id) { return id === child.id ? child : channel; } } };
+    const gateway = new DiscordGateway({ state: updated, client, providers: { codex: {
+      async dispatch(message) { delivered.push(message); recordNativeAcknowledgment(updated, { provider: 'codex', messageId: message.id, nativeId: message.nativeId, generation: message.generation }); return { status: 'submitted' }; },
+      async observe() { return { text: 'successor answer' }; }
+    } } });
+    try {
+      await gateway.start(secret);
+      await gateway.reconcilePending(new Date().toISOString());
+      await gateway.consumer.waitForNativeWork();
+      await gateway.consumer.waitForReceipts();
+      assert.equal(updated.getThreadEnrollment('child').active, true);
+      assert.equal(updated.getMessage('203').state, MESSAGE_STATES.REPLIED);
+      assert.equal(updated.getMessage('203').deliveryChannelId, child.id);
+      assert.equal(delivered.length, 1);
+      assert.equal(delivered[0].nativeId, successorNativeId);
+      assert.equal(delivered[0].generation, 2);
+      assert.ok(sent.some(payload => payload.content === 'successor answer'));
+    } finally { await gateway.stop(); updated.close(); }
+    if (operation === 'rebind') return;
 
     const retry = spawnSync(process.execPath, [CLI_PATH, 'handoff', '--state-dir', dir, '--db', db,
       '--from-lock', '--repo', repo, '--provider', 'codex', '--conductor-id', conductorId,
@@ -4493,9 +4600,9 @@ Module._load = (request, parent, isMain) => request === 'discord.js' ? fake : or
       '--session-file', transcript, '--worker-file', workerManifest], {
       env: {
         ...process.env, ...lockEnv, DISCORD_SURFACE_LOCK_SCRIPT: CONDUCTOR_LOCK,
-        DISCORD_SURFACE_TEST_CHANNEL: 'from-lock-channel', DISCORD_SURFACE_TEST_CATEGORY: categoryId, DISCORD_SURFACE_TEST_TOPIC: marker,
+        DISCORD_SURFACE_TEST_FENCES: fenceLog, DISCORD_SURFACE_TEST_CHANNEL: 'from-lock-channel', DISCORD_SURFACE_TEST_CATEGORY: categoryId, DISCORD_SURFACE_TEST_TOPIC: marker,
         NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preload}`].filter(Boolean).join(' ')
-      }, stdio: 'ignore'
+      }, timeout: 40000, stdio: 'ignore'
     });
     assert.equal(retry.status, 0);
     const reusedState = new SurfaceState(db);
@@ -4516,16 +4623,16 @@ Module._load = (request, parent, isMain) => request === 'discord.js' ? fake : or
       '--session-file', transcript, '--worker-file', workerManifest], {
       env: {
         ...process.env, ...lockEnv, DISCORD_SURFACE_LOCK_SCRIPT: CONDUCTOR_LOCK,
-        DISCORD_SURFACE_TEST_CHANNEL: 'from-lock-channel', DISCORD_SURFACE_TEST_CATEGORY: categoryId, DISCORD_SURFACE_TEST_TOPIC: marker,
+        DISCORD_SURFACE_TEST_FENCES: fenceLog, DISCORD_SURFACE_TEST_CHANNEL: 'from-lock-channel', DISCORD_SURFACE_TEST_CATEGORY: categoryId, DISCORD_SURFACE_TEST_TOPIC: marker,
         NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preload}`].filter(Boolean).join(' ')
-      }, stdio: 'ignore'
+      }, timeout: 40000, stdio: 'ignore'
     });
     assert.notEqual(forced.status, 0);
   } finally {
     worker.kill('SIGTERM');
     await waitForProcessGone(worker.pid);
     fs.rmSync(lockDir, { recursive: true, force: true });
-    fs.unlinkSync(preload);
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

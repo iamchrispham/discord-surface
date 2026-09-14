@@ -35,6 +35,38 @@ node src/cli.js bind --state-dir "$HOME/.config/discord-surface" \
   --conductor-id CONDUCTOR_ID --repo-key CANONICAL_REPOSITORY_KEY
 ```
 
+## Issue and ticket threads
+
+Create a public Discord thread under an already bound text channel, then enroll its exact ID:
+
+```sh
+node src/cli.js thread-enroll --state-dir "$HOME/.config/discord-surface" \
+  --channel-id BOUND_PARENT_CHANNEL_ID --thread-id EXISTING_PUBLIC_THREAD_ID
+```
+
+Enrollment keeps the parent's native session and generation. Messages, receipt reactions,
+read acknowledgments and replies stay in the enrolled thread. Each thread has a separate
+history cursor. Repeating an active enrollment preserves that cursor. The command records each new enrollment as pending and requests recovery from a Gateway that supports threads. `status` shows the enrollment's
+readiness. A requested wake does not prove recovery or delivery.
+
+Unbinding the parent retires its thread enrollments. After rebinding the parent, explicitly
+enroll the same thread again to establish a fresh adoption boundary. Messages posted while
+the parent was unbound are excluded from the new enrollment.
+
+The first history read establishes the adoption boundary. Existing backlog is excluded,
+while messages already accepted during recovery retain custody. Restart recovery backfills
+newer messages from that thread's own cursor. An unlocked archived thread can be read
+without unarchiving it. A normal authorized reply can reactivate it through Discord's
+send operation. Locked, missing or inaccessible threads remain unavailable, with no reply
+fallback to the parent channel. Their failure does not demote a healthy parent binding. After fixing access, explicitly
+retry recovery with `recover --state-dir <directory> --intake-channel-id <thread-id>`.
+This retains the existing cursor and custody, marks the thread pending and requests a
+Gateway wake. It does not declare delivery successful or reset the adoption boundary.
+
+This slice does not discover or create threads, enroll private threads or forum posts,
+create another native session, or route agent packets, direct posts or slash interactions
+into child threads. Ordinary text instructions in enrolled threads use the existing queue.
+
 For the `/conduct` integration, `provision` creates or reuses one text channel for the stable conductor under its configured vendor category. Its topic is a fixed address marker. Local SQLite stores the provider, canonical repository key, native UUID, generation, readiness, history coverage, and custody. It never creates a native executor or resumes a session. The category comes from configuration, so a Codex command cannot choose the Claude category.
 
 ```sh
