@@ -293,9 +293,10 @@ export function createThreadEnrollmentHandlers({
         if (!binding || !binding.active) return null;
         const timestamp = now();
         const adoptedAt = existing.adoptedAt || timestamp;
-        const adoptedThroughId = existing.adoptedAt ? existing.adoptedThroughId : latestId;
+        const adoptionCursor = existing.adoptedAt ? latestId : maxId(compareDiscordIds, existing.lastSeenId, latestId);
+        const adoptedThroughId = existing.adoptedAt ? existing.adoptedThroughId : adoptionCursor;
         const lastSeenId = maxId(compareDiscordIds, existing.lastSeenId, latestId);
-        const recoveredThroughId = maxId(compareDiscordIds, existing.recoveredThroughId, latestId);
+        const recoveredThroughId = maxId(compareDiscordIds, existing.recoveredThroughId, adoptionCursor);
         state.db.prepare(`UPDATE thread_enrollments SET adopted_through_id=?, adopted_at=?, last_seen_id=?, recovered_through_id=?, updated_at=?
           WHERE thread_id=? AND parent_channel_id=? AND active=1`).run(
           adoptedThroughId, adoptedAt, lastSeenId, recoveredThroughId, timestamp, threadId, existing.parentChannelId

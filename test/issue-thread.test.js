@@ -169,17 +169,15 @@ test('unavailable child does not demote parent or send accepted work to it', asy
   assert.equal(f.state.getMessage('100').state, MESSAGE_STATES.ACCEPTED);
 });
 
-test('thread checkpoint leaves parent watermark alone and refuses unseen coverage', async t => {
+test('thread checkpoint fences and recovers unseen child custody without touching the parent watermark', async t => {
   const f = fixture(t); f.ready('100');
   f.histories.set(f.child.id, [f.message('101')]);
   const controller = new AbortController();
   let advanced = await f.gateway.checkpointHealthyIntake(controller.signal, f.gateway.lifecycleEpoch, new Map([[f.child.id, 1]]));
-  assert.equal(advanced.has(f.child.id), false);
-  assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '100');
-  await f.gateway.consumer.intakeMessage(f.message('101'), true);
-  advanced = await f.gateway.checkpointHealthyIntake(controller.signal, f.gateway.lifecycleEpoch, new Map([[f.child.id, 1]]));
   assert.equal(advanced.has(f.child.id), true);
   assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '101');
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
   assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
 });
 
@@ -518,6 +516,42 @@ test('empty adoption baseline retains live child custody as the history cursor',
   assert.equal(f.state.getMessage('50'), null);
   assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '101');
   assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+});
+
+test('adoption baseline transaction keeps custody that arrives after the fetched snapshot', async t => {
+  const f = fixture(t);
+  await enrollPublicThread(f.state, f.client, f.parent.id, f.child.id);
+  let baselineRead = true;
+  f.gateway.fetchHistory = async (_channel, options) => {
+    if (baselineRead && options.limit === 1 && !options.after) {
+      baselineRead = false;
+      return [f.message('50')];
+    }
+    return options.after === '102' ? [] : [f.message('51'), f.message('101')];
+  };
+  const setThreadBaseline = f.state.setThreadBaseline.bind(f.state);
+  f.state.setThreadBaseline = (threadId, latestId, binding) => {
+    const live = f.state.acceptDiscordMessage({
+      id: '102', guildId: 'guild', channelId: f.child.id, authorId: 'operator', isBot: false,
+      content: 'thread question', attachments: []
+    }, { ready: false, expectedBinding: binding });
+    assert.equal(live.accepted, true);
+    return setThreadBaseline(threadId, latestId, binding);
+  };
+  const result = await recoverThread(
+    f.gateway,
+    f.state.getThreadEnrollment(f.child.id),
+    new AbortController().signal,
+    f.gateway.lifecycleEpoch,
+    waitForRecoveryOperation
+  );
+  const enrollment = f.state.getThreadEnrollment(f.child.id);
+  assert.equal(result, true);
+  assert.equal(enrollment.adoptedThroughId, '102');
+  assert.equal(enrollment.recoveredThroughId, '102');
+  assert.equal(f.state.getMessage('51'), null);
+  assert.equal(f.state.getMessage('101'), null);
+  assert.equal(f.state.getMessage('102').state, MESSAGE_STATES.ACCEPTED);
 });
 
 test('missing or invalid history reader cannot falsely prove an empty ready thread', async t => {

@@ -164,7 +164,10 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
         if (!current()) return false;
         if (total >= gateway.historyMaxMessages) break;
         if (checkpointOnly) {
-          if (!gateway.state.hasIntakeEvidence(message.id)) return false;
+          if (!gateway.state.hasIntakeEvidence(message.id)) {
+            const fenced = boundary(THREAD_STATES.PENDING, 'Thread history custody gap detected', message.id);
+            return fenced ? recoverThread(gateway, fenced, signal, epoch, wait, false, deadline) : false;
+          }
         } else {
           const intake = await gateway.consumer.intakeMessage(gateway.normalizeFetchedMessage(message, channel), false, message.id, binding);
           if (intake?.stale || !current()) return false;
