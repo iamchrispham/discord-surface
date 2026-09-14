@@ -9,6 +9,7 @@ const { createOrdinaryRepository } = require('./ordinary');
 const { createDirectPostHandlers, queryDirectPostRows } = require('./state/direct-post');
 const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = require('./state/board-refresh');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
+const { createThreadEnrollmentHandlers, THREAD_INTAKE_REASONS, THREAD_STATES, THREAD_RECEIPT_KINDS } = require('./state/thread-enrollment');
 const {
   createIntakeHandlers,
   intakeCutoffDecision,
@@ -18,7 +19,7 @@ const {
 } = require('./state/intake');
 const { createInteractionHandlers, INTERACTION_ORIGIN, INTERACTION_TRANSPORT } = require('./state/interaction');
 
-const SCHEMA_VERSION = '1.6';
+const SCHEMA_VERSION = '1.7';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
 const READINESS = Object.freeze({
   PENDING: 'pending',
@@ -118,6 +119,16 @@ const intakeHandlers = createIntakeHandlers({
 });
 
 const interactionHandlers = createInteractionHandlers();
+
+const threadEnrollmentHandlers = createThreadEnrollmentHandlers({
+  BindingError,
+  THREAD_STATES,
+  READINESS,
+  assertText,
+  bindingMatchesExpected,
+  compareDiscordIds,
+  now
+});
 
 function assertText(value, name, max = 512) {
   if (typeof value !== 'string' || value.length === 0 || value.length > max) {
@@ -306,6 +317,7 @@ function rowMessage(row) {
     id: row.discord_id,
     guildId: row.guild_id,
     channelId: row.channel_id,
+    deliveryChannelId: row.delivery_channel_id || row.channel_id,
     authorId: row.author_id,
     content: row.content,
     attachments,
@@ -478,6 +490,7 @@ class SurfaceState {
         discord_id TEXT PRIMARY KEY,
         guild_id TEXT NOT NULL,
         channel_id TEXT NOT NULL REFERENCES bindings(channel_id),
+        delivery_channel_id TEXT,
         author_id TEXT NOT NULL,
         content TEXT NOT NULL,
         attachments TEXT NOT NULL DEFAULT '[]',
@@ -500,6 +513,24 @@ class SurfaceState {
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS messages_state_idx ON messages(state);
+      CREATE TABLE IF NOT EXISTS thread_enrollments (
+        thread_id TEXT PRIMARY KEY,
+        parent_channel_id TEXT NOT NULL REFERENCES bindings(channel_id),
+        guild_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending', 'ready', 'gap', 'unavailable')),
+        active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+        adopted_through_id TEXT,
+        adopted_at TEXT,
+        last_seen_id TEXT,
+        recovered_through_id TEXT,
+        last_accepted_id TEXT,
+        gap_from TEXT,
+        gap_to TEXT,
+        detail TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS thread_enrollments_parent_idx ON thread_enrollments(parent_channel_id, active);
       CREATE TABLE IF NOT EXISTS reply_parts (
         discord_id TEXT NOT NULL REFERENCES messages(discord_id),
         part_index INTEGER NOT NULL,
@@ -572,11 +603,38 @@ class SurfaceState {
       CREATE INDEX IF NOT EXISTS topic_publications_channel_idx ON topic_publications(channel_id, updated_at);
       CREATE INDEX IF NOT EXISTS topic_publications_unresolved_idx ON topic_publications(channel_id) WHERE status IN ('in_flight', 'unknown');
     `);
+    this.ensureThreadEnrollmentSchema();
     this.ensureDirectPostIndexes();
   }
 
   tableColumns(table) {
     return new Map(this.db.prepare(`PRAGMA table_info(${table})`).all().map(row => [row.name, row]));
+  }
+
+  ensureThreadEnrollmentSchema() {
+    const messages = this.tableColumns('messages');
+    if (!messages.has('delivery_channel_id')) this.db.exec('ALTER TABLE messages ADD COLUMN delivery_channel_id TEXT');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS thread_enrollments (
+        thread_id TEXT PRIMARY KEY,
+        parent_channel_id TEXT NOT NULL REFERENCES bindings(channel_id),
+        guild_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending', 'ready', 'gap', 'unavailable')),
+        active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+        adopted_through_id TEXT,
+        adopted_at TEXT,
+        last_seen_id TEXT,
+        recovered_through_id TEXT,
+        last_accepted_id TEXT,
+        gap_from TEXT,
+        gap_to TEXT,
+        detail TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS thread_enrollments_parent_idx ON thread_enrollments(parent_channel_id, active);
+    `);
+    this.db.prepare('UPDATE messages SET delivery_channel_id=channel_id WHERE delivery_channel_id IS NULL').run();
   }
 
   ensureDirectPostIndexes() {
@@ -611,7 +669,7 @@ class SurfaceState {
   migrateSchema() {
     const version = this.db.prepare("SELECT value FROM meta WHERE key='schema'").get();
     if (!version) throw new StateCorruptError('state schema metadata is missing');
-    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== '1.5' && version.value !== SCHEMA_VERSION) {
+    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== '1.5' && version.value !== '1.6' && version.value !== SCHEMA_VERSION) {
       throw new StateCorruptError(`unsupported state schema ${version.value}`);
     }
     if (version.value === SCHEMA_VERSION) {
@@ -646,6 +704,20 @@ class SurfaceState {
       if (!topicColumns.has('operation_ended_at')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN operation_ended_at TEXT');
       if (!topicColumns.has('readback_at')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN readback_at TEXT');
       if (!topicColumns.has('readback_topic')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN readback_topic TEXT');
+      this.ensureThreadEnrollmentSchema();
+      this.ensureDirectPostIndexes();
+      return;
+    }
+    if (version.value === '1.6') {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.ensureThreadEnrollmentSchema();
+        this.db.prepare("UPDATE meta SET value=? WHERE key='schema'").run(SCHEMA_VERSION);
+        this.db.exec('COMMIT');
+      } catch (error) {
+        try { this.db.exec('ROLLBACK'); } catch {}
+        throw error;
+      }
       this.ensureDirectPostIndexes();
       return;
     }
@@ -779,6 +851,7 @@ class SurfaceState {
       try { this.db.exec('ROLLBACK'); } catch {}
       throw error;
     }
+    this.ensureThreadEnrollmentSchema();
     this.ensureDirectPostIndexes();
   }
 
@@ -799,7 +872,7 @@ class SurfaceState {
   }
 
   assertSchema() {
-    const expected = ['meta', 'config', 'bindings', 'messages', 'reply_parts', 'provision_intents', 'intake_watermarks', 'receipts', 'topic_publications'];
+    const expected = ['meta', 'config', 'bindings', 'messages', 'reply_parts', 'provision_intents', 'intake_watermarks', 'receipts', 'topic_publications', 'thread_enrollments'];
     const rows = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
     const found = new Set(rows.map(row => row.name));
     if (expected.some(name => !found.has(name))) throw new StateCorruptError('state schema is incomplete');
@@ -817,6 +890,7 @@ class SurfaceState {
     this.assertColumns('messages', {
       discord_id: { type: 'TEXT' }, guild_id: { type: 'TEXT', notnull: true },
       channel_id: { type: 'TEXT', notnull: true }, author_id: { type: 'TEXT', notnull: true },
+      delivery_channel_id: { type: 'TEXT' },
       content: { type: 'TEXT', notnull: true }, attachments: { type: 'TEXT', notnull: true }, conductor_id: { type: 'TEXT' }, repo_key: { type: 'TEXT' }, state: { type: 'TEXT', notnull: true },
       reply_next_part: { type: 'INTEGER', notnull: true }, created_at: { type: 'TEXT', notnull: true },
       updated_at: { type: 'TEXT', notnull: true }
@@ -852,7 +926,17 @@ class SurfaceState {
       operation_ended_at: { type: 'TEXT' }, readback_at: { type: 'TEXT' }, readback_topic: { type: 'TEXT' },
       created_at: { type: 'TEXT', notnull: true }, updated_at: { type: 'TEXT', notnull: true }
     });
+    this.assertColumns('thread_enrollments', {
+      thread_id: { type: 'TEXT' }, parent_channel_id: { type: 'TEXT', notnull: true },
+      guild_id: { type: 'TEXT', notnull: true }, state: { type: 'TEXT', notnull: true },
+      active: { type: 'INTEGER', notnull: true }, adopted_through_id: { type: 'TEXT' },
+      adopted_at: { type: 'TEXT' }, last_seen_id: { type: 'TEXT' },
+      recovered_through_id: { type: 'TEXT' }, last_accepted_id: { type: 'TEXT' },
+      gap_from: { type: 'TEXT' }, gap_to: { type: 'TEXT' }, detail: { type: 'TEXT' },
+      created_at: { type: 'TEXT', notnull: true }, updated_at: { type: 'TEXT', notnull: true }
+    });
     this.assertForeignKey('messages', 'channel_id', 'bindings', 'channel_id');
+    this.assertForeignKey('thread_enrollments', 'parent_channel_id', 'bindings', 'channel_id');
     this.assertForeignKey('reply_parts', 'discord_id', 'messages', 'discord_id');
     this.assertForeignKey('receipts', 'discord_id', 'messages', 'discord_id');
     const integrity = this.db.prepare('PRAGMA integrity_check').all();
@@ -868,6 +952,10 @@ class SurfaceState {
     if (!topicTable?.sql || !/CHECK\s*\(provider\s+IN\s*\('codex',\s*'claude'\)\)/i.test(topicTable.sql) ||
       !/CHECK\s*\(status\s+IN\s*\('in_flight',\s*'unknown',\s*'published',\s*'not_published'\)\)/i.test(topicTable.sql)) {
       throw new StateCorruptError('topic publication custody constraints are missing');
+    }
+    const threadTable = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='thread_enrollments'").get();
+    if (!threadTable?.sql || !/CHECK\s*\(state\s+IN\s*\('pending',\s*'ready',\s*'gap',\s*'unavailable'\)\)/i.test(threadTable.sql)) {
+      throw new StateCorruptError('thread enrollment state constraints are missing');
     }
   }
 
@@ -1020,11 +1108,17 @@ class SurfaceState {
     }
     const existing = this.getBinding(input.channelId);
     if (existing) throw new BindingError('channel is already bound; use rebind after work drains');
+    if (this.db.prepare('SELECT 1 FROM thread_enrollments WHERE thread_id=? AND active=1').get(input.channelId)) {
+      throw new BindingError('thread channel is already enrolled');
+    }
     this.assertNativeOwnerFree(input.provider, input.nativeId);
     this.assertConductorOwnerFree(input.provider, input.conductorId);
     const createdAt = now();
     return this.transaction(() => {
       if (this.getBinding(input.channelId)) throw new BindingError('channel is already bound; use rebind after work drains');
+      if (this.db.prepare('SELECT 1 FROM thread_enrollments WHERE thread_id=? AND active=1').get(input.channelId)) {
+        throw new BindingError('thread channel is already enrolled');
+      }
       this.assertNativeOwnerFree(input.provider, input.nativeId);
       const generationRow = input.conductorId
         ? this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE provider=? AND conductor_id=?').get(input.provider, input.conductorId)
@@ -1155,6 +1249,9 @@ class SurfaceState {
   } = {}) {
     if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     const channelId = assertText(binding.channelId, 'channelId', 128);
+    if (this.db.prepare('SELECT 1 FROM thread_enrollments WHERE thread_id=? AND active=1').get(channelId)) {
+      throw new BindingError('thread channel is already enrolled');
+    }
     const existing = this.getBinding(channelId);
     if (!existing) throw new BindingError('channel is not bound');
     if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
@@ -1182,6 +1279,9 @@ class SurfaceState {
     if (existing.conductorId && existing.provider !== input.provider) throw new BindingError('conductor provider changes require an explicit handoff');
     const generation = existing.generation + 1;
     return this.transaction(() => {
+      if (this.db.prepare('SELECT 1 FROM thread_enrollments WHERE thread_id=? AND active=1').get(channelId)) {
+        throw new BindingError('thread channel is already enrolled');
+      }
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
@@ -1255,6 +1355,34 @@ class SurfaceState {
 
   listBindings() {
     return this.db.prepare('SELECT * FROM bindings ORDER BY channel_id').all().map(rowBinding);
+  }
+
+  getMessageRoute(deliveryChannelId) {
+    return threadEnrollmentHandlers.getMessageRoute(this, deliveryChannelId);
+  }
+
+  enrollThread(input, expectedBinding = null) {
+    return threadEnrollmentHandlers.enrollThread(this, input, expectedBinding);
+  }
+
+  getThreadEnrollment(threadId) {
+    return threadEnrollmentHandlers.getThreadEnrollment(this, threadId);
+  }
+
+  listThreadEnrollments(parentChannelId = null) {
+    return threadEnrollmentHandlers.listThreadEnrollments(this, parentChannelId);
+  }
+
+  setThreadBaseline(threadId, latestId, expectedBinding = null) {
+    return threadEnrollmentHandlers.setThreadBaseline(this, threadId, latestId, expectedBinding);
+  }
+
+  markThreadBoundary(threadId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null) {
+    return threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding);
+  }
+
+  checkpointThread(threadId, coverageId, expectedBinding = null) {
+    return threadEnrollmentHandlers.checkpointThread(this, threadId, coverageId, expectedBinding);
   }
 
   findNativeBinding(nativeId, provider = null) {
@@ -1605,13 +1733,23 @@ class SurfaceState {
   }
 
   reconcileIntake(channelId, expectedBinding = null) {
+    const childEnrollment = typeof channelId === 'string' && channelId.length > 0 && channelId.length <= 128
+      ? this.db.prepare('SELECT 1 FROM thread_enrollments WHERE thread_id=?').get(channelId)
+      : null;
+    if (childEnrollment) {
+      return threadEnrollmentHandlers.reconcileThread(this, channelId, expectedBinding);
+    }
     return intakeHandlers.reconcileIntake(this, channelId, expectedBinding);
   }
 
   acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null, agentToken = null } = {}) {
     const config = this.requireConfig();
     if (coverageId !== null) assertText(coverageId, 'coverageId', 128);
-    if (typeof event?.channelId === 'string') this.recoverInterruptedOrdinaryHandoffIntake(event.channelId, expectedBinding);
+    const routeHint = typeof event?.channelId === 'string' && event.channelId.length > 0
+      ? this.getMessageRoute(event.channelId)
+      : null;
+    const authorityHint = routeHint?.binding?.channelId || event?.channelId;
+    if (typeof authorityHint === 'string') this.recoverInterruptedOrdinaryHandoffIntake(authorityHint, expectedBinding);
     let attachments;
     try { attachments = normalizeAttachments(event?.attachments); } catch { attachments = null; }
     const validEvent = event && [event.id, event.guildId, event.channelId, event.authorId].every(value => typeof value === 'string' && value.length > 0) &&
@@ -1619,15 +1757,28 @@ class SurfaceState {
     if (!validEvent) {
       if (event && [event.id, event.guildId, event.channelId].every(value => typeof value === 'string' && value.length > 0)) {
         const result = this.transaction(() => {
-          const binding = this.getBinding(event.channelId);
+          const route = this.getMessageRoute(event.channelId);
+          const binding = route?.binding || this.getBinding(event.channelId);
+          const enrollment = route?.enrollment || null;
+          const authorityChannelId = binding?.channelId || event.channelId;
           if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
-          if (this.ordinaryHandoffPauses.has(event.channelId) || this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
-            this.upsertIntakeWatermark(event, false, null);
-            this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
+          if (this.ordinaryHandoffPauses.has(authorityChannelId) || this.getIntakeWatermark(authorityChannelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+            if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, false);
+            else this.upsertIntakeWatermark(event, false, null);
+            this.receipt(null, 'intake-rejected', {
+              discordId: event.id, channelId: authorityChannelId,
+              ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+              reason: 'handoff-intake-paused', ready
+            });
             return this.reject('handoff-intake-paused');
           }
-          this.upsertIntakeWatermark(event, ready, coverageId);
-          this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'invalid-event', ready });
+          if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, false, coverageId);
+          else this.upsertIntakeWatermark(event, ready, coverageId);
+          this.receipt(null, 'intake-rejected', {
+            discordId: event.id, channelId: authorityChannelId,
+            ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+            reason: 'invalid-event', ready
+          });
           return null;
         });
         if (result?.stale) return result;
@@ -1636,18 +1787,29 @@ class SurfaceState {
     }
     const directPost = this.excludeDirectPost(event);
     return this.transaction(() => {
-      const binding = this.getBinding(event.channelId);
+      const route = this.getMessageRoute(event.channelId);
+      const binding = route?.binding || this.getBinding(event.channelId);
+      const enrollment = route?.enrollment || null;
+      const authorityChannelId = binding?.channelId || event.channelId;
       if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
-      if (this.ordinaryHandoffPauses.has(event.channelId) || this.getIntakeWatermark(event.channelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
-        this.upsertIntakeWatermark(event, false, null);
-        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'handoff-intake-paused', ready });
+      if (this.ordinaryHandoffPauses.has(authorityChannelId) || this.getIntakeWatermark(authorityChannelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
+        if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, false);
+        else this.upsertIntakeWatermark(event, false, null);
+        this.receipt(null, 'intake-rejected', {
+          discordId: event.id, channelId: authorityChannelId,
+          ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+          reason: 'handoff-intake-paused', ready
+        });
         return this.reject('handoff-intake-paused');
       }
-      const intakeCutoff = this.getIntakeWatermark(event.channelId)?.recovered_through_id || null;
-      this.upsertIntakeWatermark(event, ready, coverageId);
+      const intakeCutoff = enrollment
+        ? enrollment.recoveredThroughId
+        : this.getIntakeWatermark(authorityChannelId)?.recovered_through_id || null;
+      if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, false, coverageId);
+      else this.upsertIntakeWatermark(event, ready, coverageId);
       let agent = null;
       let invalidAgent = false;
-      if (event.isBot && event.content.startsWith(AGENT_PREFIX)) {
+      if (!enrollment && event.isBot && event.content.startsWith(AGENT_PREFIX)) {
         try {
           const target = binding && Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation'].map(key => [key, binding[key]]));
           agent = decodeAgentMessage(event.content, agentToken, target);
@@ -1656,19 +1818,31 @@ class SurfaceState {
       }
       let reason = invalidAgent ? 'invalid-event' : null;
       if (typeof event.content !== 'string' || event.content.length > 10000 || attachments === null || (event.content.length === 0 && attachments?.length === 0)) reason = 'invalid-event';
+      else if (enrollment && event.isBot) reason = 'bot-source';
       else if (!agent && directPost) reason = 'automatic-publication';
       else if (!agent && event.isBot) reason = 'bot-source';
       else if (event.guildId !== config.guildId || (!agent && event.authorId !== config.operatorId)) reason = 'unauthorized-sender';
       if (!reason && (!binding || !binding.active || binding.guildId !== event.guildId)) reason = 'unknown-binding';
+      if (!reason && enrollment && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(enrollment.state)) {
+        reason = enrollment.state === THREAD_STATES.GAP ? THREAD_INTAKE_REASONS.GAP : THREAD_INTAKE_REASONS.UNAVAILABLE;
+      }
       if (reason) {
-        this.receipt(null, 'intake-rejected', { discordId: event.id, reason, ready });
+        this.receipt(null, 'intake-rejected', {
+          discordId: event.id, channelId: authorityChannelId,
+          ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+          reason, ready
+        });
         return this.reject(reason);
       }
       const committed = this.getMessage(event.id);
       if (committed) return { accepted: false, duplicate: true, reason: 'duplicate-message', message: committed };
       const cutoffReason = intakeCutoffDecision(event.id, intakeCutoff, compareDiscordIds);
       if (cutoffReason) {
-        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: cutoffReason, ready });
+        this.receipt(null, 'intake-rejected', {
+          discordId: event.id, channelId: authorityChannelId,
+          ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+          reason: cutoffReason, ready
+        });
         return this.reject(cutoffReason);
       }
       if (agent && this.db.prepare(`SELECT 1 FROM receipts WHERE kind='agent-message'
@@ -1677,7 +1851,13 @@ class SurfaceState {
         AND json_extract(detail, '$.packet.source.nativeId')=?
         AND json_extract(detail, '$.packet.source.generation')=? LIMIT 1`)
         .get(agent.id, agent.source.provider, agent.source.nativeId, agent.source.generation)) {
-        this.receipt(null, 'intake-rejected', { discordId: event.id, reason: 'agent-message-duplicate', ready });
+        this.receipt(null, 'intake-rejected', {
+          discordId: event.id,
+          channelId: authorityChannelId,
+          ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+          reason: 'agent-message-duplicate',
+          ready
+        });
         return this.reject('agent-message-duplicate');
       }
       if (this.failNextIntakeFlag) {
@@ -1685,19 +1865,32 @@ class SurfaceState {
         throw new Error('injected intake transaction failure');
       }
       const timestamp = now();
-      this.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, author_id, content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        event.id, event.guildId, event.channelId, event.authorId, event.content, JSON.stringify(attachments), binding.provider, binding.nativeId,
+      this.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        event.id, event.guildId, authorityChannelId, event.channelId, event.authorId, event.content, JSON.stringify(attachments), binding.provider, binding.nativeId,
         binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
       );
-      const watermark = this.getIntakeWatermark(event.channelId);
-      if (!watermark?.last_accepted_id || compareDiscordIds(watermark.last_accepted_id, event.id) < 0) {
-        this.db.prepare('UPDATE intake_watermarks SET last_accepted_id=?, updated_at=? WHERE channel_id=?')
-          .run(event.id, timestamp, event.channelId);
+      if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, true);
+      else {
+        const watermark = this.getIntakeWatermark(authorityChannelId);
+        if (!watermark?.last_accepted_id || compareDiscordIds(watermark.last_accepted_id, event.id) < 0) {
+          this.db.prepare('UPDATE intake_watermarks SET last_accepted_id=?, updated_at=? WHERE channel_id=?')
+            .run(event.id, timestamp, authorityChannelId);
+        }
       }
       if (agent) this.receipt(event.id, 'agent-message', { packet: agent, authorId: event.authorId });
-      this.receipt(event.id, 'accepted', { channelId: event.channelId, conductorId: binding.conductorId, generation: binding.generation, readiness: ready ? 'ready' : 'pending' });
-      if (!ready) this.receipt(event.id, 'intake-held-not-ready', { channelId: event.channelId });
+      this.receipt(event.id, 'accepted', {
+        channelId: authorityChannelId,
+        ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+        conductorId: binding.conductorId, generation: binding.generation,
+        readiness: ready && (!enrollment || enrollment.state === THREAD_STATES.READY) ? 'ready' : 'pending'
+      });
+      if (!ready || (enrollment && enrollment.state !== THREAD_STATES.READY)) {
+        this.receipt(event.id, 'intake-held-not-ready', {
+          channelId: authorityChannelId,
+          ...(enrollment ? { deliveryChannelId: event.channelId } : {})
+        });
+      }
       return { accepted: true, message: this.getMessage(event.id) };
     });
   }
@@ -1770,6 +1963,7 @@ class SurfaceState {
         readiness: check.binding.readiness,
         status: 'attempted'
       };
+      if (check.enrollment) detail.deliveryChannelId = check.deliveryChannelId;
       if (transport !== null) detail.transport = transport;
       if (ownerPid !== null) detail.ownerPid = ownerPid;
       if (ownerIdentity !== null) detail.ownerIdentity = ownerIdentity;
@@ -1806,13 +2000,20 @@ class SurfaceState {
 
   currentMessageBinding(message) {
     const config = this.requireConfig();
-    const binding = this.getBinding(message.channelId);
-    const identity = Boolean(binding && binding.active && binding.guildId === message.guildId &&
+    const deliveryChannelId = message.deliveryChannelId || message.channelId;
+    const route = typeof deliveryChannelId === 'string' && deliveryChannelId.length > 0
+      ? this.getMessageRoute(deliveryChannelId)
+      : null;
+    const binding = route?.binding || this.getBinding(message.channelId);
+    const enrollment = route?.enrollment || null;
+    const routeIdentity = Boolean(route && route.binding.channelId === binding?.channelId &&
+      (!enrollment || enrollment.guildId === binding?.guildId));
+    const identity = Boolean(routeIdentity && binding && binding.active && binding.guildId === message.guildId &&
       binding.generation === message.generation && binding.nativeId === message.nativeId && binding.provider === message.provider);
     const current = Boolean(identity && binding.guildId === config.guildId &&
       message.guildId === config.guildId && (message.authorId === config.operatorId || this.getAgentMessage(message.id)?.authorId === message.authorId) &&
       binding.generation === message.generation && binding.nativeId === message.nativeId && binding.provider === message.provider);
-    return { config, binding, identity, current };
+    return { config, binding, identity, current, enrollment, deliveryChannelId, ready: Boolean(identity && route?.ready) };
   }
 
   hasNativeAcknowledgment(message) {
@@ -1881,8 +2082,12 @@ class SurfaceState {
           this.receipt(messageId, 'dispatch-already-acknowledged', { generation: message.generation });
           return { claimed: false, message: this.getMessage(messageId), reason: 'native-already-acknowledged' };
         }
-        if (check.binding.readiness !== READINESS.READY) {
-          this.receipt(messageId, 'dispatch-held-not-ready', { readiness: check.binding.readiness, generation: message.generation });
+        if (check.binding.readiness !== READINESS.READY || !check.ready) {
+          this.receipt(messageId, 'dispatch-held-not-ready', {
+            readiness: check.binding.readiness,
+            ...(check.enrollment ? { threadState: check.enrollment.state } : {}),
+            generation: message.generation
+          });
           return { claimed: false, message, reason: 'binding-not-ready' };
         }
         this.db.prepare('UPDATE messages SET state=?, updated_at=? WHERE discord_id=? AND state=?')
@@ -2436,6 +2641,7 @@ class SurfaceState {
     const bindings = this.listBindings();
     const messages = this.listMessages();
     const watermarks = this.listIntakeWatermarks();
+    const threadEnrollments = this.listThreadEnrollments();
     const topicCustody = this.listTopicPublications();
     const topicPublications = new Map();
     for (const row of this.listReceipts().filter(item => item.kind === 'topic-publication' || item.kind === 'topic-publication-reconciled')) {
@@ -2461,6 +2667,7 @@ class SurfaceState {
         recovery: RECOVERY_LIMITS
       },
       intakeWatermarks: watermarks.map(row => ({ channelId: row.channel_id, lastSeenId: row.last_seen_id, recoveredThroughId: row.recovered_through_id, state: row.state, gapFrom: row.gap_from, gapTo: row.gap_to, detail: row.detail })),
+      threadEnrollments,
       legacyTopicPublications: [...topicPublications.values()],
       legacyTopicPublicationCustody: topicCustody
     };
@@ -2523,6 +2730,9 @@ module.exports = {
   BOARD_RECEIPT_KINDS,
   DISPATCH_OUTCOMES,
   TOPIC_PUBLICATION_STATES,
+  THREAD_STATES,
+  THREAD_RECEIPT_KINDS,
+  THREAD_INTAKE_REASONS,
   UnresolvedWorkError,
   UUID,
   discordNonce,

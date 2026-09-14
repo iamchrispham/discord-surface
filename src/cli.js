@@ -10,7 +10,8 @@ const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
 const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
-const { DiscordGateway, discordIdAfter, readSecret, requireInstalled } = require('./discord');
+const { DiscordGateway, discordIdAfter, readSecret, requireInstalled, waitForRecoveryOperation } = require('./discord');
+const { enrollPublicThread } = require('./discord/thread-enrollment');
 const {
   assertOrdinaryIntakeRange,
   createHandoffFence,
@@ -153,6 +154,36 @@ async function latestChannelMessageId(channel) {
   else if (typeof fetched?.first === 'function') message = fetched.first();
   else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
   return typeof message?.id === 'string' && message.id.length > 0 ? message.id : cached;
+}
+
+async function threadEnroll(args, dependencies = {}) {
+  const { paths, state } = openState(args);
+  const install = dependencies.requireInstalled || requireInstalled;
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  let client;
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+  try {
+    const parentId = required(args, 'channel-id');
+    const threadId = required(args, 'thread-id');
+    const config = state.requireConfig();
+    if (state.getBinding(parentId)?.guildId !== config.guildId) throw new Error('Thread parent is outside the configured guild');
+    const { Client, GatewayIntentBits } = install('discord.js');
+    client = new Client({ intents: [GatewayIntentBits.Guilds], rest: { timeout: RECOVERY_LIMITS.timeoutMs } });
+    const deadline = Date.now() + RECOVERY_LIMITS.timeoutMs;
+    await waitForRecoveryOperation(() => client.login((dependencies.readSecret || readSecret)(config.secretFile)), controller.signal, deadline, stop);
+    const enrollment = await waitForRecoveryOperation(() => enrollPublicThread(state, client, parentId, threadId, controller.signal), controller.signal, deadline, stop);
+    const gatewayWake = (dependencies.requestGatewayRecovery || requestGatewayRecovery)(paths);
+    const result = { enrollment, gatewayWake };
+    (dependencies.print || print)(result);
+    return result;
+  } finally {
+    controller.abort();
+    process.off('SIGINT', stop);
+    process.off('SIGTERM', stop);
+    try { await client?.destroy(); } finally { state.close(); }
+  }
 }
 
 function requestGatewayRecovery(paths, { status = gatewayProcessStatus, kill = process.kill, expectedPid } = {}) {
@@ -539,7 +570,7 @@ async function liaisonDraft(args) {
 }
 
 function recover(args) {
-  const { state } = openState(args);
+  const { paths, state } = openState(args);
   try {
     const boardRequested = Object.keys(args).some(key => key.startsWith('board-') && args[key] !== undefined);
     if (boardRequested) {
@@ -574,7 +605,11 @@ function recover(args) {
         { topic: required(args, 'topic-readback'), observedAt: required(args, 'topic-readback-at') }
       ));
     } else if (args['intake-channel-id']) {
-      print(state.reconcileIntake(required(args, 'intake-channel-id')));
+      const channelId = required(args, 'intake-channel-id');
+      const thread = state.getThreadEnrollment(channelId);
+      const recovered = state.reconcileIntake(channelId);
+      if (thread && !recovered) throw new Error('Thread recovery requires the current active parent binding');
+      print(thread ? { enrollment: recovered, gatewayWake: requestGatewayRecovery(paths) } : recovered);
     } else if (args['message-id'] && ['reply_sent', 'reply_not_sent'].includes(args.resolution)) {
       print(state.reconcileReplyDelivery(required(args, 'message-id'), args.resolution === 'reply_sent' ? 'sent' : 'not_sent', {
         partIndex: args['part-index'] === undefined ? null : Number(args['part-index']),
@@ -1900,6 +1935,7 @@ async function main() {
       return directPost(args, provider, ordinary, { exportAddress: true });
     }
     case 'agent-send': return agentSend(args);
+    case 'thread-enroll': return threadEnroll(args);
     case 'post': return directPost(args);
     case 'ordinary-post': return directPost(args, 'codex', true);
     case 'ordinary-claude-post': return directPost(args, 'claude', true);
@@ -1907,11 +1943,11 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
   }
 }
 
-module.exports = { bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, unbind };
+module.exports = { bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, threadEnroll, unbind };
 
 if (require.main === module) {
   main().catch(error => {
