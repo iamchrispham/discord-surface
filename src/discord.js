@@ -396,7 +396,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   function releaseReadyOwnerBlock(message) {
     const ownerKey = nativeOwnerKey(message);
     const queue = ownerQueues.get(ownerKey);
-    if (!queue?.blockedMessageId || !ownerBindingReady(message.id)) return;
+    if (!queue?.blockedMessageId || !ownerBindingReady(queue.blockedMessageId)) return;
     const blocked = state.getMessage(queue.blockedMessageId);
     if (!blocked || ![MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(blocked.state)) return;
     if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
@@ -481,7 +481,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       finishOwner(active);
       return queue.active !== active;
     }
-    if (queue.blockedMessageId !== messageId) return false;
+    if (queue.blockedMessageId !== messageId || !ownerBindingReady(queue.blockedMessageId)) return false;
     queue.blockedMessageId = null;
     queue.blockedReason = null;
     pumpOwner(nativeOwnerKey(message));
@@ -552,7 +552,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const queue = ownerQueueFor(ownerKey);
     const queueMessage = state.getMessage(message.id) || message;
     const dispatchBlocked = queue.blockedReason === 'not_submitted';
-    if (queue.blockedMessageId && ownerCanAdvance(queue.blockedMessageId) &&
+    if (queue.blockedMessageId && ownerBindingReady(queue.blockedMessageId) && ownerCanAdvance(queue.blockedMessageId) &&
       (!dispatchBlocked || queue.blockedMessageId === message.id)) {
       if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
       queue.blockedMessageId = null;
@@ -581,7 +581,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       dispatchBlocked: false,
       onAbort: null
     };
-    if (!queue.active && queue.blockedMessageId === message.id) {
+    if (!queue.active && queue.blockedMessageId === message.id && ownerBindingReady(queue.blockedMessageId)) {
       queue.blockedMessageId = null;
       queue.active = entry;
       startOwnerEntry(entry);
@@ -1624,10 +1624,15 @@ class DiscordGateway {
       }
     }
     for (const enrollment of this.state.listThreadEnrollments()) {
-      if (!enrollment.active || enrollment.state !== THREAD_STATES.READY ||
+      if (!enrollment.active || ![THREAD_STATES.READY, THREAD_STATES.PENDING].includes(enrollment.state) ||
           (triggeredChannels.size && !triggeredChannels.has(enrollment.threadId))) continue;
-      if (await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, true, deadline)) {
+      const checkpointOnly = enrollment.state === THREAD_STATES.READY;
+      const recovered = await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, checkpointOnly, deadline);
+      if (recovered) {
         advancedChannels.add(enrollment.threadId);
+      } else if (checkpointOnly && this.state.getThreadEnrollment(enrollment.threadId)?.state === THREAD_STATES.PENDING) {
+        const currentCount = this.liveIntakeCounts.get(enrollment.threadId) || 0;
+        this.liveIntakeCounts.set(enrollment.threadId, Math.max(currentCount, this.liveCheckpointThreshold));
       }
     }
     return advancedChannels;

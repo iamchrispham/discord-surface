@@ -2023,6 +2023,7 @@ class SurfaceState {
     const binding = route?.binding || this.getBinding(message.channelId);
     const enrollment = route?.enrollment || null;
     const routeIdentity = Boolean(route && route.binding.channelId === binding?.channelId &&
+      route.binding.channelId === message.channelId &&
       (!enrollment || enrollment.guildId === binding?.guildId));
     const identity = Boolean(routeIdentity && binding && binding.active && binding.guildId === message.guildId &&
       binding.generation === message.generation && binding.nativeId === message.nativeId && binding.provider === message.provider);
