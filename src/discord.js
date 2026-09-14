@@ -1425,7 +1425,6 @@ class DiscordGateway {
 
   noteLiveIntake(message) {
     const channelId = typeof message?.channelId === 'string' ? message.channelId : null;
-    if (this.liveCheckpointRetryTimer && this.liveCheckpointRetryChannels?.has(channelId)) return;
     if (!channelId || this.stopping || !this.state.getMessageRoute(channelId)?.binding.active) return;
     const count = (this.liveIntakeCounts.get(channelId) || 0) + 1;
     this.liveIntakeCounts.set(channelId, count);
