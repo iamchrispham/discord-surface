@@ -1476,7 +1476,6 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
 async function runRuntime(args) {
   const { paths, state } = openState(args);
   const config = state.requireConfig();
-  const recoveryCutoff = new Date().toISOString();
   let gateway;
   let gatewayReady = false;
   let stopping = false;
@@ -1514,6 +1513,7 @@ async function runRuntime(args) {
       onReady: () => bindingWake.start()
     });
     await gateway.start(config.secretFile);
+    const recoveryCutoff = new Date().toISOString();
     await gateway.reconcilePending(recoveryCutoff);
     gatewayReady = true;
     bindingWake.start();

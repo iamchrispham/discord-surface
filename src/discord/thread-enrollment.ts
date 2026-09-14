@@ -139,8 +139,10 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       const baseline = await readHistory({ limit: 1, signal });
       if (!current()) return false;
       if (baseline.some(message => !/^\d+$/.test(message.id))) throw new Error('Thread history message has no stable ID');
-      const newest = baseline.sort((a, b) => compareIds(b.id, a.id))[0]?.id ||
-        gateway.state.getThreadEnrollment(enrollment.threadId)?.lastSeenId || null;
+      const fetchedNewest = baseline.sort((a, b) => compareIds(b.id, a.id))[0]?.id || null;
+      const liveLastSeenId = gateway.state.getThreadEnrollment(enrollment.threadId)?.lastSeenId || null;
+      let newest = fetchedNewest || liveLastSeenId;
+      if (fetchedNewest && liveLastSeenId && compareIds(liveLastSeenId, fetchedNewest) > 0) newest = liveLastSeenId;
       if (!gateway.state.setThreadBaseline(enrollment.threadId, newest, binding)) return false;
       after = gateway.state.getThreadEnrollment(enrollment.threadId)?.recoveredThroughId || null;
     }
