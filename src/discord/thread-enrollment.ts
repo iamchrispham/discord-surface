@@ -181,7 +181,15 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
     }
     if (!current()) return false;
     if (!complete) {
-      if (!checkpointOnly) boundary(THREAD_STATES.GAP, 'Thread history recovery bound reached', after);
+      if (checkpointOnly) {
+        const advanced = Boolean(after && (!startingAfter || compareIds(after, startingAfter) > 0));
+        const checkpointed = advanced ? gateway.state.checkpointThread(enrollment.threadId, after!, binding) as ThreadEnrollment | null : null;
+        if (!checkpointed || checkpointed.recoveredThroughId !== after) {
+          boundary(THREAD_STATES.GAP, 'Thread history recovery bound reached', after);
+        }
+      } else {
+        boundary(THREAD_STATES.GAP, 'Thread history recovery bound reached', after);
+      }
       return false;
     }
     if (checkpointOnly) {
