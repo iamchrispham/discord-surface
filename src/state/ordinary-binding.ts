@@ -153,6 +153,7 @@ export interface OrdinaryBindingDependencies {
   UnresolvedWorkError: OrdinaryErrorConstructor;
   assertText(value: unknown, name: string, max?: number): string;
   assertUuid(value: unknown, name?: string): string;
+  compareDiscordIds(left: string, right: string): number;
   bindingMatchesExpected(
     binding: OrdinaryBindingRecord | null,
     expectedBinding: OrdinaryBindingRecord | null
@@ -243,15 +244,17 @@ export function hasOrdinaryPreflightReceipt(
     LIMIT 1`).get(binding.channelId, binding.provider, binding.nativeId, binding.workspace, binding.generation, binding.sessionRoot || null));
 }
 
-function maxDiscordId(current: string | null, candidate: string): string {
+function maxDiscordId(
+  compareDiscordIds: OrdinaryBindingDependencies['compareDiscordIds'],
+  current: string | null,
+  candidate: string
+): string {
   if (!current) return candidate;
-  if (/^\d+$/.test(current) && /^\d+$/.test(candidate)) {
-    return BigInt(current) < BigInt(candidate) ? candidate : current;
-  }
-  return current;
+  return compareDiscordIds(current, candidate) < 0 ? candidate : current;
 }
 
 function advanceEnrolledThreadCutoffs(
+  compareDiscordIds: OrdinaryBindingDependencies['compareDiscordIds'],
   state: OrdinaryBindingState,
   parentChannelId: string,
   intakeCutoff: string,
@@ -261,7 +264,7 @@ function advanceEnrolledThreadCutoffs(
     FROM thread_enrollments
     WHERE parent_channel_id=? AND active=1`).all<{ thread_id: string; recovered_through_id: string | null }>(parentChannelId);
   for (const row of rows) {
-    const next = maxDiscordId(row.recovered_through_id, intakeCutoff);
+    const next = maxDiscordId(compareDiscordIds, row.recovered_through_id, intakeCutoff);
     if (next === row.recovered_through_id) continue;
     state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=?, updated_at=? WHERE thread_id=? AND active=1')
       .run(next, updatedAt, row.thread_id);
@@ -278,13 +281,14 @@ export function createOrdinaryBindingHandlers(
     UnresolvedWorkError,
     assertText,
     assertUuid,
+    compareDiscordIds,
     bindingMatchesExpected,
     now
   }: OrdinaryBindingDependencies
 ): OrdinaryBindingHandlers {
   const handlers: OrdinaryBindingHandlers = {
     advanceEnrolledThreadCutoffs(state, parentChannelId, intakeCutoff, updatedAt) {
-      advanceEnrolledThreadCutoffs(state, parentChannelId, intakeCutoff, updatedAt);
+      advanceEnrolledThreadCutoffs(compareDiscordIds, state, parentChannelId, intakeCutoff, updatedAt);
     },
 
     bindOrdinary(state, binding, identity, adoptionCutoff = null, options = {}) {
@@ -516,7 +520,7 @@ export function createOrdinaryBindingHandlers(
               state.assertThreadEnrollmentCoverage(channelId, enrollmentProof);
             }
             state.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'ordinary handoff adoption cutoff', current);
-            advanceEnrolledThreadCutoffs(state, channelId, intakeCutoff, updatedAt);
+            advanceEnrolledThreadCutoffs(compareDiscordIds, state, channelId, intakeCutoff, updatedAt);
           }
           const generation = existing.generation + 1;
           state.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, readiness=?, generation=?, active=1, updated_at=?

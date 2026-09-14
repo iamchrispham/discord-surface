@@ -7,6 +7,7 @@ const { DatabaseSync } = require('node:sqlite');
 
 const { SurfaceState, MESSAGE_STATES, PROVIDERS, READINESS } = require('../src/state');
 const { THREAD_INTAKE_REASONS, THREAD_RECEIPT_KINDS, THREAD_STATES } = require('../src/state/thread-enrollment');
+const { assertEnrolledThreadIntakeRange } = require('../src/discord/handoff-fence');
 
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const SUCCESSOR = 'f8296579-092b-4503-bf98-1f3c2b6d4913';
@@ -191,6 +192,51 @@ test('authorized parent generation changes preserve active thread routes behind 
   assert.equal(currentConductor.accepted, true);
   assert.equal(currentConductor.message.generation, conductorSuccessor.generation);
   assert.equal(currentConductor.message.deliveryChannelId, 'conductor-child');
+});
+
+test('ordinary rebind advances enrolled cutoff for non-numeric Discord IDs', t => {
+  const f = fixture(t);
+  adoptReady(f, 'cursor-a');
+  const predecessor = f.state.getBinding('parent');
+  const successor = f.state.rebind({ ...predecessor, nativeId: SUCCESSOR }, { intakeCutoff: 'cursor-b' });
+  assert.equal(successor.generation, predecessor.generation + 1);
+  assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, 'cursor-b');
+});
+
+test('enrolled handoff history paginates backward and validates the oldest unseen page', async () => {
+  const messages = Array.from({ length: 102 }, (_, index) => ({ id: String(index + 100) }));
+  const requests = [];
+  const child = {
+    id: 'child',
+    messages: {
+      async fetch(options) {
+        requests.push(options);
+        const bound = options.before ? BigInt(options.before) : null;
+        const after = options.after ? BigInt(options.after) : null;
+        return messages
+          .filter(message => (!bound || BigInt(message.id) < bound) && (!after || BigInt(message.id) > after))
+          .sort((left, right) => Number(BigInt(right.id) - BigInt(left.id)))
+          .slice(0, options.limit);
+      }
+    }
+  };
+  const enrollment = { threadId: child.id, active: true, recoveredThroughId: '100', updatedAt: 'updated' };
+  const state = {
+    listThreadEnrollments: () => [enrollment],
+    hasIntakeEvidence: id => id !== '101',
+    checkpointIntake: () => true
+  };
+  const binding = { channelId: 'parent' };
+  const client = { channels: { fetch: async id => id === child.id ? child : null } };
+
+  await assert.rejects(
+    () => assertEnrolledThreadIntakeRange(client, state, binding, '202', 'test handoff'),
+    /durably drained/
+  );
+  assert.deepEqual(requests, [
+    { limit: 100, before: '202' },
+    { limit: 100, before: '102' }
+  ]);
 });
 
 test('child intake records parent authority and child delivery while preserving custody', t => {

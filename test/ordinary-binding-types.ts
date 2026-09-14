@@ -91,6 +91,7 @@ const handlers = createOrdinaryBindingHandlers({
   READINESS: readinessValues,
   assertText: value => String(value),
   assertUuid: value => String(value),
+  compareDiscordIds: (left, right) => left.localeCompare(right),
   bindingMatchesExpected: () => true,
   now: () => '2026-09-13T00:00:00.000Z'
 });

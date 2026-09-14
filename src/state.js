@@ -96,6 +96,7 @@ const ordinaryBindingHandlers = createOrdinaryBindingHandlers({
   UnresolvedWorkError,
   assertText,
   assertUuid,
+  compareDiscordIds,
   bindingMatchesExpected,
   now
 });

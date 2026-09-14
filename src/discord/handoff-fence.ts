@@ -16,7 +16,7 @@ export interface HandoffChannel {
   id?: unknown;
   send?: (payload: { content: string; allowedMentions: { parse: string[] } }) => Promise<unknown>;
   messages?: {
-    fetch?: (options: { limit: number; after?: string }) => Promise<unknown>;
+    fetch?: (options: { limit: number; after?: string; before?: string }) => Promise<unknown>;
   };
 }
 
@@ -199,13 +199,14 @@ export async function assertEnrolledThreadIntakeRange(
     if (!channel || channel.id !== enrollment.threadId || typeof channel.messages?.fetch !== 'function') {
       throw new Error(`${operation} requires Discord history range access for enrolled thread ${enrollment.threadId}`);
     }
-    let after = enrollment.recoveredThroughId || null;
+    let before = typeof fenceId === 'string' && fenceId.length > 0 ? fenceId : null;
+    const recoveredThrough = enrollment.recoveredThroughId || null;
     let pages = 0;
     let total = 0;
     let complete = false;
     while (pages < RECOVERY_LIMITS.maxPages && total < RECOVERY_LIMITS.maxMessages) {
-      const options: { limit: number; after?: string } = { limit: RECOVERY_LIMITS.pageSize };
-      if (after) options.after = after;
+      const options: { limit: number; before?: string } = { limit: RECOVERY_LIMITS.pageSize };
+      if (before) options.before = before;
       const page = historyMessages(await channel.messages.fetch(options));
       pages += 1;
       if (!page.length) {
@@ -220,11 +221,11 @@ export async function assertEnrolledThreadIntakeRange(
       }
       const stablePage = page as HistoryMessage[];
       stablePage.sort((left, right) => compareDiscordIds(left.id, right.id));
-      const reachedFence = stablePage.some(message => compareDiscordIds(message.id, fenceId) >= 0);
-      const fresh = stablePage.filter(message => (!after || compareDiscordIds(message.id, after) > 0) &&
+      const reachedRecovery = Boolean(recoveredThrough && stablePage.some(message => compareDiscordIds(message.id, recoveredThrough) <= 0));
+      const fresh = stablePage.filter(message => (!recoveredThrough || compareDiscordIds(message.id, recoveredThrough) > 0) &&
         compareDiscordIds(message.id, fenceId) < 0);
       if (!fresh.length) {
-        if (reachedFence || stablePage.length < RECOVERY_LIMITS.pageSize) {
+        if (reachedRecovery || stablePage.length < RECOVERY_LIMITS.pageSize) {
           complete = true;
           break;
         }
@@ -234,13 +235,13 @@ export async function assertEnrolledThreadIntakeRange(
         if (total >= RECOVERY_LIMITS.maxMessages || !state.hasIntakeEvidence(message.id)) {
           throw new Error(`${operation} requires enrolled thread ${enrollment.threadId} intake to be durably drained`);
         }
-        after = message.id;
         total += 1;
       }
-      if (!enrollment.recoveredThroughId && stablePage.length >= RECOVERY_LIMITS.pageSize && !reachedFence) {
+      before = stablePage[0].id;
+      if (!recoveredThrough && stablePage.length >= RECOVERY_LIMITS.pageSize) {
         throw new Error(`${operation} requires a confirmed intake boundary for enrolled thread ${enrollment.threadId}`);
       }
-      if (reachedFence || stablePage.length < RECOVERY_LIMITS.pageSize) {
+      if (reachedRecovery || stablePage.length < RECOVERY_LIMITS.pageSize) {
         complete = true;
         break;
       }
