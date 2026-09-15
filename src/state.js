@@ -1880,16 +1880,17 @@ class SurfaceState {
       else this.upsertIntakeWatermark(event, ready, coverageId);
       let agent = null;
       let invalidAgent = false;
-      if (!enrollment && event.isBot && event.content.startsWith(AGENT_PREFIX)) {
+      if (event.isBot && event.content.startsWith(AGENT_PREFIX)) {
         try {
-          const target = binding && Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation'].map(key => [key, binding[key]]));
+          const target = binding && Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation']
+            .map(key => [key, key === 'channelId' ? event.channelId : binding[key]]));
           agent = decodeAgentMessage(event.content, agentToken, target);
           if (attachments.length) throw new BindingError('agent attachments are not supported');
         } catch { invalidAgent = true; }
       }
       let reason = invalidAgent ? 'invalid-event' : null;
       if (typeof event.content !== 'string' || event.content.length > 10000 || attachments === null || (event.content.length === 0 && attachments?.length === 0)) reason = 'invalid-event';
-      else if (enrollment && event.isBot) reason = 'bot-source';
+      else if (enrollment && event.isBot && !agent) reason = 'bot-source';
       else if (!agent && directPost) reason = 'automatic-publication';
       else if (!agent && event.isBot) reason = 'bot-source';
       else if (event.guildId !== config.guildId || (!agent && event.authorId !== config.operatorId)) reason = 'unauthorized-sender';
@@ -1918,10 +1919,18 @@ class SurfaceState {
       }
       if (agent && this.db.prepare(`SELECT 1 FROM receipts WHERE kind='agent-message'
         AND json_extract(detail, '$.packet.id')=?
+        AND json_extract(detail, '$.packet.source.guildId')=?
+        AND json_extract(detail, '$.packet.source.channelId')=?
         AND json_extract(detail, '$.packet.source.provider')=?
         AND json_extract(detail, '$.packet.source.nativeId')=?
-        AND json_extract(detail, '$.packet.source.generation')=? LIMIT 1`)
-        .get(agent.id, agent.source.provider, agent.source.nativeId, agent.source.generation)) {
+        AND json_extract(detail, '$.packet.source.generation')=?
+        AND json_extract(detail, '$.packet.target.guildId')=?
+        AND json_extract(detail, '$.packet.target.channelId')=?
+        AND json_extract(detail, '$.packet.target.provider')=?
+        AND json_extract(detail, '$.packet.target.nativeId')=?
+        AND json_extract(detail, '$.packet.target.generation')=? LIMIT 1`)
+        .get(agent.id, agent.source.guildId, agent.source.channelId, agent.source.provider, agent.source.nativeId, agent.source.generation,
+          agent.target.guildId, agent.target.channelId, agent.target.provider, agent.target.nativeId, agent.target.generation)) {
         this.receipt(null, 'intake-rejected', {
           discordId: event.id,
           channelId: authorityChannelId,
@@ -2598,11 +2607,17 @@ class SurfaceState {
     return recovered;
   }
 
-  directPostBindingCurrent(binding, operatorId = null) {
+  directPostBindingCurrent(binding, operatorId = null, deliveryChannelId = null) {
     const config = this.requireConfig();
     const current = this.getBinding(binding?.channelId);
-    return Boolean(binding && current && bindingMatchesExpected(current, binding) && current.guildId === config.guildId &&
+    const parentCurrent = Boolean(binding && current && bindingMatchesExpected(current, binding) && current.guildId === config.guildId &&
       (operatorId === null || config.operatorId === operatorId));
+    if (!parentCurrent) return false;
+    if (deliveryChannelId === null || deliveryChannelId === binding.channelId) return true;
+    const route = this.getMessageRoute(deliveryChannelId);
+    return Boolean(route?.enrollment?.active && route.enrollment.threadId === deliveryChannelId &&
+      route.enrollment.parentChannelId === current.channelId && route.enrollment.guildId === config.guildId &&
+      route.binding.channelId === current.channelId && route.ready);
   }
 
   captureBoardRevision(target) {

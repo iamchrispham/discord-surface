@@ -2,7 +2,7 @@
 const { issueAgentAddress, verifyAgentAddress } = require('./agent-message');
 
 const fs = require('node:fs');
-const { resolveDedupeKey, resolveDirectBinding, runDirectPost } = require('./direct-post');
+const { resolveAgentAddress, resolveDedupeKey, resolveDirectBinding, runDirectPost } = require('./direct-post');
 const { runBoardRefresh } = require('./board-refresh');
 const os = require('node:os');
 const path = require('node:path');
@@ -1777,6 +1777,7 @@ async function agentSend(args) {
   }
   return directPost(args, provider, ordinary, {
     agentTarget,
+    agentThreadId: Object.hasOwn(args, 'agent-thread-id') ? args['agent-thread-id'] : null,
     agentPresentation: args['agent-presentation']
   });
 }
@@ -1821,7 +1822,8 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
     if (ordinary) await assertOrdinaryPostCaller(state, { provider, nativeId, generation, channelId }, dependencies);
     if (dependencies.exportAddress) {
       const binding = resolveDirectBinding(state, { nativeId, generation: Number(generation), channelId, provider, ordinary });
-      const envelope = issueAgentAddress(binding, readSecret(config.secretFile));
+      const address = resolveAgentAddress(state, binding, dependencies.agentThreadId ?? null);
+      const envelope = issueAgentAddress(address, readSecret(config.secretFile));
       print(envelope);
       return envelope;
     }
@@ -1832,6 +1834,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       generation,
       channelId,
       provider,
+      agentThreadId: dependencies.agentThreadId ?? null,
       textFile: required(args, 'text-file'),
       agentTarget: dependencies.agentTarget ?? null,
       agentPresentation: dependencies.agentPresentation,
@@ -2031,7 +2034,8 @@ async function main() {
       let ordinary;
       try { ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id'))); }
       finally { state.close(); }
-      return directPost(args, provider, ordinary, { exportAddress: true });
+      return directPost(args, provider, ordinary, { exportAddress: true,
+        agentThreadId: Object.hasOwn(args, 'agent-thread-id') ? args['agent-thread-id'] : null });
     }
     case 'agent-send': return agentSend(args);
     case 'decision-present': return decisionPresent(args);

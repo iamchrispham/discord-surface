@@ -64,8 +64,8 @@ This retains the existing cursor and custody, marks the thread pending and reque
 Gateway wake. It does not declare delivery successful or reset the adoption boundary.
 
 This slice does not discover or create threads, enroll private threads or forum posts,
-create another native session, or route agent packets, direct posts or slash interactions
-into child threads. Ordinary text instructions in enrolled threads use the existing queue.
+create another native session, or route direct posts or slash interactions into child
+threads. Ordinary text instructions in enrolled threads use the existing queue.
 
 For the `/conduct` integration, `provision` creates or reuses one text channel for the stable conductor under its configured vendor category. Its topic is a fixed address marker. Local SQLite stores the provider, canonical repository key, native UUID, generation, readiness, history coverage, and custody. It never creates a native executor or resumes a session. The category comes from configuration, so a Codex command cannot choose the Claude category.
 
@@ -446,6 +446,7 @@ binding. This uses the existing ordinary-session or conductor owner checks:
 
 ```sh
 node src/cli.js agent-address --provider claude --channel-id TARGET_CHANNEL \
+  --agent-thread-id TARGET_CHILD_THREAD_ID \
   --native-id TARGET_NATIVE_UUID --generation TARGET_GENERATION > destination.json
 ```
 
@@ -453,6 +454,7 @@ Transfer that file to the sender, then run:
 
 ```sh
 node src/cli.js agent-send --provider codex --channel-id SOURCE_CHANNEL \
+  --agent-thread-id SOURCE_CHILD_THREAD_ID \
   --native-id SOURCE_NATIVE_UUID --generation SOURCE_GENERATION \
   --target-file destination.json --text-file task.txt --dedupe-key task-123 \
   --agent-presentation attachment-v1
@@ -469,6 +471,13 @@ the exact signed packet as one `agent-message.tether` attachment. The native
 Discord rendering of that attachment still needs verification with a real
 Discord client before enabling the mode for a receiver. Legacy JSON posting
 remains the release default and is used when the flag is omitted.
+
+`--agent-thread-id` selects one already enrolled public child under the supplied
+`--channel-id` parent. The parent remains the binding authority, while the selected
+child is the signed source or destination channel. Selection is explicit and has no
+parent fallback or thread discovery. Ordinary native replies remain in the receiving
+child. An explicit result follows the peer address carried by the accepted request,
+including that peer's selected child when present.
 
 Only authenticated addressed packets enter agent delivery. Ordinary bot replies
 and milestone posts remain excluded. A result may be explicitly sent with
