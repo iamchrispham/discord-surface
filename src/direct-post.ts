@@ -550,6 +550,11 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       try {
         await verifyAgentDestination({ token, agentTarget: deliveryTarget, fetchImpl, signal, timeoutMs });
       } catch (error) {
+        if (!state.directPostBindingCurrent(binding, operatorId, address.channelId)) {
+          const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
+          parts.push({ index: partIndex, status: stale.outcome, messageId: null });
+          break;
+        }
         const preflight = state.recordDirectPostPreflight(meta, outcomeFor(error), {
           status: errorStatus(error) || null, error: errorMessage(error).slice(0, 300)
         });

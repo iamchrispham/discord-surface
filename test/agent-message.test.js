@@ -679,6 +679,37 @@ test('source child revocation after destination lookup refuses before custody or
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('source child revocation after rejected destination lookup records stale custody', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-child-rejected-lookup-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    let binding = state.getBinding(source.channelId);
+    binding = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', binding);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, binding);
+    state.setThreadBaseline('103', '7000', binding);
+    state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
+    const textFile = path.join(dir, 'task.txt');
+    fs.writeFileSync(textFile, packet.text);
+    let posts = 0;
+    const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId,
+      provider: source.provider, agentThreadId: '103', textFile, dedupeKey: 'child-rejected-lookup', agentTarget: issueAgentAddress(target, token),
+      fetchImpl: async (_url, options) => {
+        if (options.method === 'POST') posts += 1;
+        else {
+          state.markThreadBoundary('103', THREAD_STATES.UNAVAILABLE, 'child revoked during rejected destination lookup', null, null, binding);
+          throw Object.assign(new Error('destination lookup rejected after source revocation'), { outcome: 'not_sent', status: 404 });
+        }
+        return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+      } });
+    assert.equal(result.status, 'stale');
+    assert.equal(posts, 0);
+    assert.equal(state.directPostRows('child-rejected-lookup').filter(row => row.kind === 'direct-post-attempt').length, 0);
+    assert.equal(state.directPostRows('child-rejected-lookup').find(row => row.kind === 'direct-post-outcome').detail.outcome, 'stale');
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('results reverse an accepted request and reject unrelated or unknown correlation before custody', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-result-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));

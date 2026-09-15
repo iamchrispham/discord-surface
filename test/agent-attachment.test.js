@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
-const { ChannelType } = require('discord.js');
+const { ChannelType, Collection } = require('discord.js');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -165,6 +165,67 @@ test('enrolled child attachment reaches authenticated child custody', async t =>
   assert.equal(state.getThreadEnrollment(destination.channelId).lastAcceptedId, '7001');
 });
 
+test('live child intake normalizes a Discord.js attachment collection before bot rejection', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-child-collection-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  let gateway;
+  t.after(async () => { try { await gateway?.stop(); } catch {} try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/ac.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  let binding = state.getBinding(target.channelId);
+  binding = state.setBindingReadiness(target.channelId, READINESS.READY, 'fixture ready', binding);
+  state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
+  state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
+  state.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId }, binding);
+  state.setThreadBaseline('103', '6999', binding);
+  state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
+  const destination = { ...target, channelId: '103', generation: binding.generation };
+  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  let fetchCalls = 0;
+  const parentChannel = {
+    id: target.channelId, guildId: target.guildId, type: ChannelType.GuildText,
+    topic: staticConductorMarker({ provider: target.provider, conductorId: binding.conductorId, repoKey: binding.repoKey }),
+    permissionsFor: () => ({ has: () => true }), messages: { fetch: async () => [] },
+    send: async () => ({ id: 'parent-receipt' })
+  };
+  const childChannel = {
+    id: destination.channelId, guildId: destination.guildId, parentId: target.channelId, type: ChannelType.PublicThread,
+    locked: false, archived: false, isThread: () => true,
+    permissionsFor: () => ({ has: () => true }), messages: { fetch: async () => [] },
+    send: async () => ({ id: 'child-receipt' })
+  };
+  gateway = new DiscordGateway({
+    state,
+    client: { user: { id: '901' }, channels: { fetch: async id => id === target.channelId ? parentChannel : childChannel }, on() {}, off() {}, async destroy() {} },
+    providers: {},
+    fetchHistory: async () => [],
+    recoveryOptions: {
+      agentAttachmentFetch: async () => {
+        fetchCalls += 1;
+        return new Response(Buffer.from(wire), { status: 200, headers: { 'content-length': String(Buffer.byteLength(wire)) } });
+      }
+    }
+  });
+  gateway.discordToken = token;
+  gateway.ready = false;
+  const attachment = { url: 'https://cdn.discordapp.com/attachments/100/103/agent-message.tether', filename: 'agent-message.tether',
+    contentType: 'application/octet-stream', size: Buffer.byteLength(wire) };
+  const message = {
+    id: '7002', guildId: destination.guildId, channelId: destination.channelId, channel: childChannel,
+    author: { id: '901', bot: true }, content: 'readable child preview',
+    attachments: new Collection([[attachment.filename, attachment]])
+  };
+  gateway.boundMessage(message);
+  await Promise.all([...gateway.inFlight]);
+  await gateway.consumer.waitForReceipts();
+  const stored = state.getMessage(message.id);
+  assert.ok(stored);
+  assert.equal(fetchCalls, 1);
+  assert.equal(stored.channelId, target.channelId);
+  assert.equal(stored.deliveryChannelId, destination.channelId);
+  assert.deepEqual(stored.agentMessage, { ...packet, target: destination });
+});
+
 test('declared attachment size mismatch is a retryable intake failure', async () => {
   const url = 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether';
   const body = Buffer.from('short body', 'utf8');
@@ -311,6 +372,77 @@ test('child attachment failure retries after child recovery without a new arriva
   assert.equal(state.getIntakeWatermark(target.channelId).recovered_through_id, '6999');
   assert.equal(gateway.attachmentIntakeRetryMessages.has(destination.channelId), false);
   assert.equal(gateway.attachmentIntakeBlockedChannels.has(destination.channelId), false);
+  await gateway.stop();
+});
+
+test('child attachment recovery does not read or demote the healthy parent', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-attachment-child-parent-isolation-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  let gateway;
+  t.after(async () => { try { await gateway?.stop(); } catch {} try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-child-parent-isolation.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  let binding = state.getBinding(target.channelId);
+  binding = state.setBindingReadiness(target.channelId, READINESS.READY, 'fixture ready', binding);
+  state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
+  state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
+  state.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId }, binding);
+  state.setThreadBaseline('103', '6999', binding);
+  state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
+  const destination = { ...target, channelId: '103', generation: binding.generation };
+  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  let fetchAttempts = 0;
+  let parentFetches = 0;
+  const message = {
+    id: '7000', guildId: destination.guildId, channelId: destination.channelId,
+    author: { id: '901', bot: true }, content: 'readable preview',
+    attachments: [{ url: 'https://cdn.discordapp.com/attachments/100/103/agent-message.tether', filename: 'agent-message.tether',
+      contentType: 'application/octet-stream', size: Buffer.byteLength(wire) }]
+  };
+  const parentChannel = {
+    id: target.channelId, guildId: target.guildId, type: ChannelType.GuildText,
+    topic: staticConductorMarker({ provider: target.provider, conductorId: binding.conductorId, repoKey: binding.repoKey }),
+    permissionsFor: () => ({ has: () => true }), messages: { fetch: async () => [] }
+  };
+  const childChannel = {
+    id: destination.channelId, guildId: destination.guildId, parentId: target.channelId, type: ChannelType.PublicThread,
+    locked: false, archived: false, isThread: () => true,
+    permissionsFor: () => ({ has: () => true }), messages: { fetch: async () => [] }
+  };
+  gateway = new DiscordGateway({
+    state,
+    client: {
+      user: { id: '901' },
+      channels: { fetch: async id => {
+        if (id === target.channelId) {
+          parentFetches += 1;
+          throw new Error('parent history must not be read for child recovery');
+        }
+        return childChannel;
+      } },
+      on() {}, off() {}, async destroy() {}
+    },
+    providers: {},
+    fetchHistory: async channel => {
+      assert.equal(channel.id, destination.channelId);
+      return [];
+    },
+    recoveryOptions: {
+      agentAttachmentFetch: async () => {
+        fetchAttempts += 1;
+        if (fetchAttempts === 1) throw new Error('CDN unavailable');
+        return new Response(Buffer.from(wire), { status: 200, headers: { 'content-length': String(Buffer.byteLength(wire)) } });
+      }
+    }
+  });
+  gateway.discordToken = token;
+  gateway.ready = true;
+  gateway.boundMessage({ ...message, channel: childChannel });
+  await waitForCondition(() => state.getMessage(message.id), 'child attachment did not recover without parent history');
+  assert.equal(fetchAttempts, 2);
+  assert.equal(parentFetches, 0);
+  assert.equal(state.getBinding(target.channelId).readiness, READINESS.READY);
+  assert.equal(state.getThreadEnrollment(destination.channelId).state, THREAD_STATES.READY);
   await gateway.stop();
 });
 

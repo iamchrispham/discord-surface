@@ -407,8 +407,9 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const route = state.getMessageRoute(message?.channelId);
     if (!route?.enrollment || !message?.author?.bot) return null;
     const content = typeof message.content === 'string' ? message.content : '';
-    if (content.startsWith(AGENT_PREFIX) || message.attachments?.length) return null;
-    return state.acceptDiscordMessage(eventToInput(message), { ready, coverageId, expectedBinding });
+    const input = eventToInput(message);
+    if (content.startsWith(AGENT_PREFIX) || input.attachments?.length) return null;
+    return state.acceptDiscordMessage(input, { ready, coverageId, expectedBinding });
   }
 
   function connectedBotId() {
@@ -1709,7 +1710,7 @@ class DiscordGateway {
           return;
         }
       }
-      this.recoverTransport('live-attachment-gap', this.lifecycleEpoch, [binding.channelId]).then(async recovery => {
+      this.recoverTransport('live-attachment-gap', this.lifecycleEpoch, [intakeChannelId]).then(async recovery => {
         const recoveredRoute = childDelivery ? this.state.getMessageRoute(intakeChannelId) : null;
         const recoveredRouteIsCurrent = !childDelivery || Boolean(recoveredRoute?.enrollment?.active &&
           recoveredRoute.enrollment.threadId === intakeChannelId && recoveredRoute.enrollment.parentChannelId === binding.channelId &&
