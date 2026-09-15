@@ -426,11 +426,12 @@ const CREATED_THREAD_DIRECTIVE = /^::created-thread\{(?:threadId|clientThreadId)
 type CodeFence = { marker: '`' | '~'; length: number };
 
 function readFenceStart(line: string): CodeFence | null {
-  const match = /^ {0,3}([`~]{3,})[^\r\n]*$/.exec(line);
+  const match = /^ {0,3}([`~]{3,})([^\r\n]*)$/.exec(line);
   if (!match) return null;
   const run = match[1];
   const marker = run[0] as CodeFence['marker'];
   if (!run.split('').every(char => char === marker)) return null;
+  if (marker === '`' && match[2].includes('`')) return null;
   return { marker, length: run.length };
 }
 
@@ -465,20 +466,13 @@ function stripCreatedThreadDirectivePart(text: string, initialFence: CodeFence |
 type FinalAnswer = { text: string; parts: string[] };
 
 function sanitizeCreatedThreadDirective(text: string): FinalAnswer {
-  let fence: CodeFence | null = null;
-  let lineStart = true;
-  let parts = splitReply(text).map(part => {
-    const result = stripCreatedThreadDirectivePart(part, fence, lineStart);
-    fence = result.fence;
-    lineStart = result.lineStart;
-    return result.text;
-  });
-  if (parts.length) {
-    parts[0] = parts[0].trimStart();
-    parts[parts.length - 1] = parts[parts.length - 1].trimEnd();
-  }
-  if (parts.length > 1) parts = parts.filter(part => part.length > 0);
-  if (parts.length === 1 && parts[0] === '') parts = [];
+  let sanitized = splitReply(text)
+    .map(part => stripCreatedThreadDirectivePart(part, null, true).text)
+    .join('')
+    .trim();
+  if (!sanitized) return { text: '', parts: [] };
+  let parts = splitReply(sanitized);
+  if (parts.some(part => !part.trim())) parts = parts.filter(part => part.trim());
   return { text: parts.join(''), parts };
 }
 
