@@ -3,10 +3,10 @@ const { acknowledgmentCommand } = require('./acknowledgment');
 const fs = require('node:fs');
 const path = require('node:path');
 const { ClaudeChannel } = require('./claude-channel');
-const { messageRequest } = require('./native');
+const { agentCompletionCommand, messageRequest } = require('./native');
 const { MESSAGE_STATES, normalizeAttachments } = require('./state');
 
-const PAYLOAD_SCHEMA_VERSION = 3;
+const PAYLOAD_SCHEMA_VERSION = 4;
 const MONITOR_DEDUPE_CLEANUP_INTERVAL_MS = 1000;
 const MONITOR_DEDUPE_STATES = new Set([MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED]);
 
@@ -93,13 +93,15 @@ function eventValues(event) {
   return { content, messageId, nativeId, generation, attachments };
 }
 
-function monitorEvent({ content, messageId, nativeId, generation, attachments = [], stateDir, dbPath, cliPath, textFile }) {
+function monitorEvent({ content, messageId, nativeId, generation, attachments = [], completion = null, stateDir, dbPath, cliPath, textFile }) {
   const event = {
     type: 'discord-surface/claude-monitor',
     version: PAYLOAD_SCHEMA_VERSION,
     content,
     meta: { messageId, nativeId, generation: String(generation) },
-    instructions: 'At pickup run acknowledgment.command once with argument boundaries preserved. Then create reply.directory owner-only if needed, write the final answer to reply.textFile, and run reply.command. Acknowledgment means received, not completed.',
+    instructions: completion
+      ? 'At pickup run acknowledgment.command once with argument boundaries preserved. If no Discord reply is needed, run completion.command exactly once. Otherwise create reply.directory owner-only if needed, write the final answer to reply.textFile, and run reply.command. Acknowledgment means received, not completed.'
+      : 'At pickup run acknowledgment.command once with argument boundaries preserved. Then create reply.directory owner-only if needed, write the final answer to reply.textFile, and run reply.command. Acknowledgment means received, not completed.',
     acknowledgment: { command: acknowledgmentCommand({ id: messageId, nativeId, generation, provider: 'claude' }, dbPath, cliPath) },
     reply: {
       messageId,
@@ -127,15 +129,18 @@ function monitorEvent({ content, messageId, nativeId, generation, attachments = 
     }
   };
   if (attachments.length) event.attachments = attachments;
+  if (completion?.length) event.completion = { messageId, nativeId, generation, command: [...completion] };
   return event;
 }
 
-function monitorPointer({ messageId, nativeId, generation, payloadPath }) {
+function monitorPointer({ messageId, nativeId, generation, payloadPath, hasCompletion = false }) {
   return {
     type: 'discord-surface/claude-monitor',
     payloadPath: path.resolve(payloadPath),
     meta: { messageId, nativeId, generation: String(generation) },
-    instructions: 'Read the payload at payloadPath with Read. Run acknowledgment.command, then answer through reply.command.'
+    instructions: hasCompletion
+      ? 'Read the payload at payloadPath with Read. Run acknowledgment.command, then use reply.command or completion.command as instructed.'
+      : 'Read the payload at payloadPath with Read. Run acknowledgment.command, then answer through reply.command.'
   };
 }
 
@@ -184,11 +189,15 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
       }
       const textFile = replyFileFor(stateDir, values.messageId, values.generation);
       const payloadPath = payloadFileFor(stateDir, values.messageId, values.nativeId, values.generation, dbPath);
+      const completion = message.agentMessage
+        ? agentCompletionCommand(message, path.resolve(dbPath), path.resolve(cliPath), path.resolve(stateDir))
+        : null;
       let payload;
       try {
         payload = monitorEvent({
           ...values,
           content: messageRequest(message),
+          completion,
           attachments: message.attachments,
           stateDir: path.resolve(stateDir),
           dbPath: path.resolve(dbPath),
@@ -202,7 +211,13 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
       }
       const entry = { promise: null, settled: false };
       entry.promise = (async () => {
-        try { await writeStdoutLine(stdout, JSON.stringify(monitorPointer({ ...values, payloadPath }))); }
+        try {
+          await writeStdoutLine(stdout, JSON.stringify(monitorPointer({
+            ...values,
+            payloadPath,
+            hasCompletion: Boolean(completion?.length)
+          })));
+        }
         catch (error) {
           error.potentiallyDelivered = true;
           notifyTransport('onerror', error);

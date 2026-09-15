@@ -1,4 +1,5 @@
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
+const path = require('node:path');
 const {
   AGENT_ATTACHMENT_CONTENT_TYPE,
   AGENT_ATTACHMENT_FILENAME,
@@ -9,7 +10,7 @@ const {
 } = require('./agent-attachment');
 const fs = require('node:fs');
 const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
-const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
+const { CODEX_VALIDATION_KINDS, dispatchAndObserve, agentCompletionCommand, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, TRANSPORT_RECEIPT_OUTCOMES, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
@@ -488,12 +489,14 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   function ownerMessageIsTerminal(message) {
-    return Boolean(message && [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state));
+    return Boolean(message && [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
+      MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST].includes(message.state));
   }
 
   function ownerCanAdvance(messageId) {
     const message = state.getMessage(messageId);
-    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state) ||
+    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
+      MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST].includes(message.state) ||
       (message.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(message));
   }
 
@@ -512,7 +515,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const queue = ownerQueues.get(ownerKey);
     if (!queue?.blockedMessageId || !ownerBindingReady(queue.blockedMessageId)) return;
     const blocked = state.getMessage(queue.blockedMessageId);
-    if (!blocked || ![MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(blocked.state)) return;
+    if (!blocked || !ownerMessageIsTerminal(blocked)) return;
     if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
     queue.blockedMessageId = null;
     queue.blockedReason = null;
@@ -607,6 +610,45 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     queue.blockedReason = null;
     pumpOwner(nativeOwnerKey(message));
     return true;
+  }
+
+  function releaseHandledWithoutPostId(messageId) {
+    const message = state.getMessage(messageId);
+    if (!message || message.state !== MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST) return false;
+    const queue = ownerQueues.get(nativeOwnerKey(message));
+    if (!queue) return false;
+    if (queue.active?.message.id === messageId) {
+      const activeWork = nativeWork.get(messageId);
+      if (activeWork) {
+        activeWork.controller?.abort();
+        return false;
+      }
+      queue.active = null;
+      queue.blockedMessageId = null;
+      queue.blockedReason = null;
+      pumpOwner(nativeOwnerKey(message));
+      return true;
+    }
+    if (queue.blockedMessageId !== messageId) return false;
+    queue.blockedMessageId = null;
+    queue.blockedReason = null;
+    pumpOwner(nativeOwnerKey(message));
+    return true;
+  }
+
+  function releaseHandledWithoutPost(messageId = null) {
+    if (messageId !== null) return releaseHandledWithoutPostId(messageId);
+    let released = false;
+    for (const queue of ownerQueues.values()) {
+      const messageIds = new Set([
+        queue.active?.message?.id,
+        queue.blockedMessageId
+      ].filter(Boolean));
+      for (const queuedMessageId of messageIds) {
+        released = releaseHandledWithoutPostId(queuedMessageId) || released;
+      }
+    }
+    return released;
   }
 
   function cancelQueuedEntry(entry) {
@@ -984,12 +1026,14 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     await Promise.allSettled([...receiptWork]);
   }
 
-  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, releaseAcknowledged, releaseIntake, resumeSubmitted, waitForNativeWork, waitForReceipts };
+  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted,
+    releaseAcknowledged, releaseHandledWithoutPost, releaseIntake, resumeSubmitted, waitForNativeWork, waitForReceipts };
 }
 
 class DiscordGateway {
-  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null, interactionFetch = globalThis.fetch } = {}) {
+  constructor({ state, stateDir = path.dirname(state.dbPath), client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null, interactionFetch = globalThis.fetch } = {}) {
     this.state = state;
+    this.stateDir = stateDir;
     this.logger = logger;
     this.onReady = typeof onReady === 'function' ? onReady : null;
     this.interactionFetch = interactionFetch;
@@ -1050,9 +1094,16 @@ class DiscordGateway {
       state,
       send: (message, reaction) => this.sendAcknowledgment(message, reaction)
     });
+    const completionFor = message => message.agentMessage ? agentCompletionCommand(message, state.dbPath, undefined, this.stateDir) : null;
     this.providers = providers || {
-      codex: new CodexProvider({ acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath) }),
-      claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(state, id, options) })
+      codex: new CodexProvider({
+        acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath),
+        completionFor
+      }),
+      claude: new ClaudeProvider({
+        waitForReply: (id, options) => waitForReply(state, id, options),
+        completionFor
+      })
     };
     this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (async (binding, options = {}) => {
       if (binding.provider === 'codex') return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot, options);
@@ -2472,6 +2523,7 @@ class DiscordGateway {
   async _reconcilePending(before, signal, readyOnly = false, channelIds = null) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const selectedChannels = channelIds ? new Set(channelIds) : null;
+    this.consumer?.releaseHandledWithoutPost?.();
     const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
       (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready);
     this.startDecisionRecovery(signal, selectedChannels);

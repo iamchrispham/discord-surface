@@ -60,7 +60,7 @@ export function sameAddress(left: unknown, right: unknown): boolean {
   return Object.keys(left).every(key => left[key as keyof AgentAddress] === right[key as keyof AgentAddress]);
 }
 
-function validate(packet: unknown): asserts packet is AgentMessage {
+export function validateAgentMessage(packet: unknown): asserts packet is AgentMessage {
   if (!exactKeys(packet, ['id', 'kind', 'source', 'target', 'replyTo', 'text'])) {
     throw new Error('invalid agent message');
   }
@@ -89,7 +89,7 @@ function signature(body: string, token: string): Buffer {
 }
 
 export function encodeAgentMessage(packet: AgentMessage, token: string): string {
-  validate(packet);
+  validateAgentMessage(packet);
   const body = Buffer.from(JSON.stringify(packet)).toString('base64url');
   const wire = `${PREFIX}${body}.${signature(body, token).toString('base64url')}`;
   if (wire.length > AGENT_MESSAGE_MAX_ENCODED_LENGTH) throw messageLimitError(wire.length);
@@ -109,7 +109,7 @@ export function decodeAgentMessage(wire: unknown, token: string, target: AgentAd
   const bytes = Buffer.from(body, 'base64url');
   if (bytes.toString('base64url') !== body) throw new Error('invalid agent message encoding');
   const packet: unknown = JSON.parse(bytes.toString('utf8'));
-  validate(packet);
+  validateAgentMessage(packet);
   if (!sameAddress(packet.target, target)) throw new Error('agent message target is stale or mismatched');
   return packet;
 }
