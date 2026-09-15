@@ -466,10 +466,7 @@ function stripCreatedThreadDirectivePart(text: string, initialFence: CodeFence |
 type FinalAnswer = { text: string; parts: string[] };
 
 function sanitizeCreatedThreadDirective(text: string): FinalAnswer {
-  let sanitized = splitReply(text)
-    .map(part => stripCreatedThreadDirectivePart(part, null, true).text)
-    .join('')
-    .trim();
+  const sanitized = stripCreatedThreadDirectivePart(text, null, true).text.trim();
   if (!sanitized) return { text: '', parts: [] };
   let parts = splitReply(sanitized);
   if (parts.some(part => !part.trim())) parts = parts.filter(part => part.trim());

@@ -399,27 +399,25 @@ test('Discord text removes only a top-level created-thread directive', async t =
   ].join('\n'));
 });
 
-test('Discord directive sanitization resets fence state at reply partitions', async t => {
+test('Discord directive sanitization preserves fence state across reply partitions', async t => {
   const { file } = fixture(t);
   const cursor = cursorAt(file);
   const reply = ['```text', 'x'.repeat(1990), '::created-thread{threadId="inside-partitioned-code"}', '```'].join('\n');
   fs.appendFileSync(file, finalRow(reply));
   const result = await observe(file, cursor);
-  assert.equal(result.text, ['```text', 'x'.repeat(1990), '```'].join('\n'));
+  assert.equal(result.text, reply);
   assert.equal(result.parts.join(''), result.text);
   assert.equal(result.parts.length, 2);
-  assert.ok(result.parts.every(part => part.trim()));
 });
 
-test('Discord directive sanitization treats a directive at a part boundary as top-level', async t => {
+test('Discord directive sanitization preserves a line split before an inline example', async t => {
   const { file } = fixture(t);
   const cursor = cursorAt(file);
   const reply = `${'x'.repeat(2000)}::created-thread{threadId="inline-partition"}\nfollowing prose`;
   fs.appendFileSync(file, finalRow(reply));
   const result = await observe(file, cursor);
-  assert.equal(result.text, `${'x'.repeat(2000)}following prose`);
+  assert.equal(result.text, reply);
   assert.equal(result.parts.join(''), result.text);
-  assert.ok(result.parts.every(part => !part.includes('inline-partition')));
 });
 
 test('Discord directive sanitization repartitions whitespace-only sanitized parts', async t => {
