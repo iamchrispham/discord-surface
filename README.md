@@ -35,6 +35,38 @@ node src/cli.js bind --state-dir "$HOME/.config/discord-surface" \
   --conductor-id CONDUCTOR_ID --repo-key CANONICAL_REPOSITORY_KEY
 ```
 
+## Issue and ticket threads
+
+Create a public Discord thread under an already bound text channel, then enroll its exact ID:
+
+```sh
+node src/cli.js thread-enroll --state-dir "$HOME/.config/discord-surface" \
+  --channel-id BOUND_PARENT_CHANNEL_ID --thread-id EXISTING_PUBLIC_THREAD_ID
+```
+
+Enrollment keeps the parent's native session and generation. Messages, receipt reactions,
+read acknowledgments and replies stay in the enrolled thread. Each thread has a separate
+history cursor. Repeating an active enrollment preserves that cursor. The command records each new enrollment as pending and requests recovery from a Gateway that supports threads. `status` shows the enrollment's
+readiness. A requested wake does not prove recovery or delivery.
+
+Unbinding the parent retires its thread enrollments. After rebinding the parent, explicitly
+enroll the same thread again to establish a fresh adoption boundary. Messages posted while
+the parent was unbound are excluded from the new enrollment.
+
+The first history read establishes the adoption boundary. Existing backlog is excluded,
+while messages already accepted during recovery retain custody. Restart recovery backfills
+newer messages from that thread's own cursor. An unlocked archived thread can be read
+without unarchiving it. A normal authorized reply can reactivate it through Discord's
+send operation. Locked, missing or inaccessible threads remain unavailable, with no reply
+fallback to the parent channel. Their failure does not demote a healthy parent binding. After fixing access, explicitly
+retry recovery with `recover --state-dir <directory> --intake-channel-id <thread-id>`.
+This retains the existing cursor and custody, marks the thread pending and requests a
+Gateway wake. It does not declare delivery successful or reset the adoption boundary.
+
+This slice does not discover or create threads, enroll private threads or forum posts,
+create another native session, or route agent packets, direct posts or slash interactions
+into child threads. Ordinary text instructions in enrolled threads use the existing queue.
+
 For the `/conduct` integration, `provision` creates or reuses one text channel for the stable conductor under its configured vendor category. Its topic is a fixed address marker. Local SQLite stores the provider, canonical repository key, native UUID, generation, readiness, history coverage, and custody. It never creates a native executor or resumes a session. The category comes from configuration, so a Codex command cannot choose the Claude category.
 
 ```sh
@@ -222,9 +254,47 @@ This command resolves the current Claude caller again and requires the active or
 
 This path is currently qualified only by local simulated tests and package smoke. The adapter requires Node 22.13.x through 22.x. Claude attachment uses an owner-only Unix socket with a short absolute path, so Windows support is not established by this text. macOS, Linux, and Windows Claude host and provider rows, native session opt-in, Discord permissions, approval behavior, endpoint recovery, and a live instruction/reply/milestone round trip require separate direct verification.
 
+### Explicit live board refresh
+
+`board-refresh` updates one already bound status-board message from a compact rendered text file. It requires the exact active native UUID and generation, bound channel ID, target message ID, text file, and dedupe key. `--request-id` is accepted as the legacy alias for `--dedupe-key`; if both are supplied they must match.
+
+```sh
+node src/cli.js board-refresh \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id CURRENT_NATIVE_UUID \
+  --generation CURRENT_GENERATION \
+  --channel-id BOUND_CHANNEL_ID \
+  --message-id STATUS_BOARD_MESSAGE_ID \
+  --text-file /absolute/path/to/compact-board.txt \
+  --dedupe-key BOARD_REFRESH_KEY
+```
+
+The text file must contain non-empty text no longer than Discord's 2,000-character message limit. Before admission, the command reads the installation identity and target message, verifies the configured guild, bound channel, exact target ID, bot author, and sent-message provenance already recorded for that target. An already matching target is an honest no-op. Otherwise the command makes one PATCH with mentions suppressed. It does not POST, split, retry, delete, pin, or fall back to another target.
+
+Board custody has one unresolved edit fence per target message across dedupe keys and native generations. The command captures the target revision before its asynchronous reads and compares it atomically at admission. A stale prepared request refuses before PATCH. After admission, a timeout, abort, process stop, or malformed response remains unknown and blocks a newer edit for that target. A pre-aborted request refuses before admission and creates no attempt. Handoff, readiness, intake, topic publication, and ordinary-post custody remain separate. A settled duplicate returns historical receipt evidence without requiring a fresh target read.
+
+Reconcile a board attempt recorded as unknown only after direct evidence establishes that the desired content was applied:
+
+```sh
+node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
+  --board-guild-id GUILD_ID \
+  --board-channel-id BOUND_CHANNEL_ID \
+  --board-message-id STATUS_BOARD_MESSAGE_ID \
+  --board-attempt-id BOARD_ATTEMPT_ID \
+  --board-resolution applied \
+  --board-evidence-scope EVIDENCE_DESCRIPTION \
+  --board-readback-at 2026-09-12T19:00:00.000Z \
+  --board-readback 'EXACT_DESIRED_BOARD_TEXT' \
+  --board-sole-writer true \
+  --board-single-attempt true \
+  --board-no-hidden-retry true
+```
+
+`--board-readback` is the exact desired board text, not a filename. Reconciliation requires a post-operation readback with the exact desired content, different from the pre-edit content, and explicit sole-writer, single-attempt, and no-hidden-retry evidence. An old response or a GET of prior content does not prove that the PATCH was unsent. The local suite uses disposable SQLite and controlled HTTP, so it does not prove that a real Discord target exists, that the configured token can access it, or that live Discord applies a disconnected PATCH. Those facts require separate direct verification.
+
 Accepted input is durable before a Discord handler returns. After authorized intake commits, a ready binding gets one 📥 reaction on the source message. A binding that is unavailable when the receipt is prepared gets one reply: `Receipt: saved. Delivery was paused when this receipt was prepared.` Ready bindings do not get a text receipt. Text receipts are replies with mentions disabled and a stable nonce. Neither receipt claims that the native agent has read, acted on, or answered the input. Receipt delivery is independent of native forwarding and never retries an uncertain send. Duplicate or rejected input gets no receipt attempt.
 
-Discord attachments are retained as validated URL metadata with the message, including filename, MIME type, and size. The adapter never downloads or archives attachment bytes. CDN URLs can expire, so native sessions receive the references as untrusted user data and decide whether they need to read them.
+Ordinary Discord attachments are retained as validated URL metadata with the message, including filename, MIME type, and size. They are not downloaded or archived. The explicit `agent-message.tether` transport is the exception: with `--agent-presentation attachment-v1`, the adapter performs a bounded CDN fetch to recover the exact signed packet before durable intake and does not archive a separate copy of the bytes. CDN URLs can expire, so native sessions receive ordinary attachment references as untrusted user data and decide whether they need to read them.
 
 An operator may request one manual Spark preview from an existing durable receipt. The command reads one persisted source message and its transport receipt, keeps that raw evidence beside the result, and sends only code-derived facts to the isolated read-only Spark subprocess. The result is labeled `liaison draft`; it is never posted to Discord and never changes forwarding or custody. Missing receipts, unavailable Spark, invalid output, quota failure, timeout, and cancellation return `draft: null`.
 
@@ -317,14 +387,21 @@ Transfer that file to the sender, then run:
 ```sh
 node src/cli.js agent-send --provider codex --channel-id SOURCE_CHANNEL \
   --native-id SOURCE_NATIVE_UUID --generation SOURCE_GENERATION \
-  --target-file destination.json --text-file task.txt --dedupe-key task-123
+  --target-file destination.json --text-file task.txt --dedupe-key task-123 \
+  --agent-presentation attachment-v1
 ```
 
 The source uses existing ordinary-session or conductor post checks. Repeating the
 same key and content reuses custody. Changing the destination or content under
 that key is refused. A packet must fit in one Discord message, including its
-signed address envelope. Oversized input fails before posting. Attachments are
-not supported for this first slice.
+signed address envelope. Oversized input fails before posting. The optional
+`--agent-presentation` flag accepts `legacy` (the default) or `attachment-v1`.
+Use `--agent-presentation attachment-v1` only when the receiver has opted into
+the attachment transport. Discord then receives a short readable preview and
+the exact signed packet as one `agent-message.tether` attachment. The native
+Discord rendering of that attachment still needs verification with a real
+Discord client before enabling the mode for a receiver. Legacy JSON posting
+remains the release default and is used when the flag is omitted.
 
 Only authenticated addressed packets enter agent delivery. Ordinary bot replies
 and milestone posts remain excluded. A result may be explicitly sent with

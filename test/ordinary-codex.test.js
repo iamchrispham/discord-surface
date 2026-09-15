@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
+const Module = require('node:module');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -10,9 +11,14 @@ const { createBindingWakeController, GATEWAY_CAPABILITIES, handoffInternal, ordi
 const { DiscordGateway } = require('../src/discord');
 const { CodexProvider, readCodexSessionIdentityAsync, sessionRoot, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('../src/native');
 const { SurfaceState, PROVIDERS, READINESS, StaleGenerationError } = require('../src/state');
+const { ORDINARY_RECEIPT_KINDS } = require('../src/ordinary/constants');
+const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { runDirectPost } = require('../src/direct-post');
+const { staticConductorMarker } = require('../src/topic');
 const facade = require('../src/ordinary-codex');
 const emitted = require('../dist/ordinary-codex');
+const ordinaryConstantsFacade = require('../src/ordinary/constants');
+const ordinaryConstantsEmitted = require('../dist/ordinary/constants');
 
 const CODEX = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CODEX_V7 = '01a0701c-5714-7671-a455-db7d67f9fa78';
@@ -117,6 +123,13 @@ test('ordinary CommonJS facade exposes emitted code and fails closed when output
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('ordinary constants CommonJS facade preserves emitted values and identity', () => {
+  assert.deepEqual(Object.keys(ordinaryConstantsFacade).sort(), ['CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX', 'ORDINARY_RECEIPT_KINDS']);
+  assert.equal(ordinaryConstantsFacade.CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX, ordinaryConstantsEmitted.CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX);
+  assert.equal(ordinaryConstantsFacade.ORDINARY_RECEIPT_KINDS, ordinaryConstantsEmitted.ORDINARY_RECEIPT_KINDS);
+  assert.equal(Object.isFrozen(ordinaryConstantsFacade.ORDINARY_RECEIPT_KINDS), true);
 });
 
 test('channel resolution accepts exact ID, mention, and one name only in the configured guild', () => {
@@ -886,6 +899,20 @@ test('ordinary bind starts pending with paired null conductor identity and holds
   }, { sessionId: OTHER, threadId: OTHER }), /does not match the native session/);
 });
 
+test('ordinary classification excludes a conductor-owned Codex binding', t => {
+  const f = fixture(t);
+  const binding = f.state.bind({
+    channelId: 'conductor-owned', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
+    workspace: f.dir, conductorId: 'conductor', repoKey: 'repo:test'
+  });
+  f.state.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
+    channelId: binding.channelId, provider: binding.provider, nativeId: binding.nativeId,
+    workspace: binding.workspace, generation: binding.generation
+  });
+  assert.equal(f.state.isOrdinaryBindingRecord(binding), false);
+  assert.equal(f.state.isOrdinaryBinding(binding), false);
+});
+
 test('ordinary binding permits a verified transcript-root relocation', t => {
   const f = fixture(t);
   const binding = ordinary(f);
@@ -1333,6 +1360,153 @@ test('explicit ordinary handoff refuses an active remote intake gap', async t =>
   try {
     assert.equal(recovered.getBinding(original.channelId).nativeId, CODEX);
     assert.equal(recovered.getBinding(original.channelId).generation, 1);
+  } finally {
+    recovered.close();
+  }
+});
+
+test('public conductor handoff refuses an enrolled child history gap before ownership transfer', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'conductor-child-gap-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const secretFile = path.join(dir, 'discord.secret');
+  fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile, codexCategoryId: 'codex-category' });
+  const original = setup.bind({
+    channelId: 'conductor-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
+    workspace: dir, categoryId: 'codex-category', conductorId: 'conductor', repoKey: 'repo'
+  });
+  setup.enrollThread({ threadId: 'child', parentChannelId: original.channelId, guildId: original.guildId }, original);
+  setup.setThreadBaseline('child', '100', original);
+  setup.markThreadBoundary('child', THREAD_STATES.READY, 'fixture adoption', null, null, original);
+  setup.setIntakeCutoff(original.channelId, 'guild', '100', 'fixture parent coverage');
+  setup.markIntakeBoundary(original.channelId, READINESS.READY, 'fixture parent ready', null, null, original);
+  setup.close();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const parent = {
+    id: original.channelId,
+    parentId: 'codex-category',
+    topic: staticConductorMarker({ provider: PROVIDERS.CODEX, conductorId: 'conductor', repoKey: 'repo' }),
+    messages: { fetch: async () => new Map([['fence', { id: '150' }]]) },
+    send: async () => ({ id: '150', async delete() {} })
+  };
+  const child = {
+    id: 'child',
+    messages: { fetch: async () => new Map([['missing', { id: '120' }]]) }
+  };
+  const discord = {
+    GatewayIntentBits: { Guilds: 1 },
+    Client: class {
+      constructor() {
+        this.guilds = { fetch: async () => ({ channels: { fetch: async () => parent } }) };
+        this.channels = { fetch: async id => id === child.id ? child : parent };
+      }
+      async login() {}
+      async destroy() {}
+    }
+  };
+  const originalLoad = Module._load;
+  t.mock.method(Module, '_load', function(request, parentModule, isMain) {
+    if (request === 'discord.js') return discord;
+    return originalLoad.call(this, request, parentModule, isMain);
+  });
+
+  await assert.rejects(() => handoffInternal({
+    'state-dir': dir, provider: PROVIDERS.CODEX, 'channel-id': original.channelId,
+    'conductor-id': 'conductor', 'repo-key': 'repo', 'from-native-id': CODEX,
+    'from-generation': '1', 'native-id': OTHER, workspace: dir, 'handoff-id': 'conductor-child-gap'
+  }), /durably drained/);
+
+  const recovered = new SurfaceState(db);
+  try {
+    const binding = recovered.getBinding(original.channelId);
+    assert.equal(binding.nativeId, CODEX);
+    assert.equal(binding.generation, 1);
+    assert.equal(recovered.getThreadEnrollment(child.id).active, true);
+    assert.equal(recovered.getThreadEnrollment(child.id).recoveredThroughId, '100');
+  } finally {
+    recovered.close();
+  }
+});
+
+test('public conductor handoff rejects enrollment added between proof and commit', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'conductor-enrollment-race-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const secretFile = path.join(dir, 'discord.secret');
+  fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  const setup = new SurfaceState(db);
+  setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile, codexCategoryId: 'codex-category' });
+  const original = setup.bind({
+    channelId: 'conductor-race-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
+    workspace: dir, categoryId: 'codex-category', conductorId: 'conductor', repoKey: 'repo'
+  });
+  setup.enrollThread({ threadId: 'child-a', parentChannelId: original.channelId, guildId: original.guildId }, original);
+  setup.setThreadBaseline('child-a', '100', original);
+  setup.markThreadBoundary('child-a', THREAD_STATES.READY, 'fixture adoption', null, null, original);
+  setup.setIntakeCutoff(original.channelId, 'guild', '100', 'fixture parent coverage');
+  setup.markIntakeBoundary(original.channelId, READINESS.READY, 'fixture parent ready', null, null, original);
+  setup.close();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const parent = {
+    id: original.channelId,
+    parentId: 'codex-category',
+    topic: staticConductorMarker({ provider: PROVIDERS.CODEX, conductorId: 'conductor', repoKey: 'repo' }),
+    messages: { fetch: async () => new Map([['fence', { id: '150' }]]) },
+    send: async () => ({ id: '150', async delete() {} })
+  };
+  const child = {
+    id: 'child-a',
+    messages: { fetch: async () => new Map([['fence', { id: '150' }]]) }
+  };
+  const discord = {
+    GatewayIntentBits: { Guilds: 1 },
+    Client: class {
+      constructor() {
+        this.guilds = { fetch: async () => ({ channels: { fetch: async () => parent } }) };
+        this.channels = { fetch: async id => id === child.id ? child : parent };
+      }
+      async login() {}
+      async destroy() {}
+    }
+  };
+  const originalLoad = Module._load;
+  t.mock.method(Module, '_load', function(request, parentModule, isMain) {
+    if (request === 'discord.js') return discord;
+    return originalLoad.call(this, request, parentModule, isMain);
+  });
+
+  const originalHandoffConductor = SurfaceState.prototype.handoffConductor;
+  let inserted = false;
+  t.mock.method(SurfaceState.prototype, 'handoffConductor', function(input) {
+    if (!inserted) {
+      inserted = true;
+      const raceState = new SurfaceState(db);
+      try {
+        const binding = raceState.getBinding(input.channelId);
+        raceState.enrollThread({ threadId: 'child-b', parentChannelId: input.channelId, guildId: 'guild' }, binding);
+      } finally {
+        raceState.close();
+      }
+    }
+    return originalHandoffConductor.call(this, input);
+  });
+
+  await assert.rejects(() => handoffInternal({
+    'state-dir': dir, provider: PROVIDERS.CODEX, 'channel-id': original.channelId,
+    'conductor-id': 'conductor', 'repo-key': 'repo', 'from-native-id': CODEX,
+    'from-generation': '1', 'native-id': OTHER, workspace: dir, 'handoff-id': 'conductor-enrollment-race'
+  }), /active thread enrollments changed during handoff proof/);
+
+  const recovered = new SurfaceState(db);
+  try {
+    const binding = recovered.getBinding(original.channelId);
+    assert.equal(binding.nativeId, CODEX);
+    assert.equal(binding.generation, 1);
+    assert.equal(recovered.getThreadEnrollment('child-a').recoveredThroughId, '100');
+    assert.equal(recovered.getThreadEnrollment('child-b').active, true);
+    assert.equal(recovered.getThreadEnrollment('child-b').recoveredThroughId, null);
   } finally {
     recovered.close();
   }
@@ -1965,7 +2139,7 @@ test('ordinary readiness requires native proof before the intake boundary can be
   const f = fixture(t);
   const binding = ordinary(f);
   assert.throws(() => f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'history complete', null, null, binding), /preflight/);
-  assert.throws(() => f.state.recordOrdinaryPreflight(binding, { file: '/tmp/exact.jsonl', sessionId: OTHER, threadId: OTHER, workspace: f.dir }), /does not match/);
+  assert.throws(() => f.state.recordOrdinaryPreflight(binding, { file: '/tmp/exact.jsonl', sessionId: OTHER, threadId: OTHER, workspace: f.dir }), /ordinary codex native preflight proof does not match the binding/);
   f.state.recordOrdinaryPreflight(binding, { file: '/tmp/exact.jsonl', sessionId: CODEX, threadId: CODEX, workspace: f.dir });
   f.state.markIntakeBoundary(binding.channelId, READINESS.READY, 'history complete', null, null, binding);
   assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.READY);
@@ -2706,10 +2880,14 @@ test('live intake checkpoints retain demand after a failed pass', async t => {
   assert.equal(gateway.liveCheckpointPromise, null);
   assert.equal(gateway.liveIntakeCounts.get(binding.channelId), gateway.liveCheckpointThreshold);
 
+  const fetchesBeforeBackoffArrival = historyFetches;
   await send(103);
-  const retryCheckpoint = gateway.liveCheckpointPromise;
-  assert.ok(retryCheckpoint);
-  await retryCheckpoint;
+  assert.equal(gateway.liveCheckpointPromise, null);
+  assert.equal(historyFetches, fetchesBeforeBackoffArrival);
+  assert.equal(gateway.liveIntakeCounts.get(binding.channelId), gateway.liveCheckpointThreshold + 1);
+
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  if (gateway.liveCheckpointPromise) await gateway.liveCheckpointPromise;
 
   assert.equal(historyFetches >= 2, true);
   assert.equal(f.state.getIntakeWatermark(binding.channelId).recovered_through_id, '103');
