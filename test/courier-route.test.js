@@ -566,7 +566,7 @@ test('human messages reject a stale courier target', t => {
   assert.equal(f.state.getCourierAttempt(message.id), null);
 });
 
-test('persisted Claude courier routes stay out of selected dispatch', async t => {
+test('persisted invalid courier routes stay held without parent fallback', async t => {
   const f = fixture(t);
   f.state.receipt(null, 'courier-route', {
     ...f.route,
@@ -577,9 +577,12 @@ test('persisted Claude courier routes stay out of selected dispatch', async t =>
   const parentCalls = [];
   const result = await consumerFor(f, { courierCalls, parentCalls }).processAccepted(f.message);
 
-  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(result.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+  assert.equal(result.message.state, MESSAGE_STATES.ACCEPTED);
   assert.equal(courierCalls.length, 0);
-  assert.deepEqual(parentCalls, [f.message.id]);
+  assert.deepEqual(parentCalls, []);
+  assert.equal(f.state.getCourierAttempt(f.message.id), null);
+  assert.equal(f.state.listReceipts().some(row => row.kind === 'courier-rejection'), true);
 });
 
 test('Codex courier queue uses a fixed forwarding call and exact parent payload', async t => {

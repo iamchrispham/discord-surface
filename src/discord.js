@@ -823,7 +823,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     if (!isCourierOriginAllowed(state, message)) return false;
     const selected = state.getCourierRoute(courierRoute.routeId) || courierRoute;
     if (!selected || selected.parentChannelId !== message.channelId || selected.guildId !== message.guildId) return false;
-    if (message.provider !== 'codex' || selected.target?.provider !== 'codex' || selected.courier?.provider !== 'codex') return false;
+    if (message.provider !== 'codex') return false;
     if (message.agentMessage) return selected.deliveryChannelId === message.deliveryChannelId;
     const config = state.requireConfig();
     return message.authorId === config.operatorId && (
