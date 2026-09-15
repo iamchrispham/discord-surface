@@ -110,7 +110,7 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
           : { accepted: false, status: COURIER_RESULT_STATUSES.SETTLED, message };
       }
       const existing = latestAttempt(deps, state, messageId);
-      if (existing && existing.outcome?.outcome !== COURIER_OUTCOMES.NOT_SUBMITTED) {
+      if (existing) {
         return { accepted: false, duplicate: true, status: COURIER_RESULT_STATUSES.DUPLICATE, message, ...existing };
       }
       const match = findMatchingRoute(deps, state, message, input.routeId);

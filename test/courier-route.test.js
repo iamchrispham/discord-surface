@@ -420,32 +420,34 @@ test('route revoked after queue result preserves parent observation', async t =>
   assert.equal(f.state.listReceipts().filter(row => row.kind === 'native-ack').length, 1);
 });
 
-test('definite non-submission remains retryable', async t => {
+test('recovered definite non-submission retains custody without resend', async t => {
   const f = fixture(t);
   const courierCalls = [];
   const parentCalls = [];
   const replies = [];
-  let dispatches = 0;
   const dispatchCourier = async () => {
-    dispatches += 1;
-    return dispatches === 1
-      ? { status: COURIER_OUTCOMES.NOT_SUBMITTED, error: new Error('courier unavailable') }
-      : { status: COURIER_OUTCOMES.SUBMITTED };
+    return { status: COURIER_OUTCOMES.NOT_SUBMITTED, error: new Error('courier unavailable') };
   };
 
-  const first = await consumerFor(f, { courierCalls, parentCalls, replies, dispatchCourier }).processAccepted(f.message);
+  const consumer = consumerFor(f, { courierCalls, parentCalls, replies, dispatchCourier });
+  const first = await consumer.processAccepted(f.message);
   assert.equal(first.status, COURIER_OUTCOMES.NOT_SUBMITTED);
   assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
-  assert.equal(dispatches, 1);
 
-  const second = await consumerFor(f, { courierCalls, parentCalls, replies, dispatchCourier })
-    .processAccepted(f.state.getMessage(f.message.id));
-  assert.equal(second.message.state, MESSAGE_STATES.REPLIED);
-  assert.equal(dispatches, 2);
-  assert.equal(f.state.listReceipts().filter(row => row.kind === 'courier-attempt').length, 2);
-  assert.equal(f.state.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
+  f.state.close();
+  const reopened = new SurfaceState(f.dbPath);
+  f.replaceState(reopened);
+  const recoveredConsumer = consumerFor(f, { courierCalls, parentCalls, replies, dispatchCourier });
+  const recovered = await recoveredConsumer.handleStoredMessage(reopened.getMessage(f.message.id), new AbortController().signal);
+  await recoveredConsumer.waitForReceipts();
+
+  assert.equal(recovered.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+  assert.equal(reopened.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(courierCalls.length, 1);
+  assert.equal(reopened.listReceipts().filter(row => row.kind === 'courier-attempt').length, 1);
+  assert.equal(reopened.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
   assert.equal(parentCalls.length, 0);
-  assert.equal(replies.length, 1);
+  assert.equal(replies.length, 0);
 });
 
 test('courier route registration rejects a Claude parent', t => {
