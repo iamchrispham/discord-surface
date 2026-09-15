@@ -346,7 +346,7 @@ The tests use injected native providers and fake Discord events. They do not con
 
 ## Conductor milestone announcements
 
-`post` sends an explicit milestone from an existing bound conductor without an inbound message, a running Gateway, or sidecar inference. `claude-post` is the Claude-only alias. Use it for a landing, a blocker, or a ruling the operator may want to override. Keep round-by-round detail in beacons and PR bodies. Human-grade events retain the existing phone path. This command sends no Telegram copy.
+`post` sends an explicit milestone from an existing bound conductor without an inbound message, a running Gateway, or sidecar inference. `claude-post` is the Claude-only alias. Use it for a landing, a blocker, or a ruling the operator may want to override. Keep round-by-round detail in beacons and PR bodies. Human-grade events retain the existing phone path. This command sends no Telegram copy. Questions requiring an operator answer remain pending until that answer is recorded.
 
 ```sh
 node src/cli.js claude-post \
@@ -364,6 +364,75 @@ The CLI requires `--dedupe-key`. Existing callers may use `--request-id` as a le
 Repeat the same key, target and unchanged file to inspect or resume the same milestone, not create a duplicate. A new successful send returns `recorded: true, duplicate: false, state: "sent"`. A repeated confirmed send returns `recorded: false, duplicate: true, state: "sent"`. Partial, unknown, in-flight and stale results retain their existing `status`, `requestId`, `messageIds` and `parts` fields and expose the same value as `state`. Confirmed parts are skipped on retry. A request interrupted after its durable attempt stays uncertain and is never blindly resent. Definite unsent failures can be retried explicitly. Each part's attempt and delivery result are recorded in the existing receipts table.
 
 No native session, channel binding, automatic publication selection or phone configuration is changed. A successful receipt means Discord accepted the returned message IDs, not that the operator read them.
+
+
+## Decision presentations
+
+`decision-present` presents a question in an existing ordinary-session or conductor
+binding. Ordinary calls verify the native caller against the binding. Conductor
+calls resolve the requested active binding and generation, without the same native
+caller identity check. The canonical question CLI assigns the question identity
+and answer keys. The adapter stores the presentation and its canonical route in
+the existing receipts journal.
+
+The producer and local Gateway decision path are implemented. Gateway button
+consumption records callback custody and gates canonical settlement, original-question
+projection, and native continuation on Gateway readiness. Live Discord delivery and
+native-session return remain separate qualification boundaries. A sent presentation
+is not proof that a click reached the native session.
+
+Write a request file using the channel, native ID and generation returned by your
+binding. Use a stable namespace and request ID for each question:
+
+```json
+{
+  "namespace": "release",
+  "requestId": "release-choice-1",
+  "target": "lane:release",
+  "head": "-",
+  "question": "Release the verified build?",
+  "menu": [
+    { "key": "release", "consequence": "Publish the verified build." },
+    { "key": "hold", "consequence": "Keep the build unpublished." }
+  ],
+  "channelId": "BOUND_CHANNEL_ID",
+  "provider": "codex",
+  "nativeId": "BOUND_NATIVE_UUID",
+  "generation": 1
+}
+```
+
+```sh
+node src/cli.js decision-present \
+  --state-dir "$HOME/.config/discord-surface" \
+  --request-file /absolute/path/to/question.json \
+  --canonical-cli /absolute/path/to/tg-canonical.mjs \
+  --canonical-state-root /absolute/path/to/canonical-state
+```
+
+`provider` is `codex` or `claude`. Ordinary callers must run from the bound native
+session. The producer uses the canonical CLI's `register` operation and exported
+path resolver. The Gateway consumer uses exact `settle` and generation-bound `read`
+through that same owner. That CLI remains the answer authority. The adapter does
+not create a separate answer store. If `--canonical-cli` is
+omitted, it uses `~/.claude/skills/phone-notify/scripts/tg-canonical.mjs`.
+
+The request must be a regular JSON file of at most 64 KiB. The complete canonical
+menu, including any research option added by its owner, must fit one Discord
+message and no more than 25 buttons. Answer keys and consequences are not
+truncated. Question identity and question generation are owner-assigned and are
+not accepted in the request file. The numeric binding generation is separate.
+
+Retry with the same namespace, request ID, binding, target, head, question and
+menu. Saved custody selects the original canonical route before registration,
+even if ambient state paths change. Explicit conflicting route overrides are
+refused. A previously sent, pending or unknown presentation never authorizes
+another POST. An unknown outcome must be reconciled before claiming delivery.
+
+Presentation delivery, callback visibility, canonical settlement, message update
+and native acknowledgment are distinct outcomes. Only a materialized canonical
+answer may return to the existing session. Silence or an uncertain callback never
+selects an answer or grants permission to continue blocked work.
 
 
 ## Addressed agent messages

@@ -15,7 +15,8 @@ const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
 const { THREAD_STATES } = require('./state/thread-enrollment');
-const { parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
+const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
+const { createDecisionConsumer } = require('./discord/decision');
 
 const requireInstalled = require;
 const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
@@ -200,7 +201,7 @@ async function readRetryAfter(response) {
 }
 
 async function sendDiscordMessage({ token, channelId, content, nonce, signal, timeoutMs = RECOVERY_LIMITS.timeoutMs,
-  fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] }, agentAttachment = null }) {
+  fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] }, agentAttachment = null, components = null }) {
   if (typeof fetchImpl !== 'function') throw Object.assign(new Error('Discord message fetch is unavailable'), { outcome: 'not_sent' });
   if (signal?.aborted) throw Object.assign(new Error('Discord message send stopped before request'), { outcome: 'not_sent' });
   if (agentAttachment !== null && (!Buffer.isBuffer(agentAttachment) || agentAttachment.length === 0 || agentAttachment.length > AGENT_ATTACHMENT_MAX_BYTES)) {
@@ -217,7 +218,8 @@ async function sendDiscordMessage({ token, channelId, content, nonce, signal, ti
     try {
       const payload = {
         content, nonce, enforce_nonce: true, allowed_mentions: allowedMentions,
-        ...(messageReference ? { message_reference: messageReference } : {})
+        ...(messageReference ? { message_reference: messageReference } : {}),
+        ...(components ? { components } : {})
       };
       const request = {
         method: 'POST',
@@ -1001,6 +1003,8 @@ class DiscordGateway {
     this.connectionEpoch = 0;
     this.recoveryController = null;
     this.recoveryPromise = null;
+    this.decisionRecoveryPromise = null;
+    this.decisionRecoveryController = null;
     this.recoveryFollowupPromise = null;
     this.pendingRecoveryChannels = new Set();
     this.pendingFullRecovery = false;
@@ -1076,6 +1080,14 @@ class DiscordGateway {
           this.handleNativeUnavailable(message, error, outcome);
         }
       }
+    });
+    this.decisionConsumer = createDecisionConsumer({
+      state,
+      interactionFetch: this.interactionFetch,
+      callbackTimeoutMs: this.interactionCallbackTimeoutMs,
+      waitForDispatch: (channelId, signal) => this.waitForInteractionDispatch({ channelId }, signal),
+      processAccepted: (message, signal, options) => this.consumer.processAccepted(message, signal, options),
+      project: (input, signal) => this.projectDecisionMessage(input, signal)
     });
     this.boundMessage = message => {
       if (this.stopping) return;
@@ -1156,6 +1168,8 @@ class DiscordGateway {
 
   async handleInteraction(interaction, signal) {
     const expectedApplicationId = this.client.application?.id || null;
+    const parsedComponent = parseComponentInteraction(interaction, expectedApplicationId);
+    if (parsedComponent) return this.decisionConsumer.handleParsed(parsedComponent, signal);
     const parsed = parseCsInteraction(interaction, expectedApplicationId);
     if (!parsed) return { accepted: false, reason: 'invalid-interaction' };
     const binding = this.state.getBinding(parsed.channelId);
@@ -1196,6 +1210,34 @@ class DiscordGateway {
     if (!message) return { accepted: false, reason: 'interaction-custody-missing' };
     if (!await this.waitForInteractionDispatch(message, signal)) return { ...accepted, message, deferred: true };
     return this.consumer.processAccepted(message, signal);
+  }
+
+  async projectDecisionMessage({ click, answer }, signal) {
+    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
+    const channel = await this.client.channels?.fetch?.(click.channelId);
+    const message = await channel?.messages?.fetch?.(click.messageId);
+    if (!message || typeof message.edit !== 'function') {
+      throw Object.assign(new Error('decision question message cannot be edited'), { outcome: 'not_sent' });
+    }
+    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
+    const stored = this.state.getMessage(click.interactionId);
+    if (stored) {
+      this.state.assertMessageCurrent(click.interactionId, 'decision-projection');
+    } else {
+      const config = this.state.requireConfig();
+      const current = this.state.getBinding(click.channelId);
+      const sameBinding = Boolean(current?.active) && current.channelId === click.binding.channelId &&
+        current.guildId === click.binding.guildId && current.provider === click.binding.provider &&
+        current.nativeId === click.binding.nativeId && current.workspace === click.binding.workspace &&
+        (current.sessionRoot || null) === (click.binding.sessionRoot || null) &&
+        (current.endpoint || null) === (click.binding.endpoint || null) &&
+        (current.conductorId || null) === (click.binding.conductorId || null) &&
+        (current.repoKey || null) === (click.binding.repoKey || null) && current.generation === click.binding.generation;
+      if (!sameBinding || config.guildId !== click.guildId || config.operatorId !== click.actorId) {
+        throw new Error('decision projection authorization is no longer valid');
+      }
+    }
+    return message.edit({ content: answer, components: [] });
   }
 
   async sendInteractionRejection(interaction, reason, signal) {
@@ -2427,6 +2469,7 @@ class DiscordGateway {
     const selectedChannels = channelIds ? new Set(channelIds) : null;
     const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
       (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready);
+    this.startDecisionRecovery(signal, selectedChannels);
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const blockedOwners = new Set();
@@ -2501,6 +2544,29 @@ class DiscordGateway {
     return this.state.recoveryCandidates(before).filter(allowed);
   }
 
+  startDecisionRecovery(signal, channelIds = null) {
+    if (this.stopping || this.decisionRecoveryPromise || !this.decisionConsumer) return this.decisionRecoveryPromise;
+    const controller = new AbortController();
+    const relayAbort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener('abort', relayAbort, { once: true });
+    this.decisionRecoveryController = controller;
+    const work = Promise.resolve().then(() => this.decisionConsumer.recover(controller.signal, channelIds));
+    const tracked = work.catch(error => {
+      this.logger(`Discord decision recovery failed: ${error.message}`);
+      return [];
+    });
+    this.decisionRecoveryPromise = tracked;
+    this.inFlight.add(tracked);
+    tracked.finally(() => {
+      signal?.removeEventListener('abort', relayAbort);
+      this.inFlight.delete(tracked);
+      if (this.decisionRecoveryPromise === tracked) this.decisionRecoveryPromise = null;
+      if (this.decisionRecoveryController === controller) this.decisionRecoveryController = null;
+    }).catch(() => {});
+    return tracked;
+  }
+
   async stop() {
     if (this.stopPromise) return this.stopPromise;
     this.lifecycleEpoch += 1;
@@ -2528,6 +2594,7 @@ class DiscordGateway {
     this.stopPromise = (async () => {
       this.ready = false;
       this.recoveryController?.abort();
+      this.decisionRecoveryController?.abort();
       this.liveCheckpointController?.abort();
       const recovery = this.recoveryPromise;
       const reconnect = this.reconnectPromise;

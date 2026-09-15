@@ -1782,6 +1782,24 @@ async function agentSend(args) {
   });
 }
 
+async function assertOrdinaryPostCaller(state, { provider, nativeId, generation, channelId }, dependencies = {}) {
+  const invocation = provider === PROVIDERS.CLAUDE
+    ? await (dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies)))()
+    : (dependencies.resolveInvocationIdentity || resolveInvocationIdentity)(dependencies.environment || process.env);
+  if (provider === PROVIDERS.CLAUDE &&
+    (!invocation || invocation.harness !== 'claude-code' || typeof invocation.sessionId !== 'string')) {
+    throw new Error('ordinary Claude caller identity is unavailable or uses the wrong harness');
+  }
+  const invocationSessionId = invocation.sessionId;
+  const invocationThreadId = provider === PROVIDERS.CLAUDE ? invocationSessionId : invocation.threadId;
+  const binding = state.getBinding(channelId);
+  if (nativeId !== invocationSessionId || invocationThreadId !== invocationSessionId ||
+    !binding?.active || binding.provider !== provider || !state.isOrdinaryBindingRecord(binding) || binding.nativeId !== invocationSessionId ||
+    Number(binding.generation) !== Number(generation)) {
+    throw new Error(`ordinary post identity does not match the active ${provider === PROVIDERS.CLAUDE ? 'Claude' : 'Codex'} binding`);
+  }
+}
+
 async function directPost(args, provider = null, ordinary = false, dependencies = {}) {
   const { state } = openState(args);
   const controller = new AbortController();
@@ -1801,23 +1819,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
     const nativeId = required(args, 'native-id');
     const generation = required(args, 'generation');
     const channelId = ordinary ? required(args, 'channel-id') : (args['channel-id'] || null);
-    if (ordinary) {
-      const invocation = provider === PROVIDERS.CLAUDE
-        ? await (dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies)))()
-        : (dependencies.resolveInvocationIdentity || resolveInvocationIdentity)(dependencies.environment || process.env);
-      if (provider === PROVIDERS.CLAUDE &&
-        (!invocation || invocation.harness !== 'claude-code' || typeof invocation.sessionId !== 'string')) {
-        throw new Error('ordinary Claude caller identity is unavailable or uses the wrong harness');
-      }
-      const invocationSessionId = invocation.sessionId;
-      const invocationThreadId = provider === PROVIDERS.CLAUDE ? invocationSessionId : invocation.threadId;
-      const binding = state.getBinding(channelId);
-      if (nativeId !== invocationSessionId || invocationThreadId !== invocationSessionId ||
-        !binding?.active || binding.provider !== provider || !state.isOrdinaryBindingRecord(binding) || binding.nativeId !== invocationSessionId ||
-        Number(binding.generation) !== Number(generation)) {
-        throw new Error(`ordinary post identity does not match the active ${provider === PROVIDERS.CLAUDE ? 'Claude' : 'Codex'} binding`);
-      }
-    }
+    if (ordinary) await assertOrdinaryPostCaller(state, { provider, nativeId, generation, channelId }, dependencies);
     if (dependencies.exportAddress) {
       const binding = resolveDirectBinding(state, { nativeId, generation: Number(generation), channelId, provider, ordinary });
       const address = resolveAgentAddress(state, binding, dependencies.agentThreadId ?? null);
@@ -1850,6 +1852,37 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
   } finally {
     process.removeListener('SIGINT', handleSignal);
     process.removeListener('SIGTERM', handleSignal);
+    state.close();
+  }
+}
+
+async function decisionPresent(args, dependencies = {}) {
+  const { readDecisionRequest, presentDecision } = require('./decision-present');
+  const { DECISION_TRANSPORT_OUTCOMES } = require('./state/decision');
+  const request = readDecisionRequest(required(args, 'request-file'));
+  const { state } = openState(args);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  process.once('SIGINT', abort);
+  process.once('SIGTERM', abort);
+  try {
+    const config = state.requireConfig();
+    const result = await presentDecision({
+      state, request, token: readSecret(config.secretFile), signal: controller.signal,
+      canonical: {
+        ...(args['canonical-cli'] ? { executable: required(args, 'canonical-cli') } : {}),
+        ...(args['canonical-state-root'] ? { stateRoot: required(args, 'canonical-state-root') } : {}),
+        environment: dependencies.environment || process.env
+      },
+      fetchImpl: dependencies.fetchImpl,
+      authorizeOrdinary: binding => assertOrdinaryPostCaller(state, binding, dependencies)
+    });
+    print(result);
+    if (result.presentationOutcome !== DECISION_TRANSPORT_OUTCOMES.SENT) process.exitCode = 1;
+    return result;
+  } finally {
+    process.removeListener('SIGINT', abort);
+    process.removeListener('SIGTERM', abort);
     state.close();
   }
 }
@@ -2005,6 +2038,7 @@ async function main() {
         agentThreadId: Object.hasOwn(args, 'agent-thread-id') ? args['agent-thread-id'] : null });
     }
     case 'agent-send': return agentSend(args);
+    case 'decision-present': return decisionPresent(args);
     case 'thread-enroll': return threadEnroll(args);
     case 'post': return directPost(args);
     case 'ordinary-post': return directPost(args, 'codex', true);
@@ -2013,11 +2047,11 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, decision-present, liaison draft');
   }
 }
 
-module.exports = { bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, threadEnroll, unbind };
+module.exports = { bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, threadEnroll, unbind };
 
 if (require.main === module) {
   main().catch(error => {
