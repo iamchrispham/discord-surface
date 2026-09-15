@@ -839,6 +839,11 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       if (signal?.aborted) return { ...result, message: state.markReplyFailure(ready.message.id, new Error('reply delivery stopped'), true, part.index) };
       try {
         state.assertMessageCurrent(ready.message.id, 'reply-send');
+        if (!part.content.trim()) {
+          const skipped = state.markReplyPartSkipped(ready.message.id, part.index);
+          if (skipped.state === 'replied') return { ...result, message: skipped };
+          continue;
+        }
         if (part.content.length > 2000) throw new Error('Discord reply part exceeds 2000 characters');
         const sent = await sendReply(message, { ...ready.message, replyText: part.content, replyNonce: part.nonce, replyPart: part });
         const replyId = sent?.id || sent?.messageId;
