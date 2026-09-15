@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 
 const { KINDS } = require('../src/agent-message');
 const { DECISION_WINNER_SOURCES } = require('../src/state');
-const { claudeEvent, codexPrompt, messageRequest } = require('../src/native');
+const { agentCompletionCommand, claudeEvent, codexPrompt, messageRequest } = require('../src/native');
 
 const decisionResult = {
   qid: 'qid:opaque/42',
@@ -71,6 +71,7 @@ test('ordinary and agent messages keep their existing native routing', { timeout
   assert.match(claudeEvent(ordinary).content, /^Inbound Discord message transport-message-1/);
 
   const agent = baseMessage({
+    provider: 'codex',
     decisionResult: undefined,
     content: 'agent carrier content',
     agentMessage: {
@@ -98,4 +99,7 @@ test('ordinary and agent messages keep their existing native routing', { timeout
   assert.match(codexPrompt(agent), /Handle the agent context in your normal final response\./);
   assert.match(claudeEvent(agent).content, /^Inbound Discord message transport-message-1/);
   assert.match(claudeEvent(agent).content, /agent task context/);
+  const completion = agentCompletionCommand(agent, '/tmp/surface.sqlite', '/tmp/discord-surface-cli.js');
+  assert.match(codexPrompt(agent, null, completion), /agent-complete/);
+  assert.match(claudeEvent(agent, completion).content, /agent-complete/);
 });

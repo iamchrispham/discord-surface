@@ -82,6 +82,7 @@ export interface ClaudeChannelEvent {
   generation: number;
   content: string;
   attachments?: unknown;
+  completion?: readonly string[] | null;
 }
 
 export interface ClaudeChannelNotification {
@@ -94,6 +95,7 @@ export interface ClaudeChannelNotification {
       nativeId: string;
     };
     attachments?: Attachment[];
+    completion?: readonly string[];
   };
 }
 
@@ -387,12 +389,17 @@ export class ClaudeChannel<
     }
     this.state.assertMessageCurrent(body.messageId, 'native-dispatch');
     const attachments = normalizeAttachments(body.attachments);
+    if (body.completion !== undefined && body.completion !== null &&
+      (!Array.isArray(body.completion) || body.completion.length === 0 || body.completion.some(argument => typeof argument !== 'string'))) {
+      throw new Error('invalid Claude channel completion command');
+    }
     try {
       const params: ClaudeChannelNotification['params'] = {
         content: body.content,
         meta: { messageId: body.messageId, generation: String(body.generation), nativeId: body.nativeId }
       };
       if (attachments.length) params.attachments = attachments;
+      if (body.completion?.length) params.completion = [...body.completion];
       await (this.mcp as unknown as ClaudeRuntimeMcp).notification({ method: 'notifications/claude/channel', params });
     } catch (error) {
       markPotentiallyDelivered(error);

@@ -47,6 +47,7 @@ const { MESSAGE_STATES, PROVIDERS, splitReply, validateNativeId } = require('../
     DISPATCH_FAILED: 'dispatch_failed';
     REPLY_FAILED: 'reply_failed';
     REPLY_UNKNOWN: 'reply_unknown';
+    AGENT_HANDLED_WITHOUT_POST: 'agent_handled_without_post';
     REJECTED: 'rejected';
   };
   PROVIDERS: {
@@ -90,6 +91,17 @@ export interface NativeMessage {
   state: MessageState;
   replyText?: string | null;
   observerCursor?: PersistedObserverCursor | null;
+}
+
+export function agentCompletionCommand(
+  message: Pick<NativeMessage, 'id' | 'provider' | 'nativeId' | 'generation'>,
+  dbPath: string,
+  cliPath = path.join(__dirname, '..', 'src', 'cli.js'),
+  stateDir = path.dirname(dbPath)
+): string[] {
+  return [process.execPath, cliPath, 'agent-complete', '--state-dir', stateDir, '--db', dbPath,
+    '--provider', message.provider, '--message-id', message.id,
+    '--native-id', message.nativeId, '--generation', String(message.generation)];
 }
 
 export interface NativeBinding {
@@ -441,14 +453,27 @@ export function messageRequest(message: NativeMessage): string {
   ].filter(line => line !== '').join('\n');
 }
 
-export function codexPrompt(message: NativeMessage, acknowledgment: readonly string[] | null = null): string {
+function noPostCompletionInstruction(completion: readonly string[] | null | undefined): string | null {
+  if (!completion) return null;
+  return `If this agent packet is fully handled without a Discord reply, run this exact command once, preserving argument boundaries: ${JSON.stringify(completion)}. Do not produce a normal final response after running it.`;
+}
+
+export function codexPrompt(
+  message: NativeMessage,
+  acknowledgment: readonly string[] | null = null,
+  completion: readonly string[] | null | undefined = null
+): string {
   const marker = `[[discord-surface:${message.id}]]`;
   const isDecision = Boolean(message.decisionResult);
+  const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
+  const hasCompletionPath = Boolean(completionInstruction);
   let handlingInstruction: string;
   if (isDecision) {
     handlingInstruction = 'Handle the saved canonical decision continuation using its exact identity and canonical answer. Preserve this session. Do not start another session or hand this work to another agent.';
   } else if (message.agentMessage) {
-    handlingInstruction = 'Handle the agent context in your normal final response. Preserve this session.';
+    handlingInstruction = hasCompletionPath
+      ? 'Handle the authenticated agent packet in this session. If a Discord reply is needed, produce the normal final response. If it is fully handled without a reply, use the exact no-post completion command below instead. Preserve this session.'
+      : 'Handle the agent context in your normal final response. Preserve this session.';
   } else {
     handlingInstruction = 'Answer the user request in your normal final response. Do not start another session or hand this work to another agent.';
   }
@@ -459,6 +484,7 @@ export function codexPrompt(message: NativeMessage, acknowledgment: readonly str
     `Transport message ID: ${message.id}. Ownership generation: ${message.generation}.`,
     `Begin the final response with the exact marker ${marker} on its own line. The transport removes that marker before sending the reply.`,
     handlingInstruction,
+    ...(completionInstruction ? [completionInstruction] : []),
     '',
     messageRequest(message)
   ];
@@ -468,21 +494,31 @@ export function codexPrompt(message: NativeMessage, acknowledgment: readonly str
   return prompt.join('\n');
 }
 
-export function claudeEvent(message: NativeMessage): {
+export function claudeEvent(message: NativeMessage, completion: readonly string[] | null | undefined = null): {
   nativeId: string;
   messageId: string;
   generation: number;
   content: string;
   attachments?: readonly Attachment[] | null;
+  completion?: readonly string[];
 } {
   const isDecision = Boolean(message.decisionResult);
+  const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
+  const hasCompletionPath = Boolean(completionInstruction);
+  let replyInstruction: string;
+  if (isDecision) {
+    replyInstruction = `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after handling the saved decision continuation.`;
+  } else if (hasCompletionPath) {
+    replyInstruction = `After handling this agent packet, either use the reply tool with messageId "${message.id}" and generation ${message.generation} for a Discord reply, or run the exact no-post completion command below when no reply is needed.`;
+  } else {
+    replyInstruction = `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`;
+  }
   const content = [
     isDecision
       ? `Saved canonical decision continuation ${message.id} for native Claude session ${message.nativeId}.`
       : `Inbound Discord message ${message.id} for native Claude session ${message.nativeId}.`,
-    isDecision
-      ? `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after handling the saved decision continuation.`
-      : `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`,
+    replyInstruction,
+    ...(completionInstruction ? [completionInstruction] : []),
     isDecision ? 'Preserve the exact canonical identity and answer from the decision JSON. Preserve this session. Do not start or resume another session.' : 'Do not start or resume another session.',
     '',
     messageRequest(message)
@@ -495,6 +531,7 @@ export function claudeEvent(message: NativeMessage): {
     generation: number;
     content: string;
     attachments?: readonly Attachment[] | null;
+    completion?: readonly string[];
   } = {
     nativeId: message.nativeId,
     messageId: message.id,
@@ -502,6 +539,7 @@ export function claudeEvent(message: NativeMessage): {
     content: content.join('\n')
   };
   if (message.attachments?.length) event.attachments = message.attachments;
+  if (message.agentMessage && completion?.length) event.completion = [...completion];
   return event;
 }
 
@@ -956,22 +994,26 @@ export class CodexProvider implements NativeProvider {
   private readonly root: string;
   private readonly run: (command: string, args: readonly string[], options?: CodexRunOptions) => Promise<CodexRunResult>;
   private readonly acknowledgmentFor: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
+  private readonly completionFor: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
 
   constructor({
     command = 'codex',
     root = sessionRoot(),
     run = runCodex,
-    acknowledgmentFor = null
+    acknowledgmentFor = null,
+    completionFor = null
   }: {
     command?: string;
     root?: string;
     run?: (command: string, args: readonly string[], options?: CodexRunOptions) => Promise<CodexRunResult>;
     acknowledgmentFor?: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
+    completionFor?: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
   } = {}) {
     this.command = command;
     this.root = root;
     this.run = run;
     this.acknowledgmentFor = acknowledgmentFor;
+    this.completionFor = completionFor;
   }
 
   async dispatch(message: NativeMessage, { onCursor }: DispatchOptions = {}): Promise<DispatchOutcome> {
@@ -985,7 +1027,8 @@ export class CodexProvider implements NativeProvider {
     }
     const cursor = readInitialCursor(message.nativeId, root);
     onCursor?.(cursor);
-    const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message, this.acknowledgmentFor?.(message)), '--cd', message.workspace];
+    const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message,
+      this.acknowledgmentFor?.(message), this.completionFor?.(message)), '--cd', message.workspace];
     const result = await this.run(this.command, args, {
       cwd: message.workspace,
       env: { ...process.env, CODEX_HOME: codexHome }
@@ -1057,16 +1100,20 @@ export function postUnixJson(socketPath: string, body: unknown, { timeoutMs = 10
 export class ClaudeProvider implements NativeProvider {
   private readonly post: (socketPath: string, body: unknown) => Promise<UnixJsonResponse>;
   private readonly waitForReply?: (messageId: string, options?: WaitForReplyOptions) => Promise<WaitForReplyResult> | WaitForReplyResult | null;
+  private readonly completionFor: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
 
   constructor({
     post = postUnixJson,
-    waitForReply
+    waitForReply,
+    completionFor = null
   }: {
     post?: (socketPath: string, body: unknown) => Promise<UnixJsonResponse>;
     waitForReply?: (messageId: string, options?: WaitForReplyOptions) => Promise<WaitForReplyResult> | WaitForReplyResult | null;
+    completionFor?: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
   } = {}) {
     this.post = post;
     this.waitForReply = waitForReply;
+    this.completionFor = completionFor;
   }
 
   async dispatch(message: NativeMessage): Promise<DispatchOutcome> {
@@ -1075,7 +1122,7 @@ export class ClaudeProvider implements NativeProvider {
     }
     if (!message.endpoint) return { status: DISPATCH_STATUSES.NOT_SUBMITTED, endpointUnavailable: true, error: new Error('Claude binding has no native channel endpoint') };
     try {
-      const result = await this.post(message.endpoint, claudeEvent(message));
+      const result = await this.post(message.endpoint, claudeEvent(message, this.completionFor?.(message)));
       if (result.statusCode === 202) return { status: DISPATCH_STATUSES.SUBMITTED };
       if (result.statusCode !== undefined && result.statusCode >= 400 && result.statusCode < 500) return { status: DISPATCH_STATUSES.NOT_SUBMITTED, error: new Error(`Claude channel rejected event: ${result.statusCode}`) };
       return { status: DISPATCH_STATUSES.UNCERTAIN, error: new Error(`Claude channel returned ${result.statusCode}`) };
@@ -1098,6 +1145,7 @@ export async function waitForReply(state: NativeState, messageId: string, { time
     const message = state.getMessage(messageId);
     if (!message) return null;
     if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) return { text: message.replyText };
+    if (message.state === MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST) return { stopped: true };
     if (isCurrent && !isCurrent()) return { stopped: true };
     if (message.state === MESSAGE_STATES.UNCERTAIN || message.state === MESSAGE_STATES.REPLY_UNKNOWN) return null;
     await sleep(pollMs, signal);
@@ -1111,6 +1159,9 @@ export async function observeSubmitted(
   provider: NativeProvider,
   options: ObserveCodexOptions = {}
 ): Promise<DispatchReport> {
+  if (message.state === MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST) {
+    return { status: message.state, message: state.getMessage(message.id) };
+  }
   if (!provider?.observe) {
     const unavailable = state.markObservationUnavailable(message.id, 'native observer is unavailable');
     return { status: unavailable?.state || message.state, message: unavailable || state.getMessage(message.id) };

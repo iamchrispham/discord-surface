@@ -7,6 +7,7 @@ const { normalizeAttachments } = require('./attachments');
 const { ORDINARY_RECEIPT_KINDS } = require('./ordinary/constants');
 const { createOrdinaryRepository } = require('./ordinary');
 const { createDirectPostHandlers, queryDirectPostRows, DIRECT_POST_OUTCOMES } = require('./state/direct-post');
+const { createAgentCompletionHandlers } = require('./state/agent-completion');
 const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = require('./state/board-refresh');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
 const {
@@ -69,7 +70,12 @@ const MESSAGE_STATES = Object.freeze({
   DISPATCH_FAILED: 'dispatch_failed',
   REPLY_FAILED: 'reply_failed',
   REPLY_UNKNOWN: 'reply_unknown',
+  AGENT_HANDLED_WITHOUT_POST: 'agent_handled_without_post',
   REJECTED: 'rejected'
+});
+const AGENT_COMPLETION_RECEIPTS = Object.freeze({
+  RESULT_CONSUMED: 'result-consumed',
+  REQUEST_HANDLED_WITHOUT_POST: 'agent-handled-without-post'
 });
 const TOPIC_PUBLICATION_STATES = Object.freeze({
   IN_FLIGHT: 'in_flight',
@@ -132,6 +138,22 @@ const directPostHandlers = createDirectPostHandlers({
   bindingMatchesExpected,
   parseJson,
   now
+});
+
+const agentCompletionHandlers = createAgentCompletionHandlers({
+  AGENT_COMPLETION_RECEIPTS,
+  MESSAGE_STATES,
+  DIRECT_POST_ATTEMPT,
+  DIRECT_POST_OUTCOME,
+  assertText,
+  assertProvider,
+  assertUuid,
+  parseJson,
+  now,
+  AuthorizationError,
+  BindingError,
+  StaleGenerationError,
+  StateCorruptError
 });
 
 const boardRefreshHandlers = createBoardRefreshHandlers();
@@ -2777,6 +2799,10 @@ class SurfaceState {
     return directPostHandlers.recordDirectPostOutcome(this, requestId, attemptId, outcome, detail);
   }
 
+  completeAgentHandledWithoutPost(args) {
+    return agentCompletionHandlers.completeAgentHandledWithoutPost(this, args);
+  }
+
   reconcileDirectPostOutcome(requestId, attemptId, resolution, evidence = {}) {
     return directPostHandlers.reconcileDirectPostOutcome(this, requestId, attemptId, resolution, evidence);
   }
@@ -2979,6 +3005,7 @@ function validateNativeId(value) {
 
 module.exports = {
   ACTIVE_STATES,
+  AGENT_COMPLETION_RECEIPTS,
   AuthorizationError,
   BindingError,
   DecisionError,

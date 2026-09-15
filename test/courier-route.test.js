@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { acknowledgmentCommand } = require('../src/acknowledgment');
-const { codexPrompt, readInitialCursor, CodexProvider } = require('../src/native');
+const { agentCompletionCommand, codexPrompt, readInitialCursor, CodexProvider } = require('../src/native');
 const {
   COURIER_OUTCOMES,
   COURIER_SOURCE_KINDS,
@@ -165,7 +165,10 @@ function materializedDecisionMessage(f, id = 'decision-origin-1') {
 }
 
 function parentPrompt(state, message) {
-  return codexPrompt(message, acknowledgmentCommand(message, state.dbPath));
+  const completion = message.agentMessage
+    ? agentCompletionCommand(message, state.dbPath, undefined, path.dirname(state.dbPath))
+    : null;
+  return codexPrompt(message, acknowledgmentCommand(message, state.dbPath), completion);
 }
 
 function preparedInput(f, message) {

@@ -72,6 +72,7 @@ interface DirectPostPartMeta {
   nonce: string;
   binding: DirectPostBinding;
   deliveryChannelId?: string;
+  agentPacket?: AgentMessage;
   presentation: AgentPresentation;
 }
 
@@ -430,7 +431,8 @@ function agentNonceScope(source: DirectPostBinding | AgentAddress, destination: 
 function partMeta(binding: DirectPostBinding, operatorId: string, requestId: string, inReplyTo: string | null,
   sourcePath: string, textHash: string, parts: readonly string[], partIndex: number, sourceAddress: AgentAddress,
   agentTarget: AgentAddress | null = null,
-  presentation: AgentPresentation = AGENT_PRESENTATIONS.LEGACY): DirectPostPartMeta {
+  presentation: AgentPresentation = AGENT_PRESENTATIONS.LEGACY,
+  agentPacket: AgentMessage | null = null): DirectPostPartMeta {
   const nonceScope = agentTarget === null
     ? `direct:${requestId}:${partIndex}`
     : agentNonceScope(sourceAddress, agentTarget, requestId, partIndex);
@@ -453,7 +455,8 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
     partCount: parts.length,
     nonce: discordNonce(nonceScope),
     binding,
-    presentation
+    presentation,
+    ...(agentPacket ? { agentPacket } : {})
   };
 }
 
@@ -490,6 +493,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   }
   const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: isAgentMessage });
   let deliveryTarget: AgentAddress | null = null;
+  let agentPacket: AgentMessage | null = null;
   const address = isAgentMessage ? resolveAgentAddress(state, binding, agentThreadId) : canonicalAddress(binding);
   if (isAgentMessage) {
     if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
@@ -497,10 +501,11 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       const replyTo = requiredString(agentReplyTo, 'agent-reply-to', 128);
       const hasProof = agentTarget !== null && typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
       if (hasProof) agentTarget = verifyAgentAddress(agentTarget, token);
-      deliveryTarget = resolveAgentReplyRequest(state, replyTo, address,
-        agentTarget as AgentAddress | null).source;
+      const request = resolveAgentReplyRequest(state, replyTo, address,
+        agentTarget as AgentAddress | null);
+      deliveryTarget = request.source;
       agentTarget = deliveryTarget;
-      agentReplyTo = replyTo;
+      agentReplyTo = request.id;
     } else {
       deliveryTarget = verifyAgentAddress(agentTarget, token);
       agentTarget = deliveryTarget;
@@ -514,6 +519,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       replyTo: (agentReplyTo ?? null) as string | null,
       text: source.text
     } as unknown as AgentMessage;
+    agentPacket = packet;
     const wire = encodeAgentMessage(packet, token);
     source = {
       ...source,
@@ -532,7 +538,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
       break;
     }
-    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation);
+    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     if (deliveryTarget !== null) {
       let existing;
