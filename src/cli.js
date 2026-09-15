@@ -56,7 +56,10 @@ function parseArgs(argv) {
       positional.push(value);
       continue;
     }
-    const [key, inline] = value.slice(2).split('=', 2);
+    const raw = value.slice(2);
+    const equalsIndex = raw.indexOf('=');
+    const key = equalsIndex === -1 ? raw : raw.slice(0, equalsIndex);
+    const inline = equalsIndex === -1 ? undefined : raw.slice(equalsIndex + 1);
     if (inline !== undefined) args[key] = inline;
     else if (argv[i + 1] && !argv[i + 1].startsWith('--')) args[key] = argv[++i];
     else args[key] = true;
@@ -83,6 +86,14 @@ function required(args, key) {
   return args[key];
 }
 
+function resolveCourierRoute(state, args) {
+  if (!Object.hasOwn(args, 'courier-route-id')) return null;
+  const routeId = required(args, 'courier-route-id');
+  const route = state.getCourierRoute(routeId);
+  if (!route) throw new Error(`courier route is unknown: ${routeId}`);
+  return { routeId };
+}
+
 function openState(args) {
   const paths = pathsFor(args);
   return { paths, state: new SurfaceState(paths.db) };
@@ -99,6 +110,8 @@ status, recover, board-refresh, thread-enroll, provision, handoff, start, stop,
 claude-channel, claude-monitor, native-ack, claude-reply, agent-address,
 agent-send, agent-complete, post, ordinary-post, ordinary-claude-post, claude-post,
 decision-present, liaison draft
+
+Start options: --state-dir DIR [--courier-route-id ROUTE_ID]
 
 Use \"discord-surface agent-send --help\" for addressed agent-message options.
 `;
@@ -1588,13 +1601,15 @@ async function runRuntime(args) {
   try {
     startupLock = await acquireHeldLockUntilAvailable(paths.bindLock, () => stopping);
     if (stopping || !startupLock) return;
+    const courierRoute = resolveCourierRoute(state, args);
     state.recoverAfterRestart();
     writePid(paths.pid, config.guildId, paths.stateDir, paths.db);
     gateway = new DiscordGateway({
       state,
       stateDir: paths.stateDir,
       observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) },
-      onReady: () => bindingWake.start()
+      onReady: () => bindingWake.start(),
+      courierRoute
     });
     await gateway.start(config.secretFile);
     const recoveryCutoff = new Date().toISOString();
@@ -1611,18 +1626,24 @@ async function runRuntime(args) {
   await new Promise(() => {});
 }
 
-function start(args) {
+function start(args, dependencies = {}) {
   const { stateDir, lock } = pathsFor(args);
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const state = new SurfaceState(pathsFor(args).db);
-  const config = state.requireConfig();
-  state.close();
+  let config;
+  let courierRoute;
+  try {
+    config = state.requireConfig();
+    courierRoute = resolveCourierRoute(state, args);
+  } finally { state.close(); }
   const runtimeDir = path.join(os.tmpdir(), 'discord-surface-runtime');
   fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(runtimeDir, 0o700); } catch {}
   const guildLock = path.join(runtimeDir, `guild-${config.guildId}.lock`);
-  const runArgs = [process.execPath, __filename, 'run', '--state-dir', stateDir, ...(args.db ? ['--db', path.resolve(args.db)] : [])];
-  const result = spawnSync('lockf', ['-t', '0', '-k', guildLock, 'lockf', '-t', '0', '-k', lock, ...runArgs], {
+  const runArgs = [process.execPath, __filename, 'run', '--state-dir', stateDir,
+    ...(args.db ? ['--db', path.resolve(args.db)] : []),
+    ...(courierRoute ? [`--courier-route-id=${courierRoute.routeId}`] : [])];
+  const result = (dependencies.spawnSync || spawnSync)('lockf', ['-t', '0', '-k', guildLock, 'lockf', '-t', '0', '-k', lock, ...runArgs], {
     stdio: 'inherit',
     env: { ...process.env, DISCORD_SURFACE_LOCK_HELD: '1' }
   });
@@ -2129,7 +2150,7 @@ async function main() {
   }
 }
 
-module.exports = { agentComplete, bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, threadEnroll, unbind };
+module.exports = { agentComplete, bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, start, threadEnroll, unbind };
 
 if (require.main === module) {
   main().catch(error => {

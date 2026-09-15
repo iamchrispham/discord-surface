@@ -134,6 +134,21 @@ node src/cli.js status --state-dir "$HOME/.config/discord-surface"
 node src/cli.js stop --state-dir "$HOME/.config/discord-surface"
 ```
 
+To select one already registered courier route for a Gateway run, pass its exact
+route ID to `start`:
+
+```sh
+node src/cli.js start --state-dir "$HOME/.config/discord-surface" \
+  --courier-route-id ROUTE_ID
+```
+
+The CLI resolves the ID from existing state before starting the Gateway. A
+present option without a value or an unknown ID fails closed. Omitting the
+option keeps courier selection disabled. This exposes route selection only. It
+does not register a route,
+intercept a Desktop session, or prove live Discord and native qualification.
+Those checks remain required before operator activation.
+
 `status` includes a `gateway` process object. Its `state` is `running` only when the runtime PID file and the matching `ps` command identify this adapter and state directory. `stopped` means no PID file exists, `stale` means the recorded process is gone, and `unknown` means the PID file or owner identity cannot be verified. A `running` process reports `connection: unverified-live`; it does not claim a Discord connection.
 
 The Codex provider queues `codex queue --thread <UUID>` in the bound workspace. It observes only the matching session JSONL file and does not select a task by name, newest activity, directory, or process ID. The runtime never adds approval bypass flags.
