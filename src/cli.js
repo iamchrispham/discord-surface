@@ -1592,6 +1592,7 @@ async function runRuntime(args) {
     writePid(paths.pid, config.guildId, paths.stateDir, paths.db);
     gateway = new DiscordGateway({
       state,
+      stateDir: paths.stateDir,
       observeOptions: { timeoutMs: Number(args['reply-timeout-ms'] || 120000) },
       onReady: () => bindingWake.start()
     });

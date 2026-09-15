@@ -94,9 +94,10 @@ export interface NativeMessage {
 export function agentCompletionCommand(
   message: Pick<NativeMessage, 'id' | 'provider' | 'nativeId' | 'generation'>,
   dbPath: string,
-  cliPath = path.join(__dirname, '..', 'src', 'cli.js')
+  cliPath = path.join(__dirname, '..', 'src', 'cli.js'),
+  stateDir = path.dirname(dbPath)
 ): string[] {
-  return [process.execPath, cliPath, 'agent-complete', '--db', dbPath,
+  return [process.execPath, cliPath, 'agent-complete', '--state-dir', stateDir, '--db', dbPath,
     '--provider', message.provider, '--message-id', message.id,
     '--native-id', message.nativeId, '--generation', String(message.generation)];
 }
@@ -377,11 +378,14 @@ export function codexPrompt(
   const marker = `[[discord-surface:${message.id}]]`;
   const isDecision = Boolean(message.decisionResult);
   const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
+  const hasCompletionPath = Boolean(completionInstruction);
   let handlingInstruction: string;
   if (isDecision) {
     handlingInstruction = 'Handle the saved canonical decision continuation using its exact identity and canonical answer. Preserve this session. Do not start another session or hand this work to another agent.';
   } else if (message.agentMessage) {
-    handlingInstruction = 'Handle the agent context in your normal final response. Preserve this session.';
+    handlingInstruction = hasCompletionPath
+      ? 'Handle the authenticated agent packet in this session. If a Discord reply is needed, produce the normal final response. If it is fully handled without a reply, use the exact no-post completion command below instead. Preserve this session.'
+      : 'Handle the agent context in your normal final response. Preserve this session.';
   } else {
     handlingInstruction = 'Answer the user request in your normal final response. Do not start another session or hand this work to another agent.';
   }
@@ -411,13 +415,20 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
 } {
   const isDecision = Boolean(message.decisionResult);
   const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
+  const hasCompletionPath = Boolean(completionInstruction);
+  let replyInstruction: string;
+  if (isDecision) {
+    replyInstruction = `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after handling the saved decision continuation.`;
+  } else if (hasCompletionPath) {
+    replyInstruction = `After handling this agent packet, either use the reply tool with messageId "${message.id}" and generation ${message.generation} for a Discord reply, or run the exact no-post completion command below when no reply is needed.`;
+  } else {
+    replyInstruction = `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`;
+  }
   const content = [
     isDecision
       ? `Saved canonical decision continuation ${message.id} for native Claude session ${message.nativeId}.`
       : `Inbound Discord message ${message.id} for native Claude session ${message.nativeId}.`,
-    isDecision
-      ? `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after handling the saved decision continuation.`
-      : `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`,
+    replyInstruction,
     ...(completionInstruction ? [completionInstruction] : []),
     isDecision ? 'Preserve the exact canonical identity and answer from the decision JSON. Preserve this session. Do not start or resume another session.' : 'Do not start or resume another session.',
     '',

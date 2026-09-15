@@ -1,4 +1,5 @@
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
+const path = require('node:path');
 const {
   AGENT_ATTACHMENT_CONTENT_TYPE,
   AGENT_ATTACHMENT_FILENAME,
@@ -1025,8 +1026,9 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
 }
 
 class DiscordGateway {
-  constructor({ state, client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null, interactionFetch = globalThis.fetch } = {}) {
+  constructor({ state, stateDir = path.dirname(state.dbPath), client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null, interactionFetch = globalThis.fetch } = {}) {
     this.state = state;
+    this.stateDir = stateDir;
     this.logger = logger;
     this.onReady = typeof onReady === 'function' ? onReady : null;
     this.interactionFetch = interactionFetch;
@@ -1087,7 +1089,7 @@ class DiscordGateway {
       state,
       send: (message, reaction) => this.sendAcknowledgment(message, reaction)
     });
-    const completionFor = message => message.agentMessage ? agentCompletionCommand(message, state.dbPath) : null;
+    const completionFor = message => message.agentMessage ? agentCompletionCommand(message, state.dbPath, undefined, this.stateDir) : null;
     this.providers = providers || {
       codex: new CodexProvider({
         acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath),
