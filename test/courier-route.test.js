@@ -396,7 +396,7 @@ test('revoked selected route returns to accepted without parent fallback', async
   assert.equal(f.state.listReceipts().some(row => row.kind === 'courier-rejection'), true);
 });
 
-test('route revoked after queue result blocks parent observation', async t => {
+test('route revoked after queue result preserves parent observation', async t => {
   const f = fixture(t);
   const courierCalls = [];
   const parentCalls = [];
@@ -411,13 +411,81 @@ test('route revoked after queue result blocks parent observation', async t => {
     }
   }).processAccepted(f.message);
 
-  assert.equal(result.status, COURIER_OUTCOMES.NOT_SUBMITTED);
-  assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.REPLIED);
   assert.equal(f.state.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
   assert.equal(courierCalls.length, 1);
   assert.equal(parentCalls.length, 0);
-  assert.equal(replies.length, 0);
-  assert.equal(f.state.listReceipts().filter(row => row.kind === 'native-ack').length, 0);
+  assert.deepEqual(replies, [{ messageId: f.message.id, channelId: '2000', content: `answer for ${f.message.id}` }]);
+  assert.equal(f.state.listReceipts().filter(row => row.kind === 'native-ack').length, 1);
+});
+
+test('definite non-submission remains retryable', async t => {
+  const f = fixture(t);
+  const courierCalls = [];
+  const parentCalls = [];
+  const replies = [];
+  let dispatches = 0;
+  const dispatchCourier = async () => {
+    dispatches += 1;
+    return dispatches === 1
+      ? { status: COURIER_OUTCOMES.NOT_SUBMITTED, error: new Error('courier unavailable') }
+      : { status: COURIER_OUTCOMES.SUBMITTED };
+  };
+
+  const first = await consumerFor(f, { courierCalls, parentCalls, replies, dispatchCourier }).processAccepted(f.message);
+  assert.equal(first.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+  assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(dispatches, 1);
+
+  const second = await consumerFor(f, { courierCalls, parentCalls, replies, dispatchCourier })
+    .processAccepted(f.state.getMessage(f.message.id));
+  assert.equal(second.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(dispatches, 2);
+  assert.equal(f.state.listReceipts().filter(row => row.kind === 'courier-attempt').length, 2);
+  assert.equal(f.state.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
+  assert.equal(parentCalls.length, 0);
+  assert.equal(replies.length, 1);
+});
+
+test('courier route registration rejects a Claude parent', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-courier-claude-route-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  const parentNative = '55555555-5555-5555-5555-555555555555';
+  const courierNative = '66666666-6666-6666-6666-666666666666';
+  const sessionRoot = path.join(dir, 'sessions');
+  fs.mkdirSync(sessionRoot, { recursive: true });
+  state.setConfig({ operatorId: 'operator', guildId: '100', secretFile: path.join(dir, 'secret') });
+  const binding = state.bind({
+    channelId: '1000',
+    guildId: '100',
+    provider: 'claude',
+    nativeId: parentNative,
+    workspace: dir,
+    endpoint: '/tmp/discord-courier-claude.sock'
+  });
+  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100' }, binding);
+  state.setThreadBaseline('2000', null, binding);
+  state.markThreadBoundary('2000', THREAD_STATES.READY, 'Claude route fixture', null, null, binding);
+
+  assert.throws(() => state.registerCourierRoute({
+    routeId: 'claude-route',
+    routeGeneration: 1,
+    guildId: '100',
+    parentChannelId: '1000',
+    deliveryChannelId: '2000',
+    target: { guildId: '100', channelId: '2000', provider: 'claude', nativeId: parentNative, generation: binding.generation },
+    courier: {
+      provider: 'codex',
+      nativeId: courierNative,
+      workspace: dir,
+      sessionRoot,
+      recipientThreadId: RECIPIENT_THREAD,
+      hostId: 'host-local'
+    }
+  }), /courier route parent must use codex provider/);
+  state.close();
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test('Codex courier queue uses a fixed forwarding call and exact parent payload', async t => {

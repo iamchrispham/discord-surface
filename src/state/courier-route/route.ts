@@ -109,7 +109,8 @@ function bindingForRoute(deps: CourierDependencies, state: CourierState, route: 
 export function registerRoute(deps: CourierDependencies, state: CourierState, input: unknown): CourierRoute | null {
   const route = routeInput(deps, input);
   return state.transaction(() => {
-    bindingForRoute(deps, state, route);
+    const { binding } = bindingForRoute(deps, state, route);
+    if (binding.provider !== 'codex') throw new deps.BindingError('courier route parent must use codex provider');
     const existing = getRoute(deps, state, route.routeId);
     if (existing) {
       if (existing.status === COURIER_ROUTE_STATES.ACTIVE && routeComparable(existing) === routeComparable(route)) return existing;

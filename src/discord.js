@@ -823,6 +823,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     if (!isCourierOriginAllowed(state, message)) return false;
     const selected = state.getCourierRoute(courierRoute.routeId) || courierRoute;
     if (!selected || selected.parentChannelId !== message.channelId || selected.guildId !== message.guildId) return false;
+    if (message.provider !== 'codex' || selected.target?.provider !== 'codex') return false;
     if (message.agentMessage) return selected.deliveryChannelId === message.deliveryChannelId;
     const config = state.requireConfig();
     return message.authorId === config.operatorId && (
@@ -897,13 +898,10 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
       dispatched = { status: COURIER_OUTCOMES.UNCERTAIN, error };
     }
     const status = courierDispatchStatus(dispatched);
-    const current = state.authorizeCourierAttempt(message.id, claimed.attempt.attemptId, input);
+    state.authorizeCourierAttempt(message.id, claimed.attempt.attemptId, input);
     state.recordCourierOutcome(message.id, claimed.attempt.attemptId, status, {
       ...(dispatched?.error ? { error: String(dispatched.error.message || dispatched.error).slice(0, 200) } : {})
     });
-    if (status === COURIER_OUTCOMES.SUBMITTED && !current.authorized) {
-      return { status: COURIER_OUTCOMES.NOT_SUBMITTED, error: courierDispatchError(current.status) };
-    }
     return {
       status,
       cursor: observerCursor,

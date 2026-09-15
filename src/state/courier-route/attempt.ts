@@ -54,7 +54,7 @@ function latestAttempt(deps: CourierDependencies, state: CourierState, messageId
   const rows = attemptRows(deps, state, messageId).filter(row => !id || row.detail.attemptId === id);
   const row = rows.at(-1);
   if (!row) return null;
-  const outcomes = outcomeRows(deps, state, messageId, String(row.detail.attemptId));
+  const outcomes = outcomeRows(deps, state, messageId, String(row.detail.attemptId)).filter(outcome => outcome.id > row.id);
   const outcomeRow = outcomes.at(-1);
   const attempt = { ...row.detail, receiptId: row.id, createdAt: row.createdAt } as CourierAttempt;
   const outcome = outcomeRow
@@ -110,7 +110,7 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
           : { accepted: false, status: COURIER_RESULT_STATUSES.SETTLED, message };
       }
       const existing = latestAttempt(deps, state, messageId);
-      if (existing) {
+      if (existing && existing.outcome?.outcome !== COURIER_OUTCOMES.NOT_SUBMITTED) {
         return { accepted: false, duplicate: true, status: COURIER_RESULT_STATUSES.DUPLICATE, message, ...existing };
       }
       const match = findMatchingRoute(deps, state, message, input.routeId);
@@ -201,7 +201,7 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
     const operation = () => {
       let recovered = 0;
       for (const row of attemptRows(deps, state)) {
-        if (outcomeRows(deps, state, row.discordId, String(row.detail.attemptId)).length) continue;
+        if (outcomeRows(deps, state, row.discordId, String(row.detail.attemptId)).some(outcome => outcome.id > row.id)) continue;
         state.receipt(row.discordId, COURIER_RECEIPT_KINDS.OUTCOME, {
           attemptId: row.detail.attemptId,
           outcome: COURIER_OUTCOMES.UNCERTAIN,
