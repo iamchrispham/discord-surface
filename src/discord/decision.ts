@@ -99,6 +99,7 @@ export interface DecisionConsumerOptions {
   state: DecisionConsumerState;
   interactionFetch?: InteractionFetch;
   callbackTimeoutMs?: number;
+  waitForDispatch?: (channelId: string, signal?: AbortSignal) => Promise<boolean>;
   processAccepted?: (message: DecisionMessage, signal?: AbortSignal, options?: Record<string, unknown>) => Promise<unknown>;
   project?: (input: DecisionProjectionInput, signal?: AbortSignal) => Promise<unknown>;
   resolveRoute?: typeof resolveCanonicalRoute;
@@ -373,6 +374,17 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     }
     const click = state.getDecisionClick(parsed.id) || admission.click;
     if (!click) return invalidResult(DECISION_REASONS.UNKNOWN_INTERACTION);
+    if (options.waitForDispatch && !await options.waitForDispatch(click.channelId, signal)) {
+      return {
+        handled: true,
+        accepted: true,
+        duplicate: admission.duplicate,
+        continuing: admission.continuing,
+        click,
+        message: safeMessage(state, click.interactionId),
+        ...(callback ? { callback } : {})
+      };
+    }
     const continuation = await continueClick(click, signal);
     return { ...continuation, duplicate: admission.duplicate, continuing: admission.continuing, ...(callback ? { callback } : {}) };
   }

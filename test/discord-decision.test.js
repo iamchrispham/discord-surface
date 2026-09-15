@@ -122,6 +122,14 @@ function decisionMessages(state) {
   return state.listMessages().filter(message => message.decisionResult);
 }
 
+async function waitForCondition(predicate, message, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
 test('Gateway settles competing component clicks once and imports the canonical winner', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const first = await f.gateway.handleInteraction(component(f.presentation, 'component-approve', 0), new AbortController().signal);
@@ -144,6 +152,48 @@ test('Gateway settles competing component clicks once and imports the canonical 
   assert.equal(losing.selectedKey, 'hold');
   assert.equal(losing.canonical.answer, 'approve');
   assert.equal(losing.canonical.source, 'current');
+});
+
+test('bound component ingress keeps callback custody before readiness and gates continuation', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.ready = true;
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.createInteractionRecoveryBarrier();
+  const listener = f.listeners.get('interactionCreate');
+  assert.equal(typeof listener, 'function');
+  listener(component(f.presentation, 'barrier-component', 0));
+
+  await waitForCondition(() => f.callbacks.length === 1, 'bound component callback was not attempted');
+  assert.deepEqual(f.callbacks.map(item => item.body), [{ type: 6 }]);
+  assert.equal(f.edits.length, 0);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(decisionMessages(f.state).length, 0);
+  assert.equal(f.state.getDecisionClick('barrier-component').callbackOutcome, 'sent');
+  assert.equal(f.state.getDecisionClick('barrier-component').canonical, null);
+
+  f.gateway.resolveInteractionRecovery(true);
+  await waitForCondition(() => f.edits.length === 1 && f.dispatches.length === 1,
+    'decision continuation did not resume after readiness barrier');
+  assert.deepEqual(f.edits.map(item => item.content), ['approve']);
+  assert.equal(decisionMessages(f.state).length, 1);
+
+  const aborted = await fixture(t);
+  aborted.gateway.ready = true;
+  aborted.gateway.started = true;
+  aborted.gateway.transportReady = true;
+  aborted.gateway.createInteractionRecoveryBarrier();
+  const abortedListener = aborted.listeners.get('interactionCreate');
+  assert.equal(typeof abortedListener, 'function');
+  abortedListener(component(aborted.presentation, 'aborted-barrier-component', 0));
+  await waitForCondition(() => aborted.callbacks.length === 1, 'aborted barrier callback was not attempted');
+  await aborted.gateway.stop();
+  assert.equal(aborted.edits.length, 0);
+  assert.equal(aborted.dispatches.length, 0);
+  assert.equal(decisionMessages(aborted.state).length, 0);
+  const pending = aborted.state.getDecisionClick('aborted-barrier-component');
+  assert.equal(pending.callbackOutcome, 'sent');
+  assert.ok(aborted.state.listDecisionPendingWork().some(click => click.interactionId === 'aborted-barrier-component'));
 });
 
 test('losing projection refuses binding and config drift during question fetch', { timeout: 30000 }, async t => {

@@ -1085,6 +1085,7 @@ class DiscordGateway {
       state,
       interactionFetch: this.interactionFetch,
       callbackTimeoutMs: this.interactionCallbackTimeoutMs,
+      waitForDispatch: (channelId, signal) => this.waitForInteractionDispatch({ channelId }, signal),
       processAccepted: (message, signal, options) => this.consumer.processAccepted(message, signal, options),
       project: (input, signal) => this.projectDecisionMessage(input, signal)
     });

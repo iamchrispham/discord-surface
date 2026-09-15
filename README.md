@@ -375,9 +375,11 @@ caller identity check. The canonical question CLI assigns the question identity
 and answer keys. The adapter stores the presentation and its canonical route in
 the existing receipts journal.
 
-The producer has local validation. Gateway button consumption and live decision
-return are still under implementation and qualification on this branch. A sent
-presentation is not proof that a click reached the native session.
+The producer and local Gateway decision path are implemented. Gateway button
+consumption records callback custody and gates canonical settlement, original-question
+projection, and native continuation on Gateway readiness. Live Discord delivery and
+native-session return remain separate qualification boundaries. A sent presentation
+is not proof that a click reached the native session.
 
 Write a request file using the channel, native ID and generation returned by your
 binding. Use a stable namespace and request ID for each question:
@@ -410,8 +412,8 @@ node src/cli.js decision-present \
 
 `provider` is `codex` or `claude`. Ordinary callers must run from the bound native
 session. The producer uses the canonical CLI's `register` operation and exported
-path resolver. The pending Gateway consumer additionally requires `settle` and
-exact-generation `read`. That CLI remains the answer authority. The adapter does
+path resolver. The Gateway consumer uses exact `settle` and generation-bound `read`
+through that same owner. That CLI remains the answer authority. The adapter does
 not create a separate answer store. If `--canonical-cli` is
 omitted, it uses `~/.claude/skills/phone-notify/scripts/tg-canonical.mjs`.
 
