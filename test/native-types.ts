@@ -1,6 +1,8 @@
+import { acknowledgmentCommand } from '../src/acknowledgment';
 import {
   ClaudeProvider,
   CodexProvider,
+  codexPrompt,
   dispatchAndObserve,
   finalText,
   messageRequest,
@@ -39,7 +41,8 @@ const state: NativeState = {
 };
 
 const submitted: DispatchOutcome = { status: 'submitted', cursor: null };
-const provider: NativeProvider = new CodexProvider();
+const acknowledgmentFor = (nativeMessage: NativeMessage) => acknowledgmentCommand(nativeMessage, '/tmp/unused-contract-probe.sqlite');
+const provider: NativeProvider = new CodexProvider({ acknowledgmentFor });
 const claudeProvider: NativeProvider = new ClaudeProvider({ waitForReply: async () => ({ stopped: true }) });
 
 if (submitted.status === 'submitted') {
@@ -48,8 +51,10 @@ if (submitted.status === 'submitted') {
 }
 
 const request: string = messageRequest(message);
+const prompt: string = codexPrompt(message, acknowledgmentFor(message));
 const final: string | null = finalText({ type: 'response_item', payload: null }, '[[discord-surface:discord-message-1]]');
 void request;
+void prompt;
 void final;
 void claudeProvider;
 

@@ -326,7 +326,7 @@ export function messageRequest(message: NativeMessage): string {
   ].filter(line => line !== '').join('\n');
 }
 
-export function codexPrompt(message: NativeMessage, acknowledgment: string | null = null): string {
+export function codexPrompt(message: NativeMessage, acknowledgment: readonly string[] | null = null): string {
   const marker = `[[discord-surface:${message.id}]]`;
   const prompt = [
     `This is an inbound Discord message for native session ${message.nativeId}.`,
@@ -772,7 +772,7 @@ export class CodexProvider implements NativeProvider {
   private readonly command: string;
   private readonly root: string;
   private readonly run: (command: string, args: readonly string[], options?: CodexRunOptions) => Promise<CodexRunResult>;
-  private readonly acknowledgmentFor: ((message: NativeMessage) => string | null | undefined) | null;
+  private readonly acknowledgmentFor: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
 
   constructor({
     command = 'codex',
@@ -783,7 +783,7 @@ export class CodexProvider implements NativeProvider {
     command?: string;
     root?: string;
     run?: (command: string, args: readonly string[], options?: CodexRunOptions) => Promise<CodexRunResult>;
-    acknowledgmentFor?: ((message: NativeMessage) => string | null | undefined) | null;
+    acknowledgmentFor?: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
   } = {}) {
     this.command = command;
     this.root = root;
