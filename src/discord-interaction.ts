@@ -1,7 +1,10 @@
 const CALLBACK_TYPE = 4;
+const DEFERRED_UPDATE_MESSAGE_CALLBACK_TYPE = 6;
 const APPLICATION_COMMAND_INTERACTION_TYPE = 2;
+const MESSAGE_COMPONENT_INTERACTION_TYPE = 3;
 const CHAT_INPUT_COMMAND_TYPE = 1;
 const BOOLEAN_OPTION_TYPE = 5;
+const BUTTON_COMPONENT_TYPE = 2;
 const EPHEMERAL_MESSAGE_FLAG = 64;
 const DEFAULT_CALLBACK_TIMEOUT_MS = 2500;
 
@@ -14,6 +17,41 @@ export const INTERACTION_OUTCOMES = Object.freeze({
 } as const);
 
 export type InteractionOutcome = typeof INTERACTION_OUTCOMES[keyof typeof INTERACTION_OUTCOMES];
+
+export const COMPONENT_TYPES = Object.freeze({
+  BUTTON: BUTTON_COMPONENT_TYPE
+} as const);
+
+export type ComponentType = typeof COMPONENT_TYPES[keyof typeof COMPONENT_TYPES];
+
+export const DEFERRED_UPDATE_CALLBACK_TYPE = DEFERRED_UPDATE_MESSAGE_CALLBACK_TYPE;
+export const DECISION_BUTTON_LIMIT = 25;
+
+export interface DecisionCustomId {
+  presentationId: string;
+  selectedIndex: number;
+}
+
+export function decodeDecisionCustomId(value: unknown): DecisionCustomId | null {
+  if (!text(value, 100)) return null;
+  const parts = value.split(':');
+  if (parts.length !== 3 || parts[0] !== 'd') return null;
+  const [, presentationId, indexText] = parts;
+  if (!text(presentationId, 48) || /[^A-Za-z0-9._-]/.test(presentationId)) return null;
+  const selectedIndex = Number(indexText);
+  if (!Number.isInteger(selectedIndex) || String(selectedIndex) !== indexText ||
+    selectedIndex < 0 || selectedIndex >= DECISION_BUTTON_LIMIT) return null;
+  return { presentationId, selectedIndex };
+}
+
+export function encodeDecisionCustomId(presentationId: string, selectedIndex: number): string {
+  if (typeof presentationId !== 'string' || !Number.isInteger(selectedIndex)) {
+    throw new Error('invalid decision button identity');
+  }
+  const encoded = `d:${presentationId}:${selectedIndex}`;
+  if (!decodeDecisionCustomId(encoded)) throw new Error('invalid decision button identity');
+  return encoded;
+}
 
 export const CS_COMMAND = Object.freeze({
   name: 'cs',
@@ -44,6 +82,19 @@ export interface ParsedCsInteraction {
   applicationId: string | null;
   full: boolean;
   content: '/cs' | '/cs full';
+}
+
+export interface ParsedComponentInteraction {
+  id: string;
+  guildId: string;
+  channelId: string;
+  userId: string;
+  token: string;
+  applicationId: string;
+  messageId: string;
+  componentType: ComponentType;
+  customId: string;
+  presentationId: string;
 }
 
 export interface InteractionCallbackFetchResponse {
@@ -89,6 +140,19 @@ function optionsOf(interaction: Record<string, unknown>): InteractionOption[] | 
   return data as InteractionOption[];
 }
 
+function recordOf(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function componentMessageIdOf(interaction: Record<string, unknown>): unknown {
+  const message = recordOf(interaction.message);
+  return message?.id;
+}
+
+function isComponentType(value: unknown): value is ComponentType {
+  return value === BUTTON_COMPONENT_TYPE;
+}
+
 export function parseCsInteraction(input: unknown, expectedApplicationId: string | null = null): ParsedCsInteraction | null {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return null;
   const interaction = input as Record<string, unknown>;
@@ -114,6 +178,36 @@ export function parseCsInteraction(input: unknown, expectedApplicationId: string
     applicationId,
     full,
     content: full ? '/cs full' : '/cs'
+  };
+}
+
+export function parseComponentInteraction(input: unknown, expectedApplicationId: string | null = null): ParsedComponentInteraction | null {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return null;
+  const interaction = input as Record<string, unknown>;
+  if (interaction.type !== MESSAGE_COMPONENT_INTERACTION_TYPE) return null;
+  if (typeof interaction.isMessageComponent === 'function' && !(interaction.isMessageComponent as () => unknown).call(interaction)) return null;
+  const componentType = interaction.componentType;
+  if (!isComponentType(componentType)) return null;
+  if (!text(interaction.id) || !text(interaction.guildId) || !text(interaction.channelId) || !text(interaction.applicationId)) return null;
+  const user = recordOf(interaction.user);
+  if (!text(user?.id) || !text(interaction.token, 512)) return null;
+  const applicationId = interaction.applicationId as string;
+  if (expectedApplicationId && applicationId !== expectedApplicationId) return null;
+  const messageId = componentMessageIdOf(interaction);
+  const customId = interaction.customId;
+  if (!text(messageId) || !text(customId, 100)) return null;
+  return {
+    id: interaction.id as string,
+    guildId: interaction.guildId as string,
+    channelId: interaction.channelId as string,
+    userId: user.id as string,
+    token: interaction.token as string,
+    applicationId,
+    messageId,
+    componentType,
+    customId,
+    // The custom ID is an opaque persisted presentation reference. Admission owns authority checks.
+    presentationId: customId
   };
 }
 
@@ -162,16 +256,21 @@ function responseStatus(response: InteractionCallbackFetchResponse): number | nu
   return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
 }
 
-export async function sendInteractionCallback(
+type InteractionCallbackRequest =
+  | { type: typeof CALLBACK_TYPE; data: Record<string, unknown>; withResponse: true }
+  | { type: typeof DEFERRED_UPDATE_MESSAGE_CALLBACK_TYPE; withResponse: false };
+
+interface InteractionCallbackOptions {
+  signal?: AbortSignal;
+  fetchImpl?: InteractionFetch;
+  timeoutMs?: number;
+}
+
+async function sendCallbackRequest(
   interaction: Pick<ParsedCsInteraction, 'id' | 'token'>,
-  { signal, fetchImpl = globalThis.fetch as unknown as InteractionFetch, content = SAVED_CALLBACK_CONTENT,
-    ephemeral = false, timeoutMs = DEFAULT_CALLBACK_TIMEOUT_MS }: {
-    signal?: AbortSignal;
-    fetchImpl?: InteractionFetch;
-    content?: string;
-    ephemeral?: boolean;
-    timeoutMs?: number;
-  } = {}
+  requestSpec: InteractionCallbackRequest,
+  { signal, fetchImpl = globalThis.fetch as unknown as InteractionFetch,
+    timeoutMs = DEFAULT_CALLBACK_TIMEOUT_MS }: InteractionCallbackOptions = {}
 ): Promise<InteractionCallbackResult> {
   if (signal?.aborted) return { outcome: INTERACTION_OUTCOMES.NOT_SENT, reason: 'callback stopped before request' };
   if (typeof fetchImpl !== 'function') return { outcome: INTERACTION_OUTCOMES.NOT_SENT, reason: 'Discord interaction callback fetch is unavailable' };
@@ -181,23 +280,19 @@ export async function sendInteractionCallback(
   const relayAbort = () => callbackController.abort();
   signal?.addEventListener('abort', relayAbort, { once: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let response: InteractionCallbackFetchResponse;
   try {
     started = true;
-    const request = Promise.resolve().then(() => fetchImpl(`https://discord.com/api/v10/interactions/${encodeURIComponent(interaction.id)}/${encodeURIComponent(interaction.token)}/callback?with_response=true`, {
+    const endpoint = `https://discord.com/api/v10/interactions/${encodeURIComponent(interaction.id)}/${encodeURIComponent(interaction.token)}/callback${requestSpec.withResponse ? '?with_response=true' : ''}`;
+    const body = requestSpec.withResponse
+      ? { type: requestSpec.type, data: requestSpec.data }
+      : { type: requestSpec.type };
+    const request = Promise.resolve().then(() => fetchImpl(endpoint, {
       method: 'POST',
       headers: {
         'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        type: CALLBACK_TYPE,
-        data: {
-          content,
-          allowed_mentions: { parse: [] },
-          ...(ephemeral ? { flags: EPHEMERAL_MESSAGE_FLAG } : {})
-        }
-      }),
+      body: JSON.stringify(body),
       signal: callbackController.signal
     }));
     const timeout = Number(timeoutMs);
@@ -211,21 +306,25 @@ export async function sendInteractionCallback(
         reject(new Error('Discord interaction callback deadline exceeded'));
       }, boundedTimeout);
     });
-    response = await Promise.race([request, deadline]);
+    const response = await Promise.race([request, deadline]);
     const status = responseStatus(response);
     if (response?.ok !== true) {
       await Promise.race([cancelBody(response), deadline]);
       return {
         outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
         ...(status === null ? {} : { statusCode: status }),
-        reason: 'Discord interaction callback request rejected'
+        reason: requestSpec.withResponse ? 'Discord interaction callback request rejected' : 'Discord component callback request rejected'
       };
     }
-    let body: unknown = null;
-    try { body = await Promise.race([response.json?.() || Promise.resolve(null), deadline]); }
+    if (!requestSpec.withResponse) {
+      await Promise.race([cancelBody(response), deadline]);
+      return { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }) };
+    }
+    let responseBody: unknown = null;
+    try { responseBody = await Promise.race([response.json?.() || Promise.resolve(null), deadline]); }
     catch (error) { if (timedOut) throw error; }
-    const id = responseMessageId(body);
-    if (!id) {
+    const responseId = responseMessageId(responseBody);
+    if (!responseId) {
       await Promise.race([cancelBody(response), deadline]);
       return {
         outcome: INTERACTION_OUTCOMES.UNKNOWN,
@@ -236,7 +335,7 @@ export async function sendInteractionCallback(
       };
     }
     await Promise.race([cancelBody(response), deadline]);
-    return { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }), responseMessageId: id, visibility: 'available' };
+    return { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }), responseMessageId: responseId, visibility: 'available' };
   } catch (error) {
     return {
       outcome: started ? INTERACTION_OUTCOMES.UNKNOWN : INTERACTION_OUTCOMES.NOT_SENT,
@@ -246,6 +345,40 @@ export async function sendInteractionCallback(
     if (timer) clearTimeout(timer);
     signal?.removeEventListener('abort', relayAbort);
   }
+}
+
+export async function sendInteractionCallback(
+  interaction: Pick<ParsedCsInteraction, 'id' | 'token'>,
+  { signal, fetchImpl = globalThis.fetch as unknown as InteractionFetch, content = SAVED_CALLBACK_CONTENT,
+    ephemeral = false, timeoutMs = DEFAULT_CALLBACK_TIMEOUT_MS }: {
+    signal?: AbortSignal;
+    fetchImpl?: InteractionFetch;
+    content?: string;
+    ephemeral?: boolean;
+    timeoutMs?: number;
+  } = {}
+): Promise<InteractionCallbackResult> {
+  return sendCallbackRequest(interaction, {
+    type: CALLBACK_TYPE,
+    withResponse: true,
+    data: {
+      content,
+      allowed_mentions: { parse: [] },
+      ...(ephemeral ? { flags: EPHEMERAL_MESSAGE_FLAG } : {})
+    }
+  }, { signal, fetchImpl, timeoutMs });
+}
+
+export async function sendComponentCallback(
+  interaction: Pick<ParsedComponentInteraction, 'id' | 'token'>,
+  { signal, fetchImpl = globalThis.fetch as unknown as InteractionFetch,
+    timeoutMs = DEFAULT_CALLBACK_TIMEOUT_MS }: {
+    signal?: AbortSignal;
+    fetchImpl?: InteractionFetch;
+    timeoutMs?: number;
+  } = {}
+): Promise<InteractionCallbackResult> {
+  return sendCallbackRequest(interaction, { type: DEFERRED_UPDATE_MESSAGE_CALLBACK_TYPE, withResponse: false }, { signal, fetchImpl, timeoutMs });
 }
 
 export { responseMessageId };

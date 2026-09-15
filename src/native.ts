@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import * as path from 'node:path';
 import type { Attachment } from './attachments';
 import type { AgentMessage } from './agent-message';
+import type { DecisionResult } from './state/decision';
 import {
   CODEX_VALIDATION_KINDS,
   CLAUDE_METADATA_RECORD_MAX_BYTES,
@@ -83,6 +84,7 @@ export interface NativeMessage {
   content: string;
   attachments?: readonly Attachment[] | null;
   agentMessage?: AgentMessage | null;
+  decisionResult?: DecisionResult | null;
   state: MessageState;
   replyText?: string | null;
   observerCursor?: PersistedObserverCursor | null;
@@ -312,7 +314,32 @@ export function attachmentPrompt(message: NativeMessage): string {
   ].join('\n');
 }
 
+function decisionRequest(message: NativeMessage): string | null {
+  const decision = message.decisionResult;
+  if (!decision) return null;
+  const payload = {
+    qid: decision.qid,
+    questionGeneration: decision.questionGeneration,
+    target: decision.target,
+    canonicalSource: decision.canonicalSource,
+    canonicalReference: decision.canonicalReference,
+    answer: decision.answer,
+    questionMessageId: decision.questionMessageId,
+    interactionId: decision.interactionId,
+    selectedKey: decision.selectedKey
+  };
+  return [
+    'Saved canonical decision continuation.',
+    'Apply the saved answer only to the exact canonical question identified in the JSON below.',
+    'Question generation and canonical reference are exact identity fields.',
+    'The selected key records the carrier click. The canonical answer is authoritative.',
+    `Decision JSON: ${JSON.stringify(payload)}`
+  ].join('\n');
+}
+
 export function messageRequest(message: NativeMessage): string {
+  const decision = decisionRequest(message);
+  if (decision) return decision;
   const agent = message.agentMessage;
   if (!agent) return message.content;
   return [
@@ -328,11 +355,22 @@ export function messageRequest(message: NativeMessage): string {
 
 export function codexPrompt(message: NativeMessage, acknowledgment: readonly string[] | null = null): string {
   const marker = `[[discord-surface:${message.id}]]`;
+  const isDecision = Boolean(message.decisionResult);
+  let handlingInstruction: string;
+  if (isDecision) {
+    handlingInstruction = 'Handle the saved canonical decision continuation using its exact identity and canonical answer. Preserve this session. Do not start another session or hand this work to another agent.';
+  } else if (message.agentMessage) {
+    handlingInstruction = 'Handle the agent context in your normal final response. Preserve this session.';
+  } else {
+    handlingInstruction = 'Answer the user request in your normal final response. Do not start another session or hand this work to another agent.';
+  }
   const prompt = [
-    `This is an inbound Discord message for native session ${message.nativeId}.`,
+    isDecision
+      ? `This is a saved canonical decision continuation for native session ${message.nativeId}.`
+      : `This is an inbound Discord message for native session ${message.nativeId}.`,
     `Transport message ID: ${message.id}. Ownership generation: ${message.generation}.`,
     `Begin the final response with the exact marker ${marker} on its own line. The transport removes that marker before sending the reply.`,
-    message.agentMessage ? 'Handle the agent context in your normal final response. Preserve this session.' : 'Answer the user request in your normal final response. Do not start another session or hand this work to another agent.',
+    handlingInstruction,
     '',
     messageRequest(message)
   ];
@@ -349,10 +387,15 @@ export function claudeEvent(message: NativeMessage): {
   content: string;
   attachments?: readonly Attachment[] | null;
 } {
+  const isDecision = Boolean(message.decisionResult);
   const content = [
-    `Inbound Discord message ${message.id} for native Claude session ${message.nativeId}.`,
-    `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`,
-    'Do not start or resume another session.',
+    isDecision
+      ? `Saved canonical decision continuation ${message.id} for native Claude session ${message.nativeId}.`
+      : `Inbound Discord message ${message.id} for native Claude session ${message.nativeId}.`,
+    isDecision
+      ? `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after handling the saved decision continuation.`
+      : `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`,
+    isDecision ? 'Preserve the exact canonical identity and answer from the decision JSON. Preserve this session. Do not start or resume another session.' : 'Do not start or resume another session.',
     '',
     messageRequest(message)
   ];

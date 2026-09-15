@@ -24,6 +24,17 @@ const {
   recoverInterruptedOrdinaryHandoffIntake
 } = require('./state/intake');
 const { createInteractionHandlers, INTERACTION_ORIGIN, INTERACTION_TRANSPORT } = require('./state/interaction');
+const {
+  createDecisionHandlers,
+  DecisionError,
+  DECISION_JOURNAL,
+  DECISION_REASONS,
+  DECISION_STATES,
+  DECISION_RECEIPT_KINDS,
+  DECISION_TRANSPORT_OUTCOMES,
+  DECISION_WINNER_SOURCES,
+  DECISION_NATIVE_OUTCOMES
+} = require('./state/decision');
 
 const SCHEMA_VERSION = '1.7';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -125,6 +136,7 @@ const intakeHandlers = createIntakeHandlers({
 });
 
 const interactionHandlers = createInteractionHandlers();
+const decisionHandlers = createDecisionHandlers();
 
 const threadEnrollmentHandlers = createThreadEnrollmentHandlers({
   BindingError,
@@ -450,6 +462,10 @@ class SurfaceState {
     }
     this.dbPath = dbPath;
     this.failNextIntakeFlag = Boolean(options.failNextIntake);
+    this.interactionVocabulary = Object.freeze({
+      acceptedMessageState: MESSAGE_STATES.ACCEPTED,
+      readyReadiness: READINESS.READY
+    });
     this.ordinary = createOrdinaryRepository({ state: this, assertOrdinaryIdentity, assertOrdinaryNativeIdentity });
     this.ordinaryHandoffPauses = new Set();
     this.ordinaryHandoffPauseSnapshots = new Map();
@@ -1551,7 +1567,8 @@ class SurfaceState {
     const states = [...ACTIVE_STATES];
     const row = this.db.prepare(`SELECT 1 FROM messages WHERE channel_id=? AND state IN (${states.map(() => '?').join(',')}) LIMIT 1`)
       .get(channelId, ...states);
-    return Boolean(row);
+    if (row) return true;
+    return this.listDecisionPendingWork().some(click => click.channelId === channelId && !this.getMessage(click.interactionId)?.decisionResult);
   }
 
   hasDispatching(channelId) {
@@ -1953,6 +1970,11 @@ class SurfaceState {
     return interactionHandlers.acceptInteraction(this, input, expectedBinding, options);
   }
 
+  acceptDecisionInteraction(input, { inTransaction = false } = {}) {
+    const operation = () => interactionHandlers.acceptDecisionInteraction(this, input);
+    return inTransaction ? operation() : this.transaction(operation);
+  }
+
   isInteractionMessage(messageId) {
     assertText(messageId, 'messageId', 128);
     return interactionHandlers.isInteractionMessage(this, messageId);
@@ -1972,6 +1994,66 @@ class SurfaceState {
 
   recoverInteractionCallbacksInTransaction(ownerAlive = null) {
     return interactionHandlers.recoverCallbacksInTransaction(this, ownerAlive || undefined);
+  }
+
+  registerDecisionPresentation(input) {
+    return decisionHandlers.registerPresentation(this, input);
+  }
+
+  findDecisionPresentation(input) {
+    return decisionHandlers.findPresentation(this, input);
+  }
+
+  recordDecisionPresentationOutcome(presentationId, outcome, messageId = null) {
+    return decisionHandlers.recordPresentationOutcome(this, presentationId, outcome, messageId);
+  }
+
+  markDecisionPresentationStale(presentationId, reason) {
+    return decisionHandlers.markPresentationStale(this, presentationId, reason);
+  }
+
+  getDecisionPresentation(presentationId) {
+    return decisionHandlers.getPresentation(this, presentationId);
+  }
+
+  admitDecisionClick(input) {
+    return decisionHandlers.admitClick(this, input);
+  }
+
+  admitDecisionClickAndBeginCallback(input) {
+    return decisionHandlers.admitClickAndBeginCallback(this, input);
+  }
+
+  getDecisionClick(interactionId) {
+    return decisionHandlers.getClick(this, interactionId);
+  }
+
+  beginDecisionCallback(interactionId) {
+    return decisionHandlers.beginCallback(this, interactionId);
+  }
+
+  recordDecisionCallbackOutcome(interactionId, outcome) {
+    return decisionHandlers.recordCallbackOutcome(this, interactionId, outcome);
+  }
+
+  importDecisionWinner(interactionId, result) {
+    return decisionHandlers.importWinner(this, interactionId, result);
+  }
+
+  recordDecisionProjectionOutcome(interactionId, outcome) {
+    return decisionHandlers.recordProjectionOutcome(this, interactionId, outcome);
+  }
+
+  queueDecisionNativeReturn(interactionId) {
+    return decisionHandlers.queueNativeReturn(this, interactionId);
+  }
+
+  recordDecisionNativeReturnOutcome(interactionId, outcome) {
+    return decisionHandlers.recordNativeReturnOutcome(this, interactionId, outcome);
+  }
+
+  listDecisionPendingWork() {
+    return decisionHandlers.pendingWork(this);
   }
 
   getTransportReceipt(messageId, transport = null) {
@@ -2676,6 +2758,8 @@ class SurfaceState {
       message.replyParts = this.listReplyParts(messageId);
       const agent = message.content.startsWith(AGENT_PREFIX) ? this.getAgentMessage(messageId) : null;
       if (agent) message.agentMessage = agent.packet;
+      const decisionResult = interactionHandlers.decisionResult(this, message);
+      if (decisionResult) message.decisionResult = decisionResult;
     }
     return message;
   }
@@ -2772,6 +2856,14 @@ module.exports = {
   ACTIVE_STATES,
   AuthorizationError,
   BindingError,
+  DecisionError,
+  DECISION_JOURNAL,
+  DECISION_REASONS,
+  DECISION_STATES,
+  DECISION_RECEIPT_KINDS,
+  DECISION_TRANSPORT_OUTCOMES,
+  DECISION_WINNER_SOURCES,
+  DECISION_NATIVE_OUTCOMES,
   MESSAGE_STATES,
   PROVIDERS,
   READINESS,
