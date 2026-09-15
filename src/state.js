@@ -2428,6 +2428,33 @@ class SurfaceState {
     });
   }
 
+  markReplyPartSkipped(messageId, partIndex) {
+    return this.transaction(() => {
+      const message = this.getMessage(messageId);
+      if (!message) throw new BindingError('message is unknown');
+      if (message.state === MESSAGE_STATES.REPLIED) return message;
+      if (message.state !== MESSAGE_STATES.REPLYING) throw new BindingError(`reply is not in flight in state ${message.state}`);
+      const part = this.db.prepare('SELECT * FROM reply_parts WHERE discord_id=? AND part_index=?').get(messageId, partIndex);
+      if (!part) throw new BindingError('reply part is unknown');
+      if (part.state === 'sent') return message;
+      this.db.prepare("UPDATE reply_parts SET state='sent', message_id=NULL, error=NULL, updated_at=? WHERE discord_id=? AND part_index=?")
+        .run(now(), messageId, partIndex);
+      const remaining = this.db.prepare("SELECT COUNT(*) AS count FROM reply_parts WHERE discord_id=? AND state<>'sent'").get(messageId).count;
+      if (Number(remaining) === 0) {
+        const lastPosted = this.db.prepare("SELECT message_id FROM reply_parts WHERE discord_id=? AND state='sent' AND message_id IS NOT NULL ORDER BY part_index DESC LIMIT 1").get(messageId);
+        const replyMessageId = lastPosted?.message_id || null;
+        this.db.prepare('UPDATE messages SET state=?, reply_message_id=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+          .run(MESSAGE_STATES.REPLIED, replyMessageId, now(), messageId, MESSAGE_STATES.REPLYING);
+        if (replyMessageId) this.receipt(messageId, 'reply-sent', { replyMessageId, skipped: true });
+        else this.receipt(messageId, REPLY_COMPLETED_WITHOUT_POST, { generation: message.generation });
+      } else {
+        this.db.prepare('UPDATE messages SET reply_next_part=?, updated_at=? WHERE discord_id=?').run(Number(partIndex) + 1, now(), messageId);
+        this.receipt(messageId, 'reply-part-skipped', { partIndex });
+      }
+      return this.getMessage(messageId);
+    });
+  }
+
   markReplySent(messageId, replyMessageId) {
     const parts = this.listReplyParts(messageId);
     if (parts.length > 1) throw new BindingError('multi-part replies must acknowledge each part separately');

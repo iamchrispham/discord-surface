@@ -468,9 +468,7 @@ type FinalAnswer = { text: string; parts: string[] };
 function sanitizeCreatedThreadDirective(text: string): FinalAnswer {
   const sanitized = stripCreatedThreadDirectivePart(text, null, true).text.trim();
   if (!sanitized) return { text: '', parts: [] };
-  let parts = splitReply(sanitized);
-  if (parts.some(part => !part.trim())) parts = parts.filter(part => part.trim());
-  return { text: parts.join(''), parts };
+  return { text: sanitized, parts: splitReply(sanitized) };
 }
 
 function parseFinalAnswer(row: TranscriptRow, marker: string): FinalAnswer | null {

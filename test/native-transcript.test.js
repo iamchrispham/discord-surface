@@ -431,6 +431,17 @@ test('Discord directive sanitization repartitions whitespace-only sanitized part
   assert.ok(result.parts.every(part => part.trim()));
 });
 
+test('Discord directive sanitization preserves whitespace-only reply parts', async t => {
+  const { file } = fixture(t);
+  const cursor = cursorAt(file);
+  const reply = `a${' '.repeat(4000)}b`;
+  fs.appendFileSync(file, finalRow(reply));
+  const result = await observe(file, cursor);
+  assert.equal(result.text, reply);
+  assert.equal(result.parts.join(''), result.text);
+  assert.equal(result.parts.filter(part => !part.trim()).length, 1);
+});
+
 test('Discord directive sanitization rejects backticks in backtick fence info strings', async t => {
   const { file } = fixture(t);
   const cursor = cursorAt(file);
@@ -496,6 +507,61 @@ test('directive-only final completes custody without an empty Discord send', asy
   assert.throws(() => state.recordNativeReply({
     provider: 'codex', messageId, nativeId: ID, generation: 1, text: ''
   }), /reply text must be a non-empty string/);
+});
+
+test('whitespace-only reply parts complete custody without a Discord send', async t => {
+  const { file, sessionRoot, state } = surfaceFixture(t);
+  const messageId = 'whitespace-boundary';
+  const marker = `[[discord-surface:${messageId}]]`;
+  const cursor = cursorAt(file);
+  const reply = `a${' '.repeat(4000)}b`;
+  fs.appendFileSync(file, finalRow(reply, { marker }));
+  const accepted = state.acceptDiscordMessage({
+    id: messageId,
+    guildId: 'guild-1',
+    channelId: 'channel-codex',
+    authorId: 'operator-1',
+    isBot: false,
+    content: 'preserve reply whitespace',
+    attachments: []
+  });
+  assert.equal(accepted.accepted, true);
+  let dispatches = 0;
+  const sentParts = [];
+  const provider = {
+    async dispatch(message) {
+      dispatches += 1;
+      assert.equal(message.nativeId, ID);
+      return { status: 'submitted', cursor };
+    },
+    observe(message, outcome, options) {
+      return observeCodexReply(message.nativeId, outcome.cursor, {
+        ...options,
+        marker,
+        root: sessionRoot,
+        pollMs: 1,
+        timeoutMs: 100
+      });
+    }
+  };
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: provider },
+    sendReply: async (_message, part) => {
+      sentParts.push(part.replyText);
+      return { id: `reply-${sentParts.length}` };
+    }
+  });
+  const result = await consumer.processAccepted(accepted.message, undefined, { continueUntilFinal: false });
+  assert.equal(dispatches, 1);
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(result.message.replyText, reply);
+  assert.equal(result.message.replyParts.map(part => part.content).join(''), reply);
+  assert.equal(result.message.replyParts.filter(part => !part.content.trim()).length, 1);
+  assert.ok(result.message.replyParts.every(part => part.state === 'sent'));
+  assert.equal(sentParts.length, 2);
+  assert.ok(sentParts.every(part => part.trim()));
+  assert.equal(state.listReplyParts(messageId).filter(part => !part.content.trim())[0].messageId, null);
 });
 
 test('header and tail descriptors close on read/stat failures', async t => {
