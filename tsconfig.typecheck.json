@@ -35,6 +35,7 @@
     "src/decision-present.ts",
     "src/state/decision.ts",
     "src/state/courier-route/index.ts",
+    "test/courier-route-types.ts",
     "test/topic-types.ts",
     "test/types/attachments.ts",
     "test/types/agent-presentation.ts",

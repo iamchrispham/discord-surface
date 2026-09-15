@@ -425,9 +425,7 @@ test('recovered definite non-submission retains custody without resend', async t
   const courierCalls = [];
   const parentCalls = [];
   const replies = [];
-  const dispatchCourier = async () => {
-    return { status: COURIER_OUTCOMES.NOT_SUBMITTED, error: new Error('courier unavailable') };
-  };
+  const dispatchCourier = async () => ({ status: COURIER_OUTCOMES.NOT_SUBMITTED, error: new Error('courier unavailable') });
 
   const consumer = consumerFor(f, { courierCalls, parentCalls, replies, dispatchCourier });
   const first = await consumer.processAccepted(f.message);
@@ -448,6 +446,60 @@ test('recovered definite non-submission retains custody without resend', async t
   assert.equal(reopened.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
   assert.equal(parentCalls.length, 0);
   assert.equal(replies.length, 0);
+});
+
+test('restart preserves a durable submitted courier outcome for observation', t => {
+  const f = fixture(t);
+  assert.equal(f.state.claimDispatch(f.message.id).claimed, true);
+  const claimed = f.state.beginCourierAttempt(f.message.id, preparedInput(f, f.message));
+  assert.equal(claimed.accepted, true);
+  f.state.recordCourierOutcome(f.message.id, claimed.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+
+  f.state.close();
+  const reopened = new SurfaceState(f.dbPath);
+  f.replaceState(reopened);
+  const recovery = reopened.recoverAfterRestart();
+
+  assert.equal(recovery.courierAttempts, 0);
+  assert.equal(reopened.getMessage(f.message.id).state, MESSAGE_STATES.SUBMITTED);
+  assert.deepEqual(reopened.recoveryCandidates().map(message => message.id), [f.message.id]);
+  assert.equal(reopened.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
+});
+
+test('restart restores a durable not-submitted courier outcome to retryable custody', t => {
+  const f = fixture(t);
+  assert.equal(f.state.claimDispatch(f.message.id).claimed, true);
+  const claimed = f.state.beginCourierAttempt(f.message.id, preparedInput(f, f.message));
+  assert.equal(claimed.accepted, true);
+  f.state.recordCourierOutcome(f.message.id, claimed.attempt.attemptId, COURIER_OUTCOMES.NOT_SUBMITTED);
+
+  f.state.close();
+  const reopened = new SurfaceState(f.dbPath);
+  f.replaceState(reopened);
+  reopened.recoverAfterRestart();
+
+  assert.equal(reopened.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(reopened.recoveryCandidates().map(message => message.id), [f.message.id]);
+  assert.equal(reopened.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
+});
+
+test('courier outcome detail cannot override authoritative receipt fields', t => {
+  const f = fixture(t);
+  const claimed = f.state.beginCourierAttempt(f.message.id, preparedInput(f, f.message));
+  const attemptId = claimed.attempt.attemptId;
+  const result = f.state.recordCourierOutcome(f.message.id, attemptId, COURIER_OUTCOMES.SUBMITTED, {
+    attemptId: 'spoofed-attempt',
+    outcome: COURIER_OUTCOMES.NOT_SUBMITTED,
+    note: 'caller metadata'
+  });
+
+  assert.equal(result.outcome.attemptId, attemptId);
+  assert.equal(result.outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
+  const receipt = f.state.listReceipts().find(row => row.kind === 'courier-outcome');
+  const receiptDetail = JSON.parse(receipt.detail);
+  assert.equal(receiptDetail.attemptId, attemptId);
+  assert.equal(receiptDetail.outcome, COURIER_OUTCOMES.SUBMITTED);
+  assert.equal(receiptDetail.note, 'caller metadata');
 });
 
 test('courier route registration rejects a Claude parent', t => {
@@ -488,6 +540,46 @@ test('courier route registration rejects a Claude parent', t => {
   }), /courier route parent must use codex provider/);
   state.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('courier route registration rejects a Claude courier', t => {
+  const f = fixture(t);
+  assert.throws(() => f.state.registerCourierRoute({
+    ...f.route,
+    routeId: 'claude-courier-route',
+    courier: { ...f.route.courier, provider: 'claude' }
+  }), /courier provider must use codex provider/);
+});
+
+test('human messages reject a stale courier target', t => {
+  const f = fixture(t, { includeInitialAgent: false });
+  const message = humanMessage(f, 'human-stale-target');
+  f.state.receipt(null, 'courier-route', {
+    ...f.route,
+    target: { ...f.route.target, nativeId: '55555555-5555-5555-5555-555555555555' },
+    recordedAt: new Date().toISOString()
+  });
+
+  const rejected = f.state.beginCourierAttempt(message.id, preparedInput(f, message));
+  assert.equal(rejected.accepted, false);
+  assert.equal(rejected.status, 'stale');
+  assert.equal(f.state.getCourierAttempt(message.id), null);
+});
+
+test('persisted Claude courier routes stay out of selected dispatch', async t => {
+  const f = fixture(t);
+  f.state.receipt(null, 'courier-route', {
+    ...f.route,
+    courier: { ...f.route.courier, provider: 'claude' },
+    recordedAt: new Date().toISOString()
+  });
+  const courierCalls = [];
+  const parentCalls = [];
+  const result = await consumerFor(f, { courierCalls, parentCalls }).processAccepted(f.message);
+
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(courierCalls.length, 0);
+  assert.deepEqual(parentCalls, [f.message.id]);
 });
 
 test('Codex courier queue uses a fixed forwarding call and exact parent payload', async t => {

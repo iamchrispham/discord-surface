@@ -2562,10 +2562,24 @@ class SurfaceState {
       const dispatching = this.db.prepare('SELECT discord_id FROM messages WHERE state=?').all(MESSAGE_STATES.DISPATCHING);
       for (const row of dispatching) {
         const message = this.getMessage(row.discord_id);
+        const courierOutcome = this.getCourierAttempt(row.discord_id)?.outcome?.outcome;
         if (this.hasNativeAcknowledgment(message)) {
           this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
             .run(MESSAGE_STATES.SUBMITTED, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
           this.receipt(row.discord_id, 'dispatch-already-acknowledged', { generation: message.generation, afterRestart: true });
+          continue;
+        }
+        if (courierOutcome === COURIER_OUTCOMES.SUBMITTED) {
+          const marker = `[[discord-surface:${row.discord_id}]]`;
+          this.db.prepare('UPDATE messages SET state=?, observer_marker=COALESCE(observer_marker, ?), error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.SUBMITTED, marker, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
+          this.receipt(row.discord_id, 'submitted', { marker, afterRestart: true });
+          continue;
+        }
+        if (courierOutcome === COURIER_OUTCOMES.NOT_SUBMITTED) {
+          this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.ACCEPTED, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
+          this.receipt(row.discord_id, 'dispatch-not-submitted-after-restart', { afterRestart: true });
           continue;
         }
         this.db.prepare('UPDATE messages SET state=?, error=?, updated_at=? WHERE discord_id=?')

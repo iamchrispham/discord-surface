@@ -188,9 +188,9 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
       if (!record) throw new deps.BindingError('courier attempt is unknown');
       if (record.outcome) return { ...record, duplicate: true };
       state.receipt(messageId, COURIER_RECEIPT_KINDS.OUTCOME, {
+        ...detail,
         attemptId: id,
         outcome,
-        ...detail,
         recordedAt: deps.now()
       });
       return { ...latestAttempt(deps, state, messageId, id), duplicate: false };

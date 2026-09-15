@@ -20,6 +20,7 @@ function routeInput(deps: CourierDependencies, input: unknown): CourierRoute {
   const rawCourier = value.courier;
   if (!rawCourier || typeof rawCourier !== 'object' || Array.isArray(rawCourier)) throw new deps.BindingError('courier identity is required');
   const provider = deps.assertProvider(rawCourier.provider);
+  if (provider !== 'codex') throw new deps.BindingError('courier provider must use codex provider');
   const nativeId = deps.assertUuid(rawCourier.nativeId, 'courier.nativeId');
   const workspace = deps.assertText(rawCourier.workspace, 'courier.workspace', 4096);
   if (!path.isAbsolute(workspace)) throw new deps.BindingError('courier.workspace must be absolute');
@@ -170,7 +171,7 @@ export function findMatchingRoute(deps: CourierDependencies, state: CourierState
     if ((routeId && route.routeId !== routeId) || route.guildId !== message.guildId || route.parentChannelId !== message.channelId) return false;
     return (human && message.deliveryChannelId === message.channelId) || route.deliveryChannelId === message.deliveryChannelId;
   });
-  const routes = allRoutes.filter(route => route.status === COURIER_ROUTE_STATES.ACTIVE &&
+  const routes = allRoutes.filter(route => route.status === COURIER_ROUTE_STATES.ACTIVE && route.courier.provider === 'codex' &&
     (human || sameAddress(route.target, message.agentMessage?.target)));
   if (routes.length !== 1) {
     if (routes.length === 0 && allRoutes.length === 1) {
@@ -186,10 +187,9 @@ export function findMatchingRoute(deps: CourierDependencies, state: CourierState
   if (!check?.identity || !check.current) return { status: COURIER_RESULT_STATUSES.STALE, route, check };
   if (!check.ready) return { status: COURIER_RESULT_STATUSES.HELD, route, check };
   if (!childRouteReady(deps, state, route)) return { status: COURIER_RESULT_STATUSES.HELD, route, check };
-  if (human) return { status: null, route, check };
   const expectedTarget = {
     guildId: check.binding.guildId,
-    channelId: message.deliveryChannelId,
+    channelId: route.deliveryChannelId,
     provider: check.binding.provider,
     nativeId: check.binding.nativeId,
     generation: check.binding.generation

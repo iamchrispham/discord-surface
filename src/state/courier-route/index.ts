@@ -29,5 +29,9 @@ export {
   COURIER_SOURCE_KINDS,
   ENVELOPE_TYPE,
   PROMPT_PREFIX,
+  createEnvelope,
   isCourierOriginAllowed
 };
+
+export * from './types';
+export type { RouteMatch } from './route';
