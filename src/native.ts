@@ -417,6 +417,42 @@ export function claudeEvent(message: NativeMessage): {
   return event;
 }
 
+const CREATED_THREAD_DIRECTIVE = /^::created-thread\{(?:threadId|clientThreadId)="[^"\r\n]+"\}$/;
+
+type CodeFence = { marker: '`' | '~'; length: number };
+
+function readFenceStart(line: string): CodeFence | null {
+  const match = /^\s*([`~]{3,})[^\r\n]*$/.exec(line);
+  if (!match) return null;
+  const run = match[1];
+  const marker = run[0] as CodeFence['marker'];
+  if (!run.split('').every(char => char === marker)) return null;
+  return { marker, length: run.length };
+}
+
+function isFenceClose(line: string, fence: CodeFence): boolean {
+  const match = /^\s*([`~]{3,})[ \t]*$/.exec(line);
+  if (!match) return false;
+  const run = match[1];
+  return run[0] === fence.marker && run.length >= fence.length && run.split('').every(char => char === fence.marker);
+}
+
+function stripCreatedThreadDirective(text: string): string {
+  let fence: CodeFence | null = null;
+  const lines: string[] = [];
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (fence) {
+      if (isFenceClose(line, fence)) fence = null;
+    } else {
+      if (CREATED_THREAD_DIRECTIVE.test(line)) continue;
+      fence = readFenceStart(line);
+    }
+    lines.push(rawLine);
+  }
+  return lines.join('\n').trim();
+}
+
 
 export function finalText(row: TranscriptRow, marker: string): string | null {
   const payload = row.payload;
@@ -439,7 +475,7 @@ export function finalText(row: TranscriptRow, marker: string): string | null {
   if (!text || text.split(/\r?\n/, 1)[0].trim() !== marker) return null;
   const newline = text.indexOf('\n');
   if (newline < 0) return null;
-  const reply = text.slice(newline + 1).trim();
+  const reply = stripCreatedThreadDirective(text.slice(newline + 1));
   return reply || null;
 }
 

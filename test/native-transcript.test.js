@@ -338,6 +338,47 @@ test('marker, phase and timestamp filtering remain exact', async t => {
   assert.equal((await observe(file, cursor)).text, 'right answer');
 });
 
+test('Discord text removes only a top-level created-thread directive', async t => {
+  const { file } = fixture(t);
+  const cursor = cursorAt(file);
+  const reply = [
+    'Keep this prose.',
+    '::created-thread{threadId="01a0a411-9b29-7c41-b6a4-227fe89ada0c"}',
+    '::created-thread{clientThreadId="client-queued-1"}',
+    '```text',
+    '::created-thread{threadId="inside-code"}',
+    '```',
+    '~~~text',
+    '::created-thread{threadId="inside-tilde-code"}',
+    '~~~',
+    '````text',
+    '::created-thread{threadId="inside-long-code"}',
+    '```',
+    '::created-thread{clientThreadId="inside-after-short-close"}',
+    '````',
+    '> ::created-thread{threadId="quoted"}',
+    '`::created-thread{threadId="inline"}`'
+  ].join('\n');
+  fs.appendFileSync(file, finalRow(reply));
+  const result = await observe(file, cursor);
+  assert.equal(result.text, [
+    'Keep this prose.',
+    '```text',
+    '::created-thread{threadId="inside-code"}',
+    '```',
+    '~~~text',
+    '::created-thread{threadId="inside-tilde-code"}',
+    '~~~',
+    '````text',
+    '::created-thread{threadId="inside-long-code"}',
+    '```',
+    '::created-thread{clientThreadId="inside-after-short-close"}',
+    '````',
+    '> ::created-thread{threadId="quoted"}',
+    '`::created-thread{threadId="inline"}`'
+  ].join('\n'));
+});
+
 test('header and tail descriptors close on read/stat failures', async t => {
   for (const [name, options, initial] of [
     ['header read', { failRead: 1 }, false],
