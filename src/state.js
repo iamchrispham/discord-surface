@@ -36,6 +36,15 @@ const {
   DECISION_WINNER_SOURCES,
   DECISION_NATIVE_OUTCOMES
 } = require('./state/decision');
+const {
+  createCourierRouteHandlers,
+  COURIER_ATTEMPT_STATES,
+  COURIER_OUTCOMES,
+  COURIER_RECEIPT_KINDS,
+  COURIER_RESULT_STATUSES,
+  COURIER_ROUTE_STATES,
+  COURIER_SOURCE_KINDS
+} = require('./state/courier-route');
 
 const SCHEMA_VERSION = '1.7';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -168,6 +177,19 @@ const threadEnrollmentHandlers = createThreadEnrollmentHandlers({
   assertText,
   bindingMatchesExpected,
   compareDiscordIds,
+  now
+});
+
+const courierRouteHandlers = createCourierRouteHandlers({
+  BindingError,
+  MESSAGE_STATES,
+  PROVIDERS,
+  READINESS,
+  THREAD_STATES,
+  assertText,
+  assertUuid,
+  assertProvider,
+  parseJson,
   now
 });
 
@@ -1456,6 +1478,38 @@ class SurfaceState {
     return threadEnrollmentHandlers.checkpointThread(this, threadId, coverageId, expectedBinding);
   }
 
+  registerCourierRoute(...args) {
+    return courierRouteHandlers.registerCourierRoute(this, ...args);
+  }
+
+  revokeCourierRoute(...args) {
+    return courierRouteHandlers.revokeCourierRoute(this, ...args);
+  }
+
+  listCourierRoutes(...args) {
+    return courierRouteHandlers.listCourierRoutes(this, ...args);
+  }
+
+  getCourierRoute(...args) {
+    return courierRouteHandlers.getCourierRoute(this, ...args);
+  }
+
+  getCourierAttempt(...args) {
+    return courierRouteHandlers.getCourierAttempt(this, ...args);
+  }
+
+  beginCourierAttempt(...args) {
+    return courierRouteHandlers.beginCourierAttempt(this, ...args);
+  }
+
+  authorizeCourierAttempt(...args) {
+    return courierRouteHandlers.authorizeCourierAttempt(this, ...args);
+  }
+
+  recordCourierOutcome(...args) {
+    return courierRouteHandlers.recordCourierOutcome(this, ...args);
+  }
+
   findNativeBinding(nativeId, provider = null) {
     assertUuid(nativeId);
     if (provider) assertProvider(provider);
@@ -2566,13 +2620,28 @@ class SurfaceState {
       }
       const interactionCallbacks = this.recoverInteractionCallbacksInTransaction(ownerAlive);
       decisionHandlers.recoverCallbackAttemptsAfterRestart(this);
+      const courierAttempts = courierRouteHandlers.recoverCourierAttemptsAfterRestart(this, { inTransaction: true });
       const dispatching = this.db.prepare('SELECT discord_id FROM messages WHERE state=?').all(MESSAGE_STATES.DISPATCHING);
       for (const row of dispatching) {
         const message = this.getMessage(row.discord_id);
+        const courierOutcome = this.getCourierAttempt(row.discord_id)?.outcome?.outcome;
         if (this.hasNativeAcknowledgment(message)) {
           this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
             .run(MESSAGE_STATES.SUBMITTED, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
           this.receipt(row.discord_id, 'dispatch-already-acknowledged', { generation: message.generation, afterRestart: true });
+          continue;
+        }
+        if (courierOutcome === COURIER_OUTCOMES.SUBMITTED) {
+          const marker = `[[discord-surface:${row.discord_id}]]`;
+          this.db.prepare('UPDATE messages SET state=?, observer_marker=COALESCE(observer_marker, ?), error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.SUBMITTED, marker, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
+          this.receipt(row.discord_id, 'submitted', { marker, afterRestart: true });
+          continue;
+        }
+        if (courierOutcome === COURIER_OUTCOMES.NOT_SUBMITTED) {
+          this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.ACCEPTED, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
+          this.receipt(row.discord_id, 'dispatch-not-submitted-after-restart', { afterRestart: true });
           continue;
         }
         this.db.prepare('UPDATE messages SET state=?, error=?, updated_at=? WHERE discord_id=?')
@@ -2587,7 +2656,7 @@ class SurfaceState {
         this.receipt(row.discord_id, 'reply-unknown-after-restart', {});
       }
       const candidates = this.recoveryCandidates();
-      return { dispatching: dispatching.length, replying: replying.length, interactionCallbacks, candidates: candidates.map(row => row.id) };
+      return { dispatching: dispatching.length, replying: replying.length, interactionCallbacks, courierAttempts, candidates: candidates.map(row => row.id) };
     });
   }
 
@@ -2967,6 +3036,12 @@ module.exports = {
   DIRECT_POST_OUTCOMES,
   BOARD_OUTCOMES,
   BOARD_RECEIPT_KINDS,
+  COURIER_ATTEMPT_STATES,
+  COURIER_OUTCOMES,
+  COURIER_RECEIPT_KINDS,
+  COURIER_RESULT_STATUSES,
+  COURIER_ROUTE_STATES,
+  COURIER_SOURCE_KINDS,
   DISPATCH_OUTCOMES,
   TOPIC_PUBLICATION_STATES,
   THREAD_STATES,

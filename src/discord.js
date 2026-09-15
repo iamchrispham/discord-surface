@@ -10,8 +10,9 @@ const {
 } = require('./agent-attachment');
 const fs = require('node:fs');
 const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
-const { CODEX_VALIDATION_KINDS, dispatchAndObserve, agentCompletionCommand, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
+const { CODEX_VALIDATION_KINDS, codexPrompt, dispatchAndObserve, agentCompletionCommand, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, readInitialCursor, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, TRANSPORT_RECEIPT_OUTCOMES, UnresolvedWorkError } = require('./state');
+const { COURIER_OUTCOMES, COURIER_RESULT_STATUSES, isCourierOriginAllowed } = require('./state/courier-route');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
@@ -337,9 +338,9 @@ function transportReceiptText(message, attempt) {
   return 'Receipt: saved. Delivery was paused when this receipt was prepared.';
 }
 
-function createSurfaceConsumer({ state, providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {},
+function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {},
   agentCredential = () => null, agentAttachmentFetch = globalThis.fetch,
-  agentAttachmentTimeoutMs = RECOVERY_LIMITS.timeoutMs, agentBotId = () => null, readyForLiveIntake = null }) {
+  agentAttachmentTimeoutMs = RECOVERY_LIMITS.timeoutMs, agentBotId = () => null, readyForLiveIntake = null, courierRoute = null }) {
   const receiptWork = new Set();
   const nativeWork = new Map();
   const ownerQueues = new Map();
@@ -858,9 +859,109 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     return { ...result, message: state.getMessage(ready.message.id) };
   }
 
+  function courierDispatchStatus(result) {
+    if (result?.status === COURIER_OUTCOMES.SUBMITTED) return COURIER_OUTCOMES.SUBMITTED;
+    if (result?.status === COURIER_OUTCOMES.NOT_SUBMITTED) return COURIER_OUTCOMES.NOT_SUBMITTED;
+    return COURIER_OUTCOMES.UNCERTAIN;
+  }
+
+  function selectedCourierRoute(message) {
+    if (!courierRoute || typeof courierRoute !== 'object' || typeof courierRoute.routeId !== 'string') return false;
+    if (!isCourierOriginAllowed(state, message)) return false;
+    const selected = state.getCourierRoute(courierRoute.routeId) || courierRoute;
+    if (!selected || selected.parentChannelId !== message.channelId || selected.guildId !== message.guildId) return false;
+    if (message.provider !== 'codex') return false;
+    if (message.agentMessage) return selected.deliveryChannelId === message.deliveryChannelId;
+    const config = state.requireConfig();
+    return message.authorId === config.operatorId && (
+      message.channelId === message.deliveryChannelId || selected.deliveryChannelId === message.deliveryChannelId
+    );
+  }
+
+  function courierDispatchError(status) {
+    return new Error(`courier dispatch ${status}`);
+  }
+
+  async function dispatchAtCourierBoundary(message, _parentProvider, dispatchOptions, selected) {
+    const binding = state.currentMessageBinding(message)?.binding;
+    const observerCursor = readInitialCursor(message.nativeId, binding?.sessionRoot || undefined);
+    const completion = message.agentMessage ? agentCompletionCommand(message, state.dbPath, undefined, stateDir) : null;
+    const prompt = codexPrompt(message, acknowledgmentCommand(message, state.dbPath), completion);
+    const input = { routeId: selected.routeId, prompt, observerCursor };
+    const claimed = state.beginCourierAttempt(message.id, input);
+    if (!claimed.accepted) {
+      const previousOutcome = claimed.outcome?.outcome;
+      if (previousOutcome) {
+        const current = state.authorizeCourierAttempt(message.id, claimed.attempt.attemptId, input);
+        if (!current.authorized && current.status !== COURIER_RESULT_STATUSES.DUPLICATE) {
+          const status = previousOutcome === COURIER_OUTCOMES.UNCERTAIN
+            ? COURIER_OUTCOMES.UNCERTAIN
+            : COURIER_OUTCOMES.NOT_SUBMITTED;
+          return { status, error: courierDispatchError(current.status) };
+        }
+        return {
+          status: previousOutcome,
+          cursor: claimed.attempt?.observerCursor || observerCursor,
+          ...(previousOutcome === COURIER_OUTCOMES.UNCERTAIN ? { error: courierDispatchError(previousOutcome) } : {})
+        };
+      }
+      return { status: COURIER_OUTCOMES.NOT_SUBMITTED, error: courierDispatchError(claimed.status) };
+    }
+    dispatchOptions.onCursor?.(observerCursor);
+    if (dispatchOptions.signal?.aborted) {
+      state.recordCourierOutcome(message.id, claimed.attempt.attemptId, COURIER_OUTCOMES.NOT_SUBMITTED, {
+        reason: 'courier dispatch stopped before queue submission'
+      });
+      return { status: COURIER_OUTCOMES.NOT_SUBMITTED, error: courierDispatchError(COURIER_OUTCOMES.NOT_SUBMITTED) };
+    }
+    const authorized = state.authorizeCourierAttempt(message.id, claimed.attempt.attemptId, input);
+    if (!authorized.authorized) {
+      const priorOutcome = authorized.outcome?.outcome;
+      if (Object.values(COURIER_OUTCOMES).includes(priorOutcome)) {
+        return {
+          status: priorOutcome,
+          cursor: authorized.attempt?.observerCursor || observerCursor,
+          ...(priorOutcome === COURIER_OUTCOMES.UNCERTAIN ? { error: courierDispatchError(priorOutcome) } : {})
+        };
+      }
+      const status = [COURIER_RESULT_STATUSES.STALE, COURIER_RESULT_STATUSES.HELD, COURIER_RESULT_STATUSES.CONFLICT].includes(authorized.status)
+        ? COURIER_OUTCOMES.NOT_SUBMITTED
+        : COURIER_OUTCOMES.UNCERTAIN;
+      state.recordCourierOutcome(message.id, claimed.attempt.attemptId, status, {
+        reason: `courier authorization ${authorized.status}`
+      });
+      return { status, error: courierDispatchError(authorized.status) };
+    }
+    const provider = providers[authorized.route.courier.provider];
+    if (!provider || typeof provider.dispatchCourier !== 'function') {
+      state.recordCourierOutcome(message.id, claimed.attempt.attemptId, COURIER_OUTCOMES.NOT_SUBMITTED, {
+        reason: 'courier provider has no fixed queue boundary'
+      });
+      return { status: COURIER_OUTCOMES.NOT_SUBMITTED, error: courierDispatchError(COURIER_OUTCOMES.NOT_SUBMITTED) };
+    }
+    let dispatched;
+    try {
+      dispatched = await provider.dispatchCourier(authorized.envelope, { signal: dispatchOptions.signal });
+    } catch (error) {
+      dispatched = { status: COURIER_OUTCOMES.UNCERTAIN, error };
+    }
+    const status = courierDispatchStatus(dispatched);
+    state.authorizeCourierAttempt(message.id, claimed.attempt.attemptId, input);
+    state.recordCourierOutcome(message.id, claimed.attempt.attemptId, status, {
+      ...(dispatched?.error ? { error: String(dispatched.error.message || dispatched.error).slice(0, 200) } : {})
+    });
+    return {
+      status,
+      cursor: observerCursor,
+      ...(dispatched?.error ? { error: dispatched.error } : {})
+    };
+  }
+
   function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
+    const durable = state.getMessage(message?.id) || message;
+    const selected = selectedCourierRoute(durable) ? { routeId: courierRoute.routeId } : null;
     return enqueueOwnerWork(message, signal, (onNativeSettled, ownerEntry) => {
       let settleHandoff;
       let rejectHandoff;
@@ -888,6 +989,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
             ...observeOptions,
             signal: taskSignal,
             continueUntilFinal,
+            ...(selected ? { dispatch: (dispatchMessage, parentProvider, dispatchOptions) => dispatchAtCourierBoundary(dispatchMessage, parentProvider, dispatchOptions, selected) } : {}),
             onDispatchOutcome: outcome => {
               if (outcome?.status === 'not_submitted') {
                 ownerEntry.dispatchBlocked = !hasCurrentNativeAcknowledgment(state.getMessage(message.id));
@@ -1031,7 +1133,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
 }
 
 class DiscordGateway {
-  constructor({ state, stateDir = path.dirname(state.dbPath), client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null, interactionFetch = globalThis.fetch } = {}) {
+  constructor({ state, stateDir = path.dirname(state.dbPath), client, logger = () => {}, observeOptions = {}, providers, fetchHistory, recoveryOptions = {}, onReady = null, interactionFetch = globalThis.fetch, courierRoute = null } = {}) {
     this.state = state;
     this.stateDir = stateDir;
     this.logger = logger;
@@ -1120,6 +1222,7 @@ class DiscordGateway {
     const onNativeUnavailable = observeOptions.onNativeUnavailable;
     this.consumer = createSurfaceConsumer({
       state,
+      stateDir: this.stateDir,
       providers: this.providers,
       agentCredential: () => this.discordToken,
       agentBotId: () => this.client.user?.id || null,
@@ -1129,6 +1232,7 @@ class DiscordGateway {
       sendReply: (message, reply) => this.sendReply(message, reply),
       prepareReply: (messageId, signal) => this.prepareReply(messageId, signal),
       sendTransportReceipt: (message, receipt) => this.sendTransportReceipt(message, receipt),
+      courierRoute: courierRoute || recoveryOptions.courierRoute || null,
       observeOptions: {
         ...observeOptions,
         onNativeUnavailable: (message, error, outcome) => {
