@@ -596,7 +596,7 @@ test('agent reply can correlate by accepted Discord message ID across duplicate 
   assert.match(calls[0].url, /\/channels\/901$/);
   const packet = decodeAgentMessage(JSON.parse(calls[1].options.body).content, token, sourceA);
   assert.equal(packet.target.channelId, sourceA.channelId);
-  assert.equal(packet.replyTo, '1001');
+  assert.equal(packet.replyTo, 'shared-key');
   await assert.rejects(runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
     textFile, dedupeKey: 'result-key-ambiguous', agentKind: KINDS.RESULT, agentReplyTo: 'shared-key', fetchImpl }), /unknown or does not match/);
   assert.equal(accept('1003', sourceB, '1001').accepted, true);

@@ -210,7 +210,7 @@ test('agent request completion requires a full reversed result receipt', () => {
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('request completion accepts nonce-only direct-result reconciliation', async () => {
+test('request completion accepts a Discord-id alias with nonce-only direct-result reconciliation', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-handled-unknown-result-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
@@ -228,16 +228,17 @@ test('request completion accepts nonce-only direct-result reconciliation', async
     fs.writeFileSync(textFile, 'Uncertain result.');
     const result = await runDirectPost({ state, token, nativeId: owners.target.nativeId, generation: owners.target.generation,
       channelId: owners.target.channelId, provider: owners.target.provider, textFile, dedupeKey: 'a2-unknown-result',
-      agentTarget: issueAgentAddress(owners.source, token), agentKind: KINDS.RESULT, agentReplyTo: request.id,
+      agentTarget: issueAgentAddress(owners.source, token), agentKind: KINDS.RESULT, agentReplyTo: messageId,
       fetchImpl: async (_url, options) => {
         if (options.method === 'POST') throw Object.assign(new Error('transport outcome unknown'), { outcome: 'unknown' });
         return { ok: true, status: 200, json: async () => ({ id: owners.source.channelId, guild_id: owners.source.guildId }) };
       } });
     assert.equal(result.status, 'unknown');
     assert.equal(state.directPostRows('a2-unknown-result').at(-1).detail.outcome, 'unknown');
+    const attempt = state.directPostRows('a2-unknown-result').find(row => row.kind === 'direct-post-attempt');
+    assert.equal(attempt.detail.agentPacket.replyTo, request.id);
     assert.throws(() => state.completeAgentHandledWithoutPost({ messageId,
       provider: owners.target.provider, nativeId: owners.target.nativeId, generation: owners.target.generation }), /immutable correlated result/);
-    const attempt = state.directPostRows('a2-unknown-result').find(row => row.kind === 'direct-post-attempt');
     state.reconcileDirectPostOutcome('a2-unknown-result', attempt.detail.attemptId, 'sent', {
       source: 'operator-reconciliation', nonce: attempt.detail.nonce
     });

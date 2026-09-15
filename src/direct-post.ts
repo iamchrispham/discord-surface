@@ -501,10 +501,11 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       const replyTo = requiredString(agentReplyTo, 'agent-reply-to', 128);
       const hasProof = agentTarget !== null && typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
       if (hasProof) agentTarget = verifyAgentAddress(agentTarget, token);
-      deliveryTarget = resolveAgentReplyRequest(state, replyTo, address,
-        agentTarget as AgentAddress | null).source;
+      const request = resolveAgentReplyRequest(state, replyTo, address,
+        agentTarget as AgentAddress | null);
+      deliveryTarget = request.source;
       agentTarget = deliveryTarget;
-      agentReplyTo = replyTo;
+      agentReplyTo = request.id;
     } else {
       deliveryTarget = verifyAgentAddress(agentTarget, token);
       agentTarget = deliveryTarget;
