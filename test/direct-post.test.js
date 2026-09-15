@@ -4,13 +4,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { SurfaceState } = require('../src/state');
+const { SurfaceState, DIRECT_POST_OUTCOMES: stateOutcomes } = require('../src/state');
 const { main } = require('../src/cli');
 const { createSurfaceConsumer } = require('../src/discord');
 const { runDirectPost } = require('../src/direct-post');
 const { decodeAgentMessage, encodeAgentMessage, issueAgentAddress, KINDS } = require('../src/agent-message');
 const { AGENT_ATTACHMENT_CONTENT_TYPE, AGENT_ATTACHMENT_FILENAME } = require('../src/agent-attachment');
 const { AGENT_PRESENTATIONS } = require('../src/agent-presentation');
+const { createDirectPostHandlers, DIRECT_POST_OUTCOMES } = require('../src/state/direct-post');
 
 const CODEX = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CLAUDE = '79e3da8e-94b4-4aff-8f88-b45b3a451dd1';
@@ -57,6 +58,97 @@ function fetchRecorder({ responses = [], pending = false } = {}) {
   };
   return { calls, fetchImpl, release: () => release?.() };
 }
+
+test('direct post inspection preserves captured dependency kinds after factory creation', () => {
+  const BindingError = class extends Error {};
+  const StaleGenerationError = class extends Error {};
+  const StateCorruptError = class extends Error {};
+  const dependencies = {
+    BindingError,
+    StaleGenerationError,
+    StateCorruptError,
+    DIRECT_POST_ATTEMPT: 'direct-post-attempt',
+    DIRECT_POST_OUTCOME: 'direct-post-outcome',
+    DIRECT_POST_OUTCOMES: ['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale'],
+    assertText(value, name, max = 512) {
+      if (typeof value !== 'string' || value.length === 0 || value.length > max) throw new TypeError(`${name} invalid`);
+      return value;
+    },
+    bindingMatchesExpected: () => true,
+    parseJson(value, fallback) {
+      if (typeof value !== 'string') return fallback;
+      try { return JSON.parse(value); } catch { return fallback; }
+    },
+    now: () => '2026-09-13T00:00:00.000Z'
+  };
+  const binding = {
+    active: true,
+    channelId: 'channel-1',
+    guildId: 'guild-1',
+    provider: 'codex',
+    nativeId: CODEX,
+    generation: 1,
+    conductorId: null,
+    repoKey: null
+  };
+  const meta = {
+    requestId: 'request-1',
+    inReplyTo: null,
+    attemptId: 'attempt-1',
+    sourcePath: '/tmp/source.md',
+    textHash: 'text-hash',
+    operatorId: 'operator-1',
+    partHash: 'part-hash',
+    channelId: 'channel-1',
+    guildId: 'guild-1',
+    provider: 'codex',
+    nativeId: CODEX,
+    generation: 1,
+    conductorId: null,
+    repoKey: null,
+    partIndex: 0,
+    partCount: 1,
+    nonce: 'nonce-1',
+    binding
+  };
+  const attempt = { journal: 'direct-post-v1', ...meta, status: 'attempted' };
+  const outcome = { ...attempt, outcome: 'sent' };
+  const rows = [
+    { id: 1, kind: 'direct-post-attempt', detail: attempt, createdAt: '2026-09-13T00:00:00.000Z' },
+    { id: 2, kind: 'direct-post-outcome', detail: outcome, createdAt: '2026-09-13T00:00:01.000Z' }
+  ];
+  const receipts = [];
+  const state = {
+    db: { prepare: () => ({ all: () => [] }) },
+    transaction: operation => operation(),
+    directPostRows: () => rows.map(row => ({ ...row, detail: { ...row.detail } })),
+    directPostBindingCurrent: () => true,
+    directPostOwnerIdentity: () => ({ ownerPid: 123 }),
+    receipt: (discordId, kind, detail) => receipts.push({ discordId, kind, detail })
+  };
+  const handlers = createDirectPostHandlers(dependencies);
+  dependencies.DIRECT_POST_ATTEMPT = 'mutated-attempt-kind';
+  dependencies.DIRECT_POST_OUTCOME = 'mutated-outcome-kind';
+
+  assert.deepEqual(handlers.beginDirectPostPart(state, meta), {
+    claimed: false,
+    status: 'sent',
+    attemptId: 'attempt-1',
+    nonce: 'nonce-1',
+    outcome
+  });
+  assert.deepEqual(receipts, []);
+});
+
+test('direct post facade exposes the frozen owner outcome vocabulary', () => {
+  const owner = require('../dist/state/direct-post.js');
+  assert.strictEqual(stateOutcomes, DIRECT_POST_OUTCOMES);
+  assert.strictEqual(DIRECT_POST_OUTCOMES, owner.DIRECT_POST_OUTCOMES);
+  assert.deepEqual(DIRECT_POST_OUTCOMES, ['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
+  assert.equal(Object.isFrozen(DIRECT_POST_OUTCOMES), true);
+  assert.throws(() => DIRECT_POST_OUTCOMES.push('bogus'), TypeError);
+  assert.deepEqual(DIRECT_POST_OUTCOMES, owner.DIRECT_POST_OUTCOMES);
+});
 
 test('post sends multipart text in order and records durable per-part outcomes', async t => {
   const f = fixture(t);

@@ -6,7 +6,7 @@ const { DatabaseSync } = require('node:sqlite');
 const { normalizeAttachments } = require('./attachments');
 const { ORDINARY_RECEIPT_KINDS } = require('./ordinary/constants');
 const { createOrdinaryRepository } = require('./ordinary');
-const { createDirectPostHandlers, queryDirectPostRows } = require('./state/direct-post');
+const { createDirectPostHandlers, queryDirectPostRows, DIRECT_POST_OUTCOMES } = require('./state/direct-post');
 const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = require('./state/board-refresh');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
 const {
@@ -65,7 +65,6 @@ const NATIVE_ACK_RECEIPT = 'native-ack';
 
 const DIRECT_POST_ATTEMPT = 'direct-post-attempt';
 const DIRECT_POST_OUTCOME = 'direct-post-outcome';
-const DIRECT_POST_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
 const DISPATCH_OUTCOMES = Object.freeze({ NOT_SUBMITTED: 'not_submitted' });
 
 const ACTIVE_STATES = new Set([
