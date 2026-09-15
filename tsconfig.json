@@ -18,6 +18,7 @@
     "src/ordinary-bind/channel-resolution.ts",
     "src/ordinary-bind/gateway-capability.ts",
     "src/native-transcript.ts",
+    "src/native.ts",
     "src/agent-message.ts",
     "src/agent-presentation.ts",
     "src/agent-attachment.ts",
