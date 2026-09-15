@@ -97,7 +97,7 @@ const GENERAL_USAGE = `Usage: discord-surface <command> [options]
 Commands: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind,
 status, recover, board-refresh, thread-enroll, provision, handoff, start, stop,
 claude-channel, claude-monitor, native-ack, claude-reply, agent-address,
-agent-send, post, ordinary-post, ordinary-claude-post, claude-post,
+agent-send, agent-complete, post, ordinary-post, ordinary-claude-post, claude-post,
 decision-present, liaison draft
 
 Use \"discord-surface agent-send --help\" for addressed agent-message options.
@@ -114,8 +114,17 @@ Agent packets must fit in one Discord message. The limit is ${AGENT_MESSAGE_MAX_
 Usable text varies with envelope metadata, UTF-8 width, and JSON escaping.
 `;
 
+const AGENT_COMPLETE_USAGE = `Usage: discord-surface agent-complete --provider PROVIDER --message-id MESSAGE_ID \\
+  --native-id NATIVE_UUID --generation GENERATION [--channel-id CHANNEL_ID]
+
+Consumes one authenticated agent request or result without posting a reply. A live Gateway must advertise the completion wake capability.
+`;
+
 function printUsage(command) {
-  process.stdout.write(command === 'agent-send' ? AGENT_SEND_USAGE : GENERAL_USAGE);
+  let usage = GENERAL_USAGE;
+  if (command === 'agent-send') usage = AGENT_SEND_USAGE;
+  if (command === 'agent-complete') usage = AGENT_COMPLETE_USAGE;
+  process.stdout.write(usage);
 }
 
 function configure(args) {
@@ -1416,7 +1425,8 @@ function writePid(pidFile, guildId, stateDir, db) {
       GATEWAY_CAPABILITIES.ordinaryBindWake,
       GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake,
       GATEWAY_CAPABILITIES.runtimeBindLock,
-      GATEWAY_CAPABILITIES.ordinaryClaudeBind
+      GATEWAY_CAPABILITIES.ordinaryClaudeBind,
+      GATEWAY_CAPABILITIES.agentHandledWithoutPost
     ]
   }), { mode: 0o600 });
   fs.chmodSync(pidFile, 0o600);
@@ -1882,6 +1892,45 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
   }
 }
 
+function agentComplete(args, dependencies = {}) {
+  const { paths, state } = openState(args);
+  const output = dependencies.print || print;
+  const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
+  const requestRecovery = dependencies.requestGatewayRecovery || requestGatewayRecovery;
+  try {
+    const runtime = gatewayStatus(paths);
+    const requiredCapability = GATEWAY_CAPABILITIES.agentHandledWithoutPost;
+    if (!runtime || !['running', 'stopped', 'stale'].includes(runtime.state)) {
+      throw new Error('Gateway status is unknown; stop or restart it before agent completion');
+    }
+    const live = runtime.state === 'running' && Number.isSafeInteger(Number(runtime.pid)) && Number(runtime.pid) > 0;
+    if (runtime.state === 'running' && !live) {
+      throw new Error('Gateway status is unknown; stop or restart it before agent completion');
+    }
+    if (live && !runtime.capabilities?.includes(requiredCapability)) {
+      throw new Error('running Gateway does not support agent handled-without-post completion; stop or restart it before completion');
+    }
+    const result = state.completeAgentHandledWithoutPost({
+      messageId: required(args, 'message-id'),
+      provider: required(args, 'provider'),
+      nativeId: required(args, 'native-id'),
+      generation: Number(required(args, 'generation')),
+      channelId: args['channel-id'] || null
+    });
+    const gatewayWake = requestRecovery(paths, {
+      status: gatewayStatus,
+      kill: dependencies.killProcess || process.kill,
+      ...(live ? { expectedPid: runtime.pid } : {}),
+      requiredCapability
+    });
+    const response = { ...result, gatewayWake };
+    output(response);
+    return response;
+  } finally {
+    state.close();
+  }
+}
+
 async function decisionPresent(args, dependencies = {}) {
   const { readDecisionRequest, presentDecision } = require('./decision-present');
   const { DECISION_TRANSPORT_OUTCOMES } = require('./state/decision');
@@ -2065,6 +2114,7 @@ async function main() {
         agentThreadId: Object.hasOwn(args, 'agent-thread-id') ? args['agent-thread-id'] : null });
     }
     case 'agent-send': return agentSend(args);
+    case 'agent-complete': return agentComplete(args);
     case 'decision-present': return decisionPresent(args);
     case 'thread-enroll': return threadEnroll(args);
     case 'post': return directPost(args);
@@ -2074,11 +2124,11 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, post, ordinary-post, ordinary-claude-post, claude-post, decision-present, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, agent-complete, post, ordinary-post, ordinary-claude-post, claude-post, decision-present, liaison draft');
   }
 }
 
-module.exports = { bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, threadEnroll, unbind };
+module.exports = { agentComplete, bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCurrentClaudeCaller, threadEnroll, unbind };
 
 if (require.main === module) {
   main().catch(error => {

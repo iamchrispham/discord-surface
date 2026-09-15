@@ -20,6 +20,7 @@ const {
     DISPATCH_FAILED: 'dispatch_failed';
     REPLY_FAILED: 'reply_failed';
     REPLY_UNKNOWN: 'reply_unknown';
+    AGENT_HANDLED_WITHOUT_POST: 'agent_handled_without_post';
     REJECTED: 'rejected';
   };
   NATIVE_ACK_RECEIPT: string;

@@ -46,6 +46,7 @@ const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('../src/state') 
     DISPATCH_FAILED: 'dispatch_failed';
     REPLY_FAILED: 'reply_failed';
     REPLY_UNKNOWN: 'reply_unknown';
+    AGENT_HANDLED_WITHOUT_POST: 'agent_handled_without_post';
     REJECTED: 'rejected';
   };
   PROVIDERS: {
@@ -929,6 +930,7 @@ export async function waitForReply(state: NativeState, messageId: string, { time
     const message = state.getMessage(messageId);
     if (!message) return null;
     if (message.state === MESSAGE_STATES.REPLY_READY || message.state === MESSAGE_STATES.REPLIED) return { text: message.replyText };
+    if (message.state === MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST) return { stopped: true };
     if (isCurrent && !isCurrent()) return { stopped: true };
     if (message.state === MESSAGE_STATES.UNCERTAIN || message.state === MESSAGE_STATES.REPLY_UNKNOWN) return null;
     await sleep(pollMs, signal);
@@ -942,6 +944,9 @@ export async function observeSubmitted(
   provider: NativeProvider,
   options: ObserveCodexOptions = {}
 ): Promise<DispatchReport> {
+  if (message.state === MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST) {
+    return { status: message.state, message: state.getMessage(message.id) };
+  }
   if (!provider?.observe) {
     const unavailable = state.markObservationUnavailable(message.id, 'native observer is unavailable');
     return { status: unavailable?.state || message.state, message: unavailable || state.getMessage(message.id) };

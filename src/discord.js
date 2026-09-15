@@ -488,12 +488,14 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
   }
 
   function ownerMessageIsTerminal(message) {
-    return Boolean(message && [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state));
+    return Boolean(message && [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
+      MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST].includes(message.state));
   }
 
   function ownerCanAdvance(messageId) {
     const message = state.getMessage(messageId);
-    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state) ||
+    return !message || [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
+      MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST].includes(message.state) ||
       (message.state === MESSAGE_STATES.SUBMITTED && hasCurrentNativeAcknowledgment(message));
   }
 
@@ -512,7 +514,7 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     const queue = ownerQueues.get(ownerKey);
     if (!queue?.blockedMessageId || !ownerBindingReady(queue.blockedMessageId)) return;
     const blocked = state.getMessage(queue.blockedMessageId);
-    if (!blocked || ![MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(blocked.state)) return;
+    if (!blocked || !ownerMessageIsTerminal(blocked)) return;
     if (queue.active?.message.id === queue.blockedMessageId) queue.active = null;
     queue.blockedMessageId = null;
     queue.blockedReason = null;
@@ -607,6 +609,45 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     queue.blockedReason = null;
     pumpOwner(nativeOwnerKey(message));
     return true;
+  }
+
+  function releaseHandledWithoutPostId(messageId) {
+    const message = state.getMessage(messageId);
+    if (!message || message.state !== MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST) return false;
+    const queue = ownerQueues.get(nativeOwnerKey(message));
+    if (!queue) return false;
+    if (queue.active?.message.id === messageId) {
+      const activeWork = nativeWork.get(messageId);
+      if (activeWork) {
+        activeWork.controller?.abort();
+        return false;
+      }
+      queue.active = null;
+      queue.blockedMessageId = null;
+      queue.blockedReason = null;
+      pumpOwner(nativeOwnerKey(message));
+      return true;
+    }
+    if (queue.blockedMessageId !== messageId) return false;
+    queue.blockedMessageId = null;
+    queue.blockedReason = null;
+    pumpOwner(nativeOwnerKey(message));
+    return true;
+  }
+
+  function releaseHandledWithoutPost(messageId = null) {
+    if (messageId !== null) return releaseHandledWithoutPostId(messageId);
+    let released = false;
+    for (const queue of ownerQueues.values()) {
+      const messageIds = new Set([
+        queue.active?.message?.id,
+        queue.blockedMessageId
+      ].filter(Boolean));
+      for (const queuedMessageId of messageIds) {
+        released = releaseHandledWithoutPostId(queuedMessageId) || released;
+      }
+    }
+    return released;
   }
 
   function cancelQueuedEntry(entry) {
@@ -979,7 +1020,8 @@ function createSurfaceConsumer({ state, providers, sendReply, sendTransportRecei
     await Promise.allSettled([...receiptWork]);
   }
 
-  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted, releaseAcknowledged, releaseIntake, resumeSubmitted, waitForNativeWork, waitForReceipts };
+  return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted,
+    releaseAcknowledged, releaseHandledWithoutPost, releaseIntake, resumeSubmitted, waitForNativeWork, waitForReceipts };
 }
 
 class DiscordGateway {
@@ -2467,6 +2509,7 @@ class DiscordGateway {
   async _reconcilePending(before, signal, readyOnly = false, channelIds = null) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const selectedChannels = channelIds ? new Set(channelIds) : null;
+    this.consumer?.releaseHandledWithoutPost?.();
     const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
       (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready);
     this.startDecisionRecovery(signal, selectedChannels);
