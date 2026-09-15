@@ -16,18 +16,21 @@ const target = { guildId: '100', channelId: '102', provider: 'claude', nativeId:
 const token = 'isolated-test-credential';
 
 test('native owners receive the exact no-post completion command', () => {
-  const completion = agentCompletionCommand(target, '/custom/state/surface.sqlite', '/custom/cli.js', '/custom/state');
-  assert.deepEqual(completion.slice(1, 8), [
-    '/custom/cli.js', 'agent-complete', '--state-dir', '/custom/state', '--db', '/custom/state/surface.sqlite', '--provider'
-  ]);
   const message = {
     id: 'completion-packet-event', provider: target.provider, nativeId: target.nativeId, generation: target.generation,
     workspace: '/tmp', content: 'Handle this packet.', state: MESSAGE_STATES.SUBMITTED,
     agentMessage: { id: 'completion-packet', kind: KINDS.RESULT, source, target, replyTo: null, text: 'Handle this packet.' }
   };
+  const completion = agentCompletionCommand(message, '/custom/state/surface.sqlite', '/custom/cli.js', '/custom/state');
+  assert.deepEqual(completion.slice(1, 8), [
+    '/custom/cli.js', 'agent-complete', '--state-dir', '/custom/state', '--db', '/custom/state/surface.sqlite', '--provider'
+  ]);
+  assert.equal(completion[completion.indexOf('--message-id') + 1], message.id);
   const instruction = JSON.stringify(completion);
   assert.match(codexPrompt(message, null, completion), new RegExp(instruction.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(claudeEvent(message, completion).content, new RegExp(instruction.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const event = claudeEvent(message, completion);
+  assert.match(event.content, new RegExp(instruction.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.deepEqual(event.completion, completion);
 });
 
 test('agent retry preserves a predecessor journal without inventing completion evidence', async () => {

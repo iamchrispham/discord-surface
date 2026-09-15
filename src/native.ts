@@ -412,6 +412,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
   generation: number;
   content: string;
   attachments?: readonly Attachment[] | null;
+  completion?: readonly string[];
 } {
   const isDecision = Boolean(message.decisionResult);
   const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
@@ -442,6 +443,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     generation: number;
     content: string;
     attachments?: readonly Attachment[] | null;
+    completion?: readonly string[];
   } = {
     nativeId: message.nativeId,
     messageId: message.id,
@@ -449,6 +451,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     content: content.join('\n')
   };
   if (message.attachments?.length) event.attachments = message.attachments;
+  if (message.agentMessage && completion?.length) event.completion = [...completion];
   return event;
 }
 
