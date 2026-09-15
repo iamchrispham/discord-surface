@@ -4,6 +4,8 @@ type AgentMessage = import('./agent-message').AgentMessage;
 type AgentMessageKind = import('./agent-message').AgentMessageKind;
 type AgentProvider = import('./agent-message').AgentProvider;
 type AgentPresentation = import('./agent-presentation').AgentPresentation;
+type DirectPostFileManifest = import('./direct-post-file').DirectPostFileManifest;
+type DirectPostFilePreparation = import('./direct-post-file').DirectPostFilePreparation;
 
 export const DIRECT_POST_OUTCOMES = {
   SENT: 'sent',
@@ -74,6 +76,8 @@ interface DirectPostPartMeta {
   deliveryChannelId?: string;
   agentPacket?: AgentMessage;
   presentation: AgentPresentation;
+  caption?: string;
+  fileManifest?: DirectPostFileManifest;
 }
 
 interface DirectPostInspection {
@@ -103,7 +107,11 @@ export interface DirectPostState {
   recordDirectPostPreflight(meta: DirectPostPartMeta, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostReceiptDetail;
   beginDirectPostPart(meta: DirectPostPartMeta): DirectPostClaim;
   directPostBindingCurrent(binding: DirectPostBinding, operatorId: string, deliveryChannelId?: string | null): boolean;
+  directPostOwnerIdentity(pid: number): { ownerPid: number; ownerStartTime: string | null; ownerCommand: string | null } | null;
   recordDirectPostOutcome(requestId: string, attemptId: string, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostReceiptDetail;
+  directPostFilePreparation?(requestId: string): DirectPostFilePreparation | null;
+  beginDirectPostFilePreparation?(seed: Record<string, unknown>): DirectPostFilePreparation;
+  admitDirectPostFilePreparation?(preparationId: string, manifest: DirectPostFileManifest): DirectPostFilePreparation;
 }
 
 export interface DirectPostSource {
@@ -112,6 +120,8 @@ export interface DirectPostSource {
   textHash: string;
   parts: string[];
   displayParts?: string[];
+  fileManifest?: DirectPostFileManifest;
+  filePreparation?: DirectPostFilePreparation;
 }
 
 export interface DirectPostPartResult {
@@ -132,6 +142,7 @@ export interface DirectPostResult {
   state: DirectPostPartStatus;
   recorded: boolean;
   duplicate: boolean;
+  filePreparationId?: string;
   messageIds: string[];
   parts: DirectPostPartResult[];
 }
@@ -168,7 +179,10 @@ interface DirectPostInputBase {
   channelId?: string | null;
   agentThreadId?: string | null;
   provider?: AgentProvider | null;
-  textFile: unknown;
+  textFile?: unknown;
+  attachmentFile?: unknown;
+  resume?: boolean;
+  stateDir?: string;
   dedupeKey?: unknown;
   requestId?: unknown;
   inReplyTo?: unknown;
@@ -235,6 +249,23 @@ const { AGENT_PRESENTATIONS, agentMessagePreview } = require('../src/agent-prese
   AGENT_PRESENTATIONS: Readonly<{ LEGACY: 'legacy'; ATTACHMENT: 'attachment-v1' }>;
   agentMessagePreview: (packet: AgentMessage) => string;
 };
+const {
+  DIRECT_POST_FILE_PHASES,
+  DirectPostFileSnapshotError,
+  hashDirectPostFile,
+  inspectDirectPostFile,
+  readDirectPostFileSnapshot,
+  stageDirectPostFile,
+  stagedDirectPostFilePath
+} = require('../src/direct-post-file') as {
+  DIRECT_POST_FILE_PHASES: Readonly<{ PREPARING: 'preparing'; ADMITTED: 'admitted'; RELEASED: 'released' }>;
+  DirectPostFileSnapshotError: new (message: string, options?: { cause?: unknown }) => Error;
+  hashDirectPostFile: (sourcePath: unknown) => { sourcePath: string; filename: string; size: number; sha256: string };
+  inspectDirectPostFile: (sourcePath: unknown) => { sourcePath: string; filename: string; size: number };
+  readDirectPostFileSnapshot: (manifest: DirectPostFileManifest) => Buffer;
+  stageDirectPostFile: (input: { sourcePath: unknown; stateDir: string; preparationId: string; caption: string; captionHash: string }) => DirectPostFileManifest;
+  stagedDirectPostFilePath: (stateDir: string, preparationId: string) => string;
+};
 const crypto = require('node:crypto') as typeof import('node:crypto');
 const fs = require('node:fs') as typeof import('node:fs');
 const path = require('node:path') as typeof import('node:path');
@@ -275,6 +306,7 @@ const { fetchDiscordChannel, sendDiscordMessage } = require('../src/discord') as
       fail_if_not_exists: boolean;
     } | null;
     agentAttachment?: Buffer | null;
+    fileAttachment?: { bytes: Buffer; filename: string } | null;
   }) => Promise<DiscordMessage>;
 };
 
@@ -432,7 +464,8 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
   sourcePath: string, textHash: string, parts: readonly string[], partIndex: number, sourceAddress: AgentAddress,
   agentTarget: AgentAddress | null = null,
   presentation: AgentPresentation = AGENT_PRESENTATIONS.LEGACY,
-  agentPacket: AgentMessage | null = null): DirectPostPartMeta {
+  agentPacket: AgentMessage | null = null,
+  fileManifest: DirectPostFileManifest | null = null): DirectPostPartMeta {
   const nonceScope = agentTarget === null
     ? `direct:${requestId}:${partIndex}`
     : agentNonceScope(sourceAddress, agentTarget, requestId, partIndex);
@@ -456,6 +489,7 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
     nonce: discordNonce(nonceScope),
     binding,
     presentation,
+    ...(fileManifest ? { caption: fileManifest.caption, fileManifest } : {}),
     ...(agentPacket ? { agentPacket } : {})
   };
 }
@@ -475,23 +509,129 @@ function errorMessage(error: unknown): string {
   return String((error as { message?: unknown }).message || error);
 }
 
+function directPostStateDir(state: DirectPostState, requested: string | undefined): string {
+  if (requested !== undefined) return path.resolve(requiredString(requested, 'state-dir'));
+  const dbPath = (state as unknown as { dbPath?: unknown }).dbPath;
+  return typeof dbPath === 'string' ? path.dirname(dbPath) : process.cwd();
+}
+
+function assertFilePreparationAuthority(existing: DirectPostFilePreparation, binding: DirectPostBinding, operatorId: string,
+  inReplyTo: unknown, resume = false): void {
+  if (resume && inReplyTo !== undefined) throw new BindingError('direct post resume does not accept a replacement reply reference');
+  const effectiveReplyTarget = inReplyTo === undefined ? existing.inReplyTo : inReplyToValue(inReplyTo);
+  if (effectiveReplyTarget !== existing.inReplyTo) throw new BindingError('direct post file request cannot override immutable inReplyTo');
+  for (const [key, expected, actual] of [
+    ['channelId', existing.channelId, binding.channelId],
+    ['guildId', existing.guildId, binding.guildId],
+    ['provider', existing.provider, binding.provider],
+    ['nativeId', existing.nativeId, binding.nativeId],
+    ['generation', existing.generation, binding.generation],
+    ['operatorId', existing.operatorId, operatorId],
+    ['conductorId', existing.conductorId ?? null, binding.conductorId ?? null],
+    ['repoKey', existing.repoKey ?? null, binding.repoKey ?? null]
+  ] as const) {
+    if (expected !== actual) throw new BindingError(`direct post resume cannot override immutable ${key}`);
+  }
+}
+
+function prepareFileSource({ state, requestId, textFile, attachmentFile, resume, stateDir, binding, operatorId, inReplyTo }:
+  { state: DirectPostState; requestId: string; textFile: unknown; attachmentFile: unknown; resume: boolean; stateDir?: string;
+    binding: DirectPostBinding; operatorId: string; inReplyTo: unknown }): DirectPostSource {
+  if (!state.directPostFilePreparation || !state.beginDirectPostFilePreparation || !state.admitDirectPostFilePreparation) {
+    throw new BindingError('direct post file custody is unavailable');
+  }
+  const existing = state.directPostFilePreparation(requestId);
+  if (resume) {
+    if (attachmentFile !== undefined || textFile !== undefined) throw new BindingError('direct post resume does not accept replacement files');
+    if (!existing || existing.phase !== DIRECT_POST_FILE_PHASES.ADMITTED) throw new BindingError('direct post resume requires an admitted file preparation');
+    assertFilePreparationAuthority(existing, binding, operatorId, inReplyTo, true);
+    return { sourcePath: existing.sourcePath, text: existing.caption, textHash: existing.captionHash,
+      parts: [existing.caption], fileManifest: existing, filePreparation: existing };
+  }
+  if (attachmentFile === undefined) throw new BindingError('attachment-file is required for a file post');
+  const captionSource = readTextFile(textFile);
+  if (captionSource.parts.length !== 1) throw new BindingError('file posts require one Discord message caption');
+  let inspected;
+  try { inspected = inspectDirectPostFile(attachmentFile); }
+  catch (error) { throw new BindingError(errorMessage(error)); }
+  const captionHash = captionSource.textHash;
+  if (existing && existing.phase === DIRECT_POST_FILE_PHASES.ADMITTED) {
+    assertFilePreparationAuthority(existing, binding, operatorId, inReplyTo);
+    let descriptor;
+    try { descriptor = hashDirectPostFile(attachmentFile); }
+    catch (error) { throw new BindingError(errorMessage(error)); }
+    if (descriptor.filename !== existing.filename || descriptor.size !== existing.size || descriptor.sha256 !== existing.sha256 || captionHash !== existing.captionHash) {
+      throw new BindingError('direct post file request identity conflicts with its admitted custody');
+    }
+    return { sourcePath: existing.sourcePath, text: existing.caption, textHash: existing.captionHash,
+      parts: [existing.caption], fileManifest: existing, filePreparation: existing };
+  }
+  if (existing && existing.phase === DIRECT_POST_FILE_PHASES.PREPARING) throw new BindingError('direct post file preparation is already in progress');
+  const preparationId = crypto.randomUUID();
+  const root = directPostStateDir(state, stateDir);
+  const ownerIdentity = state.directPostOwnerIdentity(process.pid);
+  if (!ownerIdentity) throw new BindingError('direct post file preparation owner identity is unavailable');
+  const seed = {
+    preparationId,
+    requestId,
+    custodyRoot: root,
+    sourcePath: inspected.sourcePath,
+    stagedPath: stagedDirectPostFilePath(root, preparationId),
+    filename: inspected.filename,
+    size: inspected.size,
+    caption: captionSource.text,
+    captionHash,
+    channelId: binding.channelId,
+    guildId: binding.guildId,
+    provider: binding.provider,
+    nativeId: binding.nativeId,
+    generation: binding.generation,
+    operatorId,
+    inReplyTo: inReplyToValue(inReplyTo),
+    ...(binding.conductorId ? { conductorId: binding.conductorId } : {}),
+    ...(binding.repoKey ? { repoKey: binding.repoKey } : {}),
+    ...ownerIdentity
+  };
+  const admittedSeed = state.beginDirectPostFilePreparation(seed);
+  if (admittedSeed.phase === DIRECT_POST_FILE_PHASES.ADMITTED) {
+    return { sourcePath: admittedSeed.sourcePath, text: admittedSeed.caption, textHash: admittedSeed.captionHash,
+      parts: [admittedSeed.caption], fileManifest: admittedSeed, filePreparation: admittedSeed };
+  }
+  if (admittedSeed.phase !== DIRECT_POST_FILE_PHASES.PREPARING) throw new BindingError('direct post file preparation is unavailable');
+  let manifest;
+  try { manifest = stageDirectPostFile({ sourcePath: attachmentFile, stateDir: root, preparationId, caption: captionSource.text, captionHash }); }
+  catch (error) { throw new BindingError(`direct post file preparation ${preparationId} is not admitted: ${errorMessage(error)}`); }
+  let admitted;
+  try { admitted = state.admitDirectPostFilePreparation(preparationId, manifest); }
+  catch (error) { throw new BindingError(`direct post file preparation ${preparationId} could not be admitted: ${errorMessage(error)}`); }
+  return { sourcePath: admitted.sourcePath, text: admitted.caption, textHash: admitted.captionHash,
+    parts: [admitted.caption], fileManifest: admitted, filePreparation: admitted };
+}
+
 async function runDirectPost({ state, token, nativeId, generation, channelId = null, provider = null, textFile,
   agentThreadId = null,
-  dedupeKey, requestId: legacyRequestId, inReplyTo = null, signal, fetchImpl, timeoutMs, ordinary = false,
+  dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
   agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
-  agentPresentation = AGENT_PRESENTATIONS.LEGACY }: DirectPostInput): Promise<DirectPostResult> {
+  agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir }: DirectPostInput): Promise<DirectPostResult> {
   const binding = resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
   const operatorId = state.requireConfig().operatorId;
-  let source = readTextFile(textFile);
   const replyTarget = inReplyToValue(inReplyTo);
   const isAgentMessage = agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT;
+  const fileRequested = attachmentFile !== undefined || resume;
   if (!Object.values(AGENT_PRESENTATIONS).includes(agentPresentation)) {
     throw new BindingError(`unsupported agent presentation: ${agentPresentation}`);
   }
+  if (fileRequested && isAgentMessage) throw new BindingError('local file posts are only supported for ordinary direct posts');
   if (!isAgentMessage && agentPresentation !== AGENT_PRESENTATIONS.LEGACY) {
     throw new BindingError('attachment presentation is only supported for agent messages');
   }
   const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: isAgentMessage });
+  if (fileRequested && explicitRequestId === undefined) throw new BindingError('file posts require an explicit dedupe-key');
+  let source = fileRequested
+    ? prepareFileSource({ state, requestId: explicitRequestId as string, textFile, attachmentFile, resume, stateDir,
+      binding, operatorId, inReplyTo })
+    : readTextFile(textFile);
+  const effectiveReplyTarget = source.filePreparation?.inReplyTo ?? replyTarget;
   let deliveryTarget: AgentAddress | null = null;
   let agentPacket: AgentMessage | null = null;
   const address = isAgentMessage ? resolveAgentAddress(state, binding, agentThreadId) : canonicalAddress(binding);
@@ -528,7 +668,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       displayParts: [agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT ? agentMessagePreview(packet) : wire]
     };
   }
-  const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, replyTarget);
+  const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, effectiveReplyTarget);
   state.recoverDirectPostReceipts();
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;
@@ -538,7 +678,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
       break;
     }
-    const meta = partMeta(binding, operatorId, requestId, replyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket);
+    const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     if (deliveryTarget !== null) {
       let existing;
@@ -612,14 +752,15 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
         agentAttachment: isAgentMessage && agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT
           ? Buffer.from(source.parts[partIndex], 'utf8')
           : null,
+        fileAttachment: source.fileManifest ? { bytes: readDirectPostFileSnapshot(source.fileManifest), filename: source.fileManifest.filename } : null,
         nonce: claim.nonce,
-        messageReference: replyTarget === null ? null : { message_id: replyTarget, channel_id: binding.channelId, fail_if_not_exists: true },
+        messageReference: effectiveReplyTarget === null ? null : { message_id: effectiveReplyTarget, channel_id: binding.channelId, fail_if_not_exists: true },
         signal, fetchImpl, timeoutMs });
       const outcome = state.recordDirectPostOutcome(requestId, claim.attemptId, 'sent', { messageId: String(sent.id), status: 200 });
       parts.push({ index: partIndex, status: outcome.outcome, messageId: outcome.messageId });
       recorded = true;
     } catch (error) {
-      const outcome = outcomeFor(error);
+      const outcome = source.fileManifest && error instanceof DirectPostFileSnapshotError ? 'not_sent' : outcomeFor(error);
       const recorded = state.recordDirectPostOutcome(requestId, claim.attemptId, outcome, { status: errorStatus(error) || null, error: errorMessage(error).slice(0, 300) });
       parts.push({ index: partIndex, status: recorded.outcome, messageId: recorded.messageId || null });
       break;
@@ -627,8 +768,9 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   }
   const status = parts.every(part => part.status === 'sent') ? 'sent' : parts.find(part => part.status !== 'sent')?.status || 'not_sent';
   const duplicate = !claimedAny && parts.length > 0 && parts.every(part => part.status === 'sent');
-  return { requestId, dedupeKey: requestId, inReplyTo: replyTarget, channelId: deliveryTarget?.channelId || binding.channelId, provider: binding.provider,
+  return { requestId, dedupeKey: requestId, inReplyTo: effectiveReplyTarget, channelId: deliveryTarget?.channelId || binding.channelId, provider: binding.provider,
     nativeId: binding.nativeId, generation: binding.generation, status, state: status, recorded, duplicate,
+    ...(source.fileManifest ? { filePreparationId: source.fileManifest.preparationId } : {}),
     messageIds: parts.filter((part): part is DirectPostPartResult & { messageId: string } => typeof part.messageId === 'string')
       .map(part => part.messageId), parts };
 }

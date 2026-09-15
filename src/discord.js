@@ -15,6 +15,7 @@ const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, TRANSPORT
 const { COURIER_OUTCOMES, COURIER_RESULT_STATUSES, isCourierOriginAllowed } = require('./state/courier-route');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
+const { DIRECT_POST_FILE_LIMITS } = require('./direct-post-file');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
@@ -203,11 +204,16 @@ async function readRetryAfter(response) {
 }
 
 async function sendDiscordMessage({ token, channelId, content, nonce, signal, timeoutMs = RECOVERY_LIMITS.timeoutMs,
-  fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] }, agentAttachment = null, components = null }) {
+  fetchImpl = globalThis.fetch, messageReference = null, allowedMentions = { parse: [] }, agentAttachment = null, fileAttachment = null, components = null }) {
   if (typeof fetchImpl !== 'function') throw Object.assign(new Error('Discord message fetch is unavailable'), { outcome: 'not_sent' });
   if (signal?.aborted) throw Object.assign(new Error('Discord message send stopped before request'), { outcome: 'not_sent' });
   if (agentAttachment !== null && (!Buffer.isBuffer(agentAttachment) || agentAttachment.length === 0 || agentAttachment.length > AGENT_ATTACHMENT_MAX_BYTES)) {
     throw Object.assign(new Error('agent attachment is outside the bounded wire limit'), { outcome: 'not_sent' });
+  }
+  if (agentAttachment !== null && fileAttachment !== null) throw Object.assign(new Error('Discord message cannot carry both attachment kinds'), { outcome: 'not_sent' });
+  if (fileAttachment !== null && (!fileAttachment || !Buffer.isBuffer(fileAttachment.bytes) || fileAttachment.bytes.length > DIRECT_POST_FILE_LIMITS.maxBytes ||
+      typeof fileAttachment.filename !== 'string' || !fileAttachment.filename || path.basename(fileAttachment.filename) !== fileAttachment.filename || fileAttachment.filename.length > 255)) {
+    throw Object.assign(new Error('file attachment is outside the bounded wire limit'), { outcome: 'not_sent' });
   }
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -231,7 +237,7 @@ async function sendDiscordMessage({ token, channelId, content, nonce, signal, ti
         },
         signal: controller.signal
       };
-      if (agentAttachment === null) {
+      if (agentAttachment === null && fileAttachment === null) {
         request.headers['Content-Type'] = 'application/json';
         request.body = JSON.stringify(payload);
       } else {
@@ -240,7 +246,10 @@ async function sendDiscordMessage({ token, channelId, content, nonce, signal, ti
         }
         const form = new FormData();
         form.append('payload_json', JSON.stringify(payload));
-        form.append('files[0]', new Blob([agentAttachment], { type: AGENT_ATTACHMENT_CONTENT_TYPE }), AGENT_ATTACHMENT_FILENAME);
+        const bytes = agentAttachment === null ? fileAttachment.bytes : agentAttachment;
+        const filename = agentAttachment === null ? fileAttachment.filename : AGENT_ATTACHMENT_FILENAME;
+        const contentType = agentAttachment === null ? DIRECT_POST_FILE_LIMITS.contentType : AGENT_ATTACHMENT_CONTENT_TYPE;
+        form.append('files[0]', new Blob([bytes], { type: contentType }), filename);
         request.body = form;
       }
       response = await fetchImpl(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, request);

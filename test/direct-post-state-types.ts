@@ -50,6 +50,7 @@ const state: DirectPostState = {
   directPostRows: () => [],
   directPostBindingCurrent: () => true,
   directPostOwnerIdentity: () => ({ ownerPid: 1, ownerStartTime: null, ownerCommand: null }),
+  directPostOwnerAlive: () => false,
   receipt: () => {}
 };
 
@@ -61,6 +62,7 @@ const handlers = createDirectPostHandlers({
   StaleGenerationError: class extends Error {},
   DIRECT_POST_ATTEMPT: 'direct-post-attempt',
   DIRECT_POST_OUTCOME: 'direct-post-outcome',
+  DIRECT_POST_FILE_PREPARATION: 'direct-post-file-preparation',
   DIRECT_POST_OUTCOMES: ['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale'] as const,
   bindingMatchesExpected: () => true,
   now: () => new Date().toISOString()
