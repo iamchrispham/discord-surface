@@ -64,7 +64,10 @@ interface ThreadGateway {
   fetchHistory(channel: ThreadChannel, options: { limit: number; after?: string; signal: AbortSignal }): Promise<unknown>;
   historyMessages(value: unknown): HistoryMessage[];
   normalizeFetchedMessage(message: HistoryMessage, channel: ThreadChannel): unknown;
-  consumer: { intakeMessage(message: unknown, ready: boolean, coverage: string, binding: ThreadBinding): Promise<{ stale?: boolean }> };
+  consumer: {
+    intakeMessage(message: unknown, ready: boolean, coverage: string | null, binding: ThreadBinding,
+      emitReceipt?: boolean, signal?: AbortSignal | null, deadline?: number | null, bypassBarrier?: boolean): Promise<{ stale?: boolean }>;
+  };
 }
 
 type WaitOperation = <T>(operation: () => Promise<T>, signal: AbortSignal, deadline: number) => Promise<T>;
@@ -169,7 +172,9 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
             return fenced ? recoverThread(gateway, fenced, signal, epoch, wait, false, deadline) : false;
           }
         } else {
-          const intake = await gateway.consumer.intakeMessage(gateway.normalizeFetchedMessage(message, channel), false, message.id, binding);
+          const intake = await gateway.consumer.intakeMessage(
+            gateway.normalizeFetchedMessage(message, channel), false, message.id, binding, false, signal, deadline, true
+          );
           if (intake?.stale || !current()) return false;
         }
         after = message.id;
