@@ -91,6 +91,16 @@ export interface NativeMessage {
   observerCursor?: PersistedObserverCursor | null;
 }
 
+export function agentCompletionCommand(
+  message: Pick<NativeMessage, 'id' | 'provider' | 'nativeId' | 'generation'>,
+  dbPath: string,
+  cliPath = path.join(__dirname, '..', 'src', 'cli.js')
+): string[] {
+  return [process.execPath, cliPath, 'agent-complete', '--db', dbPath,
+    '--provider', message.provider, '--message-id', message.id,
+    '--native-id', message.nativeId, '--generation', String(message.generation)];
+}
+
 export interface NativeBinding {
   sessionRoot?: string | null;
 }
@@ -354,9 +364,19 @@ export function messageRequest(message: NativeMessage): string {
   ].filter(line => line !== '').join('\n');
 }
 
-export function codexPrompt(message: NativeMessage, acknowledgment: readonly string[] | null = null): string {
+function noPostCompletionInstruction(completion: readonly string[] | null | undefined): string | null {
+  if (!completion) return null;
+  return `If this agent packet is fully handled without a Discord reply, run this exact command once, preserving argument boundaries: ${JSON.stringify(completion)}. Do not produce a normal final response after running it.`;
+}
+
+export function codexPrompt(
+  message: NativeMessage,
+  acknowledgment: readonly string[] | null = null,
+  completion: readonly string[] | null | undefined = null
+): string {
   const marker = `[[discord-surface:${message.id}]]`;
   const isDecision = Boolean(message.decisionResult);
+  const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
   let handlingInstruction: string;
   if (isDecision) {
     handlingInstruction = 'Handle the saved canonical decision continuation using its exact identity and canonical answer. Preserve this session. Do not start another session or hand this work to another agent.';
@@ -372,6 +392,7 @@ export function codexPrompt(message: NativeMessage, acknowledgment: readonly str
     `Transport message ID: ${message.id}. Ownership generation: ${message.generation}.`,
     `Begin the final response with the exact marker ${marker} on its own line. The transport removes that marker before sending the reply.`,
     handlingInstruction,
+    ...(completionInstruction ? [completionInstruction] : []),
     '',
     messageRequest(message)
   ];
@@ -381,7 +402,7 @@ export function codexPrompt(message: NativeMessage, acknowledgment: readonly str
   return prompt.join('\n');
 }
 
-export function claudeEvent(message: NativeMessage): {
+export function claudeEvent(message: NativeMessage, completion: readonly string[] | null | undefined = null): {
   nativeId: string;
   messageId: string;
   generation: number;
@@ -389,6 +410,7 @@ export function claudeEvent(message: NativeMessage): {
   attachments?: readonly Attachment[] | null;
 } {
   const isDecision = Boolean(message.decisionResult);
+  const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
   const content = [
     isDecision
       ? `Saved canonical decision continuation ${message.id} for native Claude session ${message.nativeId}.`
@@ -396,6 +418,7 @@ export function claudeEvent(message: NativeMessage): {
     isDecision
       ? `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after handling the saved decision continuation.`
       : `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`,
+    ...(completionInstruction ? [completionInstruction] : []),
     isDecision ? 'Preserve the exact canonical identity and answer from the decision JSON. Preserve this session. Do not start or resume another session.' : 'Do not start or resume another session.',
     '',
     messageRequest(message)
@@ -817,22 +840,26 @@ export class CodexProvider implements NativeProvider {
   private readonly root: string;
   private readonly run: (command: string, args: readonly string[], options?: CodexRunOptions) => Promise<CodexRunResult>;
   private readonly acknowledgmentFor: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
+  private readonly completionFor: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
 
   constructor({
     command = 'codex',
     root = sessionRoot(),
     run = runCodex,
-    acknowledgmentFor = null
+    acknowledgmentFor = null,
+    completionFor = null
   }: {
     command?: string;
     root?: string;
     run?: (command: string, args: readonly string[], options?: CodexRunOptions) => Promise<CodexRunResult>;
     acknowledgmentFor?: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
+    completionFor?: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
   } = {}) {
     this.command = command;
     this.root = root;
     this.run = run;
     this.acknowledgmentFor = acknowledgmentFor;
+    this.completionFor = completionFor;
   }
 
   async dispatch(message: NativeMessage, { onCursor }: DispatchOptions = {}): Promise<DispatchOutcome> {
@@ -846,7 +873,8 @@ export class CodexProvider implements NativeProvider {
     }
     const cursor = readInitialCursor(message.nativeId, root);
     onCursor?.(cursor);
-    const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message, this.acknowledgmentFor?.(message)), '--cd', message.workspace];
+    const args = ['queue', '--thread', message.nativeId, '--message', codexPrompt(message,
+      this.acknowledgmentFor?.(message), this.completionFor?.(message)), '--cd', message.workspace];
     const result = await this.run(this.command, args, {
       cwd: message.workspace,
       env: { ...process.env, CODEX_HOME: codexHome }
@@ -889,16 +917,20 @@ export function postUnixJson(socketPath: string, body: unknown, { timeoutMs = 10
 export class ClaudeProvider implements NativeProvider {
   private readonly post: (socketPath: string, body: unknown) => Promise<UnixJsonResponse>;
   private readonly waitForReply?: (messageId: string, options?: WaitForReplyOptions) => Promise<WaitForReplyResult> | WaitForReplyResult | null;
+  private readonly completionFor: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
 
   constructor({
     post = postUnixJson,
-    waitForReply
+    waitForReply,
+    completionFor = null
   }: {
     post?: (socketPath: string, body: unknown) => Promise<UnixJsonResponse>;
     waitForReply?: (messageId: string, options?: WaitForReplyOptions) => Promise<WaitForReplyResult> | WaitForReplyResult | null;
+    completionFor?: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
   } = {}) {
     this.post = post;
     this.waitForReply = waitForReply;
+    this.completionFor = completionFor;
   }
 
   async dispatch(message: NativeMessage): Promise<DispatchOutcome> {
@@ -907,7 +939,7 @@ export class ClaudeProvider implements NativeProvider {
     }
     if (!message.endpoint) return { status: DISPATCH_STATUSES.NOT_SUBMITTED, endpointUnavailable: true, error: new Error('Claude binding has no native channel endpoint') };
     try {
-      const result = await this.post(message.endpoint, claudeEvent(message));
+      const result = await this.post(message.endpoint, claudeEvent(message, this.completionFor?.(message)));
       if (result.statusCode === 202) return { status: DISPATCH_STATUSES.SUBMITTED };
       if (result.statusCode !== undefined && result.statusCode >= 400 && result.statusCode < 500) return { status: DISPATCH_STATUSES.NOT_SUBMITTED, error: new Error(`Claude channel rejected event: ${result.statusCode}`) };
       return { status: DISPATCH_STATUSES.UNCERTAIN, error: new Error(`Claude channel returned ${result.statusCode}`) };

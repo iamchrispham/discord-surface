@@ -208,7 +208,8 @@ function sentReplyEvidence(
       kind: 'sent-result',
       attemptReceiptId: row.attemptReceiptId,
       outcomeReceiptId: row.outcomeReceiptId,
-      messageId: row.messageId,
+      ...(row.messageId ? { messageId: row.messageId } : {}),
+      ...(row.nonce ? { nonce: row.nonce } : {}),
       ...agentPacketEvidence(candidate)
     };
   }

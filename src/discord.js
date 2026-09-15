@@ -9,7 +9,7 @@ const {
 } = require('./agent-attachment');
 const fs = require('node:fs');
 const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
-const { CODEX_VALIDATION_KINDS, dispatchAndObserve, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
+const { CODEX_VALIDATION_KINDS, dispatchAndObserve, agentCompletionCommand, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, TRANSPORT_RECEIPT_OUTCOMES, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
@@ -1087,9 +1087,16 @@ class DiscordGateway {
       state,
       send: (message, reaction) => this.sendAcknowledgment(message, reaction)
     });
+    const completionFor = message => message.agentMessage ? agentCompletionCommand(message, state.dbPath) : null;
     this.providers = providers || {
-      codex: new CodexProvider({ acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath) }),
-      claude: new ClaudeProvider({ waitForReply: (id, options) => waitForReply(state, id, options) })
+      codex: new CodexProvider({
+        acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath),
+        completionFor
+      }),
+      claude: new ClaudeProvider({
+        waitForReply: (id, options) => waitForReply(state, id, options),
+        completionFor
+      })
     };
     this.ordinaryNativePreflight = recoveryOptions.ordinaryNativePreflight || (async (binding, options = {}) => {
       if (binding.provider === 'codex') return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, binding.sessionRoot || this.codexSessionRoot, options);

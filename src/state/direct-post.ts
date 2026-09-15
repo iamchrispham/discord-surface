@@ -76,7 +76,8 @@ export interface DirectPostState {
 export interface SentAgentResultRow {
   attemptReceiptId: number;
   outcomeReceiptId: number;
-  messageId: string;
+  messageId?: string;
+  nonce?: string;
   attemptDetail: DirectPostReceiptDetail;
   outcomeDetail: DirectPostReceiptDetail;
 }
@@ -282,8 +283,7 @@ export function querySentAgentResultRows(
     "json_extract(outcome.detail, '$.journal')='direct-post-v1'",
     "json_extract(outcome.detail, '$.attemptId')=json_extract(attempt.detail, '$.attemptId')",
     "json_extract(outcome.detail, '$.outcome')='sent'",
-    "typeof(json_extract(outcome.detail, '$.messageId'))='text'",
-    "json_extract(outcome.detail, '$.messageId')<>''",
+    "((typeof(json_extract(outcome.detail, '$.messageId'))='text' AND json_extract(outcome.detail, '$.messageId')<>'') OR (typeof(json_extract(outcome.detail, '$.nonce'))='text' AND json_extract(outcome.detail, '$.nonce')<>'' AND json_extract(outcome.detail, '$.nonce')=json_extract(attempt.detail, '$.nonce')))",
     "json_extract(attempt.detail, '$.channelId')=?"
   ];
   const parameters: unknown[] = [outcomeKind, attemptKind, channelId];
@@ -306,12 +306,16 @@ export function querySentAgentResultRows(
   return rows.flatMap(row => {
     const attemptDetail = parseJson(row.attempt_detail, null);
     const outcomeDetail = parseJson(row.outcome_detail, null);
-    const messageId = outcomeDetail?.messageId;
-    if (!attemptDetail || !outcomeDetail || typeof messageId !== 'string' || !messageId) return [];
+    const messageId = typeof outcomeDetail?.messageId === 'string' && outcomeDetail.messageId ? outcomeDetail.messageId : null;
+    const nonce = typeof outcomeDetail?.nonce === 'string' && outcomeDetail.nonce && outcomeDetail.nonce === attemptDetail?.nonce
+      ? outcomeDetail.nonce
+      : null;
+    if (!attemptDetail || !outcomeDetail || (!messageId && !nonce)) return [];
     return [{
       attemptReceiptId: Number(row.attempt_receipt_id),
       outcomeReceiptId: Number(row.outcome_receipt_id),
-      messageId,
+      ...(messageId ? { messageId } : {}),
+      ...(nonce ? { nonce } : {}),
       attemptDetail,
       outcomeDetail
     }];

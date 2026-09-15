@@ -1016,7 +1016,7 @@ test('agent request completion requires a full reversed result receipt', () => {
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('request completion ignores unknown direct-result custody', async () => {
+test('request completion accepts nonce-only direct-result reconciliation', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-handled-unknown-result-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
@@ -1043,7 +1043,16 @@ test('request completion ignores unknown direct-result custody', async () => {
     assert.equal(state.directPostRows('a2-unknown-result').at(-1).detail.outcome, 'unknown');
     assert.throws(() => state.completeAgentHandledWithoutPost({ messageId,
       provider: owners.target.provider, nativeId: owners.target.nativeId, generation: owners.target.generation }), /immutable correlated result/);
-    assert.equal(state.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
+    const attempt = state.directPostRows('a2-unknown-result').find(row => row.kind === 'direct-post-attempt');
+    state.reconcileDirectPostOutcome('a2-unknown-result', attempt.detail.attemptId, 'sent', {
+      source: 'operator-reconciliation', nonce: attempt.detail.nonce
+    });
+    const completed = state.completeAgentHandledWithoutPost({ messageId,
+      provider: owners.target.provider, nativeId: owners.target.nativeId, generation: owners.target.generation });
+    assert.equal(completed.evidence.kind, 'sent-result');
+    assert.equal(completed.evidence.nonce, attempt.detail.nonce);
+    assert.equal(completed.evidence.messageId, undefined);
+    assert.equal(state.getMessage(messageId).state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
