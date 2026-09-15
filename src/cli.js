@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const { issueAgentAddress, verifyAgentAddress } = require('./agent-message');
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, issueAgentAddress, verifyAgentAddress } = require('./agent-message');
 
 const fs = require('node:fs');
 const { resolveAgentAddress, resolveDedupeKey, resolveDirectBinding, runDirectPost } = require('./direct-post');
@@ -90,6 +90,32 @@ function openState(args) {
 
 function print(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+const GENERAL_USAGE = `Usage: discord-surface <command> [options]
+
+Commands: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind,
+status, recover, board-refresh, thread-enroll, provision, handoff, start, stop,
+claude-channel, claude-monitor, native-ack, claude-reply, agent-address,
+agent-send, post, ordinary-post, ordinary-claude-post, claude-post,
+decision-present, liaison draft
+
+Use \"discord-surface agent-send --help\" for addressed agent-message options.
+`;
+
+const AGENT_SEND_USAGE = `Usage: discord-surface agent-send --provider PROVIDER --channel-id CHANNEL_ID \\
+  --native-id NATIVE_UUID --generation GENERATION --target-file ADDRESS_FILE \\
+  --text-file TEXT_FILE --dedupe-key KEY [--agent-thread-id THREAD_ID] \\
+  [--agent-presentation MODE]
+
+For an agent result, use --agent-reply-to REQUEST_ID instead of --target-file.
+MODE must be legacy or attachment-v1.
+Agent packets must fit in one Discord message. The limit is ${AGENT_MESSAGE_MAX_ENCODED_LENGTH} encoded characters, including the envelope and signature.
+Usable text varies with envelope metadata, UTF-8 width, and JSON escaping.
+`;
+
+function printUsage(command) {
+  process.stdout.write(command === 'agent-send' ? AGENT_SEND_USAGE : GENERAL_USAGE);
 }
 
 function configure(args) {
@@ -1979,6 +2005,7 @@ function stop(args) {
 
 async function main() {
   const { command, subcommand, args } = parseArgs(process.argv.slice(2));
+  if (command === 'help' || args.help) return printUsage(command === 'help' ? subcommand : command);
   switch (command) {
     case 'configure': return configure(args);
     case 'bind': return bind(args);
