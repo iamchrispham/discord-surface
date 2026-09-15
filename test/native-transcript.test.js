@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { findCodexSessionFile, observeCodexReply, readInitialCursor, validateCodexSessionIdentityAsync } = require('../src/native');
+const { SurfaceState, MESSAGE_STATES, REPLY_COMPLETED_WITHOUT_POST } = require('../src/state');
+const { createSurfaceConsumer } = require('../src/discord');
 
 const ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const MARKER = '[[discord-surface:bounded-read]]';
@@ -29,6 +31,22 @@ function fixture(t, size = 256) {
 
 function cursorAt(file, offset = fs.statSync(file).size) {
   return { file, offset, since: 1, tail: '', tailBytes: '' };
+}
+
+function surfaceFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-native-custody-'));
+  const sessionRoot = path.join(root, 'sessions');
+  fs.mkdirSync(sessionRoot);
+  const file = path.join(sessionRoot, `${ID}.jsonl`);
+  fs.writeFileSync(file, META);
+  const state = new SurfaceState(path.join(root, 'surface.sqlite'));
+  state.setConfig({ operatorId: 'operator-1', guildId: 'guild-1', secretFile: path.join(root, 'discord.secret') });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: ID, workspace: root, sessionRoot });
+  t.after(() => {
+    try { state.close(); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return { file, root, sessionRoot, state };
 }
 
 function finalRow(text, { marker = MARKER, timestamp = new Date(Date.now() + 60000).toISOString() } = {}) {
@@ -342,6 +360,7 @@ test('Discord text removes only a top-level created-thread directive', async t =
   const { file } = fixture(t);
   const cursor = cursorAt(file);
   const reply = [
+    '::created-thread{threadId="inline-example"} is an example, not an app directive.',
     'Keep this prose.',
     '::created-thread{threadId="01a0a411-9b29-7c41-b6a4-227fe89ada0c"}',
     '::created-thread{clientThreadId="client-queued-1"}',
@@ -362,6 +381,7 @@ test('Discord text removes only a top-level created-thread directive', async t =
   fs.appendFileSync(file, finalRow(reply));
   const result = await observe(file, cursor);
   assert.equal(result.text, [
+    '::created-thread{threadId="inline-example"} is an example, not an app directive.',
     'Keep this prose.',
     '```text',
     '::created-thread{threadId="inside-code"}',
@@ -377,6 +397,80 @@ test('Discord text removes only a top-level created-thread directive', async t =
     '> ::created-thread{threadId="quoted"}',
     '`::created-thread{threadId="inline"}`'
   ].join('\n'));
+});
+
+test('Discord directive sanitization preserves fence state across reply partitions', async t => {
+  const { file } = fixture(t);
+  const cursor = cursorAt(file);
+  const reply = ['```text', 'x'.repeat(1990), '::created-thread{threadId="inside-partitioned-code"}', '```'].join('\n');
+  fs.appendFileSync(file, finalRow(reply));
+  const result = await observe(file, cursor);
+  assert.equal(result.text, reply);
+  assert.equal(result.parts.join(''), reply);
+  assert.equal(result.parts.length, 2);
+});
+
+test('Discord directive sanitization preserves a line split before an inline example', async t => {
+  const { file } = fixture(t);
+  const cursor = cursorAt(file);
+  const reply = `${'x'.repeat(2000)}::created-thread{threadId="inline-partition"}\nfollowing prose`;
+  fs.appendFileSync(file, finalRow(reply));
+  const result = await observe(file, cursor);
+  assert.equal(result.text, reply);
+  assert.equal(result.parts.join(''), reply);
+});
+
+test('directive-only final completes custody without an empty Discord send', async t => {
+  const { file, sessionRoot, state } = surfaceFixture(t);
+  const messageId = 'directive-only';
+  const cursor = cursorAt(file);
+  fs.appendFileSync(file, finalRow('::created-thread{threadId="created-child"}', { marker: `[[discord-surface:${messageId}]]` }));
+  const accepted = state.acceptDiscordMessage({
+    id: messageId,
+    guildId: 'guild-1',
+    channelId: 'channel-codex',
+    authorId: 'operator-1',
+    isBot: false,
+    content: 'create a child',
+    attachments: []
+  });
+  assert.equal(accepted.accepted, true);
+  let dispatches = 0;
+  let sends = 0;
+  const provider = {
+    async dispatch(message) {
+      dispatches += 1;
+      assert.equal(message.nativeId, ID);
+      return { status: 'submitted', cursor };
+    },
+    observe(message, outcome, options) {
+      return observeCodexReply(message.nativeId, outcome.cursor, {
+        ...options,
+        marker: `[[discord-surface:${message.id}]]`,
+        root: sessionRoot,
+        pollMs: 1,
+        timeoutMs: 100
+      });
+    }
+  };
+  const consumer = createSurfaceConsumer({
+    state,
+    providers: { codex: provider },
+    sendReply: async () => {
+      sends += 1;
+      return { id: 'unexpected-empty-reply' };
+    }
+  });
+  const result = await consumer.processAccepted(accepted.message, undefined, { continueUntilFinal: false });
+  assert.equal(dispatches, 1);
+  assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
+  assert.equal(result.message.replyText, '');
+  assert.deepEqual(result.message.replyParts, []);
+  assert.equal(sends, 0);
+  assert.equal(state.listReceipts().filter(receipt => receipt.discord_id === messageId && receipt.kind === REPLY_COMPLETED_WITHOUT_POST).length, 1);
+  assert.throws(() => state.recordNativeReply({
+    provider: 'codex', messageId, nativeId: ID, generation: 1, text: ''
+  }), /reply text must be a non-empty string/);
 });
 
 test('header and tail descriptors close on read/stat failures', async t => {
