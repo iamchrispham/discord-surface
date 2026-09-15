@@ -263,6 +263,48 @@ test('recovery resumes an admitted click without repeating its callback and pres
   assert.equal(recoveredState.listMessages().filter(message => message.decisionResult).length, 1);
 });
 
+test('restart recovery classifies an interrupted callback without resending it', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId: 'restart-callback',
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'hold',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  f.state.close();
+
+  const recoveredState = new SurfaceState(f.db);
+  recoveredState.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(f.dir, 'discord.secret') });
+  const restart = recoveredState.recoverAfterRestart();
+  assert.equal(restart.interactionCallbacks, 0);
+  assert.equal(recoveredState.getDecisionClick('restart-callback').callbackOutcome, 'unknown');
+  let recoveryCallbacks = 0;
+  const recoveredGateway = new DiscordGateway({
+    state: recoveredState,
+    client: f.gateway.client,
+    providers: { codex: { async dispatch(message) { f.dispatches.push(message); return { status: 'submitted' }; } } },
+    interactionFetch: async () => {
+      recoveryCallbacks += 1;
+      throw new Error('restart recovery must not repeat component callback');
+    }
+  });
+  t.after(async () => { await recoveredGateway.stop(); recoveredState.close(); });
+  const remaining = await recoveredGateway.startDecisionRecovery(new AbortController().signal);
+  const click = recoveredState.getDecisionClick('restart-callback');
+
+  assert.deepEqual(remaining, []);
+  assert.equal(recoveryCallbacks, 0);
+  assert.equal(click.callbackOutcome, 'unknown');
+  assert.equal(click.canonical.answer, 'hold');
+  assert.equal(recoveredState.interactionResponseTarget('restart-callback'), f.presentation.messageId);
+  assert.equal(recoveredState.listMessages().filter(message => message.decisionResult).length, 1);
+});
+
 test('ordinary recovery is returned while decision recovery remains independently pending', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const admitted = f.state.admitDecisionClickAndBeginCallback({

@@ -356,6 +356,18 @@ export function createDecisionHandlers(): DecisionHandlers {
       });
     },
 
+    recoverCallbackAttemptsAfterRestart(state) {
+      const interrupted = [...snapshot(state).clicks.values()].filter(click => click.callbackAttempted && !click.callbackOutcome);
+      for (const click of interrupted) {
+        append(state, DECISION_RECEIPT_KINDS.CALLBACK_OUTCOME, {
+          interactionId: click.interactionId,
+          outcome: DECISION_TRANSPORT_OUTCOMES.UNKNOWN,
+          reason: 'process stopped before decision callback outcome'
+        });
+      }
+      return interrupted.length;
+    },
+
     importWinner(state, interactionId, rawResult) {
       const id = text(interactionId, 'interactionId', 256);
       const result: DecisionCanonicalResult = {

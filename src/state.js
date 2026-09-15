@@ -2494,6 +2494,7 @@ class SurfaceState {
         });
       }
       const interactionCallbacks = this.recoverInteractionCallbacksInTransaction(ownerAlive);
+      decisionHandlers.recoverCallbackAttemptsAfterRestart(this);
       const dispatching = this.db.prepare('SELECT discord_id FROM messages WHERE state=?').all(MESSAGE_STATES.DISPATCHING);
       for (const row of dispatching) {
         const message = this.getMessage(row.discord_id);
