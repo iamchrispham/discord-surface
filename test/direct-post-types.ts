@@ -35,7 +35,11 @@ const state: DirectPostState = {
   recordDirectPostPreflight: (_meta, outcome) => ({ outcome }),
   beginDirectPostPart: meta => ({ claimed: true, status: 'claimed', attemptId: meta.attemptId, nonce: meta.nonce }),
   directPostBindingCurrent: () => true,
-  recordDirectPostOutcome: (_requestId, _attemptId, outcome) => ({ outcome, messageId: 'message' })
+  directPostOwnerIdentity: () => ({ ownerPid: 1, ownerStartTime: null, ownerCommand: null }),
+  recordDirectPostOutcome: (_requestId, _attemptId, outcome) => ({ outcome, messageId: 'message' }),
+  directPostFilePreparation: () => null,
+  beginDirectPostFilePreparation: seed => seed as never,
+  admitDirectPostFilePreparation: (_preparationId, manifest) => manifest as never
 };
 
 const fetchImpl: FetchImplementation = async (_url, _options) => ({

@@ -7,6 +7,7 @@ const { normalizeAttachments } = require('./attachments');
 const { ORDINARY_RECEIPT_KINDS } = require('./ordinary/constants');
 const { createOrdinaryRepository } = require('./ordinary');
 const { createDirectPostHandlers, queryDirectPostRows, DIRECT_POST_OUTCOMES } = require('./state/direct-post');
+const { removeDirectPostFile } = require('./direct-post-file');
 const { createAgentCompletionHandlers } = require('./state/agent-completion');
 const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = require('./state/board-refresh');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
@@ -92,6 +93,7 @@ const REPLY_COMPLETED_WITHOUT_POST = 'reply-completed-without-post';
 
 const DIRECT_POST_ATTEMPT = 'direct-post-attempt';
 const DIRECT_POST_OUTCOME = 'direct-post-outcome';
+const DIRECT_POST_FILE_PREPARATION = 'direct-post-file-preparation';
 const DISPATCH_OUTCOMES = Object.freeze({ NOT_SUBMITTED: 'not_submitted' });
 
 const ACTIVE_STATES = new Set([
@@ -133,6 +135,7 @@ const directPostHandlers = createDirectPostHandlers({
   StateCorruptError,
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
+  DIRECT_POST_FILE_PREPARATION,
   DIRECT_POST_OUTCOMES,
   assertText,
   bindingMatchesExpected,
@@ -2669,6 +2672,27 @@ class SurfaceState {
       attemptKind: DIRECT_POST_ATTEMPT,
       outcomeKind: DIRECT_POST_OUTCOME
     }, requestId, channelId);
+  }
+
+  directPostFilePreparation(requestId) {
+    return directPostHandlers.findDirectPostFilePreparation(this, requestId);
+  }
+
+  beginDirectPostFilePreparation(seed) {
+    return directPostHandlers.beginDirectPostFilePreparation(this, seed);
+  }
+
+  admitDirectPostFilePreparation(preparationId, manifest) {
+    return directPostHandlers.admitDirectPostFilePreparation(this, preparationId, manifest);
+  }
+
+  releaseDirectPostFilePreparation(preparationId) {
+    return directPostHandlers.releaseDirectPostFilePreparation(this, preparationId, preparation => {
+      const stateDir = typeof preparation.custodyRoot === 'string'
+        ? preparation.custodyRoot
+        : path.dirname(path.dirname(preparation.stagedPath));
+      removeDirectPostFile({ stateDir, preparationId, stagedPath: preparation.stagedPath });
+    });
   }
 
   directPostOwnerIdentity(pid) {

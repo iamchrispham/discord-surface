@@ -380,6 +380,40 @@ Repeat the same key, target and unchanged file to inspect or resume the same mil
 
 No native session, channel binding, automatic publication selection or phone configuration is changed. A successful receipt means Discord accepted the returned message IDs, not that the operator read them.
 
+### Direct-post local files
+
+The `post`, `ordinary-post`, `ordinary-claude-post` and `claude-post` commands can carry one regular local file beside one non-empty caption. Supply `--attachment-file FILE`, `--text-file CAPTION_FILE` and an explicit `--dedupe-key`. The file is copied into private state before the Discord request, hashed, and sent as the recorded snapshot. Files up to 20 MiB are accepted, including empty regular files. Eight file preparations can remain reserved at once.
+
+```sh
+node src/cli.js post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
+  --text-file /absolute/path/to/caption.txt \
+  --attachment-file /absolute/path/to/report.pdf \
+  --dedupe-key FILE_KEY
+```
+
+Resume is explicit and uses the same key. It reads the admitted snapshot, so the original caption and file can be absent. Omit `--in-reply-to` on resume so the recorded reference is restored. Replacement `--text-file`, `--attachment-file`, or `--in-reply-to` inputs are refused, as are binding or destination changes.
+
+The direct-post result includes `filePreparationId` for the named cleanup command.
+
+```sh
+node src/cli.js post \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
+  --resume --dedupe-key FILE_KEY
+```
+
+An unknown network outcome retains the snapshot and must be reconciled before cleanup. After the network outcome is resolved, release a named preparation using its recorded preparation ID:
+
+```sh
+node src/cli.js post-file-cleanup \
+  --state-dir "$HOME/.config/discord-surface" \
+  --preparation-id PREPARATION_ID
+```
+
+Cleanup deletes only the state-owned snapshot and releases its reservation. Native reply uploads and signed agent attachment delivery use separate contracts.
+
 
 ## Decision presentations
 

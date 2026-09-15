@@ -109,6 +109,7 @@ Commands: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind,
 status, recover, board-refresh, thread-enroll, provision, handoff, start, stop,
 claude-channel, claude-monitor, native-ack, claude-reply, agent-address,
 agent-send, agent-complete, post, ordinary-post, ordinary-claude-post, claude-post,
+post-file-cleanup,
 decision-present, liaison draft
 
 Start options: --state-dir DIR [--courier-route-id ROUTE_ID]
@@ -1859,7 +1860,7 @@ async function assertOrdinaryPostCaller(state, { provider, nativeId, generation,
 }
 
 async function directPost(args, provider = null, ordinary = false, dependencies = {}) {
-  const { state } = openState(args);
+  const { paths, state } = openState(args);
   const controller = new AbortController();
   let receivedSignal = null;
   const handleSignal = signal => {
@@ -1873,6 +1874,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
     const config = state.requireConfig();
     const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: !dependencies.exportAddress });
     const hasAgentReplyTo = Object.hasOwn(args, 'agent-reply-to');
+    const resume = Boolean(args.resume);
     if (hasAgentReplyTo && !args['agent-reply-to']) throw new Error('agent reply correlation must not be empty');
     const nativeId = required(args, 'native-id');
     const generation = required(args, 'generation');
@@ -1893,13 +1895,16 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       channelId,
       provider,
       agentThreadId: dependencies.agentThreadId ?? null,
-      textFile: required(args, 'text-file'),
+      textFile: Object.hasOwn(args, 'text-file') ? required(args, 'text-file') : undefined,
+      attachmentFile: Object.hasOwn(args, 'attachment-file') ? required(args, 'attachment-file') : undefined,
+      resume,
+      stateDir: paths.stateDir,
       agentTarget: dependencies.agentTarget ?? null,
       agentPresentation: dependencies.agentPresentation,
       agentKind: hasAgentReplyTo ? 'result' : 'request',
       agentReplyTo: hasAgentReplyTo ? args['agent-reply-to'] : null,
       dedupeKey,
-      inReplyTo: args['in-reply-to'] === undefined ? null : args['in-reply-to'],
+      inReplyTo: args['in-reply-to'],
       signal: controller.signal,
       ordinary
     });
@@ -1912,6 +1917,15 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
     process.removeListener('SIGTERM', handleSignal);
     state.close();
   }
+}
+
+function directPostFileCleanup(args) {
+  const { state } = openState(args);
+  try {
+    const result = state.releaseDirectPostFilePreparation(required(args, 'preparation-id'));
+    print(result);
+    return result;
+  } finally { state.close(); }
 }
 
 function agentComplete(args, dependencies = {}) {
@@ -2143,6 +2157,7 @@ async function main() {
     case 'ordinary-post': return directPost(args, 'codex', true);
     case 'ordinary-claude-post': return directPost(args, 'claude', true);
     case 'claude-post': return directPost(args, 'claude');
+    case 'post-file-cleanup': return directPostFileCleanup(args);
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
@@ -2150,7 +2165,7 @@ async function main() {
   }
 }
 
-module.exports = { agentComplete, bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, start, threadEnroll, unbind };
+module.exports = { agentComplete, bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, start, threadEnroll, unbind };
 
 if (require.main === module) {
   main().catch(error => {
