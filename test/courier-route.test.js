@@ -108,14 +108,38 @@ test('public start forwards only an existing explicit courier route', t => {
     else process.exitCode = priorExitCode;
   }
   assert.equal(calls.length, 1);
-  const routeIndex = calls[0].args.lastIndexOf('--courier-route-id');
-  assert.equal(calls[0].args[routeIndex + 1], f.route.routeId);
+  assert.ok(calls[0].args.includes(`--courier-route-id=${f.route.routeId}`));
   assert.throws(() => start(parseArgs(['start', '--state-dir', f.dir, '--courier-route-id', 'missing']).args, {
     spawnSync() { throw new Error('start must reject before spawning'); }
   }), /courier route is unknown: missing/);
   assert.throws(() => start(parseArgs(['start', '--state-dir', f.dir, '--courier-route-id']).args, {
     spawnSync() { throw new Error('start must reject before spawning'); }
   }), /missing --courier-route-id/);
+});
+
+test('public start reparses route IDs containing equals from the captured child argv', t => {
+  for (const routeId of ['route=one', '--route=one']) {
+    const f = fixture(t);
+    f.state.registerCourierRoute({ ...f.route, routeId });
+    const parsed = parseArgs(['start', '--state-dir', f.dir, '--db', f.dbPath, `--courier-route-id=${routeId}`]);
+    const calls = [];
+    const priorExitCode = process.exitCode;
+    try {
+      start(parsed.args, {
+        spawnSync(command, args) {
+          calls.push({ command, args });
+          return { status: 0 };
+        }
+      });
+    } finally {
+      if (priorExitCode === undefined) delete process.exitCode;
+      else process.exitCode = priorExitCode;
+    }
+    assert.equal(calls.length, 1);
+    const childStart = calls[0].args.lastIndexOf(process.execPath);
+    const child = parseArgs(calls[0].args.slice(childStart + 2));
+    assert.deepEqual(resolveCourierRoute(f.state, child.args), { routeId });
+  }
 });
 
 test('public run passes explicit courier route into Gateway construction', t => {

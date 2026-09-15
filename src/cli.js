@@ -56,7 +56,10 @@ function parseArgs(argv) {
       positional.push(value);
       continue;
     }
-    const [key, inline] = value.slice(2).split('=', 2);
+    const raw = value.slice(2);
+    const equalsIndex = raw.indexOf('=');
+    const key = equalsIndex === -1 ? raw : raw.slice(0, equalsIndex);
+    const inline = equalsIndex === -1 ? undefined : raw.slice(equalsIndex + 1);
     if (inline !== undefined) args[key] = inline;
     else if (argv[i + 1] && !argv[i + 1].startsWith('--')) args[key] = argv[++i];
     else args[key] = true;
@@ -1639,7 +1642,7 @@ function start(args, dependencies = {}) {
   const guildLock = path.join(runtimeDir, `guild-${config.guildId}.lock`);
   const runArgs = [process.execPath, __filename, 'run', '--state-dir', stateDir,
     ...(args.db ? ['--db', path.resolve(args.db)] : []),
-    ...(courierRoute ? ['--courier-route-id', courierRoute.routeId] : [])];
+    ...(courierRoute ? [`--courier-route-id=${courierRoute.routeId}`] : [])];
   const result = (dependencies.spawnSync || spawnSync)('lockf', ['-t', '0', '-k', guildLock, 'lockf', '-t', '0', '-k', lock, ...runArgs], {
     stdio: 'inherit',
     env: { ...process.env, DISCORD_SURFACE_LOCK_HELD: '1' }
