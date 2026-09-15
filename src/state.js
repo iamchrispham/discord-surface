@@ -82,6 +82,7 @@ const TRANSPORT_RECEIPT_ATTEMPT = 'transport-receipt-attempt';
 const TRANSPORT_RECEIPT_OUTCOME = 'transport-receipt-outcome';
 const TRANSPORT_RECEIPT_OUTCOMES = Object.freeze(['sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale']);
 const NATIVE_ACK_RECEIPT = 'native-ack';
+const REPLY_COMPLETED_WITHOUT_POST = 'reply-completed-without-post';
 
 const DIRECT_POST_ATTEMPT = 'direct-post-attempt';
 const DIRECT_POST_OUTCOME = 'direct-post-outcome';
@@ -2370,12 +2371,13 @@ class SurfaceState {
     });
   }
 
-  recordNativeReply({ provider, messageId, nativeId, generation, text }) {
+  recordNativeReply({ provider, messageId, nativeId, generation, text, parts: prepartitionedParts }) {
     assertProvider(provider);
     assertText(messageId, 'messageId', 128);
     assertUuid(nativeId);
     if (!Number.isInteger(generation) || generation < 1) throw new StaleGenerationError('invalid generation');
-    assertText(text, 'reply text', 10000);
+    const hasPrepartitionedParts = Array.isArray(prepartitionedParts);
+    if (!(hasPrepartitionedParts && text === '')) assertText(text, 'reply text', 10000);
     try {
       return this.transaction(() => {
         let message = this.getMessage(messageId);
@@ -2402,7 +2404,18 @@ class SurfaceState {
         }
         if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.DISPATCHING].includes(message.state)) throw new BindingError(`reply is not accepted in state ${message.state}`);
         const timestamp = now();
-        const parts = splitReply(text);
+        const parts = hasPrepartitionedParts ? prepartitionedParts.slice() : splitReply(text);
+        if ((!parts.length && text !== '') || parts.some(part => typeof part !== 'string' || part.length > REPLY_LIMIT) || parts.join('') !== text) {
+          throw new BindingError('reply parts are invalid');
+        }
+        if (text === '' && parts.every(part => part.length === 0)) {
+          this.db.prepare('UPDATE messages SET state=?, reply_text=?, reply_nonce=?, reply_message_id=NULL, reply_next_part=0, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+            .run(MESSAGE_STATES.REPLIED, text, discordNonce(messageId, 0), timestamp, messageId, message.state);
+          this.db.prepare('DELETE FROM reply_parts WHERE discord_id=?').run(messageId);
+          this.receipt(messageId, message.state === MESSAGE_STATES.DISPATCHING ? 'native-reply-before-submit' : 'native-reply', { generation, parts: 0 });
+          this.receipt(messageId, REPLY_COMPLETED_WITHOUT_POST, { generation });
+          return { duplicate: false, message: this.getMessage(messageId) };
+        }
         this.db.prepare('UPDATE messages SET state=?, reply_text=?, reply_nonce=?, reply_next_part=0, updated_at=? WHERE discord_id=? AND state=?')
           .run(MESSAGE_STATES.REPLY_READY, text, discordNonce(messageId, 0), timestamp, messageId, message.state);
         this.db.prepare('DELETE FROM reply_parts WHERE discord_id=?').run(messageId);
@@ -2464,6 +2477,33 @@ class SurfaceState {
       } else {
         this.db.prepare('UPDATE messages SET reply_next_part=?, updated_at=? WHERE discord_id=?').run(Number(partIndex) + 1, now(), messageId);
         this.receipt(messageId, 'reply-part-sent', { partIndex, replyMessageId });
+      }
+      return this.getMessage(messageId);
+    });
+  }
+
+  markReplyPartSkipped(messageId, partIndex) {
+    return this.transaction(() => {
+      const message = this.getMessage(messageId);
+      if (!message) throw new BindingError('message is unknown');
+      if (message.state === MESSAGE_STATES.REPLIED) return message;
+      if (message.state !== MESSAGE_STATES.REPLYING) throw new BindingError(`reply is not in flight in state ${message.state}`);
+      const part = this.db.prepare('SELECT * FROM reply_parts WHERE discord_id=? AND part_index=?').get(messageId, partIndex);
+      if (!part) throw new BindingError('reply part is unknown');
+      if (part.state === 'sent') return message;
+      this.db.prepare("UPDATE reply_parts SET state='sent', message_id=NULL, error=NULL, updated_at=? WHERE discord_id=? AND part_index=?")
+        .run(now(), messageId, partIndex);
+      const remaining = this.db.prepare("SELECT COUNT(*) AS count FROM reply_parts WHERE discord_id=? AND state<>'sent'").get(messageId).count;
+      if (Number(remaining) === 0) {
+        const lastPosted = this.db.prepare("SELECT message_id FROM reply_parts WHERE discord_id=? AND state='sent' AND message_id IS NOT NULL ORDER BY part_index DESC LIMIT 1").get(messageId);
+        const replyMessageId = lastPosted?.message_id || null;
+        this.db.prepare('UPDATE messages SET state=?, reply_message_id=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
+          .run(MESSAGE_STATES.REPLIED, replyMessageId, now(), messageId, MESSAGE_STATES.REPLYING);
+        if (replyMessageId) this.receipt(messageId, 'reply-sent', { replyMessageId, skipped: true });
+        else this.receipt(messageId, REPLY_COMPLETED_WITHOUT_POST, { generation: message.generation });
+      } else {
+        this.db.prepare('UPDATE messages SET reply_next_part=?, updated_at=? WHERE discord_id=?').run(Number(partIndex) + 1, now(), messageId);
+        this.receipt(messageId, 'reply-part-skipped', { partIndex });
       }
       return this.getMessage(messageId);
     });
@@ -2963,6 +3003,7 @@ module.exports = {
   INTERACTION_ORIGIN,
   INTERACTION_TRANSPORT,
   NATIVE_ACK_RECEIPT,
+  REPLY_COMPLETED_WITHOUT_POST,
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
   DIRECT_POST_OUTCOMES,

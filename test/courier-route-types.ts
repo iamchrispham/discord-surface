@@ -32,7 +32,7 @@ const courier: CourierIdentity = {
   nativeId: courierNativeId,
   workspace: '/tmp/courier-route-types',
   sessionRoot: '/tmp/courier-route-types/sessions',
-  recipientThreadId: '33333333-3333-3333-3333-333333333333',
+  recipientThreadId: parentNativeId,
   hostId: null
 };
 const route: CourierRoute = {

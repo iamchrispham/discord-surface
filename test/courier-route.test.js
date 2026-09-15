@@ -19,7 +19,8 @@ const TOKEN = 'courier-route-fixture-token';
 const PARENT_NATIVE = '11111111-1111-1111-1111-111111111111';
 const SOURCE_NATIVE = '22222222-2222-2222-2222-222222222222';
 const COURIER_NATIVE = '33333333-3333-3333-3333-333333333333';
-const RECIPIENT_THREAD = '44444444-4444-4444-4444-444444444444';
+const RECIPIENT_THREAD = PARENT_NATIVE;
+const WRONG_RECIPIENT_THREAD = '44444444-4444-4444-4444-444444444444';
 
 function fixture(t, { packetKind = KINDS.REQUEST, includeInitialAgent = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-courier-route-'));
@@ -551,6 +552,15 @@ test('courier route registration rejects a Claude courier', t => {
   }), /courier provider must use codex provider/);
 });
 
+test('courier route registration rejects a non-parent recipient', t => {
+  const f = fixture(t);
+  assert.throws(() => f.state.registerCourierRoute({
+    ...f.route,
+    routeId: 'wrong-recipient-route',
+    courier: { ...f.route.courier, recipientThreadId: WRONG_RECIPIENT_THREAD }
+  }), /courier route recipient must match parent native identity/);
+});
+
 test('human messages reject a stale courier target', t => {
   const f = fixture(t, { includeInitialAgent: false });
   const message = humanMessage(f, 'human-stale-target');
@@ -583,6 +593,26 @@ test('persisted invalid courier routes stay held without parent fallback', async
   assert.deepEqual(parentCalls, []);
   assert.equal(f.state.getCourierAttempt(f.message.id), null);
   assert.equal(f.state.listReceipts().some(row => row.kind === 'courier-rejection'), true);
+});
+
+test('persisted wrong recipient stays stale without parent fallback', async t => {
+  const f = fixture(t);
+  const storedRoute = f.state.getCourierRoute(f.route.routeId);
+  f.state.receipt(null, 'courier-route', {
+    ...storedRoute,
+    courier: { ...storedRoute.courier, recipientThreadId: WRONG_RECIPIENT_THREAD },
+    recordedAt: new Date().toISOString()
+  });
+  const courierCalls = [];
+  const parentCalls = [];
+  const result = await consumerFor(f, { courierCalls, parentCalls }).processAccepted(f.message);
+
+  assert.equal(result.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+  assert.equal(result.message.state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(courierCalls.length, 0);
+  assert.deepEqual(parentCalls, []);
+  assert.equal(f.state.getCourierAttempt(f.message.id), null);
+  assert.equal(f.state.listReceipts().some(row => row.kind === 'courier-rejection' && JSON.parse(row.detail).reason === 'stale'), true);
 });
 
 test('Codex courier queue uses a fixed forwarding call and exact parent payload', async t => {
@@ -649,8 +679,17 @@ test('Codex courier queue uses a fixed forwarding call and exact parent payload'
   assert.equal(calls[0].options.cwd, dir);
   assert.ok(calls[0].options.env.CODEX_HOME.endsWith('/.codex'));
 
-  const mismatched = { ...envelope, recipient: { threadId: PARENT_NATIVE, hostId: 'host-local' } };
-  const rejected = await provider.dispatchCourier(mismatched);
-  assert.equal(rejected.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+  const mismatchedFixedIdentity = { ...envelope, recipient: { threadId: WRONG_RECIPIENT_THREAD, hostId: 'host-local' } };
+  const fixedIdentityRejected = await provider.dispatchCourier(mismatchedFixedIdentity);
+  assert.equal(fixedIdentityRejected.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+  assert.equal(calls.length, 1);
+
+  const mismatchedParentIdentity = {
+    ...envelope,
+    recipient: { threadId: WRONG_RECIPIENT_THREAD, hostId: 'host-local' },
+    courier: { ...envelope.courier, recipientThreadId: WRONG_RECIPIENT_THREAD }
+  };
+  const parentIdentityRejected = await provider.dispatchCourier(mismatchedParentIdentity);
+  assert.equal(parentIdentityRejected.status, COURIER_OUTCOMES.NOT_SUBMITTED);
   assert.equal(calls.length, 1);
 });

@@ -57,6 +57,10 @@ function routeComparable(route: CourierRoute): string {
   });
 }
 
+function recipientMatchesParent(route: CourierRoute, binding: any): boolean {
+  return route.courier.recipientThreadId === binding.nativeId;
+}
+
 interface RouteReceiptRow {
   id: number;
   detail: CourierRoute;
@@ -112,6 +116,7 @@ export function registerRoute(deps: CourierDependencies, state: CourierState, in
   return state.transaction(() => {
     const { binding } = bindingForRoute(deps, state, route);
     if (binding.provider !== 'codex') throw new deps.BindingError('courier route parent must use codex provider');
+    if (!recipientMatchesParent(route, binding)) throw new deps.BindingError('courier route recipient must match parent native identity');
     const existing = getRoute(deps, state, route.routeId);
     if (existing) {
       if (existing.status === COURIER_ROUTE_STATES.ACTIVE && routeComparable(existing) === routeComparable(route)) return existing;
@@ -195,6 +200,7 @@ export function findMatchingRoute(deps: CourierDependencies, state: CourierState
     generation: check.binding.generation
   };
   if (!sameAddress(route.target, expectedTarget)) return { status: COURIER_RESULT_STATUSES.STALE, route, check };
+  if (!recipientMatchesParent(route, check.binding)) return { status: COURIER_RESULT_STATUSES.STALE, route, check };
   return { status: null, route, check };
 }
 
