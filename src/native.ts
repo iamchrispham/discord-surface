@@ -34,7 +34,7 @@ export {
   walkAsync
 };
 
-const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('../src/state') as {
+const { MESSAGE_STATES, PROVIDERS, splitReply, validateNativeId } = require('../src/state') as {
   MESSAGE_STATES: {
     ACCEPTED: 'accepted';
     DISPATCHING: 'dispatching';
@@ -52,6 +52,7 @@ const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('../src/state') 
     CODEX: 'codex';
     CLAUDE: 'claude';
   };
+  splitReply: (text: string) => string[];
   validateNativeId: (value: unknown) => unknown;
 };
 
@@ -112,6 +113,7 @@ export interface NativeReplyInput {
   nativeId: string;
   generation: number;
   text: string;
+  parts?: readonly string[];
 }
 
 export interface NativeState {
@@ -173,6 +175,7 @@ export interface ObserveCodexOptions {
 
 export interface CodexObservation {
   text?: string;
+  parts?: readonly string[];
   stopped?: boolean;
   cursor: ObserverCursor;
 }
@@ -198,6 +201,7 @@ export interface ObserveOutcome {
 
 export interface ProviderObservation {
   text?: string | null;
+  parts?: readonly string[];
   stopped?: boolean;
   cursor?: PersistedObserverCursor | null;
 }
@@ -417,8 +421,57 @@ export function claudeEvent(message: NativeMessage): {
   return event;
 }
 
+const CREATED_THREAD_DIRECTIVE = /^::created-thread\{(?:threadId|clientThreadId)="[^"\r\n]+"\}$/;
 
-export function finalText(row: TranscriptRow, marker: string): string | null {
+type CodeFence = { marker: '`' | '~'; length: number };
+
+function readFenceStart(line: string): CodeFence | null {
+  const match = /^ {0,3}([`~]{3,})([^\r\n]*)$/.exec(line);
+  if (!match) return null;
+  const run = match[1];
+  const marker = run[0] as CodeFence['marker'];
+  if (!run.split('').every(char => char === marker)) return null;
+  if (marker === '`' && match[2].includes('`')) return null;
+  return { marker, length: run.length };
+}
+
+function isFenceClose(line: string, fence: CodeFence): boolean {
+  const match = /^ {0,3}([`~]{3,})[ \t]*$/.exec(line);
+  if (!match) return false;
+  const run = match[1];
+  return run[0] === fence.marker && run.length >= fence.length && run.split('').every(char => char === fence.marker);
+}
+
+function stripCreatedThreadDirectivePart(text: string, initialFence: CodeFence | null, initialLineStart: boolean): { text: string; fence: CodeFence | null; lineStart: boolean } {
+  let fence = initialFence;
+  let lineStart = initialLineStart;
+  const lines: string[] = [];
+  const rawLines = text.split('\n');
+  for (const [index, rawLine] of rawLines.entries()) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (fence) {
+      if (lineStart && isFenceClose(line, fence)) fence = null;
+    } else {
+      if (lineStart && CREATED_THREAD_DIRECTIVE.test(line)) {
+        continue;
+      }
+      if (lineStart) fence = readFenceStart(line);
+    }
+    lines.push(rawLine);
+    lineStart = index < rawLines.length - 1;
+  }
+  return { text: lines.join('\n'), fence, lineStart: text.endsWith('\n') };
+}
+
+type FinalAnswer = { text: string; parts: string[] };
+
+function sanitizeCreatedThreadDirective(text: string): FinalAnswer {
+  const sanitized = stripCreatedThreadDirectivePart(text, null, true).text.trim();
+  if (!sanitized) return { text: '', parts: [] };
+  return { text: sanitized, parts: splitReply(sanitized) };
+}
+
+function parseFinalAnswer(row: TranscriptRow, marker: string): FinalAnswer | null {
   const payload = row.payload;
   let item = null;
   let phase = null;
@@ -439,8 +492,11 @@ export function finalText(row: TranscriptRow, marker: string): string | null {
   if (!text || text.split(/\r?\n/, 1)[0].trim() !== marker) return null;
   const newline = text.indexOf('\n');
   if (newline < 0) return null;
-  const reply = text.slice(newline + 1).trim();
-  return reply || null;
+  return sanitizeCreatedThreadDirective(text.slice(newline + 1));
+}
+
+export function finalText(row: TranscriptRow, marker: string): string | null {
+  return parseFinalAnswer(row, marker)?.text ?? null;
 }
 
 function cursorTailBytes(cursor: PersistedObserverCursor | null | undefined): Buffer {
@@ -716,7 +772,7 @@ export async function observeCodexReply(
     if (file) {
       try {
         const fd = fs.openSync(file, 'r');
-        let text = null;
+        let answer: FinalAnswer | null = null;
         try {
           const end = fs.fstatSync(fd).size;
           const truncated = end < offset;
@@ -732,12 +788,12 @@ export async function observeCodexReply(
             position += bytes.length;
             let start = 0;
             for (let newline = bytes.indexOf(0x0a); newline >= 0; newline = bytes.indexOf(0x0a, start)) {
-              if (!text && (parts.length || newline > start)) {
+              if (!answer && (parts.length || newline > start)) {
                 const piece = bytes.subarray(start, newline);
                 const line = parts.length ? Buffer.concat([...parts, piece]) : piece;
                 try {
                   const row = JSON.parse(line.toString('utf8'));
-                  if (!(Date.parse(row.timestamp || '') < nextSince)) text = finalText(row, marker);
+                  if (!(Date.parse(row.timestamp || '') < nextSince)) answer = parseFinalAnswer(row, marker);
                 } catch {}
               }
               parts = [];
@@ -754,7 +810,7 @@ export async function observeCodexReply(
         } finally {
           fs.closeSync(fd);
         }
-        if (text) return { text, cursor: currentCursor() };
+        if (answer !== null) return { text: answer.text, parts: answer.parts, cursor: currentCursor() };
         onCursor?.(currentCursor());
       } catch (error) {
         const code = errorCode(error);
@@ -976,9 +1032,11 @@ export async function observeSubmitted(
     state.markObservationUnavailable(message.id, error);
     return { status: state.getMessage(message.id)?.state || message.state, message: state.getMessage(message.id), error };
   }
-  if (reply?.text) {
+  if (reply && typeof reply.text === 'string') {
     try {
-      state.recordNativeReply({ provider: message.provider, messageId: message.id, nativeId: message.nativeId, generation: message.generation, text: reply.text });
+      const nativeReply: NativeReplyInput = { provider: message.provider, messageId: message.id, nativeId: message.nativeId, generation: message.generation, text: reply.text };
+      if (reply.parts) nativeReply.parts = reply.parts;
+      state.recordNativeReply(nativeReply);
       const cursor = reply.cursor || observedCursor;
       if (cursor) state.setObserverCursor(message.id, cursor, marker);
     } catch (error) {
