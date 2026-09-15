@@ -8,8 +8,11 @@ import {
   type DirectPostInput,
   type DirectPostResult,
   type DirectPostState,
-  type FetchImplementation
+  type FetchImplementation,
+  type FetchOptions
 } from '../src/direct-post';
+import { AGENT_PRESENTATIONS, type AgentPresentation } from '../src/agent-presentation';
+import type { AgentAddressEnvelope } from '../src/agent-message';
 
 const binding: DirectPostBinding = {
   active: true,
@@ -55,6 +58,30 @@ const input: DirectPostInput = {
 
 const result: Promise<DirectPostResult> = runDirectPost(input);
 const sourcePath: string = readTextFile(input.textFile).sourcePath;
+const multipartOptions: FetchOptions = {
+  method: 'POST',
+  headers: { 'Content-Type': 'multipart/form-data' },
+  body: new FormData()
+};
+const agentPresentation: AgentPresentation = AGENT_PRESENTATIONS.ATTACHMENT;
+const agentTarget: AgentAddressEnvelope = {
+  address: {
+    guildId: binding.guildId,
+    channelId: 'target-channel',
+    provider: 'claude',
+    nativeId: '7b7d7b2b-0a61-43d0-b7f2-842f6d7fe2d1',
+    generation: 1
+  },
+  proof: 'proof'
+};
+const agentInput: DirectPostInput = {
+  ...input,
+  dedupeKey: 'agent-request',
+  agentTarget,
+  agentPresentation
+};
+// @ts-expect-error ordinary direct posts expose only the legacy presentation
+const ordinaryAttachmentInput: DirectPostInput = { ...input, agentPresentation: AGENT_PRESENTATIONS.ATTACHMENT };
 const dedupeKey: string | undefined = resolveDedupeKey({ dedupeKey: 'request' });
 const requestId: string = requestIdFor(binding, 'operator', sourcePath, 'hash', dedupeKey);
 const resolvedBinding: DirectPostBinding = resolveDirectBinding(state, {
@@ -66,6 +93,9 @@ const resolvedBinding: DirectPostBinding = resolveDirectBinding(state, {
 const invalidBinding: DirectPostBinding = { ...binding, provider: 'other' };
 
 void result;
+void multipartOptions;
+void agentInput;
+void ordinaryAttachmentInput;
 void incompleteFetchImpl;
 void requestId;
 void resolvedBinding;

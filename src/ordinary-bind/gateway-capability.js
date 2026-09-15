@@ -1,12 +1,8 @@
-const { GATEWAY_CAPABILITIES } = require('./constants');
+'use strict';
 
-function assertGatewayWakeCompatible(paths, status, runtime = undefined) {
-  const snapshot = runtime || status(paths);
-  if (!snapshot || snapshot.state === 'unknown') {
-    throw new Error('Gateway status is unknown; stop or restart it before binding');
-  }
-  if (snapshot.state !== 'running' || !snapshot.pid || snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.ordinaryBindWake)) return snapshot;
-  throw new Error('running Gateway does not support ordinary binding wake; stop or restart it before binding');
+try {
+  module.exports = require('../../dist/ordinary-bind/gateway-capability.js');
+} catch (error) {
+  if (error?.code !== 'MODULE_NOT_FOUND' || !String(error?.message || '').includes("Cannot find module '../../dist/ordinary-bind/gateway-capability.js'")) throw error;
+  throw new Error('discord-surface Gateway capability build is missing; run npm run build before starting', { cause: error });
 }
-
-module.exports = { assertGatewayWakeCompatible };

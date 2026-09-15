@@ -320,6 +320,8 @@ def parse_options():
     parser.add_argument('--state-dir', required=True)
     parser.add_argument('--db', required=True)
     parser.add_argument('--endpoint', required=False)
+    parser.add_argument('--intake-cutoff', required=False)
+    parser.add_argument('--enrollment-proof', required=False)
     parser.add_argument('--reuse', action='store_true')
     return parser.parse_args()
 
@@ -368,6 +370,10 @@ def main():
         ]
         if options.endpoint:
             commit.extend(['--endpoint', options.endpoint])
+        if options.intake_cutoff:
+            commit.extend(['--intake-cutoff', options.intake_cutoff])
+        if options.enrollment_proof:
+            commit.extend(['--enrollment-proof', options.enrollment_proof])
         if options.reuse:
             commit.append('--reuse')
         else:

@@ -51,6 +51,13 @@ function runInstalledSmoke(installedRoot, env) {
     const attachmentFacade = require(path.join(root, 'src/attachments.js'));
     const attachmentEmitted = require(path.join(root, 'dist/attachments.js'));
     assert.equal(typeof cli.main, 'function');
+    assert.equal(typeof cli.threadEnroll, 'function');
+    const threadState = require(path.join(root, 'src/state/thread-enrollment.js'));
+    const threadGateway = require(path.join(root, 'src/discord/thread-enrollment.js'));
+    assert.equal(threadState, require(path.join(root, 'dist/state/thread-enrollment.js')));
+    assert.equal(threadGateway, require(path.join(root, 'dist/discord/thread-enrollment.js')));
+    assert.equal(typeof threadState.createThreadEnrollmentHandlers, 'function');
+    assert.equal(typeof threadGateway.enrollPublicThread, 'function');
     assert.equal(typeof discord.DiscordGateway, 'function');
     assert.equal(typeof claude.ClaudeChannel, 'function');
     assert.equal(typeof discord.requireInstalled('discord.js').Client, 'function');
@@ -108,6 +115,11 @@ function main() {
     const files = new Set(pack.files.map(file => file.path));
     for (const required of ['package.json', 'src/topic.js', 'dist/topic.js', 'dist/topic.d.ts', 'src/attachments.js', 'dist/attachments.js', 'dist/attachments.d.ts']) {
       assert(files.has(required), `packed artifact is missing ${required}`);
+    }
+    for (const owner of ['state', 'discord']) {
+      for (const required of [`src/${owner}/thread-enrollment.js`, `dist/${owner}/thread-enrollment.js`, `dist/${owner}/thread-enrollment.d.ts`]) {
+        assert(files.has(required), `packed artifact is missing ${required}`);
+      }
     }
     run(npm, ['install', '--ignore-scripts', '--prefix', install, packagePath], { env });
     runInstalledSmoke(path.join(install, 'node_modules', packageJson.name), env);
