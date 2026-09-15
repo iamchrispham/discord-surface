@@ -7,7 +7,7 @@ export const KINDS = Object.freeze({ REQUEST: 'request', RESULT: 'result' } as c
 export const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' } as const);
 export type AgentMessageKind = typeof KINDS[keyof typeof KINDS];
 
-const LIMIT = 2000;
+export const AGENT_MESSAGE_MAX_ENCODED_LENGTH = 2000;
 
 export type AgentProvider = typeof PROVIDERS[keyof typeof PROVIDERS];
 
@@ -33,6 +33,12 @@ export type AgentMessage =
 export interface AgentAddressEnvelope {
   address: AgentAddress;
   proof: string;
+}
+
+function messageLimitError(encodedLength: number): Error {
+  return new Error(
+    `agent message exceeds Discord message limit: encoded size ${encodedLength} characters, maximum ${AGENT_MESSAGE_MAX_ENCODED_LENGTH} characters`
+  );
 }
 
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -86,13 +92,13 @@ export function encodeAgentMessage(packet: AgentMessage, token: string): string 
   validate(packet);
   const body = Buffer.from(JSON.stringify(packet)).toString('base64url');
   const wire = `${PREFIX}${body}.${signature(body, token).toString('base64url')}`;
-  if (wire.length > LIMIT) throw new Error('agent message exceeds Discord message limit');
+  if (wire.length > AGENT_MESSAGE_MAX_ENCODED_LENGTH) throw messageLimitError(wire.length);
   return wire;
 }
 
 export function decodeAgentMessage(wire: unknown, token: string, target: AgentAddress): AgentMessage | null {
   if (typeof wire !== 'string' || !wire.startsWith(PREFIX)) return null;
-  if (wire.length > LIMIT) throw new Error('agent message exceeds Discord message limit');
+  if (wire.length > AGENT_MESSAGE_MAX_ENCODED_LENGTH) throw messageLimitError(wire.length);
   const match = /^([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]{43})$/.exec(wire.slice(PREFIX.length));
   if (!match) throw new Error('invalid agent message encoding');
   const [, body, mac] = match;
