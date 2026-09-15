@@ -3,6 +3,7 @@
 try {
   const {
     readTextFile,
+    resolveAgentAddress,
     requestIdFor,
     resolveDedupeKey,
     resolveDirectBinding,
@@ -10,6 +11,7 @@ try {
   } = require('../dist/direct-post.js');
   module.exports = {
     readTextFile,
+    resolveAgentAddress,
     requestIdFor,
     resolveDedupeKey,
     resolveDirectBinding,

@@ -118,7 +118,7 @@ test('live enrolled thread keeps native owner and sends receipt, eyes and answer
   assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
 });
 
-test('enrolled child bot attachment failure is rejected without parent gap recovery', async t => {
+test('enrolled child bot attachment failure fences only child recovery', async t => {
   let fetchCalls = 0;
   const f = fixture(t, {
     agentAttachmentFetch: async () => {
@@ -142,25 +142,17 @@ test('enrolled child bot attachment failure is rejected without parent gap recov
   f.gateway.boundMessage(message);
   await Promise.all([...f.gateway.inFlight]);
 
-  assert.equal(fetchCalls, 0);
+  assert.equal(fetchCalls, 1);
   assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
   assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
-  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
-  const rejection = f.state.listReceipts()
-    .filter(row => row.kind === 'intake-rejected')
-    .map(row => ({ row, detail: JSON.parse(row.detail) }))
-    .find(({ detail }) => detail.discordId === message.id);
-  assert.ok(rejection);
-  assert.equal(rejection.detail.reason, 'bot-source');
-  assert.equal(rejection.detail.channelId, f.parent.id);
-  assert.equal(rejection.detail.deliveryChannelId, f.child.id);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.GAP);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).lastSeenId, null);
   assert.equal(f.state.getMessage(message.id), null);
-  assert.equal(f.state.getThreadEnrollment(f.child.id).lastSeenId, message.id);
   assert.deepEqual(f.dispatched, []);
   assert.deepEqual(f.sends, []);
   assert.deepEqual(f.reactions, []);
-  assert.equal(f.gateway.attachmentIntakeRetryMessages.size, 0);
-  assert.equal(f.gateway.attachmentIntakeBlockedChannels.size, 0);
+  assert.equal(f.gateway.attachmentIntakeRetryMessages.get(f.child.id)?.binding.channelId, f.parent.id);
+  assert.equal(f.gateway.attachmentIntakeBlockedChannels.has(f.child.id), true);
 });
 
 test('pending child holds live work, recovery deduplicates it and replies after child readiness', async t => {
