@@ -107,9 +107,10 @@ const GENERAL_USAGE = `Usage: discord-surface <command> [options]
 
 Commands: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind,
 status, recover, board-refresh, thread-enroll, provision, handoff, start, stop,
-claude-channel, claude-monitor, native-ack, claude-reply, agent-address,
+claude-channel, claude-monitor, native-ack, native-reply, claude-reply, agent-address,
 agent-send, agent-complete, watcher-arm, watcher-send, watcher-consume, post, ordinary-post, ordinary-claude-post, claude-post,
 post-file-cleanup,
+native-reply-file-cleanup,
 decision-present, liaison draft
 
 Start options: --state-dir DIR [--courier-route-id ROUTE_ID]
@@ -1797,28 +1798,43 @@ async function claudeMonitor(args) {
   }
 }
 
-function claudeReply(args) {
+function nativeReply(args, compatibilityProvider = null) {
   const { state } = openState(args);
   try {
+    const provider = compatibilityProvider || required(args, 'provider');
+    if (!['codex', 'claude'].includes(provider)) throw new Error('invalid agent provider');
     const generation = Number(required(args, 'generation'));
     if (!Number.isSafeInteger(generation) || generation < 1) throw new Error('generation must be a positive integer');
     const textFile = path.resolve(required(args, 'text-file'));
     const stat = fs.statSync(textFile);
     if (!stat.isFile()) throw new Error('text file must be a regular file');
+    const messageId = required(args, 'message-id');
+    const nativeId = required(args, 'native-id');
+    const text = fs.readFileSync(textFile, 'utf8');
+    const fileManifest = Object.hasOwn(args, 'attachment-file')
+      ? state.prepareNativeReplyFile({ provider, messageId, nativeId, generation, stateDir: pathsFor(args).stateDir,
+        sourcePath: path.resolve(required(args, 'attachment-file')), caption: text })
+      : null;
     const result = state.recordNativeReply({
-      provider: 'claude',
-      messageId: required(args, 'message-id'),
-      nativeId: required(args, 'native-id'),
+      provider,
+      messageId,
+      nativeId,
       generation,
-      text: fs.readFileSync(textFile, 'utf8')
+      text,
+      ...(fileManifest ? { fileManifest } : {})
     });
     print({
-      messageId: required(args, 'message-id'),
+      messageId,
       recorded: !result.duplicate,
       duplicate: Boolean(result.duplicate),
-      state: result.message.state
+      state: result.message.state,
+      ...(fileManifest ? { filePreparationId: fileManifest.preparationId } : {})
     });
   } finally { state.close(); }
+}
+
+function claudeReply(args) {
+  return nativeReply(args, 'claude');
 }
 
 async function agentSend(args) {
@@ -2260,6 +2276,7 @@ async function main() {
         }));
       } finally { state.close(); }
     }
+    case 'native-reply': return nativeReply(args);
     case 'claude-reply': return claudeReply(args);
     case 'agent-address': {
       const provider = required(args, 'provider');
@@ -2283,14 +2300,22 @@ async function main() {
     case 'ordinary-claude-post': return directPost(args, 'claude', true);
     case 'claude-post': return directPost(args, 'claude');
     case 'post-file-cleanup': return directPostFileCleanup(args);
+    case 'native-reply-file-cleanup': {
+      const { state } = openState(args);
+      try {
+        const result = state.releaseNativeReplyFilePreparation(required(args, 'message-id'), required(args, 'preparation-id'), Number(args['part-index'] || 0));
+        print(result);
+        return result;
+      } finally { state.close(); }
+    }
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, claude-reply, agent-address, agent-send, agent-complete, watcher-arm, watcher-send, watcher-consume, post, ordinary-post, ordinary-claude-post, claude-post, decision-present, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, native-reply, claude-reply, agent-address, agent-send, agent-complete, post, ordinary-post, ordinary-claude-post, claude-post, native-reply-file-cleanup, decision-present, liaison draft');
   }
 }
 
-module.exports = { agentComplete, bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
+module.exports = { agentComplete, bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
 
 if (require.main === module) {
   main().catch(error => {

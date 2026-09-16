@@ -8,6 +8,7 @@ import {
   type WatcherAddress,
   type WatcherNotice
 } from '../watcher-notice';
+import type { NativeReplyFilePhase } from './native-reply-file';
 
 export const WATCHER_NOTICE_RECEIPTS = Object.freeze({
   ARM: 'watcher-notice-arm',
@@ -144,6 +145,7 @@ interface WatcherState {
   getMessageRoute(deliveryChannelId: string): WatcherRoute | null;
   getWatcherNotice(messageId: string): WatcherNoticeProvenance | null;
   getMessage(messageId: string): WatcherMessage | null;
+  nativeReplyFilePreparation(messageId: string): { phase: NativeReplyFilePhase } | null;
   currentMessageBinding(message: WatcherMessage): WatcherBindingCheck;
   hasNativeAcknowledgment(message: WatcherMessage): boolean;
   listReplyParts(messageId: string): unknown[];
@@ -164,6 +166,7 @@ export interface WatcherNoticeDependencies {
     SUBMITTED: string;
     AGENT_HANDLED_WITHOUT_POST: string;
   }>;
+  NATIVE_REPLY_FILE_PHASES: typeof import('./native-reply-file').NATIVE_REPLY_FILE_PHASES;
   assertText(value: unknown, name: string, max?: number): string;
   assertUuid(value: unknown, name?: string): string;
   now(): string;
@@ -550,6 +553,11 @@ export function createWatcherNoticeHandlers(deps: WatcherNoticeDependencies) {
       if (!publication) throw new deps.BindingError('watcher notice requires its original child publication');
       if (!state.hasNativeAcknowledgment(message)) throw new deps.BindingError('watcher notice requires a matching native acknowledgment');
       if (!emptyReplyCustody(state, message)) throw new deps.BindingError('watcher notice requires empty reply custody');
+      const filePreparation = state.nativeReplyFilePreparation(message.id);
+      if (filePreparation?.phase === deps.NATIVE_REPLY_FILE_PHASES.PREPARING ||
+          filePreparation?.phase === deps.NATIVE_REPLY_FILE_PHASES.ADMITTED) {
+        throw new deps.BindingError('watcher notice requires native reply file custody to be recorded or explicitly released');
+      }
       const consumedRows = state.db.prepare(`SELECT id, detail FROM receipts
         WHERE discord_id=? AND kind=? ORDER BY id DESC`).all(message.id, WATCHER_NOTICE_RECEIPTS.CONSUMED) as Array<{ id: number; detail: unknown }>;
       const previous = consumedRows.map(row => ({ ...row, detail: parseDetail(row.detail) })).find(row =>

@@ -8,7 +8,15 @@ const { normalizeAttachments } = require('./attachments');
 const { ORDINARY_RECEIPT_KINDS } = require('./ordinary/constants');
 const { createOrdinaryRepository } = require('./ordinary');
 const { createDirectPostHandlers, queryDirectPostRows, DIRECT_POST_OUTCOMES } = require('./state/direct-post');
-const { removeDirectPostFile } = require('./direct-post-file');
+const {
+  removeDirectPostFile
+} = require('./direct-post-file');
+const {
+  NATIVE_REPLY_FILE_PHASES,
+  NATIVE_REPLY_FILE_PREPARATION,
+  assertNativeReplyFileManifest,
+  createNativeReplyFileHandlers
+} = require('./state/native-reply-file');
 const { createAgentCompletionHandlers } = require('./state/agent-completion');
 const {
   createWatcherNoticeHandlers,
@@ -55,7 +63,7 @@ const {
   COURIER_SOURCE_KINDS
 } = require('./state/courier-route');
 
-const SCHEMA_VERSION = '1.7';
+const SCHEMA_VERSION = '1.8';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
 const READINESS = Object.freeze({
   PENDING: 'pending',
@@ -151,11 +159,29 @@ const directPostHandlers = createDirectPostHandlers({
   now
 });
 
+const nativeReplyFileHandlers = createNativeReplyFileHandlers({
+  BindingError,
+  AuthorizationError,
+  StaleGenerationError,
+  StateCorruptError,
+  MESSAGE_STATES,
+  DIRECT_POST_FILE_PREPARATION,
+  NATIVE_ACK_RECEIPT,
+  REPLY_LIMIT,
+  assertProvider,
+  assertText,
+  assertUuid,
+  parseJson,
+  safeDetail,
+  now
+});
+
 const agentCompletionHandlers = createAgentCompletionHandlers({
   AGENT_COMPLETION_RECEIPTS,
   MESSAGE_STATES,
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
+  NATIVE_REPLY_FILE_PHASES,
   assertText,
   assertProvider,
   assertUuid,
@@ -173,6 +199,7 @@ const watcherNoticeHandlers = createWatcherNoticeHandlers({
   StaleGenerationError,
   StateCorruptError,
   MESSAGE_STATES,
+  NATIVE_REPLY_FILE_PHASES,
   assertText,
   assertUuid,
   now
@@ -376,6 +403,13 @@ function splitReply(text) {
 }
 
 function rowReplyPart(row) {
+  let fileManifest = null;
+  if (row.file_manifest !== null && row.file_manifest !== undefined) {
+    fileManifest = parseJson(row.file_manifest, null);
+    if (!fileManifest || typeof fileManifest !== 'object' || Array.isArray(fileManifest)) {
+      throw new StateCorruptError('reply part file manifest is invalid');
+    }
+  }
   return {
     index: Number(row.part_index),
     content: row.content,
@@ -383,6 +417,7 @@ function rowReplyPart(row) {
     state: row.state,
     messageId: row.message_id,
     error: row.error,
+    fileManifest,
     updatedAt: row.updated_at
   };
 }
@@ -628,6 +663,7 @@ class SurfaceState {
         state TEXT NOT NULL CHECK(state IN ('pending', 'sending', 'sent', 'failed', 'unknown')),
         message_id TEXT,
         error TEXT,
+        file_manifest TEXT,
         updated_at TEXT NOT NULL,
         PRIMARY KEY(discord_id, part_index)
       );
@@ -693,6 +729,7 @@ class SurfaceState {
       CREATE INDEX IF NOT EXISTS topic_publications_unresolved_idx ON topic_publications(channel_id) WHERE status IN ('in_flight', 'unknown');
     `);
     this.ensureThreadEnrollmentSchema();
+    this.ensureNativeReplyFileSchema();
     this.ensureDirectPostIndexes();
   }
 
@@ -724,6 +761,11 @@ class SurfaceState {
       CREATE INDEX IF NOT EXISTS thread_enrollments_parent_idx ON thread_enrollments(parent_channel_id, active);
     `);
     this.db.prepare('UPDATE messages SET delivery_channel_id=channel_id WHERE delivery_channel_id IS NULL').run();
+  }
+
+  ensureNativeReplyFileSchema() {
+    const columns = this.tableColumns('reply_parts');
+    if (!columns.has('file_manifest')) this.db.exec('ALTER TABLE reply_parts ADD COLUMN file_manifest TEXT');
   }
 
   ensureDirectPostIndexes() {
@@ -758,7 +800,7 @@ class SurfaceState {
   migrateSchema() {
     const version = this.db.prepare("SELECT value FROM meta WHERE key='schema'").get();
     if (!version) throw new StateCorruptError('state schema metadata is missing');
-    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== '1.5' && version.value !== '1.6' && version.value !== SCHEMA_VERSION) {
+    if (version.value !== '1.1' && version.value !== '1.2' && version.value !== '1.3' && version.value !== '1.4' && version.value !== '1.5' && version.value !== '1.6' && version.value !== '1.7' && version.value !== SCHEMA_VERSION) {
       throw new StateCorruptError(`unsupported state schema ${version.value}`);
     }
     if (version.value === SCHEMA_VERSION) {
@@ -794,6 +836,20 @@ class SurfaceState {
       if (!topicColumns.has('readback_at')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN readback_at TEXT');
       if (!topicColumns.has('readback_topic')) this.db.exec('ALTER TABLE topic_publications ADD COLUMN readback_topic TEXT');
       this.ensureThreadEnrollmentSchema();
+      this.ensureNativeReplyFileSchema();
+      this.ensureDirectPostIndexes();
+      return;
+    }
+    if (version.value === '1.7') {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.ensureNativeReplyFileSchema();
+        this.db.prepare("UPDATE meta SET value=? WHERE key='schema'").run(SCHEMA_VERSION);
+        this.db.exec('COMMIT');
+      } catch (error) {
+        try { this.db.exec('ROLLBACK'); } catch {}
+        throw error;
+      }
       this.ensureDirectPostIndexes();
       return;
     }
@@ -801,6 +857,7 @@ class SurfaceState {
       this.db.exec('BEGIN IMMEDIATE');
       try {
         this.ensureThreadEnrollmentSchema();
+        this.ensureNativeReplyFileSchema();
         this.db.prepare("UPDATE meta SET value=? WHERE key='schema'").run(SCHEMA_VERSION);
         this.db.exec('COMMIT');
       } catch (error) {
@@ -941,6 +998,7 @@ class SurfaceState {
       throw error;
     }
     this.ensureThreadEnrollmentSchema();
+    this.ensureNativeReplyFileSchema();
     this.ensureDirectPostIndexes();
   }
 
@@ -987,7 +1045,7 @@ class SurfaceState {
     this.assertColumns('reply_parts', {
       discord_id: { type: 'TEXT', notnull: true }, part_index: { type: 'INTEGER', notnull: true },
       content: { type: 'TEXT', notnull: true }, nonce: { type: 'TEXT', notnull: true },
-      state: { type: 'TEXT', notnull: true }, updated_at: { type: 'TEXT', notnull: true }
+      state: { type: 'TEXT', notnull: true }, file_manifest: { type: 'TEXT' }, updated_at: { type: 'TEXT', notnull: true }
     });
     this.assertColumns('provision_intents', {
       provider: { type: 'TEXT', notnull: true }, native_id: { type: 'TEXT', notnull: true },
@@ -2460,13 +2518,34 @@ class SurfaceState {
     });
   }
 
-  recordNativeReply({ provider, messageId, nativeId, generation, text, parts: prepartitionedParts }) {
+  nativeReplyFilePreparation(messageId) {
+    return nativeReplyFileHandlers.nativeReplyFilePreparation(this, messageId);
+  }
+
+  activeFilePreparationCount() {
+    return nativeReplyFileHandlers.activeFilePreparationCount(this);
+  }
+
+  prepareNativeReplyFile(input) {
+    return nativeReplyFileHandlers.prepareNativeReplyFile(this, input);
+  }
+
+  releaseNativeReplyFilePreparation(messageId, preparationId, partIndex = 0) {
+    return nativeReplyFileHandlers.releaseNativeReplyFilePreparation(this, messageId, preparationId, partIndex);
+  }
+
+  recordNativeReply({ provider, messageId, nativeId, generation, text, parts: prepartitionedParts, fileManifest = null }) {
     assertProvider(provider);
     assertText(messageId, 'messageId', 128);
     assertUuid(nativeId);
     if (!Number.isInteger(generation) || generation < 1) throw new StaleGenerationError('invalid generation');
     const hasPrepartitionedParts = Array.isArray(prepartitionedParts);
     if (!(hasPrepartitionedParts && text === '')) assertText(text, 'reply text', 10000);
+    if (fileManifest !== null) {
+      try { assertNativeReplyFileManifest(fileManifest); }
+      catch (error) { throw new BindingError(error.message); }
+      if (!text.trim() || text.length > REPLY_LIMIT) throw new BindingError('file replies require one nonblank caption at most 2000 characters');
+    }
     try {
       return this.transaction(() => {
         let message = this.getMessage(messageId);
@@ -2492,12 +2571,31 @@ class SurfaceState {
           return { duplicate: true, message };
         }
         if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.DISPATCHING].includes(message.state)) throw new BindingError(`reply is not accepted in state ${message.state}`);
+        const admittedFile = this.nativeReplyFilePreparation(messageId);
+        if (admittedFile?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING) {
+          throw new BindingError('native reply file preparation is still in progress');
+        }
+        if (admittedFile?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED && fileManifest === null) {
+          throw new BindingError('native reply file custody requires its admitted attachment');
+        }
+        if (fileManifest !== null) {
+          if (!admittedFile || admittedFile.phase !== NATIVE_REPLY_FILE_PHASES.ADMITTED ||
+            admittedFile.preparationId !== fileManifest.preparationId || admittedFile.stagedPath !== fileManifest.stagedPath ||
+            admittedFile.filename !== fileManifest.filename || admittedFile.size !== fileManifest.size ||
+            admittedFile.sha256 !== fileManifest.sha256 || admittedFile.caption !== fileManifest.caption ||
+            admittedFile.captionHash !== fileManifest.captionHash || admittedFile.caption !== text) {
+            throw new BindingError('native reply file preparation is not admitted for this reply');
+          }
+        }
         const timestamp = now();
         const parts = hasPrepartitionedParts ? prepartitionedParts.slice() : splitReply(text);
         if ((!parts.length && text !== '') || parts.some(part => typeof part !== 'string' || part.length > REPLY_LIMIT) || parts.join('') !== text) {
           throw new BindingError('reply parts are invalid');
         }
-        if (text === '' && parts.every(part => part.length === 0)) {
+        if (fileManifest !== null && (parts.length !== 1 || parts[0] !== text)) {
+          throw new BindingError('file replies require exactly one caption part');
+        }
+        if (fileManifest === null && text === '' && parts.every(part => part.length === 0)) {
           this.db.prepare('UPDATE messages SET state=?, reply_text=?, reply_nonce=?, reply_message_id=NULL, reply_next_part=0, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
             .run(MESSAGE_STATES.REPLIED, text, discordNonce(messageId, 0), timestamp, messageId, message.state);
           this.db.prepare('DELETE FROM reply_parts WHERE discord_id=?').run(messageId);
@@ -2508,8 +2606,8 @@ class SurfaceState {
         this.db.prepare('UPDATE messages SET state=?, reply_text=?, reply_nonce=?, reply_next_part=0, updated_at=? WHERE discord_id=? AND state=?')
           .run(MESSAGE_STATES.REPLY_READY, text, discordNonce(messageId, 0), timestamp, messageId, message.state);
         this.db.prepare('DELETE FROM reply_parts WHERE discord_id=?').run(messageId);
-        const insert = this.db.prepare('INSERT INTO reply_parts(discord_id, part_index, content, nonce, state, updated_at) VALUES(?, ?, ?, ?, ?, ?)');
-        parts.forEach((part, index) => insert.run(messageId, index, part, discordNonce(messageId, index), 'pending', timestamp));
+        const insert = this.db.prepare('INSERT INTO reply_parts(discord_id, part_index, content, nonce, state, file_manifest, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)');
+        parts.forEach((part, index) => insert.run(messageId, index, part, discordNonce(messageId, index), 'pending', index === 0 && fileManifest !== null ? safeDetail(fileManifest) : null, timestamp));
         this.receipt(messageId, message.state === MESSAGE_STATES.DISPATCHING ? 'native-reply-before-submit' : 'native-reply', { generation, parts: parts.length });
         return { duplicate: false, message: this.getMessage(messageId) };
       });
@@ -2549,7 +2647,7 @@ class SurfaceState {
 
   markReplyPartSent(messageId, partIndex, replyMessageId) {
     assertText(replyMessageId, 'replyMessageId', 128);
-    return this.transaction(() => {
+    const result = this.transaction(() => {
       const message = this.getMessage(messageId);
       if (!message) throw new BindingError('message is unknown');
       if (message.state === MESSAGE_STATES.REPLIED) return message;
@@ -2569,6 +2667,7 @@ class SurfaceState {
       }
       return this.getMessage(messageId);
     });
+    return result;
   }
 
   markReplyPartSkipped(messageId, partIndex) {
@@ -2579,6 +2678,7 @@ class SurfaceState {
       if (message.state !== MESSAGE_STATES.REPLYING) throw new BindingError(`reply is not in flight in state ${message.state}`);
       const part = this.db.prepare('SELECT * FROM reply_parts WHERE discord_id=? AND part_index=?').get(messageId, partIndex);
       if (!part) throw new BindingError('reply part is unknown');
+      if (part.file_manifest) throw new BindingError('file-bearing replies cannot be skipped');
       if (part.state === 'sent') return message;
       this.db.prepare("UPDATE reply_parts SET state='sent', message_id=NULL, error=NULL, updated_at=? WHERE discord_id=? AND part_index=?")
         .run(now(), messageId, partIndex);
@@ -2620,7 +2720,7 @@ class SurfaceState {
 
   reconcileReplyDelivery(messageId, resolution, { partIndex = null, replyMessageId = null } = {}) {
     if (!['sent', 'not_sent'].includes(resolution)) throw new BindingError('reply resolution must be sent or not_sent');
-    return this.transaction(() => {
+    const result = this.transaction(() => {
       const message = this.getMessage(messageId);
       if (!message || ![MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state)) {
         throw new BindingError('message does not need reply delivery reconciliation');
@@ -2651,6 +2751,7 @@ class SurfaceState {
       }
       return this.getMessage(messageId);
     });
+    return result;
   }
 
   recoverAfterRestart(ownerAlive = null) {

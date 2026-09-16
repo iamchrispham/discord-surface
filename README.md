@@ -414,6 +414,57 @@ node src/cli.js post-file-cleanup \
 
 Cleanup deletes only the state-owned snapshot and releases its reservation. Native reply uploads and signed agent attachment delivery use separate contracts.
 
+### Native reply local files
+
+This feature uses state schema 1.8. Before any new-version command opens an existing
+1.7 database, stop the old Gateway and Monitors and pause every old CLI caller. Back up
+the drained database, then migrate and restart all adapter clients on the new release
+with their existing native sessions, bindings and generations. Opening the database
+performs the migration. Do not mix versions or relabel the database as 1.7: old clients
+cannot preserve native file metadata and intentionally refuse schema 1.8.
+
+`native-reply` records a reply for an existing submitted Discord message. An optional
+`--attachment-file` uploads one private staged snapshot beside the nonblank caption in
+`--text-file`. The file is limited to 20 MiB and uses the same eight-reservation pool as
+direct posts. `claude-reply` remains the Claude-only compatibility alias; `native-reply`
+requires an explicit `--provider` of `codex` or `claude`.
+
+```sh
+node src/cli.js native-reply \
+  --state-dir "$HOME/.config/discord-surface" \
+  --provider codex --message-id DISCORD_MESSAGE_ID \
+  --native-id FULL_NATIVE_UUID --generation CURRENT_GENERATION \
+  --text-file /absolute/path/to/caption.txt \
+  --attachment-file /absolute/path/to/report.pdf
+```
+
+The result includes `filePreparationId` when a file is admitted. The preparation ID is
+part of the durable reply manifest and must be supplied for cleanup. A sent file part
+may be released explicitly with:
+
+```sh
+node src/cli.js native-reply-file-cleanup \
+  --state-dir "$HOME/.config/discord-surface" \
+  --message-id DISCORD_MESSAGE_ID \
+  --preparation-id FILE_PREPARATION_ID
+```
+
+Cleanup compares the named preparation with the stored reply-part manifest before
+deleting bytes. It also accepts a dead-owner `PREPARING` reservation so a pre-stage
+crash can release its slot. Live preparations, pending or unknown reply delivery, and
+unresolved snapshots retain custody. Sending a reply never deletes the snapshot
+automatically.
+
+After a delivery failure, inspect the Discord outcome and use the existing explicit
+reconciliation command. `--resolution reply_not_sent` returns the reply to retryable
+custody and a later Gateway attempt reads the same staged snapshot. `reply_sent` records
+the observed Discord message so the exact preparation can then be cleaned up. A missing
+or corrupt staged snapshot cannot be repaired or abandoned through a supported command
+before a sent outcome is established. A `reply_not_sent` retry reports the known local
+snapshot failure and keeps custody for operator recovery. After exact sent-part and
+manifest proof, cleanup is idempotent even when a prior unlink completed before its
+`RELEASED` receipt was committed.
+
 
 ## Decision presentations
 

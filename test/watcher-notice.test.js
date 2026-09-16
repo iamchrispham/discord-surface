@@ -18,6 +18,11 @@ const { ClaudeProvider, watcherNoticeCompletionCommand } = require('../src/nativ
 const { createMonitorMcp } = require('../src/claude-monitor');
 const { createSurfaceConsumer } = require('../src/discord');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
+const {
+  NATIVE_REPLY_FILE_JOURNAL,
+  NATIVE_REPLY_FILE_PHASES,
+  NATIVE_REPLY_FILE_PREPARATION
+} = require('../src/state/native-reply-file');
 const { GATEWAY_CAPABILITIES, watcherArm, watcherSend } = require('../src/cli');
 
 const token = 'watcher-notice-fixture-token';
@@ -62,6 +67,36 @@ function armFixture(state, armKey = 'watcher-arm-fixture', nativeId = owner.nati
 
 function response(status, body) {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
+}
+
+async function submittedWatcherMessage(f, messageId, triggerKey = 'file-custody-trigger') {
+  const textFile = path.join(f.dir, `${messageId}.txt`);
+  fs.writeFileSync(textFile, 'Watcher file custody test.');
+  armFixture(f.state, f.armKey);
+  let postedBody;
+  await runWatcherNoticePost({
+    state: f.state,
+    token,
+    armKey: f.armKey,
+    triggerKey,
+    textFile,
+    fetchImpl: async (_url, options) => {
+      if (options.method === 'GET') return response(200, { id: child.channelId, guild_id: child.guildId });
+      postedBody = JSON.parse(options.body);
+      return response(200, { id: messageId });
+    }
+  });
+  const accepted = f.state.acceptDiscordMessage({
+    id: messageId, guildId: child.guildId, channelId: child.channelId, authorId: '901', isBot: true,
+    attachments: [], content: postedBody.content
+  }, { agentToken: token });
+  assert.equal(accepted.accepted, true);
+  assert.equal(f.state.claimDispatch(messageId).claimed, true);
+  f.state.markSubmitted(messageId);
+  recordNativeAcknowledgment(f.state, {
+    provider: owner.provider, messageId, nativeId: owner.nativeId, generation: owner.generation
+  });
+  return { textFile, message: f.state.getMessage(messageId) };
 }
 
 test('watcher notice travels from arm through child custody, native Claude, Monitor, ACK, and idempotent consume', async () => {
@@ -182,6 +217,79 @@ test('watcher notice travels from arm through child custody, native Claude, Moni
   } finally {
     f.state.close();
     fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('watcher consume shares native file preparation custody with agent completion', async t => {
+  const scenarios = [
+    {
+      name: 'preparing',
+      prepare: ({ f, message, textFile }) => {
+        const spool = path.join(f.dir, '.direct-post-files');
+        fs.writeFileSync(spool, 'occupied by a bounded fixture');
+        assert.throws(() => f.state.prepareNativeReplyFile({
+          provider: owner.provider, messageId: message.id, nativeId: owner.nativeId, generation: owner.generation,
+          stateDir: f.dir, sourcePath: textFile, caption: 'preparing file'
+        }), /not admitted/);
+        assert.equal(f.state.nativeReplyFilePreparation(message.id).phase, NATIVE_REPLY_FILE_PHASES.PREPARING);
+      },
+      expected: /native reply file custody/
+    },
+    {
+      name: 'admitted',
+      prepare: ({ f, message, textFile }) => {
+        const manifest = f.state.prepareNativeReplyFile({
+          provider: owner.provider, messageId: message.id, nativeId: owner.nativeId, generation: owner.generation,
+          stateDir: f.dir, sourcePath: textFile, caption: 'admitted file'
+        });
+        assert.equal(manifest.phase, NATIVE_REPLY_FILE_PHASES.ADMITTED);
+        assert.equal(f.state.nativeReplyFilePreparation(message.id).phase, NATIVE_REPLY_FILE_PHASES.ADMITTED);
+      },
+      expected: /native reply file custody/
+    },
+    {
+      name: 'released',
+      prepare: ({ f, message }) => {
+        f.state.receipt(message.id, NATIVE_REPLY_FILE_PREPARATION, {
+          journal: NATIVE_REPLY_FILE_JOURNAL,
+          phase: NATIVE_REPLY_FILE_PHASES.RELEASED,
+          preparationId: '77777777-7777-4777-8777-777777777777'
+        });
+        assert.equal(f.state.nativeReplyFilePreparation(message.id).phase, NATIVE_REPLY_FILE_PHASES.RELEASED);
+      },
+      expected: null
+    },
+    {
+      name: 'empty',
+      prepare: ({ f, message }) => assert.equal(f.state.nativeReplyFilePreparation(message.id), null),
+      expected: null
+    }
+  ];
+
+  for (const [index, scenario] of scenarios.entries()) {
+    await t.test(scenario.name, async t2 => {
+      const f = fixture();
+      try {
+        const { textFile, message } = await submittedWatcherMessage(f, `210${index}`, `file-custody-${scenario.name}`);
+        scenario.prepare({ f, message, textFile });
+        if (scenario.expected) {
+          assert.throws(() => f.state.consumeWatcherNotice({
+            messageId: message.id, provider: owner.provider, nativeId: owner.nativeId, generation: owner.generation,
+            channelId: child.channelId
+          }), scenario.expected);
+        } else {
+          const consumed = f.state.consumeWatcherNotice({
+            messageId: message.id, provider: owner.provider, nativeId: owner.nativeId, generation: owner.generation,
+            channelId: child.channelId
+          });
+          assert.equal(consumed.consumed, true);
+          assert.equal(consumed.message.state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
+        }
+      } finally {
+        f.state.close();
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    });
   }
 });
 

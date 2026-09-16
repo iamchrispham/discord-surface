@@ -2,6 +2,7 @@ import type { AgentMessage, AgentProvider } from '../agent-message';
 import type { WatcherNotice } from '../watcher-notice';
 import { DIRECT_POST_FILE_LIMITS, DIRECT_POST_FILE_PHASES, stagedDirectPostFilePath } from '../direct-post-file';
 import type { DirectPostFileManifest, DirectPostFilePreparation } from '../direct-post-file';
+import { NATIVE_REPLY_FILE_JOURNAL, NATIVE_REPLY_FILE_PREPARATION } from './native-reply-file';
 
 export const DIRECT_POST_OUTCOMES = Object.freeze([
   'sent',
@@ -72,6 +73,7 @@ export interface DirectPostReceiptRow {
 
 export interface DirectPostState {
   db: DirectPostDatabase;
+  activeFilePreparationCount?(): number;
   transaction<T>(operation: () => T): T;
   directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
   directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null): boolean;
@@ -658,10 +660,24 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       assertFileSeed(seed, BindingError, assertText);
       return state.transaction(() => {
         const rows = queryFilePreparationRows(state, DIRECT_POST_FILE_PREPARATION, parseJson, StateCorruptError);
-        const latestByPreparation = new Map<string, DirectPostReceiptRow>();
+        const latestByPreparation = new Map<string, { kind: string; detail: any }>();
         for (const row of rows) {
           const id = row.detail.preparationId;
-          if (typeof id === 'string') latestByPreparation.set(id, row);
+          if (typeof id === 'string') latestByPreparation.set(`${DIRECT_POST_FILE_PREPARATION}\u0000${id}`, {
+            kind: DIRECT_POST_FILE_PREPARATION,
+            detail: row.detail
+          });
+        }
+        const nativeRows = state.db.prepare('SELECT detail FROM receipts WHERE kind=? ORDER BY id').all(NATIVE_REPLY_FILE_PREPARATION);
+        for (const row of nativeRows) {
+          const detail = parseJson(row.detail, null);
+          if (!detail || detail.journal !== NATIVE_REPLY_FILE_JOURNAL || typeof detail.preparationId !== 'string' || typeof detail.phase !== 'string') {
+            throw new StateCorruptError('file preparation receipt is malformed');
+          }
+          latestByPreparation.set(`${NATIVE_REPLY_FILE_PREPARATION}\u0000${detail.preparationId}`, {
+            kind: NATIVE_REPLY_FILE_PREPARATION,
+            detail
+          });
         }
         const existing = rows.filter(row => row.detail.requestId === seed.requestId).at(-1);
         if (existing && existing.detail.phase === DIRECT_POST_FILE_PHASES.RELEASED) {
@@ -671,12 +687,16 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
           assertFileIdentity(existing.detail, seed, BindingError);
           return existing.detail as unknown as DirectPostFilePreparation;
         }
-        const active = [...latestByPreparation.values()]
-          .filter(row => row.detail.phase !== DIRECT_POST_FILE_PHASES.RELEASED).length;
+        const active = typeof state.activeFilePreparationCount === 'function'
+          ? state.activeFilePreparationCount()
+          : [...latestByPreparation.values()].filter(({ detail }) => detail.reservesCapacity !== false &&
+            detail.phase !== DIRECT_POST_FILE_PHASES.RELEASED).length;
         if (active >= DIRECT_POST_FILE_LIMITS.maxReservations) {
           const held = [...latestByPreparation.values()]
-            .filter(row => row.detail.phase !== DIRECT_POST_FILE_PHASES.RELEASED)
-            .map(row => ({ preparationId: row.detail.preparationId, requestId: row.detail.requestId, phase: row.detail.phase }));
+            .filter(({ detail }) => detail.reservesCapacity !== false && detail.phase !== DIRECT_POST_FILE_PHASES.RELEASED)
+            .map(({ kind, detail }) => kind === DIRECT_POST_FILE_PREPARATION
+              ? { preparationId: detail.preparationId, requestId: detail.requestId, phase: detail.phase }
+              : { preparationId: detail.preparationId, messageId: detail.messageId, phase: detail.phase });
           throw new BindingError(`direct post file capacity is exhausted: ${JSON.stringify(held)}`);
         }
         const next = {
