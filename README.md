@@ -416,6 +416,13 @@ Cleanup deletes only the state-owned snapshot and releases its reservation. Nati
 
 ### Native reply local files
 
+This feature uses state schema 1.8. Before any new-version command opens an existing
+1.7 database, stop the old Gateway and Monitors and pause every old CLI caller. Back up
+the drained database, then migrate and restart all adapter clients on the new release
+with their existing native sessions, bindings and generations. Opening the database
+performs the migration. Do not mix versions or relabel the database as 1.7: old clients
+cannot preserve native file metadata and intentionally refuse schema 1.8.
+
 `native-reply` records a reply for an existing submitted Discord message. An optional
 `--attachment-file` uploads one private staged snapshot beside the nonblank caption in
 `--text-file`. The file is limited to 20 MiB and uses the same eight-reservation pool as
