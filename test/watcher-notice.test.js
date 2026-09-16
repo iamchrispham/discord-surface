@@ -214,6 +214,11 @@ test('watcher arm and trigger custody survive restart and refuse changed content
       const { SurfaceState } = require('./src/state');
       const { runWatcherNoticePost } = require('./src/direct-post');
       const [db, textFile, marker, resultFile, token, childChannelId, childGuildId] = process.argv.slice(1);
+      const deadline = setTimeout(() => {
+        fs.writeFileSync(resultFile, JSON.stringify({ error: 'child deadline exceeded' }));
+        process.exit(124);
+      }, 4500);
+      deadline.unref();
       let state;
       (async () => {
         try {
@@ -230,6 +235,7 @@ test('watcher arm and trigger custody survive restart and refuse changed content
           fs.writeFileSync(resultFile, JSON.stringify({ status: result.status, recorded: result.recorded }));
         } finally {
           state?.close();
+          clearTimeout(deadline);
         }
       })().catch(error => {
         fs.writeFileSync(resultFile, JSON.stringify({ error: String(error) }));
