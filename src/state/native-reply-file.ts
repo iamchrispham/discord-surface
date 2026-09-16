@@ -213,22 +213,24 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
         throw new deps.BindingError(`reply is not accepted in state ${currentMessage.state}`);
       }
     };
-    state.transaction(() => {
+    const capacityExhausted = state.transaction(() => {
       assertReservationCustody();
       const current = latestPreparation(state, deps, messageId);
       if (current?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) throw new deps.BindingError('native reply file preparation is already admitted');
       if (current?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING) {
         throw new deps.BindingError(`native reply file preparation is already in progress: ${current.preparationId}`);
       }
-      if (activePreparationCount(state, deps) >= DIRECT_POST_FILE_LIMITS.maxReservations) throw new deps.BindingError('file custody capacity is exhausted');
       const acknowledgment = state.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id DESC LIMIT 1')
         .get(messageId, deps.NATIVE_ACK_RECEIPT);
       const identity = deps.parseJson(acknowledgment?.detail, null);
       if (!identity || identity.provider !== provider || identity.nativeId !== nativeId || identity.generation !== generation) {
         state.receipt(messageId, deps.NATIVE_ACK_RECEIPT, { provider, nativeId, generation, source: 'native-reply-file' });
       }
+      if (activePreparationCount(state, deps) >= DIRECT_POST_FILE_LIMITS.maxReservations) return true;
       state.receipt(messageId, NATIVE_REPLY_FILE_PREPARATION, seed);
+      return false;
     });
+    if (capacityExhausted) throw new deps.BindingError('file custody capacity is exhausted');
     let manifest;
     try { manifest = stageDirectPostFile({ sourcePath, stateDir: root, preparationId, caption, captionHash: seed.captionHash }); }
     catch (error) { throw new deps.BindingError(`native reply file preparation ${preparationId} is not admitted: ${(error as Error).message}`); }

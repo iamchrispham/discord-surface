@@ -60,7 +60,7 @@ function directPreparationSeed(f, index) {
     captionHash: `caption-hash-${index}`,
     channelId: 'channel',
     guildId: 'guild',
-    provider: 'codex',
+    provider: f.provider,
     nativeId: f.nativeId,
     generation: 1,
     operatorId: 'operator',
@@ -115,7 +115,7 @@ test('Codex and Claude file replies recover submitted and uncertain dispatch', a
 });
 
 test('early file-reply acknowledgment wakes the existing Gateway consumer when ready', async t => {
-  for (const provider of ['codex', 'claude']) for (const dispatchState of [MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN]) {
+  for (const provider of ['codex', 'claude']) for (const dispatchState of [MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN]) {
     await t.test(`${provider} ${dispatchState}`, async t2 => {
       const f = fixture(t2, provider);
       const id = `native-file-early-ack-${provider}-${dispatchState}`;
@@ -166,8 +166,8 @@ test('early file-reply acknowledgment wakes the existing Gateway consumer when r
           text: 'answer with file', fileManifest: manifest });
         await gateway.acknowledgments.drain();
         await waitForCondition(() => posts.length === 1);
-        assert.deepEqual(resumes, [id]);
-        assert.deepEqual(observations, [id]);
+        assert.deepEqual(resumes, dispatchState === MESSAGE_STATES.SUBMITTED ? [id, id] : [id]);
+        assert.deepEqual(observations, dispatchState === MESSAGE_STATES.SUBMITTED ? [id, id] : [id]);
         assert.equal(posts[0].content, 'answer with file');
         assert.deepEqual(posts[0].files[0].attachment, bytes);
         assert.equal(posts[0].files[0].name, 'answer.bin');
@@ -355,6 +355,32 @@ test('direct and native preparations share capacity and release permits replacem
   f.state.releaseNativeReplyFilePreparation(id, manifest.preparationId);
   assert.equal(f.state.activeFilePreparationCount(), 7);
   assert.equal(f.state.beginDirectPostFilePreparation(directPreparationSeed(f, 8)).phase, 'preparing');
+});
+
+test('full native file capacity records ownership without reserving a file', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    for (let index = 0; index < 8; index += 1) f.state.beginDirectPostFilePreparation(directPreparationSeed(f, index));
+    const id = `native-file-full-capacity-${provider}`;
+    const source = path.join(f.dir, 'full-capacity.bin');
+    fs.writeFileSync(source, Buffer.from('full capacity payload'));
+    submitted(f, id, MESSAGE_STATES.UNCERTAIN);
+    const input = { provider, messageId: id, nativeId: f.nativeId, generation: 1,
+      stateDir: f.dir, sourcePath: source, caption: 'full capacity' };
+
+    assert.throws(() => f.state.prepareNativeReplyFile(input), /file custody capacity is exhausted/);
+    assert.equal(f.state.activeFilePreparationCount(), 8);
+    assert.equal(f.state.nativeReplyFilePreparation(id), null);
+    assert.equal(fs.existsSync(path.join(f.dir, '.direct-post-files')), false);
+    const acknowledgmentRows = f.state.listReceipts().filter(row => row.discord_id === id && row.kind === 'native-ack');
+    assert.equal(acknowledgmentRows.length, 1);
+    assert.deepEqual(JSON.parse(acknowledgmentRows[0].detail), { provider, nativeId: f.nativeId, generation: 1, source: 'native-reply-file' });
+    assert.throws(() => f.state.reconcileUncertain(id, 'not_submitted'), /native acknowledgment prevents retrying delivery/);
+    assert.equal(f.state.claimDispatch(id).claimed, false);
+
+    assert.throws(() => f.state.prepareNativeReplyFile(input), /file custody capacity is exhausted/);
+    assert.equal(f.state.listReceipts().filter(row => row.discord_id === id && row.kind === 'native-ack').length, 1);
+  });
 });
 
 test('stale native cleanup cannot release a later preparation for the same message', t => {

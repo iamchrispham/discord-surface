@@ -117,6 +117,10 @@ export interface AcknowledgmentWatchOptions {
 export const ACK = Object.freeze({ RECEIVED: NATIVE_ACK_RECEIPT, OUTCOME: 'native-ack-reaction' } as const);
 export const ACK_WAITING = Symbol('native-acknowledgment-waiting');
 export const REACTION = Object.freeze({ SAVED: '📥', ACKNOWLEDGED: '👀' } as const);
+const REPLY_READY_RECEIPTS = Object.freeze({
+  REPLY: 'native-reply',
+  BEFORE_SUBMIT: 'native-reply-before-submit'
+} as const);
 const ACK_RETRY = Object.freeze({ BASE_MS: 250, MAX_MS: 60000, MAX_ATTEMPTS: 8 } as const);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -151,9 +155,11 @@ function hasAcknowledgmentReceipt(state: AcknowledgmentState, messageId: string)
     .get(messageId, ACK.RECEIVED));
 }
 
-function receiptRowsAfter(state: AcknowledgmentState, receiptId: number, throughId: number): Array<{ id: number; discord_id: string }> {
-  return state.db.prepare(`SELECT id, discord_id FROM receipts
-    WHERE id>? AND id<=? AND kind IN (?, ?) ORDER BY id`).all<{ id: number; discord_id: string }>(receiptId, throughId, ACK.RECEIVED, ACK.OUTCOME);
+function receiptRowsAfter(state: AcknowledgmentState, receiptId: number, throughId: number): Array<{ id: number; discord_id: string; kind: string }> {
+  return state.db.prepare(`SELECT id, discord_id, kind FROM receipts
+    WHERE id>? AND id<=? AND kind IN (?, ?, ?, ?) ORDER BY id`).all<{ id: number; discord_id: string; kind: string }>(
+      receiptId, throughId, ACK.RECEIVED, ACK.OUTCOME, REPLY_READY_RECEIPTS.REPLY, REPLY_READY_RECEIPTS.BEFORE_SUBMIT
+    );
 }
 
 function latestReceiptId(state: AcknowledgmentState): number {
@@ -399,20 +405,11 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
   let receiptCursor: number | null = null;
   const retryAtByMessage = new Map<string, number>();
   const notified = new Set<string>();
-  const awaitingReplyReady = new Set<string>();
-
   function notifyAcknowledged(messageId: string): void {
     if (!onAcknowledged || notified.has(messageId) || !hasAcknowledgmentReceipt(state, messageId)) return;
     notified.add(messageId);
-    const message = state.getMessage(messageId);
-    if (message && (message.state === MESSAGE_STATES.DISPATCHING || message.state === MESSAGE_STATES.UNCERTAIN)) {
-      awaitingReplyReady.add(messageId);
-    }
     Promise.resolve().then(() => onAcknowledged(messageId))
-      .then(result => {
-        if (result === ACK_WAITING) awaitingReplyReady.add(messageId);
-        else awaitingReplyReady.delete(messageId);
-      })
+      .then(() => {})
       .catch(error => logger(`native acknowledgment resume failed: ${String(property(error, 'message'))}`))
       .finally(() => {
         if (closed || !state.db) return;
@@ -453,20 +450,25 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
     const wakeOnly = new Set<string>();
     const queued = new Set<string>();
     const seen = new Set();
+    const ready = new Set<string>();
     for (const row of rows) {
-      if (!row.discord_id || seen.has(row.discord_id)) continue;
-      seen.add(row.discord_id);
-      rememberRetryAt(row.discord_id);
-      if (isAcknowledgmentPending(state, row.discord_id, now)) {
-        ids.push(row.discord_id);
-        queued.add(row.discord_id);
+      if (!row.discord_id) continue;
+      if (row.kind === REPLY_READY_RECEIPTS.REPLY || row.kind === REPLY_READY_RECEIPTS.BEFORE_SUBMIT) {
+        ready.add(row.discord_id);
+      }
+      if (!seen.has(row.discord_id)) {
+        seen.add(row.discord_id);
+        rememberRetryAt(row.discord_id);
+        if (isAcknowledgmentPending(state, row.discord_id, now)) {
+          ids.push(row.discord_id);
+          queued.add(row.discord_id);
+        }
       }
     }
-    for (const messageId of awaitingReplyReady) {
-      if (queued.has(messageId)) continue;
+    for (const messageId of ready) {
       if (state.getMessage(messageId)?.state !== MESSAGE_STATES.REPLY_READY) continue;
-      awaitingReplyReady.delete(messageId);
       notified.delete(messageId);
+      if (queued.has(messageId)) continue;
       ids.push(messageId);
       wakeOnly.add(messageId);
       queued.add(messageId);
@@ -569,7 +571,6 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
       timer = null;
       timerDueAt = null;
       notified.clear();
-      awaitingReplyReady.clear();
       await running;
     }
   };
