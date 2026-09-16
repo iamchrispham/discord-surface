@@ -545,13 +545,14 @@ function bindingIdentityMatchesTopicPublication(binding, publication) {
 class SurfaceState {
   constructor(dbPath, options = {}) {
     if (!path.isAbsolute(dbPath)) throw new TypeError('dbPath must be absolute');
-    ensurePrivateDir(path.dirname(dbPath));
     const existed = fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0;
+    if (options.requireCurrentSchema && !existed) throw new StateCorruptError('state database is missing');
+    ensurePrivateDir(path.dirname(dbPath));
     try {
       this.db = new DatabaseSync(dbPath);
       this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;');
       if (existed) {
-        this.migrateSchema();
+        if (!options.requireCurrentSchema) this.migrateSchema();
         this.assertSchema();
       } else {
         this.createSchema();

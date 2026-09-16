@@ -162,6 +162,8 @@ courier session and workspace, the fixed recipient and exact prompt from one
 persisted attempt, current binding ownership and an unacknowledged message.
 It atomically records one forwarding claim before allowing the tool. Refusal
 returns a native deny decision and exit 2. Startup failures also exit 2.
+The database must already have the current schema. The guard never creates,
+migrates or repairs it.
 A claim survives restart or an unknown host-call outcome and cannot be retried.
 It neither acknowledges the message nor completes its reply obligation.
 Installing this command does not trust a project hook or activate a route.

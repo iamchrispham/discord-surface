@@ -27,7 +27,7 @@ function courierGuard(args, pathsFor) {
     const stat = fs.statSync(db);
     if (!stat.isFile() || stat.size === 0) throw new Error('courier state database is missing');
     const { SurfaceState } = require('./state');
-    state = new SurfaceState(db);
+    state = new SurfaceState(db, { requireCurrentSchema: true });
     state.claimCourierForward(args['courier-route-id'], event);
     state.close();
     state = null;

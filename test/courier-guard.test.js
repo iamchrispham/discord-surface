@@ -182,3 +182,23 @@ test('public hook startup blocks when its module or runtime build is missing', t
   denied({ ...result, decision: JSON.parse(result.stdout).hookSpecificOutput }, /build is missing/);
   assert.equal(f.claims().length, 0);
 });
+
+test('a denied hook never migrates or repairs old or incomplete state', t => {
+  const mutations = [
+    f => f.state.db.prepare("UPDATE meta SET value='1.7' WHERE key='schema'").run(),
+    f => f.state.db.exec('ALTER TABLE bindings DROP COLUMN session_root')
+  ];
+  const snapshot = f => ({
+    schema: f.state.db.prepare("SELECT value FROM meta WHERE key='schema'").get(),
+    definitions: f.state.db.prepare('SELECT name, sql FROM sqlite_master ORDER BY name').all()
+  });
+  for (const mutate of mutations) {
+    const f = fixture(t); mutate(f);
+    const before = snapshot(f);
+    denied(invoke(f), /schema|session_root/);
+    assert.deepEqual(snapshot(f), before);
+    assert.equal(f.claims().length, 0);
+    f.reopen();
+    assert.equal(invoke(f).status, 0, 'regular state open still initializes the schema');
+  }
+});
