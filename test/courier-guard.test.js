@@ -55,13 +55,17 @@ function invoke(f, event = f.event, extra = []) {
     input: typeof event === 'string' ? event : JSON.stringify(event), encoding: 'utf8', timeout: 5000, maxBuffer: 2 * 1024 * 1024
   });
   assert.equal(r.error, undefined, r.error?.message);
-  return { ...r, decision: JSON.parse(r.stdout).hookSpecificOutput };
+  return { ...r, decision: r.stdout ? JSON.parse(r.stdout).hookSpecificOutput : null };
 }
 
 function denied(r, reason) {
   assert.equal(r.status, 2, r.stderr);
+  assert.notEqual(r.stderr.trim(), '');
   assert.equal(r.decision.permissionDecision, 'deny');
-  if (reason) assert.match(r.decision.permissionDecisionReason, reason);
+  if (reason) {
+    assert.match(r.decision.permissionDecisionReason, reason);
+    assert.match(r.stderr, reason);
+  }
 }
 
 test('public hook claims one exact human or peer forward, without acknowledging or replying', t => {
@@ -71,7 +75,9 @@ test('public hook claims one exact human or peer forward, without acknowledging 
     f.state.markSubmitted('9000');
     const r = invoke(f);
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(r.decision.permissionDecision, 'allow');
+    assert.equal(r.stdout, '');
+    assert.equal(r.stderr, '');
+    assert.equal(r.decision, null);
     assert.equal(f.claims().length, 1);
     assert.equal(f.state.hasNativeAcknowledgment(f.state.getMessage('9000')), false);
     assert.equal(f.state.getMessage('9000').state, 'submitted');

@@ -31,14 +31,13 @@ function courierGuard(args, pathsFor) {
     state.claimCourierForward(args['courier-route-id'], event);
     state.close();
     state = null;
-    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: {
-      hookEventName: 'PreToolUse', permissionDecision: 'allow'
-    } })}\n`);
   } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
     process.stdout.write(`${JSON.stringify({ hookSpecificOutput: {
       hookEventName: 'PreToolUse', permissionDecision: 'deny',
-      permissionDecisionReason: error.message
+      permissionDecisionReason: reason
     } })}\n`);
+    process.stderr.write(`${reason}\n`);
     process.exitCode = 2;
   } finally {
     if (state) {
