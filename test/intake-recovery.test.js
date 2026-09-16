@@ -8,7 +8,7 @@ const { SurfaceState } = require('../src/state');
 const { DiscordGateway } = require('../src/discord');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 
-function fixture(t) {
+function fixture(t, { adoptThread = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'intake-recovery-'));
   const db = path.join(dir, 'surface.sqlite');
   let state = new SurfaceState(db);
@@ -18,8 +18,10 @@ function fixture(t) {
   state.setIntakeBaseline('1000', '100', 'fixture');
   state.markIntakeBoundary('1000', 'ready');
   state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: 'guild' }, state.getBinding('1000'));
-  state.setThreadBaseline('2000', '100', state.getBinding('1000'));
-  state.markThreadBoundary('2000', 'ready');
+  if (adoptThread) {
+    state.setThreadBaseline('2000', '100', state.getBinding('1000'));
+    state.markThreadBoundary('2000', 'ready');
+  }
   let fault = null;
   let deliveryAllowed = false;
   const dispatched = [], replies = [];
@@ -67,6 +69,49 @@ function fixture(t) {
     cursor(id) { return id === '1000' ? state.getIntakeWatermark(id).recovered_through_id : state.getThreadEnrollment(id).recoveredThroughId; },
     message(id, channelId) { return { id, channelId, guildId: 'guild', content: 'fresh work', author: { id: 'operator', bot: false }, channel: channels.get(channelId) }; }
   };
+}
+
+for (const kind of ['channel', 'history']) {
+  test(`pre-adoption thread ${kind} 503 stays pending and preserves observed custody`, async t => {
+    const f = fixture(t, { adoptThread: false });
+    const binding = f.state.getBinding('1000');
+    const message = { ...f.message('101', '2000'), authorId: 'operator', isBot: false, attachments: [] };
+
+    f.fail({ id: '2000', kind, status: 503 });
+    await f.recover();
+    assert.equal(f.boundary('2000').state, 'pending');
+
+    const accepted = f.state.acceptDiscordMessage(message, { expectedBinding: binding });
+    assert.equal(accepted.accepted, true);
+    assert.equal(f.state.getMessage('101').state, 'accepted');
+
+    f.history.set('2000', [message]);
+    f.fail(null);
+    await f.recover();
+    assert.equal(f.boundary('2000').state, 'ready');
+    assert.equal(f.boundary('2000').adoptedThroughId, '101');
+    assert.equal(f.state.getMessage('101').state, 'accepted');
+  });
+}
+
+for (const [state, detail] of [['gap', 'explicit child gap'], ['unavailable', 'explicit child hold']]) {
+  test(`thread delivery 503 preserves enrolled ${state} boundary`, async t => {
+    const f = fixture(t);
+    const binding = f.state.getBinding('1000');
+    const message = { ...f.message('101', '2000'), authorId: 'operator', isBot: false, attachments: [] };
+    const accepted = f.state.acceptDiscordMessage(message, { expectedBinding: binding });
+    assert.equal(accepted.accepted, true);
+    f.state.markThreadBoundary('2000', state, detail, '101', '202', binding);
+    f.fail({ id: '2000', kind: 'channel', status: 503 });
+
+    await assert.rejects(() => f.gateway.threadDeliveryMessage({ id: '101', channelId: '2000' }), /Discord HTTP 503 during recovery/);
+
+    const boundary = f.boundary('2000');
+    assert.equal(boundary.state, state);
+    assert.equal(boundary.detail, detail);
+    assert.equal(boundary.gapFrom, '101');
+    assert.equal(boundary.gapTo, '202');
+  });
 }
 
 for (const id of ['1000', '2000']) {

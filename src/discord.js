@@ -1493,10 +1493,13 @@ class DiscordGateway {
     if (!stored?.deliveryChannelId || stored.deliveryChannelId === stored.channelId) return;
     const binding = this.state.getBinding(stored.channelId);
     if (!bindingIdentityMatches(stored, binding)) return;
-    const watermark = this.state.getIntakeWatermark(stored.deliveryChannelId);
-    if (watermark && ['gap', 'unavailable'].includes(watermark.state) &&
-      !isRetryableFetchBoundary(watermark.state, watermark.detail)) return;
-    this.state.markThreadBoundary(stored.deliveryChannelId, THREAD_STATES.UNAVAILABLE,
+    const enrollment = this.state.getThreadEnrollment(stored.deliveryChannelId);
+    if (!enrollment) return;
+    const retryableBoundary = isRetryableFetchBoundary(enrollment.state, enrollment.detail);
+    const retryableFetch = isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, error.message);
+    if (['gap', 'unavailable'].includes(enrollment.state) && !retryableBoundary) return;
+    const nextState = !enrollment.adoptedAt && retryableFetch ? THREAD_STATES.PENDING : THREAD_STATES.UNAVAILABLE;
+    this.state.markThreadBoundary(stored.deliveryChannelId, nextState,
       error.message, null, null, binding);
   }
 

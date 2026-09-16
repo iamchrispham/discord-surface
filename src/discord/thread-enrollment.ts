@@ -96,8 +96,10 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   const parent = gateway.state.getMessageRoute(enrollment.parentChannelId);
   if (!parent?.ready) return false;
   const binding = parent.binding;
+  const retryableBoundary = enrollment.adoptedAt != null &&
+    isRetryableFetchBoundary(enrollment.state, enrollment.detail);
   if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state) &&
-      !isRetryableFetchBoundary(enrollment.state, enrollment.detail)) return false;
+      !retryableBoundary) return false;
   const current = () => !signal.aborted && gateway.isCurrentLifecycle(epoch) && gateway.isCurrentBinding(binding);
   const boundary = (
     state: ThreadState,
@@ -230,7 +232,13 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
     if (!checkpointOnly) {
       const deadlineReached = (error as { recoveryKind?: string }).recoveryKind === CODEX_VALIDATION_KINDS.DEADLINE;
       if (deadlineReached && !recoveryAttempted) return false;
-      boundary(deadlineReached ? THREAD_STATES.GAP : THREAD_STATES.UNAVAILABLE, error instanceof Error ? error.message : String(error), after);
+      const detail = error instanceof Error ? error.message : String(error);
+      const preAdoptionRetry = !gateway.state.getThreadEnrollment(enrollment.threadId)?.adoptedAt &&
+        isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
+      let nextState: ThreadState = THREAD_STATES.UNAVAILABLE;
+      if (deadlineReached) nextState = THREAD_STATES.GAP;
+      else if (preAdoptionRetry) nextState = THREAD_STATES.PENDING;
+      boundary(nextState, detail, after);
     }
     return false;
   }
