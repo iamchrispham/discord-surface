@@ -6,6 +6,7 @@ const path = require('node:path');
 const { ChannelType } = require('discord.js');
 const { SurfaceState } = require('../src/state');
 const { DiscordGateway } = require('../src/discord');
+const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'intake-recovery-'));
@@ -20,12 +21,18 @@ function fixture(t) {
   state.setThreadBaseline('2000', '100', state.getBinding('1000'));
   state.markThreadBoundary('2000', 'ready');
   let fault = null;
+  let deliveryAllowed = false;
+  const dispatched = [], replies = [];
+  const secret = path.join(dir, 'unused');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=disposable-test-token\n', { mode: 0o600 });
   const calls = [];
   const history = new Map([['1000', []], ['2000', []]]);
   const channels = new Map(['1000', '2000'].map(id => [id, {
     id, guildId: 'guild', type: id === '1000' ? ChannelType.GuildText : ChannelType.PublicThread,
     parentId: id === '2000' ? '1000' : null, isThread: () => id === '2000',
-    permissionsFor: () => ({ has: () => true })
+    permissionsFor: () => ({ has: () => true }),
+    async send(options) { replies.push({ channelId: id, ...options }); return { id: `reply-${replies.length}` }; },
+    messages: { async fetch() { return { async react() {} }; } }
   }]));
   const check = (kind, id, after) => {
     calls.push({ kind, id, after });
@@ -33,19 +40,26 @@ function fixture(t) {
       throw Object.assign(new Error('fetch failed'), { status: fault.status });
     }
   };
-  const client = { user: { id: 'bot' }, on() {}, off() {}, async destroy() {},
+  const client = { user: { id: 'bot' }, on() {}, off() {}, async login() {}, async destroy() {},
     channels: { async fetch(id) { check('channel', id); return channels.get(id); } }
   };
   const options = { client, fetchHistory: async (channel, options) => {
     check('history', channel.id, options.after);
     return history.get(channel.id).filter(m => !options.after || BigInt(m.id) > BigInt(options.after)).slice(0, options.limit);
   }, recoveryOptions: { pageLimit: 1 }, providers: { codex: {
-    async dispatch() { assert.fail('recovery must not dispatch native work'); }
+    async dispatch(message) {
+      assert.ok(deliveryAllowed, 'recovery must not dispatch native work');
+      dispatched.push(message);
+      recordNativeAcknowledgment(state, { provider: 'codex', messageId: message.id, nativeId: message.nativeId, generation: message.generation });
+      return { status: 'submitted' };
+    },
+    async observe() { return { text: 'recovered answer' }; }
   } } };
   let gateway = new DiscordGateway({ ...options, state });
   t.after(async () => { await gateway.stop(); state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   return {
-    get state() { return state; }, get gateway() { return gateway; }, calls, history, channels,
+    get state() { return state; }, get gateway() { return gateway; }, calls, history, channels, dispatched, replies, secret,
+    enableDelivery() { deliveryAllowed = true; },
     fail(value) { fault = value; },
     async reopen() { await gateway.stop(); state.close(); state = new SurfaceState(db); gateway = new DiscordGateway({ ...options, state }); },
     recover(signal = new AbortController().signal) { return gateway.recoverInbound(signal, 'restart'); },
@@ -134,5 +148,32 @@ for (const id of ['1000', '2000']) {
     assert.equal(f.calls.length, 0);
     await f.recover();
     assert.equal(f.boundary(id).state, 'ready');
+  });
+}
+
+for (const id of ['1000', '2000']) {
+  test(`${id} startup retry delivers accepted custody exactly once to its unchanged owner`, { timeout: 5000 }, async t => {
+    const f = fixture(t);
+    const originalOwner = f.state.getBinding('1000');
+    const message = f.message('101', id);
+    await f.gateway.consumer.intakeMessage(message, false, null, originalOwner);
+    await f.gateway.consumer.waitForReceipts();
+    assert.equal(f.state.getMessage('101').state, 'accepted');
+    f.history.set(id, [message]);
+    f.fail({ id, kind: 'channel', status: 503 });
+    if (id === '1000') await assert.rejects(f.gateway.start(f.secret), /intake recovery is unavailable/);
+    else await f.gateway.start(f.secret);
+    assert.equal(f.boundary(id).state, 'unavailable');
+    await f.reopen(); f.fail(null); f.enableDelivery();
+    await f.gateway.start(f.secret);
+    await f.gateway.reconcilePending();
+    await f.gateway.consumer.waitForNativeWork();
+    await f.gateway.reconcilePending();
+    assert.equal(f.boundary(id).state, 'ready');
+    assert.equal(f.state.getMessage('101').state, 'replied');
+    assert.equal(f.dispatched.length, 1);
+    assert.equal(f.dispatched[0].nativeId, originalOwner.nativeId);
+    assert.equal(f.dispatched[0].generation, originalOwner.generation);
+    assert.equal(f.replies.filter(r => r.content === 'recovered answer' && r.channelId === id).length, 1);
   });
 }
