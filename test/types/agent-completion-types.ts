@@ -3,6 +3,7 @@ import {
   type AgentCompletionDependencies,
   type AgentCompletionInput
 } from '../../src/state/agent-completion';
+import { NATIVE_REPLY_FILE_PHASES } from '../../src/state/native-reply-file';
 
 const dependencies = {
   AGENT_COMPLETION_RECEIPTS: {
@@ -15,6 +16,7 @@ const dependencies = {
   },
   DIRECT_POST_ATTEMPT: 'direct-post-attempt',
   DIRECT_POST_OUTCOME: 'direct-post-outcome',
+  NATIVE_REPLY_FILE_PHASES,
   assertText: (value: unknown, _name: string, _max?: number) => String(value),
   assertProvider: (value: unknown) => String(value),
   assertUuid: (value: unknown) => String(value),

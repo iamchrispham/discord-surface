@@ -147,7 +147,7 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
       if (existing?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) return existing;
       throw new deps.BindingError('reply is already recorded without file custody');
     }
-    if (![deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.DISPATCHING].includes(message.state)) {
+    if (![deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.UNCERTAIN].includes(message.state)) {
       throw new deps.BindingError(`reply is not accepted in state ${message.state}`);
     }
     if (existing?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) {

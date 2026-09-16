@@ -26,10 +26,11 @@ function fixture(t, provider = 'codex') {
   return { dir, state, provider, nativeId: NATIVE[provider] };
 }
 
-function submitted(f, id) {
+function submitted(f, id, dispatchState = MESSAGE_STATES.SUBMITTED) {
   f.state.acceptDiscordMessage({ id, guildId: 'guild', channelId: 'channel', authorId: 'operator', isBot: false, content: 'question' });
   f.state.claimDispatch(id);
-  f.state.markSubmitted(id);
+  if (dispatchState === MESSAGE_STATES.UNCERTAIN) f.state.markUncertain(id, new Error('dispatch interrupted'));
+  else f.state.markSubmitted(id);
 }
 
 function directPreparationSeed(f, index) {
@@ -58,14 +59,16 @@ function directPreparationSeed(f, index) {
   };
 }
 
-test('Codex and Claude native replies admit one shared file and deliver its snapshot', async t => {
-  for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
+test('Codex and Claude file replies recover submitted and uncertain dispatch', async t => {
+  for (const provider of ['codex', 'claude']) for (const dispatchState of [MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.UNCERTAIN]) {
+    await t.test(`${provider} ${dispatchState}`, async t2 => {
     const f = fixture(t2, provider);
     const id = `native-file-${provider}`;
     const source = path.join(f.dir, 'answer.bin');
     const bytes = Buffer.from([0, 4, 8, 255]);
     fs.writeFileSync(source, bytes);
-    submitted(f, id);
+    submitted(f, id, dispatchState);
+    assert.equal(f.state.getMessage(id).state, dispatchState);
     const manifest = f.state.prepareNativeReplyFile({ provider, messageId: id, nativeId: f.nativeId, generation: 1,
       stateDir: f.dir, sourcePath: source, caption: 'answer with file' });
     assert.deepEqual(f.state.prepareNativeReplyFile({ provider, messageId: id, nativeId: f.nativeId, generation: 1,
@@ -95,7 +98,8 @@ test('Codex and Claude native replies admit one shared file and deliver its snap
     assert.equal(f.state.nativeReplyFilePreparation(id).phase, 'admitted');
     assert.equal(f.state.releaseNativeReplyFilePreparation(id, manifest.preparationId).phase, 'released');
     assert.equal(fs.existsSync(manifest.stagedPath), false);
-  });
+    });
+  }
 });
 
 test('native file custody survives not-sent reconciliation and named cleanup only', t => {

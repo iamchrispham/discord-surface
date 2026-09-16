@@ -44,6 +44,7 @@
     "test/types/agent-presentation.ts",
     "test/types/agent-attachment.ts",
     "test/types/agent-completion-types.ts",
+    "test/types/native-reply-file-types.ts",
     "test/ordinary-codex-types.ts",
     "test/ordinary-claude-types.ts",
     "test/ordinary-channel-resolution-types.ts",

@@ -84,6 +84,7 @@ export interface AgentCompletionDependencies {
   DIRECT_POST_ATTEMPT: string;
   DIRECT_POST_OUTCOME: string;
   NATIVE_REPLY_FILE_PREPARATION?: string;
+  NATIVE_REPLY_FILE_PHASES: typeof import('./native-reply-file').NATIVE_REPLY_FILE_PHASES;
   assertText(value: unknown, name: string, max?: number): string;
   assertProvider(value: unknown): string;
   assertUuid(value: unknown, name?: string): string;
@@ -270,7 +271,8 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
           .get(messageId, deps.NATIVE_REPLY_FILE_PREPARATION) as { detail?: unknown } | undefined
         : undefined;
       const fileDetail = filePreparation ? deps.parseJson(filePreparation.detail, null) : null;
-      if (fileDetail?.phase === 'preparing' || fileDetail?.phase === 'admitted') {
+      if (fileDetail?.phase === deps.NATIVE_REPLY_FILE_PHASES.PREPARING ||
+          fileDetail?.phase === deps.NATIVE_REPLY_FILE_PHASES.ADMITTED) {
         throw new deps.BindingError('agent completion requires native reply file custody to be recorded or explicitly released');
       }
       const completionRows = state.db.prepare(`SELECT id, kind, detail FROM receipts
