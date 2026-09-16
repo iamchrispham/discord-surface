@@ -1224,3 +1224,36 @@ test('old capacity refusal cleanup cannot shadow a later admitted native file', 
     }
   });
 });
+
+test('terminal native file retry validates its immutable request identity', t => {
+  const f = fixture(t, 'codex');
+  const id = 'native-file-terminal-retry-identity';
+  const source = path.join(f.dir, 'terminal-retry.bin');
+  fs.writeFileSync(source, Buffer.from('terminal retry bytes'));
+  submitted(f, id, MESSAGE_STATES.SUBMITTED);
+  const input = {
+    provider: 'codex',
+    messageId: id,
+    nativeId: f.nativeId,
+    generation: 1,
+    stateDir: f.dir,
+    sourcePath: source,
+    caption: 'terminal retry caption'
+  };
+
+  const manifest = f.state.prepareNativeReplyFile(input);
+  f.state.recordNativeReply({ ...input, text: input.caption, fileManifest: manifest });
+  assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLY_READY);
+
+  assert.throws(
+    () => f.state.prepareNativeReplyFile({ ...input, caption: 'different terminal caption' }),
+    /identity conflicts with its admitted custody/
+  );
+
+  fs.writeFileSync(source, Buffer.from('different terminal bytes'));
+  assert.throws(
+    () => f.state.prepareNativeReplyFile(input),
+    /identity conflicts with its admitted custody/
+  );
+  assert.equal(f.state.nativeReplyFilePreparation(id).preparationId, manifest.preparationId);
+});

@@ -53,12 +53,20 @@ interface NativeReplyFileState {
   receipt(discordId: string, kind: string, detail: unknown): void;
 }
 
+interface NativeReplyFileMessageStates {
+  REPLIED: string;
+  REPLY_READY: string;
+  SUBMITTED: string;
+  DISPATCHING: string;
+  UNCERTAIN: string;
+}
+
 interface NativeReplyFileDependencies {
   BindingError: new (message: string) => Error;
   AuthorizationError: new (message: string) => Error;
   StaleGenerationError: new (message: string) => Error;
   StateCorruptError: new (message: string) => Error;
-  MESSAGE_STATES: Record<string, string>;
+  MESSAGE_STATES: NativeReplyFileMessageStates;
   DIRECT_POST_FILE_PREPARATION: string;
   NATIVE_ACK_RECEIPT: string;
   REPLY_LIMIT: number;
@@ -88,10 +96,10 @@ function preparationReceipts(state: NativeReplyFileState, deps: NativeReplyFileD
 }
 
 function latestPreparation(state: NativeReplyFileState, deps: NativeReplyFileDependencies, messageId: string): any {
-  // An older release receipt must not shadow a newer preparation identity.
   const latestByPreparation = new Map<string, any>();
   for (const detail of preparationReceipts(state, deps, messageId)) latestByPreparation.set(detail.preparationId, detail);
-  return [...latestByPreparation.values()].at(-1) || null;
+  const preparations = [...latestByPreparation.values()];
+  return preparations.filter(detail => detail.phase !== NATIVE_REPLY_FILE_PHASES.RELEASED).at(-1) || preparations.at(-1) || null;
 }
 
 function preparationById(state: NativeReplyFileState, deps: NativeReplyFileDependencies, messageId: string, preparationId: string): any {
@@ -148,14 +156,6 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
     }
     if (!check.current) throw new deps.AuthorizationError('native reply authorization is no longer valid');
     const existing = latestPreparation(state, deps, messageId);
-    if (message.state === deps.MESSAGE_STATES.REPLIED) return existing?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED ? existing : null;
-    if (message.state === deps.MESSAGE_STATES.REPLY_READY) {
-      if (existing?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) return existing;
-      throw new deps.BindingError('reply is already recorded without file custody');
-    }
-    if (![deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.UNCERTAIN].includes(message.state)) {
-      throw new deps.BindingError(`reply is not accepted in state ${message.state}`);
-    }
     if (existing?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) {
       if (existing.captionHash !== crypto.createHash('sha256').update(caption).digest('hex')) {
         throw new deps.BindingError('native reply file request identity conflicts with its admitted custody');
@@ -176,8 +176,16 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
           }
         }
       }
-      return existing;
     }
+    if (message.state === deps.MESSAGE_STATES.REPLIED) return existing?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED ? existing : null;
+    if (message.state === deps.MESSAGE_STATES.REPLY_READY) {
+      if (existing?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) return existing;
+      throw new deps.BindingError('reply is already recorded without file custody');
+    }
+    if (![deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.UNCERTAIN].includes(message.state)) {
+      throw new deps.BindingError(`reply is not accepted in state ${message.state}`);
+    }
+    if (existing?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) return existing;
     if (existing?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING && existing.reservesCapacity !== false) {
       throw new deps.BindingError(`native reply file preparation is already in progress: ${existing.preparationId}`);
     }
