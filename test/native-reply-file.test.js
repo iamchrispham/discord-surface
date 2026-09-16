@@ -643,6 +643,57 @@ test('public native-reply command accepts Claude alias and records file custody'
   assert.match(cleanup.stdout, /"phase": "released"/);
 });
 
+test('capacity refusal CLI exposes the cleanup ID and reopens text replies', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    for (let index = 0; index < 8; index += 1) {
+      f.state.receipt(null, 'direct-post-file-preparation', {
+        journal: 'direct-post-v1',
+        preparationId: `55555555-5555-4555-8555-${String(index).padStart(12, '0')}`,
+        requestId: `direct-capacity-cli-${index}`,
+        phase: 'preparing',
+        reservesCapacity: true
+      });
+    }
+
+    const id = `native-file-capacity-cli-${provider}`;
+    const textFile = path.join(f.dir, 'reply.txt');
+    const source = path.join(f.dir, 'capacity.bin');
+    fs.writeFileSync(textFile, 'capacity reply');
+    fs.writeFileSync(source, Buffer.from('capacity payload'));
+    submitted(f, id);
+    const cli = path.join(__dirname, '..', 'src', 'cli.js');
+    const nativeArgs = [cli, 'native-reply', '--state-dir', f.dir, '--provider', provider,
+      '--message-id', id, '--native-id', f.nativeId, '--generation', '1', '--text-file', textFile,
+      '--attachment-file', source];
+    const first = spawnSync(process.execPath, nativeArgs, { encoding: 'utf8' });
+    assert.equal(first.status, 1, first.stdout);
+    const firstMatch = first.stderr.match(/file custody capacity is exhausted: ([^\s]+)/);
+    assert.ok(firstMatch, first.stderr);
+    const preparationId = firstMatch[1];
+    assert.equal(f.state.nativeReplyFilePreparation(id).preparationId, preparationId);
+
+    const duplicate = spawnSync(process.execPath, nativeArgs, { encoding: 'utf8' });
+    assert.equal(duplicate.status, 1, duplicate.stdout);
+    const duplicateMatch = duplicate.stderr.match(/file custody capacity is exhausted: ([^\s]+)/);
+    assert.ok(duplicateMatch, duplicate.stderr);
+    assert.equal(duplicateMatch[1], preparationId);
+    assert.equal(f.state.activeFilePreparationCount(), 8);
+    assert.equal(fs.existsSync(path.join(f.dir, '.direct-post-files')), false);
+
+    const cleanup = spawnSync(process.execPath, [cli, 'native-reply-file-cleanup', '--state-dir', f.dir,
+      '--message-id', id, '--preparation-id', preparationId], { encoding: 'utf8' });
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.match(cleanup.stdout, /"phase": "released"/);
+
+    const textReply = spawnSync(process.execPath, [cli, 'native-reply', '--state-dir', f.dir, '--provider', provider,
+      '--message-id', id, '--native-id', f.nativeId, '--generation', '1', '--text-file', textFile], { encoding: 'utf8' });
+    assert.equal(textReply.status, 0, textReply.stderr);
+    assert.match(textReply.stdout, /"recorded": true/);
+    assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLY_READY);
+  });
+});
+
 function nativeFileFinalRegressionInput(f, messageId, sourcePath, caption) {
   return {
     provider: f.provider,

@@ -218,7 +218,7 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
         throw new deps.BindingError(`reply is not accepted in state ${currentMessage.state}`);
       }
     };
-    const capacityExhausted = state.transaction(() => {
+    const capacityRefusalId = state.transaction(() => {
       assertReservationCustody();
       const current = latestPreparation(state, deps, messageId);
       if (current?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) throw new deps.BindingError('native reply file preparation is already admitted');
@@ -245,14 +245,14 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
         state.receipt(messageId, deps.NATIVE_ACK_RECEIPT, { provider, nativeId, generation, source: 'native-reply-file' });
       }
       if (activePreparationCount(state, deps) >= DIRECT_POST_FILE_LIMITS.maxReservations) {
-        if (sameCapacityRefusal) return true;
+        if (sameCapacityRefusal) return current.preparationId;
         state.receipt(messageId, NATIVE_REPLY_FILE_PREPARATION, { ...seed, reservesCapacity: false });
-        return true;
+        return preparationId;
       }
       state.receipt(messageId, NATIVE_REPLY_FILE_PREPARATION, seed);
       return false;
     });
-    if (capacityExhausted) throw new deps.BindingError('file custody capacity is exhausted');
+    if (capacityRefusalId) throw new deps.BindingError(`file custody capacity is exhausted: ${capacityRefusalId}`);
     let manifest;
     try { manifest = stageDirectPostFile({ sourcePath, stateDir: root, preparationId, caption, captionHash: seed.captionHash }); }
     catch (error) { throw new deps.BindingError(`native reply file preparation ${preparationId} is not admitted: ${(error as Error).message}`); }
