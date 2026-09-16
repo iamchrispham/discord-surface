@@ -493,7 +493,7 @@ test('accepted child custody blocks parent handoff and unbind during a pause', t
   assert.equal(f.state.getMessage('401').state, MESSAGE_STATES.ACCEPTED);
 });
 
-test('schema 1.6 rows migrate additively to 1.7 on reopen', t => {
+test('schema 1.6 rows migrate additively to 1.8 on reopen', t => {
   const f = fixture(t);
   const accepted = f.state.acceptDiscordMessage(event('201', 'parent'), { expectedBinding: f.state.getBinding('parent') });
   assert.equal(accepted.accepted, true);
@@ -503,7 +503,7 @@ test('schema 1.6 rows migrate additively to 1.7 on reopen', t => {
   legacy.close();
   const reopened = f.reopen();
   assert.equal(reopened.getMessage('201').deliveryChannelId, 'parent');
-  assert.equal(reopened.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.7');
+  assert.equal(reopened.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.8');
   assert.equal(reopened.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='thread_enrollments'").get().name, 'thread_enrollments');
   assert.equal(reopened.db.prepare('PRAGMA table_info(messages)').all().some(row => row.name === 'delivery_channel_id'), true);
 });

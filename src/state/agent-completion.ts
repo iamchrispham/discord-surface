@@ -10,6 +10,7 @@ import {
   type DirectPostReceiptDetail,
   type SentAgentResultRow
 } from './direct-post';
+import type { NativeReplyFilePhase } from './native-reply-file';
 
 interface SqlRow {
   [key: string]: unknown;
@@ -60,6 +61,7 @@ interface CompletionState {
   db: CompletionDatabase;
   transaction<T>(operation: () => T): T;
   getMessage(messageId: string): CompletionMessage | null;
+  nativeReplyFilePreparation(messageId: string): { phase: NativeReplyFilePhase } | null;
   isInteractionMessage(messageId: string): boolean;
   getAgentMessage(messageId: string): AgentMessageProvenance | null;
   currentMessageBinding(message: CompletionMessage): MessageBindingCheck;
@@ -83,6 +85,7 @@ export interface AgentCompletionDependencies {
   }>;
   DIRECT_POST_ATTEMPT: string;
   DIRECT_POST_OUTCOME: string;
+  NATIVE_REPLY_FILE_PHASES: typeof import('./native-reply-file').NATIVE_REPLY_FILE_PHASES;
   assertText(value: unknown, name: string, max?: number): string;
   assertProvider(value: unknown): string;
   assertUuid(value: unknown, name?: string): string;
@@ -263,6 +266,11 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
           (message.replyMessageId !== null && message.replyMessageId !== undefined) ||
           message.replyNextPart > 0 || state.listReplyParts(messageId).length > 0) {
         throw new deps.BindingError('agent completion requires empty reply custody');
+      }
+      const filePreparation = state.nativeReplyFilePreparation(messageId);
+      if (filePreparation?.phase === deps.NATIVE_REPLY_FILE_PHASES.PREPARING ||
+          filePreparation?.phase === deps.NATIVE_REPLY_FILE_PHASES.ADMITTED) {
+        throw new deps.BindingError('agent completion requires native reply file custody to be recorded or explicitly released');
       }
       const completionRows = state.db.prepare(`SELECT id, kind, detail FROM receipts
         WHERE discord_id=? AND kind IN (?, ?) ORDER BY id DESC`).all(

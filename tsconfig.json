@@ -33,6 +33,7 @@
     "src/discord/board-refresh.ts",
     "src/board-refresh.ts",
     "src/state/direct-post.ts",
+    "src/state/native-reply-file.ts",
     "src/direct-post-file.ts",
     "src/state/agent-completion.ts",
     "src/state/ordinary-binding.ts",
