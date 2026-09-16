@@ -473,3 +473,57 @@ test('handled completion leaves later accepted owner work recoverable after rest
     assert.deepEqual(state.recoveryCandidates().map(message => message.id), ['a2-restart-second-event']);
   } finally { state?.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+
+test('agent completion stays eligible after newest capacity refusal cleanup and reopen', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-handled-released-refusal-'));
+    const db = path.join(dir, 'surface.sqlite');
+    let state = new SurfaceState(db);
+    try {
+      state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+      const bound = bindAgentOwners(state, dir);
+      const owners = provider === 'claude' ? bound : { source: bound.target, target: bound.source };
+      const ownerIdentity = state.directPostOwnerIdentity(process.pid);
+      for (let index = 0; index < 8; index += 1) {
+        const preparationId = `55555555-5555-4555-8555-${String(index).padStart(12, '0')}`;
+        state.beginDirectPostFilePreparation({
+          preparationId, requestId: `completion-capacity-${index}`, custodyRoot: dir,
+          sourcePath: path.join(dir, `${preparationId}.bin`),
+          stagedPath: path.join(dir, '.direct-post-files', `${preparationId}.bin`),
+          filename: `${preparationId}.bin`, size: 0, caption: 'held direct file', captionHash: `caption-${index}`,
+          ...owners.target, operatorId: '900', inReplyTo: null, ...ownerIdentity
+        });
+      }
+      const messageId = 'released-refusal-result-event';
+      const packet = { id: 'released-refusal-result', kind: KINDS.RESULT,
+        source: owners.source, target: owners.target, replyTo: 'remote-request', text: 'Result.' };
+      assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.target.guildId,
+        channelId: owners.target.channelId, authorId: '901', isBot: true, attachments: [],
+        content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
+      assert.equal(state.claimDispatch(messageId).claimed, true);
+      state.markSubmitted(messageId);
+      const identity = { messageId, provider, nativeId: owners.target.nativeId, generation: owners.target.generation };
+      recordNativeAcknowledgment(state, identity);
+      const sourceFile = path.join(dir, 'answer.bin');
+      fs.writeFileSync(sourceFile, 'refused result bytes');
+      const input = { ...identity, stateDir: dir, sourcePath: sourceFile, caption: 'first caption' };
+      assert.throws(() => state.prepareNativeReplyFile(input), /file custody capacity is exhausted/);
+      const older = state.nativeReplyFilePreparation(messageId);
+      assert.throws(() => state.prepareNativeReplyFile({ ...input, caption: 'changed caption' }), /file custody capacity is exhausted/);
+      const latest = state.nativeReplyFilePreparation(messageId);
+      assert.notEqual(latest.preparationId, older.preparationId);
+      assert.throws(() => state.completeAgentHandledWithoutPost(identity), /native reply file custody/);
+      state.directPostOwnerAlive = () => false;
+      state.releaseNativeReplyFilePreparation(messageId, latest.preparationId);
+      state.close();
+      state = new SurfaceState(db);
+      const completed = state.completeAgentHandledWithoutPost(identity);
+      assert.equal(completed.completed, true);
+      assert.equal(completed.disposition, 'result-consumed');
+      assert.equal(completed.message.state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
+      assert.deepEqual(state.listReplyParts(messageId), []);
+      assert.equal(state.activeFilePreparationCount(), 8);
+    } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});

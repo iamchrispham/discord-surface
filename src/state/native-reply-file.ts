@@ -99,7 +99,7 @@ function latestPreparation(state: NativeReplyFileState, deps: NativeReplyFileDep
   const latestByPreparation = new Map<string, any>();
   for (const detail of preparationReceipts(state, deps, messageId)) latestByPreparation.set(detail.preparationId, detail);
   const preparations = [...latestByPreparation.values()];
-  return preparations.filter(detail => detail.phase !== NATIVE_REPLY_FILE_PHASES.RELEASED).at(-1) || preparations.at(-1) || null;
+  return preparations.at(-1) || null;
 }
 
 function preparationById(state: NativeReplyFileState, deps: NativeReplyFileDependencies, messageId: string, preparationId: string): any {
