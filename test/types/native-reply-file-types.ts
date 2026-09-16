@@ -36,6 +36,16 @@ const prepare: typeof handlers.prepareNativeReplyFile = handlers.prepareNativeRe
 const release: typeof handlers.releaseNativeReplyFilePreparation = handlers.releaseNativeReplyFilePreparation;
 const lookup: typeof handlers.nativeReplyFilePreparation = handlers.nativeReplyFilePreparation;
 
+const prepareInput: Parameters<typeof prepare>[1] = {
+  provider: 'codex',
+  messageId: 'message-id',
+  nativeId: '11111111-1111-1111-1111-111111111111',
+  generation: 1,
+  stateDir: '/tmp',
+  sourcePath: '/tmp/reply.txt',
+  caption: 'Reply'
+};
+
 const preparation: NativeReplyFilePreparation = {
   journal: NATIVE_REPLY_FILE_JOURNAL,
   phase: NATIVE_REPLY_FILE_PHASES.ADMITTED,
@@ -65,9 +75,15 @@ const unsupportedPhase: NativeReplyFilePhase = 'sent';
 const key: string = nativeReplyFilePreparationKey('native-reply-file', preparation.preparationId);
 assertNativeReplyFileManifest(preparation);
 
-void prepare;
-void release;
-void lookup;
+const prepared = prepare(null as unknown as Parameters<typeof prepare>[0], prepareInput);
+const admitted: NativeReplyFilePreparation | null = prepared;
+const preparationId: Parameters<typeof release>[2] = preparation.preparationId;
+const messageId: Parameters<typeof release>[1] = preparation.messageId;
+const lookedUp: ReturnType<typeof lookup> = lookup(null as unknown as Parameters<typeof lookup>[0], messageId);
+
+void admitted;
+void lookedUp;
+void preparationId;
 void phase;
 void unsupportedPhase;
 void key;

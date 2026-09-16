@@ -2518,7 +2518,7 @@ class SurfaceState {
             admittedFile.preparationId !== fileManifest.preparationId || admittedFile.stagedPath !== fileManifest.stagedPath ||
             admittedFile.filename !== fileManifest.filename || admittedFile.size !== fileManifest.size ||
             admittedFile.sha256 !== fileManifest.sha256 || admittedFile.caption !== fileManifest.caption ||
-            admittedFile.captionHash !== fileManifest.captionHash) {
+            admittedFile.captionHash !== fileManifest.captionHash || admittedFile.caption !== text) {
             throw new BindingError('native reply file preparation is not admitted for this reply');
           }
         }

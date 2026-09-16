@@ -168,7 +168,9 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
       }
       return existing;
     }
-    if (existing?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING) throw new deps.BindingError('native reply file preparation is already in progress');
+    if (existing?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING) {
+      throw new deps.BindingError(`native reply file preparation is already in progress: ${existing.preparationId}`);
+    }
     let inspected;
     try { inspected = inspectDirectPostFile(sourcePath); }
     catch (error) { throw new deps.BindingError((error as Error).message); }
@@ -185,10 +187,26 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
       channelId: message.channelId, guildId: message.guildId, provider, nativeId, generation,
       operatorId: check.config.operatorId, ...ownerIdentity
     } as any;
+    const assertReservationCustody = () => {
+      const currentMessage = state.getMessage(messageId);
+      if (!currentMessage) throw new deps.StaleGenerationError('native reply is stale');
+      const currentCheck = state.currentMessageBinding(currentMessage);
+      if (currentMessage.provider !== provider || currentMessage.nativeId !== nativeId || currentMessage.generation !== generation ||
+        !currentCheck.binding || currentCheck.binding.nativeId !== nativeId || currentCheck.binding.generation !== generation || currentCheck.binding.provider !== provider) {
+        throw new deps.StaleGenerationError('native reply is stale');
+      }
+      if (!currentCheck.current) throw new deps.AuthorizationError('native reply authorization is no longer valid');
+      if (![deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.UNCERTAIN].includes(currentMessage.state)) {
+        throw new deps.BindingError(`reply is not accepted in state ${currentMessage.state}`);
+      }
+    };
     state.transaction(() => {
+      assertReservationCustody();
       const current = latestPreparation(state, deps, messageId);
       if (current?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) throw new deps.BindingError('native reply file preparation is already admitted');
-      if (current?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING) throw new deps.BindingError('native reply file preparation is already in progress');
+      if (current?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING) {
+        throw new deps.BindingError(`native reply file preparation is already in progress: ${current.preparationId}`);
+      }
       if (activePreparationCount(state, deps) >= DIRECT_POST_FILE_LIMITS.maxReservations) throw new deps.BindingError('file custody capacity is exhausted');
       state.receipt(messageId, NATIVE_REPLY_FILE_PREPARATION, seed);
     });
@@ -196,6 +214,7 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
     try { manifest = stageDirectPostFile({ sourcePath, stateDir: root, preparationId, caption, captionHash: seed.captionHash }); }
     catch (error) { throw new deps.BindingError(`native reply file preparation ${preparationId} is not admitted: ${(error as Error).message}`); }
     return state.transaction(() => {
+      assertReservationCustody();
       const current = latestPreparation(state, deps, messageId);
       if (!current || current.preparationId !== preparationId || current.phase !== NATIVE_REPLY_FILE_PHASES.PREPARING) {
         throw new deps.BindingError('native reply file preparation is no longer open');
