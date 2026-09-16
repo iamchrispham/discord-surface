@@ -22,6 +22,7 @@ const dependencies = {
     REPLY_READY: 'reply_ready'
   },
   DIRECT_POST_FILE_PREPARATION: 'direct-post-file-preparation',
+  NATIVE_ACK_RECEIPT: 'native-ack',
   REPLY_LIMIT: 4000,
   assertProvider: (value: unknown): asserts value is AgentProvider => { void value; },
   assertText: (value: unknown, _name: string, _max?: number): string => String(value),
@@ -32,9 +33,11 @@ const dependencies = {
 } satisfies Parameters<typeof createNativeReplyFileHandlers>[0];
 
 const handlers = createNativeReplyFileHandlers(dependencies);
+type NativeReplyFileHandlers = typeof handlers;
 const prepare: typeof handlers.prepareNativeReplyFile = handlers.prepareNativeReplyFile;
 const release: typeof handlers.releaseNativeReplyFilePreparation = handlers.releaseNativeReplyFilePreparation;
 const lookup: typeof handlers.nativeReplyFilePreparation = handlers.nativeReplyFilePreparation;
+const activeCount: NativeReplyFileHandlers['activeFilePreparationCount'] = handlers.activeFilePreparationCount;
 
 const prepareInput: Parameters<typeof prepare>[1] = {
   provider: 'codex',
@@ -83,6 +86,7 @@ const lookedUp: ReturnType<typeof lookup> = lookup(null as unknown as Parameters
 
 void admitted;
 void lookedUp;
+void activeCount;
 void preparationId;
 void phase;
 void unsupportedPhase;

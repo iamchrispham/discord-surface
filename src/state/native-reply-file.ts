@@ -59,6 +59,7 @@ interface NativeReplyFileDependencies {
   StateCorruptError: new (message: string) => Error;
   MESSAGE_STATES: Record<string, string>;
   DIRECT_POST_FILE_PREPARATION: string;
+  NATIVE_ACK_RECEIPT: string;
   REPLY_LIMIT: number;
   assertProvider(provider: unknown): asserts provider is AgentProvider;
   assertText(value: unknown, name: string, max?: number): string;
@@ -208,6 +209,12 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
         throw new deps.BindingError(`native reply file preparation is already in progress: ${current.preparationId}`);
       }
       if (activePreparationCount(state, deps) >= DIRECT_POST_FILE_LIMITS.maxReservations) throw new deps.BindingError('file custody capacity is exhausted');
+      const acknowledgment = state.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id DESC LIMIT 1')
+        .get(messageId, deps.NATIVE_ACK_RECEIPT);
+      const identity = deps.parseJson(acknowledgment?.detail, null);
+      if (!identity || identity.provider !== provider || identity.nativeId !== nativeId || identity.generation !== generation) {
+        state.receipt(messageId, deps.NATIVE_ACK_RECEIPT, { provider, nativeId, generation, source: 'native-reply-file' });
+      }
       state.receipt(messageId, NATIVE_REPLY_FILE_PREPARATION, seed);
     });
     let manifest;

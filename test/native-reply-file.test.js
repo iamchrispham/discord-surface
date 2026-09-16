@@ -102,6 +102,40 @@ test('Codex and Claude file replies recover submitted and uncertain dispatch', a
   }
 });
 
+test('file replies keep the caption on their attachment part', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-parts-${provider}`;
+    const source = path.join(f.dir, 'parts.bin');
+    fs.writeFileSync(source, Buffer.from('parts payload'));
+    submitted(f, id);
+    const manifest = f.state.prepareNativeReplyFile({ provider, messageId: id, nativeId: f.nativeId, generation: 1,
+      stateDir: f.dir, sourcePath: source, caption: 'caption' });
+    assert.throws(() => f.state.recordNativeReply({ provider, messageId: id, nativeId: f.nativeId, generation: 1,
+      text: 'caption', parts: ['', 'caption'], fileManifest: manifest }), /exactly one caption part/);
+    assert.equal(f.state.listReplyParts(id).length, 0);
+    const recorded = f.state.recordNativeReply({ provider, messageId: id, nativeId: f.nativeId, generation: 1,
+      text: 'caption', parts: ['caption'], fileManifest: manifest });
+    assert.equal(recorded.message.state, MESSAGE_STATES.REPLY_READY);
+    assert.deepEqual(f.state.listReplyParts(id)[0].fileManifest, manifest);
+  });
+});
+
+test('uncertain file preparation persists native acknowledgment before delivery retry', t => {
+  const f = fixture(t);
+  const id = 'native-file-uncertain-ack';
+  const source = path.join(f.dir, 'uncertain.bin');
+  fs.writeFileSync(source, Buffer.from('uncertain payload'));
+  submitted(f, id, MESSAGE_STATES.UNCERTAIN);
+  const manifest = f.state.prepareNativeReplyFile({ provider: 'codex', messageId: id, nativeId: f.nativeId, generation: 1,
+    stateDir: f.dir, sourcePath: source, caption: 'uncertain caption' });
+  assert.equal(f.state.hasNativeAcknowledgment(f.state.getMessage(id)), true);
+  const reopened = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+  assert.throws(() => reopened.reconcileUncertain(id, 'not_submitted'), /native acknowledgment/);
+  reopened.close();
+  assert.equal(f.state.nativeReplyFilePreparation(id).preparationId, manifest.preparationId);
+});
+
 test('native file custody survives not-sent reconciliation and named cleanup only', t => {
   const f = fixture(t);
   const id = 'native-file-reconcile';

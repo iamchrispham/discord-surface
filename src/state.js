@@ -158,6 +158,7 @@ const nativeReplyFileHandlers = createNativeReplyFileHandlers({
   StateCorruptError,
   MESSAGE_STATES,
   DIRECT_POST_FILE_PREPARATION,
+  NATIVE_ACK_RECEIPT,
   REPLY_LIMIT,
   assertProvider,
   assertText,
@@ -2526,6 +2527,9 @@ class SurfaceState {
         const parts = hasPrepartitionedParts ? prepartitionedParts.slice() : splitReply(text);
         if ((!parts.length && text !== '') || parts.some(part => typeof part !== 'string' || part.length > REPLY_LIMIT) || parts.join('') !== text) {
           throw new BindingError('reply parts are invalid');
+        }
+        if (fileManifest !== null && (parts.length !== 1 || parts[0] !== text)) {
+          throw new BindingError('file replies require exactly one caption part');
         }
         if (fileManifest === null && text === '' && parts.every(part => part.length === 0)) {
           this.db.prepare('UPDATE messages SET state=?, reply_text=?, reply_nonce=?, reply_message_id=NULL, reply_next_part=0, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
