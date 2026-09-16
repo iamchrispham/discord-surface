@@ -1,5 +1,6 @@
 const discord = () => require('discord.js') as typeof import('discord.js');
 import { CODEX_VALIDATION_KINDS } from '../native-transcript';
+import { isRetryableFetchBoundary, recoveryFetch } from './recovery-fetch';
 import { THREAD_STATES, type ThreadBinding, type ThreadEnrollment, type ThreadRoute, type ThreadState } from '../state/thread-enrollment';
 
 export interface ThreadChannel {
@@ -95,7 +96,8 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   const parent = gateway.state.getMessageRoute(enrollment.parentChannelId);
   if (!parent?.ready) return false;
   const binding = parent.binding;
-  if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state)) return false;
+  if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state) &&
+      !isRetryableFetchBoundary(enrollment.state, enrollment.detail)) return false;
   const current = () => !signal.aborted && gateway.isCurrentLifecycle(epoch) && gateway.isCurrentBinding(binding);
   const boundary = (
     state: ThreadState,
@@ -125,13 +127,13 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   try {
     const channel = await wait(() => {
       recoveryAttempted = true;
-      return gateway.client.channels.fetch(enrollment.threadId);
+      return recoveryFetch(() => gateway.client.channels.fetch(enrollment.threadId));
     }, signal, deadline);
     if (!current()) return false;
     assertPublicThread(channel, binding, enrollment.threadId, gateway.client.user);
     if (!gateway.fetchHistoryInjected && typeof channel.messages?.fetch !== 'function') throw new Error('Thread history fetch is unavailable');
     const readHistory = async (options: { limit: number; after?: string; signal: AbortSignal }) => {
-      const result = await wait(() => gateway.fetchHistory(channel, options), signal, deadline);
+      const result = await wait(() => recoveryFetch(() => gateway.fetchHistory(channel, options)), signal, deadline);
       if (!result || (!Array.isArray(result) && typeof (result as { values?: unknown }).values !== 'function')) {
         throw new Error('Thread history result is unavailable');
       }

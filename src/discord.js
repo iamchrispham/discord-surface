@@ -18,6 +18,7 @@ const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { DIRECT_POST_FILE_LIMITS, readDirectPostFileSnapshot } = require('./direct-post-file');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
+const { isRetryableFetchBoundary, recoveryFetch } = require('./discord/recovery-fetch');
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer } = require('./discord/decision');
@@ -2364,6 +2365,15 @@ class DiscordGateway {
         continue;
       }
       let watermark = this.state.getIntakeWatermark(binding.channelId);
+      if (watermark && isRetryableFetchBoundary(watermark.state, watermark.detail)) {
+        const retrying = this.state.markIntakeBoundary(binding.channelId, 'pending', `${reason} retry after Discord HTTP 503`,
+          watermark.gap_from, watermark.gap_to, binding);
+        if (!retrying) {
+          failure ||= { ready: false, state: 'unavailable' };
+          continue;
+        }
+        watermark = retrying;
+      }
       if (watermark && ['gap', 'unavailable'].includes(watermark.state)) {
         const terminalReadiness = watermark.state === READINESS.GAP ? READINESS.GAP : READINESS.UNAVAILABLE;
         this.state.setBindingReadiness(binding.channelId, terminalReadiness,
@@ -2373,7 +2383,7 @@ class DiscordGateway {
       }
       let channel;
       try {
-        channel = await waitForRecoveryOperation(() => this.client.channels.fetch(binding.channelId), signal, deadline);
+        channel = await waitForRecoveryOperation(() => recoveryFetch(() => this.client.channels.fetch(binding.channelId)), signal, deadline);
         if (!channel) throw new Error('Discord channel is unavailable');
       } catch (error) {
         const kind = recoveryKind(error);
@@ -2450,7 +2460,7 @@ class DiscordGateway {
       }
       if (!watermark?.recovered_through_id) {
         let baseline;
-        try { baseline = this.historyMessages(await waitForRecoveryOperation(() => this.fetchHistory(channel, { limit: 1, signal }), signal, deadline)); }
+        try { baseline = this.historyMessages(await waitForRecoveryOperation(() => recoveryFetch(() => this.fetchHistory(channel, { limit: 1, signal })), signal, deadline)); }
         catch (error) {
           const kind = recoveryKind(error);
           if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
@@ -2501,7 +2511,7 @@ class DiscordGateway {
           if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
           const options = { limit: this.historyPageLimit, signal };
           if (after) options.after = after;
-          const page = this.historyMessages(await waitForRecoveryOperation(() => this.fetchHistory(channel, options), signal, deadline));
+          const page = this.historyMessages(await waitForRecoveryOperation(() => recoveryFetch(() => this.fetchHistory(channel, options)), signal, deadline));
           if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'Discord recovery binding changed during history fetch');
           pages += 1;
           if (!page.length) { complete = true; break; }
