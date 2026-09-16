@@ -993,9 +993,17 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       }) : null;
       handoffPromise?.catch(() => {});
       let nativeSettled = false;
+      const refreshDispatchBlock = () => {
+        if (!selected || ownerEntry.dispatchBlocked) return;
+        const latest = state.getMessage(message.id);
+        if (latest?.state === MESSAGE_STATES.ACCEPTED && !hasCurrentNativeAcknowledgment(latest)) {
+          ownerEntry.dispatchBlocked = true;
+        }
+      };
       const settleNative = () => {
         if (nativeSettled) return;
         nativeSettled = true;
+        refreshDispatchBlock();
         onNativeSettled();
       };
       const work = startNativeWork(message.id, signal, async taskSignal => {
@@ -1010,6 +1018,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
               if (outcome?.status === 'not_submitted') {
                 ownerEntry.dispatchBlocked = !hasCurrentNativeAcknowledgment(state.getMessage(message.id));
               }
+              refreshDispatchBlock();
               settleDispatchOutcome?.(outcome);
             },
             onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })

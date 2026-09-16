@@ -6,6 +6,7 @@ function persistGuardRefusal(state, routeId, event, reason) {
   if (!state || typeof routeId !== 'string' || !event || typeof event !== 'object') return false;
   if (reason !== 'courier hook caller or route is not current' &&
       reason !== 'courier message is not eligible for forwarding' &&
+      reason !== 'courier attempt changed after admission' &&
       !reason.startsWith('courier forwarding authorization ')) return false;
   const input = event.tool_input;
   if (!input || typeof input !== 'object' || typeof input.prompt !== 'string' || typeof event.session_id !== 'string' ||
@@ -30,10 +31,10 @@ function persistGuardRefusal(state, routeId, event, reason) {
       AND json_extract(detail, '$.attemptId')=? LIMIT 1`)
       .get(COURIER_RECEIPT_KINDS.FORWARD_CLAIM, messageId, Number(row.id), attemptId)) return false;
     const message = state.getMessage(messageId);
-    if (!message || ![MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED].includes(message.state) ||
+    if (!message || ![MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.UNCERTAIN].includes(message.state) ||
         state.hasNativeAcknowledgment(message)) return false;
-    state.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state IN (?, ?)')
-      .run(MESSAGE_STATES.ACCEPTED, new Date().toISOString(), messageId, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED);
+    state.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state IN (?, ?, ?)')
+      .run(MESSAGE_STATES.ACCEPTED, new Date().toISOString(), messageId, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.UNCERTAIN);
     state.receipt(messageId, COURIER_RECEIPT_KINDS.OUTCOME, {
       attemptId,
       outcome: COURIER_OUTCOMES.NOT_SUBMITTED,
