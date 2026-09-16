@@ -83,6 +83,7 @@ export interface AgentCompletionDependencies {
   }>;
   DIRECT_POST_ATTEMPT: string;
   DIRECT_POST_OUTCOME: string;
+  NATIVE_REPLY_FILE_PREPARATION?: string;
   assertText(value: unknown, name: string, max?: number): string;
   assertProvider(value: unknown): string;
   assertUuid(value: unknown, name?: string): string;
@@ -263,6 +264,14 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
           (message.replyMessageId !== null && message.replyMessageId !== undefined) ||
           message.replyNextPart > 0 || state.listReplyParts(messageId).length > 0) {
         throw new deps.BindingError('agent completion requires empty reply custody');
+      }
+      const filePreparation = deps.NATIVE_REPLY_FILE_PREPARATION
+        ? state.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id DESC LIMIT 1')
+          .get(messageId, deps.NATIVE_REPLY_FILE_PREPARATION) as { detail?: unknown } | undefined
+        : undefined;
+      const fileDetail = filePreparation ? deps.parseJson(filePreparation.detail, null) : null;
+      if (fileDetail?.phase === 'preparing' || fileDetail?.phase === 'admitted') {
+        throw new deps.BindingError('agent completion requires native reply file custody to be recorded or explicitly released');
       }
       const completionRows = state.db.prepare(`SELECT id, kind, detail FROM receipts
         WHERE discord_id=? AND kind IN (?, ?) ORDER BY id DESC`).all(
