@@ -1506,7 +1506,7 @@ class DiscordGateway {
     let channel;
     try {
       channel = message.channel?.id === stored.deliveryChannelId ? message.channel :
-        await this.client.channels.fetch(stored.deliveryChannelId);
+        await recoveryFetch(() => this.client.channels.fetch(stored.deliveryChannelId));
       assertPublicThread(channel, binding, stored.deliveryChannelId, this.client.user);
     }
     catch (error) {
@@ -2675,7 +2675,13 @@ class DiscordGateway {
       const key = `${message.provider}:${message.nativeId}`;
       if (blockedOwners.has(key)) continue;
       let channel;
-      try { channel = await waitForRecoveryOperation(() => this.client.channels.fetch(message.deliveryChannelId || message.channelId), signal, deadline); } catch (error) {
+      try {
+        channel = await waitForRecoveryOperation(
+          () => recoveryFetch(() => this.client.channels.fetch(message.deliveryChannelId || message.channelId)),
+          signal,
+          deadline
+        );
+      } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
         this.markThreadDeliveryUnavailable(message, error);
