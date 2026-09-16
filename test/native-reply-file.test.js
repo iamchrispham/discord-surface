@@ -8,6 +8,7 @@ const readline = require('node:readline');
 const test = require('node:test');
 const { SurfaceState, MESSAGE_STATES } = require('../src/state');
 const { DiscordGateway, createSurfaceConsumer } = require('../src/discord');
+const { recordNativeAcknowledgment, watchAcknowledgments } = require('../src/acknowledgment.js');
 
 const NATIVE = {
   codex: '9caa5d21-2169-429d-918b-5f08651b5dbd',
@@ -355,7 +356,14 @@ test('direct and native preparations share capacity and release permits replacem
   const manifest = f.state.prepareNativeReplyFile({ provider: 'codex', messageId: id, nativeId: f.nativeId, generation: 1,
     stateDir: f.dir, sourcePath: source, caption: 'capacity' });
   assert.equal(f.state.activeFilePreparationCount(), 8);
-  assert.throws(() => f.state.beginDirectPostFilePreparation(directPreparationSeed(f, 8)), /capacity is exhausted/);
+  assert.throws(() => f.state.beginDirectPostFilePreparation(directPreparationSeed(f, 8)), error => {
+    assert.match(error.message, /capacity is exhausted/);
+    const held = JSON.parse(error.message.slice(error.message.indexOf('[')));
+    assert.equal(held.length, 8);
+    assert.ok(held.some(detail => detail.preparationId === manifest.preparationId &&
+      detail.messageId === id && detail.phase === 'admitted'));
+    return true;
+  });
   f.state.recordNativeReply({ provider: 'codex', messageId: id, nativeId: f.nativeId, generation: 1, text: 'capacity', fileManifest: manifest });
   f.state.beginReply(id);
   f.state.markReplyPartSent(id, 0, 'capacity-posted');
@@ -377,7 +385,9 @@ test('full native file capacity records ownership without reserving a file', asy
 
     assert.throws(() => f.state.prepareNativeReplyFile(input), /file custody capacity is exhausted/);
     assert.equal(f.state.activeFilePreparationCount(), 8);
-    assert.equal(f.state.nativeReplyFilePreparation(id), null);
+    const refused = f.state.nativeReplyFilePreparation(id);
+    assert.deepEqual({ phase: refused?.phase, reservesCapacity: refused?.reservesCapacity },
+      { phase: 'preparing', reservesCapacity: false });
     assert.equal(fs.existsSync(path.join(f.dir, '.direct-post-files')), false);
     const acknowledgmentRows = f.state.listReceipts().filter(row => row.discord_id === id && row.kind === 'native-ack');
     assert.equal(acknowledgmentRows.length, 1);
@@ -387,6 +397,39 @@ test('full native file capacity records ownership without reserving a file', asy
 
     assert.throws(() => f.state.prepareNativeReplyFile(input), /file custody capacity is exhausted/);
     assert.equal(f.state.listReceipts().filter(row => row.discord_id === id && row.kind === 'native-ack').length, 1);
+  });
+});
+
+test('native-only capacity rejection reports native holders', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const holders = [];
+    for (let index = 0; index < 8; index += 1) {
+      const id = `native-only-holder-${provider}-${index}`;
+      const source = path.join(f.dir, `${id}.bin`);
+      fs.writeFileSync(source, Buffer.from(id));
+      submitted(f, id);
+      holders.push(f.state.prepareNativeReplyFile({
+        provider,
+        messageId: id,
+        nativeId: f.nativeId,
+        generation: 1,
+        stateDir: f.dir,
+        sourcePath: source,
+        caption: `native holder ${index}`
+      }));
+    }
+    assert.equal(f.state.activeFilePreparationCount(), 8);
+
+    assert.throws(() => f.state.beginDirectPostFilePreparation(directPreparationSeed(f, `native-only-rejected-${provider}`)), error => {
+      assert.match(error.message, /capacity is exhausted/);
+      const held = JSON.parse(error.message.slice(error.message.indexOf('[')));
+      assert.equal(held.length, 8);
+      assert.equal(held.every(detail => detail.messageId), true);
+      assert.deepEqual(new Set(held.map(detail => detail.messageId)), new Set(holders.map(detail => detail.messageId)));
+      assert.deepEqual(new Set(held.map(detail => detail.preparationId)), new Set(holders.map(detail => detail.preparationId)));
+      return true;
+    });
   });
 });
 
@@ -937,6 +980,247 @@ test('concurrent PREPARING native file wakes existing Gateway with exact attachm
       } finally {
         await gateway.stop();
       }
+    }
+  });
+});
+
+test('startup initial drain wakes a reply-ready native file', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-startup-ready-${provider}`;
+    const source = path.join(f.dir, 'startup.bin');
+    fs.writeFileSync(source, Buffer.from(`startup bytes ${provider}`));
+    submitted(f, id, MESSAGE_STATES.SUBMITTED);
+    recordNativeAcknowledgment(f.state, { provider, messageId: id, nativeId: f.nativeId, generation: 1 });
+
+    const acknowledgmentReactions = [];
+    const acknowledgmentWatch = watchAcknowledgments({
+      state: f.state,
+      send: async (_message, reaction) => {
+        acknowledgmentReactions.push(reaction);
+        return { targetMessageId: id };
+      }
+    });
+    try {
+      await acknowledgmentWatch.drain();
+    } finally {
+      await acknowledgmentWatch.stop();
+    }
+    assert.deepEqual(acknowledgmentReactions, ['👀']);
+
+    const manifest = f.state.prepareNativeReplyFile({
+      provider,
+      messageId: id,
+      nativeId: f.nativeId,
+      generation: 1,
+      stateDir: f.dir,
+      sourcePath: source,
+      caption: 'startup caption'
+    });
+    f.state.recordNativeReply({
+      provider,
+      messageId: id,
+      nativeId: f.nativeId,
+      generation: 1,
+      text: 'startup caption',
+      fileManifest: manifest
+    });
+    assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLY_READY);
+
+    const resumed = [];
+    const unexpectedAcknowledgmentDeliveries = [];
+    const startupWatch = watchAcknowledgments({
+      state: f.state,
+      send: async (_message, reaction) => {
+        unexpectedAcknowledgmentDeliveries.push(reaction);
+        return { targetMessageId: id };
+      },
+      deliver: async () => {
+        throw new Error('reply-ready startup wake must not deliver another acknowledgment');
+      },
+      onAcknowledged: messageId => {
+        resumed.push(messageId);
+      }
+    });
+    try {
+      await startupWatch.drain();
+      await waitForCondition(() => resumed.length === 1, 1000).catch(error => {
+        throw new Error(`startup initial drain did not wake reply-ready native file: ${error.message}`);
+      });
+      assert.deepEqual(resumed, [id]);
+      assert.deepEqual(unexpectedAcknowledgmentDeliveries, []);
+    } finally {
+      await startupWatch.stop();
+    }
+  });
+});
+
+test('full-capacity refusal blocks competing text until later file retry', async t => {
+  for (const provider of ['codex', 'claude']) for (const dispatchState of [MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.UNCERTAIN]) {
+    await t.test(`${provider} ${dispatchState}`, t2 => {
+      const f = fixture(t2, provider);
+      const held = [];
+      try {
+        for (let index = 0; index < 8; index += 1) {
+          const seed = directPreparationSeed(f, index);
+          seed.ownerPid = 999999;
+          seed.ownerStartTime = null;
+          seed.ownerCommand = null;
+          held.push(f.state.beginDirectPostFilePreparation(seed));
+        }
+        assert.equal(f.state.activeFilePreparationCount(), 8);
+
+        const id = `native-file-capacity-retry-${provider}-${dispatchState}`;
+        const source = path.join(f.dir, 'capacity-retry.bin');
+        fs.writeFileSync(source, Buffer.from(`capacity retry bytes ${provider}`));
+        submitted(f, id, dispatchState);
+        const input = {
+          provider,
+          messageId: id,
+          nativeId: f.nativeId,
+          generation: 1,
+          stateDir: f.dir,
+          sourcePath: source,
+          caption: 'capacity retry caption'
+        };
+
+        assert.throws(() => f.state.prepareNativeReplyFile(input), /file custody capacity is exhausted/);
+        const refused = f.state.nativeReplyFilePreparation(id);
+        const other = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+        try {
+          assert.throws(
+            () => other.recordNativeReply({ ...input, text: 'competing text' }),
+            /native reply file preparation is still in progress/,
+            'capacity refusal must keep competing text from closing the reply'
+          );
+        } finally {
+          other.close();
+        }
+
+        assert.deepEqual(
+          { phase: refused?.phase, reservesCapacity: refused?.reservesCapacity },
+          { phase: 'preparing', reservesCapacity: false }
+        );
+        assert.equal(f.state.getMessage(id).state, dispatchState);
+        assert.equal(f.state.listReplyParts(id).length, 0);
+        assert.equal(f.state.activeFilePreparationCount(), 8);
+        assert.equal(fs.existsSync(path.join(f.dir, '.direct-post-files')), false);
+
+        assert.equal(f.state.releaseDirectPostFilePreparation(held[0].preparationId).phase, 'released');
+        assert.equal(f.state.activeFilePreparationCount(), 7);
+
+        const manifest = f.state.prepareNativeReplyFile(input);
+        assert.equal(manifest.phase, 'admitted');
+        assert.notEqual(manifest.preparationId, refused.preparationId);
+        assert.equal(f.state.nativeReplyFilePreparation(id).preparationId, manifest.preparationId);
+        assert.equal(f.state.activeFilePreparationCount(), 8);
+
+        const recorded = f.state.recordNativeReply({
+          ...input,
+          text: 'capacity retry caption',
+          fileManifest: manifest
+        });
+        assert.equal(recorded.message.state, MESSAGE_STATES.REPLY_READY);
+        assert.equal(f.state.listReplyParts(id)[0].fileManifest.preparationId, manifest.preparationId);
+        f.state.beginReply(id);
+        f.state.markReplyPartSent(id, 0, 'capacity-retry-posted');
+        assert.equal(f.state.releaseNativeReplyFilePreparation(id, manifest.preparationId).phase, 'released');
+        assert.equal(f.state.activeFilePreparationCount(), 7);
+      } finally {
+        for (const preparation of held) {
+          try {
+            f.state.releaseDirectPostFilePreparation(preparation.preparationId);
+          } catch {}
+        }
+      }
+    });
+  }
+});
+
+test('old capacity refusal cleanup cannot shadow a later admitted native file', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const held = [];
+    const ownerAlive = f.state.directPostOwnerAlive;
+    try {
+      for (let index = 0; index < 8; index += 1) {
+        const seed = directPreparationSeed(f, index);
+        seed.ownerPid = 999999;
+        seed.ownerStartTime = null;
+        seed.ownerCommand = null;
+        held.push(f.state.beginDirectPostFilePreparation(seed));
+      }
+      assert.equal(f.state.activeFilePreparationCount(), 8);
+
+      const id = `native-file-marker-shadow-${provider}`;
+      const source = path.join(f.dir, 'marker-shadow.bin');
+      const originalBytes = Buffer.from(`marker shadow bytes ${provider}`);
+      fs.writeFileSync(source, originalBytes);
+      submitted(f, id, MESSAGE_STATES.SUBMITTED);
+      const input = {
+        provider,
+        messageId: id,
+        nativeId: f.nativeId,
+        generation: 1,
+        stateDir: f.dir,
+        sourcePath: source,
+        caption: 'marker shadow caption'
+      };
+
+      assert.throws(() => f.state.prepareNativeReplyFile(input), /file custody capacity is exhausted/);
+      const oldMarker = f.state.nativeReplyFilePreparation(id);
+      assert.deepEqual(
+        { phase: oldMarker?.phase, reservesCapacity: oldMarker?.reservesCapacity },
+        { phase: 'preparing', reservesCapacity: false }
+      );
+      assert.equal(f.state.activeFilePreparationCount(), 8);
+
+      f.state.directPostOwnerAlive = () => false;
+      assert.equal(f.state.releaseDirectPostFilePreparation(held[0].preparationId).phase, 'released');
+      assert.equal(f.state.activeFilePreparationCount(), 7);
+
+      const admitted = f.state.prepareNativeReplyFile(input);
+      assert.equal(admitted.phase, 'admitted');
+      assert.notEqual(admitted.preparationId, oldMarker.preparationId);
+      assert.equal(f.state.activeFilePreparationCount(), 8);
+
+      const releasedOld = f.state.releaseNativeReplyFilePreparation(id, oldMarker.preparationId);
+      assert.equal(releasedOld.phase, 'released');
+      const latest = f.state.nativeReplyFilePreparation(id);
+      assert.equal(latest.phase, 'admitted');
+      assert.equal(latest.preparationId, admitted.preparationId);
+      assert.equal(f.state.activeFilePreparationCount(), 8);
+      assert.equal(fs.existsSync(admitted.stagedPath), true);
+      assert.deepEqual(fs.readFileSync(admitted.stagedPath), originalBytes);
+
+      const other = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+      try {
+        assert.throws(
+          () => other.recordNativeReply({ ...input, text: 'competing text after old marker cleanup' }),
+          /native reply file custody requires its admitted attachment/
+        );
+      } finally {
+        other.close();
+      }
+
+      const recorded = f.state.recordNativeReply({
+        ...input,
+        text: input.caption,
+        fileManifest: admitted
+      });
+      assert.equal(recorded.message.state, MESSAGE_STATES.REPLY_READY);
+      f.state.beginReply(id);
+      f.state.markReplyPartSent(id, 0, 'marker-shadow-posted');
+      assert.equal(f.state.releaseNativeReplyFilePreparation(id, admitted.preparationId).phase, 'released');
+      assert.equal(f.state.activeFilePreparationCount(), 7);
+      assert.equal(fs.existsSync(admitted.stagedPath), false);
+    } finally {
+      for (const preparation of held) {
+        try {
+          f.state.releaseDirectPostFilePreparation(preparation.preparationId);
+        } catch {}
+      }
+      f.state.directPostOwnerAlive = ownerAlive;
     }
   });
 });

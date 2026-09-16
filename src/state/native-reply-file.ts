@@ -88,7 +88,10 @@ function preparationReceipts(state: NativeReplyFileState, deps: NativeReplyFileD
 }
 
 function latestPreparation(state: NativeReplyFileState, deps: NativeReplyFileDependencies, messageId: string): any {
-  return preparationReceipts(state, deps, messageId).at(-1) || null;
+  // An older release receipt must not shadow a newer preparation identity.
+  const latestByPreparation = new Map<string, any>();
+  for (const detail of preparationReceipts(state, deps, messageId)) latestByPreparation.set(detail.preparationId, detail);
+  return [...latestByPreparation.values()].at(-1) || null;
 }
 
 function preparationById(state: NativeReplyFileState, deps: NativeReplyFileDependencies, messageId: string, preparationId: string): any {
