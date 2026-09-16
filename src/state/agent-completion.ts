@@ -10,6 +10,7 @@ import {
   type DirectPostReceiptDetail,
   type SentAgentResultRow
 } from './direct-post';
+import type { NativeReplyFilePhase } from './native-reply-file';
 
 interface SqlRow {
   [key: string]: unknown;
@@ -60,7 +61,7 @@ interface CompletionState {
   db: CompletionDatabase;
   transaction<T>(operation: () => T): T;
   getMessage(messageId: string): CompletionMessage | null;
-  nativeReplyFilePreparation(messageId: string): { phase: string } | null;
+  nativeReplyFilePreparation(messageId: string): { phase: NativeReplyFilePhase } | null;
   isInteractionMessage(messageId: string): boolean;
   getAgentMessage(messageId: string): AgentMessageProvenance | null;
   currentMessageBinding(message: CompletionMessage): MessageBindingCheck;

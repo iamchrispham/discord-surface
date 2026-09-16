@@ -399,11 +399,20 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
   let receiptCursor: number | null = null;
   const retryAtByMessage = new Map<string, number>();
   const notified = new Set<string>();
+  const awaitingReplyReady = new Set<string>();
 
   function notifyAcknowledged(messageId: string): void {
     if (!onAcknowledged || notified.has(messageId) || !hasAcknowledgmentReceipt(state, messageId)) return;
     notified.add(messageId);
+    const message = state.getMessage(messageId);
+    if (message && (message.state === MESSAGE_STATES.DISPATCHING || message.state === MESSAGE_STATES.UNCERTAIN)) {
+      awaitingReplyReady.add(messageId);
+    }
     Promise.resolve().then(() => onAcknowledged(messageId))
+      .then(result => {
+        if (result === ACK_WAITING) awaitingReplyReady.add(messageId);
+        else awaitingReplyReady.delete(messageId);
+      })
       .catch(error => logger(`native acknowledgment resume failed: ${String(property(error, 'message'))}`))
       .finally(() => {
         if (closed || !state.db) return;
@@ -426,7 +435,7 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
     return next;
   }
 
-  function initialPending(now: number): string[] {
+  function initialPending(now: number): { ids: string[]; wakeOnly: Set<string> } {
     const watermark = latestReceiptId(state);
     const ids = pendingAcknowledgments(state, now, watermark);
     for (const row of latestAcknowledgmentOutcomes(state)) {
@@ -434,27 +443,44 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
       if (retryableUnknown(detail)) retryAtByMessage.set(row.discord_id, detail.retryAt);
     }
     receiptCursor = watermark;
-    return ids;
+    return { ids, wakeOnly: new Set() };
   }
 
-  function incrementalPending(now: number): string[] {
+  function incrementalPending(now: number): { ids: string[]; wakeOnly: Set<string> } {
     const watermark = latestReceiptId(state);
     const rows = receiptRowsAfter(state, receiptCursor as number, watermark);
     const ids = [];
+    const wakeOnly = new Set<string>();
+    const queued = new Set<string>();
     const seen = new Set();
     for (const row of rows) {
       if (!row.discord_id || seen.has(row.discord_id)) continue;
       seen.add(row.discord_id);
       rememberRetryAt(row.discord_id);
-      if (isAcknowledgmentPending(state, row.discord_id, now)) ids.push(row.discord_id);
+      if (isAcknowledgmentPending(state, row.discord_id, now)) {
+        ids.push(row.discord_id);
+        queued.add(row.discord_id);
+      }
+    }
+    for (const messageId of awaitingReplyReady) {
+      if (queued.has(messageId)) continue;
+      if (state.getMessage(messageId)?.state !== MESSAGE_STATES.REPLY_READY) continue;
+      awaitingReplyReady.delete(messageId);
+      notified.delete(messageId);
+      ids.push(messageId);
+      wakeOnly.add(messageId);
+      queued.add(messageId);
     }
     for (const [messageId, retryAt] of retryAtByMessage) {
       if (retryAt > now || seen.has(messageId)) continue;
       rememberRetryAt(messageId);
-      if (isAcknowledgmentPending(state, messageId, now)) ids.push(messageId);
+      if (isAcknowledgmentPending(state, messageId, now) && !queued.has(messageId)) {
+        ids.push(messageId);
+        queued.add(messageId);
+      }
     }
     receiptCursor = watermark;
-    return ids;
+    return { ids, wakeOnly };
   }
 
   async function drain(): Promise<void> {
@@ -462,11 +488,11 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
     if (running) { dirty = true; return running; }
     running = (async () => {
       const now = Date.now();
-      const ids = receiptCursor === null ? initialPending(now) : incrementalPending(now);
-      for (const id of ids) {
+      const pending = receiptCursor === null ? initialPending(now) : incrementalPending(now);
+      for (const id of pending.ids) {
         if (closed) return;
         notifyAcknowledged(id);
-        await deliver(id);
+        if (!pending.wakeOnly.has(id)) await deliver(id);
         const detail = latestAcknowledgmentOutcome(state, id);
         if (isRecord(detail) && (detail.outcome !== ACK_OUTCOMES.UNKNOWN || detail.terminal)) notified.delete(id);
         rememberRetryAt(id);
@@ -543,6 +569,7 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
       timer = null;
       timerDueAt = null;
       notified.clear();
+      awaitingReplyReady.clear();
       await running;
     }
   };

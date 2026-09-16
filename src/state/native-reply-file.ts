@@ -101,6 +101,14 @@ function manifestMatchesPreparation(manifest: any, preparation: any): boolean {
       .every(key => manifest[key] === preparation[key]);
 }
 
+function staleNativeReplyFileOwnership(state: NativeReplyFileState, preparation: any): boolean {
+  const message = state.getMessage(preparation.messageId);
+  if (!message) return false;
+  const check = state.currentMessageBinding(message);
+  return !check?.identity || message.guildId !== preparation.guildId || message.channelId !== preparation.channelId ||
+    message.provider !== preparation.provider || message.nativeId !== preparation.nativeId || message.generation !== preparation.generation;
+}
+
 function activePreparationCount(state: NativeReplyFileState, deps: NativeReplyFileDependencies): number {
   const rows = state.db.prepare('SELECT kind, detail FROM receipts WHERE kind IN (?, ?) ORDER BY id')
     .all(deps.DIRECT_POST_FILE_PREPARATION, NATIVE_REPLY_FILE_PREPARATION);
@@ -252,11 +260,15 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
         };
         if (state.directPostOwnerAlive(ownerIdentity.ownerPid, ownerIdentity)) throw new deps.BindingError('native reply file preparation owner is still active');
       } else if (preparation.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) {
+        const stale = staleNativeReplyFileOwnership(state, preparation);
         const part = state.db.prepare('SELECT state, file_manifest FROM reply_parts WHERE discord_id=? AND part_index=?').get(messageId, partIndex);
-        if (!part || part.state !== 'sent' || !part.file_manifest) throw new deps.BindingError('native reply file cleanup requires a sent file part');
-        const manifest = deps.parseJson(part.file_manifest, null);
-        if (!manifestMatchesPreparation(manifest, preparation)) {
-          throw new deps.BindingError('native reply file cleanup manifest does not match the requested preparation');
+        const manifest = deps.parseJson(part?.file_manifest, null);
+        const stalePending = stale && (!part || (part.state === 'pending' && manifestMatchesPreparation(manifest, preparation)));
+        if (!stalePending) {
+          if (!part || part.state !== 'sent' || !part.file_manifest) throw new deps.BindingError('native reply file cleanup requires a sent file part');
+          if (!manifestMatchesPreparation(manifest, preparation)) {
+            throw new deps.BindingError('native reply file cleanup manifest does not match the requested preparation');
+          }
         }
       } else throw new deps.BindingError('native reply file preparation cannot be cleaned up');
       removeDirectPostFile({ stateDir: path.dirname(path.dirname(preparation.stagedPath)), preparationId: preparation.preparationId, stagedPath: preparation.stagedPath });

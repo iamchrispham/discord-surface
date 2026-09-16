@@ -30,7 +30,19 @@ function submitted(f, id, dispatchState = MESSAGE_STATES.SUBMITTED) {
   f.state.acceptDiscordMessage({ id, guildId: 'guild', channelId: 'channel', authorId: 'operator', isBot: false, content: 'question' });
   f.state.claimDispatch(id);
   if (dispatchState === MESSAGE_STATES.UNCERTAIN) f.state.markUncertain(id, new Error('dispatch interrupted'));
-  else f.state.markSubmitted(id);
+  else if (dispatchState === MESSAGE_STATES.SUBMITTED) f.state.markSubmitted(id);
+}
+
+function waitForCondition(predicate, timeoutMs = 2000) {
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (predicate()) return resolve();
+      if (Date.now() - startedAt >= timeoutMs) return reject(new Error('condition was not met before timeout'));
+      setImmediate(check);
+    };
+    check();
+  });
 }
 
 function directPreparationSeed(f, index) {
@@ -98,6 +110,74 @@ test('Codex and Claude file replies recover submitted and uncertain dispatch', a
     assert.equal(f.state.nativeReplyFilePreparation(id).phase, 'admitted');
     assert.equal(f.state.releaseNativeReplyFilePreparation(id, manifest.preparationId).phase, 'released');
     assert.equal(fs.existsSync(manifest.stagedPath), false);
+    });
+  }
+});
+
+test('early file-reply acknowledgment wakes the existing Gateway consumer when ready', async t => {
+  for (const provider of ['codex', 'claude']) for (const dispatchState of [MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN]) {
+    await t.test(`${provider} ${dispatchState}`, async t2 => {
+      const f = fixture(t2, provider);
+      const id = `native-file-early-ack-${provider}-${dispatchState}`;
+      const source = path.join(f.dir, 'answer.bin');
+      const bytes = Buffer.from([0, 4, 8, 255]);
+      fs.writeFileSync(source, bytes);
+      submitted(f, id, dispatchState);
+      const reactions = [];
+      const posts = [];
+      const observations = [];
+      const resumes = [];
+      const channel = {
+        id: 'channel',
+        messages: { fetch: async () => ({ react: async reaction => reactions.push(reaction) }) },
+        send: async payload => {
+          if (!String(payload.content || '').startsWith('Receipt:')) posts.push(payload);
+          return { id: `posted-${posts.length}` };
+        }
+      };
+      const client = new EventEmitter();
+      client.user = { id: 'bot' };
+      client.login = async token => assert.equal(token, 'fixture');
+      client.channels = { fetch: async channelId => { assert.equal(channelId, 'channel'); return channel; } };
+      client.destroy = async () => {};
+      const gateway = new DiscordGateway({ state: f.state, client, providers: {
+        [provider]: { observe: async () => { observations.push(id); return { text: 'answer with file' }; } }
+      } });
+      gateway.registerApplicationCommand = async () => {};
+      gateway.recoverTransport = async () => {
+        gateway.ready = true;
+        return { ready: true, state: 'ready' };
+      };
+      const resumeSubmitted = gateway.consumer.resumeSubmitted;
+      gateway.consumer.resumeSubmitted = (...args) => {
+        resumes.push(id);
+        return resumeSubmitted(...args);
+      };
+      try {
+        await gateway.start(path.join(f.dir, 'discord.env'));
+        await gateway.acknowledgments.drain();
+        const manifest = f.state.prepareNativeReplyFile({ provider, messageId: id, nativeId: f.nativeId, generation: 1,
+          stateDir: f.dir, sourcePath: source, caption: 'answer with file' });
+        await waitForCondition(() => reactions.length === 1);
+        await gateway.acknowledgments.drain();
+        assert.deepEqual(reactions, ['👀']);
+        assert.equal(f.state.getMessage(id).state, dispatchState);
+        f.state.recordNativeReply({ provider, messageId: id, nativeId: f.nativeId, generation: 1,
+          text: 'answer with file', fileManifest: manifest });
+        await gateway.acknowledgments.drain();
+        await waitForCondition(() => posts.length === 1);
+        assert.deepEqual(resumes, [id]);
+        assert.deepEqual(observations, [id]);
+        assert.equal(posts[0].content, 'answer with file');
+        assert.deepEqual(posts[0].files[0].attachment, bytes);
+        assert.equal(posts[0].files[0].name, 'answer.bin');
+        assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLIED);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(reactions, ['👀']);
+        assert.equal(posts.length, 1);
+      } finally {
+        await gateway.stop();
+      }
     });
   }
 });
@@ -206,6 +286,23 @@ test('native file custody survives not-sent reconciliation and named cleanup onl
   f.state.markReplyPartSent(id, 0, 'posted');
   f.state.releaseNativeReplyFilePreparation(id, manifest.preparationId);
   assert.equal(fs.existsSync(manifest.stagedPath), false);
+});
+
+test('stale admitted native custody releases when its binding can no longer deliver', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-stale-admitted-${provider}`;
+    const source = path.join(f.dir, 'stale.bin');
+    fs.writeFileSync(source, Buffer.from('stale payload'));
+    submitted(f, id);
+    const manifest = f.state.prepareNativeReplyFile({ provider, messageId: id, nativeId: f.nativeId, generation: 1,
+      stateDir: f.dir, sourcePath: source, caption: 'stale caption' });
+    f.state.db.prepare('UPDATE bindings SET active=0 WHERE channel_id=?').run('channel');
+    assert.equal(f.state.currentMessageBinding(f.state.getMessage(id)).identity, false);
+    assert.equal(f.state.releaseNativeReplyFilePreparation(id, manifest.preparationId).phase, 'released');
+    assert.equal(fs.existsSync(manifest.stagedPath), false);
+    assert.equal(f.state.activeFilePreparationCount(), 0);
+  });
 });
 
 test('dead native preparation owner can release a pre-stage reservation', t => {

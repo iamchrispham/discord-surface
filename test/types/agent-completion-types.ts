@@ -3,7 +3,7 @@ import {
   type AgentCompletionDependencies,
   type AgentCompletionInput
 } from '../../src/state/agent-completion';
-import { NATIVE_REPLY_FILE_PHASES } from '../../src/state/native-reply-file';
+import { NATIVE_REPLY_FILE_PHASES, type NativeReplyFilePhase } from '../../src/state/native-reply-file';
 
 const dependencies = {
   AGENT_COMPLETION_RECEIPTS: {
@@ -40,3 +40,7 @@ const input: AgentCompletionInput = {
 
 void complete;
 void input;
+const completionState = null as unknown as Parameters<typeof complete>[0];
+const preparation = completionState.nativeReplyFilePreparation(input.messageId);
+const phase: NativeReplyFilePhase | undefined = preparation?.phase;
+void phase;

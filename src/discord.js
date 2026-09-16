@@ -1756,7 +1756,7 @@ class DiscordGateway {
         onAcknowledged: messageId => {
           if (this.stopping) return null;
           const message = this.state.getMessage(messageId);
-          if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY].includes(message?.state)) return null;
+          if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY].includes(message?.state)) return ACK_WAITING;
           this.consumer?.releaseAcknowledged?.(messageId);
           return this.consumer?.resumeSubmitted(message, undefined, { awaitExisting: false, continueUntilFinal: true });
         },
