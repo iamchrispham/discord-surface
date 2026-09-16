@@ -6,6 +6,8 @@ type AgentProvider = import('./agent-message').AgentProvider;
 type AgentPresentation = import('./agent-presentation').AgentPresentation;
 type DirectPostFileManifest = import('./direct-post-file').DirectPostFileManifest;
 type DirectPostFilePreparation = import('./direct-post-file').DirectPostFilePreparation;
+type WatcherNotice = import('./watcher-notice').WatcherNotice;
+type WatcherAddress = import('./watcher-notice').WatcherAddress;
 
 export const DIRECT_POST_OUTCOMES = {
   SENT: 'sent',
@@ -75,6 +77,7 @@ interface DirectPostPartMeta {
   binding: DirectPostBinding;
   deliveryChannelId?: string;
   agentPacket?: AgentMessage;
+  watcherNotice?: WatcherNotice;
   presentation: AgentPresentation;
   caption?: string;
   fileManifest?: DirectPostFileManifest;
@@ -112,6 +115,19 @@ export interface DirectPostState {
   directPostFilePreparation?(requestId: string): DirectPostFilePreparation | null;
   beginDirectPostFilePreparation?(seed: Record<string, unknown>): DirectPostFilePreparation;
   admitDirectPostFilePreparation?(preparationId: string, manifest: DirectPostFileManifest): DirectPostFilePreparation;
+  getWatcherNoticeArm?(armKey: string): {
+    armKey: string;
+    provider: 'claude';
+    source: WatcherAddress;
+    target: WatcherAddress;
+    workspace: string;
+    endpoint: string | null;
+    conductorId: string | null;
+    repoKey: string | null;
+    generation: number;
+  } | null;
+  authorizeWatcherNoticeSend?(packet: WatcherNotice): { arm: unknown; binding: DirectPostBinding; route: DirectPostRoute };
+  recordWatcherNoticeTrigger?(packet: WatcherNotice): { duplicate: boolean; packet: WatcherNotice; receiptId?: number };
 }
 
 export interface DirectPostSource {
@@ -190,6 +206,7 @@ interface DirectPostInputBase {
   fetchImpl?: FetchImplementation;
   timeoutMs?: number;
   ordinary?: boolean;
+  watcherNotice?: { packet: WatcherNotice; binding: DirectPostBinding } | null;
 }
 
 interface OrdinaryDirectPostInput extends DirectPostInputBase {
@@ -244,6 +261,12 @@ const { encodeAgentMessage, sameAddress, verifyAgentAddress, KINDS } = require('
   sameAddress: (left: unknown, right: unknown) => boolean;
   verifyAgentAddress: (envelope: unknown, token: string) => AgentAddress;
   KINDS: Readonly<{ REQUEST: 'request'; RESULT: 'result' }>;
+};
+const { createWatcherNotice, encodeWatcherNotice, sameWatcherAddress, WATCHER_NOTICE_PROVIDERS } = require('../src/watcher-notice') as {
+  createWatcherNotice: (input: { armKey: string; triggerKey: string; source: WatcherAddress; target: WatcherAddress; text: string }) => WatcherNotice;
+  encodeWatcherNotice: (packet: WatcherNotice, token: string) => string;
+  sameWatcherAddress: (left: unknown, right: unknown) => boolean;
+  WATCHER_NOTICE_PROVIDERS: Readonly<{ CLAUDE: 'claude' }>;
 };
 const { AGENT_PRESENTATIONS, agentMessagePreview } = require('../src/agent-presentation') as {
   AGENT_PRESENTATIONS: Readonly<{ LEGACY: 'legacy'; ATTACHMENT: 'attachment-v1' }>;
@@ -465,7 +488,8 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
   agentTarget: AgentAddress | null = null,
   presentation: AgentPresentation = AGENT_PRESENTATIONS.LEGACY,
   agentPacket: AgentMessage | null = null,
-  fileManifest: DirectPostFileManifest | null = null): DirectPostPartMeta {
+  fileManifest: DirectPostFileManifest | null = null,
+  watcherNotice: WatcherNotice | null = null): DirectPostPartMeta {
   const nonceScope = agentTarget === null
     ? `direct:${requestId}:${partIndex}`
     : agentNonceScope(sourceAddress, agentTarget, requestId, partIndex);
@@ -490,7 +514,8 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
     binding,
     presentation,
     ...(fileManifest ? { caption: fileManifest.caption, fileManifest } : {}),
-    ...(agentPacket ? { agentPacket } : {})
+    ...(agentPacket ? { agentPacket } : {}),
+    ...(watcherNotice ? { watcherNotice } : {})
   };
 }
 
@@ -612,11 +637,22 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   agentThreadId = null,
   dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
   agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
-  agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir }: DirectPostInput): Promise<DirectPostResult> {
-  const binding = resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
+  agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null }: DirectPostInput): Promise<DirectPostResult> {
+  const binding = watcherNotice
+    ? watcherNotice.binding
+    : resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
+  if (watcherNotice) {
+    if (provider !== null && provider !== WATCHER_NOTICE_PROVIDERS.CLAUDE) throw new BindingError('watcher notice provider is fixed to Claude');
+    if (nativeId !== binding.nativeId || Number(generation) !== binding.generation ||
+        !sameWatcherAddress(watcherNotice.packet.source, canonicalAddress(binding))) {
+      throw new BindingError('watcher notice does not match its frozen arm');
+    }
+    if (typeof state.authorizeWatcherNoticeSend !== 'function') throw new BindingError('watcher notice custody is unavailable');
+    state.authorizeWatcherNoticeSend(watcherNotice.packet);
+  }
   const operatorId = state.requireConfig().operatorId;
   const replyTarget = inReplyToValue(inReplyTo);
-  const isAgentMessage = agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT;
+  const isAgentMessage = watcherNotice !== null || agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT;
   const fileRequested = attachmentFile !== undefined || resume;
   if (!Object.values(AGENT_PRESENTATIONS).includes(agentPresentation)) {
     throw new BindingError(`unsupported agent presentation: ${agentPresentation}`);
@@ -625,7 +661,13 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   if (!isAgentMessage && agentPresentation !== AGENT_PRESENTATIONS.LEGACY) {
     throw new BindingError('attachment presentation is only supported for agent messages');
   }
-  const explicitRequestId = resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: isAgentMessage });
+  const requestedRequestId = watcherNotice
+    ? resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: false })
+    : resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: isAgentMessage });
+  const explicitRequestId = watcherNotice ? requestedRequestId || watcherNotice.packet.id : requestedRequestId;
+  if (watcherNotice && explicitRequestId !== watcherNotice.packet.id) {
+    throw new BindingError('watcher notice dedupe key must match its frozen identity');
+  }
   if (fileRequested && explicitRequestId === undefined) throw new BindingError('file posts require an explicit dedupe-key');
   let source = fileRequested
     ? prepareFileSource({ state, requestId: explicitRequestId as string, textFile, attachmentFile, resume, stateDir,
@@ -635,7 +677,20 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   let deliveryTarget: AgentAddress | null = null;
   let agentPacket: AgentMessage | null = null;
   const address = isAgentMessage ? resolveAgentAddress(state, binding, agentThreadId) : canonicalAddress(binding);
-  if (isAgentMessage) {
+  if (watcherNotice) {
+    if (agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT || agentReplyTo !== null) {
+      throw new BindingError('watcher notices do not accept agent message options');
+    }
+    deliveryTarget = watcherNotice.packet.target as unknown as AgentAddress;
+    if (source.text !== watcherNotice.packet.text) throw new BindingError('watcher notice content changed while reading custody');
+    const wire = encodeWatcherNotice(watcherNotice.packet, token);
+    source = {
+      ...source,
+      textHash: hash(JSON.stringify(watcherNotice.packet)),
+      parts: [wire],
+      displayParts: [wire]
+    };
+  } else if (isAgentMessage) {
     if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
     if (agentKind === KINDS.RESULT) {
       const replyTo = requiredString(agentReplyTo, 'agent-reply-to', 128);
@@ -669,16 +724,29 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     };
   }
   const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, effectiveReplyTarget);
+  if (watcherNotice) {
+    if (typeof state.recordWatcherNoticeTrigger !== 'function') throw new BindingError('watcher notice trigger custody is unavailable');
+    state.recordWatcherNoticeTrigger(watcherNotice.packet);
+  }
   state.recoverDirectPostReceipts();
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;
   let recorded = false;
+  const currentBinding = () => {
+    if (!watcherNotice) return state.directPostBindingCurrent(binding, operatorId, address.channelId);
+    try {
+      state.authorizeWatcherNoticeSend?.(watcherNotice.packet);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   for (let partIndex = 0; partIndex < source.parts.length; partIndex += 1) {
     if (signal?.aborted) {
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
       break;
     }
-    const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null);
+    const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     if (deliveryTarget !== null) {
       let existing;
@@ -696,7 +764,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       try {
         await verifyAgentDestination({ token, agentTarget: deliveryTarget, fetchImpl, signal, timeoutMs });
       } catch (error) {
-        if (!state.directPostBindingCurrent(binding, operatorId, address.channelId)) {
+        if (!currentBinding()) {
           const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
           parts.push({ index: partIndex, status: stale.outcome, messageId: null });
           break;
@@ -707,7 +775,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
         parts.push({ index: partIndex, status: preflight.outcome, messageId: null });
         break;
       }
-      if (!state.directPostBindingCurrent(binding, operatorId, address.channelId)) {
+      if (!currentBinding()) {
         const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
         parts.push({ index: partIndex, status: stale.outcome, messageId: null });
         break;
@@ -736,13 +804,13 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       continue;
     }
     claimedAny = true;
-    if (!state.directPostBindingCurrent(binding, operatorId, address.channelId)) {
+    if (!currentBinding()) {
       const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before network' });
       parts.push({ index: partIndex, status: stale.outcome });
       break;
     }
     try {
-      if (!state.directPostBindingCurrent(binding, operatorId, address.channelId)) {
+      if (!currentBinding()) {
         const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before send' });
         parts.push({ index: partIndex, status: stale.outcome });
         break;
@@ -773,6 +841,49 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     ...(source.fileManifest ? { filePreparationId: source.fileManifest.preparationId } : {}),
     messageIds: parts.filter((part): part is DirectPostPartResult & { messageId: string } => typeof part.messageId === 'string')
       .map(part => part.messageId), parts };
+}
+
+export async function runWatcherNoticePost({ state, token, armKey, triggerKey, textFile, signal, fetchImpl, timeoutMs, stateDir }: {
+  state: DirectPostState;
+  token: string;
+  armKey: string;
+  triggerKey: string;
+  textFile: unknown;
+  signal?: AbortSignal;
+  fetchImpl?: FetchImplementation;
+  timeoutMs?: number;
+  stateDir?: string;
+}): Promise<DirectPostResult> {
+  if (typeof state.getWatcherNoticeArm !== 'function') throw new BindingError('watcher notice arm custody is unavailable');
+  const arm = state.getWatcherNoticeArm(armKey);
+  if (!arm) throw new BindingError('watcher notice arm is unknown');
+  const source = readTextFile(textFile);
+  const packet = createWatcherNotice({ armKey, triggerKey, source: arm.source, target: arm.target, text: source.text });
+  const binding: DirectPostBinding = {
+    active: true,
+    guildId: arm.source.guildId,
+    channelId: arm.source.channelId,
+    provider: arm.provider,
+    nativeId: arm.source.nativeId,
+    generation: arm.generation,
+    conductorId: arm.conductorId,
+    repoKey: arm.repoKey
+  };
+  return runDirectPost({
+    state,
+    token,
+    nativeId: arm.source.nativeId,
+    generation: arm.generation,
+    channelId: arm.source.channelId,
+    provider: arm.provider,
+    textFile,
+    dedupeKey: packet.id,
+    signal,
+    fetchImpl,
+    timeoutMs,
+    stateDir,
+    watcherNotice: { packet, binding }
+  });
 }
 
 export { readTextFile, resolveAgentAddress, resolveDedupeKey, resolveDirectBinding, requestIdFor, runDirectPost };

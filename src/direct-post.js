@@ -7,7 +7,8 @@ try {
     requestIdFor,
     resolveDedupeKey,
     resolveDirectBinding,
-    runDirectPost
+    runDirectPost,
+    runWatcherNoticePost
   } = require('../dist/direct-post.js');
   module.exports = {
     readTextFile,
@@ -15,7 +16,8 @@ try {
     requestIdFor,
     resolveDedupeKey,
     resolveDirectBinding,
-    runDirectPost
+    runDirectPost,
+    runWatcherNoticePost
   };
 } catch (error) {
   if (error?.code !== 'MODULE_NOT_FOUND' || !String(error?.message || '').includes("Cannot find module '../dist/direct-post.js'")) throw error;
