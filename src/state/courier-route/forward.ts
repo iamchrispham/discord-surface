@@ -12,6 +12,7 @@ const FORWARD = Object.freeze({
   EVENT: 'PreToolUse',
   TOOL: 'mcp__codex_app__send_message_to_thread'
 } as const);
+const UNCERTAIN_RECONCILIATION_NOT_SUBMITTED = 'uncertain-reconciled-not_submitted' as const;
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -38,7 +39,7 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
       throw new deps.BindingError('courier hook tool input differs from the fixed recipient');
     }
 
-    const rows = state.db.prepare(`SELECT discord_id, detail FROM receipts WHERE kind=?
+    const rows = state.db.prepare(`SELECT id, discord_id, detail FROM receipts WHERE kind=?
       AND json_extract(detail, '$.route.routeId')=?
       AND json_extract(detail, '$.courier.nativeId')=?
       AND json_extract(detail, '$.prompt')=? LIMIT 2`)
@@ -47,17 +48,21 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
     const saved = deps.parseJson(rows[0].detail, null);
     const id = saved?.attemptId;
     const messageId = String(rows[0].discord_id);
+    const attemptReceiptId = Number(rows[0].id);
     if (typeof id !== 'string') throw new deps.BindingError('courier attempt identity is invalid');
     const current = state.getCourierAttempt(messageId, id);
     const message = state.getMessage(messageId);
     if (!current || !message) throw new deps.BindingError('courier attempt is unavailable');
     const eligible = [deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.UNCERTAIN];
+    const reconciledNotSubmitted = state.db.prepare(`SELECT id FROM receipts WHERE kind=?
+      AND discord_id=? AND id>? LIMIT 1`)
+      .get(UNCERTAIN_RECONCILIATION_NOT_SUBMITTED, messageId, attemptReceiptId);
     if (!eligible.includes(message.state) || state.hasNativeAcknowledgment(message)) {
       throw new deps.BindingError('courier message was already recognized or settled');
     }
     const match = findMatchingRoute(deps, state, message, routeId);
     if (match.status) throw new deps.BindingError(`courier forwarding authorization ${match.status}`);
-    if (current.outcome?.outcome === COURIER_OUTCOMES.NOT_SUBMITTED) {
+    if (reconciledNotSubmitted || current.outcome?.outcome === COURIER_OUTCOMES.NOT_SUBMITTED) {
       throw new deps.BindingError('courier queue submission was refused');
     }
 

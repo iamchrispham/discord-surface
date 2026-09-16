@@ -140,6 +140,17 @@ test('an uncertain queue can deliver its original attempt once after restart', t
   denied(invoke(f), /already claimed/);
 });
 
+test('a reconciled non-submission denies a stale courier retry after parent redispatch', t => {
+  const f = fixture(t);
+  f.state.markUncertain('9000', new Error('queue outcome unknown'));
+  f.state.recordCourierOutcome('9000', f.claim.attempt.attemptId, COURIER_OUTCOMES.UNCERTAIN);
+  f.state.reconcileUncertain('9000', 'not_submitted');
+  assert.equal(f.state.getCourierAttempt('9000', f.claim.attempt.attemptId).outcome.outcome, COURIER_OUTCOMES.UNCERTAIN);
+  assert.equal(f.state.claimDispatch('9000').claimed, true);
+  denied(invoke(f), /queue submission was refused/);
+  assert.equal(f.claims().length, 0);
+});
+
 test('two actual guard processes atomically claim at most one host call', async t => {
   const f = fixture(t);
   const run = () => new Promise((resolve, reject) => {
