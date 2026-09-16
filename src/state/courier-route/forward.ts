@@ -1,3 +1,4 @@
+import * as path from 'node:path';
 import { COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_ROUTE_STATES } from './constants';
 import { attemptId, attemptKey, createEnvelope, payloadHash } from './envelope';
 import { findMatchingRoute, getRoute } from './route';
@@ -18,6 +19,12 @@ function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function transcriptIsInSessionRoot(transcriptPath: unknown, sessionRoot: string | null): boolean {
+  if (typeof transcriptPath !== 'string' || !sessionRoot) return false;
+  const relative = path.relative(path.resolve(sessionRoot), path.resolve(transcriptPath));
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
 export function claimCourierForward(deps: CourierDependencies, state: ForwardState, routeId: string, event: unknown) {
   deps.assertText(routeId, 'routeId', 128);
   if (!record(event) || event.hook_event_name !== FORWARD.EVENT || event.tool_name !== FORWARD.TOOL ||
@@ -29,7 +36,8 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
   return state.transaction(() => {
     const route = getRoute(deps, state, routeId);
     if (!route || route.status !== COURIER_ROUTE_STATES.ACTIVE ||
-        event.session_id !== route.courier.nativeId || event.cwd !== route.courier.workspace) {
+        event.session_id !== route.courier.nativeId || event.cwd !== route.courier.workspace ||
+        !transcriptIsInSessionRoot(event.transcript_path, route.courier.sessionRoot)) {
       throw new deps.BindingError('courier hook caller or route is not current');
     }
     const expected: Record<string, unknown> = { threadId: route.courier.recipientThreadId, prompt };

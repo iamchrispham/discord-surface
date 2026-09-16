@@ -153,7 +153,8 @@ The courier's trusted native `PreToolUse` hook must run the installed guard
 before `mcp__codex_app__send_message_to_thread`:
 
 ```sh
-node --disable-warning=ExperimentalWarning /absolute/path/to/discord-surface/src/cli.js courier-guard \
+sh /absolute/path/to/discord-surface/src/courier-guard.sh \
+  --disable-warning=ExperimentalWarning \
   --db /absolute/path/to/surface.sqlite --courier-route-id ROUTE_ID
 ```
 
@@ -162,7 +163,11 @@ courier session and workspace, the fixed recipient and exact prompt from one
 persisted attempt, current binding ownership and an unacknowledged message.
 It atomically records one forwarding claim before allowing the tool. Refusal
 writes the blocking reason to stderr and exits 2. Success leaves stdout empty.
-Startup failures also exit 2.
+Startup failures also exit 2. The registered transcript root is checked before authorization.
+A refusal before any forwarding claim leaves the original message accepted and
+records definite non-forwarding, even if the courier queue already accepted it.
+A later queue result cannot override that refusal. The existing attempt stays
+held without automatic replay. Refusal after a forwarding claim cannot undo it.
 The database must already have the current schema. The guard never creates,
 migrates or repairs it.
 A claim survives restart or an unknown host-call outcome and cannot be retried.

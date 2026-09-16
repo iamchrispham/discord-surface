@@ -1,0 +1,35 @@
+#!/bin/sh
+
+script_dir=${0%/*}
+if [ "$script_dir" = "$0" ]; then
+  script_dir=.
+fi
+script_dir=$(CDPATH= cd -- "$script_dir" 2>/dev/null && pwd -P)
+if [ -z "$script_dir" ]; then
+  printf '%s\n' 'discord-surface courier guard: wrapper directory is unavailable' >&2
+  exit 2
+fi
+cli="$script_dir/cli.js"
+
+if [ ! -f "$cli" ]; then
+  printf '%s\n' "discord-surface courier guard: CLI entrypoint is missing: $cli" >&2
+  exit 2
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  printf '%s\n' 'discord-surface courier guard: node runtime is unavailable' >&2
+  exit 2
+fi
+
+if [ "${1-}" = '--disable-warning=ExperimentalWarning' ]; then
+  shift
+fi
+
+node --disable-warning=ExperimentalWarning "$cli" courier-guard "$@"
+status=$?
+if [ "$status" -eq 0 ] || [ "$status" -eq 2 ]; then
+  exit "$status"
+fi
+
+printf '%s\n' "discord-surface courier guard: launcher failed with exit $status" >&2
+exit 2

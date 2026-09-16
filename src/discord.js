@@ -963,14 +963,14 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     }
     const status = courierDispatchStatus(dispatched);
     state.authorizeCourierAttempt(message.id, claimed.attempt.attemptId, input);
-    state.recordCourierOutcome(message.id, claimed.attempt.attemptId, status, {
+    const recorded = state.recordCourierOutcome(message.id, claimed.attempt.attemptId, status, {
       ...(dispatched?.error ? { error: String(dispatched.error.message || dispatched.error).slice(0, 200) } : {})
     });
-    return {
-      status,
-      cursor: observerCursor,
-      ...(dispatched?.error ? { error: dispatched.error } : {})
-    };
+    const savedStatus = recorded.outcome?.outcome || status;
+    const error = savedStatus === COURIER_OUTCOMES.NOT_SUBMITTED
+      ? courierDispatchError(savedStatus)
+      : dispatched?.error;
+    return { status: savedStatus, cursor: observerCursor, ...(error ? { error } : {}) };
   }
 
   function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {

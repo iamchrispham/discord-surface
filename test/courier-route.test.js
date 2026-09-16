@@ -531,6 +531,43 @@ test('route revoked after queue result preserves parent observation', async t =>
   assert.equal(f.state.listReceipts().filter(row => row.kind === 'native-ack').length, 1);
 });
 
+test('guard refusal wins over a later queue return without observing or replaying', async t => {
+  for (const returned of [COURIER_OUTCOMES.SUBMITTED, COURIER_OUTCOMES.UNCERTAIN]) {
+    const f = fixture(t);
+    const courierCalls = [];
+    const parentCalls = [];
+    const replies = [];
+    let observations = 0;
+    const consumer = consumerFor(f, {
+      courierCalls, parentCalls, replies,
+      dispatchCourier: async envelope => {
+        f.state.markThreadBoundary('2000', THREAD_STATES.GAP, 'changed before forwarding', null, null, f.binding);
+        const result = spawnSync(process.execPath, [path.resolve(__dirname, '../src/cli.js'),
+          'courier-guard', '--db', f.dbPath, '--courier-route-id', f.route.routeId], {
+          input: JSON.stringify({ session_id: COURIER_NATIVE, cwd: f.dir,
+            transcript_path: path.join(f.route.courier.sessionRoot, 'courier.jsonl'),
+            hook_event_name: 'PreToolUse', tool_name: 'mcp__codex_app__send_message_to_thread',
+            tool_input: { threadId: RECIPIENT_THREAD, hostId: 'host-local', prompt: envelope.prompt } }),
+          encoding: 'utf8', timeout: 5000
+        });
+        assert.equal(result.status, 2, result.stderr);
+        return { status: returned };
+      },
+      observe: async () => { observations++; return null; }
+    });
+    const result = await consumer.processAccepted(f.message);
+    assert.equal(result.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+    assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+    assert.equal(f.state.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
+    f.state.markThreadBoundary('2000', THREAD_STATES.READY, 'recovered', null, null, f.binding);
+    await consumer.processAccepted(f.state.getMessage(f.message.id));
+    assert.equal(courierCalls.length, 1);
+    assert.equal(observations, 0);
+    assert.equal(parentCalls.length, 0);
+    assert.equal(replies.length, 0);
+  }
+});
+
 test('recovered definite non-submission retains custody without resend', async t => {
   const f = fixture(t);
   const courierCalls = [];

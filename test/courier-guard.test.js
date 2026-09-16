@@ -9,11 +9,14 @@ const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { codexPrompt } = require('../src/native');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const CLI = path.resolve(__dirname, '../src/cli.js');
+const WRAPPER = path.resolve(__dirname, '../src/courier-guard.sh');
 const PARENT = '11111111-1111-1111-1111-111111111111';
 const COURIER = '22222222-2222-2222-2222-222222222222';
 
 function fixture(t, { agent = false, hostId = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'courier-guard-'));
+  const sessionRoot = path.join(dir, 'sessions');
+  fs.mkdirSync(sessionRoot);
   const db = path.join(dir, 'surface.sqlite');
   let state = new SurfaceState(db);
   state.setConfig({ operatorId: 'operator', guildId: '100', secretFile: path.join(dir, 'unused') });
@@ -25,7 +28,7 @@ function fixture(t, { agent = false, hostId = null } = {}) {
   const target = { guildId: '100', channelId: '2000', provider: 'codex', nativeId: PARENT, generation: binding.generation };
   const route = state.registerCourierRoute({ routeId: 'guard-route', routeGeneration: 1,
     guildId: '100', parentChannelId: '1000', deliveryChannelId: '2000', target,
-    courier: { provider: 'codex', nativeId: COURIER, workspace: dir, recipientThreadId: PARENT, hostId }
+    courier: { provider: 'codex', nativeId: COURIER, workspace: dir, sessionRoot, recipientThreadId: PARENT, hostId }
   });
   const packet = { id: 'request-guard', kind: KINDS.REQUEST,
     source: { ...target, provider: 'claude', channelId: '3000', nativeId: '33333333-3333-3333-3333-333333333333' },
@@ -40,11 +43,12 @@ function fixture(t, { agent = false, hostId = null } = {}) {
   const claim = state.beginCourierAttempt('9000', { routeId: route.routeId, prompt });
   assert.equal(claim.accepted, true);
   const event = { session_id: COURIER, turn_id: 'fixture-turn', tool_use_id: 'fixture-call',
-    cwd: dir, hook_event_name: 'PreToolUse', tool_name: 'mcp__codex_app__send_message_to_thread',
+    cwd: dir, transcript_path: path.join(sessionRoot, `${COURIER}.jsonl`), hook_event_name: 'PreToolUse',
+    tool_name: 'mcp__codex_app__send_message_to_thread',
     tool_input: { threadId: PARENT, prompt, ...(hostId ? { hostId } : {}) } };
   const argv = ['--disable-warning=ExperimentalWarning', CLI, 'courier-guard', '--db', db, '--courier-route-id', route.routeId];
   t.after(() => { state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { dir, db, route, event, argv, claim, binding, get state() { return state; },
+  return { dir, db, sessionRoot, route, event, argv, claim, binding, get state() { return state; },
     reopen() { state.close(); state = new SurfaceState(db); },
     claims() { return state.db.prepare('SELECT * FROM receipts WHERE kind=?').all(COURIER_RECEIPT_KINDS.FORWARD_CLAIM); }
   };
@@ -100,6 +104,23 @@ test('wrong event, caller, cwd, target, bytes, host and extra model input deny w
     const event = structuredClone(f.event); mutate(event); denied(invoke(f, event));
     assert.equal(f.claims().length, 0);
   }
+  assert.equal(invoke(f).status, 0);
+});
+
+test('courier transcript path must stay within the enrolled session root', t => {
+  for (const mutate of [
+    event => { delete event.transcript_path; },
+    event => { event.transcript_path = path.join(path.dirname(event.transcript_path), '..', 'relocated', 'courier.jsonl'); }
+  ]) {
+    const f = fixture(t);
+    const event = structuredClone(f.event);
+    mutate(event);
+    denied(invoke(f, event), /caller or route is not current/);
+    assert.equal(f.claims().length, 0);
+    assert.equal(f.state.getCourierAttempt('9000', f.claim.attempt.attemptId).outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
+    assert.equal(f.state.getMessage('9000').state, 'accepted');
+  }
+  const f = fixture(t);
   assert.equal(invoke(f).status, 0);
 });
 
@@ -199,6 +220,70 @@ test('public hook startup blocks when its module or runtime build is missing', t
   result = run();
   denied({ ...result, decision: JSON.parse(result.stdout).hookSpecificOutput }, /build is missing/);
   assert.equal(f.claims().length, 0);
+});
+
+test('shell hook wrapper blocks missing CLI and unavailable Node', t => {
+  const f = fixture(t);
+  const isolated = path.join(f.dir, 'wrapper-only');
+  fs.mkdirSync(isolated);
+  const wrapper = path.join(isolated, 'courier-guard.sh');
+  fs.copyFileSync(WRAPPER, wrapper);
+  let result = spawnSync('/bin/sh', [wrapper, '--db', f.db, '--courier-route-id', f.route.routeId], {
+    input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000
+  });
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /CLI entrypoint is missing/);
+
+  result = spawnSync('/bin/sh', [WRAPPER, '--db', f.db, '--courier-route-id', f.route.routeId], {
+    input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000,
+    env: { ...process.env, PATH: path.join(f.dir, 'no-node') }
+  });
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /node runtime is unavailable/);
+
+  const bin = path.join(f.dir, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'node'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  result = spawnSync('/bin/sh', [WRAPPER, '--db', f.db, '--courier-route-id', f.route.routeId], {
+    input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000,
+    env: { ...process.env, PATH: bin }
+  });
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /launcher failed with exit 1/);
+});
+
+test('guard refusal holds custody before or after queue acceptance across restart', t => {
+  for (const outcome of [null, COURIER_OUTCOMES.SUBMITTED, COURIER_OUTCOMES.UNCERTAIN]) {
+    const f = fixture(t);
+    if (outcome) {
+      f.state.recordCourierOutcome('9000', f.claim.attempt.attemptId, outcome);
+      f.state.markSubmitted('9000');
+    }
+    f.state.markThreadBoundary('2000', THREAD_STATES.GAP, 'test', null, null, f.binding);
+    denied(invoke(f), /courier forwarding authorization held/);
+    assert.equal(f.state.getMessage('9000').state, 'accepted');
+    const attempt = f.state.getCourierAttempt('9000', f.claim.attempt.attemptId);
+    assert.equal(attempt.outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
+    assert.equal(attempt.outcome.reason, 'courier guard refused before host call');
+    f.reopen();
+    f.state.markThreadBoundary('2000', THREAD_STATES.READY, 'recovered', null, null, f.binding);
+    denied(invoke(f), /not eligible/);
+    assert.equal(f.claims().length, 0);
+    assert.equal(f.state.getMessage('9000').state, 'accepted');
+    assert.equal(f.state.beginCourierAttempt('9000', { routeId: f.route.routeId, prompt: f.event.tool_input.prompt }).duplicate, true);
+  }
+});
+
+test('refusal after a forwarding claim cannot reset custody or grant a second call', t => {
+  const f = fixture(t);
+  f.state.recordCourierOutcome('9000', f.claim.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+  f.state.markSubmitted('9000');
+  assert.equal(invoke(f).status, 0);
+  f.state.markThreadBoundary('2000', THREAD_STATES.GAP, 'test', null, null, f.binding);
+  denied(invoke(f), /authorization held/);
+  assert.equal(f.state.getMessage('9000').state, 'submitted');
+  assert.equal(f.state.getCourierAttempt('9000', f.claim.attempt.attemptId).outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
+  assert.equal(f.claims().length, 1);
 });
 
 test('a denied hook never migrates or repairs old or incomplete state', t => {
