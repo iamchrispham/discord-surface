@@ -235,6 +235,14 @@ function pendingAcknowledgments(state: AcknowledgmentState, now = Date.now(), th
     }).map(row => row.discord_id);
 }
 
+function currentReplyReadyMessages(state: AcknowledgmentState, throughId: number): string[] {
+  return state.db.prepare(`SELECT m.discord_id FROM messages m
+    WHERE m.state=? AND EXISTS
+    (SELECT 1 FROM receipts r WHERE r.discord_id=m.discord_id AND r.id<=? AND r.kind IN (?, ?))`).all<{ discord_id: string }>(
+      MESSAGE_STATES.REPLY_READY, throughId, REPLY_READY_RECEIPTS.REPLY, REPLY_READY_RECEIPTS.BEFORE_SUBMIT
+    ).map(row => row.discord_id);
+}
+
 function isAcknowledgmentPending(state: AcknowledgmentState, messageId: string, now = Date.now()): boolean {
   const row = state.db.prepare(`SELECT r.discord_id, latest.detail AS outcome_detail
     FROM receipts r
@@ -435,12 +443,19 @@ function watchAcknowledgments({ state, send, deliver = createAcknowledgmentDeliv
   function initialPending(now: number): { ids: string[]; wakeOnly: Set<string> } {
     const watermark = latestReceiptId(state);
     const ids = pendingAcknowledgments(state, now, watermark);
+    const wakeOnly = new Set<string>();
+    for (const messageId of currentReplyReadyMessages(state, watermark)) {
+      notified.delete(messageId);
+      if (ids.includes(messageId)) continue;
+      ids.push(messageId);
+      wakeOnly.add(messageId);
+    }
     for (const row of latestAcknowledgmentOutcomes(state)) {
       const detail = parseReceiptDetail(row.detail);
       if (retryableUnknown(detail)) retryAtByMessage.set(row.discord_id, detail.retryAt);
     }
     receiptCursor = watermark;
-    return { ids, wakeOnly: new Set() };
+    return { ids, wakeOnly };
   }
 
   function incrementalPending(now: number): { ids: string[]; wakeOnly: Set<string> } {

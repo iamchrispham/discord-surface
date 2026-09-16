@@ -26,6 +26,7 @@ export type NativeReplyFilePhase = typeof NATIVE_REPLY_FILE_PHASES[keyof typeof 
 export interface NativeReplyFilePreparation extends DirectPostFileManifest {
   journal: typeof NATIVE_REPLY_FILE_JOURNAL;
   phase: NativeReplyFilePhase;
+  reservesCapacity?: boolean;
   messageId: string;
   channelId: string;
   guildId: string;
@@ -113,7 +114,8 @@ function activePreparationCount(state: NativeReplyFileState, deps: NativeReplyFi
     }
     latest.set(nativeReplyFilePreparationKey(row.kind, detail.preparationId), detail);
   }
-  return [...latest.values()].filter(detail => detail.phase !== DIRECT_POST_FILE_PHASES.RELEASED && detail.phase !== NATIVE_REPLY_FILE_PHASES.RELEASED).length;
+  return [...latest.values()].filter(detail => detail.reservesCapacity !== false &&
+    detail.phase !== DIRECT_POST_FILE_PHASES.RELEASED && detail.phase !== NATIVE_REPLY_FILE_PHASES.RELEASED).length;
 }
 
 export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies) {
@@ -173,7 +175,7 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
       }
       return existing;
     }
-    if (existing?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING) {
+    if (existing?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING && existing.reservesCapacity !== false) {
       throw new deps.BindingError(`native reply file preparation is already in progress: ${existing.preparationId}`);
     }
     let inspected;
@@ -190,7 +192,7 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
       stagedPath: stagedDirectPostFilePath(root, preparationId), filename: inspected.filename,
       size: inspected.size, caption, captionHash: crypto.createHash('sha256').update(caption).digest('hex'),
       channelId: message.channelId, guildId: message.guildId, provider, nativeId, generation,
-      operatorId: check.config.operatorId, ...ownerIdentity
+      operatorId: check.config.operatorId, reservesCapacity: true, ...ownerIdentity
     } as any;
     const assertReservationCustody = () => {
       const currentMessage = state.getMessage(messageId);
@@ -209,7 +211,7 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
       assertReservationCustody();
       const current = latestPreparation(state, deps, messageId);
       if (current?.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) throw new deps.BindingError('native reply file preparation is already admitted');
-      if (current?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING) {
+      if (current?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING && current.reservesCapacity !== false) {
         throw new deps.BindingError(`native reply file preparation is already in progress: ${current.preparationId}`);
       }
       const acknowledgment = state.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id DESC LIMIT 1')
@@ -218,7 +220,10 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
       if (!identity || identity.provider !== provider || identity.nativeId !== nativeId || identity.generation !== generation) {
         state.receipt(messageId, deps.NATIVE_ACK_RECEIPT, { provider, nativeId, generation, source: 'native-reply-file' });
       }
-      if (activePreparationCount(state, deps) >= DIRECT_POST_FILE_LIMITS.maxReservations) return true;
+      if (activePreparationCount(state, deps) >= DIRECT_POST_FILE_LIMITS.maxReservations) {
+        state.receipt(messageId, NATIVE_REPLY_FILE_PREPARATION, { ...seed, reservesCapacity: false });
+        return true;
+      }
       state.receipt(messageId, NATIVE_REPLY_FILE_PREPARATION, seed);
       return false;
     });
