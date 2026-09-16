@@ -166,7 +166,7 @@ function eventToInput(message) {
 function classifyReplyError(error) {
   if (error?.outcome) return error.outcome;
   if (/authorization|stale|custody|generation/i.test(error?.message || '')) return 'failed';
-  if (error?.status === 400 || error?.status === 401 || error?.status === 403 || error?.status === 404 || error?.code === 50013) return 'failed';
+  if ([400, 401, 403, 404, 413].includes(error?.status) || error?.code === 50013) return 'failed';
   if (error?.status >= 500 || error?.potentiallyDelivered || error?.wrote || error?.name === 'TypeError') return 'unknown';
   if (['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT'].includes(error?.code)) return 'unknown';
   return 'unknown';
@@ -1520,6 +1520,7 @@ class DiscordGateway {
     const files = fileManifest
       ? [{ attachment: readDirectPostFileSnapshot(fileManifest), name: fileManifest.filename }]
       : undefined;
+    this.state.assertMessageCurrent(reply.id, 'reply-send');
     try {
       return await channel.send({
         content: reply.replyText,

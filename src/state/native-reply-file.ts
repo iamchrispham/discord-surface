@@ -225,6 +225,19 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
       if (current?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING && current.reservesCapacity !== false) {
         throw new deps.BindingError(`native reply file preparation is already in progress: ${current.preparationId}`);
       }
+      const sameCapacityRefusal = current?.phase === NATIVE_REPLY_FILE_PHASES.PREPARING &&
+        current.reservesCapacity === false &&
+        current.sourcePath === seed.sourcePath &&
+        current.filename === seed.filename &&
+        current.size === seed.size &&
+        current.caption === seed.caption &&
+        current.captionHash === seed.captionHash &&
+        current.channelId === seed.channelId &&
+        current.guildId === seed.guildId &&
+        current.provider === seed.provider &&
+        current.nativeId === seed.nativeId &&
+        current.generation === seed.generation &&
+        current.operatorId === seed.operatorId;
       const acknowledgment = state.db.prepare('SELECT detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id DESC LIMIT 1')
         .get(messageId, deps.NATIVE_ACK_RECEIPT);
       const identity = deps.parseJson(acknowledgment?.detail, null);
@@ -232,6 +245,7 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
         state.receipt(messageId, deps.NATIVE_ACK_RECEIPT, { provider, nativeId, generation, source: 'native-reply-file' });
       }
       if (activePreparationCount(state, deps) >= DIRECT_POST_FILE_LIMITS.maxReservations) {
+        if (sameCapacityRefusal) return true;
         state.receipt(messageId, NATIVE_REPLY_FILE_PREPARATION, { ...seed, reservesCapacity: false });
         return true;
       }

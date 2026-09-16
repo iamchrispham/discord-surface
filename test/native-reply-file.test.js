@@ -116,6 +116,50 @@ test('Codex and Claude file replies recover submitted and uncertain dispatch', a
   }
 });
 
+test('native file send rechecks authorization after loading the snapshot', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-snapshot-auth-${provider}`;
+    const source = path.join(f.dir, 'answer.bin');
+    fs.writeFileSync(source, Buffer.from('snapshot authorization payload'));
+    submitted(f, id);
+    const input = { provider, messageId: id, nativeId: f.nativeId, generation: 1,
+      stateDir: f.dir, sourcePath: source, caption: 'snapshot authorization' };
+    const manifest = f.state.prepareNativeReplyFile(input);
+    f.state.recordNativeReply({ ...input, text: input.caption, fileManifest: manifest });
+    f.state.beginReply(id);
+    const other = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+    const originalReadFileSync = fs.readFileSync;
+    let snapshotRead = false;
+    let sends = 0;
+    const channel = { id: 'channel', send: async () => { sends += 1; return { id: 'posted' }; } };
+    const client = new EventEmitter();
+    client.user = { id: 'bot' };
+    const gateway = new DiscordGateway({ state: f.state, client });
+    try {
+      fs.readFileSync = (...args) => {
+        const bytes = originalReadFileSync(...args);
+        if (!snapshotRead && path.resolve(String(args[0])) === path.resolve(manifest.stagedPath)) {
+          snapshotRead = true;
+          other.setConfig({ operatorId: 'different-operator', guildId: 'guild', secretFile: path.join(f.dir, 'discord.env') });
+        }
+        return bytes;
+      };
+      await assert.rejects(() => gateway.sendReply({ id, channel }, {
+        id, replyText: input.caption, replyNonce: f.state.getMessage(id).replyNonce,
+        replyPart: f.state.listReplyParts(id)[0]
+      }), /authorization|authorized|stale/);
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+      other.close();
+    }
+    assert.equal(snapshotRead, true);
+    assert.equal(sends, 0);
+    assert.equal(f.state.nativeReplyFilePreparation(id).phase, 'admitted');
+    assert.deepEqual(f.state.listReplyParts(id)[0].fileManifest, manifest);
+  });
+});
+
 test('early file-reply acknowledgment wakes the existing Gateway consumer when ready', async t => {
   for (const provider of ['codex', 'claude']) for (const dispatchState of [MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN]) {
     await t.test(`${provider} ${dispatchState}`, async t2 => {
@@ -1086,6 +1130,8 @@ test('full-capacity refusal blocks competing text until later file retry', async
 
         assert.throws(() => f.state.prepareNativeReplyFile(input), /file custody capacity is exhausted/);
         const refused = f.state.nativeReplyFilePreparation(id);
+        assert.throws(() => f.state.prepareNativeReplyFile(input), /file custody capacity is exhausted/);
+        assert.equal(f.state.nativeReplyFilePreparation(id).preparationId, refused.preparationId);
         const other = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
         try {
           assert.throws(
@@ -1135,6 +1181,50 @@ test('full-capacity refusal blocks competing text until later file retry', async
       }
     });
   }
+});
+
+test('HTTP 413 native file upload is definite not-sent and retries the retained snapshot', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-413-${provider}`;
+    const source = path.join(f.dir, 'answer.bin');
+    const bytes = Buffer.from('413 retained snapshot payload');
+    fs.writeFileSync(source, bytes);
+    submitted(f, id);
+    const input = { provider, messageId: id, nativeId: f.nativeId, generation: 1,
+      stateDir: f.dir, sourcePath: source, caption: '413 retained snapshot' };
+    const manifest = f.state.prepareNativeReplyFile(input);
+    f.state.recordNativeReply({ ...input, text: input.caption, fileManifest: manifest });
+    let sends = 0;
+    const channel = {
+      id: 'channel',
+      send: async payload => {
+        sends += 1;
+        if (sends === 1) {
+          const error = new Error('attachment exceeds Discord upload limit');
+          error.status = 413;
+          throw error;
+        }
+        assert.deepEqual(payload.files[0].attachment, bytes);
+        return { id: 'posted-after-413' };
+      }
+    };
+    const client = new EventEmitter();
+    client.user = { id: 'bot' };
+    const gateway = new DiscordGateway({ state: f.state, client });
+    const consumer = createSurfaceConsumer({ state: f.state, providers: {},
+      sendReply: (message, reply) => gateway.sendReply(message, reply) });
+    const first = await consumer.deliverReply({ id, channel }, { message: f.state.getMessage(id) });
+    assert.equal(first.error.outcome, 'failed');
+    assert.equal(first.message.state, 'reply_failed');
+    assert.equal(f.state.nativeReplyFilePreparation(id).phase, 'admitted');
+    assert.deepEqual(f.state.listReplyParts(id)[0].fileManifest, manifest);
+    f.state.reconcileReplyDelivery(id, 'not_sent');
+    const second = await consumer.deliverReply({ id, channel }, { message: f.state.getMessage(id) });
+    assert.equal(second.message.state, 'replied');
+    assert.equal(sends, 2);
+    assert.equal(f.state.listReplyParts(id)[0].fileManifest.preparationId, manifest.preparationId);
+  });
 });
 
 test('old capacity refusal cleanup cannot shadow a later admitted native file', async t => {
