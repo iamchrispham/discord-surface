@@ -58,7 +58,7 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
       AND discord_id=? AND id>? LIMIT 1`)
       .get(UNCERTAIN_RECONCILIATION_NOT_SUBMITTED, messageId, attemptReceiptId);
     if (!eligible.includes(message.state) || state.hasNativeAcknowledgment(message)) {
-      throw new deps.BindingError('courier message was already recognized or settled');
+      throw new deps.BindingError('courier message is not eligible for forwarding');
     }
     const match = findMatchingRoute(deps, state, message, routeId);
     if (match.status) throw new deps.BindingError(`courier forwarding authorization ${match.status}`);

@@ -117,8 +117,9 @@ test('current route, generation, authorization and child readiness are rechecked
   }
 });
 
-test('acknowledged, settled, refused or missing attempts cannot forward', t => {
+test('undispatched, acknowledged, settled, refused or missing attempts cannot forward', t => {
   const mutations = [
+    f => f.state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run('accepted', '9000'),
     f => { f.state.markSubmitted('9000'); recordNativeAcknowledgment(f.state, {
       provider: 'codex', messageId: '9000', nativeId: PARENT, generation: f.binding.generation }); },
     f => f.state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run('replied', '9000'),

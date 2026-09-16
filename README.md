@@ -153,7 +153,7 @@ The courier's trusted native `PreToolUse` hook must run the installed guard
 before `mcp__codex_app__send_message_to_thread`:
 
 ```sh
-node /absolute/path/to/discord-surface/src/cli.js courier-guard \
+node --disable-warning=ExperimentalWarning /absolute/path/to/discord-surface/src/cli.js courier-guard \
   --db /absolute/path/to/surface.sqlite --courier-route-id ROUTE_ID
 ```
 
@@ -161,7 +161,8 @@ The guard reads the native hook event from stdin. It requires the registered
 courier session and workspace, the fixed recipient and exact prompt from one
 persisted attempt, current binding ownership and an unacknowledged message.
 It atomically records one forwarding claim before allowing the tool. Refusal
-returns a native deny decision and exit 2. Startup failures also exit 2.
+writes the blocking reason to stderr and exits 2. Success leaves stdout empty.
+Startup failures also exit 2.
 The database must already have the current schema. The guard never creates,
 migrates or repairs it.
 A claim survives restart or an unknown host-call outcome and cannot be retried.
