@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import * as path from 'node:path';
 import type { Attachment } from './attachments';
 import type { AgentMessage } from './agent-message';
+import { watcherNoticePrompt, type WatcherNotice } from './watcher-notice';
 import type { DecisionResult } from './state/decision';
 import { ENVELOPE_TYPE, PROMPT_PREFIX } from './state/courier-route/constants';
 import {
@@ -87,6 +88,8 @@ export interface NativeMessage {
   content: string;
   attachments?: readonly Attachment[] | null;
   agentMessage?: AgentMessage | null;
+  watcherNotice?: WatcherNotice | null;
+  watcherNoticeProvenance?: unknown;
   decisionResult?: DecisionResult | null;
   state: MessageState;
   replyText?: string | null;
@@ -100,6 +103,17 @@ export function agentCompletionCommand(
   stateDir = path.dirname(dbPath)
 ): string[] {
   return [process.execPath, cliPath, 'agent-complete', '--state-dir', stateDir, '--db', dbPath,
+    '--provider', message.provider, '--message-id', message.id,
+    '--native-id', message.nativeId, '--generation', String(message.generation)];
+}
+
+export function watcherNoticeCompletionCommand(
+  message: Pick<NativeMessage, 'id' | 'provider' | 'nativeId' | 'generation'>,
+  dbPath: string,
+  cliPath = path.join(__dirname, '..', 'src', 'cli.js'),
+  stateDir = path.dirname(dbPath)
+): string[] {
+  return [process.execPath, cliPath, 'watcher-consume', '--state-dir', stateDir, '--db', dbPath,
     '--provider', message.provider, '--message-id', message.id,
     '--native-id', message.nativeId, '--generation', String(message.generation)];
 }
@@ -440,6 +454,7 @@ function decisionRequest(message: NativeMessage): string | null {
 export function messageRequest(message: NativeMessage): string {
   const decision = decisionRequest(message);
   if (decision) return decision;
+  if (message.watcherNotice) return watcherNoticePrompt(message.watcherNotice);
   const agent = message.agentMessage;
   if (!agent) return message.content;
   return [
@@ -451,6 +466,11 @@ export function messageRequest(message: NativeMessage): string {
     agent.replyTo ? `Correlates to agent message ${agent.replyTo}.` : '',
     '', agent.text
   ].filter(line => line !== '').join('\n');
+}
+
+function noPostWatcherNoticeInstruction(completion: readonly string[] | null | undefined): string | null {
+  if (!completion) return null;
+  return `After handling this watcher notice, run this exact consume command once, preserving argument boundaries: ${JSON.stringify(completion)}. Do not use the reply tool or produce a Discord reply.`;
 }
 
 function noPostCompletionInstruction(completion: readonly string[] | null | undefined): string | null {
@@ -501,13 +521,20 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
   content: string;
   attachments?: readonly Attachment[] | null;
   completion?: readonly string[];
+  watcherNotice?: Pick<WatcherNotice, 'id' | 'armKey' | 'triggerKey' | 'source' | 'target'>;
 } {
   const isDecision = Boolean(message.decisionResult);
-  const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
+  const completionInstruction = message.agentMessage
+    ? noPostCompletionInstruction(completion)
+    : message.watcherNotice ? noPostWatcherNoticeInstruction(completion) : null;
   const hasCompletionPath = Boolean(completionInstruction);
   let replyInstruction: string;
   if (isDecision) {
     replyInstruction = `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after handling the saved decision continuation.`;
+  } else if (message.watcherNotice) {
+    replyInstruction = hasCompletionPath
+      ? `After handling this watcher notice, run the exact consume command below. Do not use the reply tool or post a Discord reply.`
+      : 'Watcher notices are data only. Do not use the reply tool or post a Discord reply.';
   } else if (hasCompletionPath) {
     replyInstruction = `After handling this agent packet, either use the reply tool with messageId "${message.id}" and generation ${message.generation} for a Discord reply, or run the exact no-post completion command below when no reply is needed.`;
   } else {
@@ -532,6 +559,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     content: string;
     attachments?: readonly Attachment[] | null;
     completion?: readonly string[];
+    watcherNotice?: Pick<WatcherNotice, 'id' | 'armKey' | 'triggerKey' | 'source' | 'target'>;
   } = {
     nativeId: message.nativeId,
     messageId: message.id,
@@ -539,7 +567,11 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     content: content.join('\n')
   };
   if (message.attachments?.length) event.attachments = message.attachments;
-  if (message.agentMessage && completion?.length) event.completion = [...completion];
+  if ((message.agentMessage || message.watcherNotice) && completion?.length) event.completion = [...completion];
+  if (message.watcherNotice) {
+    const { id, armKey, triggerKey, source, target } = message.watcherNotice;
+    event.watcherNotice = { id, armKey, triggerKey, source, target };
+  }
   return event;
 }
 

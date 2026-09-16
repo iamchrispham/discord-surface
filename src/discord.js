@@ -1,4 +1,5 @@
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
+const { WATCHER_NOTICE_PREFIX } = require('./watcher-notice');
 const path = require('node:path');
 const {
   AGENT_ATTACHMENT_CONTENT_TYPE,
@@ -10,7 +11,7 @@ const {
 } = require('./agent-attachment');
 const fs = require('node:fs');
 const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
-const { CODEX_VALIDATION_KINDS, codexPrompt, dispatchAndObserve, agentCompletionCommand, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, readInitialCursor, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
+const { CODEX_VALIDATION_KINDS, codexPrompt, dispatchAndObserve, agentCompletionCommand, watcherNoticeCompletionCommand, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, readInitialCursor, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, TRANSPORT_RECEIPT_OUTCOMES, UnresolvedWorkError } = require('./state');
 const { COURIER_OUTCOMES, COURIER_RESULT_STATUSES, isCourierOriginAllowed } = require('./state/courier-route');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
@@ -421,7 +422,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     if (!route?.enrollment || !message?.author?.bot) return null;
     const content = typeof message.content === 'string' ? message.content : '';
     const input = eventToInput(message);
-    if (content.startsWith(AGENT_PREFIX) || input.attachments?.length) return null;
+    if (content.startsWith(AGENT_PREFIX) || content.startsWith(WATCHER_NOTICE_PREFIX) || input.attachments?.length) return null;
     return state.acceptDiscordMessage(input, { ready, coverageId, expectedBinding });
   }
 
@@ -486,6 +487,12 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     const stored = state.getMessage(message.id);
     if (!stored) return null;
     return { ...input, content: stored.content, attachments: stored.attachments };
+  }
+
+  async function normalizeSurfaceMessage(message, options) {
+    const input = eventToInput(message);
+    if (typeof input.content === 'string' && input.content.startsWith(WATCHER_NOTICE_PREFIX)) return input;
+    return normalizeAgentMessage(message, input, options);
   }
 
   function nativeOwnerKey(message) {
@@ -1046,7 +1053,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       return childBotRejection;
     }
     const intake = await serializeIntake(message, async () => {
-      const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
+      const input = storedAttachmentInput(message) || await normalizeSurfaceMessage(message, {
           fetchImpl: agentAttachmentFetch,
           signal,
           timeoutMs: agentAttachmentTimeoutMs,
@@ -1060,7 +1067,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       const result = state.acceptDiscordMessage(input, {
         ready,
         expectedBinding,
-        agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
+        agentToken: input.isBot && (input.content?.startsWith(AGENT_PREFIX) || input.content?.startsWith(WATCHER_NOTICE_PREFIX)) ? agentCredential() : null
       });
       if (!result.stale) onIntake?.(message, result);
       return ready ? result : { ...result, held: true };
@@ -1075,7 +1082,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     const childBotRejection = rejectEnrolledChildBot(message, expectedBinding, ready, coverageId);
     if (childBotRejection) return childBotRejection;
     const intake = await serializeIntake(message, async () => {
-      const input = storedAttachmentInput(message) || await normalizeAgentMessage(message, eventToInput(message), {
+      const input = storedAttachmentInput(message) || await normalizeSurfaceMessage(message, {
           fetchImpl: agentAttachmentFetch,
           signal,
           timeoutMs: agentAttachmentTimeoutMs,
@@ -1090,7 +1097,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
         ready: effectiveReady,
         coverageId,
         expectedBinding,
-          agentToken: input.isBot && input.content?.startsWith(AGENT_PREFIX) ? agentCredential() : null
+          agentToken: input.isBot && (input.content?.startsWith(AGENT_PREFIX) || input.content?.startsWith(WATCHER_NOTICE_PREFIX)) ? agentCredential() : null
       });
     }, { signal, bypassBarrier });
     if (emitReceipt && intake.accepted) launchTransportReceipt(message);
@@ -1205,7 +1212,11 @@ class DiscordGateway {
       state,
       send: (message, reaction) => this.sendAcknowledgment(message, reaction)
     });
-    const completionFor = message => message.agentMessage ? agentCompletionCommand(message, state.dbPath, undefined, this.stateDir) : null;
+    const completionFor = message => {
+      if (message.watcherNotice) return watcherNoticeCompletionCommand(message, state.dbPath, undefined, this.stateDir);
+      if (message.agentMessage) return agentCompletionCommand(message, state.dbPath, undefined, this.stateDir);
+      return null;
+    };
     this.providers = providers || {
       codex: new CodexProvider({
         acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath),

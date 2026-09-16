@@ -1,4 +1,5 @@
 const { PREFIX: AGENT_PREFIX, decodeAgentMessage } = require('./agent-message');
+const { WATCHER_NOTICE_PREFIX, decodeWatcherNotice, sameWatcherNotice, validateWatcherNotice } = require('./watcher-notice');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -17,6 +18,13 @@ const {
   createNativeReplyFileHandlers
 } = require('./state/native-reply-file');
 const { createAgentCompletionHandlers } = require('./state/agent-completion');
+const {
+  createWatcherNoticeHandlers,
+  WATCHER_NOTICE_AUTHORITY,
+  WATCHER_NOTICE_JOURNAL,
+  WATCHER_NOTICE_PUBLICATION_SOURCE,
+  WATCHER_NOTICE_RECEIPTS
+} = require('./state/watcher-notice');
 const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = require('./state/board-refresh');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
 const {
@@ -183,6 +191,18 @@ const agentCompletionHandlers = createAgentCompletionHandlers({
   BindingError,
   StaleGenerationError,
   StateCorruptError
+});
+
+const watcherNoticeHandlers = createWatcherNoticeHandlers({
+  BindingError,
+  AuthorizationError,
+  StaleGenerationError,
+  StateCorruptError,
+  MESSAGE_STATES,
+  NATIVE_REPLY_FILE_PHASES,
+  assertText,
+  assertUuid,
+  now
 });
 
 const boardRefreshHandlers = createBoardRefreshHandlers();
@@ -1984,7 +2004,8 @@ class SurfaceState {
       }
       return this.reject('invalid-event');
     }
-    const directPost = this.excludeDirectPost(event);
+    const isWatcherNotice = Boolean(event.isBot && event.content.startsWith(WATCHER_NOTICE_PREFIX));
+    const directPost = isWatcherNotice ? false : this.excludeDirectPost(event);
     return this.transaction(() => {
       const route = this.getMessageRoute(event.channelId);
       const binding = route?.binding || this.getBinding(event.channelId);
@@ -2017,6 +2038,8 @@ class SurfaceState {
       else this.upsertIntakeWatermark(event, ready, coverageId);
       let agent = null;
       let invalidAgent = false;
+      let notice = null;
+      let invalidNotice = false;
       if (event.isBot && event.content.startsWith(AGENT_PREFIX)) {
         try {
           const target = binding && Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation']
@@ -2025,12 +2048,22 @@ class SurfaceState {
           if (attachments.length) throw new BindingError('agent attachments are not supported');
         } catch { invalidAgent = true; }
       }
-      let reason = invalidAgent ? 'invalid-event' : null;
+      if (isWatcherNotice) {
+        try {
+          const target = binding && Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation']
+            .map(key => [key, key === 'channelId' ? event.channelId : binding[key]]));
+          notice = decodeWatcherNotice(event.content, agentToken, target);
+          if (!notice) throw new BindingError('watcher notice is missing');
+          watcherNoticeHandlers.authorizeWatcherNoticePublication(this, notice, event);
+          if (attachments.length) throw new BindingError('watcher notice attachments are not supported');
+        } catch { invalidNotice = true; }
+      }
+      let reason = invalidAgent || invalidNotice ? 'invalid-event' : null;
       if (typeof event.content !== 'string' || event.content.length > 10000 || attachments === null || (event.content.length === 0 && attachments?.length === 0)) reason = 'invalid-event';
-      else if (enrollment && event.isBot && !agent) reason = 'bot-source';
-      else if (!agent && directPost) reason = 'automatic-publication';
-      else if (!agent && event.isBot) reason = 'bot-source';
-      else if (event.guildId !== config.guildId || (!agent && event.authorId !== config.operatorId)) reason = 'unauthorized-sender';
+      else if (enrollment && event.isBot && !agent && !notice) reason = 'bot-source';
+      else if (!agent && !notice && directPost) reason = 'automatic-publication';
+      else if (!agent && !notice && event.isBot) reason = 'bot-source';
+      else if (event.guildId !== config.guildId || (!agent && !notice && event.authorId !== config.operatorId)) reason = 'unauthorized-sender';
       if (!reason && (!binding || !binding.active || binding.guildId !== event.guildId)) reason = 'unknown-binding';
       if (!reason && enrollment && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(enrollment.state)) {
         reason = enrollment.state === THREAD_STATES.GAP ? THREAD_INTAKE_REASONS.GAP : THREAD_INTAKE_REASONS.UNAVAILABLE;
@@ -2077,6 +2110,25 @@ class SurfaceState {
         });
         return this.reject('agent-message-duplicate');
       }
+      if (notice) {
+        const prior = watcherNoticeHandlers.findWatcherNotice(this, notice.armKey, notice.triggerKey);
+        if (prior) {
+          if (!sameWatcherNotice(prior.provenance.packet, notice)) {
+            this.receipt(null, 'intake-rejected', {
+              discordId: event.id, channelId: authorityChannelId,
+              ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+              reason: 'watcher-notice-identity-conflict', ready
+            });
+            return this.reject('watcher-notice-identity-conflict');
+          }
+          this.receipt(null, 'intake-rejected', {
+            discordId: event.id, channelId: authorityChannelId,
+            ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+            reason: 'watcher-notice-duplicate', ready
+          });
+          return { accepted: false, duplicate: true, reason: 'watcher-notice-duplicate', message: this.getMessage(prior.messageId) };
+        }
+      }
       if (this.failNextIntakeFlag) {
         this.failNextIntakeFlag = false;
         throw new Error('injected intake transaction failure');
@@ -2096,6 +2148,19 @@ class SurfaceState {
         }
       }
       if (agent) this.receipt(event.id, 'agent-message', { packet: agent, authorId: event.authorId });
+      if (notice) {
+        this.receipt(event.id, WATCHER_NOTICE_RECEIPTS.PROVENANCE, {
+          journal: WATCHER_NOTICE_JOURNAL, packet: notice, authorId: event.authorId,
+          authority: WATCHER_NOTICE_AUTHORITY.NOTICE_ONLY
+        });
+        this.receipt(event.id, WATCHER_NOTICE_RECEIPTS.PUBLICATION, {
+          journal: WATCHER_NOTICE_JOURNAL, packet: notice, authorId: event.authorId,
+          noticeId: notice.id, armKey: notice.armKey, triggerKey: notice.triggerKey,
+          channelId: authorityChannelId, deliveryChannelId: event.channelId,
+          provider: binding.provider, nativeId: binding.nativeId, generation: binding.generation,
+          source: WATCHER_NOTICE_PUBLICATION_SOURCE
+        });
+      }
       this.receipt(event.id, 'accepted', {
         channelId: authorityChannelId,
         ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
@@ -2296,7 +2361,7 @@ class SurfaceState {
     const identity = Boolean(routeIdentity && binding && binding.active && binding.guildId === message.guildId &&
       binding.generation === message.generation && binding.nativeId === message.nativeId && binding.provider === message.provider);
     const current = Boolean(identity && binding.guildId === config.guildId &&
-      message.guildId === config.guildId && (message.authorId === config.operatorId || this.getAgentMessage(message.id)?.authorId === message.authorId) &&
+      message.guildId === config.guildId && (message.authorId === config.operatorId || this.getAgentMessage(message.id)?.authorId === message.authorId || this.getWatcherNotice(message.id)?.authorId === message.authorId) &&
       binding.generation === message.generation && binding.nativeId === message.nativeId && binding.provider === message.provider);
     return { config, binding, identity, current, enrollment, deliveryChannelId, ready: Boolean(identity && route?.ready) };
   }
@@ -2927,6 +2992,34 @@ class SurfaceState {
     return agentCompletionHandlers.completeAgentHandledWithoutPost(this, args);
   }
 
+  armWatcherNotice(input) {
+    return watcherNoticeHandlers.armWatcherNotice(this, input);
+  }
+
+  getWatcherNoticeArm(armKey) {
+    return watcherNoticeHandlers.getWatcherNoticeArm(this, armKey);
+  }
+
+  authorizeWatcherNoticeSend(packet) {
+    return watcherNoticeHandlers.authorizeWatcherNoticeSend(this, packet);
+  }
+
+  recordWatcherNoticeTrigger(packet) {
+    return watcherNoticeHandlers.recordWatcherNoticeTrigger(this, packet);
+  }
+
+  authorizeWatcherNoticePublication(packet, event) {
+    return watcherNoticeHandlers.authorizeWatcherNoticePublication(this, packet, event);
+  }
+
+  consumeWatcherNotice(args) {
+    return watcherNoticeHandlers.consumeWatcherNotice(this, args);
+  }
+
+  findWatcherNotice(armKey, triggerKey) {
+    return watcherNoticeHandlers.findWatcherNotice(this, armKey, triggerKey);
+  }
+
   reconcileDirectPostOutcome(requestId, attemptId, resolution, evidence = {}) {
     return directPostHandlers.reconcileDirectPostOutcome(this, requestId, attemptId, resolution, evidence);
   }
@@ -3027,12 +3120,35 @@ class SurfaceState {
     return row ? parseJson(row.detail, null) : null;
   }
 
+  getWatcherNotice(messageId) {
+    const row = this.db.prepare(`SELECT id, detail, created_at FROM receipts
+      WHERE discord_id=? AND kind=? ORDER BY id LIMIT 1`).get(messageId, WATCHER_NOTICE_RECEIPTS.PROVENANCE);
+    if (!row) return null;
+    const detail = parseJson(row.detail, null);
+    if (!detail || detail.journal !== WATCHER_NOTICE_JOURNAL || !detail.packet || typeof detail.authorId !== 'string') {
+      throw new StateCorruptError('watcher notice provenance is malformed');
+    }
+    try { validateWatcherNotice(detail.packet); }
+    catch (error) { throw new StateCorruptError(`watcher notice provenance is malformed: ${error.message}`); }
+    return {
+      packet: detail.packet,
+      authorId: detail.authorId,
+      receiptId: Number(row.id),
+      recordedAt: row.created_at
+    };
+  }
+
   getMessage(messageId) {
     const message = rowMessage(this.db.prepare('SELECT * FROM messages WHERE discord_id=?').get(messageId));
     if (message) {
       message.replyParts = this.listReplyParts(messageId);
       const agent = message.content.startsWith(AGENT_PREFIX) ? this.getAgentMessage(messageId) : null;
       if (agent) message.agentMessage = agent.packet;
+      const notice = message.content.startsWith(WATCHER_NOTICE_PREFIX) ? this.getWatcherNotice(messageId) : null;
+      if (notice) {
+        message.watcherNotice = notice.packet;
+        message.watcherNoticeProvenance = notice;
+      }
       const decisionResult = interactionHandlers.decisionResult(this, message);
       if (decisionResult) message.decisionResult = decisionResult;
     }

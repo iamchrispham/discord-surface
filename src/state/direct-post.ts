@@ -1,4 +1,5 @@
 import type { AgentMessage, AgentProvider } from '../agent-message';
+import type { WatcherNotice } from '../watcher-notice';
 import { DIRECT_POST_FILE_LIMITS, DIRECT_POST_FILE_PHASES, stagedDirectPostFilePath } from '../direct-post-file';
 import type { DirectPostFileManifest, DirectPostFilePreparation } from '../direct-post-file';
 import { NATIVE_REPLY_FILE_JOURNAL, NATIVE_REPLY_FILE_PREPARATION } from './native-reply-file';
@@ -48,6 +49,7 @@ export interface DirectPostPartMeta {
   binding: DirectPostBinding;
   deliveryChannelId?: string;
   agentPacket?: AgentMessage;
+  watcherNotice?: WatcherNotice;
   caption?: string;
   fileManifest?: DirectPostFileManifest;
 }
@@ -231,7 +233,7 @@ interface DirectPostDependencies {
 
 const identityKeys: readonly (keyof DirectPostPartMeta)[] = [
   'textHash', 'inReplyTo', 'channelId', 'guildId', 'provider', 'nativeId', 'generation',
-  'conductorId', 'repoKey', 'partCount', 'deliveryChannelId', 'agentPacket', 'caption', 'fileManifest'
+  'conductorId', 'repoKey', 'partCount', 'deliveryChannelId', 'agentPacket', 'watcherNotice', 'caption', 'fileManifest'
 ];
 
 function identityKeyValueMatches(key: string, left: unknown, right: unknown): boolean {
