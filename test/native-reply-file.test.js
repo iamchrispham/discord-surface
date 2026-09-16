@@ -421,7 +421,7 @@ test('native-only capacity rejection reports native holders', async t => {
     }
     assert.equal(f.state.activeFilePreparationCount(), 8);
 
-    assert.throws(() => f.state.beginDirectPostFilePreparation(directPreparationSeed(f, `native-only-rejected-${provider}`)), error => {
+    assert.throws(() => f.state.beginDirectPostFilePreparation(directPreparationSeed(f, 8)), error => {
       assert.match(error.message, /capacity is exhausted/);
       const held = JSON.parse(error.message.slice(error.message.indexOf('[')));
       assert.equal(held.length, 8);
