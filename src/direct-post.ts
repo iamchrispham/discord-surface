@@ -683,6 +683,8 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     }
     deliveryTarget = watcherNotice.packet.target as unknown as AgentAddress;
     if (source.text !== watcherNotice.packet.text) throw new BindingError('watcher notice content changed while reading custody');
+    if (typeof state.recordWatcherNoticeTrigger !== 'function') throw new BindingError('watcher notice trigger custody is unavailable');
+    state.recordWatcherNoticeTrigger(watcherNotice.packet);
     const wire = encodeWatcherNotice(watcherNotice.packet, token);
     source = {
       ...source,
@@ -724,10 +726,6 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     };
   }
   const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, effectiveReplyTarget);
-  if (watcherNotice) {
-    if (typeof state.recordWatcherNoticeTrigger !== 'function') throw new BindingError('watcher notice trigger custody is unavailable');
-    state.recordWatcherNoticeTrigger(watcherNotice.packet);
-  }
   state.recoverDirectPostReceipts();
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;

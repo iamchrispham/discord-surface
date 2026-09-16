@@ -371,6 +371,32 @@ test('watcher arm and trigger custody survive restart and refuse changed content
   }
 });
 
+test('watcher encoding refusal freezes trigger content across restart', async () => {
+  const f = fixture();
+  const textFile = path.join(f.dir, 'oversized.txt');
+  const oversized = 'x'.repeat(2000);
+  fs.writeFileSync(textFile, oversized);
+  let state = f.state;
+  let networkCalls = 0;
+  const send = () => runWatcherNoticePost({
+    state, token, armKey: f.armKey, triggerKey: 'oversized-trigger', textFile,
+    fetchImpl: async () => { networkCalls += 1; throw new Error('unexpected network call'); }
+  });
+  try {
+    armFixture(state, f.armKey);
+    await assert.rejects(send(), /encoded size.*maximum 2000/);
+    state.close();
+    state = new SurfaceState(f.db);
+    await assert.rejects(send(), /encoded size.*maximum 2000/);
+    fs.writeFileSync(textFile, 'Shorter changed body.');
+    await assert.rejects(send(), /trigger key conflicts with frozen content/);
+    assert.equal(networkCalls, 0);
+  } finally {
+    state.close();
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
 test('watcher arm requires the current Claude caller and never trusts a different native identity', async () => {
   const f = fixture();
   const printed = [];
