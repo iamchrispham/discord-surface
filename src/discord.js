@@ -1493,6 +1493,9 @@ class DiscordGateway {
     if (!stored?.deliveryChannelId || stored.deliveryChannelId === stored.channelId) return;
     const binding = this.state.getBinding(stored.channelId);
     if (!bindingIdentityMatches(stored, binding)) return;
+    const watermark = this.state.getIntakeWatermark(stored.deliveryChannelId);
+    if (watermark && ['gap', 'unavailable'].includes(watermark.state) &&
+      !isRetryableFetchBoundary(watermark.state, watermark.detail)) return;
     this.state.markThreadBoundary(stored.deliveryChannelId, THREAD_STATES.UNAVAILABLE,
       error.message, null, null, binding);
   }
@@ -2350,8 +2353,15 @@ class DiscordGateway {
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (Date.now() >= deadline) {
-        await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline);
-        failure ||= { ready: false, state: 'gap' };
+        const watermark = this.state.getIntakeWatermark(binding.channelId);
+        if (watermark && isRetryableFetchBoundary(watermark.state, watermark.detail)) {
+          this.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE,
+            watermark.detail || `${reason} intake unavailable`, binding);
+          failure ||= { ready: false, state: 'unavailable' };
+        } else {
+          await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline);
+          failure ||= { ready: false, state: 'gap' };
+        }
         continue;
       }
       const handoffRecovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(binding.channelId, binding);
