@@ -417,7 +417,7 @@ Cleanup deletes only the state-owned snapshot and releases its reservation. Nati
 ### Native reply local files
 
 `native-reply` records a reply for an existing submitted Discord message. An optional
-`--attachment-file` uploads one private staged snapshot beside the non-empty caption in
+`--attachment-file` uploads one private staged snapshot beside the nonblank caption in
 `--text-file`. The file is limited to 20 MiB and uses the same eight-reservation pool as
 direct posts. `claude-reply` remains the Claude-only compatibility alias; `native-reply`
 requires an explicit `--provider` of `codex` or `claude`.

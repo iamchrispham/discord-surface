@@ -156,8 +156,9 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
         throw new deps.BindingError('native reply file request identity conflicts with its admitted custody');
       }
       if (typeof sourcePath === 'string') {
+        const resolvedSourcePath = path.resolve(sourcePath);
         try {
-          const inspected = inspectDirectPostFile(sourcePath);
+          const inspected = inspectDirectPostFile(resolvedSourcePath);
           const bytes = fs.readFileSync(inspected.sourcePath);
           const hash = crypto.createHash('sha256').update(bytes).digest('hex');
           if (inspected.filename !== existing.filename || inspected.size !== existing.size || hash !== existing.sha256) {
@@ -165,6 +166,9 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
           }
         } catch (error) {
           if (error instanceof deps.BindingError) throw error;
+          if (resolvedSourcePath !== existing.sourcePath) {
+            throw new deps.BindingError('native reply file request identity conflicts with its admitted custody');
+          }
         }
       }
       return existing;

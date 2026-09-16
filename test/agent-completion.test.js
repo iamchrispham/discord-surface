@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { issueAgentAddress, encodeAgentMessage, KINDS } = require('../src/agent-message');
-const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
+const { SurfaceState, MESSAGE_STATES, READINESS, StateCorruptError } = require('../src/state');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { agentComplete, GATEWAY_CAPABILITIES } = require('../src/cli');
 const { agentCompletionCommand, claudeEvent, codexPrompt } = require('../src/native');
@@ -176,6 +176,30 @@ test('agent completion refuses native file custody admitted before reply record'
       generation: owners.target.generation, stateDir: dir, sourcePath: sourceFile, caption: 'file result' });
     assert.throws(() => state.completeAgentHandledWithoutPost({ messageId, provider: owners.target.provider,
       nativeId: owners.target.nativeId, generation: owners.target.generation }), /native reply file custody/);
+    assert.equal(state.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('agent completion fails closed on malformed native file custody', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-handled-native-file-corrupt-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    const owners = bindAgentOwners(state, dir);
+    const packet = { id: 'a2-corrupt-file-result', kind: KINDS.RESULT, source: owners.source, target: owners.target,
+      replyTo: 'remote-request', text: 'Corrupt file result.' };
+    const messageId = 'a2-corrupt-file-result-event';
+    assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.target.guildId, channelId: owners.target.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
+    assert.equal(state.claimDispatch(messageId).claimed, true);
+    state.markSubmitted(messageId);
+    recordNativeAcknowledgment(state, { provider: owners.target.provider, messageId,
+      nativeId: owners.target.nativeId, generation: owners.target.generation });
+    state.receipt(messageId, 'native-reply-file-preparation', {
+      journal: 'native-reply-file-v1', phase: 'not-a-native-file-phase', preparationId: 'malformed-preparation'
+    });
+    assert.throws(() => state.completeAgentHandledWithoutPost({ messageId, provider: owners.target.provider,
+      nativeId: owners.target.nativeId, generation: owners.target.generation }), StateCorruptError);
     assert.equal(state.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

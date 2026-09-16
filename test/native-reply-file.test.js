@@ -102,6 +102,31 @@ test('Codex and Claude file replies recover submitted and uncertain dispatch', a
   }
 });
 
+test('native reply retries preserve staged custody across source availability changes', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-retry-source-${provider}`;
+    const source = path.join(f.dir, 'answer.bin');
+    const alternate = path.join(f.dir, 'alternate', 'answer.bin');
+    const unavailable = path.join(f.dir, 'missing', 'answer.bin');
+    const bytes = Buffer.from('retry payload');
+    fs.writeFileSync(source, bytes);
+    submitted(f, id);
+    const input = { provider, messageId: id, nativeId: f.nativeId, generation: 1, stateDir: f.dir, caption: 'retry caption' };
+    const manifest = f.state.prepareNativeReplyFile({ ...input, sourcePath: source });
+
+    fs.mkdirSync(path.dirname(alternate), { recursive: true });
+    fs.writeFileSync(alternate, bytes);
+    assert.deepEqual(f.state.prepareNativeReplyFile({ ...input, sourcePath: alternate }), manifest);
+
+    fs.unlinkSync(source);
+    assert.deepEqual(f.state.prepareNativeReplyFile({ ...input, sourcePath: source }), manifest);
+
+    assert.throws(() => f.state.prepareNativeReplyFile({ ...input, sourcePath: unavailable }), /identity conflicts/);
+    assert.equal(f.state.nativeReplyFilePreparation(id).phase, 'admitted');
+  });
+});
+
 test('file replies keep the caption on their attachment part', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
     const f = fixture(t2, provider);
@@ -121,19 +146,45 @@ test('file replies keep the caption on their attachment part', async t => {
   });
 });
 
-test('uncertain file preparation persists native acknowledgment before delivery retry', t => {
-  const f = fixture(t);
-  const id = 'native-file-uncertain-ack';
-  const source = path.join(f.dir, 'uncertain.bin');
-  fs.writeFileSync(source, Buffer.from('uncertain payload'));
-  submitted(f, id, MESSAGE_STATES.UNCERTAIN);
-  const manifest = f.state.prepareNativeReplyFile({ provider: 'codex', messageId: id, nativeId: f.nativeId, generation: 1,
-    stateDir: f.dir, sourcePath: source, caption: 'uncertain caption' });
-  assert.equal(f.state.hasNativeAcknowledgment(f.state.getMessage(id)), true);
-  const reopened = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
-  assert.throws(() => reopened.reconcileUncertain(id, 'not_submitted'), /native acknowledgment/);
-  reopened.close();
-  assert.equal(f.state.nativeReplyFilePreparation(id).preparationId, manifest.preparationId);
+test('uncertain file preparation persists native acknowledgment before delivery retry', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-uncertain-ack-${provider}`;
+    const source = path.join(f.dir, 'uncertain.bin');
+    fs.writeFileSync(source, Buffer.from('uncertain payload'));
+    submitted(f, id, MESSAGE_STATES.UNCERTAIN);
+    const other = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+    const originalRename = fs.renameSync;
+    let observedDuringStaging = false;
+    try {
+      fs.renameSync = (from, to) => {
+        const result = originalRename(from, to);
+        if (!observedDuringStaging && String(to).includes(`${path.sep}.direct-post-files${path.sep}`)) {
+          observedDuringStaging = true;
+          const observed = other.getMessage(id);
+          assert.equal(other.hasNativeAcknowledgment(observed), true);
+          assert.throws(() => other.reconcileUncertain(id, 'not_submitted'), /native acknowledgment/);
+          assert.equal(other.claimDispatch(id).claimed, false);
+        }
+        return result;
+      };
+      const manifest = f.state.prepareNativeReplyFile({ provider, messageId: id, nativeId: f.nativeId, generation: 1,
+        stateDir: f.dir, sourcePath: source, caption: 'uncertain caption' });
+      assert.equal(observedDuringStaging, true);
+      assert.equal(manifest.phase, 'admitted');
+      assert.equal(f.state.nativeReplyFilePreparation(id).phase, 'admitted');
+      f.state.close();
+      const reopened = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+      assert.equal(reopened.nativeReplyFilePreparation(id).preparationId, manifest.preparationId);
+      assert.equal(reopened.nativeReplyFilePreparation(id).phase, 'admitted');
+      assert.throws(() => reopened.reconcileUncertain(id, 'not_submitted'), /native acknowledgment/);
+      assert.equal(reopened.claimDispatch(id).claimed, false);
+      reopened.close();
+    } finally {
+      fs.renameSync = originalRename;
+      other.close();
+    }
+  });
 });
 
 test('native file custody survives not-sent reconciliation and named cleanup only', t => {
@@ -373,4 +424,129 @@ test('public native-reply command accepts Claude alias and records file custody'
     '--message-id', id, '--preparation-id', manifest.preparationId], { encoding: 'utf8' });
   assert.equal(cleanup.status, 0, cleanup.stderr);
   assert.match(cleanup.stdout, /"phase": "released"/);
+});
+
+function nativeFileFinalRegressionInput(f, messageId, sourcePath, caption) {
+  return {
+    provider: f.provider,
+    messageId,
+    nativeId: f.nativeId,
+    generation: 1,
+    stateDir: f.dir,
+    sourcePath,
+    caption
+  };
+}
+
+test('native reply rejects a competing text reply before reservation', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-final-pre-reservation-${provider}`;
+    const source = path.join(f.dir, 'answer.bin');
+    fs.writeFileSync(source, Buffer.from('payload'));
+    submitted(f, id);
+    const input = nativeFileFinalRegressionInput(f, id, source, 'caption A');
+    const other = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+    const originalOwnerIdentity = f.state.directPostOwnerIdentity;
+    const ownerIdentity = originalOwnerIdentity.bind(f.state);
+    f.state.directPostOwnerIdentity = pid => {
+      const identity = ownerIdentity(pid);
+      other.recordNativeReply({ ...input, text: 'competing text' });
+      return identity;
+    };
+    try {
+      assert.throws(() => f.state.prepareNativeReplyFile(input), /reply is not accepted in state reply_ready/);
+    } finally {
+      f.state.directPostOwnerIdentity = originalOwnerIdentity;
+      other.close();
+    }
+    assert.equal(f.state.activeFilePreparationCount(), 0);
+    assert.equal(f.state.nativeReplyFilePreparation(id), null);
+    assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.REPLY_READY);
+  });
+});
+
+test('native reply authorization loss during final staging retains ACK and custody', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-final-auth-loss-${provider}`;
+    const source = path.join(f.dir, 'answer.bin');
+    fs.writeFileSync(source, Buffer.from('payload'));
+    submitted(f, id, MESSAGE_STATES.UNCERTAIN);
+    const input = nativeFileFinalRegressionInput(f, id, source, 'caption A');
+    const other = new SurfaceState(path.join(f.dir, 'surface.sqlite'));
+    const originalRename = fs.renameSync;
+    let authorizationChanged = false;
+    try {
+      fs.renameSync = (from, to) => {
+        const result = originalRename(from, to);
+        if (!authorizationChanged && String(to).includes(`${path.sep}.direct-post-files${path.sep}`)) {
+          authorizationChanged = true;
+          other.setConfig({ operatorId: 'different-operator', guildId: 'guild', secretFile: path.join(f.dir, 'discord.env') });
+        }
+        return result;
+      };
+      assert.throws(() => f.state.prepareNativeReplyFile(input), /authorization is no longer valid/);
+      assert.equal(authorizationChanged, true);
+      const pending = f.state.nativeReplyFilePreparation(id);
+      assert.equal(pending.phase, 'preparing');
+      assert.equal(f.state.activeFilePreparationCount(), 1);
+      assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.UNCERTAIN);
+      assert.equal(f.state.hasNativeAcknowledgment(f.state.getMessage(id)), true);
+      assert(fs.existsSync(pending.stagedPath));
+      assert.throws(() => f.state.reconcileUncertain(id, 'not_submitted'), /native acknowledgment prevents retrying delivery/);
+      assert.equal(f.state.getMessage(id).state, MESSAGE_STATES.UNCERTAIN);
+    } finally {
+      fs.renameSync = originalRename;
+      other.close();
+    }
+  });
+});
+
+test('native reply caption mismatch refuses and matching admitted caption retries', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-final-caption-${provider}`;
+    const source = path.join(f.dir, 'answer.bin');
+    fs.writeFileSync(source, Buffer.from('payload'));
+    submitted(f, id);
+    const input = nativeFileFinalRegressionInput(f, id, source, 'caption A');
+    const manifest = f.state.prepareNativeReplyFile(input);
+    assert.throws(() => f.state.recordNativeReply({ ...input, text: 'caption B',
+      parts: ['caption B'], fileManifest: manifest }), /not admitted for this reply/);
+    assert.equal(f.state.listReplyParts(id).length, 0);
+    assert.equal(f.state.nativeReplyFilePreparation(id).phase, 'admitted');
+    const recorded = f.state.recordNativeReply({ ...input, text: 'caption A',
+      parts: ['caption A'], fileManifest: manifest });
+    assert.equal(recorded.message.state, MESSAGE_STATES.REPLY_READY);
+    assert.equal(f.state.listReplyParts(id).length, 1);
+    assert.equal(f.state.listReplyParts(id)[0].content, 'caption A');
+    assert.deepEqual(f.state.listReplyParts(id)[0].fileManifest, manifest);
+  });
+});
+
+test('native reply preparation retry exposes its existing preparation ID', async t => {
+  for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
+    const f = fixture(t2, provider);
+    const id = `native-file-final-preparing-retry-${provider}`;
+    const source = path.join(f.dir, 'answer.bin');
+    fs.writeFileSync(source, Buffer.from('payload'));
+    submitted(f, id);
+    const preparationId = `88888888-8888-4888-8888-${provider === 'codex' ? '888888888888' : '999999999999'}`;
+    const stagedPath = path.join(f.dir, '.direct-post-files', `${preparationId}.bin`);
+    f.state.receipt(id, 'native-reply-file-preparation', {
+      journal: 'native-reply-file-v1',
+      phase: 'preparing',
+      preparationId,
+      messageId: id,
+      stagedPath,
+      ownerPid: process.pid,
+      ownerStartTime: null,
+      ownerCommand: null
+    });
+    assert.throws(() => f.state.prepareNativeReplyFile(nativeFileFinalRegressionInput(f, id, source, 'caption A')), error =>
+      /already in progress/.test(error.message) && error.message.includes(preparationId));
+    assert.equal(f.state.nativeReplyFilePreparation(id).preparationId, preparationId);
+    assert.equal(f.state.activeFilePreparationCount(), 1);
+  });
 });

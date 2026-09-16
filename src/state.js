@@ -173,7 +173,6 @@ const agentCompletionHandlers = createAgentCompletionHandlers({
   MESSAGE_STATES,
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
-  NATIVE_REPLY_FILE_PREPARATION,
   NATIVE_REPLY_FILE_PHASES,
   assertText,
   assertProvider,
