@@ -70,6 +70,7 @@ export interface DirectPostReceiptRow {
 
 export interface DirectPostState {
   db: DirectPostDatabase;
+  activeFilePreparationCount?(): number;
   transaction<T>(operation: () => T): T;
   directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
   directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null): boolean;
@@ -669,8 +670,9 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
           assertFileIdentity(existing.detail, seed, BindingError);
           return existing.detail as unknown as DirectPostFilePreparation;
         }
-        const active = [...latestByPreparation.values()]
-          .filter(row => row.detail.phase !== DIRECT_POST_FILE_PHASES.RELEASED).length;
+        const active = typeof state.activeFilePreparationCount === 'function'
+          ? state.activeFilePreparationCount()
+          : [...latestByPreparation.values()].filter(row => row.detail.phase !== DIRECT_POST_FILE_PHASES.RELEASED).length;
         if (active >= DIRECT_POST_FILE_LIMITS.maxReservations) {
           const held = [...latestByPreparation.values()]
             .filter(row => row.detail.phase !== DIRECT_POST_FILE_PHASES.RELEASED)

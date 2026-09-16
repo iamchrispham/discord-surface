@@ -15,7 +15,7 @@ const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, TRANSPORT
 const { COURIER_OUTCOMES, COURIER_RESULT_STATUSES, isCourierOriginAllowed } = require('./state/courier-route');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
-const { DIRECT_POST_FILE_LIMITS } = require('./direct-post-file');
+const { DIRECT_POST_FILE_LIMITS, readDirectPostFileSnapshot } = require('./direct-post-file');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
@@ -849,7 +849,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       if (signal?.aborted) return { ...result, message: state.markReplyFailure(ready.message.id, new Error('reply delivery stopped'), true, part.index) };
       try {
         state.assertMessageCurrent(ready.message.id, 'reply-send');
-        if (!part.content.trim()) {
+        if (!part.content.trim() && !part.fileManifest) {
           const skipped = state.markReplyPartSkipped(ready.message.id, part.index);
           if (skipped.state === 'replied') return { ...result, message: skipped };
           continue;
@@ -1516,12 +1516,17 @@ class DiscordGateway {
     const channel = message.channel || await this.client.channels?.fetch?.(message.deliveryChannelId || message.channelId);
     if (!channel?.send) throw new Error('Discord reply channel is unavailable');
     this.state.assertMessageCurrent(reply.id, 'reply-send');
+    const fileManifest = reply.replyPart?.fileManifest || null;
+    const files = fileManifest
+      ? [{ attachment: readDirectPostFileSnapshot(fileManifest), name: fileManifest.filename }]
+      : undefined;
     try {
       return await channel.send({
         content: reply.replyText,
         nonce: reply.replyNonce,
         enforceNonce: true,
-        allowedMentions: { parse: [] }
+        allowedMentions: { parse: [] },
+        ...(files ? { files } : {})
       });
     } catch (error) {
       const definitiveThreadRejection = isThreadDelivery &&

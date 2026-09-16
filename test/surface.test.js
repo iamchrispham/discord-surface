@@ -2781,7 +2781,7 @@ test('simulated: v1.4 migration adds empty attachment metadata to legacy message
 
   const migrated = new SurfaceState(db);
   assert.deepEqual(migrated.getMessage('legacy-text').attachments, []);
-  assert.equal(migrated.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.7');
+  assert.equal(migrated.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.8');
   migrated.close();
 });
 
@@ -4682,7 +4682,7 @@ esac
   fs.writeFileSync(beacon, 'beacon', { mode: 0o600 });
   const transcript = path.join(sessionRoot, `rollout-test-${successorNativeId}.jsonl`);
   fs.writeFileSync(transcript, `${JSON.stringify({ type: 'session_meta', payload: { id: successorNativeId } })}\n`, { mode: 0o600 });
-  const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: dir, stdio: 'ignore' });
+  const worker = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(124), 7000)'], { cwd: dir, stdio: 'ignore' });
   const workerManifest = path.join(workersDir, `${successorOwner}.json`);
   const childStarted = path.join(dir, 'child-started');
   const childRelease = path.join(dir, 'child-release');
@@ -4692,16 +4692,28 @@ esac
 const fs = require('node:fs');
 const waiter = new Int32Array(new SharedArrayBuffer(4));
 fs.writeFileSync(process.env.DISCORD_SURFACE_GATE_CHILD_STARTED, String(process.pid));
-while (!fs.existsSync(process.env.DISCORD_SURFACE_GATE_CHILD_RELEASE)) Atomics.wait(waiter, 0, 0, 25);
+const deadline = Date.now() + 5000;
+while (!fs.existsSync(process.env.DISCORD_SURFACE_GATE_CHILD_RELEASE)) {
+  if (Date.now() >= deadline) process.exit(124);
+  Atomics.wait(waiter, 0, 0, 25);
+}
 fs.writeFileSync(process.env.DISCORD_SURFACE_GATE_CHILD_DONE, 'done');
 `, { mode: 0o700 });
   const contenderScript = `
-import fcntl, os, sys
+import fcntl, os, signal, sys
+signal.alarm(5)
 fd = os.open(sys.argv[1], os.O_RDONLY)
 fcntl.flock(fd, fcntl.LOCK_EX)
 with open(sys.argv[2], 'w', encoding='utf-8') as output:
     output.write('acquired')
 `;
+  const boundedGate = path.join(dir, 'bounded-gate.py');
+  fs.writeFileSync(boundedGate, `import runpy, signal, sys
+signal.alarm(7)
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+`);
+  let gateStderr = '';
   let gate;
   let contender;
   let childPid = null;
@@ -4711,7 +4723,7 @@ with open(sys.argv[2], 'w', encoding='utf-8') as output:
       sessionId: successorNativeId, fullUUID: successorNativeId, pid: worker.pid,
       processStartTime: processStartTime(worker.pid), generation: 1
     }), { mode: 0o600 });
-    gate = spawn(process.env.DISCORD_SURFACE_PYTHON || 'python3', [path.resolve(__dirname, '../src/conductor-lock-gate.py'),
+    gate = spawn(process.env.DISCORD_SURFACE_PYTHON || 'python3', [boundedGate, path.resolve(__dirname, '../src/conductor-lock-gate.py'),
       '--lock-script', lockScript, '--repo', repo, '--repo-key', repoKey, '--provider', 'codex',
       '--conductor-id', conductorId, '--channel-id', 'gate-channel', '--from-native-id', oldNativeId,
       '--from-generation', '1', '--from-workspace', dir, '--native-id', successorNativeId,
@@ -4725,9 +4737,16 @@ with open(sys.argv[2], 'w', encoding='utf-8') as output:
         DISCORD_SURFACE_GATE_CHILD_STARTED: childStarted,
         DISCORD_SURFACE_GATE_CHILD_RELEASE: childRelease,
         DISCORD_SURFACE_GATE_CHILD_DONE: childDone
-      }, stdio: 'ignore'
+      }, stdio: ['ignore', 'ignore', 'pipe']
     });
-    await waitForFile(childStarted, 2000);
+    gate.stderr.setEncoding('utf8');
+    gate.stderr.on('data', chunk => { gateStderr += chunk; });
+    try {
+      await waitForFile(childStarted, 2000);
+    } catch (error) {
+      error.message += `; gate stderr: ${gateStderr}`;
+      throw error;
+    }
     childPid = Number(fs.readFileSync(childStarted, 'utf8'));
     assert.ok(Number.isInteger(childPid) && childPid > 0);
     gate.kill('SIGTERM');
@@ -4748,6 +4767,9 @@ with open(sys.argv[2], 'w', encoding='utf-8') as output:
     fs.writeFileSync(childRelease, 'release');
     if (gate?.exitCode === null) gate.kill('SIGTERM');
     if (contender?.exitCode === null) contender.kill('SIGTERM');
+    if (gate?.exitCode === null) await waitForChild(gate).catch(() => {});
+    if (contender?.exitCode === null) await waitForChild(contender).catch(() => {});
+    if (!childPid && fs.existsSync(childStarted)) childPid = Number(fs.readFileSync(childStarted, 'utf8'));
     if (childPid) {
       try { process.kill(childPid, 'SIGTERM'); } catch {}
       await waitForProcessGone(childPid).catch(() => {});
