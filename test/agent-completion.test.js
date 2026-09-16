@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { issueAgentAddress, encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { SurfaceState, MESSAGE_STATES, READINESS, StateCorruptError } = require('../src/state');
-const { recordNativeAcknowledgment } = require('../src/acknowledgment');
+const { acknowledgmentCommand, recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { agentComplete, GATEWAY_CAPABILITIES } = require('../src/cli');
 const { agentCompletionCommand, claudeEvent, codexPrompt } = require('../src/native');
 const { runDirectPost } = require('../src/direct-post');
@@ -31,6 +31,17 @@ test('native owners receive the exact no-post completion command', () => {
   const event = claudeEvent(message, completion);
   assert.match(event.content, new RegExp(instruction.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.deepEqual(event.completion, completion);
+
+  const acknowledgment = acknowledgmentCommand(message, '/custom/state with spaces/surface.sqlite', '/custom/cli=entry.js');
+  const prompt = codexPrompt(message, acknowledgment, completion);
+  const commands = [...prompt.matchAll(/exact argv: (\[.*\])/g)].map(match => JSON.parse(match[1]));
+  assert.deepEqual(commands, [acknowledgment, completion]);
+  assert.ok(prompt.includes(`Final reply: start with [[discord-surface:${message.id}]] on its own line.`));
+  assert.match(prompt, /ACK means received, not completed/);
+  assert.match(prompt, /Choose exactly one:/);
+  assert.match(prompt, /If fully handled without a Discord reply, run once/);
+  assert.match(prompt, /Then no normal final response/);
+  assert.ok(prompt.indexOf(JSON.stringify(acknowledgment)) < prompt.indexOf(message.agentMessage.text));
 });
 
 test('agent retry preserves a predecessor journal without inventing completion evidence', async () => {

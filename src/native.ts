@@ -475,7 +475,7 @@ function noPostWatcherNoticeInstruction(completion: readonly string[] | null | u
 
 function noPostCompletionInstruction(completion: readonly string[] | null | undefined): string | null {
   if (!completion) return null;
-  return `If this agent packet is fully handled without a Discord reply, run this exact command once, preserving argument boundaries: ${JSON.stringify(completion)}. Do not produce a normal final response after running it.`;
+  return `If fully handled without a Discord reply, run once with exact argv: ${JSON.stringify(completion)}. Then no normal final response.`;
 }
 
 export function codexPrompt(
@@ -492,7 +492,7 @@ export function codexPrompt(
     handlingInstruction = 'Handle the saved canonical decision continuation using its exact identity and canonical answer. Preserve this session. Do not start another session or hand this work to another agent.';
   } else if (message.agentMessage) {
     handlingInstruction = hasCompletionPath
-      ? 'Handle the authenticated agent packet in this session. If a Discord reply is needed, produce the normal final response. If it is fully handled without a reply, use the exact no-post completion command below instead. Preserve this session.'
+      ? 'Handle this authenticated agent packet in this session. Choose exactly one: normal final for a Discord reply, or the no-post command below when fully handled without one.'
       : 'Handle the agent context in your normal final response. Preserve this session.';
   } else {
     handlingInstruction = 'Answer the user request in your normal final response. Do not start another session or hand this work to another agent.';
@@ -500,15 +500,15 @@ export function codexPrompt(
   const prompt = [
     isDecision
       ? `This is a saved canonical decision continuation for native session ${message.nativeId}.`
-      : `This is an inbound Discord message for native session ${message.nativeId}.`,
-    `Transport message ID: ${message.id}. Ownership generation: ${message.generation}.`,
-    `Begin the final response with the exact marker ${marker} on its own line. The transport removes that marker before sending the reply.`,
+      : `Discord message for native session ${message.nativeId}.`,
+    `Message ID: ${message.id}. Ownership generation: ${message.generation}.`,
+    `Final reply: start with ${marker} on its own line. Transport removes it.`,
     handlingInstruction,
     ...(completionInstruction ? [completionInstruction] : []),
     '',
     messageRequest(message)
   ];
-  if (acknowledgment) prompt.splice(3, 0, `At pickup, acknowledge this exact message by running this command once, preserving argument boundaries: ${JSON.stringify(acknowledgment)}. Then handle the request normally. Acknowledgment means received, not completed.`);
+  if (acknowledgment) prompt.splice(3, 0, `At pickup, acknowledge this exact message once with exact argv: ${JSON.stringify(acknowledgment)}. ACK means received, not completed. Then handle the request.`);
   const attachments = attachmentPrompt(message);
   if (attachments) prompt.push('', attachments);
   return prompt.join('\n');
