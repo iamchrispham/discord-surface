@@ -149,6 +149,23 @@ does not register a route,
 intercept a Desktop session, or prove live Discord and native qualification.
 Those checks remain required before operator activation.
 
+The courier's trusted native `PreToolUse` hook must run the installed guard
+before `mcp__codex_app__send_message_to_thread`:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js courier-guard \
+  --db /absolute/path/to/surface.sqlite --courier-route-id ROUTE_ID
+```
+
+The guard reads the native hook event from stdin. It requires the registered
+courier session and workspace, the fixed recipient and exact prompt from one
+persisted attempt, current binding ownership and an unacknowledged message.
+It atomically records one forwarding claim before allowing the tool. Refusal
+returns a native deny decision and exit 2. Startup failures also exit 2.
+A claim survives restart or an unknown host-call outcome and cannot be retried.
+It neither acknowledges the message nor completes its reply obligation.
+Installing this command does not trust a project hook or activate a route.
+
 `status` includes a `gateway` process object. Its `state` is `running` only when the runtime PID file and the matching `ps` command identify this adapter and state directory. `stopped` means no PID file exists, `stale` means the recorded process is gone, and `unknown` means the PID file or owner identity cannot be verified. A `running` process reports `connection: unverified-live`; it does not claim a Discord connection.
 
 The Codex provider queues `codex queue --thread <UUID>` in the bound workspace. It observes only the matching session JSONL file and does not select a task by name, newest activity, directory, or process ID. The runtime never adds approval bypass flags.

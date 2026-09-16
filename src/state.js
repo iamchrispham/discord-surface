@@ -1586,6 +1586,10 @@ class SurfaceState {
     return courierRouteHandlers.authorizeCourierAttempt(this, ...args);
   }
 
+  claimCourierForward(...args) {
+    return courierRouteHandlers.claimCourierForward(this, ...args);
+  }
+
   recordCourierOutcome(...args) {
     return courierRouteHandlers.recordCourierOutcome(this, ...args);
   }
