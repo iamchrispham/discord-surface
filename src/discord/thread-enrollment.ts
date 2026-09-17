@@ -62,7 +62,7 @@ interface ThreadGateway {
   fetchHistoryInjected: boolean;
   isCurrentLifecycle(epoch: number): boolean;
   isCurrentBinding(binding: ThreadBinding): boolean;
-  recoverTransport?: (reason: string, epoch: number, channelIds: Set<string>) => Promise<unknown>;
+  recoverTransport?: (reason: string, epoch: number, channelIds: Set<string>, scopeRetryDepth?: number, recoveryDeadline?: number | null) => Promise<unknown>;
   fetchHistory(channel: ThreadChannel, options: { limit: number; after?: string; signal: AbortSignal }): Promise<unknown>;
   historyMessages(value: unknown): HistoryMessage[];
   normalizeFetchedMessage(message: HistoryMessage, channel: ThreadChannel): unknown;
@@ -275,7 +275,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
           isPreAdoptionRetryableThread(currentEnrollment)
         );
         if (retryable && gateway.recoverTransport) {
-          void gateway.recoverTransport('thread boundary retry', epoch, new Set([enrollment.threadId])).catch(() => {});
+          void gateway.recoverTransport('thread boundary retry', epoch, new Set([enrollment.threadId]), 0, deadline).catch(() => {});
         }
         return false;
       }
