@@ -990,7 +990,12 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
     const durable = state.getMessage(message?.id) || message;
-    const selected = selectedCourierRoute(durable) ? { routeId: courierRoute.routeId } : null;
+    const courierAttempt = state.getCourierAttempt?.(durable.id);
+    const retiredCourierAttempt = Boolean(courierAttempt &&
+      state.hasRetiredCourierAttempt?.(durable.id, courierAttempt.attempt.receiptId));
+    const selected = !retiredCourierAttempt && selectedCourierRoute(durable)
+      ? { routeId: courierRoute.routeId }
+      : null;
     return enqueueOwnerWork(message, signal, (onNativeSettled, ownerEntry) => {
       let settleHandoff;
       let rejectHandoff;
