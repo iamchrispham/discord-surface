@@ -19,6 +19,11 @@ function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function canonicalWorkspace(value: unknown): string | null {
+  if (typeof value !== 'string' || !path.isAbsolute(value)) return null;
+  return path.normalize(value);
+}
+
 function configuredSessionRoot(): string {
   return path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
 }
@@ -57,8 +62,11 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
   const prompt = deps.assertText(input.prompt, 'prompt', 100000);
   return state.transaction(() => {
     const route = getRoute(deps, state, routeId);
+    const eventWorkspace = canonicalWorkspace(event.cwd);
+    const routeWorkspace = route ? canonicalWorkspace(route.courier.workspace) : null;
     if (!route || route.status !== COURIER_ROUTE_STATES.ACTIVE ||
-        event.session_id !== route.courier.nativeId || event.cwd !== route.courier.workspace ||
+        event.session_id !== route.courier.nativeId || eventWorkspace === null || routeWorkspace === null ||
+        eventWorkspace !== routeWorkspace ||
         !transcriptIsInSessionRoot(event.transcript_path, route.courier.sessionRoot)) {
       throw new deps.BindingError('courier hook caller or route is not current');
     }

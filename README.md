@@ -153,7 +153,7 @@ The courier's trusted native `PreToolUse` hook must run the installed guard
 before `mcp__codex_app__send_message_to_thread`:
 
 ```sh
-sh /absolute/path/to/discord-surface/src/courier-guard.sh \
+/bin/sh /absolute/path/to/discord-surface/src/courier-guard.sh \
   --disable-warning=ExperimentalWarning \
   --db /absolute/path/to/surface.sqlite --courier-route-id ROUTE_ID
 ```

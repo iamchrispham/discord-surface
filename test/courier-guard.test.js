@@ -18,6 +18,9 @@ function fixture(t, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'courier-guard-'));
   const sessionRoot = path.join(dir, 'sessions');
   const routeSessionRoot = Object.hasOwn(options, 'routeSessionRoot') ? options.routeSessionRoot : sessionRoot;
+  const routeWorkspace = Object.hasOwn(options, 'routeWorkspace')
+    ? (typeof options.routeWorkspace === 'function' ? options.routeWorkspace(dir) : options.routeWorkspace)
+    : dir;
   fs.mkdirSync(sessionRoot);
   const db = path.join(dir, 'surface.sqlite');
   let state = new SurfaceState(db);
@@ -30,7 +33,7 @@ function fixture(t, options = {}) {
   const target = { guildId: '100', channelId: '2000', provider: 'codex', nativeId: PARENT, generation: binding.generation };
   const route = state.registerCourierRoute({ routeId: 'guard-route', routeGeneration: 1,
     guildId: '100', parentChannelId: '1000', deliveryChannelId: '2000', target,
-    courier: { provider: 'codex', nativeId: COURIER, workspace: dir, sessionRoot: routeSessionRoot, recipientThreadId: PARENT, hostId }
+    courier: { provider: 'codex', nativeId: COURIER, workspace: routeWorkspace, sessionRoot: routeSessionRoot, recipientThreadId: PARENT, hostId }
   });
   const packet = { id: 'request-guard', kind: KINDS.REQUEST,
     source: { ...target, provider: 'claude', channelId: '3000', nativeId: '33333333-3333-3333-3333-333333333333' },
@@ -359,7 +362,7 @@ test('courier guard help prints usage without consuming hook input', t => {
   assert.match(result.stdout, /Usage: discord-surface <command> \[options\]/);
 });
 
-test('shell hook wrapper blocks missing CLI and unavailable Node', t => {
+test('shell hook wrapper uses pinned Node instead of inherited PATH', t => {
   const f = fixture(t);
   const isolated = path.join(f.dir, 'wrapper-only');
   fs.mkdirSync(isolated);
@@ -371,22 +374,25 @@ test('shell hook wrapper blocks missing CLI and unavailable Node', t => {
   assert.equal(result.status, 2, result.stderr);
   assert.match(result.stderr, /CLI entrypoint is missing/);
 
-  result = spawnSync('/bin/sh', [WRAPPER, '--db', f.db, '--courier-route-id', f.route.routeId], {
-    input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000,
-    env: { ...process.env, PATH: path.join(f.dir, 'no-node') }
-  });
-  assert.equal(result.status, 2, result.stderr);
-  assert.match(result.stderr, /node runtime is unavailable/);
-
   const bin = path.join(f.dir, 'bin');
   fs.mkdirSync(bin);
-  fs.writeFileSync(path.join(bin, 'node'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, 'node'), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
   result = spawnSync('/bin/sh', [WRAPPER, '--db', f.db, '--courier-route-id', f.route.routeId], {
     input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000,
     env: { ...process.env, PATH: bin }
   });
-  assert.equal(result.status, 2, result.stderr);
-  assert.match(result.stderr, /launcher failed with exit 1/);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, '');
+  assert.equal(f.claims().length, 1);
+});
+
+test('courier forwarding canonicalizes non-normalized workspace paths', t => {
+  const f = fixture(t, { routeWorkspace: dir => path.join(dir, 'nested', '..') });
+  assert.equal(f.route.courier.workspace, f.dir);
+  const result = invoke(f);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(f.claims().length, 1);
 });
 
 test('guard refusal holds custody before or after queue acceptance across restart', t => {

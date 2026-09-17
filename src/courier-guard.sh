@@ -16,7 +16,8 @@ if [ ! -f "$cli" ]; then
   exit 2
 fi
 
-if ! command -v node >/dev/null 2>&1; then
+node_bin=/usr/local/bin/node
+if [ ! -x "$node_bin" ]; then
   printf '%s\n' 'discord-surface courier guard: node runtime is unavailable' >&2
   exit 2
 fi
@@ -25,7 +26,7 @@ if [ "${1-}" = '--disable-warning=ExperimentalWarning' ]; then
   shift
 fi
 
-node --disable-warning=ExperimentalWarning "$cli" courier-guard "$@"
+"$node_bin" --disable-warning=ExperimentalWarning "$cli" courier-guard "$@"
 status=$?
 if [ "$status" -eq 0 ] || [ "$status" -eq 2 ]; then
   exit "$status"

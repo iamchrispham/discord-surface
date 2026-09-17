@@ -1,6 +1,12 @@
 const fs = require('node:fs');
+const path = require('node:path');
 
 const MAX_HOOK_BYTES = 1024 * 1024;
+
+function canonicalWorkspace(value) {
+  if (typeof value !== 'string' || !path.isAbsolute(value)) return null;
+  return path.normalize(value);
+}
 
 function persistGuardRefusal(state, routeId, event, reason) {
   if (!state || typeof routeId !== 'string' || !event || typeof event !== 'object') return false;
@@ -24,7 +30,10 @@ function persistGuardRefusal(state, routeId, event, reason) {
     try { detail = JSON.parse(row.detail); } catch { return false; }
     const attemptId = detail?.attemptId;
     const messageId = String(row.discord_id);
-    if (typeof attemptId !== 'string' || detail?.courier?.workspace !== event.cwd) return false;
+    const attemptWorkspace = canonicalWorkspace(detail?.courier?.workspace);
+    const eventWorkspace = canonicalWorkspace(event.cwd);
+    if (typeof attemptId !== 'string' || attemptWorkspace === null || eventWorkspace === null ||
+        attemptWorkspace !== eventWorkspace) return false;
     if (state.hasRetiredCourierAttempt(messageId, Number(row.id))) return false;
     const outcome = state.getCourierAttempt(messageId, attemptId)?.outcome?.outcome;
     if (outcome && ![COURIER_OUTCOMES.SUBMITTED, COURIER_OUTCOMES.UNCERTAIN].includes(outcome)) return false;
