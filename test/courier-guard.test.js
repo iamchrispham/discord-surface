@@ -379,12 +379,24 @@ test('shell hook wrapper uses pinned Node instead of inherited PATH', t => {
   fs.writeFileSync(path.join(bin, 'node'), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
   result = spawnSync('/bin/sh', [WRAPPER, '--db', f.db, '--courier-route-id', f.route.routeId], {
     input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000,
-    env: { ...process.env, PATH: bin }
+    env: { ...process.env, PATH: bin, DISCORD_SURFACE_NODE: process.execPath }
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, '');
   assert.equal(result.stderr, '');
   assert.equal(f.claims().length, 1);
+});
+
+test('shell hook wrapper fails closed when the configured node override is not executable', t => {
+  const f = fixture(t);
+  const bogus = path.join(f.dir, 'missing-node');
+  const result = spawnSync('/bin/sh', [WRAPPER, '--db', f.db, '--courier-route-id', f.route.routeId], {
+    input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000,
+    env: { ...process.env, DISCORD_SURFACE_NODE: bogus }
+  });
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /configured node runtime is not executable/);
+  assert.equal(f.claims().length, 0);
 });
 
 test('courier forwarding canonicalizes non-normalized workspace paths', t => {
@@ -393,6 +405,26 @@ test('courier forwarding canonicalizes non-normalized workspace paths', t => {
   const result = invoke(f);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(f.claims().length, 1);
+});
+
+test('courier forwarding canonicalizes a trailing separator left after dot-segment resolution', t => {
+  const f = fixture(t, { routeWorkspace: dir => `${dir}${path.sep}nested${path.sep}..${path.sep}` });
+  assert.equal(f.route.courier.workspace, `${f.dir}${path.sep}nested${path.sep}..${path.sep}`);
+  const result = invoke(f);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(f.claims().length, 1);
+});
+
+test('a durable refusal for an unrelated reason still persists despite a trailing separator and dot segment in the registered workspace', t => {
+  const f = fixture(t, { routeWorkspace: dir => `${dir}${path.sep}nested${path.sep}..${path.sep}` });
+  const event = structuredClone(f.event);
+  event.transcript_path = path.join(path.dirname(event.transcript_path), '..', 'relocated', 'courier.jsonl');
+  denied(invoke(f, event), /caller or route is not current/);
+  assert.equal(f.claims().length, 0);
+  const attempt = f.state.getCourierAttempt('9000', f.claim.attempt.attemptId);
+  assert.equal(attempt.attempt.attemptId, f.claim.attempt.attemptId);
+  assert.equal(attempt.outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
+  assert.equal(f.state.getMessage('9000').state, 'accepted');
 });
 
 test('guard refusal holds custody before or after queue acceptance across restart', t => {

@@ -5,7 +5,11 @@ const MAX_HOOK_BYTES = 1024 * 1024;
 
 function canonicalWorkspace(value) {
   if (typeof value !== 'string' || !path.isAbsolute(value)) return null;
-  return path.normalize(value);
+  const normalized = path.normalize(value);
+  const root = path.parse(normalized).root;
+  return normalized.length > root.length && normalized.endsWith(path.sep)
+    ? normalized.slice(0, -path.sep.length)
+    : normalized;
 }
 
 function persistGuardRefusal(state, routeId, event, reason) {

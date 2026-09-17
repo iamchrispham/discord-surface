@@ -21,7 +21,11 @@ function record(value: unknown): value is Record<string, unknown> {
 
 function canonicalWorkspace(value: unknown): string | null {
   if (typeof value !== 'string' || !path.isAbsolute(value)) return null;
-  return path.normalize(value);
+  const normalized = path.normalize(value);
+  const root = path.parse(normalized).root;
+  return normalized.length > root.length && normalized.endsWith(path.sep)
+    ? normalized.slice(0, -path.sep.length)
+    : normalized;
 }
 
 function configuredSessionRoot(): string {

@@ -16,10 +16,23 @@ if [ ! -f "$cli" ]; then
   exit 2
 fi
 
-node_bin=/usr/local/bin/node
-if [ ! -x "$node_bin" ]; then
-  printf '%s\n' 'discord-surface courier guard: node runtime is unavailable' >&2
-  exit 2
+node_bin=${DISCORD_SURFACE_NODE:-}
+if [ -n "$node_bin" ]; then
+  if [ ! -x "$node_bin" ]; then
+    printf '%s\n' "discord-surface courier guard: configured node runtime is not executable: $node_bin" >&2
+    exit 2
+  fi
+else
+  for candidate in /usr/local/bin/node /opt/homebrew/bin/node /usr/bin/node; do
+    if [ -x "$candidate" ]; then
+      node_bin=$candidate
+      break
+    fi
+  done
+  if [ -z "$node_bin" ]; then
+    printf '%s\n' 'discord-surface courier guard: node runtime is unavailable' >&2
+    exit 2
+  fi
 fi
 
 if [ "${1-}" = '--disable-warning=ExperimentalWarning' ]; then

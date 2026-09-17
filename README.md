@@ -158,6 +158,12 @@ before `mcp__codex_app__send_message_to_thread`:
   --db /absolute/path/to/surface.sqlite --courier-route-id ROUTE_ID
 ```
 
+The wrapper runs Node from a fixed absolute path rather than resolving `node`
+from the inherited `PATH`, so an earlier PATH entry cannot shim the guard. It
+tries `/usr/local/bin/node`, `/opt/homebrew/bin/node`, then `/usr/bin/node`.
+Set `DISCORD_SURFACE_NODE` to the absolute path of the intended `node`
+executable when none of those match, such as nvm-only installs.
+
 The guard reads the native hook event from stdin. It requires the registered
 courier session and workspace, the fixed recipient and exact prompt from one
 persisted attempt, current binding ownership and an unacknowledged message.
