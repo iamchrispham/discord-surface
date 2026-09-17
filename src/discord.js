@@ -2388,9 +2388,16 @@ class DiscordGateway {
       if (Date.now() >= deadline) {
         const watermark = this.state.getIntakeWatermark(binding.channelId);
         if (watermark && isRetryableFetchBoundary(watermark.state, watermark.detail)) {
-          this.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE,
-            watermark.detail || `${reason} intake unavailable`, binding);
-          failure ||= { ready: false, state: 'unavailable' };
+          const expired = this.state.markIntakeBoundary(binding.channelId, READINESS.UNAVAILABLE,
+            watermark.detail || `${reason} intake unavailable`, watermark.gap_from, watermark.gap_to,
+            binding, null, watermark, binding.readiness);
+          if (expired) failure ||= { ready: false, state: 'unavailable' };
+          else {
+            const currentBinding = this.state.getBinding(binding.channelId);
+            const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+            const currentState = classifyReadiness(currentBinding, currentBoundary);
+            failure ||= { ready: false, state: currentState || 'unavailable' };
+          }
         } else {
           await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline, watermark);
           failure ||= { ready: false, state: 'gap' };
@@ -2509,9 +2516,15 @@ class DiscordGateway {
         const kind = recoveryKind(error);
         if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
         if (kind === CODEX_VALIDATION_KINDS.DEADLINE && retryBoundary && !recoveryAttempted) {
-          this.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE,
-            retryBoundary.detail || `${reason} retry after Discord HTTP 503`, binding);
-          failure ||= { ready: false, state: 'unavailable' };
+          const expired = this.state.markIntakeBoundary(binding.channelId, READINESS.UNAVAILABLE,
+            retryBoundary.detail || `${reason} retry after Discord HTTP 503`, retryBoundary.gap_from, retryBoundary.gap_to,
+            binding, null, retryBoundary, ownedReadiness);
+          if (expired) failure ||= { ready: false, state: 'unavailable' };
+          else {
+            const current = adoptCurrentReadiness();
+            if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
+            failure ||= { ready: false, state: current?.state || 'unavailable' };
+          }
           continue;
         }
         if (kind === 'stale') {
@@ -2803,13 +2816,13 @@ class DiscordGateway {
         if (initialResult && initialResult.ready !== true && followupResult?.ready === true && scopeRetryDepth === 0) {
           return this.recoverTransport(reason, lifecycleEpoch, null, 1);
         }
-        if (initialResult && initialResult.ready !== true) return { ...initialResult, ...followupResult, ready: false };
+        if (initialResult && initialResult.ready !== true) return { ...followupResult, ...initialResult, ready: false };
         return followupResult || initialResult;
       }
       if (followupResult?.ready === true) {
         if (!initialResult || initialResult.ready === true || scopeIsReady(callerScope)) return followupResult;
         if (scopeRetryDepth === 0) return this.recoverTransport(reason, lifecycleEpoch, callerScope, 1);
-        return followupResult;
+        return initialResult;
       }
       if (scopeIsReady(callerScope)) {
         return { ready: true, state: 'ready' };
