@@ -13,7 +13,7 @@ const WRAPPER = path.resolve(__dirname, '../src/courier-guard.sh');
 const PARENT = '11111111-1111-1111-1111-111111111111';
 const COURIER = '22222222-2222-2222-2222-222222222222';
 
-function fixture(t, { agent = false, hostId = null } = {}) {
+function fixture(t, { agent = false, hostId = null, preAttemptReceipt = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'courier-guard-'));
   const sessionRoot = path.join(dir, 'sessions');
   fs.mkdirSync(sessionRoot);
@@ -39,6 +39,7 @@ function fixture(t, { agent = false, hostId = null } = {}) {
   }, { ready: true, expectedBinding: binding, agentToken: 'test-secret' });
   assert.equal(accepted.accepted, true);
   assert.equal(state.claimDispatch('9000').claimed, true);
+  if (preAttemptReceipt) state.receipt('9000', COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, {});
   const prompt = codexPrompt(state.getMessage('9000'));
   const claim = state.beginCourierAttempt('9000', { routeId: route.routeId, prompt });
   assert.equal(claim.accepted, true);
@@ -171,6 +172,36 @@ test('a reconciled non-submission denies a stale courier retry after parent redi
   assert.equal(f.state.claimDispatch('9000').claimed, true);
   denied(invoke(f), /queue submission was refused/);
   assert.equal(f.claims().length, 0);
+});
+
+test('a retired courier refusal preserves newer direct custody', t => {
+  for (const stateName of ['dispatching', 'submitted']) {
+    const f = fixture(t);
+    f.state.markUncertain('9000', new Error('queue outcome unknown'));
+    f.state.recordCourierOutcome('9000', f.claim.attempt.attemptId, COURIER_OUTCOMES.UNCERTAIN);
+    f.state.reconcileUncertain('9000', 'not_submitted');
+    assert.equal(f.state.claimDispatch('9000').claimed, true);
+    if (stateName === 'submitted') f.state.markSubmitted('9000');
+    denied(invoke(f), /queue submission was refused/);
+    assert.equal(f.state.getMessage('9000').state, stateName);
+    assert.equal(f.state.getCourierAttempt('9000', f.claim.attempt.attemptId).outcome.outcome, COURIER_OUTCOMES.UNCERTAIN);
+  }
+});
+
+test('foreign and older retirement receipts do not retire a courier attempt', t => {
+  const older = fixture(t, { preAttemptReceipt: true });
+  assert.equal(invoke(older).status, 0);
+  assert.equal(older.claims().length, 1);
+
+  const foreign = fixture(t);
+  const foreignAccepted = foreign.state.acceptDiscordMessage({
+    id: 'foreign-message', guildId: '100', channelId: '1000', authorId: 'operator', isBot: false,
+    attachments: [], content: 'foreign'
+  }, { ready: true, expectedBinding: foreign.binding });
+  assert.equal(foreignAccepted.accepted, true);
+  foreign.state.receipt('foreign-message', COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, {});
+  assert.equal(invoke(foreign).status, 0);
+  assert.equal(foreign.claims().length, 1);
 });
 
 test('two actual guard processes atomically claim at most one host call', async t => {

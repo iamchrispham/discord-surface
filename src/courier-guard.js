@@ -25,11 +25,7 @@ function persistGuardRefusal(state, routeId, event, reason) {
     const attemptId = detail?.attemptId;
     const messageId = String(row.discord_id);
     if (typeof attemptId !== 'string' || detail?.courier?.workspace !== event.cwd) return false;
-    if (state.db.prepare(`SELECT 1 FROM receipts WHERE kind=? AND discord_id=? AND id>?
-      AND json_extract(detail, '$.attemptId')=?
-      AND json_extract(detail, '$.reason')=? LIMIT 1`)
-      .get(COURIER_RECEIPT_KINDS.OUTCOME, messageId, Number(row.id), attemptId,
-        'uncertain-reconciled-not_submitted')) return false;
+    if (state.hasRetiredCourierAttempt(messageId, Number(row.id))) return false;
     const outcome = state.getCourierAttempt(messageId, attemptId)?.outcome?.outcome;
     if (outcome && ![COURIER_OUTCOMES.SUBMITTED, COURIER_OUTCOMES.UNCERTAIN].includes(outcome)) return false;
     if (state.db.prepare(`SELECT 1 FROM receipts WHERE kind=? AND discord_id=? AND id>?

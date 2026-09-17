@@ -1125,11 +1125,20 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       releaseAcknowledged(message.id);
       return existing;
     }
-    const work = enqueueOwnerWork(message, signal, onNativeSettled => {
+    const selected = selectedCourierRoute(message) ? { routeId: courierRoute.routeId } : null;
+    const work = enqueueOwnerWork(message, signal, (onNativeSettled, ownerEntry) => {
       let nativeSettled = false;
+      const refreshDispatchBlock = () => {
+        if (!selected || ownerEntry.dispatchBlocked) return;
+        const latest = state.getMessage(message.id);
+        if (latest?.state === MESSAGE_STATES.ACCEPTED && !hasCurrentNativeAcknowledgment(latest)) {
+          ownerEntry.dispatchBlocked = true;
+        }
+      };
       const settleNative = () => {
         if (nativeSettled) return;
         nativeSettled = true;
+        refreshDispatchBlock();
         onNativeSettled();
       };
       const work = startNativeWork(message.id, signal, async taskSignal => {

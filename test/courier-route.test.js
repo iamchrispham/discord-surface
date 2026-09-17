@@ -16,6 +16,7 @@ const {
   THREAD_STATES
 } = require('../src/state');
 const { createSurfaceConsumer } = require('../src/discord');
+const { persistGuardRefusal } = require('../src/courier-guard');
 
 const TOKEN = 'courier-route-fixture-token';
 const PARENT_NATIVE = '11111111-1111-1111-1111-111111111111';
@@ -491,6 +492,46 @@ test('restarted claimed courier custody becomes uncertain without resend', async
   const result = await consumerFor(f, { courierCalls }).processAccepted(reopened.getMessage(f.message.id));
   assert.equal(result.status, MESSAGE_STATES.UNCERTAIN);
   assert.equal(courierCalls.length, 0);
+});
+
+test('resumed courier refusal blocks later owner work', async t => {
+  const f = fixture(t);
+  const later = humanMessage(f, '9006', 'later parent work');
+  assert.equal(f.state.claimDispatch(f.message.id).claimed, true);
+  const claimed = f.state.beginCourierAttempt(f.message.id, preparedInput(f, f.message));
+  assert.equal(claimed.accepted, true);
+  f.state.recordCourierOutcome(f.message.id, claimed.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+  f.state.markSubmitted(f.message.id);
+
+  let release;
+  let started;
+  const observed = new Promise(resolve => { started = resolve; });
+  const parentCalls = [];
+  const consumer = consumerFor(f, {
+    parentCalls,
+    observe: async message => {
+      assert.equal(message.id, f.message.id);
+      started();
+      return new Promise(resolve => { release = resolve; });
+    }
+  });
+  const resumed = consumer.resumeSubmitted(f.state.getMessage(f.message.id));
+  await observed;
+  const queued = consumer.processAccepted(later);
+  const prompt = preparedInput(f, f.message).prompt;
+  const refused = persistGuardRefusal(f.state, f.route.routeId, {
+    session_id: COURIER_NATIVE,
+    cwd: f.dir,
+    tool_input: { prompt }
+  }, 'courier forwarding authorization held');
+  assert.equal(refused, true);
+  release({ text: 'late after refusal' });
+  await resumed;
+  assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(f.state.getMessage(later.id).state, MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(parentCalls, []);
+  consumer.abortNativeWork();
+  await queued;
 });
 
 test('revoked selected route returns to accepted without parent fallback', async t => {

@@ -13,7 +13,6 @@ const FORWARD = Object.freeze({
   EVENT: 'PreToolUse',
   TOOL: 'mcp__codex_app__send_message_to_thread'
 } as const);
-const UNCERTAIN_RECONCILIATION_NOT_SUBMITTED = 'uncertain-reconciled-not_submitted' as const;
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -23,6 +22,12 @@ function transcriptIsInSessionRoot(transcriptPath: unknown, sessionRoot: string 
   if (typeof transcriptPath !== 'string' || !sessionRoot) return false;
   const relative = path.relative(path.resolve(sessionRoot), path.resolve(transcriptPath));
   return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+export function hasRetiredCourierAttempt(state: Pick<ForwardState, 'db'>, messageId: string, attemptReceiptId: number): boolean {
+  return Boolean(state.db.prepare(`SELECT id FROM receipts WHERE kind=?
+    AND discord_id=? AND id>? LIMIT 1`)
+    .get(COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, messageId, attemptReceiptId));
 }
 
 export function claimCourierForward(deps: CourierDependencies, state: ForwardState, routeId: string, event: unknown) {
@@ -62,9 +67,7 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
     const message = state.getMessage(messageId);
     if (!current || !message) throw new deps.BindingError('courier attempt is unavailable');
     const eligible = [deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.UNCERTAIN];
-    const reconciledNotSubmitted = state.db.prepare(`SELECT id FROM receipts WHERE kind=?
-      AND discord_id=? AND id>? LIMIT 1`)
-      .get(UNCERTAIN_RECONCILIATION_NOT_SUBMITTED, messageId, attemptReceiptId);
+    const reconciledNotSubmitted = hasRetiredCourierAttempt(state, messageId, attemptReceiptId);
     if (!eligible.includes(message.state) || state.hasNativeAcknowledgment(message)) {
       throw new deps.BindingError('courier message is not eligible for forwarding');
     }

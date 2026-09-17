@@ -1591,6 +1591,10 @@ class SurfaceState {
     return courierRouteHandlers.claimCourierForward(this, ...args);
   }
 
+  hasRetiredCourierAttempt(...args) {
+    return courierRouteHandlers.hasRetiredCourierAttempt(this, ...args);
+  }
+
   recordCourierOutcome(...args) {
     return courierRouteHandlers.recordCourierOutcome(this, ...args);
   }
@@ -3057,7 +3061,10 @@ class SurfaceState {
       const next = resolution === 'submitted' ? MESSAGE_STATES.SUBMITTED : MESSAGE_STATES.ACCEPTED;
       this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
         .run(next, now(), messageId, MESSAGE_STATES.UNCERTAIN);
-      this.receipt(messageId, `uncertain-reconciled-${resolution}`, {});
+      const receiptKind = resolution === 'not_submitted'
+        ? COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED
+        : `uncertain-reconciled-${resolution}`;
+      this.receipt(messageId, receiptKind, {});
       return this.getMessage(messageId);
     });
   }
