@@ -2360,8 +2360,8 @@ class DiscordGateway {
     return proof;
   }
 
-  async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
-    const deadline = Date.now() + this.recoveryTimeoutMs;
+  async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null) {
+    const deadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
     let baseReason = String(reason || '');
     let previousReason;
     do {
@@ -2425,7 +2425,7 @@ class DiscordGateway {
         const currentState = classifyReadiness(currentBinding, currentBoundary);
         if (currentState === READINESS.READY) continue;
         if (currentState === READINESS.PENDING && !this.stopping) {
-          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId]).catch(error => {
+          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], 0, deadline).catch(error => {
             this.logger(`Discord intake readiness retry failed: ${error.message}`);
           });
         }
@@ -2458,7 +2458,7 @@ class DiscordGateway {
         if (this.stopping) return;
         const current = classifyCurrentReadiness();
         if (current?.state !== READINESS.PENDING) return;
-        return this.recoverTransport(reason, lifecycleEpoch, [binding.channelId]).then(recoveryFailure => {
+        return this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], 0, deadline).then(recoveryFailure => {
           if (recoveryFailure) return null;
           const recoveredBoundary = this.state.getIntakeWatermark(binding.channelId);
           if (recoveredBoundary?.state !== READINESS.READY) return null;
@@ -2792,8 +2792,9 @@ class DiscordGateway {
     return failure || { ready: true, state: 'ready' };
   }
 
-  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, scopeRetryDepth = 0) {
+  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, scopeRetryDepth = 0, recoveryDeadline = null) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+    const overallDeadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
     const callerScope = channelIds === null || channelIds === undefined ? null : new Set(channelIds);
     const expandScope = scope => {
       if (scope === null) return null;
@@ -2819,7 +2820,8 @@ class DiscordGateway {
       }
       if (expanded === null) {
         for (const enrollment of this.state.listThreadEnrollments()) {
-          if (enrollment.active && enrollment.state !== THREAD_STATES.READY) return false;
+          if (enrollment.active && enrollment.state !== THREAD_STATES.READY &&
+              !this.isPreAdoptionRetryableThread(enrollment.threadId)) return false;
         }
       }
       return true;
@@ -2846,20 +2848,20 @@ class DiscordGateway {
           return followupResult?.ready === true ? followupResult : { ready: true, state: 'ready' };
         }
         if (initialResult && initialResult.ready !== true && followupResult?.ready === true && scopeRetryDepth === 0) {
-          return this.recoverTransport(reason, lifecycleEpoch, null, 1);
+          return this.recoverTransport(reason, lifecycleEpoch, null, 1, overallDeadline);
         }
         if (initialResult && initialResult.ready !== true) return { ...followupResult, ...initialResult, ready: false };
         return followupResult || initialResult;
       }
       if (followupResult?.ready === true) {
         if (!initialResult || initialResult.ready === true || scopeIsReady(callerScope)) return followupResult;
-        if (scopeRetryDepth === 0) return this.recoverTransport(reason, lifecycleEpoch, callerScope, 1);
+        if (scopeRetryDepth === 0) return this.recoverTransport(reason, lifecycleEpoch, callerScope, 1, overallDeadline);
         return initialResult;
       }
       if (scopeIsReady(callerScope)) {
         return { ready: true, state: 'ready' };
       }
-      if (scopeRetryDepth === 0) return this.recoverTransport(reason, lifecycleEpoch, callerScope, 1);
+      if (scopeRetryDepth === 0) return this.recoverTransport(reason, lifecycleEpoch, callerScope, 1, overallDeadline);
       return followupResult || initialResult || { ready: false, state: 'unavailable' };
     };
     const fullRecovery = callerScope === null;
@@ -2885,8 +2887,8 @@ class DiscordGateway {
           this.pendingFullRecovery = false;
           this.pendingRecoveryChannels.clear();
           this.recoveryFollowupScope = runFullRecovery ? null : new Set(queuedChannels);
-          if (runFullRecovery) return this.recoverTransport(reason, lifecycleEpoch, null, scopeRetryDepth + 1);
-          return queuedChannels.size ? this.recoverTransport(reason, lifecycleEpoch, queuedChannels, scopeRetryDepth + 1) : result;
+          if (runFullRecovery) return this.recoverTransport(reason, lifecycleEpoch, null, scopeRetryDepth + 1, overallDeadline);
+          return queuedChannels.size ? this.recoverTransport(reason, lifecycleEpoch, queuedChannels, scopeRetryDepth + 1, overallDeadline) : result;
         }, error => {
           this.recoveryFollowupPromise = null;
           this.recoveryFollowupScope = null;
@@ -2904,7 +2906,7 @@ class DiscordGateway {
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
     const activeRecovery = this.recoveryPromise = (async () => {
-      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch, selectedChannels);
+      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch, selectedChannels, overallDeadline);
       const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
       if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
