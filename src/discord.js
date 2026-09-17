@@ -510,7 +510,8 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     const attempt = state.getCourierAttempt?.(messageId);
     return Boolean(latest && latest.state === MESSAGE_STATES.ACCEPTED &&
       !hasCurrentNativeAcknowledgment(latest) && attempt &&
-      !state.hasRetiredCourierAttempt?.(messageId, attempt.attempt.receiptId));
+      (state.hasCourierForwardClaim?.(messageId) ||
+        !state.hasRetiredCourierAttempt?.(messageId, attempt.attempt.receiptId)));
   }
 
   function refreshCourierCustodyBlock(messageId, ownerEntry) {

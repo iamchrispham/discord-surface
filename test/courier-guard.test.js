@@ -206,6 +206,84 @@ test('a retired courier refusal preserves newer direct custody', t => {
   }
 });
 
+function legacyRecoveryAfterClaim(f, acknowledged = false) {
+  assert.equal(invoke(f).status, 0);
+  f.state.markUncertain('9000', new Error('host result unknown'));
+  f.state.recordCourierOutcome('9000', f.claim.attempt.attemptId, COURIER_OUTCOMES.UNCERTAIN);
+  if (acknowledged) recordNativeAcknowledgment(f.state, {
+    provider: 'codex', messageId: '9000', nativeId: PARENT, generation: f.binding.generation
+  });
+  // Persist the state written by a pre-guard recovery CLI, which did not inspect claims.
+  f.state.transaction(() => {
+    f.state.db.prepare('UPDATE messages SET state=?, error=NULL WHERE discord_id=?').run('accepted', '9000');
+    f.state.receipt('9000', COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, {});
+  });
+  f.reopen();
+}
+
+test('dispatch claim survives legacy recovery and existing native acknowledgment still promotes custody', t => {
+  const f = fixture(t);
+  legacyRecoveryAfterClaim(f);
+  assert.equal(f.state.claimDispatch('9000').claimed, false);
+  assert.equal(f.state.getMessage('9000').state, 'accepted');
+  const acknowledged = fixture(t);
+  legacyRecoveryAfterClaim(acknowledged, true);
+  assert.equal(acknowledged.state.claimDispatch('9000').claimed, false);
+  assert.equal(acknowledged.state.getMessage('9000').state, 'submitted');
+  assert.equal(f.claims().length, 1);
+  assert.equal(acknowledged.claims().length, 1);
+});
+
+for (const selected of [false, true]) for (const mode of ['normal', 'handoff', 'dispatch-outcome']) {
+  test(`legacy recovery preserves claimed custody and unclaimed retry: selected=${selected}, ${mode}`, { timeout: 5000 }, async t => {
+    for (const claimed of [true, false]) {
+      const cleanup = [];
+      const f = fixture({ after: fn => cleanup.push(fn) });
+      if (claimed) legacyRecoveryAfterClaim(f);
+      else {
+        f.state.markUncertain('9000', new Error('queue result unknown'));
+        f.state.recordCourierOutcome('9000', f.claim.attempt.attemptId, COURIER_OUTCOMES.UNCERTAIN);
+        f.state.reconcileUncertain('9000', 'not_submitted');
+      }
+      if (!selected) f.state.revokeCourierRoute(f.route.routeId, 'retry without courier');
+      const calls = [];
+      const { createSurfaceConsumer } = require('../src/discord');
+      const consumer = createSurfaceConsumer({ state: f.state,
+        ...(selected ? { courierRoute: { routeId: f.route.routeId } } : {}),
+        providers: { codex: {
+          async dispatch(message) { calls.push(message.id); return { status: 'not_submitted' }; },
+          async dispatchCourier() { assert.fail('retired attempt must never reach the courier'); },
+          async observe() { return { stopped: true }; }
+        } }, sendReply: async () => ({ id: 'reply' }), sendTransportReceipt: async () => ({ id: 'receipt' })
+      });
+      const controller = new AbortController();
+      let siblingWork;
+      try {
+        const first = consumer.processAccepted(f.state.getMessage('9000'), controller.signal, {
+          continueUntilFinal: false, handoff: mode === 'handoff', awaitDispatchOutcome: mode === 'dispatch-outcome'
+        });
+        if (claimed) {
+          const sibling = f.state.acceptDiscordMessage({ id: '9001', guildId: '100', channelId: '1000',
+            authorId: 'operator', isBot: false, attachments: [], content: 'Later input'
+          }, { ready: true, expectedBinding: f.binding });
+          assert.equal(sibling.accepted, true);
+          siblingWork = consumer.processAccepted(sibling.message, controller.signal, { continueUntilFinal: false });
+          siblingWork.catch(() => {});
+        }
+        await first;
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(calls, claimed ? [] : ['9000']);
+        assert.equal(f.claims().length, claimed ? 1 : 0);
+      } finally {
+        controller.abort(); consumer.abortNativeWork();
+        await consumer.waitForNativeWork();
+        await siblingWork?.catch(() => {});
+        cleanup.forEach(fn => fn());
+      }
+    }
+  });
+}
+
 test('foreign and older retirement receipts do not retire a courier attempt', t => {
   const older = fixture(t, { preAttemptReceipt: true });
   assert.equal(invoke(older).status, 0);

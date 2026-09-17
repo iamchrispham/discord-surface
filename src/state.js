@@ -2445,6 +2445,9 @@ class SurfaceState {
           this.receipt(messageId, 'dispatch-already-acknowledged', { generation: message.generation });
           return { claimed: false, message: this.getMessage(messageId), reason: 'native-already-acknowledged' };
         }
+        if (this.hasCourierForwardClaim(messageId)) {
+          return { claimed: false, message, reason: 'courier-forward-already-claimed' };
+        }
         if (check.binding.readiness !== READINESS.READY || !check.ready) {
           this.receipt(messageId, 'dispatch-held-not-ready', {
             readiness: check.binding.readiness,
