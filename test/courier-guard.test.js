@@ -457,3 +457,24 @@ test('a denied hook never migrates or repairs old or incomplete state', t => {
     assert.equal(invoke(f).status, 0, 'regular state open still initializes the schema');
   }
 });
+
+test('host changes settle the exact old attempt while malformed input preserves custody', t => {
+  for (const [oldHost, newHost] of [[null, 'host-b'], ['host-a', null], ['host-a', 'host-b']]) {
+    const f = fixture(t, { hostId: oldHost });
+    f.state.recordCourierOutcome('9000', f.claim.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+    f.state.markSubmitted('9000');
+    f.state.registerCourierRoute({ ...f.route, routeGeneration: 2, courier: { ...f.route.courier, hostId: newHost } });
+    const malformed = { ...f.event, tool_input: { ...f.event.tool_input, hostId: 'wrong-host' } };
+    denied(invoke(f, malformed), /fixed recipient/);
+    assert.equal(f.state.getMessage('9000').state, 'submitted');
+    assert.equal(f.state.getCourierAttempt('9000', f.claim.attempt.attemptId).outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
+    denied(invoke(f));
+    assert.equal(f.state.getMessage('9000').state, 'accepted');
+    assert.equal(f.state.getCourierAttempt('9000', f.claim.attempt.attemptId).outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
+    assert.equal(f.claims().length, 0);
+    f.reopen();
+    denied(invoke(f), /not eligible/);
+    assert.equal(f.state.getMessage('9000').state, 'accepted');
+    assert.equal(f.claims().length, 0);
+  }
+});
