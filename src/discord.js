@@ -2762,9 +2762,9 @@ class DiscordGateway {
     if (!followup) return result;
     const followupResult = await followup;
     if (result?.ready !== true && followupResult?.ready === true) {
-      return this.recoverTransport(`${reason} full follow-up`, lifecycleEpoch);
+      return this.recoverTransport(`${reason} full follow-up`, lifecycleEpoch, selectedChannels);
     }
-    if (result?.ready !== true) return { ...followupResult, ...result, ready: false };
+    if (result?.ready !== true) return { ...result, ...followupResult, ready: false };
     return followupResult;
   }
 
