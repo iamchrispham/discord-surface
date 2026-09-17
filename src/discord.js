@@ -1500,7 +1500,7 @@ class DiscordGateway {
     if (['gap', 'unavailable'].includes(enrollment.state) && !retryableBoundary) return;
     const nextState = !enrollment.adoptedAt && retryableFetch ? THREAD_STATES.PENDING : THREAD_STATES.UNAVAILABLE;
     this.state.markThreadBoundary(stored.deliveryChannelId, nextState,
-      error.message, null, null, binding);
+      error.message, null, null, binding, undefined, undefined, enrollment);
   }
 
   async threadDeliveryMessage(message) {
@@ -2622,6 +2622,13 @@ class DiscordGateway {
           failure ||= { ready: false, state: 'unavailable', error };
           continue;
         }
+        const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+        if (currentBoundary?.state === READINESS.GAP || currentBoundary?.state === READINESS.UNAVAILABLE) {
+          ownedBoundary = currentBoundary;
+          failure ||= { ready: false, state: currentBoundary.state };
+          continue;
+        }
+        if (currentBoundary) ownedBoundary = currentBoundary;
         const recorded = await recordOwnedBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, ownedBoundary?.recovered_through_id, attemptedId || after, signal, deadline, ownedBoundary);
         if (recorded?.watermark) ownedBoundary = recorded.watermark;
         failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };

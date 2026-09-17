@@ -269,7 +269,12 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       }
       if (recoveryKind === 'stale') return false;
       const detail = error instanceof Error ? error.message : String(error);
-      const preAdoptionRetry = !gateway.state.getThreadEnrollment(enrollment.threadId)?.adoptedAt &&
+      const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
+      if (!currentEnrollment?.active || currentEnrollment.state === THREAD_STATES.GAP || currentEnrollment.state === THREAD_STATES.UNAVAILABLE) {
+        return false;
+      }
+      ownedEnrollment = currentEnrollment;
+      const preAdoptionRetry = !currentEnrollment.adoptedAt &&
         isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
       let nextState: ThreadState = THREAD_STATES.UNAVAILABLE;
       if (deadlineReached) nextState = THREAD_STATES.GAP;
