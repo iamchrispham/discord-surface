@@ -149,6 +149,37 @@ does not register a route,
 intercept a Desktop session, or prove live Discord and native qualification.
 Those checks remain required before operator activation.
 
+The courier's trusted native `PreToolUse` hook must run the installed guard
+before `mcp__codex_app__send_message_to_thread`:
+
+```sh
+/bin/sh /absolute/path/to/discord-surface/src/courier-guard.sh \
+  --disable-warning=ExperimentalWarning \
+  --db /absolute/path/to/surface.sqlite --courier-route-id ROUTE_ID
+```
+
+The wrapper runs Node from a fixed absolute path rather than resolving `node`
+from the inherited `PATH`, so an earlier PATH entry cannot shim the guard. It
+tries `/usr/local/bin/node`, `/opt/homebrew/bin/node`, then `/usr/bin/node`.
+Set `DISCORD_SURFACE_NODE` to the absolute path of the intended `node`
+executable when none of those match, such as nvm-only installs.
+
+The guard reads the native hook event from stdin. It requires the registered
+courier session and workspace, the fixed recipient and exact prompt from one
+persisted attempt, current binding ownership and an unacknowledged message.
+It atomically records one forwarding claim before allowing the tool. Refusal
+writes the blocking reason to stderr and exits 2. Success leaves stdout empty.
+Startup failures also exit 2. The registered transcript root is checked before authorization.
+A refusal before any forwarding claim leaves the original message accepted and
+records definite non-forwarding, even if the courier queue already accepted it.
+A later queue result cannot override that refusal. The existing attempt stays
+held without automatic replay. Refusal after a forwarding claim cannot undo it.
+The database must already have the current schema. The guard never creates,
+migrates or repairs it.
+A claim survives restart or an unknown host-call outcome and cannot be retried.
+It neither acknowledges the message nor completes its reply obligation.
+Installing this command does not trust a project hook or activate a route.
+
 `status` includes a `gateway` process object. Its `state` is `running` only when the runtime PID file and the matching `ps` command identify this adapter and state directory. `stopped` means no PID file exists, `stale` means the recorded process is gone, and `unknown` means the PID file or owner identity cannot be verified. A `running` process reports `connection: unverified-live`; it does not claim a Discord connection.
 
 The Codex provider queues `codex queue --thread <UUID>` in the bound workspace. It observes only the matching session JSONL file and does not select a task by name, newest activity, directory, or process ID. The runtime never adds approval bypass flags.

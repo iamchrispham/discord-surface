@@ -505,6 +505,20 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return state.currentMessageBinding(message).current;
   }
 
+  function courierCustodyRequiresOwnerHold(messageId) {
+    const latest = state.getMessage(messageId);
+    const attempt = state.getCourierAttempt?.(messageId);
+    return Boolean(latest && latest.state === MESSAGE_STATES.ACCEPTED &&
+      !hasCurrentNativeAcknowledgment(latest) && attempt &&
+      (state.hasCourierForwardClaim?.(messageId) ||
+        !state.hasRetiredCourierAttempt?.(messageId, attempt.attempt.receiptId)));
+  }
+
+  function refreshCourierCustodyBlock(messageId, ownerEntry) {
+    if (ownerEntry.dispatchBlocked || !courierCustodyRequiresOwnerHold(messageId)) return;
+    ownerEntry.dispatchBlocked = true;
+  }
+
   function ownerMessageIsTerminal(message) {
     return Boolean(message && [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
       MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST].includes(message.state));
@@ -963,21 +977,26 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     }
     const status = courierDispatchStatus(dispatched);
     state.authorizeCourierAttempt(message.id, claimed.attempt.attemptId, input);
-    state.recordCourierOutcome(message.id, claimed.attempt.attemptId, status, {
+    const recorded = state.recordCourierOutcome(message.id, claimed.attempt.attemptId, status, {
       ...(dispatched?.error ? { error: String(dispatched.error.message || dispatched.error).slice(0, 200) } : {})
     });
-    return {
-      status,
-      cursor: observerCursor,
-      ...(dispatched?.error ? { error: dispatched.error } : {})
-    };
+    const savedStatus = recorded.outcome?.outcome || status;
+    const error = savedStatus === COURIER_OUTCOMES.NOT_SUBMITTED
+      ? courierDispatchError(savedStatus)
+      : dispatched?.error;
+    return { status: savedStatus, cursor: observerCursor, ...(error ? { error } : {}) };
   }
 
   function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
     const durable = state.getMessage(message?.id) || message;
-    const selected = selectedCourierRoute(durable) ? { routeId: courierRoute.routeId } : null;
+    const courierAttempt = state.getCourierAttempt?.(durable.id);
+    const retiredCourierAttempt = Boolean(courierAttempt &&
+      state.hasRetiredCourierAttempt?.(durable.id, courierAttempt.attempt.receiptId));
+    const selected = !retiredCourierAttempt && selectedCourierRoute(durable)
+      ? { routeId: courierRoute.routeId }
+      : null;
     return enqueueOwnerWork(message, signal, (onNativeSettled, ownerEntry) => {
       let settleHandoff;
       let rejectHandoff;
@@ -993,14 +1012,26 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       }) : null;
       handoffPromise?.catch(() => {});
       let nativeSettled = false;
+      const refreshDispatchBlock = () => {
+        refreshCourierCustodyBlock(message.id, ownerEntry);
+      };
       const settleNative = () => {
         if (nativeSettled) return;
         nativeSettled = true;
+        refreshDispatchBlock();
         onNativeSettled();
       };
-      const work = startNativeWork(message.id, signal, async taskSignal => {
+      refreshDispatchBlock();
+      if (ownerEntry.dispatchBlocked) settleNative();
+      const work = ownerEntry.dispatchBlocked
+        ? Promise.resolve({ status: COURIER_OUTCOMES.NOT_SUBMITTED, message: state.getMessage(message.id) })
+        : startNativeWork(message.id, signal, async taskSignal => {
         let result;
         try {
+          if (courierCustodyRequiresOwnerHold(message.id)) {
+            ownerEntry.dispatchBlocked = true;
+            return { status: COURIER_OUTCOMES.NOT_SUBMITTED, message: state.getMessage(message.id) };
+          }
           result = await dispatchAndObserve(state, message.id, providers, {
             ...observeOptions,
             signal: taskSignal,
@@ -1010,6 +1041,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
               if (outcome?.status === 'not_submitted') {
                 ownerEntry.dispatchBlocked = !hasCurrentNativeAcknowledgment(state.getMessage(message.id));
               }
+              refreshDispatchBlock();
               settleDispatchOutcome?.(outcome);
             },
             onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
@@ -1018,7 +1050,8 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
           if (promoted?.state === MESSAGE_STATES.REPLY_READY && result.message?.state !== MESSAGE_STATES.REPLY_READY) {
             result = { ...result, message: promoted };
           }
-          if (['uncertain', 'not_submitted'].includes(result.status) && promoted?.state === MESSAGE_STATES.SUBMITTED) {
+          if (['uncertain', 'not_submitted', 'native-already-acknowledged'].includes(result.status) &&
+            promoted?.state === MESSAGE_STATES.SUBMITTED) {
             result = await observeSubmitted(state, promoted, providers[promoted.provider], {
               ...observeOptions,
               signal: taskSignal,
@@ -1116,11 +1149,15 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       releaseAcknowledged(message.id);
       return existing;
     }
-    const work = enqueueOwnerWork(message, signal, onNativeSettled => {
+    const work = enqueueOwnerWork(message, signal, (onNativeSettled, ownerEntry) => {
       let nativeSettled = false;
+      const refreshDispatchBlock = () => {
+        refreshCourierCustodyBlock(message.id, ownerEntry);
+      };
       const settleNative = () => {
         if (nativeSettled) return;
         nativeSettled = true;
+        refreshDispatchBlock();
         onNativeSettled();
       };
       const work = startNativeWork(message.id, signal, async taskSignal => {

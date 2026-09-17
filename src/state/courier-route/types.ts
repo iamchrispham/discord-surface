@@ -167,7 +167,7 @@ export interface CourierState {
 
 export interface CourierDependencies {
   BindingError: new (message: string) => Error;
-  MESSAGE_STATES: { ACCEPTED: string; DISPATCHING: string };
+  MESSAGE_STATES: { ACCEPTED: string; DISPATCHING: string; SUBMITTED: string; UNCERTAIN: string };
   PROVIDERS: Record<string, AgentProvider>;
   READINESS: { READY: string };
   THREAD_STATES: { READY: string };
