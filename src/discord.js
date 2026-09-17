@@ -30,6 +30,7 @@ const LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS = 1000;
 const LIVE_CHECKPOINT_RETRY_MAX_DELAY_MS = 30_000;
 const PENDING_HANDOFF_RECOVERY_POLL_MS = 100;
 const INTERACTION_CALLBACK_TIMEOUT_MS = 2500;
+const RECOVERY_WAITER_DEADLINE_GRACE_MS = 250;
 const INTERACTION_REJECTION_MESSAGES = Object.freeze({
   'inactive-binding': 'This channel is not connected to an active status session.',
   'binding-not-ready': 'The status session is still recovering. Try again shortly.',
@@ -2905,7 +2906,7 @@ class DiscordGateway {
       };
       if (Number.isFinite(deadline)) {
         waiter.timer = setTimeout(() => waiter.settle({ ready: false, state: 'unavailable' }),
-          Math.max(0, deadline - Date.now()));
+          Math.max(0, deadline - Date.now()) + RECOVERY_WAITER_DEADLINE_GRACE_MS);
       }
       return waiter;
     };
