@@ -2440,6 +2440,8 @@ class DiscordGateway {
         const kind = recoveryKind(error);
         if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
         if (kind === CODEX_VALIDATION_KINDS.DEADLINE && retryBoundary && !recoveryAttempted) {
+          this.state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE,
+            retryBoundary.detail || `${reason} retry after Discord HTTP 503`, binding);
           failure ||= { ready: false, state: 'unavailable' };
           continue;
         }

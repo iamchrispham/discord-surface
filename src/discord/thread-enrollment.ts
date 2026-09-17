@@ -270,7 +270,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       if (recoveryKind === 'stale') return false;
       const detail = error instanceof Error ? error.message : String(error);
       const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
-      if (!currentEnrollment?.active || currentEnrollment.state === THREAD_STATES.GAP || currentEnrollment.state === THREAD_STATES.UNAVAILABLE) {
+      if (!currentEnrollment?.active || currentEnrollment.state === THREAD_STATES.GAP || currentEnrollment.state === THREAD_STATES.UNAVAILABLE || currentEnrollment.state === THREAD_STATES.READY) {
         return false;
       }
       ownedEnrollment = currentEnrollment;
