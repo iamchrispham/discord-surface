@@ -42,7 +42,7 @@ const {
 const { CODEX_VALIDATION_KINDS, sessionRoot: codexSessionRoot, validateClaudeSessionIdentity, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('./native');
 const { ClaudeChannel } = require('./claude-channel');
 const { createClaudeMonitor } = require('./claude-monitor');
-const { ordinaryBind: runOrdinaryBind, ordinaryClaudeBind: runOrdinaryClaudeBind } = require('./ordinary-bind');
+const { ordinaryBind: runOrdinaryBind, ordinaryClaudeBind: runOrdinaryClaudeBind, reconcileProofUnavailableIntake } = require('./ordinary-bind');
 const { assertGatewayWakeCompatible } = require('./ordinary-bind/gateway-capability');
 const { GATEWAY_CAPABILITIES } = require('./ordinary-bind/constants');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
@@ -503,15 +503,12 @@ async function ordinaryBind(args, dependencies = {}) {
     } else {
       nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: nativeProofError?.message || 'Codex transcript proof is pending' };
     }
-    if (decision === ORDINARY_BINDING_DECISIONS.REUSE && nativeProof.status === NATIVE_PROOF_STATUSES.VERIFIED && nativeProofDetail && !nativeProofError) {
-      const watermark = state.getIntakeWatermark(binding.channelId);
-      const nativeProofUnavailable = watermark && watermark.state === READINESS.UNAVAILABLE &&
-        typeof watermark.detail === 'string' && watermark.detail.startsWith(ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX);
-      if (nativeProofUnavailable) {
-        const reopened = state.reconcileIntake(binding.channelId, binding);
-        if (reopened) binding = state.getBinding(binding.channelId);
-      }
-    }
+    binding = reconcileProofUnavailableIntake(state, binding, {
+      reused: decision === ORDINARY_BINDING_DECISIONS.REUSE,
+      nativeProofVerified: nativeProof.status === NATIVE_PROOF_STATUSES.VERIFIED,
+      nativeProofDetail,
+      nativeProofError
+    });
     const gatewayWake = requestGatewayRecovery(paths, {
       status: gatewayStatus,
       kill: dependencies.killProcess || process.kill,
