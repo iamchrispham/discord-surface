@@ -545,13 +545,14 @@ function bindingIdentityMatchesTopicPublication(binding, publication) {
 class SurfaceState {
   constructor(dbPath, options = {}) {
     if (!path.isAbsolute(dbPath)) throw new TypeError('dbPath must be absolute');
-    ensurePrivateDir(path.dirname(dbPath));
     const existed = fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0;
+    if (options.requireCurrentSchema && !existed) throw new StateCorruptError('state database is missing');
+    ensurePrivateDir(path.dirname(dbPath));
     try {
       this.db = new DatabaseSync(dbPath);
       this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;');
       if (existed) {
-        this.migrateSchema();
+        if (!options.requireCurrentSchema) this.migrateSchema();
         this.assertSchema();
       } else {
         this.createSchema();
@@ -1586,6 +1587,18 @@ class SurfaceState {
     return courierRouteHandlers.authorizeCourierAttempt(this, ...args);
   }
 
+  claimCourierForward(...args) {
+    return courierRouteHandlers.claimCourierForward(this, ...args);
+  }
+
+  hasCourierForwardClaim(...args) {
+    return courierRouteHandlers.hasCourierForwardClaim(this, ...args);
+  }
+
+  hasRetiredCourierAttempt(...args) {
+    return courierRouteHandlers.hasRetiredCourierAttempt(this, ...args);
+  }
+
   recordCourierOutcome(...args) {
     return courierRouteHandlers.recordCourierOutcome(this, ...args);
   }
@@ -2432,6 +2445,9 @@ class SurfaceState {
           this.receipt(messageId, 'dispatch-already-acknowledged', { generation: message.generation });
           return { claimed: false, message: this.getMessage(messageId), reason: 'native-already-acknowledged' };
         }
+        if (this.hasCourierForwardClaim(messageId)) {
+          return { claimed: false, message, reason: 'courier-forward-already-claimed' };
+        }
         if (check.binding.readiness !== READINESS.READY || !check.ready) {
           this.receipt(messageId, 'dispatch-held-not-ready', {
             readiness: check.binding.readiness,
@@ -2505,15 +2521,21 @@ class SurfaceState {
       const message = this.getMessage(messageId);
       if (!message) throw new BindingError('message is unknown');
       if (message.state !== expected) return message;
-      if ([MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.UNCERTAIN].includes(next) && this.hasNativeAcknowledgment(message)) {
+      let transitionNext = next;
+      let transitionKind = kind;
+      if (transitionNext === MESSAGE_STATES.ACCEPTED && this.hasCourierForwardClaim(messageId)) {
+        transitionNext = MESSAGE_STATES.UNCERTAIN;
+        transitionKind = 'dispatch-uncertain-after-forward-claim';
+      }
+      if ([MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.UNCERTAIN].includes(transitionNext) && this.hasNativeAcknowledgment(message)) {
         this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
           .run(MESSAGE_STATES.SUBMITTED, now(), messageId, expected);
         this.receipt(messageId, 'dispatch-already-acknowledged', { generation: message.generation });
         return this.getMessage(messageId);
       }
       this.db.prepare('UPDATE messages SET state=?, error=?, updated_at=? WHERE discord_id=? AND state=?')
-        .run(next, error ? String(error.message || error).slice(0, 1000) : null, now(), messageId, expected);
-      this.receipt(messageId, kind, { error: error ? String(error.message || error).slice(0, 200) : undefined });
+        .run(transitionNext, error ? String(error.message || error).slice(0, 1000) : null, now(), messageId, expected);
+      this.receipt(messageId, transitionKind, { error: error ? String(error.message || error).slice(0, 200) : undefined });
       return this.getMessage(messageId);
     });
   }
@@ -2807,6 +2829,15 @@ class SurfaceState {
           continue;
         }
         if (courierOutcome === COURIER_OUTCOMES.NOT_SUBMITTED) {
+          if (this.hasCourierForwardClaim(row.discord_id)) {
+            this.db.prepare('UPDATE messages SET state=?, error=?, updated_at=? WHERE discord_id=? AND state=?')
+              .run(MESSAGE_STATES.UNCERTAIN, 'process stopped after courier forward claim', now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
+            this.receipt(row.discord_id, 'dispatch-uncertain-after-restart', {
+              afterRestart: true,
+              reason: 'courier forward claim fence'
+            });
+            continue;
+          }
           this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
             .run(MESSAGE_STATES.ACCEPTED, now(), row.discord_id, MESSAGE_STATES.DISPATCHING);
           this.receipt(row.discord_id, 'dispatch-not-submitted-after-restart', { afterRestart: true });
@@ -3048,11 +3079,17 @@ class SurfaceState {
       if (resolution === 'not_submitted' && this.hasNativeAcknowledgment(message)) {
         throw new BindingError('native acknowledgment prevents retrying delivery');
       }
+      if (resolution === 'not_submitted' && this.hasCourierForwardClaim(messageId)) {
+        throw new BindingError('courier forwarding claim prevents retrying delivery');
+      }
       if (message.state !== MESSAGE_STATES.UNCERTAIN) throw new BindingError('message is not uncertain');
       const next = resolution === 'submitted' ? MESSAGE_STATES.SUBMITTED : MESSAGE_STATES.ACCEPTED;
       this.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
         .run(next, now(), messageId, MESSAGE_STATES.UNCERTAIN);
-      this.receipt(messageId, `uncertain-reconciled-${resolution}`, {});
+      const receiptKind = resolution === 'not_submitted'
+        ? COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED
+        : `uncertain-reconciled-${resolution}`;
+      this.receipt(messageId, receiptKind, {});
       return this.getMessage(messageId);
     });
   }

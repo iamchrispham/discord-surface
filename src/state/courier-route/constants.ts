@@ -1,7 +1,9 @@
 export const COURIER_RECEIPT_KINDS = Object.freeze({
   ROUTE: 'courier-route',
   ATTEMPT: 'courier-attempt',
+  FORWARD_CLAIM: 'courier-forward-claim',
   OUTCOME: 'courier-outcome',
+  RECONCILED_NOT_SUBMITTED: 'uncertain-reconciled-not_submitted',
   REJECTION: 'courier-rejection'
 } as const);
 
