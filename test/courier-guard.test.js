@@ -400,6 +400,29 @@ test('shell hook wrapper fails closed when the configured node override is not e
   assert.equal(f.claims().length, 0);
 });
 
+test('shell hook wrapper rejects a relative DISCORD_SURFACE_NODE override but accepts the same runtime as an absolute path', t => {
+  const f = fixture(t);
+  const shim = path.join(f.dir, 'node-shim');
+  fs.writeFileSync(shim, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`, { mode: 0o700 });
+
+  const relative = spawnSync('/bin/sh', [WRAPPER, '--db', f.db, '--courier-route-id', f.route.routeId], {
+    input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000, cwd: f.dir,
+    env: { ...process.env, DISCORD_SURFACE_NODE: './node-shim' }
+  });
+  assert.equal(relative.status, 2, relative.stderr);
+  assert.match(relative.stderr, /configured node runtime must be an absolute path/);
+  assert.equal(f.claims().length, 0);
+
+  const absolute = spawnSync('/bin/sh', [WRAPPER, '--db', f.db, '--courier-route-id', f.route.routeId], {
+    input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000, cwd: f.dir,
+    env: { ...process.env, DISCORD_SURFACE_NODE: shim }
+  });
+  assert.equal(absolute.status, 0, absolute.stderr);
+  assert.equal(absolute.stdout, '');
+  assert.equal(absolute.stderr, '');
+  assert.equal(f.claims().length, 1);
+});
+
 test('courier forwarding canonicalizes non-normalized workspace paths', t => {
   const f = fixture(t, { routeWorkspace: dir => path.join(dir, 'nested', '..') });
   assert.equal(f.route.courier.workspace, f.dir);

@@ -19,13 +19,20 @@ function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function canonicalWorkspace(value: unknown): string | null {
+export function canonicalWorkspace(value: unknown): string | null {
   if (typeof value !== 'string' || !path.isAbsolute(value)) return null;
   const normalized = path.normalize(value);
   const root = path.parse(normalized).root;
   return normalized.length > root.length && normalized.endsWith(path.sep)
     ? normalized.slice(0, -path.sep.length)
     : normalized;
+}
+
+export function matchesFixedRecipient(persistedRecipient: { threadId: string; hostId?: string | null }, input: Record<string, unknown>): boolean {
+  const expected: Record<string, unknown> = { threadId: persistedRecipient.threadId, prompt: input.prompt };
+  if (persistedRecipient.hostId) expected.hostId = persistedRecipient.hostId;
+  return Object.keys(input).length === Object.keys(expected).length &&
+    Object.entries(expected).every(([key, value]) => input[key] === value);
 }
 
 function configuredSessionRoot(): string {
@@ -89,10 +96,7 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
     const message = state.getMessage(messageId);
     if (!current || !message) throw new deps.BindingError('courier attempt is unavailable');
     const persistedRecipient = current.attempt.envelope.recipient;
-    const expected: Record<string, unknown> = { threadId: persistedRecipient.threadId, prompt };
-    if (persistedRecipient.hostId) expected.hostId = persistedRecipient.hostId;
-    if (Object.keys(input).length !== Object.keys(expected).length ||
-        !Object.entries(expected).every(([key, value]) => input[key] === value)) {
+    if (!matchesFixedRecipient(persistedRecipient, input)) {
       throw new deps.BindingError('courier hook tool input differs from the fixed recipient');
     }
     const eligible = [deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.UNCERTAIN];

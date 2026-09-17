@@ -18,6 +18,13 @@ fi
 
 node_bin=${DISCORD_SURFACE_NODE:-}
 if [ -n "$node_bin" ]; then
+  case "$node_bin" in
+    /*) ;;
+    *)
+      printf '%s\n' "discord-surface courier guard: configured node runtime must be an absolute path: $node_bin" >&2
+      exit 2
+      ;;
+  esac
   if [ ! -x "$node_bin" ]; then
     printf '%s\n' "discord-surface courier guard: configured node runtime is not executable: $node_bin" >&2
     exit 2

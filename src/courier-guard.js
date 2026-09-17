@@ -1,16 +1,6 @@
 const fs = require('node:fs');
-const path = require('node:path');
 
 const MAX_HOOK_BYTES = 1024 * 1024;
-
-function canonicalWorkspace(value) {
-  if (typeof value !== 'string' || !path.isAbsolute(value)) return null;
-  const normalized = path.normalize(value);
-  const root = path.parse(normalized).root;
-  return normalized.length > root.length && normalized.endsWith(path.sep)
-    ? normalized.slice(0, -path.sep.length)
-    : normalized;
-}
 
 function persistGuardRefusal(state, routeId, event, reason) {
   if (!state || typeof routeId !== 'string' || !event || typeof event !== 'object') return false;
@@ -22,6 +12,7 @@ function persistGuardRefusal(state, routeId, event, reason) {
   if (!input || typeof input !== 'object' || typeof input.prompt !== 'string' || typeof event.session_id !== 'string' ||
       typeof event.cwd !== 'string') return false;
   const { COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, MESSAGE_STATES } = require('./state');
+  const { canonicalWorkspace, matchesFixedRecipient } = require('./state/courier-route');
   return state.transaction(() => {
     const rows = state.db.prepare(`SELECT id, discord_id, detail FROM receipts WHERE kind=?
       AND json_extract(detail, '$.route.routeId')=?
@@ -44,10 +35,7 @@ function persistGuardRefusal(state, routeId, event, reason) {
     if (outcome && ![COURIER_OUTCOMES.SUBMITTED, COURIER_OUTCOMES.UNCERTAIN].includes(outcome)) return false;
     const persistedRecipient = current?.attempt?.envelope?.recipient;
     if (!persistedRecipient || typeof persistedRecipient.threadId !== 'string') return false;
-    const expected = { threadId: persistedRecipient.threadId, prompt: input.prompt };
-    if (persistedRecipient.hostId) expected.hostId = persistedRecipient.hostId;
-    if (Object.keys(input).length !== Object.keys(expected).length ||
-        !Object.entries(expected).every(([key, value]) => input[key] === value)) return false;
+    if (!matchesFixedRecipient(persistedRecipient, input)) return false;
     if (state.db.prepare(`SELECT 1 FROM receipts WHERE kind=? AND discord_id=? AND id>?
       AND json_extract(detail, '$.attemptId')=? LIMIT 1`)
       .get(COURIER_RECEIPT_KINDS.FORWARD_CLAIM, messageId, Number(row.id), attemptId)) return false;
