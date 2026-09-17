@@ -2780,15 +2780,20 @@ class DiscordGateway {
       const key = `${message.provider}:${message.nativeId}`;
       if (blockedOwners.has(key)) continue;
       let channel;
+      let channelFetchStarted = false;
       try {
         channel = await waitForRecoveryOperation(
-          () => recoveryFetch(() => this.client.channels.fetch(message.deliveryChannelId || message.channelId)),
+          () => recoveryFetch(() => {
+            channelFetchStarted = true;
+            return this.client.channels.fetch(message.deliveryChannelId || message.channelId);
+          }),
           signal,
           deadline
         );
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
+        if (!channelFetchStarted) continue;
         this.markThreadDeliveryUnavailable(message, error);
         this.state.markObservationUnavailable(message.id, error);
         continue;
