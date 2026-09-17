@@ -2429,7 +2429,7 @@ class DiscordGateway {
         const currentState = classifyReadiness(currentBinding, currentBoundary);
         if (currentState === READINESS.READY) continue;
         if (currentState === READINESS.PENDING && !this.stopping) {
-          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], 0, deadline).catch(error => {
+          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], deadline).catch(error => {
             this.logger(`Discord intake readiness retry failed: ${error.message}`);
           });
         }
@@ -2467,7 +2467,7 @@ class DiscordGateway {
         queueMicrotask(() => {
           this.recoveryRetryScheduledChannels.delete(binding.channelId);
           if (this.stopping || !this.isCurrentLifecycle(lifecycleEpoch)) return;
-          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], 0, deadline).catch(error => {
+          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], deadline).catch(error => {
             this.logger(`Discord intake boundary retry failed: ${error.message}`);
           });
         });
@@ -2795,7 +2795,7 @@ class DiscordGateway {
     return failure || { ready: true, state: 'ready' };
   }
 
-  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, scopeRetryDepth = 0, recoveryDeadline = null) {
+  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
     const overallDeadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
     const callerScope = channelIds === null || channelIds === undefined ? null : new Set(channelIds);
@@ -2918,7 +2918,7 @@ class DiscordGateway {
         waiter.parents.add(parent);
       }
     };
-    const startRecoveryPass = (scope, deadline, passReason, passLifecycle, passDepth, activeWaiters) => {
+    const startRecoveryPass = (scope, deadline, passReason, passLifecycle, activeWaiters) => {
       this.recoveryActiveWaiters = new Set(activeWaiters.filter(waiter => !waiter.settled));
       this.recoveryController = new AbortController();
       const controller = this.recoveryController;
@@ -2971,7 +2971,7 @@ class DiscordGateway {
         let result;
         try {
           result = await startRecoveryPass(request.scope, request.deadline, request.reason,
-            request.lifecycleEpoch, request.scopeRetryDepth, activeWaiters);
+            request.lifecycleEpoch, activeWaiters);
         } catch (error) {
           result = { ready: false, state: recoveryKind(error) || 'unavailable', error };
         }
@@ -3016,7 +3016,6 @@ class DiscordGateway {
         deadline: overallDeadline,
         reason,
         lifecycleEpoch,
-        scopeRetryDepth,
         waiter
       });
       this.recoveryFollowupScope = callerScope === null ? null : new Set(callerScope);
@@ -3026,7 +3025,7 @@ class DiscordGateway {
 
     if (callerScope === null) this.ready = false;
     const activeRecovery = startRecoveryPass(callerScope, overallDeadline, reason,
-      lifecycleEpoch, scopeRetryDepth, [waiter]);
+      lifecycleEpoch, [waiter]);
     activeRecovery.then(
       result => waiter.completeOwn(result),
       error => waiter.completeOwn({ ready: false, state: recoveryKind(error) || 'unavailable', error })
