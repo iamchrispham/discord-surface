@@ -317,6 +317,21 @@ test('refusal after a forwarding claim cannot reset custody or grant a second ca
   assert.equal(f.claims().length, 1);
 });
 
+test('a forwarding claim fences late retryable queue results and reconciliation', t => {
+  const late = fixture(t);
+  assert.equal(invoke(late).status, 0);
+  assert.equal(late.state.markNotSubmitted('9000', new Error('late queue result')).state, 'uncertain');
+  late.reopen();
+  late.state.recoverAfterRestart();
+  assert.equal(late.state.getMessage('9000').state, 'uncertain');
+
+  const reconciled = fixture(t);
+  reconciled.state.markUncertain('9000', new Error('queue outcome unknown'));
+  assert.equal(invoke(reconciled).status, 0);
+  assert.throws(() => reconciled.state.reconcileUncertain('9000', 'not_submitted'), /forwarding claim prevents retrying delivery/);
+  assert.equal(reconciled.state.getMessage('9000').state, 'uncertain');
+});
+
 test('a denied hook never migrates or repairs old or incomplete state', t => {
   const mutations = [
     f => f.state.db.prepare("UPDATE meta SET value='1.7' WHERE key='schema'").run(),

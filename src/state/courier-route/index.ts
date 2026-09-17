@@ -1,5 +1,5 @@
 import { createCourierAttemptHandlers } from './attempt';
-import { claimCourierForward, hasRetiredCourierAttempt } from './forward';
+import { claimCourierForward, hasCourierForwardClaim, hasRetiredCourierAttempt } from './forward';
 import { COURIER_ATTEMPT_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_RESULT_STATUSES, COURIER_ROUTE_STATES, COURIER_SOURCE_KINDS, ENVELOPE_TYPE, PROMPT_PREFIX } from './constants';
 import { createEnvelope } from './envelope';
 import { getRoute, isCourierOriginAllowed, listRoutes, registerRoute, revokeRoute } from './route';
@@ -9,6 +9,7 @@ export function createCourierRouteHandlers(deps: CourierDependencies) {
   const attempts = createCourierAttemptHandlers(deps);
   return {
     claimCourierForward: claimCourierForward.bind(null, deps),
+    hasCourierForwardClaim,
     hasRetiredCourierAttempt,
     beginCourierAttempt: attempts.beginCourierAttempt,
     authorizeCourierAttempt: attempts.authorizeCourierAttempt,

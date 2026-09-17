@@ -505,6 +505,17 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return state.currentMessageBinding(message).current;
   }
 
+  function courierCustodyRequiresOwnerHold(messageId) {
+    const latest = state.getMessage(messageId);
+    return Boolean(latest && latest.state === MESSAGE_STATES.ACCEPTED &&
+      !hasCurrentNativeAcknowledgment(latest) && state.getCourierAttempt?.(messageId));
+  }
+
+  function refreshCourierCustodyBlock(messageId, ownerEntry) {
+    if (ownerEntry.dispatchBlocked || !courierCustodyRequiresOwnerHold(messageId)) return;
+    ownerEntry.dispatchBlocked = true;
+  }
+
   function ownerMessageIsTerminal(message) {
     return Boolean(message && [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED, MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN,
       MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST].includes(message.state));
@@ -994,11 +1005,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       handoffPromise?.catch(() => {});
       let nativeSettled = false;
       const refreshDispatchBlock = () => {
-        if (!selected || ownerEntry.dispatchBlocked) return;
-        const latest = state.getMessage(message.id);
-        if (latest?.state === MESSAGE_STATES.ACCEPTED && !hasCurrentNativeAcknowledgment(latest)) {
-          ownerEntry.dispatchBlocked = true;
-        }
+        refreshCourierCustodyBlock(message.id, ownerEntry);
       };
       const settleNative = () => {
         if (nativeSettled) return;
@@ -1125,15 +1132,10 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       releaseAcknowledged(message.id);
       return existing;
     }
-    const selected = selectedCourierRoute(message) ? { routeId: courierRoute.routeId } : null;
     const work = enqueueOwnerWork(message, signal, (onNativeSettled, ownerEntry) => {
       let nativeSettled = false;
       const refreshDispatchBlock = () => {
-        if (!selected || ownerEntry.dispatchBlocked) return;
-        const latest = state.getMessage(message.id);
-        if (latest?.state === MESSAGE_STATES.ACCEPTED && !hasCurrentNativeAcknowledgment(latest)) {
-          ownerEntry.dispatchBlocked = true;
-        }
+        refreshCourierCustodyBlock(message.id, ownerEntry);
       };
       const settleNative = () => {
         if (nativeSettled) return;

@@ -30,6 +30,17 @@ export function hasRetiredCourierAttempt(state: Pick<ForwardState, 'db'>, messag
     .get(COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, messageId, attemptReceiptId));
 }
 
+export function hasCourierForwardClaim(state: Pick<ForwardState, 'db'>, messageId: string, attemptId: string | null = null): boolean {
+  const query = attemptId === null
+    ? `SELECT id FROM receipts WHERE kind=? AND discord_id=? LIMIT 1`
+    : `SELECT id FROM receipts WHERE kind=? AND discord_id=?
+      AND json_extract(detail, '$.attemptId')=? LIMIT 1`;
+  const row = attemptId === null
+    ? state.db.prepare(query).get(COURIER_RECEIPT_KINDS.FORWARD_CLAIM, messageId)
+    : state.db.prepare(query).get(COURIER_RECEIPT_KINDS.FORWARD_CLAIM, messageId, attemptId);
+  return Boolean(row);
+}
+
 export function claimCourierForward(deps: CourierDependencies, state: ForwardState, routeId: string, event: unknown) {
   deps.assertText(routeId, 'routeId', 128);
   if (!record(event) || event.hook_event_name !== FORWARD.EVENT || event.tool_name !== FORWARD.TOOL ||
@@ -85,10 +96,9 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
         JSON.stringify(envelope) !== JSON.stringify(current.attempt.envelope)) {
       throw new deps.BindingError('courier attempt changed after admission');
     }
-    const claimed = state.db.prepare(`SELECT id FROM receipts WHERE kind=? AND discord_id=?
-      AND json_extract(detail, '$.attemptId')=? LIMIT 1`)
-      .get(COURIER_RECEIPT_KINDS.FORWARD_CLAIM, messageId, id);
-    if (claimed) throw new deps.BindingError('courier forwarding attempt is already claimed');
+    if (hasCourierForwardClaim(state, messageId, id)) {
+      throw new deps.BindingError('courier forwarding attempt is already claimed');
+    }
 
     // Commit before the host call. An interrupted or uncertain call never regains permission.
     state.receipt(messageId, COURIER_RECEIPT_KINDS.FORWARD_CLAIM, {
