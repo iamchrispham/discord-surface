@@ -507,8 +507,10 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
 
   function courierCustodyRequiresOwnerHold(messageId) {
     const latest = state.getMessage(messageId);
+    const attempt = state.getCourierAttempt?.(messageId);
     return Boolean(latest && latest.state === MESSAGE_STATES.ACCEPTED &&
-      !hasCurrentNativeAcknowledgment(latest) && state.getCourierAttempt?.(messageId));
+      !hasCurrentNativeAcknowledgment(latest) && attempt &&
+      !state.hasRetiredCourierAttempt?.(messageId, attempt.attempt.receiptId));
   }
 
   function refreshCourierCustodyBlock(messageId, ownerEntry) {
