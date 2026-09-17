@@ -402,3 +402,69 @@ for (const kind of ['channel', 'history']) {
     assert.equal(f.dispatched.length, 0);
   });
 }
+
+for (const fetchKind of ['channel', 'baseline', 'history']) {
+  for (const retry of [false, true]) for (const concurrent of ['arrival', 'gap', 'readiness-hold']) {
+    test(`parent failed ${fetchKind} keeps current custody: retry=${retry}, ${concurrent}`, { timeout: 5000 }, async t => {
+      const f = fixture(t);
+      if (fetchKind === 'baseline') {
+        f.state.db.prepare('DELETE FROM intake_watermarks WHERE channel_id=?').run('1000');
+        f.state.markIntakeBoundary('1000', 'pending', 'new binding needs baseline');
+      }
+      if (retry) {
+        f.fail({ id: '1000', kind: 'channel', status: 503 });
+        await f.recover(); f.fail(null);
+      }
+      let heldBinding;
+      const injectFailure = () => {
+        const binding = f.state.getBinding('1000');
+        const message = { ...f.message('101', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+        assert.equal(f.state.acceptDiscordMessage(message, { expectedBinding: binding }).accepted, true);
+        f.history.set('1000', [f.message('101', '1000')]);
+        if (concurrent === 'gap') f.state.markIntakeBoundary('1000', 'gap', 'newer explicit hold', '101', '110', binding);
+        if (concurrent === 'readiness-hold') {
+          f.state.setBindingReadiness('1000', 'unavailable', 'newer readiness hold', binding);
+          heldBinding = f.state.getBinding('1000');
+        }
+        throw Object.assign(new Error('fetch failed'), { status: 503 });
+      };
+      const originalChannelFetch = f.gateway.client.channels.fetch;
+      let reached = false;
+      if (fetchKind === 'channel') {
+        const fetch = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+        f.gateway.client.channels.fetch = async id => {
+          if (id !== '1000') return fetch(id);
+          reached = true; injectFailure();
+        };
+      } else {
+        const fetch = f.gateway.fetchHistory.bind(f.gateway);
+        f.gateway.fetchHistory = async (channel, options) => {
+          if (channel.id !== '1000') return fetch(channel, options);
+          assert.equal(options.after, fetchKind === 'baseline' ? undefined : '100');
+          reached = true; injectFailure();
+        };
+      }
+      await f.recover();
+      assert.equal(reached, true);
+      assert.equal(f.state.getMessage('101').state, 'accepted');
+      assert.equal(f.boundary('1000').last_seen_id, '101');
+      assert.equal(f.cursor('1000'), fetchKind === 'baseline' ? null : '100');
+      assert.equal(f.dispatched.length, 0);
+      if (concurrent === 'gap') {
+        assert.equal(f.boundary('1000').state, 'gap');
+        assert.equal(f.boundary('1000').detail, 'newer explicit hold');
+      } else if (concurrent === 'readiness-hold') {
+        assert.equal(f.state.getBinding('1000').readiness, 'unavailable');
+        assert.deepEqual(f.state.getBinding('1000'), heldBinding);
+      } else {
+        assert.equal(f.boundary('1000').state, 'unavailable');
+        assert.match(f.boundary('1000').detail, /Discord HTTP 503 during recovery/);
+        f.gateway.client.channels.fetch = originalChannelFetch;
+        await f.reopen();
+        await f.recover();
+        assert.equal(f.boundary('1000').state, 'ready');
+        assert.equal(f.state.getMessage('101').state, 'accepted');
+      }
+    });
+  }
+}

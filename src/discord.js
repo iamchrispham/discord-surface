@@ -2394,8 +2394,17 @@ class DiscordGateway {
       let ownedReadiness = recovering.readiness;
       const currentRecovery = () => this.isCurrentBinding(binding) &&
         this.state.getBinding(binding.channelId)?.readiness === ownedReadiness;
-      const recordOwnedBoundary = async (...args) => {
-        const result = await this.recordBoundary(...args, ownedReadiness);
+      const recordOwnedBoundary = async (owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary) => {
+        if (nextState === READINESS.GAP || nextState === READINESS.UNAVAILABLE) {
+          if (!currentRecovery()) return null;
+          const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+          if (currentBoundary?.state === READINESS.GAP || currentBoundary?.state === READINESS.UNAVAILABLE) return null;
+          if (currentBoundary) {
+            expectedBoundary = currentBoundary;
+            gapFrom = currentBoundary.recovered_through_id;
+          }
+        }
+        const result = await this.recordBoundary(owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary, ownedReadiness);
         if (result?.watermark) ownedReadiness = result.watermark.state;
         return result;
       };
@@ -2622,13 +2631,6 @@ class DiscordGateway {
           failure ||= { ready: false, state: 'unavailable', error };
           continue;
         }
-        const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
-        if (currentBoundary?.state === READINESS.GAP || currentBoundary?.state === READINESS.UNAVAILABLE) {
-          ownedBoundary = currentBoundary;
-          failure ||= { ready: false, state: currentBoundary.state };
-          continue;
-        }
-        if (currentBoundary) ownedBoundary = currentBoundary;
         const recorded = await recordOwnedBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, ownedBoundary?.recovered_through_id, attemptedId || after, signal, deadline, ownedBoundary);
         if (recorded?.watermark) ownedBoundary = recorded.watermark;
         failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
