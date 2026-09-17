@@ -1174,6 +1174,7 @@ class DiscordGateway {
     this.decisionRecoveryPromise = null;
     this.decisionRecoveryController = null;
     this.recoveryFollowupPromise = null;
+    this.recoveryFollowupScope = null;
     this.pendingRecoveryChannels = new Set();
     this.pendingFullRecovery = false;
     this.liveCheckpointController = null;
@@ -2717,8 +2718,11 @@ class DiscordGateway {
       if (!this.pendingRecoveryChannels.size && !this.pendingFullRecovery) return this.recoveryPromise;
       if (!this.recoveryFollowupPromise) {
         const activeRecovery = this.recoveryPromise;
+        const followupScope = channelIds === null || channelIds === undefined ? null : new Set(channelIds);
+        this.recoveryFollowupScope = followupScope;
         this.recoveryFollowupPromise = activeRecovery.then(result => {
           this.recoveryFollowupPromise = null;
+          this.recoveryFollowupScope = null;
           if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
           const runFullRecovery = this.pendingFullRecovery;
           const queuedChannels = new Set(this.pendingRecoveryChannels);
@@ -2728,6 +2732,7 @@ class DiscordGateway {
           return queuedChannels.size ? this.recoverTransport(`${reason} follow-up`, lifecycleEpoch, queuedChannels) : result;
         }, error => {
           this.recoveryFollowupPromise = null;
+          this.recoveryFollowupScope = null;
           throw error;
         });
       }
@@ -2759,7 +2764,10 @@ class DiscordGateway {
       }
     }
     const followup = this.recoveryFollowupPromise;
-    if (!followup) return result;
+    const followupScope = this.recoveryFollowupScope;
+    const followupIsInScope = !followupScope || !selectedChannels ||
+      [...followupScope].every(channelId => selectedChannels.has(channelId));
+    if (!followup || !followupIsInScope) return result;
     const followupResult = await followup;
     if (result?.ready !== true && followupResult?.ready === true) {
       return this.recoverTransport(`${reason} full follow-up`, lifecycleEpoch, selectedChannels);
