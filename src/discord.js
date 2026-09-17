@@ -2398,8 +2398,15 @@ class DiscordGateway {
         if (this.stopping || !currentRecovery()) return;
         const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
         if (currentBoundary?.state !== READINESS.PENDING) return;
-        this.recoverTransport(`${reason} boundary retry`, lifecycleEpoch, [binding.channelId]).catch(error => {
+        return this.recoverTransport(`${reason} boundary retry`, lifecycleEpoch, [binding.channelId]).then(recoveryFailure => {
+          if (recoveryFailure) return null;
+          const recoveredBoundary = this.state.getIntakeWatermark(binding.channelId);
+          if (recoveredBoundary?.state !== READINESS.READY) return null;
+          ownedReadiness = recoveredBoundary.state;
+          return { watermark: recoveredBoundary };
+        }).catch(error => {
           this.logger(`Discord intake boundary retry failed: ${error.message}`);
+          return null;
         });
       };
       const recordOwnedBoundary = async (owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary) => {
@@ -2414,7 +2421,10 @@ class DiscordGateway {
         }
         const result = await this.recordBoundary(owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary, ownedReadiness);
         if (result?.watermark) ownedReadiness = result.watermark.state;
-        if (!result) queueRecoveryIfPending();
+        if (!result) {
+          const queuedRecovery = queueRecoveryIfPending();
+          if (queuedRecovery) return queuedRecovery;
+        }
         return result;
       };
       let retryBoundary = null;
