@@ -3158,11 +3158,16 @@ class DiscordGateway {
       let result;
       try {
         if (message.state === 'accepted') {
-          result = await waitForRecoveryOperation(
-            () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true, awaitDispatchOutcome: true }),
-            signal,
-            deadline
-          );
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            result = await waitForRecoveryOperation(
+              () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true, awaitDispatchOutcome: true }),
+              signal,
+              deadline
+            );
+            const stillAccepted = result?.status === DISPATCH_OUTCOMES.NOT_SUBMITTED &&
+              this.state.getMessage(message.id)?.state === 'accepted';
+            if (!stillAccepted || !this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready) break;
+          }
         } else if (message.state === 'submitted') {
           result = await waitForRecoveryOperation(
             () => this.consumer.resumeSubmitted(storedMessage, signal, { continueUntilFinal: true }),
