@@ -222,3 +222,183 @@ for (const id of ['1000', '2000']) {
     assert.equal(f.replies.filter(r => r.content === 'recovered answer' && r.channelId === id).length, 1);
   });
 }
+
+function freezeRecoveryClock(t) {
+  const RealDate = global.Date;
+  const instant = RealDate.now();
+  global.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length ? args : [instant])); }
+    static now() { return instant; }
+  };
+  t.after(() => { global.Date = RealDate; });
+}
+
+for (const id of ['1000', '2000']) {
+  for (const kind of ['channel', 'history']) {
+    test(id + ' retry preserves a newer gap during ' + kind + ' fetch', { timeout: 3000 }, async t => {
+      freezeRecoveryClock(t);
+      const f = fixture(t);
+      f.fail({ id, kind: 'channel', status: 503 });
+      await f.recover();
+      assert.equal(f.boundary(id).state, 'unavailable');
+      f.fail(null);
+      let injected = false;
+      const inject = () => {
+        if (injected) return;
+        injected = true;
+        const owner = f.state.getBinding('1000');
+        if (id === '1000') f.state.markIntakeBoundary(id, 'gap', 'newer unresolved custody', '101', '110', owner);
+        else f.state.markThreadBoundary(id, 'gap', 'newer unresolved custody', '101', '110', owner);
+      };
+      if (kind === 'channel') {
+        const fetch = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+        f.gateway.client.channels.fetch = async channelId => {
+          const value = await fetch(channelId);
+          if (channelId === id) inject();
+          return value;
+        };
+      } else {
+        const fetch = f.gateway.fetchHistory.bind(f.gateway);
+        f.gateway.fetchHistory = async (channel, options) => {
+          const value = await fetch(channel, options);
+          if (channel.id === id) inject();
+          return value;
+        };
+      }
+      await f.recover();
+      assert.equal(injected, true, 'probe must reach the awaited fetch');
+      assert.equal(f.boundary(id).state, 'gap', 'retry erased a newer gap');
+      assert.equal(f.boundary(id).detail, 'newer unresolved custody');
+      assert.equal(f.dispatched.length, 0);
+    });
+  }
+}
+test('pre-adoption 503 waits for later recovery instead of scheduling itself again', { timeout: 3000 }, async t => {
+  const f = fixture(t, { adoptThread: false });
+  f.fail({ id: '2000', kind: 'channel', status: 503 });
+  await f.gateway.recoverTransport('startup');
+  for (let i = 0; i < 4 && f.gateway.liveCheckpointPromise; i++) {
+    await f.gateway.liveCheckpointPromise;
+  }
+  assert.ok(!f.gateway.liveCheckpointRetryTimer, 'persistent 503 armed another live retry');
+  assert.equal(f.calls.filter(c => c.kind === 'channel' && c.id === '2000').length, 1,
+    'one recovery invocation caused repeated child fetches');
+  assert.equal(f.dispatched.length, 0);
+});
+
+for (const expired of [true, false]) {
+  test('parent retry with ' + (expired ? 'expired' : 'fresh') + ' deadline before first fetch', { timeout: 3000 }, async t => {
+    const f = fixture(t);
+    f.fail({ id: '1000', kind: 'channel', status: 503 });
+    await f.recover();
+    const held = f.boundary('1000');
+    assert.equal(held.state, 'unavailable');
+    f.fail(null); f.calls.length = 0;
+    const originalNow = Date.now;
+    const readiness = f.state.setBindingReadiness.bind(f.state);
+    f.state.setBindingReadiness = (...args) => {
+      const result = readiness(...args);
+      if (expired && args[0] === '1000' && args[1] === 'recovering') {
+        const exhausted = originalNow() + f.gateway.recoveryTimeoutMs + 1;
+        Date.now = () => exhausted;
+      }
+      return result;
+    };
+    try { await f.recover(); }
+    finally { Date.now = originalNow; f.state.setBindingReadiness = readiness; }
+    if (expired) {
+      assert.equal(f.calls.filter(c => c.id === '1000').length, 0, 'no fetch started');
+      assert.equal(f.boundary('1000').state, held.state, 'unused deadline erased retryability');
+      assert.equal(f.boundary('1000').detail, held.detail);
+    }
+    assert.equal(f.cursor('1000'), '100');
+    assert.equal(f.dispatched.length, 0);
+    await f.reopen(); await f.recover();
+    assert.equal(f.boundary('1000').state, 'ready', 'later recovery must remain possible');
+  });
+}
+const { recoverThread } = require('../src/discord/thread-enrollment');
+const { waitForRecoveryOperation } = require('../src/discord');
+for (const expired of [true, false]) {
+  test('child retry with ' + (expired ? 'expired' : 'fresh') + ' shared deadline', { timeout: 3000 }, async t => {
+    const f = fixture(t);
+    f.fail({ id: '2000', kind: 'channel', status: 503 });
+    await f.recover();
+    const held = f.boundary('2000');
+    assert.equal(held.state, 'unavailable');
+    f.fail(null); f.calls.length = 0;
+    await recoverThread(f.gateway, held, new AbortController().signal,
+      f.gateway.lifecycleEpoch, waitForRecoveryOperation, false, Date.now() + (expired ? -1 : 2000));
+    if (expired) {
+      assert.equal(f.calls.filter(c => c.id === '2000').length, 0, 'no fetch started');
+      assert.equal(f.boundary('2000').state, held.state, 'unused deadline erased retryability');
+      assert.equal(f.boundary('2000').detail, held.detail);
+    }
+    assert.equal(f.cursor('2000'), '100');
+    assert.equal(f.dispatched.length, 0);
+    await f.reopen();
+    await f.recover();
+    assert.equal(f.boundary('2000').state, 'ready', 'later recovery must remain possible');
+  });
+}
+
+
+test('recovery fetch inventory stays covered by parent, child and delivery lifecycle cases', () => {
+  const source = path.join(__dirname, '../src');
+  const consumers = {};
+  for (const relative of fs.readdirSync(source, { recursive: true })) {
+    if (!/\.(?:js|ts)$/.test(relative)) continue;
+    const count = (fs.readFileSync(path.join(source, relative), 'utf8').match(/\brecoveryFetch\(/g) || []).length;
+    if (count) consumers[relative.split(path.sep).join('/')] = count;
+  }
+  assert.deepEqual(consumers, { 'discord.js': 5, 'discord/thread-enrollment.ts': 2 },
+    'map each new recovery fetch to deadline, concurrent-boundary and delivery custody cases');
+});
+
+test('pre-adoption retry never clears an explicit gap carrying the prior 503 detail', async t => {
+  const f = fixture(t, { adoptThread: false });
+  f.fail({ id: '2000', kind: 'channel', status: 503 });
+  await f.recover();
+  const detail = f.boundary('2000').detail;
+  f.state.markThreadBoundary('2000', 'gap', detail, '101', '202', f.state.getBinding('1000'));
+  const held = f.boundary('2000');
+  f.fail(null); f.calls.length = 0;
+  await f.recover();
+  assert.deepEqual(f.boundary('2000'), held);
+  assert.equal(f.calls.filter(call => call.id === '2000').length, 0);
+});
+
+for (const kind of ['channel', 'history']) {
+  test('parent retry preserves same-owner readiness-only hold during ' + kind + ' fetch', async t => {
+    freezeRecoveryClock(t);
+    const f = fixture(t);
+    f.fail({ id: '1000', kind: 'channel', status: 503 });
+    await f.recover();
+    f.fail(null);
+    let held;
+    const inject = () => {
+      held = f.boundary('1000');
+      f.state.setBindingReadiness('1000', 'unavailable', 'native endpoint lost', f.state.getBinding('1000'));
+    };
+    if (kind === 'channel') {
+      const fetch = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+      f.gateway.client.channels.fetch = async id => {
+        const value = await fetch(id);
+        if (id === '1000') inject();
+        return value;
+      };
+    } else {
+      const fetch = f.gateway.fetchHistory.bind(f.gateway);
+      f.gateway.fetchHistory = async (channel, options) => {
+        const value = await fetch(channel, options);
+        if (channel.id === '1000') inject();
+        return value;
+      };
+    }
+    await f.recover();
+    assert.ok(held);
+    assert.equal(f.state.getBinding('1000').readiness, 'unavailable');
+    assert.deepEqual(f.boundary('1000'), held);
+    assert.equal(f.dispatched.length, 0);
+  });
+}

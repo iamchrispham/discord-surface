@@ -1,6 +1,6 @@
 const discord = () => require('discord.js') as typeof import('discord.js');
 import { CODEX_VALIDATION_KINDS } from '../native-transcript';
-import { isRetryableFetchBoundary, recoveryFetch } from './recovery-fetch';
+import { isPreAdoptionRetryableThread, isRetryableFetchBoundary, recoveryFetch } from './recovery-fetch';
 import { THREAD_STATES, type ThreadBinding, type ThreadEnrollment, type ThreadRoute, type ThreadState } from '../state/thread-enrollment';
 
 export interface ThreadChannel {
@@ -45,9 +45,9 @@ interface ThreadStateOwner {
   getMessageRoute(id: string): ThreadRoute | null;
   getThreadEnrollment(id: string): ThreadEnrollment | null;
   enrollThread(input: { threadId: string; parentChannelId: string; guildId: string }, binding: ThreadBinding): unknown;
-  setThreadBaseline(id: string, latestId: string | null, binding: ThreadBinding): unknown;
-  markThreadBoundary(id: string, state: ThreadState, detail: string, from: string | null, to: string | null, binding: ThreadBinding, coverageId?: string | null, lastSeenBaselineId?: string | null): ThreadEnrollment | null;
-  checkpointThread(id: string, coverage: string, binding: ThreadBinding): unknown;
+  setThreadBaseline(id: string, latestId: string | null, binding: ThreadBinding, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
+  markThreadBoundary(id: string, state: ThreadState, detail: string, from: string | null, to: string | null, binding: ThreadBinding, coverageId?: string | null, lastSeenBaselineId?: string | null, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
+  checkpointThread(id: string, coverage: string, binding: ThreadBinding, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
   hasIntakeEvidence(id: string): boolean;
 }
 
@@ -93,14 +93,21 @@ export async function enrollPublicThread(state: ThreadStateOwner, client: Thread
 
 export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEnrollment, signal: AbortSignal,
   epoch: number, wait: WaitOperation, checkpointOnly = false, deadline = Date.now() + gateway.recoveryTimeoutMs): Promise<boolean> {
+  const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
+  if (!currentEnrollment?.active) return false;
+  enrollment = currentEnrollment;
   const parent = gateway.state.getMessageRoute(enrollment.parentChannelId);
   if (!parent?.ready) return false;
   const binding = parent.binding;
   const retryableBoundary = enrollment.adoptedAt != null &&
     isRetryableFetchBoundary(enrollment.state, enrollment.detail);
+  const preAdoptionRetryBoundary = isPreAdoptionRetryableThread(enrollment);
+  const retryableHold = retryableBoundary || preAdoptionRetryBoundary;
   if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state) &&
-      !retryableBoundary) return false;
+      !retryableHold) return false;
+  let ownedEnrollment = enrollment;
   const current = () => !signal.aborted && gateway.isCurrentLifecycle(epoch) && gateway.isCurrentBinding(binding);
+  const stale = () => Object.assign(new Error('Thread enrollment changed during recovery'), { recoveryKind: 'stale' });
   const boundary = (
     state: ThreadState,
     detail: string,
@@ -109,25 +116,31 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
     lastSeenBaselineId: string | null | undefined = undefined
   ) => {
     if (!current()) return null;
-    return gateway.state.markThreadBoundary(
+    const next = gateway.state.markThreadBoundary(
       enrollment.threadId,
       state,
       detail,
-      enrollment.recoveredThroughId,
+      ownedEnrollment.recoveredThroughId,
       after,
       binding,
       coverageId,
-      lastSeenBaselineId
+      lastSeenBaselineId,
+      ownedEnrollment
     );
+    if (next) ownedEnrollment = next;
+    return next;
   };
   if (!current()) return false;
-  if (!checkpointOnly) boundary(THREAD_STATES.PENDING, 'Thread history recovery in progress', null);
   let after = enrollment.recoveredThroughId;
   const startingAfter = after;
   const startingLastSeenId = enrollment.lastSeenId;
   let recoveryAttempted = false;
   try {
     const channel = await wait(() => {
+      if (!checkpointOnly) {
+        const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery in progress', null);
+        if (!pending) throw stale();
+      }
       recoveryAttempted = true;
       return recoveryFetch(() => gateway.client.channels.fetch(enrollment.threadId));
     }, signal, deadline);
@@ -146,12 +159,17 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       const baseline = await readHistory({ limit: 1, signal });
       if (!current()) return false;
       if (baseline.some(message => !/^\d+$/.test(message.id))) throw new Error('Thread history message has no stable ID');
+      const fetchedEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
+      if (!fetchedEnrollment?.active || fetchedEnrollment.state === THREAD_STATES.GAP || fetchedEnrollment.state === THREAD_STATES.UNAVAILABLE) return false;
+      ownedEnrollment = fetchedEnrollment;
       const fetchedNewest = baseline.sort((a, b) => compareIds(b.id, a.id))[0]?.id || null;
       const liveLastSeenId = gateway.state.getThreadEnrollment(enrollment.threadId)?.lastSeenId || null;
       let newest = fetchedNewest || liveLastSeenId;
       if (fetchedNewest && liveLastSeenId && compareIds(liveLastSeenId, fetchedNewest) > 0) newest = liveLastSeenId;
-      if (!gateway.state.setThreadBaseline(enrollment.threadId, newest, binding)) return false;
-      after = gateway.state.getThreadEnrollment(enrollment.threadId)?.recoveredThroughId || null;
+      const baselineEnrollment = gateway.state.setThreadBaseline(enrollment.threadId, newest, binding, ownedEnrollment);
+      if (!baselineEnrollment) return false;
+      ownedEnrollment = baselineEnrollment;
+      after = baselineEnrollment.recoveredThroughId;
     }
     let pages = 0;
     let total = 0;
@@ -161,6 +179,9 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       const options = { limit: gateway.historyPageLimit, signal, ...(after ? { after } : {}) };
       const page = await readHistory(options);
       if (!current()) return false;
+      const fetchedEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
+      if (!fetchedEnrollment?.active || fetchedEnrollment.state === THREAD_STATES.GAP || fetchedEnrollment.state === THREAD_STATES.UNAVAILABLE) return false;
+      ownedEnrollment = fetchedEnrollment;
       pages += 1;
       if (!page.length) { complete = true; break; }
       if (page.some(message => !/^\d+$/.test(message.id))) throw new Error('Thread history message has no stable ID');
@@ -180,6 +201,9 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
             gateway.normalizeFetchedMessage(message, channel), false, message.id, binding, false, signal, deadline, true
           );
           if (intake?.stale || !current()) return false;
+          const afterIntake = gateway.state.getThreadEnrollment(enrollment.threadId);
+          if (!afterIntake?.active || afterIntake.state === THREAD_STATES.GAP || afterIntake.state === THREAD_STATES.UNAVAILABLE) return false;
+          ownedEnrollment = afterIntake;
         }
         after = message.id;
         total += 1;
@@ -196,7 +220,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
     if (!complete) {
       if (checkpointOnly) {
         const advanced = Boolean(after && (!startingAfter || compareIds(after, startingAfter) > 0));
-        const checkpointed = advanced ? gateway.state.checkpointThread(enrollment.threadId, after!, binding) as ThreadEnrollment | null : null;
+        const checkpointed = advanced ? gateway.state.checkpointThread(enrollment.threadId, after!, binding, ownedEnrollment) : null;
         if (!checkpointed || checkpointed.recoveredThroughId !== after) {
           boundary(THREAD_STATES.GAP, 'Thread history recovery bound reached', after);
         }
@@ -207,21 +231,25 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
     }
     if (checkpointOnly) {
       const advanced = Boolean(after && (!startingAfter || compareIds(after, startingAfter) > 0));
-      const checkpointed = advanced ? gateway.state.checkpointThread(enrollment.threadId, after!, binding) as ThreadEnrollment | null : null;
+      const checkpointed = advanced ? gateway.state.checkpointThread(enrollment.threadId, after!, binding, ownedEnrollment) : null;
       return Boolean(checkpointed?.recoveredThroughId === after && checkpointed.recoveredThroughId !== startingAfter);
     }
-    const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
-    if (!currentEnrollment?.active) return false;
-    const liveCustodyAhead = Boolean(currentEnrollment.lastSeenId &&
-      (!after || compareIds(currentEnrollment.lastSeenId, after) > 0));
+    const liveEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
+    if (!liveEnrollment?.active) return false;
+    const liveCustodyAhead = Boolean(liveEnrollment.lastSeenId &&
+      (!after || compareIds(liveEnrollment.lastSeenId, after) > 0));
     if (liveCustodyAhead) {
+      if (liveEnrollment.state !== THREAD_STATES.PENDING && liveEnrollment.state !== THREAD_STATES.READY) return false;
       gateway.state.markThreadBoundary(
         enrollment.threadId,
         THREAD_STATES.GAP,
         'live Discord custody arrived while thread recovery was closing',
-        currentEnrollment.recoveredThroughId,
-        currentEnrollment.lastSeenId,
-        binding
+        liveEnrollment.recoveredThroughId,
+        liveEnrollment.lastSeenId,
+        binding,
+        undefined,
+        undefined,
+        liveEnrollment
       );
       return false;
     }
@@ -230,8 +258,16 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   } catch (error) {
     if (!current()) return false;
     if (!checkpointOnly) {
-      const deadlineReached = (error as { recoveryKind?: string }).recoveryKind === CODEX_VALIDATION_KINDS.DEADLINE;
-      if (deadlineReached && !recoveryAttempted) return false;
+      const recoveryKind = (error as { recoveryKind?: string }).recoveryKind;
+      const deadlineReached = recoveryKind === CODEX_VALIDATION_KINDS.DEADLINE;
+      if (deadlineReached && !recoveryAttempted) {
+        if (!retryableHold) {
+          const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery pending before first fetch', null);
+          if (!pending) return false;
+        }
+        return false;
+      }
+      if (recoveryKind === 'stale') return false;
       const detail = error instanceof Error ? error.message : String(error);
       const preAdoptionRetry = !gateway.state.getThreadEnrollment(enrollment.threadId)?.adoptedAt &&
         isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
