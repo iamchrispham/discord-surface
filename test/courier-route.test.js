@@ -538,6 +538,29 @@ test('resumed courier refusal blocks later owner work with or without route sele
   }
 });
 
+test('held accepted courier custody does not fall back to the parent provider', async t => {
+  const f = fixture(t);
+  assert.equal(f.state.claimDispatch(f.message.id).claimed, true);
+  const claimed = f.state.beginCourierAttempt(f.message.id, preparedInput(f, f.message));
+  assert.equal(claimed.accepted, true);
+  f.state.recordCourierOutcome(f.message.id, claimed.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+  f.state.markSubmitted(f.message.id);
+  assert.equal(persistGuardRefusal(f.state, f.route.routeId, {
+    session_id: COURIER_NATIVE,
+    cwd: f.dir,
+    tool_input: { prompt: preparedInput(f, f.message).prompt }
+  }, 'courier forwarding authorization held'), true);
+
+  const courierCalls = [];
+  const parentCalls = [];
+  const result = await consumerFor(f, { courierRoute: null, courierCalls, parentCalls })
+    .processAccepted(f.state.getMessage(f.message.id));
+  assert.equal(result.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+  assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(courierCalls, []);
+  assert.deepEqual(parentCalls, []);
+});
+
 test('revoked selected route returns to accepted without parent fallback', async t => {
   const f = fixture(t);
   f.state.revokeCourierRoute(f.route.routeId, 'route paused');

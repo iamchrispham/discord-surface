@@ -13,9 +13,11 @@ const WRAPPER = path.resolve(__dirname, '../src/courier-guard.sh');
 const PARENT = '11111111-1111-1111-1111-111111111111';
 const COURIER = '22222222-2222-2222-2222-222222222222';
 
-function fixture(t, { agent = false, hostId = null, preAttemptReceipt = false } = {}) {
+function fixture(t, options = {}) {
+  const { agent = false, hostId = null, preAttemptReceipt = false } = options;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'courier-guard-'));
   const sessionRoot = path.join(dir, 'sessions');
+  const routeSessionRoot = Object.hasOwn(options, 'routeSessionRoot') ? options.routeSessionRoot : sessionRoot;
   fs.mkdirSync(sessionRoot);
   const db = path.join(dir, 'surface.sqlite');
   let state = new SurfaceState(db);
@@ -28,7 +30,7 @@ function fixture(t, { agent = false, hostId = null, preAttemptReceipt = false } 
   const target = { guildId: '100', channelId: '2000', provider: 'codex', nativeId: PARENT, generation: binding.generation };
   const route = state.registerCourierRoute({ routeId: 'guard-route', routeGeneration: 1,
     guildId: '100', parentChannelId: '1000', deliveryChannelId: '2000', target,
-    courier: { provider: 'codex', nativeId: COURIER, workspace: dir, sessionRoot, recipientThreadId: PARENT, hostId }
+    courier: { provider: 'codex', nativeId: COURIER, workspace: dir, sessionRoot: routeSessionRoot, recipientThreadId: PARENT, hostId }
   });
   const packet = { id: 'request-guard', kind: KINDS.REQUEST,
     source: { ...target, provider: 'claude', channelId: '3000', nativeId: '33333333-3333-3333-3333-333333333333' },
@@ -44,7 +46,7 @@ function fixture(t, { agent = false, hostId = null, preAttemptReceipt = false } 
   const claim = state.beginCourierAttempt('9000', { routeId: route.routeId, prompt });
   assert.equal(claim.accepted, true);
   const event = { session_id: COURIER, turn_id: 'fixture-turn', tool_use_id: 'fixture-call',
-    cwd: dir, transcript_path: path.join(sessionRoot, `${COURIER}.jsonl`), hook_event_name: 'PreToolUse',
+    cwd: dir, transcript_path: path.join(routeSessionRoot || sessionRoot, `${COURIER}.jsonl`), hook_event_name: 'PreToolUse',
     tool_name: 'mcp__codex_app__send_message_to_thread',
     tool_input: { threadId: PARENT, prompt, ...(hostId ? { hostId } : {}) } };
   const argv = ['--disable-warning=ExperimentalWarning', CLI, 'courier-guard', '--db', db, '--courier-route-id', route.routeId];
@@ -123,6 +125,22 @@ test('courier transcript path must stay within the enrolled session root', t => 
   }
   const f = fixture(t);
   assert.equal(invoke(f).status, 0);
+});
+
+test('null courier roots use the configured Codex session root', t => {
+  const f = fixture(t, { routeSessionRoot: null });
+  const fallbackRoot = path.join(f.dir, 'configured', 'sessions');
+  fs.mkdirSync(fallbackRoot, { recursive: true });
+  const priorCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = path.dirname(fallbackRoot);
+  try {
+    const event = { ...f.event, transcript_path: path.join(fallbackRoot, `${COURIER}.jsonl`) };
+    assert.equal(invoke(f, event).status, 0);
+    assert.equal(f.state.getCourierRoute(f.route.routeId).courier.sessionRoot, null);
+  } finally {
+    if (priorCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = priorCodexHome;
+  }
 });
 
 test('current route, generation, authorization and child readiness are rechecked at forwarding', t => {
@@ -251,6 +269,16 @@ test('public hook startup blocks when its module or runtime build is missing', t
   result = run();
   denied({ ...result, decision: JSON.parse(result.stdout).hookSpecificOutput }, /build is missing/);
   assert.equal(f.claims().length, 0);
+});
+
+test('courier guard help prints usage without consuming hook input', t => {
+  const f = fixture(t);
+  const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', CLI, 'courier-guard', '--help'], {
+    input: JSON.stringify(f.event), encoding: 'utf8', timeout: 5000
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  assert.match(result.stdout, /Usage: discord-surface <command> \[options\]/);
 });
 
 test('shell hook wrapper blocks missing CLI and unavailable Node', t => {

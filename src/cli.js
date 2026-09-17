@@ -4,9 +4,10 @@ const os = require('node:os');
 const path = require('node:path');
 
 // Hook startup failures must block the tool, including a missing runtime build.
-if (require.main === module && parseArgs(process.argv.slice(2)).command === 'courier-guard') {
+const startup = parseArgs(process.argv.slice(2));
+if (require.main === module && startup.command === 'courier-guard' && !startup.args.help) {
   try {
-    require('./courier-guard').courierGuard(parseArgs(process.argv.slice(2)).args, pathsFor);
+    require('./courier-guard').courierGuard(startup.args, pathsFor);
   } catch (error) {
     process.stderr.write(`discord-surface courier guard: ${error.message}\n`);
     process.exitCode = 2;

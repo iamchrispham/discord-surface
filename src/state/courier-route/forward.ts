@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_ROUTE_STATES } from './constants';
 import { attemptId, attemptKey, createEnvelope, payloadHash } from './envelope';
 import { findMatchingRoute, getRoute } from './route';
@@ -18,9 +19,14 @@ function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function transcriptIsInSessionRoot(transcriptPath: unknown, sessionRoot: string | null): boolean {
-  if (typeof transcriptPath !== 'string' || !sessionRoot) return false;
-  const relative = path.relative(path.resolve(sessionRoot), path.resolve(transcriptPath));
+function configuredSessionRoot(): string {
+  return path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
+}
+
+function transcriptIsInSessionRoot(transcriptPath: unknown, configuredRoot: string | null): boolean {
+  if (typeof transcriptPath !== 'string') return false;
+  const effectiveRoot = configuredRoot || configuredSessionRoot();
+  const relative = path.relative(path.resolve(effectiveRoot), path.resolve(transcriptPath));
   return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 

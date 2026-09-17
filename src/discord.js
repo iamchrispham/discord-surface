@@ -1013,9 +1013,17 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
         refreshDispatchBlock();
         onNativeSettled();
       };
-      const work = startNativeWork(message.id, signal, async taskSignal => {
+      refreshDispatchBlock();
+      if (ownerEntry.dispatchBlocked) settleNative();
+      const work = ownerEntry.dispatchBlocked
+        ? Promise.resolve({ status: COURIER_OUTCOMES.NOT_SUBMITTED, message: state.getMessage(message.id) })
+        : startNativeWork(message.id, signal, async taskSignal => {
         let result;
         try {
+          if (courierCustodyRequiresOwnerHold(message.id)) {
+            ownerEntry.dispatchBlocked = true;
+            return { status: COURIER_OUTCOMES.NOT_SUBMITTED, message: state.getMessage(message.id) };
+          }
           result = await dispatchAndObserve(state, message.id, providers, {
             ...observeOptions,
             signal: taskSignal,
