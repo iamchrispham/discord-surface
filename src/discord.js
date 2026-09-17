@@ -1050,7 +1050,8 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
           if (promoted?.state === MESSAGE_STATES.REPLY_READY && result.message?.state !== MESSAGE_STATES.REPLY_READY) {
             result = { ...result, message: promoted };
           }
-          if (['uncertain', 'not_submitted'].includes(result.status) && promoted?.state === MESSAGE_STATES.SUBMITTED) {
+          if (['uncertain', 'not_submitted', 'native-already-acknowledged'].includes(result.status) &&
+            promoted?.state === MESSAGE_STATES.SUBMITTED) {
             result = await observeSubmitted(state, promoted, providers[promoted.provider], {
               ...observeOptions,
               signal: taskSignal,
