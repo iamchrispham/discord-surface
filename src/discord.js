@@ -1176,6 +1176,7 @@ class DiscordGateway {
     this.recoveryFollowupPromise = null;
     this.recoveryFollowupScope = null;
     this.pendingRecoveryChannels = new Set();
+    this.pendingRecoveryRequests = [];
     this.pendingFullRecovery = false;
     this.liveCheckpointController = null;
     this.liveCheckpointPromise = null;
@@ -2525,6 +2526,8 @@ class DiscordGateway {
         const kind = recoveryKind(error);
         if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
         if (kind === CODEX_VALIDATION_KINDS.DEADLINE && retryBoundary && !recoveryAttempted) {
+          this.state.setBindingReadiness(binding.channelId, retryBoundary.state,
+            retryBoundary.detail || `${reason} retry deadline expired`, binding);
           failure ||= { ready: false, state: 'unavailable' };
           continue;
         }
@@ -2807,7 +2810,8 @@ class DiscordGateway {
         const watermark = this.state.getIntakeWatermark(channelId);
         if (binding?.active && binding.readiness === READINESS.READY && watermark?.state === READINESS.READY) continue;
         const enrollment = this.state.getThreadEnrollment(channelId);
-        if (enrollment?.active && enrollment.state === THREAD_STATES.READY) continue;
+        if (enrollment?.active && (enrollment.state === THREAD_STATES.READY ||
+            this.isPreAdoptionRetryableThread(enrollment.threadId))) continue;
         return false;
       }
       if (expanded === null) {
@@ -2867,20 +2871,54 @@ class DiscordGateway {
       }
     }
     if (this.recoveryPromise) {
+      const queuedRequestScope = callerScope === null ? null : new Set(callerScope);
+      if (queuedRequestScope === null || queuedRequestScope.size) {
+        const existingRequest = this.pendingRecoveryRequests.find(request => {
+          if (request.scope === null || queuedRequestScope === null) return request.scope === queuedRequestScope;
+          return request.scope.size === queuedRequestScope.size &&
+            [...request.scope].every(channelId => queuedRequestScope.has(channelId));
+        });
+        if (existingRequest) {
+          existingRequest.deadline = Math.max(existingRequest.deadline, overallDeadline);
+        } else {
+          this.pendingRecoveryRequests.push({ scope: queuedRequestScope, deadline: overallDeadline });
+        }
+      }
       if (!this.pendingRecoveryChannels.size && !this.pendingFullRecovery) return this.recoveryPromise;
       if (!this.recoveryFollowupPromise) {
         const activeRecovery = this.recoveryPromise;
-        this.recoveryFollowupPromise = activeRecovery.then(result => {
+        this.recoveryFollowupPromise = activeRecovery.then(async result => {
           this.recoveryFollowupPromise = null;
           this.recoveryFollowupScope = null;
-          if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+          if (!this.isCurrentLifecycle(lifecycleEpoch)) {
+            this.pendingRecoveryRequests.length = 0;
+            return { ready: false, state: 'stopped' };
+          }
           const runFullRecovery = this.pendingFullRecovery;
           const queuedChannels = new Set(this.pendingRecoveryChannels);
+          const queuedRequests = Array.isArray(this.pendingRecoveryRequests)
+            ? this.pendingRecoveryRequests.splice(0) : [];
           this.pendingFullRecovery = false;
           this.pendingRecoveryChannels.clear();
           this.recoveryFollowupScope = runFullRecovery ? null : new Set(queuedChannels);
-          if (runFullRecovery) return this.recoverTransport(reason, lifecycleEpoch, null, scopeRetryDepth + 1, overallDeadline);
-          return queuedChannels.size ? this.recoverTransport(reason, lifecycleEpoch, queuedChannels, scopeRetryDepth + 1, overallDeadline) : result;
+          if (runFullRecovery) {
+            const fullRequest = queuedRequests.find(request => request.scope === null);
+            return this.recoverTransport(reason, lifecycleEpoch, null, scopeRetryDepth + 1,
+              fullRequest?.deadline ?? overallDeadline);
+          }
+          if (queuedRequests.length) {
+            let followupResult = { ready: true, state: 'ready' };
+            for (const request of queuedRequests) {
+              const requestResult = await this.recoverTransport(reason, lifecycleEpoch, request.scope,
+                scopeRetryDepth + 1, request.deadline);
+              if (requestResult?.state === 'stopped') return requestResult;
+              if (requestResult?.ready !== true) followupResult = requestResult;
+            }
+            return followupResult;
+          }
+          return queuedChannels.size
+            ? this.recoverTransport(reason, lifecycleEpoch, queuedChannels, scopeRetryDepth + 1, overallDeadline)
+            : result;
         }, error => {
           this.recoveryFollowupPromise = null;
           this.recoveryFollowupScope = null;
@@ -2895,6 +2933,7 @@ class DiscordGateway {
       (this.pendingRecoveryChannels.size ? new Set(this.pendingRecoveryChannels) : callerScope);
     this.pendingFullRecovery = false;
     this.pendingRecoveryChannels.clear();
+    this.pendingRecoveryRequests.length = 0;
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
     const activeRecovery = this.recoveryPromise = (async () => {
@@ -3084,6 +3123,7 @@ class DiscordGateway {
     this.pendingHandoffRecoveryChannels.clear();
     this.pendingFullRecovery = false;
     this.pendingRecoveryChannels.clear();
+    this.pendingRecoveryRequests.length = 0;
     this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.stopPromise = (async () => {
       this.ready = false;
