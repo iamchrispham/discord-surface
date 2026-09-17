@@ -2422,8 +2422,7 @@ class DiscordGateway {
         const result = await this.recordBoundary(owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary, ownedReadiness);
         if (result?.watermark) ownedReadiness = result.watermark.state;
         if (!result) {
-          const queuedRecovery = queueRecoveryIfPending();
-          if (queuedRecovery) return queuedRecovery;
+          queueRecoveryIfPending();
         }
         return result;
       };
@@ -2734,7 +2733,7 @@ class DiscordGateway {
     this.pendingRecoveryChannels.clear();
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
-    this.recoveryPromise = (async () => {
+    const activeRecovery = this.recoveryPromise = (async () => {
       const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch, selectedChannels);
       const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
       if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
@@ -2742,13 +2741,19 @@ class DiscordGateway {
       this.releaseRecoveredAttachmentIntake();
       return result;
     })();
-    try { return await this.recoveryPromise; }
-    finally {
-      this.recoveryPromise = null;
-      this.recoveryController = null;
-      this.releaseRecoveredAttachmentIntake();
-      this.scheduleHeldLiveCheckpoints();
+    let result;
+    try {
+      result = await activeRecovery;
+    } finally {
+      if (this.recoveryPromise === activeRecovery) {
+        this.recoveryPromise = null;
+        this.recoveryController = null;
+        this.releaseRecoveredAttachmentIntake();
+        this.scheduleHeldLiveCheckpoints();
+      }
     }
+    const followup = this.recoveryFollowupPromise;
+    return followup ? await followup : result;
   }
 
   async reconcilePending(before = undefined, { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
