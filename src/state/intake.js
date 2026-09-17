@@ -280,7 +280,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
       });
     },
 
-    reconcileIntake(state, channelId, expectedBinding = null) {
+    reconcileIntake(state, channelId, expectedBinding = null, expectedBoundary = null) {
       assertText(channelId, 'channelId', 128);
       return state.transaction(() => {
         if (!intakePauseAllowsUpdate(state, channelId)) return null;
@@ -288,6 +288,13 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
         const watermark = state.getIntakeWatermark(channelId);
         if (!binding || !binding.active || !watermark) throw new BindingError('intake boundary is unknown');
         if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+        if (expectedBoundary) {
+          const allowedStates = Array.isArray(expectedBoundary.states) ? expectedBoundary.states : [];
+          if (!allowedStates.includes(watermark.state) ||
+            typeof expectedBoundary.detailPrefix !== 'string' ||
+            typeof watermark.detail !== 'string' ||
+            !watermark.detail.startsWith(expectedBoundary.detailPrefix)) return watermark;
+        }
         state.db.prepare("UPDATE intake_watermarks SET state='pending', detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?")
           .run('explicit intake reconciliation requested', now(), channelId);
         state.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(READINESS.PENDING, now(), channelId);

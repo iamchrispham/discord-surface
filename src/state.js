@@ -1964,14 +1964,14 @@ class SurfaceState {
     });
   }
 
-  reconcileIntake(channelId, expectedBinding = null) {
+  reconcileIntake(channelId, expectedBinding = null, expectedBoundary = null) {
     const childEnrollment = typeof channelId === 'string' && channelId.length > 0 && channelId.length <= 128
       ? this.db.prepare('SELECT 1 FROM thread_enrollments WHERE thread_id=? AND active=1').get(channelId)
       : null;
     if (childEnrollment) {
       return threadEnrollmentHandlers.reconcileThread(this, channelId, expectedBinding);
     }
-    return intakeHandlers.reconcileIntake(this, channelId, expectedBinding);
+    return intakeHandlers.reconcileIntake(this, channelId, expectedBinding, expectedBoundary);
   }
 
   acceptDiscordMessage(event, { ready = true, coverageId = null, expectedBinding = null, agentToken = null } = {}) {

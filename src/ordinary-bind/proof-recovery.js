@@ -9,13 +9,10 @@ function reconcileProofUnavailableIntake(state, binding, {
   nativeProofError
 }) {
   if (!reused || !nativeProofVerified || !nativeProofDetail || nativeProofError) return binding;
-  const watermark = state.getIntakeWatermark(binding.channelId);
-  const proofUnavailable = watermark &&
-    (watermark.state === READINESS.UNAVAILABLE || watermark.state === READINESS.GAP) &&
-    typeof watermark.detail === 'string' &&
-    watermark.detail.startsWith(ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX);
-  if (!proofUnavailable) return binding;
-  const reopened = state.reconcileIntake(binding.channelId, binding);
+  const reopened = state.reconcileIntake(binding.channelId, binding, {
+    states: [READINESS.UNAVAILABLE, READINESS.GAP],
+    detailPrefix: ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX
+  });
   return reopened ? state.getBinding(binding.channelId) : binding;
 }
 
