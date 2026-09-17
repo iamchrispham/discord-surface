@@ -14,6 +14,7 @@ const { assertSameChannelSelection, resolveDiscordChannel } = require('./channel
 const { assertGatewayWakeCompatible } = require('./gateway-capability');
 const { GATEWAY_CAPABILITIES } = require('./constants');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('../ordinary/constants');
+const { reconcileProofUnavailableIntake } = require('./proof-recovery');
 
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
 const ORDINARY_CODEX_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CODEX_RUNTIME_PID';
@@ -204,15 +205,12 @@ async function ordinaryBind(args, dependencies = {}) {
     } else {
       nativeProof = { status: 'pending', reason: nativeProofError?.message || 'Codex transcript proof is pending' };
     }
-    if (decision === ORDINARY_BINDING_DECISIONS.REUSE && nativeProof.status === 'verified' && nativeProofDetail && !nativeProofError) {
-      const watermark = state.getIntakeWatermark(binding.channelId);
-      const nativeProofUnavailable = watermark && watermark.state === READINESS.UNAVAILABLE &&
-        typeof watermark.detail === 'string' && watermark.detail.startsWith(ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX);
-      if (nativeProofUnavailable) {
-        const reopened = state.reconcileIntake(binding.channelId, binding);
-        if (reopened) binding = state.getBinding(binding.channelId);
-      }
-    }
+    binding = reconcileProofUnavailableIntake(state, binding, {
+      reused: decision === ORDINARY_BINDING_DECISIONS.REUSE,
+      nativeProofVerified: nativeProof.status === 'verified',
+      nativeProofDetail,
+      nativeProofError
+    });
     const gatewayWake = requestGatewayRecovery(paths, {
       status: gatewayStatus,
       kill: dependencies.killProcess || process.kill,
@@ -370,4 +368,4 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
   }
 }
 
-module.exports = { ordinaryBind, ordinaryClaudeBind, resolveCurrentClaudeCaller };
+module.exports = { ordinaryBind, ordinaryClaudeBind, reconcileProofUnavailableIntake, resolveCurrentClaudeCaller };

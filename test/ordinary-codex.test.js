@@ -15,6 +15,7 @@ const { ORDINARY_RECEIPT_KINDS } = require('../src/ordinary/constants');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { runDirectPost } = require('../src/direct-post');
 const { staticConductorMarker } = require('../src/topic');
+const { reconcileProofUnavailableIntake } = require('../src/ordinary-bind');
 const facade = require('../src/ordinary-codex');
 const emitted = require('../dist/ordinary-codex');
 const ordinaryConstantsFacade = require('../src/ordinary/constants');
@@ -417,6 +418,34 @@ test('ordinary bind preserves unrelated terminal intake after native proof recov
     assert.equal(state.getBinding('ordinary-recovery-channel').readiness, READINESS.UNAVAILABLE);
     assert.equal(state.getIntakeWatermark('ordinary-recovery-channel').state, READINESS.UNAVAILABLE);
   } finally { state.close(); }
+});
+
+test('ordinary bind reopens a proof-related intake gap after native proof recovers', t => {
+  const f = fixture(t);
+  const binding = ordinary(f);
+  f.state.recordOrdinaryPreflight(binding, {
+    file: path.join(f.dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: f.dir
+  });
+  f.state.markIntakeBoundary(binding.channelId, READINESS.GAP,
+    'Codex transcript proof unavailable before event write: transcript is unavailable');
+
+  const reopened = reconcileProofUnavailableIntake(f.state, binding, {
+    reused: true,
+    nativeProofVerified: true,
+    nativeProofDetail: { file: path.join(f.dir, 'session.jsonl') },
+    nativeProofError: null
+  });
+
+  assert.equal(reopened.readiness, READINESS.PENDING);
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).state, READINESS.PENDING);
+  assert.equal(f.state.listReceipts().filter(receipt => receipt.kind === 'intake-reconcile-requested').length, 1);
+
+  f.state.markIntakeBoundary(binding.channelId, READINESS.GAP, 'unrelated history gap');
+  const unchanged = reconcileProofUnavailableIntake(f.state, f.state.getBinding(binding.channelId), {
+    reused: true, nativeProofVerified: true, nativeProofDetail: { file: path.join(f.dir, 'session.jsonl') }, nativeProofError: null
+  });
+  assert.equal(unchanged.readiness, READINESS.GAP);
+  assert.equal(f.state.getIntakeWatermark(binding.channelId).state, READINESS.GAP);
 });
 
 test('ordinary bind derives workspace from exact transcript metadata across checkouts', async t => {
