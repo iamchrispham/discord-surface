@@ -2382,12 +2382,21 @@ class DiscordGateway {
       if (currentBoundary?.state === READINESS.UNAVAILABLE) return READINESS.UNAVAILABLE;
       return null;
     };
+    const isInterruptedRetryBoundary = boundary => boundary?.state === READINESS.PENDING &&
+      typeof boundary.detail === 'string' &&
+      boundary.detail.endsWith('retry after Discord HTTP 503');
+    const isRetryableRecoveryBoundary = boundary => boundary &&
+      (isRetryableFetchBoundary(boundary.state, boundary.detail) || isInterruptedRetryBoundary(boundary));
     let failure = null;
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (Date.now() >= deadline) {
         const watermark = this.state.getIntakeWatermark(binding.channelId);
-        if (watermark && isRetryableFetchBoundary(watermark.state, watermark.detail)) {
+        if (isRetryableRecoveryBoundary(watermark)) {
+          if (isInterruptedRetryBoundary(watermark)) {
+            failure ||= { ready: false, state: 'unavailable' };
+            continue;
+          }
           const expired = this.state.markIntakeBoundary(binding.channelId, READINESS.UNAVAILABLE,
             watermark.detail || `${reason} intake unavailable`, watermark.gap_from, watermark.gap_to,
             binding, null, watermark, binding.readiness);
@@ -2485,7 +2494,7 @@ class DiscordGateway {
         return result;
       };
       let retryBoundary = null;
-      if (watermark && isRetryableFetchBoundary(watermark.state, watermark.detail)) {
+      if (isRetryableRecoveryBoundary(watermark)) {
         retryBoundary = watermark;
       }
       if (watermark && ['gap', 'unavailable'].includes(watermark.state) && !retryBoundary) {
@@ -2797,8 +2806,10 @@ class DiscordGateway {
     };
     const scopeIsReady = scope => {
       const expanded = expandScope(scope);
-      if (expanded === null) return false;
-      for (const channelId of expanded) {
+      const channelIds = expanded === null
+        ? new Set(this.state.listBindings().filter(binding => binding.active).map(binding => binding.channelId))
+        : expanded;
+      for (const channelId of channelIds) {
         const binding = this.state.getBinding(channelId);
         const watermark = this.state.getIntakeWatermark(channelId);
         if (binding?.active && binding.readiness === READINESS.READY && watermark?.state === READINESS.READY) continue;
@@ -2806,13 +2817,34 @@ class DiscordGateway {
         if (enrollment?.active && enrollment.state === THREAD_STATES.READY) continue;
         return false;
       }
+      if (expanded === null) {
+        for (const enrollment of this.state.listThreadEnrollments()) {
+          if (enrollment.active && enrollment.state !== THREAD_STATES.READY) return false;
+        }
+      }
       return true;
+    };
+    const queuedFollowupScope = () => {
+      if (this.pendingFullRecovery) return null;
+      if (this.pendingRecoveryChannels.size) return new Set(this.pendingRecoveryChannels);
+      if (this.recoveryFollowupScope instanceof Set) return this.recoveryFollowupScope;
+      return null;
+    };
+    const followupIntersectsCaller = () => {
+      const followupScope = queuedFollowupScope();
+      if (callerScope === null || followupScope === null) return true;
+      const callerChannels = expandScope(callerScope);
+      const followupChannels = expandScope(followupScope);
+      return [...callerChannels].some(channelId => followupChannels.has(channelId));
     };
     const resolveFollowup = async (initialResult, followupResult) => {
       if (!this.isCurrentLifecycle(lifecycleEpoch) || initialResult?.state === 'stopped' || followupResult?.state === 'stopped') {
         return { ready: false, state: 'stopped' };
       }
       if (callerScope === null) {
+        if (initialResult && initialResult.ready !== true && scopeIsReady(null)) {
+          return followupResult?.ready === true ? followupResult : { ready: true, state: 'ready' };
+        }
         if (initialResult && initialResult.ready !== true && followupResult?.ready === true && scopeRetryDepth === 0) {
           return this.recoverTransport(reason, lifecycleEpoch, null, 1);
         }
@@ -2861,6 +2893,7 @@ class DiscordGateway {
           throw error;
         });
       }
+      if (!followupIntersectsCaller()) return this.recoveryPromise;
       const followupResult = await this.recoveryFollowupPromise;
       return resolveFollowup(null, followupResult);
     }
@@ -2890,7 +2923,7 @@ class DiscordGateway {
       }
     }
     const followup = this.recoveryFollowupPromise;
-    if (!followup) return result;
+    if (!followup || !followupIntersectsCaller()) return result;
     const followupResult = await followup;
     return resolveFollowup(result, followupResult);
   }
