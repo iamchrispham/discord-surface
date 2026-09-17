@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { SurfaceState, DIRECT_POST_OUTCOMES: stateOutcomes } = require('../src/state');
+const { SurfaceState, READINESS, DIRECT_POST_OUTCOMES: stateOutcomes } = require('../src/state');
+const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { main } = require('../src/cli');
 const { createSurfaceConsumer } = require('../src/discord');
 const { runDirectPost } = require('../src/direct-post');
@@ -36,9 +37,14 @@ function agentFixture(t) {
   fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture\n', { mode: 0o600 });
   state.bind({ channelId: '101', guildId: '100', provider: 'codex', nativeId: CODEX, workspace: dir,
     conductorId: 'conductor', repoKey: 'repo:fixture' });
+  let binding = state.getBinding('101');
+  binding = state.setBindingReadiness('101', READINESS.READY, 'agent fixture ready', binding);
+  state.enrollThread({ threadId: '103', parentChannelId: '101', guildId: '100' }, binding);
+  state.setThreadBaseline('103', '0', binding);
+  state.markThreadBoundary('103', THREAD_STATES.READY, 'agent fixture child ready', null, null, binding);
   const textFile = path.join(dir, 'milestone.txt');
   t.after(() => { state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { dir, state, nativeId: CODEX, textFile };
+  return { dir, state, nativeId: CODEX, agentThreadId: '103', textFile };
 }
 
 function response(id, status = 200) {
@@ -516,6 +522,7 @@ test('opt-in agent attachment carries the exact wire beside a deterministic prev
     token: 'fixture',
     nativeId: f.nativeId,
     generation: 1,
+    agentThreadId: f.agentThreadId,
     textFile: f.textFile,
     dedupeKey: 'attachment-request',
     agentTarget: issueAgentAddress(destination, 'fixture'),
@@ -556,6 +563,7 @@ test('changing carrier after an unknown attachment POST does not bypass custody'
     token: 'fixture',
     nativeId: f.nativeId,
     generation: 1,
+    agentThreadId: f.agentThreadId,
     textFile: f.textFile,
     dedupeKey: 'uncertain-attachment-request',
     agentTarget: issueAgentAddress(destination, 'fixture')
@@ -905,13 +913,19 @@ test('agent reply can correlate by accepted Discord message ID across duplicate 
   state.setConfig({ operatorId: 'operator', guildId: local.guildId, secretFile: path.join(dir, 'discord.env') });
   fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
   state.bind({ ...local, workspace: dir, conductorId: 'conductor', repoKey: 'repo:fixture' });
+  let localBinding = state.getBinding(local.channelId);
+  localBinding = state.setBindingReadiness(local.channelId, READINESS.READY, 'fixture ready', localBinding);
+  state.enrollThread({ threadId: '457', parentChannelId: local.channelId, guildId: local.guildId }, localBinding);
+  state.setThreadBaseline('457', '1000', localBinding);
+  state.markThreadBoundary('457', THREAD_STATES.READY, 'fixture adoption', null, null, localBinding);
+  const localChild = { ...local, channelId: '457', generation: localBinding.generation };
   const textFile = path.join(dir, 'reply.txt');
   fs.writeFileSync(textFile, 'reply');
   t.after(() => { state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
   const accept = (id, source, key = 'shared-key') => state.acceptDiscordMessage({
-    id, guildId: local.guildId, channelId: local.channelId, authorId: 'discord-bot', isBot: true,
-    content: encodeAgentMessage({ id: key, kind: KINDS.REQUEST, source, target: local, replyTo: null, text: 'request' }, token)
+    id, guildId: local.guildId, channelId: localChild.channelId, authorId: 'discord-bot', isBot: true,
+    content: encodeAgentMessage({ id: key, kind: KINDS.REQUEST, source, target: localChild, replyTo: null, text: 'request' }, token)
   }, { agentToken: token });
   assert.equal(accept('1001', sourceA).accepted, true);
   assert.equal(accept('1002', sourceB).accepted, true);
@@ -923,17 +937,17 @@ test('agent reply can correlate by accepted Discord message ID across duplicate 
     return response('reply-1');
   };
   const result = await runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
-    textFile, dedupeKey: 'result-key', agentKind: KINDS.RESULT, agentReplyTo: '1001', fetchImpl });
+    agentThreadId: localChild.channelId, textFile, dedupeKey: 'result-key', agentKind: KINDS.RESULT, agentReplyTo: '1001', fetchImpl });
   assert.equal(result.parts[0].status, 'sent');
   assert.match(calls[0].url, /\/channels\/901$/);
   const packet = decodeAgentMessage(JSON.parse(calls[1].options.body).content, token, sourceA);
   assert.equal(packet.target.channelId, sourceA.channelId);
   assert.equal(packet.replyTo, 'shared-key');
   await assert.rejects(runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
-    textFile, dedupeKey: 'result-key-ambiguous', agentKind: KINDS.RESULT, agentReplyTo: 'shared-key', fetchImpl }), /unknown or does not match/);
+    agentThreadId: localChild.channelId, textFile, dedupeKey: 'result-key-ambiguous', agentKind: KINDS.RESULT, agentReplyTo: 'shared-key', fetchImpl }), /unknown or does not match/);
   assert.equal(accept('1003', sourceB, '1001').accepted, true);
   const priorCalls = calls.length;
   await assert.rejects(runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
-    textFile, dedupeKey: 'result-key-cross-collision', agentKind: KINDS.RESULT, agentReplyTo: '1001', fetchImpl }), /unknown or does not match/);
+    agentThreadId: localChild.channelId, textFile, dedupeKey: 'result-key-cross-collision', agentKind: KINDS.RESULT, agentReplyTo: '1001', fetchImpl }), /unknown or does not match/);
   assert.equal(calls.length, priorCalls);
 });

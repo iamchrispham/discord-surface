@@ -432,7 +432,9 @@ function canonicalAddress(address: DirectPostBinding | AgentAddress): AgentAddre
 }
 
 function resolveAgentAddress(state: DirectPostState, binding: DirectPostBinding, agentThreadId: string | null = null): AgentAddress {
-  if (agentThreadId === null || agentThreadId === undefined) return canonicalAddress(binding);
+  if (agentThreadId === null || agentThreadId === undefined) {
+    throw new BindingError('agent messages require --agent-thread-id for an actively enrolled child route');
+  }
   if (typeof agentThreadId !== 'string' || agentThreadId.length === 0 || agentThreadId.length > 128) {
     throw new BindingError('agent-thread-id must be a non-empty string');
   }
@@ -676,7 +678,8 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
   const effectiveReplyTarget = source.filePreparation?.inReplyTo ?? replyTarget;
   let deliveryTarget: AgentAddress | null = null;
   let agentPacket: AgentMessage | null = null;
-  const address = isAgentMessage ? resolveAgentAddress(state, binding, agentThreadId) : canonicalAddress(binding);
+  let address = canonicalAddress(binding);
+  if (!watcherNotice && isAgentMessage) address = resolveAgentAddress(state, binding, agentThreadId);
   if (watcherNotice) {
     if (agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT || agentReplyTo !== null) {
       throw new BindingError('watcher notices do not accept agent message options');

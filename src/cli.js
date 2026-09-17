@@ -132,10 +132,11 @@ Use \"discord-surface agent-send --help\" for addressed agent-message options.
 
 const AGENT_SEND_USAGE = `Usage: discord-surface agent-send --provider PROVIDER --channel-id CHANNEL_ID \\
   --native-id NATIVE_UUID --generation GENERATION --target-file ADDRESS_FILE \\
-  --text-file TEXT_FILE --dedupe-key KEY [--agent-thread-id THREAD_ID] \\
+  --text-file TEXT_FILE --dedupe-key KEY --agent-thread-id THREAD_ID \\
   [--agent-presentation MODE]
 
 For an agent result, use --agent-reply-to REQUEST_ID instead of --target-file.
+Agent requests and results require an actively enrolled child route.
 MODE must be legacy or attachment-v1.
 Agent packets must fit in one Discord message. The limit is ${AGENT_MESSAGE_MAX_ENCODED_LENGTH} encoded characters, including the envelope and signature.
 Usable text varies with envelope metadata, UTF-8 width, and JSON escaping.
