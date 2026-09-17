@@ -525,7 +525,7 @@ test('resumed courier refusal blocks later owner work with or without route sele
     const refused = persistGuardRefusal(f.state, f.route.routeId, {
       session_id: COURIER_NATIVE,
       cwd: f.dir,
-      tool_input: { prompt }
+      tool_input: { threadId: RECIPIENT_THREAD, hostId: 'host-local', prompt }
     }, 'courier forwarding authorization held');
     assert.equal(refused, true);
     release({ text: 'late after refusal' });
@@ -548,7 +548,7 @@ test('held accepted courier custody does not fall back to the parent provider', 
   assert.equal(persistGuardRefusal(f.state, f.route.routeId, {
     session_id: COURIER_NATIVE,
     cwd: f.dir,
-    tool_input: { prompt: preparedInput(f, f.message).prompt }
+    tool_input: { threadId: RECIPIENT_THREAD, hostId: 'host-local', prompt: preparedInput(f, f.message).prompt }
   }, 'courier forwarding authorization held'), true);
 
   const courierCalls = [];

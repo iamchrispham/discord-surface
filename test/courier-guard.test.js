@@ -12,6 +12,7 @@ const CLI = path.resolve(__dirname, '../src/cli.js');
 const WRAPPER = path.resolve(__dirname, '../src/courier-guard.sh');
 const PARENT = '11111111-1111-1111-1111-111111111111';
 const COURIER = '22222222-2222-2222-2222-222222222222';
+const SUCCESSOR = '44444444-4444-4444-4444-444444444444';
 
 function fixture(t, options = {}) {
   const { agent = false, hostId = null, preAttemptReceipt = false } = options;
@@ -515,4 +516,19 @@ test('host changes settle the exact old attempt while malformed input preserves 
     assert.equal(f.state.getMessage('9000').state, 'accepted');
     assert.equal(f.claims().length, 0);
   }
+});
+
+test('a native session change lets exact old input settle custody but blocks a malformed recipient', t => {
+  const f = fixture(t);
+  f.state.recordCourierOutcome('9000', f.claim.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+  f.state.markSubmitted('9000');
+  f.state.registerCourierRoute({ ...f.route, routeGeneration: 2, courier: { ...f.route.courier, nativeId: SUCCESSOR } });
+  const malformed = { ...f.event, tool_input: { ...f.event.tool_input, threadId: 'wrong-thread' } };
+  denied(invoke(f, malformed), /caller or route is not current/);
+  assert.equal(f.state.getMessage('9000').state, 'submitted');
+  assert.equal(f.state.getCourierAttempt('9000', f.claim.attempt.attemptId).outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
+  denied(invoke(f), /caller or route is not current/);
+  assert.equal(f.state.getMessage('9000').state, 'accepted');
+  assert.equal(f.state.getCourierAttempt('9000', f.claim.attempt.attemptId).outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
+  assert.equal(f.claims().length, 0);
 });

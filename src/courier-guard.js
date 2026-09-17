@@ -39,8 +39,15 @@ function persistGuardRefusal(state, routeId, event, reason) {
     if (typeof attemptId !== 'string' || attemptWorkspace === null || eventWorkspace === null ||
         attemptWorkspace !== eventWorkspace) return false;
     if (state.hasRetiredCourierAttempt(messageId, Number(row.id))) return false;
-    const outcome = state.getCourierAttempt(messageId, attemptId)?.outcome?.outcome;
+    const current = state.getCourierAttempt(messageId, attemptId);
+    const outcome = current?.outcome?.outcome;
     if (outcome && ![COURIER_OUTCOMES.SUBMITTED, COURIER_OUTCOMES.UNCERTAIN].includes(outcome)) return false;
+    const persistedRecipient = current?.attempt?.envelope?.recipient;
+    if (!persistedRecipient || typeof persistedRecipient.threadId !== 'string') return false;
+    const expected = { threadId: persistedRecipient.threadId, prompt: input.prompt };
+    if (persistedRecipient.hostId) expected.hostId = persistedRecipient.hostId;
+    if (Object.keys(input).length !== Object.keys(expected).length ||
+        !Object.entries(expected).every(([key, value]) => input[key] === value)) return false;
     if (state.db.prepare(`SELECT 1 FROM receipts WHERE kind=? AND discord_id=? AND id>?
       AND json_extract(detail, '$.attemptId')=? LIMIT 1`)
       .get(COURIER_RECEIPT_KINDS.FORWARD_CLAIM, messageId, Number(row.id), attemptId)) return false;
