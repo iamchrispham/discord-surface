@@ -1,11 +1,23 @@
 #!/usr/bin/env node
-const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, issueAgentAddress, verifyAgentAddress } = require('./agent-message');
-
 const fs = require('node:fs');
-const { resolveAgentAddress, resolveDedupeKey, resolveDirectBinding, runDirectPost, runWatcherNoticePost } = require('./direct-post');
-const { runBoardRefresh } = require('./board-refresh');
 const os = require('node:os');
 const path = require('node:path');
+
+// Hook startup failures must block the tool, including a missing runtime build.
+const startup = parseArgs(process.argv.slice(2));
+if (require.main === module && startup.command === 'courier-guard' && !startup.args.help) {
+  try {
+    require('./courier-guard').courierGuard(startup.args, pathsFor);
+  } catch (error) {
+    process.stderr.write(`discord-surface courier guard: ${error.message}\n`);
+    process.exitCode = 2;
+  }
+  return;
+}
+
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, issueAgentAddress, verifyAgentAddress } = require('./agent-message');
+const { resolveAgentAddress, resolveDedupeKey, resolveDirectBinding, runDirectPost, runWatcherNoticePost } = require('./direct-post');
+const { runBoardRefresh } = require('./board-refresh');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
@@ -111,7 +123,7 @@ claude-channel, claude-monitor, native-ack, native-reply, claude-reply, agent-ad
 agent-send, agent-complete, watcher-arm, watcher-send, watcher-consume, post, ordinary-post, ordinary-claude-post, claude-post,
 post-file-cleanup,
 native-reply-file-cleanup,
-decision-present, liaison draft
+decision-present, courier-guard, liaison draft
 
 Start options: --state-dir DIR [--courier-route-id ROUTE_ID]
 
@@ -2230,6 +2242,7 @@ async function main() {
   const { command, subcommand, args } = parseArgs(process.argv.slice(2));
   if (command === 'help' || args.help) return printUsage(command === 'help' ? subcommand : command);
   switch (command) {
+    case 'courier-guard': return require('./courier-guard').courierGuard(args, pathsFor);
     case 'configure': return configure(args);
     case 'bind': return bind(args);
     case 'ordinary-bind':

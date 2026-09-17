@@ -16,6 +16,7 @@ const {
   THREAD_STATES
 } = require('../src/state');
 const { createSurfaceConsumer } = require('../src/discord');
+const { persistGuardRefusal } = require('../src/courier-guard');
 
 const TOKEN = 'courier-route-fixture-token';
 const PARENT_NATIVE = '11111111-1111-1111-1111-111111111111';
@@ -286,10 +287,10 @@ function preparedInput(f, message) {
   };
 }
 
-function consumerFor(f, { courierCalls = [], parentCalls = [], replies = [], dispatchCourier, observe } = {}) {
+function consumerFor(f, { courierCalls = [], parentCalls = [], replies = [], dispatchCourier, observe, courierRoute = f.route } = {}) {
   return createSurfaceConsumer({
     state: f.state,
-    courierRoute: { routeId: f.route.routeId },
+    courierRoute: courierRoute ? { routeId: courierRoute.routeId } : null,
     providers: {
       codex: {
         async dispatchCourier(envelope, options) {
@@ -493,6 +494,73 @@ test('restarted claimed courier custody becomes uncertain without resend', async
   assert.equal(courierCalls.length, 0);
 });
 
+test('resumed courier refusal blocks later owner work with or without route selection', async t => {
+  for (const selected of [true, false]) {
+    const f = fixture(t);
+    const later = humanMessage(f, `9006-${selected}`, 'later parent work');
+    assert.equal(f.state.claimDispatch(f.message.id).claimed, true);
+    const claimed = f.state.beginCourierAttempt(f.message.id, preparedInput(f, f.message));
+    assert.equal(claimed.accepted, true);
+    f.state.recordCourierOutcome(f.message.id, claimed.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+    f.state.markSubmitted(f.message.id);
+    if (!selected) f.state.revokeCourierRoute(f.route.routeId, 'route paused during restart');
+
+    let release;
+    let started;
+    const observed = new Promise(resolve => { started = resolve; });
+    const parentCalls = [];
+    const consumer = consumerFor(f, {
+      courierRoute: selected ? f.route : null,
+      parentCalls,
+      observe: async message => {
+        assert.equal(message.id, f.message.id);
+        started();
+        return new Promise(resolve => { release = resolve; });
+      }
+    });
+    const resumed = consumer.resumeSubmitted(f.state.getMessage(f.message.id));
+    await observed;
+    const queued = consumer.processAccepted(later);
+    const prompt = preparedInput(f, f.message).prompt;
+    const refused = persistGuardRefusal(f.state, f.route.routeId, {
+      session_id: COURIER_NATIVE,
+      cwd: f.dir,
+      tool_input: { threadId: RECIPIENT_THREAD, hostId: 'host-local', prompt }
+    }, 'courier forwarding authorization held');
+    assert.equal(refused, true);
+    release({ text: 'late after refusal' });
+    await resumed;
+    assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+    assert.equal(f.state.getMessage(later.id).state, MESSAGE_STATES.ACCEPTED);
+    assert.deepEqual(parentCalls, []);
+    consumer.abortNativeWork();
+    await queued;
+  }
+});
+
+test('held accepted courier custody does not fall back to the parent provider', async t => {
+  const f = fixture(t);
+  assert.equal(f.state.claimDispatch(f.message.id).claimed, true);
+  const claimed = f.state.beginCourierAttempt(f.message.id, preparedInput(f, f.message));
+  assert.equal(claimed.accepted, true);
+  f.state.recordCourierOutcome(f.message.id, claimed.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+  f.state.markSubmitted(f.message.id);
+  assert.equal(persistGuardRefusal(f.state, f.route.routeId, {
+    session_id: COURIER_NATIVE,
+    cwd: f.dir,
+    tool_input: { threadId: RECIPIENT_THREAD, hostId: 'host-local', prompt: preparedInput(f, f.message).prompt }
+  }, 'courier forwarding authorization held'), true);
+
+  const courierCalls = [];
+  const parentCalls = [];
+  const result = await consumerFor(f, { courierRoute: null, courierCalls, parentCalls })
+    .processAccepted(f.state.getMessage(f.message.id));
+  assert.equal(result.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+  assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(courierCalls, []);
+  assert.deepEqual(parentCalls, []);
+});
+
 test('revoked selected route returns to accepted without parent fallback', async t => {
   const f = fixture(t);
   f.state.revokeCourierRoute(f.route.routeId, 'route paused');
@@ -529,6 +597,43 @@ test('route revoked after queue result preserves parent observation', async t =>
   assert.equal(parentCalls.length, 0);
   assert.deepEqual(replies, [{ messageId: f.message.id, channelId: '2000', content: `answer for ${f.message.id}` }]);
   assert.equal(f.state.listReceipts().filter(row => row.kind === 'native-ack').length, 1);
+});
+
+test('guard refusal wins over a later queue return without observing or replaying', async t => {
+  for (const returned of [COURIER_OUTCOMES.SUBMITTED, COURIER_OUTCOMES.UNCERTAIN]) {
+    const f = fixture(t);
+    const courierCalls = [];
+    const parentCalls = [];
+    const replies = [];
+    let observations = 0;
+    const consumer = consumerFor(f, {
+      courierCalls, parentCalls, replies,
+      dispatchCourier: async envelope => {
+        f.state.markThreadBoundary('2000', THREAD_STATES.GAP, 'changed before forwarding', null, null, f.binding);
+        const result = spawnSync(process.execPath, [path.resolve(__dirname, '../src/cli.js'),
+          'courier-guard', '--db', f.dbPath, '--courier-route-id', f.route.routeId], {
+          input: JSON.stringify({ session_id: COURIER_NATIVE, cwd: f.dir,
+            transcript_path: path.join(f.route.courier.sessionRoot, 'courier.jsonl'),
+            hook_event_name: 'PreToolUse', tool_name: 'mcp__codex_app__send_message_to_thread',
+            tool_input: { threadId: RECIPIENT_THREAD, hostId: 'host-local', prompt: envelope.prompt } }),
+          encoding: 'utf8', timeout: 5000
+        });
+        assert.equal(result.status, 2, result.stderr);
+        return { status: returned };
+      },
+      observe: async () => { observations++; return null; }
+    });
+    const result = await consumer.processAccepted(f.message);
+    assert.equal(result.status, COURIER_OUTCOMES.NOT_SUBMITTED);
+    assert.equal(f.state.getMessage(f.message.id).state, MESSAGE_STATES.ACCEPTED);
+    assert.equal(f.state.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
+    f.state.markThreadBoundary('2000', THREAD_STATES.READY, 'recovered', null, null, f.binding);
+    await consumer.processAccepted(f.state.getMessage(f.message.id));
+    assert.equal(courierCalls.length, 1);
+    assert.equal(observations, 0);
+    assert.equal(parentCalls.length, 0);
+    assert.equal(replies.length, 0);
+  }
 });
 
 test('recovered definite non-submission retains custody without resend', async t => {
