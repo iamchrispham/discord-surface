@@ -15,7 +15,7 @@ const { ORDINARY_RECEIPT_KINDS } = require('../src/ordinary/constants');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { runDirectPost } = require('../src/direct-post');
 const { staticConductorMarker } = require('../src/topic');
-const { reconcileProofUnavailableIntake } = require('../src/ordinary-bind');
+const { ordinaryBind: ordinaryBindModule, reconcileProofUnavailableIntake } = require('../src/ordinary-bind');
 const facade = require('../src/ordinary-codex');
 const emitted = require('../dist/ordinary-codex');
 const ordinaryConstantsFacade = require('../src/ordinary/constants');
@@ -24,6 +24,7 @@ const ordinaryConstantsEmitted = require('../dist/ordinary/constants');
 const CODEX = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const CODEX_V7 = '01a0701c-5714-7671-a455-db7d67f9fa78';
 const OTHER = '79e3da8e-94b4-4aff-8f88-b45b3a451dd1';
+const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-codex-'));
@@ -446,6 +447,87 @@ test('ordinary bind reopens a proof-related intake gap after native proof recove
   });
   assert.equal(unchanged.readiness, READINESS.GAP);
   assert.equal(f.state.getIntakeWatermark(binding.channelId).state, READINESS.GAP);
+});
+
+test('ordinary bind public entrypoints recover only proof-related intake boundaries', async t => {
+  for (const [label, bind] of [['cli', ordinaryBind], ['module', ordinaryBindModule]]) {
+    await t.test(label, async t => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), `ordinary-bind-public-${label}-`));
+      const db = path.join(dir, 'surface.sqlite');
+      const session = transcript(t, dir);
+      const setup = new SurfaceState(db);
+      setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
+      const binding = setup.bindOrdinary({
+        channelId: 'ordinary-public-channel', guildId: 'guild', provider: PROVIDERS.CODEX,
+        nativeId: CODEX, workspace: dir, sessionRoot: session.root
+      }, { sessionId: CODEX, threadId: CODEX });
+      setup.recordOrdinaryPreflight(binding, {
+        file: session.file, sessionId: CODEX, threadId: CODEX, workspace: dir
+      });
+      assert.throws(() => setup.reconcileIntake(binding.channelId, binding), /intake boundary is unknown/);
+      setup.close();
+      t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+      const channel = {
+        id: 'ordinary-public-channel', guildId: 'guild', name: 'dev', isTextBased: () => true
+      };
+      class FakeClient {
+        constructor() {
+          this.guilds = { fetch: async () => ({ channels: { fetch: async () => [channel] } }) };
+        }
+        async login() {}
+        async destroy() {}
+      }
+      const dependencies = {
+        environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: dir },
+        requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
+        readSecret: () => 'fixture-token',
+        validateCodexSessionIdentity: () => ({
+          file: session.file, sessionId: CODEX, threadId: CODEX, workspace: dir
+        }),
+        gatewayProcessStatus: () => ({ state: 'stopped' }),
+        print: () => {}
+      };
+      const args = { 'state-dir': dir, channel: '#dev', workspace: dir, 'session-root': session.root };
+      const bindResult = async () => bind(args, dependencies);
+      const missing = await bindResult();
+      assert.equal(missing.reused, true);
+      assert.equal(missing.nativeProof.status, 'verified');
+      assert.equal(missing.binding.nativeId, CODEX);
+      assert.equal(missing.binding.generation, 1);
+
+      const state = new SurfaceState(db);
+      try {
+        assert.equal(state.getIntakeWatermark(binding.channelId), null);
+        state.markIntakeBoundary(binding.channelId, READINESS.GAP, 'unrelated history gap');
+      } finally { state.close(); }
+      const unrelated = await bindResult();
+      assert.equal(unrelated.binding.readiness, READINESS.GAP);
+
+      const proofUnavailable = new SurfaceState(db);
+      try {
+        proofUnavailable.markIntakeBoundary(binding.channelId, READINESS.UNAVAILABLE,
+          `${ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX} transcript is unavailable`);
+      } finally { proofUnavailable.close(); }
+      const unavailable = await bindResult();
+      assert.equal(unavailable.binding.readiness, READINESS.PENDING);
+
+      const proofGap = new SurfaceState(db);
+      try {
+        proofGap.markIntakeBoundary(binding.channelId, READINESS.GAP,
+          `${ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX} transcript is unavailable`);
+      } finally { proofGap.close(); }
+      const gap = await bindResult();
+      assert.equal(gap.binding.readiness, READINESS.PENDING);
+
+      const finalState = new SurfaceState(db);
+      try {
+        assert.equal(finalState.getBinding(binding.channelId).generation, 1);
+        assert.equal(finalState.getIntakeWatermark(binding.channelId).state, READINESS.PENDING);
+        assert.equal(finalState.listReceipts().filter(receipt => receipt.kind === 'intake-reconcile-requested').length, 2);
+      } finally { finalState.close(); }
+    });
+  }
 });
 
 test('ordinary bind derives workspace from exact transcript metadata across checkouts', async t => {

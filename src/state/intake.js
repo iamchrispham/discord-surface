@@ -286,8 +286,12 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
         if (!intakePauseAllowsUpdate(state, channelId)) return null;
         const binding = state.getBinding(channelId);
         const watermark = state.getIntakeWatermark(channelId);
-        if (!binding || !binding.active || !watermark) throw new BindingError('intake boundary is unknown');
+        if (!binding || !binding.active) throw new BindingError('intake boundary is unknown');
         if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+        if (!watermark) {
+          if (expectedBoundary) return null;
+          throw new BindingError('intake boundary is unknown');
+        }
         if (expectedBoundary) {
           const allowedStates = Array.isArray(expectedBoundary.states) ? expectedBoundary.states : [];
           if (!allowedStates.includes(watermark.state) ||
