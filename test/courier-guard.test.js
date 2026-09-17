@@ -8,6 +8,8 @@ const { SurfaceState, THREAD_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS } =
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { codexPrompt } = require('../src/native');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
+const { courierGuard } = require('../src/courier-guard');
+const { pathsFor } = require('../src/cli');
 const CLI = path.resolve(__dirname, '../src/cli.js');
 const WRAPPER = path.resolve(__dirname, '../src/courier-guard.sh');
 const PARENT = '11111111-1111-1111-1111-111111111111';
@@ -96,6 +98,41 @@ test('public hook claims one exact human or peer forward, without acknowledging 
     denied(invoke(f), /already claimed/);
     assert.equal(f.claims().length, 1);
   }
+});
+
+test('a close failure after a committed claim is not reported as a forwarding denial', t => {
+  const f = fixture(t);
+  const payload = Buffer.from(JSON.stringify(f.event), 'utf8');
+  let sent = 0;
+  const realReadSync = fs.readSync;
+  const originalClose = SurfaceState.prototype.close;
+  const priorExitCode = process.exitCode;
+  fs.readSync = (fd, buffer, offset, length, position) => {
+    if (fd !== 0) return realReadSync(fd, buffer, offset, length, position);
+    const remaining = payload.length - sent;
+    if (remaining <= 0) return 0;
+    const count = Math.min(remaining, length);
+    payload.copy(buffer, offset, sent, sent + count);
+    sent += count;
+    return count;
+  };
+  SurfaceState.prototype.close = function () {
+    originalClose.call(this);
+    throw new Error('simulated close I/O failure');
+  };
+  let observedExitCode;
+  try {
+    courierGuard({ 'courier-route-id': f.route.routeId, db: f.db }, pathsFor);
+    observedExitCode = process.exitCode;
+  } finally {
+    fs.readSync = realReadSync;
+    SurfaceState.prototype.close = originalClose;
+    if (priorExitCode === undefined) delete process.exitCode;
+    else process.exitCode = priorExitCode;
+  }
+  assert.equal(observedExitCode, priorExitCode);
+  assert.equal(f.claims().length, 1);
+  assert.equal(f.state.getMessage('9000').state, 'dispatching');
 });
 
 test('wrong event, caller, cwd, target, bytes, host and extra model input deny without consuming permission', t => {

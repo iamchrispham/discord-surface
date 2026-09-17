@@ -82,8 +82,6 @@ function courierGuard(args, pathsFor) {
     const { SurfaceState } = require('./state');
     state = new SurfaceState(db, { requireCurrentSchema: true });
     state.claimCourierForward(args['courier-route-id'], event);
-    state.close();
-    state = null;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     try { persistGuardRefusal(state, args['courier-route-id'], event, reason); } catch {}
@@ -94,8 +92,11 @@ function courierGuard(args, pathsFor) {
     process.stderr.write(`${reason}\n`);
     process.exitCode = 2;
   } finally {
+    // A committed forward claim must stand even if closing the state handle
+    // afterward fails: that failure is not a forwarding denial, since the
+    // one-shot permission was already durably consumed.
     if (state) {
-      try { state.close(); } catch { process.exitCode = 2; }
+      try { state.close(); } catch {}
     }
   }
 }
