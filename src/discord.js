@@ -1175,6 +1175,8 @@ class DiscordGateway {
     this.decisionRecoveryController = null;
     this.recoveryFollowupPromise = null;
     this.recoveryFollowupScope = null;
+    this.recoveryActiveWaiters = new Set();
+    this.recoveryRetryScheduledChannels = new Set();
     this.pendingRecoveryChannels = new Set();
     this.pendingRecoveryRequests = [];
     this.pendingFullRecovery = false;
@@ -2459,15 +2461,14 @@ class DiscordGateway {
         if (this.stopping) return;
         const current = classifyCurrentReadiness();
         if (current?.state !== READINESS.PENDING) return;
-        return this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], 0, deadline).then(recoveryFailure => {
-          if (recoveryFailure) return null;
-          const recoveredBoundary = this.state.getIntakeWatermark(binding.channelId);
-          if (recoveredBoundary?.state !== READINESS.READY) return null;
-          ownedReadiness = recoveredBoundary.state;
-          return { watermark: recoveredBoundary };
-        }).catch(error => {
-          this.logger(`Discord intake boundary retry failed: ${error.message}`);
-          return null;
+        if (this.recoveryRetryScheduledChannels.has(binding.channelId)) return;
+        this.recoveryRetryScheduledChannels.add(binding.channelId);
+        queueMicrotask(() => {
+          this.recoveryRetryScheduledChannels.delete(binding.channelId);
+          if (this.stopping || !this.isCurrentLifecycle(lifecycleEpoch)) return;
+          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], 0, deadline).catch(error => {
+            this.logger(`Discord intake boundary retry failed: ${error.message}`);
+          });
         });
       };
       const recordOwnedBoundary = async (owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary) => {
@@ -2526,9 +2527,15 @@ class DiscordGateway {
         const kind = recoveryKind(error);
         if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
         if (kind === CODEX_VALIDATION_KINDS.DEADLINE && retryBoundary && !recoveryAttempted) {
-          this.state.setBindingReadiness(binding.channelId, retryBoundary.state,
-            retryBoundary.detail || `${reason} retry deadline expired`, binding);
-          failure ||= { ready: false, state: 'unavailable' };
+          const restored = this.state.markIntakeBoundary(binding.channelId, retryBoundary.state,
+            retryBoundary.detail || `${reason} retry deadline expired`, retryBoundary.gap_from,
+            retryBoundary.gap_to, binding, null, retryBoundary, ownedReadiness);
+          if (restored) failure ||= { ready: false, state: 'unavailable' };
+          else {
+            const current = adoptCurrentReadiness();
+            if (current?.state === READINESS.READY) continue;
+            failure ||= { ready: false, state: current?.state || 'unavailable' };
+          }
           continue;
         }
         if (kind === 'stale') {
@@ -2802,10 +2809,10 @@ class DiscordGateway {
     };
     const scopeIsReady = scope => {
       const expanded = expandScope(scope);
-      const channelIds = expanded === null
+      const scopedChannels = expanded === null
         ? new Set(this.state.listBindings().filter(binding => binding.active).map(binding => binding.channelId))
         : expanded;
-      for (const channelId of channelIds) {
+      for (const channelId of scopedChannels) {
         const binding = this.state.getBinding(channelId);
         const watermark = this.state.getIntakeWatermark(channelId);
         if (binding?.active && binding.readiness === READINESS.READY && watermark?.state === READINESS.READY) continue;
@@ -2822,143 +2829,208 @@ class DiscordGateway {
       }
       return true;
     };
-    const queuedFollowupScope = () => {
-      if (this.pendingFullRecovery) return null;
-      if (this.pendingRecoveryChannels.size) return new Set(this.pendingRecoveryChannels);
-      if (this.recoveryFollowupScope instanceof Set) return this.recoveryFollowupScope;
-      return null;
+    const scopesIntersect = (left, right) => {
+      if (left === null || right === null) return true;
+      const leftScope = expandScope(left);
+      const rightScope = expandScope(right);
+      return [...leftScope].some(channelId => rightScope.has(channelId));
     };
-    const followupIntersectsCaller = () => {
-      const followupScope = queuedFollowupScope();
-      if (callerScope === null || followupScope === null) return true;
-      const callerChannels = expandScope(callerScope);
-      const followupChannels = expandScope(followupScope);
-      return [...callerChannels].some(channelId => followupChannels.has(channelId));
+    const makeResult = (waiter, fallback = null) => {
+      if (waiter.stopped || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+      if (scopeIsReady(waiter.scope)) return { ready: true, state: 'ready' };
+      if (waiter.childCount === 0 && waiter.ownResult?.ready === true) return waiter.ownResult;
+      const result = fallback || waiter.lastResult || waiter.ownResult || { ready: false, state: 'unavailable' };
+      return result?.ready === true ? { ready: false, state: 'unavailable', error: result.error } : result;
     };
-    const resolveFollowup = async (initialResult, followupResult) => {
-      if (!this.isCurrentLifecycle(lifecycleEpoch) || initialResult?.state === 'stopped' || followupResult?.state === 'stopped') {
-        return { ready: false, state: 'stopped' };
-      }
-      if (callerScope === null) {
-        if (initialResult && initialResult.ready !== true && scopeIsReady(null)) {
-          return followupResult?.ready === true ? followupResult : { ready: true, state: 'ready' };
+    const makeWaiter = (scope, deadline) => {
+      let resolveWaiter;
+      const waiter = {
+        scope,
+        deadline,
+        parents: new Set(),
+        childCount: 0,
+        pending: 1,
+        ownDone: false,
+        ownResult: null,
+        lastResult: null,
+        settled: false,
+        stopped: false,
+        timer: null,
+        promise: new Promise(resolve => { resolveWaiter = resolve; })
+      };
+      const notifyParents = result => {
+        for (const parent of waiter.parents) parent.childFinished(result);
+      };
+      waiter.settle = fallback => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        const result = makeResult(waiter, fallback);
+        resolveWaiter(result);
+        notifyParents(result);
+      };
+      waiter.stop = () => {
+        if (waiter.settled) return;
+        waiter.stopped = true;
+        waiter.settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        const result = { ready: false, state: 'stopped' };
+        resolveWaiter(result);
+        notifyParents(result);
+      };
+      waiter.maybeSettle = () => {
+        if (waiter.ownDone && waiter.pending === 0) waiter.settle();
+      };
+      waiter.childFinished = result => {
+        if (waiter.settled) return;
+        if (result?.state === 'stopped') {
+          waiter.stop();
+          return;
         }
-        if (initialResult && initialResult.ready !== true && followupResult?.ready === true && scopeRetryDepth === 0) {
-          return this.recoverTransport(reason, lifecycleEpoch, null, 1, overallDeadline);
+        waiter.lastResult = result;
+        waiter.pending = Math.max(0, waiter.pending - 1);
+        waiter.maybeSettle();
+      };
+      waiter.completeOwn = result => {
+        if (waiter.settled || waiter.ownDone) return;
+        waiter.ownDone = true;
+        waiter.ownResult = result;
+        waiter.lastResult = result;
+        if (result?.state === 'stopped') {
+          waiter.stop();
+          return;
         }
-        if (initialResult && initialResult.ready !== true) return { ...followupResult, ...initialResult, ready: false };
-        return followupResult || initialResult;
+        waiter.pending = Math.max(0, waiter.pending - 1);
+        waiter.maybeSettle();
+      };
+      if (Number.isFinite(deadline)) {
+        waiter.timer = setTimeout(() => waiter.settle({ ready: false, state: 'unavailable' }),
+          Math.max(0, deadline - Date.now()));
       }
-      if (followupResult?.ready === true) {
-        if (!initialResult || initialResult.ready === true || scopeIsReady(callerScope)) return followupResult;
-        if (scopeRetryDepth === 0) return this.recoverTransport(reason, lifecycleEpoch, callerScope, 1, overallDeadline);
-        return initialResult;
-      }
-      if (scopeIsReady(callerScope)) {
-        return { ready: true, state: 'ready' };
-      }
-      if (scopeRetryDepth === 0) return this.recoverTransport(reason, lifecycleEpoch, callerScope, 1, overallDeadline);
-      return followupResult || initialResult || { ready: false, state: 'unavailable' };
+      return waiter;
     };
-    const fullRecovery = callerScope === null;
-    if (fullRecovery) {
-      this.ready = false;
-      if (this.recoveryPromise) this.pendingFullRecovery = true;
-    }
-    if (channelIds) {
-      for (const channelId of channelIds) {
-        if (typeof channelId === 'string') this.pendingRecoveryChannels.add(channelId);
+    const attachParents = waiter => {
+      for (const parent of this.recoveryActiveWaiters) {
+        if (parent === waiter || parent.settled || !scopesIntersect(parent.scope, waiter.scope)) continue;
+        parent.pending += 1;
+        parent.childCount += 1;
+        waiter.parents.add(parent);
       }
-    }
-    if (this.recoveryPromise) {
-      const queuedRequestScope = callerScope === null ? null : new Set(callerScope);
-      if (queuedRequestScope === null || queuedRequestScope.size) {
-        const existingRequest = this.pendingRecoveryRequests.find(request => {
-          if (request.scope === null || queuedRequestScope === null) return request.scope === queuedRequestScope;
-          return request.scope.size === queuedRequestScope.size &&
-            [...request.scope].every(channelId => queuedRequestScope.has(channelId));
-        });
-        if (existingRequest) {
-          existingRequest.deadline = Math.max(existingRequest.deadline, overallDeadline);
-        } else {
-          this.pendingRecoveryRequests.push({ scope: queuedRequestScope, deadline: overallDeadline });
+    };
+    const startRecoveryPass = (scope, deadline, passReason, passLifecycle, passDepth, activeWaiters) => {
+      this.recoveryActiveWaiters = new Set(activeWaiters.filter(waiter => !waiter.settled));
+      this.recoveryController = new AbortController();
+      const controller = this.recoveryController;
+      let resolvePass;
+      let rejectPass;
+      const activeRecovery = new Promise((resolve, reject) => {
+        resolvePass = resolve;
+        rejectPass = reject;
+      });
+      this.recoveryPromise = activeRecovery;
+      Promise.resolve().then(async () => {
+        try {
+          const result = await this.recoverInbound(controller.signal, passReason, passLifecycle,
+            scope === null ? null : new Set(scope), deadline);
+          const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
+          if (!this.isCurrentLifecycle(passLifecycle)) {
+            resolvePass({ ready: false, state: 'stopped' });
+            return;
+          }
+          this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
+          resolvePass(result);
+        } catch (error) {
+          rejectPass(error);
         }
-      }
-      if (!this.pendingRecoveryChannels.size && !this.pendingFullRecovery) return this.recoveryPromise;
-      if (!this.recoveryFollowupPromise) {
-        const activeRecovery = this.recoveryPromise;
-        this.recoveryFollowupPromise = activeRecovery.then(async result => {
-          this.recoveryFollowupPromise = null;
-          this.recoveryFollowupScope = null;
-          if (!this.isCurrentLifecycle(lifecycleEpoch)) {
-            this.pendingRecoveryRequests.length = 0;
-            return { ready: false, state: 'stopped' };
-          }
-          const runFullRecovery = this.pendingFullRecovery;
-          const queuedChannels = new Set(this.pendingRecoveryChannels);
-          const queuedRequests = Array.isArray(this.pendingRecoveryRequests)
-            ? this.pendingRecoveryRequests.splice(0) : [];
-          this.pendingFullRecovery = false;
-          this.pendingRecoveryChannels.clear();
-          this.recoveryFollowupScope = runFullRecovery ? null : new Set(queuedChannels);
-          if (runFullRecovery) {
-            const fullRequest = queuedRequests.find(request => request.scope === null);
-            return this.recoverTransport(reason, lifecycleEpoch, null, scopeRetryDepth + 1,
-              fullRequest?.deadline ?? overallDeadline);
-          }
-          if (queuedRequests.length) {
-            let followupResult = { ready: true, state: 'ready' };
-            for (const request of queuedRequests) {
-              const requestResult = await this.recoverTransport(reason, lifecycleEpoch, request.scope,
-                scopeRetryDepth + 1, request.deadline);
-              if (requestResult?.state === 'stopped') return requestResult;
-              if (requestResult?.ready !== true) followupResult = requestResult;
-            }
-            return followupResult;
-          }
-          return queuedChannels.size
-            ? this.recoverTransport(reason, lifecycleEpoch, queuedChannels, scopeRetryDepth + 1, overallDeadline)
-            : result;
-        }, error => {
-          this.recoveryFollowupPromise = null;
-          this.recoveryFollowupScope = null;
-          throw error;
-        });
-      }
-      if (!followupIntersectsCaller()) return this.recoveryPromise;
-      const followupResult = await this.recoveryFollowupPromise;
-      return resolveFollowup(null, followupResult);
-    }
-    const selectedChannels = this.pendingFullRecovery ? null :
-      (this.pendingRecoveryChannels.size ? new Set(this.pendingRecoveryChannels) : callerScope);
-    this.pendingFullRecovery = false;
-    this.pendingRecoveryChannels.clear();
-    this.pendingRecoveryRequests.length = 0;
-    this.recoveryController = new AbortController();
-    const controller = this.recoveryController;
-    const activeRecovery = this.recoveryPromise = (async () => {
-      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch, selectedChannels, overallDeadline);
-      const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
-      if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-      this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
-      this.releaseRecoveredAttachmentIntake();
-      return result;
-    })();
-    let result;
-    try {
-      result = await activeRecovery;
-    } finally {
-      if (this.recoveryPromise === activeRecovery) {
+      });
+      const cleanup = () => {
+        if (this.recoveryPromise !== activeRecovery) return;
         this.recoveryPromise = null;
         this.recoveryController = null;
         this.releaseRecoveredAttachmentIntake();
         this.scheduleHeldLiveCheckpoints();
+      };
+      activeRecovery.then(cleanup, cleanup).catch(() => {});
+      return activeRecovery;
+    };
+    const drainRecoveryFollowups = async () => {
+      while (true) {
+        if (!this.pendingRecoveryRequests.length) {
+          await Promise.resolve();
+          if (!this.pendingRecoveryRequests.length) break;
+        }
+        const request = this.pendingRecoveryRequests.shift();
+        if (!request) continue;
+        if (!this.isCurrentLifecycle(request.lifecycleEpoch)) {
+          request.waiter.stop();
+          continue;
+        }
+        const activeWaiters = [request.waiter, ...request.waiter.parents].filter(waiter => !waiter.settled);
+        this.recoveryActiveWaiters = new Set(activeWaiters);
+        let result;
+        try {
+          result = await startRecoveryPass(request.scope, request.deadline, request.reason,
+            request.lifecycleEpoch, request.scopeRetryDepth, activeWaiters);
+        } catch (error) {
+          result = { ready: false, state: recoveryKind(error) || 'unavailable', error };
+        }
+        request.waiter.completeOwn(result);
+        this.recoveryActiveWaiters = new Set(activeWaiters.filter(waiter => !waiter.settled));
+        if (result?.state === 'stopped') {
+          for (const pending of this.pendingRecoveryRequests.splice(0)) pending.waiter.stop();
+          break;
+        }
       }
+      return { ready: true, state: 'ready' };
+    };
+    const ensureFollowupCoordinator = () => {
+      if (this.recoveryFollowupPromise || !this.recoveryPromise) return;
+      const activeRecovery = this.recoveryPromise;
+      const coordinator = activeRecovery.then(
+        () => drainRecoveryFollowups(),
+        () => drainRecoveryFollowups()
+      );
+      this.recoveryFollowupPromise = coordinator;
+      coordinator.then(() => {
+        if (this.recoveryFollowupPromise === coordinator) {
+          this.recoveryFollowupPromise = null;
+          this.recoveryFollowupScope = null;
+          this.recoveryActiveWaiters.clear();
+        }
+      }, () => {
+        if (this.recoveryFollowupPromise === coordinator) {
+          this.recoveryFollowupPromise = null;
+          this.recoveryFollowupScope = null;
+          this.recoveryActiveWaiters.clear();
+        }
+      }).catch(() => {});
+    };
+
+    const waiter = makeWaiter(callerScope, overallDeadline);
+    if (this.recoveryPromise || this.recoveryFollowupPromise) {
+      if (callerScope === null) this.ready = false;
+      attachParents(waiter);
+      this.pendingRecoveryRequests.push({
+        scope: callerScope === null ? null : new Set(callerScope),
+        deadline: overallDeadline,
+        reason,
+        lifecycleEpoch,
+        scopeRetryDepth,
+        waiter
+      });
+      this.recoveryFollowupScope = callerScope === null ? null : new Set(callerScope);
+      ensureFollowupCoordinator();
+      return waiter.promise;
     }
-    const followup = this.recoveryFollowupPromise;
-    if (!followup || !followupIntersectsCaller()) return result;
-    const followupResult = await followup;
-    return resolveFollowup(result, followupResult);
+
+    if (callerScope === null) this.ready = false;
+    const activeRecovery = startRecoveryPass(callerScope, overallDeadline, reason,
+      lifecycleEpoch, scopeRetryDepth, [waiter]);
+    activeRecovery.then(
+      result => waiter.completeOwn(result),
+      error => waiter.completeOwn({ ready: false, state: recoveryKind(error) || 'unavailable', error })
+    ).catch(() => {});
+    return waiter.promise;
   }
 
   async reconcilePending(before = undefined, { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
@@ -3123,7 +3195,8 @@ class DiscordGateway {
     this.pendingHandoffRecoveryChannels.clear();
     this.pendingFullRecovery = false;
     this.pendingRecoveryChannels.clear();
-    this.pendingRecoveryRequests.length = 0;
+    for (const request of this.pendingRecoveryRequests.splice(0)) request.waiter?.stop?.();
+    this.recoveryRetryScheduledChannels.clear();
     this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.stopPromise = (async () => {
       this.ready = false;
