@@ -62,6 +62,7 @@ interface ThreadGateway {
   fetchHistoryInjected: boolean;
   isCurrentLifecycle(epoch: number): boolean;
   isCurrentBinding(binding: ThreadBinding): boolean;
+  recoverTransport?: (reason: string, epoch: number, channelIds: Set<string>) => Promise<unknown>;
   fetchHistory(channel: ThreadChannel, options: { limit: number; after?: string; signal: AbortSignal }): Promise<unknown>;
   historyMessages(value: unknown): HistoryMessage[];
   normalizeFetchedMessage(message: HistoryMessage, channel: ThreadChannel): unknown;
@@ -267,7 +268,17 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
         }
         return false;
       }
-      if (recoveryKind === 'stale') return false;
+      if (recoveryKind === 'stale') {
+        const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
+        const retryable = currentEnrollment?.active && (
+          isRetryableFetchBoundary(currentEnrollment.state, currentEnrollment.detail) ||
+          isPreAdoptionRetryableThread(currentEnrollment)
+        );
+        if (retryable && gateway.recoverTransport) {
+          void gateway.recoverTransport('thread boundary retry', epoch, new Set([enrollment.threadId])).catch(() => {});
+        }
+        return false;
+      }
       const detail = error instanceof Error ? error.message : String(error);
       const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
       if (!currentEnrollment?.active || currentEnrollment.state === THREAD_STATES.GAP || currentEnrollment.state === THREAD_STATES.UNAVAILABLE || currentEnrollment.state === THREAD_STATES.READY) {

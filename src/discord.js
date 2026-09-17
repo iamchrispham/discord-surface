@@ -2397,7 +2397,8 @@ class DiscordGateway {
       const queueRecoveryIfPending = () => {
         if (this.stopping || !currentRecovery()) return;
         const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
-        if (currentBoundary?.state !== READINESS.PENDING) return;
+        if (currentBoundary?.state !== READINESS.PENDING &&
+            !isRetryableFetchBoundary(currentBoundary?.state, currentBoundary?.detail)) return;
         return this.recoverTransport(`${reason} boundary retry`, lifecycleEpoch, [binding.channelId]).then(recoveryFailure => {
           if (recoveryFailure) return null;
           const recoveredBoundary = this.state.getIntakeWatermark(binding.channelId);
@@ -2464,6 +2465,11 @@ class DiscordGateway {
           continue;
         }
         if (kind === 'stale') {
+          const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+          if (currentBoundary && isRetryableFetchBoundary(currentBoundary.state, currentBoundary.detail)) {
+            retryBoundary = currentBoundary;
+            queueRecoveryIfPending();
+          }
           failure ||= { ready: false, state: 'unavailable', error };
           continue;
         }
@@ -2753,7 +2759,13 @@ class DiscordGateway {
       }
     }
     const followup = this.recoveryFollowupPromise;
-    return followup ? await followup : result;
+    if (!followup) return result;
+    const followupResult = await followup;
+    if (result?.ready !== true && followupResult?.ready === true) {
+      return this.recoverTransport(`${reason} full follow-up`, lifecycleEpoch);
+    }
+    if (result?.ready !== true) return { ...followupResult, ...result, ready: false };
+    return followupResult;
   }
 
   async reconcilePending(before = undefined, { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
