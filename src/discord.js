@@ -2666,9 +2666,6 @@ class DiscordGateway {
           const currentCount = this.liveIntakeCounts.get(enrollment.threadId) || 0;
           this.liveIntakeCounts.set(enrollment.threadId, Math.max(currentCount, this.liveCheckpointThreshold));
         }
-        if (currentEnrollment?.active && currentEnrollment.state === THREAD_STATES.GAP) {
-          failure ||= { ready: false, state: currentEnrollment.state };
-        }
       }
     }
     return failure || { ready: true, state: 'ready' };
