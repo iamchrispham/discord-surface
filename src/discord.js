@@ -2525,15 +2525,7 @@ class DiscordGateway {
         const kind = recoveryKind(error);
         if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
         if (kind === CODEX_VALIDATION_KINDS.DEADLINE && retryBoundary && !recoveryAttempted) {
-          const expired = this.state.markIntakeBoundary(binding.channelId, READINESS.PENDING,
-            retryBoundary.detail || `${reason} retry after Discord HTTP 503`, retryBoundary.gap_from, retryBoundary.gap_to,
-            binding, null, retryBoundary, ownedReadiness);
-          if (expired) failure ||= { ready: false, state: 'unavailable' };
-          else {
-            const current = adoptCurrentReadiness();
-            if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
-            failure ||= { ready: false, state: current?.state || 'unavailable' };
-          }
+          failure ||= { ready: false, state: 'unavailable' };
           continue;
         }
         if (kind === 'stale') {
