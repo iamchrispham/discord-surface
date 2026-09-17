@@ -2394,6 +2394,14 @@ class DiscordGateway {
       let ownedReadiness = recovering.readiness;
       const currentRecovery = () => this.isCurrentBinding(binding) &&
         this.state.getBinding(binding.channelId)?.readiness === ownedReadiness;
+      const queueRecoveryIfPending = () => {
+        if (this.stopping || !currentRecovery()) return;
+        const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+        if (currentBoundary?.state !== READINESS.PENDING) return;
+        this.recoverTransport(`${reason} boundary retry`, lifecycleEpoch, [binding.channelId]).catch(error => {
+          this.logger(`Discord intake boundary retry failed: ${error.message}`);
+        });
+      };
       const recordOwnedBoundary = async (owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary) => {
         if (nextState === READINESS.GAP || nextState === READINESS.UNAVAILABLE) {
           if (!currentRecovery()) return null;
@@ -2406,6 +2414,7 @@ class DiscordGateway {
         }
         const result = await this.recordBoundary(owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary, ownedReadiness);
         if (result?.watermark) ownedReadiness = result.watermark.state;
+        if (!result) queueRecoveryIfPending();
         return result;
       };
       let retryBoundary = null;
@@ -2560,6 +2569,7 @@ class DiscordGateway {
         if (newest?.id) {
           const baselineWatermark = this.state.setIntakeBaseline(binding.channelId, newest.id, `${reason} cutoff excludes pre-adoption backlog`, binding, ownedBoundary, ownedReadiness);
           if (!baselineWatermark) {
+            queueRecoveryIfPending();
             failure ||= { ready: false, state: 'unavailable' };
             continue;
           }
@@ -2574,6 +2584,7 @@ class DiscordGateway {
           }
           const baselineWatermark = this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`, binding, ownedBoundary, ownedReadiness);
           if (!baselineWatermark) {
+            queueRecoveryIfPending();
             failure ||= { ready: false, state: 'unavailable' };
             continue;
           }
