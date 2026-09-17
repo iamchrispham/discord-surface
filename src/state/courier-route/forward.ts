@@ -62,13 +62,6 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
         !transcriptIsInSessionRoot(event.transcript_path, route.courier.sessionRoot)) {
       throw new deps.BindingError('courier hook caller or route is not current');
     }
-    const expected: Record<string, unknown> = { threadId: route.courier.recipientThreadId, prompt };
-    if (route.courier.hostId) expected.hostId = route.courier.hostId;
-    if (Object.keys(input).length !== Object.keys(expected).length ||
-        !Object.entries(expected).every(([key, value]) => input[key] === value)) {
-      throw new deps.BindingError('courier hook tool input differs from the fixed recipient');
-    }
-
     const rows = state.db.prepare(`SELECT id, discord_id, detail FROM receipts WHERE kind=?
       AND json_extract(detail, '$.route.routeId')=?
       AND json_extract(detail, '$.courier.nativeId')=?
@@ -83,6 +76,13 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
     const current = state.getCourierAttempt(messageId, id);
     const message = state.getMessage(messageId);
     if (!current || !message) throw new deps.BindingError('courier attempt is unavailable');
+    const persistedRecipient = current.attempt.envelope.recipient;
+    const expected: Record<string, unknown> = { threadId: persistedRecipient.threadId, prompt };
+    if (persistedRecipient.hostId) expected.hostId = persistedRecipient.hostId;
+    if (Object.keys(input).length !== Object.keys(expected).length ||
+        !Object.entries(expected).every(([key, value]) => input[key] === value)) {
+      throw new deps.BindingError('courier hook tool input differs from the fixed recipient');
+    }
     const eligible = [deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.UNCERTAIN];
     const reconciledNotSubmitted = hasRetiredCourierAttempt(state, messageId, attemptReceiptId);
     if (!eligible.includes(message.state) || state.hasNativeAcknowledgment(message)) {
