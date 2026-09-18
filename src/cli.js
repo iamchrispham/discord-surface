@@ -1739,10 +1739,22 @@ async function claudeChannel(args) {
   let ordinaryListenerAttached = false;
   let ordinaryStartupBinding = null;
   let stopPromise;
+  let revokeFailureReported = false;
+  const reportRevokeFailure = error => {
+    if (revokeFailureReported) return;
+    revokeFailureReported = true;
+    process.stderr.write(`discord-surface: Claude channel readiness revoke failed: ${error.message}\n`);
+  };
   const detach = () => {
     if (!ordinaryListenerAttached) return false;
-    ordinaryListenerAttached = false;
-    return detachOrdinaryListener({ state, startupBinding: ordinaryStartupBinding, reason: 'Claude channel unavailable' });
+    try {
+      const revoked = detachOrdinaryListener({ state, startupBinding: ordinaryStartupBinding, reason: 'Claude channel unavailable' });
+      ordinaryListenerAttached = false;
+      return revoked;
+    } catch (error) {
+      reportRevokeFailure(error);
+      throw error;
+    }
   };
   const stop = async () => {
     if (stopPromise) return stopPromise;
@@ -1757,8 +1769,12 @@ async function claudeChannel(args) {
   };
   // Readiness revoke and channel teardown both run inside stop, so an exit path must report
   // a stop failure rather than leaving it as an unhandled rejection.
-  const exit = () => stop().then(() => process.exit(0)).catch(error => {
+  const handleStopFailure = error => {
     process.stderr.write(`discord-surface: Claude channel stop failed: ${error.message}\n`);
+    process.exitCode = 1;
+  };
+  const exit = () => stop().then(() => process.exit(0)).catch(error => {
+    handleStopFailure(error);
     process.exit(1);
   });
   process.once('SIGINT', exit);
@@ -1771,7 +1787,7 @@ async function claudeChannel(args) {
       nativeId: required(args, 'native-id'),
       socketPath: path.resolve(required(args, 'socket')),
       beforeTransportClose: detach,
-      onTransportClose: stop
+      onTransportClose: () => { stop().catch(handleStopFailure); }
     });
     ordinaryStartupBinding = servedOrdinaryBinding(state, channel.bindingIdentity);
     await channel.start();
