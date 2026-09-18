@@ -801,7 +801,8 @@ test('retries return pre-upgrade parent-sourced outcomes without child migration
       const legacyEnvelope = { address: target, proof: 'A'.repeat(43) };
       let networkCalls = 0;
       const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
-        channelId: source.channelId, provider: source.provider, requestId, textFile: path.join(dir, 'missing.txt'),
+        channelId: source.channelId, provider: source.provider, requestId,
+        textFile: path.relative(process.cwd(), path.join(dir, 'missing.txt')),
         agentTarget: legacyEnvelope, fetchImpl: async () => { networkCalls += 1; throw new Error('legacy retry must not send'); } });
       assert.equal(result.status, outcome);
       assert.equal(result.duplicate, outcome === 'sent');
@@ -810,6 +811,34 @@ test('retries return pre-upgrade parent-sourced outcomes without child migration
       assert.equal(state.listReceipts().filter(row => row.kind === 'direct-post-attempt' || row.kind === 'direct-post-outcome').length, 2);
     } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   }
+});
+
+test('retryable pre-upgrade custody requires a child route before resend', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-legacy-retryable-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const requestId = 'legacy-not-sent';
+    const legacyPacket = { ...packet, id: requestId, source, target };
+    const attempt = {
+      journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, sourcePath: path.join(dir, 'missing.txt'),
+      textHash: crypto.createHash('sha256').update(JSON.stringify(legacyPacket)).digest('hex'), operatorId: '900',
+      partHash: 'legacy-part-hash', channelId: source.channelId, guildId: source.guildId, provider: source.provider,
+      nativeId: source.nativeId, generation: source.generation, conductorId: 'fixture', repoKey: 'repo:fixture',
+      partIndex: 0, partCount: 1, nonce: `${requestId}-nonce`, deliveryChannelId: target.channelId,
+      presentation: 'legacy', agentPacket: legacyPacket, status: 'attempted'
+    };
+    state.receipt(null, 'direct-post-attempt', attempt);
+    state.receipt(null, 'direct-post-outcome', { ...attempt, outcome: 'not_sent' });
+    let networkCalls = 0;
+    await assert.rejects(runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
+      channelId: source.channelId, provider: source.provider, requestId, textFile: path.join(dir, 'missing.txt'),
+      agentTarget: { address: target, proof: 'A'.repeat(43) },
+      fetchImpl: async () => { networkCalls += 1; throw new Error('legacy retry must not reach network'); } }),
+    /agent messages require --agent-thread-id/);
+    assert.equal(networkCalls, 0);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 
@@ -944,11 +973,11 @@ test('results can answer a parent-targeted request accepted before child routing
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
-    const sourceChild = enrollChild(state, source, '103');
     const request = { ...packet, id: 'legacy-parent-request', source: target, target: source };
     const intake = state.acceptDiscordMessage({ id: '8102', guildId: source.guildId, channelId: source.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token });
     assert.equal(intake.accepted, true);
+    const sourceChild = enrollChild(state, source, '103');
     const textFile = path.join(dir, 'result.txt');
     fs.writeFileSync(textFile, 'Legacy result');
     const calls = [];
@@ -970,6 +999,13 @@ test('results can answer a parent-targeted request accepted before child routing
       id: 'legacy-parent-result', kind: KINDS.RESULT, source: sourceChild, target,
       replyTo: request.id, text: 'Legacy result'
     });
+    const postUpgradeRequest = { ...packet, id: 'post-upgrade-parent-request', source: target, target: source };
+    assert.equal(state.acceptDiscordMessage({ id: '8103', guildId: source.guildId, channelId: source.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(postUpgradeRequest, token) }, { agentToken: token }).accepted, true);
+    await assert.rejects(runDirectPost({ state, token, nativeId: source.nativeId, generation: 1,
+      channelId: source.channelId, provider: source.provider, agentThreadId: sourceChild.channelId, textFile,
+      dedupeKey: 'post-upgrade-parent-result', agentKind: KINDS.RESULT, agentReplyTo: postUpgradeRequest.id,
+      fetchImpl: async () => { throw new Error('post-upgrade parent request must not send'); } }), /unknown or does not match/);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1019,4 +1055,40 @@ test('child result correlation returns to the peer child address', async () => {
     assert.equal(receiver.getMessage('8201').channelId, target.channelId);
     assert.equal(receiver.getMessage('8201').deliveryChannelId, peerChild.channelId);
   } finally { state.close(); receiver.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI lets a receipt-bound v1 retry reach legacy custody before v2 validation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-cli-legacy-retry-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const secret = path.join(dir, 'secret');
+  const textFile = path.join(dir, 'gone.txt');
+  const destination = path.join(dir, 'destination.json');
+  const state = new SurfaceState(db);
+  try {
+    fs.writeFileSync(secret, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secret });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const requestId = 'cli-legacy-retry';
+    const legacyPacket = { ...packet, id: requestId, source, target };
+    const attempt = {
+      journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, sourcePath: textFile,
+      textHash: crypto.createHash('sha256').update(JSON.stringify(legacyPacket)).digest('hex'), operatorId: '900',
+      partHash: 'legacy-part-hash', channelId: source.channelId, guildId: source.guildId, provider: source.provider,
+      nativeId: source.nativeId, generation: source.generation, conductorId: 'fixture', repoKey: 'repo:fixture',
+      partIndex: 0, partCount: 1, nonce: `${requestId}-nonce`, deliveryChannelId: target.channelId,
+      presentation: 'legacy', agentPacket: legacyPacket, status: 'attempted'
+    };
+    state.receipt(null, 'direct-post-attempt', attempt);
+    state.receipt(null, 'direct-post-outcome', { ...attempt, outcome: 'sent', messageId: `${requestId}-message` });
+    fs.writeFileSync(destination, JSON.stringify({ address: target, proof: 'A'.repeat(43) }));
+  } finally { state.close(); }
+  try {
+    const cli = path.resolve(__dirname, '../src/cli.js');
+    const result = require('node:child_process').spawnSync(process.execPath, [cli, 'agent-send', '--db', db,
+      '--provider', source.provider, '--channel-id', source.channelId, '--native-id', source.nativeId,
+      '--generation', '1', '--target-file', destination, '--text-file', textFile, '--dedupe-key', 'cli-legacy-retry'],
+    { encoding: 'utf8', timeout: 5000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).status, 'sent');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

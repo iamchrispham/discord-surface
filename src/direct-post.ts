@@ -45,9 +45,11 @@ interface DirectPostConfig {
 }
 
 interface DirectPostReceiptRow {
+  id?: number;
   kind: string;
   detail: string;
   discord_id: string | null;
+  created_at?: string;
 }
 
 interface DirectPostReceiptDetail {
@@ -193,7 +195,6 @@ interface DirectPostInputBase {
   nativeId: unknown;
   generation: unknown;
   channelId?: string | null;
-  agentThreadId?: string | null;
   provider?: AgentProvider | null;
   textFile?: unknown;
   attachmentFile?: unknown;
@@ -210,6 +211,7 @@ interface DirectPostInputBase {
 }
 
 interface OrdinaryDirectPostInput extends DirectPostInputBase {
+  agentThreadId?: never;
   agentKind?: Extract<AgentMessageKind, 'request'>;
   agentTarget?: null;
   agentReplyTo?: null;
@@ -217,6 +219,7 @@ interface OrdinaryDirectPostInput extends DirectPostInputBase {
 }
 
 interface AgentRequestDirectPostInput extends DirectPostInputBase {
+  agentThreadId: string;
   agentKind?: Extract<AgentMessageKind, 'request'>;
   agentTarget: AgentAddressEnvelope;
   agentReplyTo?: null;
@@ -224,6 +227,7 @@ interface AgentRequestDirectPostInput extends DirectPostInputBase {
 }
 
 interface AgentResultDirectPostInput extends DirectPostInputBase {
+  agentThreadId: string;
   agentKind: Extract<AgentMessageKind, 'result'>;
   agentTarget?: AgentAddress | AgentAddressEnvelope | null;
   agentReplyTo: string;
@@ -501,6 +505,13 @@ function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | nu
   return agentTarget as AgentAddress;
 }
 
+function receiptBefore(left: { id?: number; created_at?: string }, right: { id?: number; created_at?: string }): boolean {
+  const leftId = left.id;
+  const rightId = right.id;
+  if (Number.isSafeInteger(leftId) && Number.isSafeInteger(rightId)) return (leftId as number) < (rightId as number);
+  return typeof left.created_at === 'string' && typeof right.created_at === 'string' && left.created_at < right.created_at;
+}
+
 function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, packet, sourceText, agentKind, agentTarget, agentReplyTo }:
   { state: DirectPostState; binding: DirectPostBinding; token: string; requestId: string; packet: AgentMessage; sourceText: string;
     agentKind: AgentMessageKind; agentTarget: AgentAddress | AgentAddressEnvelope | null; agentReplyTo: string | null;
@@ -547,7 +558,7 @@ function canonicalAddress(address: DirectPostBinding | AgentAddress): AgentAddre
   return Object.fromEntries(ADDRESS_KEYS.map(key => [key, address[key]])) as unknown as AgentAddress;
 }
 
-function resolveAgentAddress(state: DirectPostState, binding: DirectPostBinding, agentThreadId: string | null = null): AgentAddress {
+function resolveAgentAddress(state: DirectPostState, binding: DirectPostBinding, agentThreadId: string | null | undefined = null): AgentAddress {
   if (agentThreadId === null || agentThreadId === undefined) {
     throw new BindingError('agent messages require --agent-thread-id for an actively enrolled child route');
   }
@@ -579,19 +590,28 @@ async function verifyAgentDestination({ token, agentTarget, fetchImpl, signal, t
 
 function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, source: AgentAddress, target: AgentAddress | null = null,
   legacyParent: AgentAddress | null = null): AgentMessage {
+  const rows = state.listReceipts();
+  const firstChildEnrollment = legacyParent === null ? null : rows
+    .filter(row => row.kind === 'thread-enrolled')
+    .map(row => ({ row, detail: receiptDetail(row) }))
+    .filter(({ detail }) => detail?.parentChannelId === legacyParent.channelId && detail?.guildId === legacyParent.guildId)
+    .sort((left, right) => (Number(left.row.id || 0) - Number(right.row.id || 0)) ||
+      String(left.row.created_at || '').localeCompare(String(right.row.created_at || '')))[0]?.row || null;
   const candidates = state.listReceipts()
     .filter(row => row.kind === 'agent-message')
     .map(row => {
       try {
         const detail: unknown = JSON.parse(row.detail);
         const packet = detail && typeof detail === 'object' ? (detail as Record<string, unknown>).packet || null : null;
-        return packet ? { packet: packet as Record<string, unknown>, discordId: row.discord_id } : null;
+        return packet ? { packet: packet as Record<string, unknown>, discordId: row.discord_id, id: row.id, createdAt: row.created_at } : null;
       } catch { return null; }
     })
-    .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null } => candidate !== null &&
+    .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; id: number | undefined; createdAt: string | undefined } => candidate !== null &&
       candidate.packet.kind === KINDS.REQUEST &&
       (target === null || sameAddress(candidate.packet.source, target)) &&
-      (sameAddress(candidate.packet.target, source) || (legacyParent !== null && sameAddress(candidate.packet.target, legacyParent))));
+      (sameAddress(candidate.packet.target, source) || (legacyParent !== null && firstChildEnrollment !== null &&
+        receiptBefore({ id: candidate.id, created_at: candidate.createdAt }, firstChildEnrollment) &&
+        sameAddress(candidate.packet.target, legacyParent))));
   const matches = candidates.filter(candidate => candidate.discordId === replyTo || candidate.packet.id === replyTo);
   if (matches.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
   const match = matches[0];
@@ -753,11 +773,13 @@ function prepareFileSource({ state, requestId, textFile, attachmentFile, resume,
     parts: [admitted.caption], fileManifest: admitted, filePreparation: admitted };
 }
 
-async function runDirectPost({ state, token, nativeId, generation, channelId = null, provider = null, textFile,
-  agentThreadId = null,
-  dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
-  agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
-  agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null }: DirectPostInput): Promise<DirectPostResult> {
+async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> {
+  let { state, token, nativeId, generation, channelId = null, provider = null, textFile,
+    agentThreadId = null,
+    dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
+    agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
+    agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null } =
+    input as DirectPostInput & { agentThreadId?: string | null };
   const binding = watcherNotice
     ? watcherNotice.binding
     : resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
@@ -802,9 +824,10 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       : readTextFile(textFile);
   } catch (error) {
     const legacySourcePath = legacy?.attempt.sourcePath;
-    if (!legacy || fileRequested || typeof textFile !== 'string' || legacySourcePath !== textFile ||
+    const requestedSourcePath = typeof textFile === 'string' ? path.resolve(textFile) : null;
+    if (!legacy || fileRequested || requestedSourcePath === null || legacySourcePath !== requestedSourcePath ||
         typeof legacy.packet.text !== 'string' || !errorMessage(error).startsWith('text file is unavailable')) throw error;
-    source = { sourcePath: textFile, text: legacy.packet.text, textHash: hash(legacy.packet.text), parts: [legacy.packet.text] };
+    source = { sourcePath: requestedSourcePath, text: legacy.packet.text, textHash: hash(legacy.packet.text), parts: [legacy.packet.text] };
   }
   const effectiveReplyTarget = source.filePreparation?.inReplyTo ?? replyTarget;
   let deliveryTarget: AgentAddress | null = null;
@@ -819,7 +842,7 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
     legacyPacket = legacy.packet;
   }
   let address = canonicalAddress(binding);
-  if (!watcherNotice && isAgentMessage && legacyPacket === null) address = resolveAgentAddress(state, binding, agentThreadId);
+  if (!watcherNotice && isAgentMessage) address = resolveAgentAddress(state, binding, agentThreadId);
   if (watcherNotice) {
     if (agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT || agentReplyTo !== null) {
       throw new BindingError('watcher notices do not accept agent message options');
@@ -836,7 +859,6 @@ async function runDirectPost({ state, token, nativeId, generation, channelId = n
       displayParts: [wire]
     };
   } else if (isAgentMessage && legacyPacket !== null) {
-    address = canonicalAddress(binding);
     deliveryTarget = legacyPacket.target;
     agentTarget = deliveryTarget;
     agentReplyTo = legacyPacket.replyTo;

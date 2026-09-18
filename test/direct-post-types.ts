@@ -82,6 +82,7 @@ const agentTarget: AgentAddressEnvelope = {
 const agentInput: DirectPostInput = {
   ...input,
   dedupeKey: 'agent-request',
+  agentThreadId: 'thread',
   agentTarget,
   agentPresentation
 };

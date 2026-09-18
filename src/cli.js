@@ -15,7 +15,7 @@ if (require.main === module && startup.command === 'courier-guard' && !startup.a
   return;
 }
 
-const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, issueAgentAddress, verifyAgentAddress } = require('./agent-message');
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, issueAgentAddress } = require('./agent-message');
 const { resolveAgentAddress, resolveDedupeKey, resolveDirectBinding, runDirectPost, runWatcherNoticePost } = require('./direct-post');
 const { runBoardRefresh } = require('./board-refresh');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
@@ -1852,10 +1852,8 @@ async function agentSend(args) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('invalid agent provider');
   const { state } = openState(args);
   let ordinary;
-  let agentCredential;
   try {
     ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id')));
-    agentCredential = readSecret(state.requireConfig().secretFile);
   }
   finally { state.close(); }
   const isReply = Object.hasOwn(args, 'agent-reply-to');
@@ -1878,7 +1876,6 @@ async function agentSend(args) {
       }
     } finally { fs.closeSync(fd); }
     agentTarget = JSON.parse(Buffer.concat(chunks, bytesRead).toString('utf8'));
-    if (!isReply) verifyAgentAddress(agentTarget, agentCredential);
   } else if (!isReply) {
     required(args, 'target-file');
   }
