@@ -1717,6 +1717,9 @@ function attachOrdinaryListener({ state, paths, startupBinding, identity, label,
   if (!gatewayWake.requested) {
     stderr.write(`discord-surface: ${label} startup could not wake Gateway (${gatewayWake.reason})\n`);
     if (gatewayWake.reason === 'gateway-wake-unsupported') {
+      // The reconcile above already moved the binding to pending. Nothing will ever
+      // resolve that, so the owner puts readiness back before the caller unwinds.
+      detachOrdinaryListener({ state, startupBinding, reason: `${label} unavailable` });
       throw new Error(`${label} startup could not wake Gateway (${gatewayWake.reason})`);
     }
   }

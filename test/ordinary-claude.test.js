@@ -597,7 +597,10 @@ for (const terminalState of [READINESS.UNAVAILABLE, READINESS.GAP]) {
 
 test('ordinary Claude channel attach fails when the running Gateway cannot be woken', t => {
   const f = fixture(t);
-  f.state.setBindingReadiness(f.binding.channelId, READINESS.UNAVAILABLE, 'Claude channel unavailable', f.binding);
+  // Held intake from an endpoint failure, so the attach reconciles to pending before it learns
+  // the wake is unsupported. The throw must not leave that pending behind.
+  f.state.markIntakeBoundary(f.binding.channelId, 'unavailable', 'Claude endpoint unavailable before event write: connect ENOENT', null, null, f.binding);
+  assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
   const identity = {
     channelId: f.binding.channelId, guildId: f.binding.guildId, provider: f.binding.provider,
     nativeId: f.binding.nativeId, workspace: f.binding.workspace, endpoint: f.binding.endpoint,
@@ -613,6 +616,7 @@ test('ordinary Claude channel attach fails when the running Gateway cannot be wo
     stderr: { write() {} }
   }), /Claude channel startup could not wake Gateway \(gateway-wake-unsupported\)/);
   assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.equal(readinessReceipts(f.state, f.binding.channelId).at(-1).detail, 'Claude channel unavailable');
 });
 
 test('Claude transport close runs the listener revoke before releasing its socket', async t => {
@@ -1191,6 +1195,9 @@ test('ordinary Claude channel startup delivers held intake through successful Ga
   await expectWithin(() => listener.stdout().includes(messageId) && listener.stdout().includes(content), 'held message delivery through Claude channel');
   assert.match(listener.stdout(), new RegExp(messageId));
   assert.match(listener.stdout(), new RegExp(content));
+  const observed = new SurfaceState(f.db);
+  t.after(() => { try { observed.close(); } catch {} });
+  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.READY);
   await listener.terminate();
   await gateway.terminate();
 });
