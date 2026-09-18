@@ -451,7 +451,8 @@ const LEGACY_RETRYABLE_OUTCOMES = new Set<DirectPostOutcome>([
   DIRECT_POST_OUTCOMES.NOT_SENT
 ]);
 
-function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostBinding, requestId: string): LegacyParentSourcedReceipt | null {
+function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostBinding, requestId: string,
+  allowLegacyChildRoute = false): LegacyParentSourcedReceipt | null {
   const rows = state.listReceipts();
   const attempts = new Map<string, Record<string, unknown>>();
   for (const row of rows) {
@@ -483,9 +484,12 @@ function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostB
     const attempt = attemptId ? attempts.get(attemptId) : detail;
     const attemptPacket = attempt?.legacyAgentPacket ?? attempt?.agentPacket;
     const packet = detail.legacyAgentPacket ?? detail.agentPacket ?? attemptPacket;
-    if (!attempt || !attemptPacket || !packet || typeof attemptPacket !== 'object' || typeof packet !== 'object' ||
-        !sameAddress((attemptPacket as Record<string, unknown>).source, parent) ||
-        !sameAddress((packet as Record<string, unknown>).source, parent) ||
+    if (!attempt || !attemptPacket || !packet || typeof attemptPacket !== 'object' || typeof packet !== 'object') continue;
+    const attemptSource = (attemptPacket as Record<string, unknown>).source;
+    const packetSource = (packet as Record<string, unknown>).source;
+    const parentSourced = sameAddress(attemptSource, parent) && sameAddress(packetSource, parent);
+    const childSourced = allowLegacyChildRoute && sameAddress(attemptSource, packetSource) && !sameAddress(packetSource, parent);
+    if ((!parentSourced && !childSourced) ||
         !sameAddress((packet as Record<string, unknown>).target, (attemptPacket as Record<string, unknown>).target)) continue;
     const target = (packet as Record<string, unknown>).target as AgentAddress;
     const partIndex = Number.isSafeInteger(detail.partIndex) ? detail.partIndex as number : 0;
@@ -524,15 +528,19 @@ function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | nu
   return agentTarget as AgentAddress;
 }
 
-function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, packet, sourceText, agentKind, agentTarget, agentReplyTo }:
+function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, packet, sourceText, agentKind, agentTarget, agentReplyTo,
+  sourceAddress = null, allowRecordedTarget = false }:
   { state: DirectPostState; binding: DirectPostBinding; token: string; requestId: string; packet: AgentMessage; sourceText: string;
     agentKind: AgentMessageKind; agentTarget: AgentAddress | AgentAddressEnvelope | null; agentReplyTo: string | null;
+    sourceAddress?: AgentAddress | null; allowRecordedTarget?: boolean;
   }): void {
   const parent = canonicalAddress(binding);
-  if (packet.id !== requestId || !sameAddress(packet.source, parent) || packet.kind !== agentKind || packet.text !== sourceText) {
+  const expectedSource = sourceAddress ?? parent;
+  if (packet.id !== requestId || !sameAddress(packet.source, expectedSource) || packet.kind !== agentKind || packet.text !== sourceText) {
     throw new BindingError('direct post request identity conflicts with existing custody');
   }
-  const expectedTarget = legacyAgentTarget(agentTarget, token, agentKind === KINDS.REQUEST);
+  const requestedTarget = legacyAgentTarget(agentTarget, token, agentKind === KINDS.REQUEST);
+  const expectedTarget = requestedTarget ?? (allowRecordedTarget ? packet.target : null);
   if (expectedTarget !== null && !sameAddress(packet.target, expectedTarget)) {
     throw new BindingError('direct post request identity conflicts with existing custody');
   }
@@ -543,7 +551,7 @@ function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, p
   } else {
     try {
       const replyTo = requiredString(agentReplyTo, 'agent-reply-to', 128);
-      const request = resolveAgentReplyRequest(state, replyTo, parent, expectedTarget, parent);
+      const request = resolveAgentReplyRequest(state, replyTo, expectedSource, expectedTarget, parent);
       if (packet.replyTo !== request.id || !sameAddress(packet.target, request.source)) {
         throw new BindingError('direct post request identity conflicts with existing custody');
       }
@@ -822,7 +830,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   let legacy: LegacyParentSourcedReceipt | null = null;
   if (!watcherNotice && isAgentMessage && explicitRequestId !== undefined) {
     state.recoverDirectPostReceipts();
-    legacy = legacyParentSourcedReceipt(state, binding, explicitRequestId);
+    legacy = legacyParentSourcedReceipt(state, binding, explicitRequestId, isLegacyAgentAddressEnvelope(agentTarget));
   }
   let source: DirectPostSource;
   try {
@@ -843,12 +851,21 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   let agentRequestTarget: AgentAddress | null = null;
   let legacyPacket: AgentMessage | null = null;
   let terminalLegacyResult: DirectPostResult | null = null;
+  const legacyChildAddress = legacy && !sameAddress(legacy.packet.source, canonicalAddress(binding))
+    ? legacy.packet.source
+    : null;
   if (legacy) {
+    if (legacyChildAddress !== null && agentThreadId !== null && agentThreadId !== legacyChildAddress.channelId) {
+      throw new BindingError('direct post request identity conflicts with existing custody');
+    }
     assertLegacyParentSourcedIdentity({ state, binding, token, requestId: explicitRequestId as string, packet: legacy.packet, sourceText: source.text,
-      agentKind, agentTarget, agentReplyTo });
+      agentKind, agentTarget, agentReplyTo, sourceAddress: legacy.packet.source,
+      allowRecordedTarget: legacyChildAddress !== null });
     if (legacy.outcome === DIRECT_POST_OUTCOMES.SENT || legacy.outcome === DIRECT_POST_OUTCOMES.UNKNOWN) {
+      const legacyMarker = legacy.detail.legacyAgentPacket;
       const migratedPacket = legacy.detail.agentPacket;
-      if (!migratedPacket || typeof migratedPacket !== 'object' || Array.isArray(migratedPacket)) return legacy.result;
+      if (!legacyMarker || typeof legacyMarker !== 'object' || Array.isArray(legacyMarker) ||
+          !migratedPacket || typeof migratedPacket !== 'object' || Array.isArray(migratedPacket)) return legacy.result;
       legacyPacket = legacy.packet;
       terminalLegacyResult = legacy.result;
     }
@@ -858,7 +875,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     if (terminalLegacyResult === null) legacyPacket = legacy.packet;
   }
   let address = canonicalAddress(binding);
-  if (!watcherNotice && isAgentMessage) address = resolveAgentAddress(state, binding, agentThreadId);
+  if (!watcherNotice && isAgentMessage) address = legacyChildAddress ?? resolveAgentAddress(state, binding, agentThreadId);
   if (watcherNotice) {
     if (agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT || agentReplyTo !== null) {
       throw new BindingError('watcher notices do not accept agent message options');
@@ -929,7 +946,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     const legacyPartIndex = legacy?.detail.partIndex;
     const partIndex = Number.isSafeInteger(legacyPartIndex) ? legacyPartIndex as number : 0;
     const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex,
-      address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null, legacyPacket, agentRequestTarget);
+      address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null,
+      legacyChildAddress === null ? legacyPacket : null, agentRequestTarget);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     state.inspectDirectPostPart(meta);
     return terminalLegacyResult;
@@ -952,7 +970,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
       break;
     }
-    const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null, legacyPacket, agentRequestTarget);
+    const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null,
+      legacyChildAddress === null ? legacyPacket : null, agentRequestTarget);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     if (deliveryTarget !== null) {
       let existing;
