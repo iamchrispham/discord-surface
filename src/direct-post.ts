@@ -448,10 +448,7 @@ interface LegacyParentSourcedReceipt {
 }
 
 const LEGACY_RETRYABLE_OUTCOMES = new Set<DirectPostOutcome>([
-  DIRECT_POST_OUTCOMES.NOT_SENT,
-  DIRECT_POST_OUTCOMES.REJECTED,
-  DIRECT_POST_OUTCOMES.RATE_LIMITED,
-  DIRECT_POST_OUTCOMES.STALE
+  DIRECT_POST_OUTCOMES.NOT_SENT
 ]);
 
 function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostBinding, requestId: string): LegacyParentSourcedReceipt | null {

@@ -18,8 +18,9 @@ export function isAgentSourcePromotion(original: unknown, packet: unknown, paren
     packet.id === original.id && packet.kind === original.kind && packet.replyTo === original.replyTo && packet.text === original.text;
 }
 
-export function isLegacyChildResult(packet: AgentMessage, request: AgentMessage, requestTarget: unknown): boolean {
-  return packet.kind === KINDS.RESULT && packet.replyTo === request.id && sameAddress(packet.target, request.source) &&
+export function isLegacyChildResult(packet: AgentMessage, request: AgentMessage, requestTarget: unknown,
+  childRouteProven = false): boolean {
+  return childRouteProven && packet.kind === KINDS.RESULT && packet.replyTo === request.id && sameAddress(packet.target, request.source) &&
     sameAddress(requestTarget, request.target) && packet.source.channelId !== request.target.channelId &&
     sameOwner(packet.source, request.target);
 }

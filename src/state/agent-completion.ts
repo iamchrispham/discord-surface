@@ -155,6 +155,16 @@ function receivedResultEvidence(
   };
 }
 
+function hasEnrolledLegacyChild(state: CompletionState, child: AgentAddress, parent: AgentAddress): boolean {
+  const row = state.db.prepare(`SELECT 1 FROM thread_enrollments AS enrollment
+    JOIN bindings AS binding ON binding.channel_id=enrollment.parent_channel_id
+    WHERE enrollment.thread_id=? AND enrollment.parent_channel_id=? AND enrollment.guild_id=? AND enrollment.active=1
+      AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1
+    LIMIT 1`)
+    .get(child.channelId, parent.channelId, parent.guildId, parent.guildId, parent.provider, parent.nativeId, parent.generation);
+  return Boolean(row);
+}
+
 function receivedReplyEvidence(
   state: CompletionState,
   request: AgentMessage,
@@ -184,7 +194,8 @@ function receivedReplyEvidence(
     const detail = deps.parseJson(candidateRow.detail, null);
     const candidate = detail?.packet;
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
-    const migrated = allowLegacyChildSource && isLegacyChildResult(candidate, request, parentTarget);
+    const migrated = allowLegacyChildSource && isLegacyChildResult(candidate, request, parentTarget,
+      hasEnrolledLegacyChild(state, candidate.source, parentTarget));
     if (!sameReverseAddresses(candidate, request) && !migrated) continue;
     return {
       kind: 'received-result',
@@ -218,9 +229,9 @@ function sentReplyEvidence(
     if (!validAgentPacket(attemptPacket, KINDS.RESULT) || !validAgentPacket(candidate, KINDS.RESULT) ||
         !sameAgentPacket(candidate, attemptPacket)) continue;
     const migrated = allowLegacyChildSource &&
-      isLegacyChildResult(candidate, request, parentTarget) &&
-      isLegacyChildResult(candidate, request, row.attemptDetail.agentRequestTarget) &&
-      isLegacyChildResult(candidate, request, row.outcomeDetail.agentRequestTarget);
+      isLegacyChildResult(candidate, request, parentTarget, true) &&
+      isLegacyChildResult(candidate, request, row.attemptDetail.agentRequestTarget, true) &&
+      isLegacyChildResult(candidate, request, row.outcomeDetail.agentRequestTarget, true);
     if (!sameReverseAddresses(candidate, request) && !migrated) continue;
     return {
       kind: 'sent-result',
