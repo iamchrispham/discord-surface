@@ -210,6 +210,29 @@ test('previous child-result custody remains idempotent without migration metadat
   assert.equal(f.state.directPostRows(packet.id).length, 2);
 });
 
+test('legacy child-targeted requests reject sibling child promotion', async t => {
+  const f = fixture(t);
+  enroll(f, '103');
+  enroll(f, '104');
+  const childA = { ...source, channelId: '103' };
+  const childB = { ...source, channelId: '104' };
+  const request = acceptRequest(f, '8112', true, childA);
+  assert.equal(f.state.claimDispatch('8112').claimed, true);
+  f.state.markSubmitted('8112');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8112', nativeId: source.nativeId, generation: 1 });
+  const receivedPacket = { id: 'received-sibling-child-result', kind: KINDS.RESULT, source: childB, target,
+    replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
+  acceptRequest(f, 'received-sibling-child-result-discord', false);
+  f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+    .run(JSON.stringify({ packet: receivedPacket }), 'received-sibling-child-result-discord');
+  assert.throws(() => agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8112', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  }), /immutable correlated result/);
+  assert.equal(f.state.getMessage('8112').state, MESSAGE_STATES.SUBMITTED);
+});
+
 test('agent-complete finds its result behind 64 newer sibling results sharing the request key', async t => {
   const f = fixture(t);
   enroll(f);
