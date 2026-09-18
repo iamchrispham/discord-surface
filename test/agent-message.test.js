@@ -300,6 +300,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
 });
 
 const { runDirectPost } = require('../src/direct-post');
+const { agentSend } = require('../src/cli');
 
 test('explicit sender posts one authenticated packet to recipient and retains source custody', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-send-'));
@@ -1117,21 +1118,29 @@ test('an interrupted v1 retry recovers before v2 validation without posting', as
     });
     fs.writeFileSync(destination, JSON.stringify({ address: target, proof: 'A'.repeat(43) }));
   } finally { state.close(); }
+  const methods = [];
+  const printed = [];
+  const previousExitCode = process.exitCode;
   try {
-    const resumed = new SurfaceState(db);
-    const methods = [];
-    const legacyTarget = JSON.parse(fs.readFileSync(destination, 'utf8'));
-    try {
-      const result = await runDirectPost({ state: resumed, token, nativeId: source.nativeId,
-        generation: 1, channelId: source.channelId, provider: source.provider, textFile,
-        dedupeKey: 'cli-legacy-interrupted', agentMode: true,
-        agentTarget: legacyTarget, fetchImpl: async (_url, options) => {
-          methods.push(options.method);
-          if (options.method === 'POST') throw new Error('unexpected Discord POST');
-          return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
-        } });
-      assert.equal(result.status, 'unknown');
-      assert.equal(methods.filter(method => method === 'POST').length, 0);
-    } finally { resumed.close(); }
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    // Public agent-send entrypoint: the v1 destination file must reach legacy custody
+    // recovery instead of failing exact-v2 prevalidation before runDirectPost.
+    const result = await agentSend({ db, provider: source.provider, 'channel-id': source.channelId,
+      'native-id': source.nativeId, generation: '1', 'target-file': destination, 'text-file': textFile,
+      'dedupe-key': 'cli-legacy-interrupted' }, {
+      print: value => printed.push(value),
+      fetchImpl: async (_url, options) => {
+        methods.push(options.method);
+        if (options.method === 'POST') throw new Error('unexpected Discord POST');
+        return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+      }
+    });
+    assert.equal(result.status, 'unknown');
+    assert.equal(printed.length, 1);
+    assert.equal(printed[0].status, 'unknown');
+    assert.equal(process.exitCode, 1);
+    assert.equal(methods.filter(method => method === 'POST').length, 0);
+  } finally {
+    process.exitCode = previousExitCode;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

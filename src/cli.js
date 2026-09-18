@@ -1906,7 +1906,7 @@ function claudeReply(args) {
   return nativeReply(args, 'claude');
 }
 
-async function agentSend(args) {
+async function agentSend(args, dependencies = {}) {
   const provider = required(args, 'provider');
   if (!['codex', 'claude'].includes(provider)) throw new Error('invalid agent provider');
   const { state } = openState(args);
@@ -1942,7 +1942,9 @@ async function agentSend(args) {
     agentTarget,
     agentMode: true,
     agentThreadId: Object.hasOwn(args, 'agent-thread-id') ? args['agent-thread-id'] : null,
-    agentPresentation: args['agent-presentation']
+    agentPresentation: args['agent-presentation'],
+    fetchImpl: dependencies.fetchImpl,
+    print: dependencies.print
   });
 }
 
@@ -1965,6 +1967,7 @@ async function assertOrdinaryPostCaller(state, { provider, nativeId, generation,
 }
 
 async function directPost(args, provider = null, ordinary = false, dependencies = {}) {
+  const output = dependencies.print || print;
   const { paths, state } = openState(args);
   const controller = new AbortController();
   let receivedSignal = null;
@@ -1989,7 +1992,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       const binding = resolveDirectBinding(state, { nativeId, generation: Number(generation), channelId, provider, ordinary });
       const address = resolveAgentAddress(state, binding, dependencies.agentThreadId ?? null);
       const envelope = issueAgentAddress(address, readSecret(config.secretFile));
-      print(envelope);
+      output(envelope);
       return envelope;
     }
     const result = await runDirectPost({
@@ -2012,9 +2015,10 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       dedupeKey,
       inReplyTo: args['in-reply-to'],
       signal: controller.signal,
+      fetchImpl: dependencies.fetchImpl,
       ordinary
     });
-    print(result);
+    output(result);
     if (result.status !== 'sent') process.exitCode = 1;
     if (receivedSignal) process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
     return result;
@@ -2384,7 +2388,7 @@ async function main() {
   }
 }
 
-module.exports = { agentComplete, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
+module.exports = { agentComplete, agentSend, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
 
 if (require.main === module) {
   main().catch(error => {
