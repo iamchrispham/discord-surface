@@ -8,7 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { createOrdinaryClaudeRequest, ordinaryBindingDecision, resolveExistingChannel } = require('../src/ordinary-codex');
 const { createClaudeMonitor, createMonitorMcp } = require('../src/claude-monitor');
-const { ordinaryClaudeBind } = require('../src/cli');
+const { attachOrdinaryListener, detachOrdinaryListener, ordinaryClaudeBind, servedOrdinaryBinding } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
 const { ClaudeProvider, dispatchAndObserve, postUnixJson, probeClaudeChannel, probeUnixSocket, validateClaudeSessionIdentity, waitForReply } = require('../src/native');
 const { MESSAGE_STATES, READINESS, SurfaceState, StaleGenerationError } = require('../src/state');
@@ -943,4 +943,159 @@ test('ordinary Claude bind pins recovery wake to the selected Gateway', async t 
   });
   assert.deepEqual(result.gatewayWake, { requested: false, pid: replacement.pid, state: 'running', reason: 'gateway-changed' });
   assert.deepEqual(wakeSignals, []);
+});
+
+function spawnChannel(t, f) {
+  const child = spawn(process.execPath, [CLI_PATH, 'claude-channel', '--state-dir', f.dir, '--db', f.db, '--native-id', CLAUDE, '--socket', f.socketPath], {
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const deadline = setTimeout(() => child.kill('SIGKILL'), 20000);
+  deadline.unref();
+  const closed = new Promise((resolve, reject) => {
+    child.once('close', resolve);
+    child.once('error', reject);
+  });
+  t.after(async () => {
+    clearTimeout(deadline);
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    await closed;
+  });
+  return {
+    child,
+    stderr: () => stderr,
+    async terminate() {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+      await closed;
+    }
+  };
+}
+
+async function expectWithin(predicate, label, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await sleep(10);
+  }
+  throw new Error(`${label} did not happen within ${timeoutMs}ms`);
+}
+
+function readinessReceipts(state, channelId) {
+  return state.listReceipts()
+    .filter(row => row.kind === 'binding-readiness')
+    .map(row => JSON.parse(row.detail))
+    .filter(detail => detail.channelId === channelId);
+}
+
+test('ordinary Claude channel startup reopens an endpoint-unavailable watermark, wakes the Gateway, and revokes readiness on stop', async t => {
+  const f = fixture(t);
+  f.state.markIntakeBoundary(f.binding.channelId, 'unavailable', 'Claude endpoint unavailable before event write: connect ENOENT', null, null, f.binding);
+  f.state.close();
+  const observed = new SurfaceState(f.db);
+  t.after(() => { try { observed.close(); } catch {} });
+  const listener = spawnChannel(t, f);
+  await expectWithin(() => fs.existsSync(f.socketPath), 'Claude channel socket');
+  await expectWithin(() => observed.getIntakeWatermark(f.binding.channelId)?.state === READINESS.PENDING,
+    'Claude channel startup reconciling the endpoint-unavailable watermark');
+  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.PENDING);
+  await expectWithin(() => listener.stderr().includes('could not wake Gateway'),
+    'Claude channel startup requesting a Gateway wake');
+  assert.match(listener.stderr(), /discord-surface: Claude channel startup could not wake Gateway \(gateway-not-running\)/);
+
+  await listener.terminate();
+  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.deepEqual(readinessReceipts(observed, f.binding.channelId).at(-1), {
+    channelId: f.binding.channelId, conductorId: null, readiness: READINESS.UNAVAILABLE, detail: 'Claude channel unavailable'
+  });
+});
+
+test('ordinary Claude channel startup with no held intake still wakes the Gateway and revokes readiness on stop', async t => {
+  const f = fixture(t);
+  f.state.close();
+  const observed = new SurfaceState(f.db);
+  t.after(() => { try { observed.close(); } catch {} });
+  const listener = spawnChannel(t, f);
+  await expectWithin(() => fs.existsSync(f.socketPath), 'Claude channel socket');
+  await expectWithin(() => listener.stderr().includes('could not wake Gateway'),
+    'Claude channel startup requesting a Gateway wake');
+  assert.match(listener.stderr(), /discord-surface: Claude channel startup could not wake Gateway \(gateway-not-running\)/);
+  assert.equal(observed.getIntakeWatermark(f.binding.channelId), null);
+
+  await listener.terminate();
+  assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
+  assert.equal(readinessReceipts(observed, f.binding.channelId).at(-1).detail, 'Claude channel unavailable');
+});
+
+test('Claude channel leaves a conductor binding untouched on start and stop', async t => {
+  const f = fixture(t, { bind: false });
+  const conductor = f.state.bind({
+    channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
+    workspace: f.dir, endpoint: f.socketPath, conductorId: 'conductor-1', repoKey: 'repo-1'
+  });
+  assert.equal(f.state.isOrdinaryBinding(conductor), false);
+  f.state.setBindingReadiness(conductor.channelId, READINESS.READY, 'conductor ready', conductor);
+  f.state.close();
+  const observed = new SurfaceState(f.db);
+  t.after(() => { try { observed.close(); } catch {} });
+  const before = readinessReceipts(observed, conductor.channelId).length;
+  const listener = spawnChannel(t, f);
+  await expectWithin(() => fs.existsSync(f.socketPath), 'Claude channel socket');
+  await sleep(50);
+  assert.equal(observed.getBinding(conductor.channelId).readiness, READINESS.READY);
+  assert.equal(listener.stderr().includes('wake Gateway'), false);
+  assert.equal(observed.getIntakeWatermark(conductor.channelId), null);
+
+  await listener.terminate();
+  assert.equal(observed.getBinding(conductor.channelId).readiness, READINESS.READY);
+  assert.equal(readinessReceipts(observed, conductor.channelId).length, before);
+});
+
+test('an ordinary listener refuses to attach when its binding changed during startup', t => {
+  const f = fixture(t);
+  const identity = {
+    channelId: f.binding.channelId, guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
+    workspace: f.dir, endpoint: f.socketPath, generation: f.binding.generation
+  };
+  const startupBinding = servedOrdinaryBinding(f.state, identity);
+  assert.ok(startupBinding);
+  f.state.unbind(f.binding.channelId);
+  f.state.rebindOrdinaryClaude({
+    channelId: f.binding.channelId, guildId: 'guild', provider: 'claude', nativeId: CLAUDE, workspace: f.dir, endpoint: f.socketPath
+  }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' });
+  for (const label of ['Claude channel', 'Claude Monitor']) {
+    assert.throws(() => attachOrdinaryListener({
+      state: f.state, paths: { stateDir: f.dir, db: f.db }, startupBinding, identity, label,
+      requestRecovery: () => { throw new Error('must not wake the Gateway for a changed binding'); },
+      stderr: { write() { throw new Error('must not report a wake for a changed binding'); } }
+    }), new RegExp(`^Error: ${label} binding changed during startup$`));
+  }
+  assert.equal(detachOrdinaryListener({ state: f.state, startupBinding, reason: 'Claude channel unavailable' }), false);
+  assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.PENDING);
+});
+
+test('every CLI listener that serves a Claude binding routes through the ordinary lifecycle owner', () => {
+  const source = fs.readFileSync(CLI_PATH, 'utf8');
+  const commands = [...source.matchAll(/case '([a-z-]+)': return (\w+)\(args\)/g)].map(match => ({ command: match[1], fn: match[2] }));
+  assert.ok(commands.length > 10, 'CLI command table must be readable');
+  const constructions = /new ClaudeChannel\(|createClaudeMonitor\(/g;
+  const listeners = [];
+  let claimed = 0;
+  for (const { command, fn } of commands) {
+    const start = ['async function', 'function']
+      .map(keyword => source.indexOf(`\n${keyword} ${fn}(args`))
+      .find(index => index >= 0);
+    if (start === undefined) continue;
+    const body = source.slice(start, source.indexOf('\n}\n', start));
+    const found = body.match(constructions)?.length || 0;
+    if (!found) continue;
+    claimed += found;
+    listeners.push(command);
+    assert.match(body, /attachOrdinaryListener\(/, `${command} must attach through the ordinary lifecycle owner`);
+    assert.match(body, /detachOrdinaryListener\(/, `${command} must detach through the ordinary lifecycle owner`);
+  }
+  assert.deepEqual(listeners.sort(), ['claude-channel', 'claude-monitor']);
+  // A listener built anywhere but a command function would escape the check above.
+  assert.equal(claimed, source.match(constructions)?.length || 0, 'every listener must be built by a CLI command function');
 });
