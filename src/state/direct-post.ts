@@ -479,7 +479,14 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     const original = detail.legacyAgentPacket;
     if (!isAgentSourcePromotion(original, detail.agentPacket, String(detail.channelId))) return detail;
     return { ...detail, agentPacket: original, agentRequestTarget: undefined,
-      textHash: createHash('sha256').update(JSON.stringify(JSON.stringify(original))).digest('hex') };
+      textHash: createHash('sha256').update(JSON.stringify(original)).digest('hex') };
+  }
+
+  function normalizedLegacyRow(detail: DirectPostReceiptDetail, original: AgentMessage | undefined, channelId: string): DirectPostReceiptDetail {
+    if (!original || (!identityValueMatches(detail.agentPacket, original) && !isAgentSourcePromotion(original, detail.agentPacket, channelId))) {
+      return normalizedIdentity(detail);
+    }
+    return { ...normalizedIdentity(detail), textHash: createHash('sha256').update(JSON.stringify(original)).digest('hex') };
   }
 
   function assertRequestIdentity(rows: DirectPostReceiptRow[], meta: DirectPostPartMeta): void {
@@ -495,7 +502,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     }
     const incoming = normalizedIdentity(meta as unknown as DirectPostReceiptDetail);
     for (const row of rows) {
-      const existing = normalizedIdentity(row.detail);
+      const existing = normalizedLegacyRow(row.detail, meta.legacyAgentPacket, meta.channelId);
       for (const key of identityKeys) {
         if (!identityKeyValueMatches(key, existing[key], incoming[key])) {
           throw new BindingError('direct post request identity conflicts with existing custody');

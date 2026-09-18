@@ -503,7 +503,10 @@ function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostB
 function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | null, token: string, requireProof: boolean): AgentAddress | null {
   if (agentTarget === null) return null;
   const hasProof = typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
-  if (hasProof && Object.hasOwn(agentTarget, 'address') && !Object.hasOwn(agentTarget, 'version')) {
+  const version = typeof agentTarget === 'object' && agentTarget !== null
+    ? (agentTarget as unknown as { version?: unknown }).version
+    : undefined;
+  if (hasProof && Object.hasOwn(agentTarget, 'address') && (version === undefined || version === 1)) {
     return (agentTarget as AgentAddressEnvelope).address;
   }
   if (hasProof || requireProof) return verifyAgentAddress(agentTarget, token);
@@ -865,7 +868,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     const wire = encodeAgentMessage(agentPacket, token);
     source = {
       ...source,
-      textHash: hash(JSON.stringify(agentPacket)),
+      textHash: hash(agentPacket),
       parts: [wire],
       displayParts: [agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT ? agentMessagePreview(agentPacket) : wire]
     };
