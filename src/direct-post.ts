@@ -597,7 +597,7 @@ function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, sourc
     .filter(({ detail }) => detail?.parentChannelId === legacyParent.channelId && detail?.guildId === legacyParent.guildId)
     .sort((left, right) => (Number(left.row.id || 0) - Number(right.row.id || 0)) ||
       String(left.row.created_at || '').localeCompare(String(right.row.created_at || '')))[0]?.row || null;
-  const candidates = state.listReceipts()
+  const candidates = rows
     .filter(row => row.kind === 'agent-message')
     .map(row => {
       try {
