@@ -158,13 +158,13 @@ function receivedResultEvidence(
 function receivedReplyEvidence(
   state: CompletionState,
   request: AgentMessage,
-  deps: AgentCompletionDependencies
+  deps: AgentCompletionDependencies,
+  allowLegacyChildSource: boolean
 ): Record<string, unknown> | null {
-  const candidateRow = state.db.prepare(`SELECT id, discord_id, detail FROM receipts
+  const candidateRows = state.db.prepare(`SELECT id, discord_id, detail FROM receipts
     WHERE kind='agent-message' AND json_extract(detail, '$.packet.kind')=?
       AND json_extract(detail, '$.packet.replyTo')=?
       AND json_extract(detail, '$.packet.source.guildId')=?
-      AND json_extract(detail, '$.packet.source.channelId')=?
       AND json_extract(detail, '$.packet.source.provider')=?
       AND json_extract(detail, '$.packet.source.nativeId')=?
       AND json_extract(detail, '$.packet.source.generation')=?
@@ -173,21 +173,26 @@ function receivedReplyEvidence(
       AND json_extract(detail, '$.packet.target.provider')=?
       AND json_extract(detail, '$.packet.target.nativeId')=?
       AND json_extract(detail, '$.packet.target.generation')=?
-    ORDER BY id LIMIT 1`).get(
+    ORDER BY id`).all(
     KINDS.RESULT, request.id,
-    request.target.guildId, request.target.channelId, request.target.provider, request.target.nativeId, request.target.generation,
+    request.target.guildId, request.target.provider, request.target.nativeId, request.target.generation,
     request.source.guildId, request.source.channelId, request.source.provider, request.source.nativeId, request.source.generation
-  ) as { id?: number; discord_id?: unknown; detail?: unknown } | undefined;
-  if (!candidateRow || typeof candidateRow.discord_id !== 'string' || !candidateRow.discord_id || !Number.isSafeInteger(candidateRow.id)) return null;
-  const detail = deps.parseJson(candidateRow.detail, null);
-  const candidate = detail?.packet;
-  if (!validAgentPacket(candidate, KINDS.RESULT) || !sameReverseAddresses(candidate, request)) return null;
-  return {
-    kind: 'received-result',
-    receiptId: Number(candidateRow.id),
-    discordId: candidateRow.discord_id,
-    ...agentPacketEvidence(candidate)
-  };
+  ) as Array<{ id?: number; discord_id?: unknown; detail?: unknown }>;
+  for (const candidateRow of candidateRows) {
+    if (typeof candidateRow.discord_id !== 'string' || !candidateRow.discord_id || !Number.isSafeInteger(candidateRow.id)) continue;
+    const detail = deps.parseJson(candidateRow.detail, null);
+    const candidate = detail?.packet;
+    if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
+    const migrated = allowLegacyChildSource && isLegacyChildResult(candidate, request, request.target);
+    if (!sameReverseAddresses(candidate, request) && !migrated) continue;
+    return {
+      kind: 'received-result',
+      receiptId: Number(candidateRow.id),
+      discordId: candidateRow.discord_id,
+      ...agentPacketEvidence(candidate)
+    };
+  }
+  return null;
 }
 
 function sentReplyEvidence(
@@ -309,7 +314,8 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
       if (packet.kind === KINDS.RESULT) {
         evidence = receivedResultEvidence(state, messageId, packet);
       } else {
-        evidence = receivedReplyEvidence(state, packet, deps) || sentReplyEvidence(state, packet, message.channelId, deps, isLegacyAgentReceipt(provenance));
+        const allowLegacyChildSource = isLegacyAgentReceipt(provenance);
+        evidence = receivedReplyEvidence(state, packet, deps, allowLegacyChildSource) || sentReplyEvidence(state, packet, message.channelId, deps, allowLegacyChildSource);
         if (!evidence) throw new deps.BindingError('agent request lacks an immutable correlated result');
       }
       const detail = {

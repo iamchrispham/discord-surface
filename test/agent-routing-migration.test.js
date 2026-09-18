@@ -161,6 +161,29 @@ test('legacy parent requests complete through agent-complete regardless of earli
   }
 });
 
+test('legacy parent requests complete from a received child result without local send custody', async t => {
+  const f = fixture(t);
+  const request = acceptRequest(f, '8111', true);
+  enroll(f);
+  assert.equal(f.state.claimDispatch('8111').claimed, true);
+  f.state.markSubmitted('8111');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8111', nativeId: source.nativeId, generation: 1 });
+  const receivedPacket = { id: 'received-child-result', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
+    replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
+  acceptRequest(f, 'received-child-result-discord', false);
+  f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+    .run(JSON.stringify({ packet: receivedPacket }), 'received-child-result-discord');
+  assert.deepEqual(f.state.directPostRows(receivedPacket.id), []);
+  const completed = agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8111', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  });
+  assert.equal(completed.completed, true);
+  assert.equal(completed.evidence.kind, 'received-result');
+  assert.equal(completed.evidence.discordId, 'received-child-result-discord');
+});
+
 test('new intake stamps its route version and cannot use legacy parent-result compatibility', async t => {
   const f = fixture(t);
   const request = acceptRequest(f, '8103', false);
