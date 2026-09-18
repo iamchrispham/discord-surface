@@ -54,8 +54,8 @@ function input(f, extra = {}) {
     textFile: f.textFile, dedupeKey: 'legacy-post', agentThreadId: '103', agentTarget: issueAgentAddress(target, token), ...extra };
 }
 
-function acceptRequest(f, id, legacy, requestTarget = source) {
-  const packet = { id: `request-${id}`, kind: KINDS.REQUEST, source: target, target: requestTarget, replyTo: null, text: 'Pending request.' };
+function acceptRequest(f, id, legacy, requestTarget = source, packetId = `request-${id}`) {
+  const packet = { id: packetId, kind: KINDS.REQUEST, source: target, target: requestTarget, replyTo: null, text: 'Pending request.' };
   assert.equal(f.state.acceptDiscordMessage({ id, guildId: '100', channelId: requestTarget.channelId, authorId: '901', isBot: true,
     content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
   assert.equal(f.state.getAgentMessage(id).routingVersion, AGENT_ROUTING_VERSION);
@@ -185,4 +185,35 @@ test('previous child-result custody remains idempotent without migration metadat
   assert.equal(repeated.duplicate, true);
   assert.deepEqual(repeated.messageIds, ['legacy-sent']);
   assert.equal(f.state.directPostRows(packet.id).length, 2);
+});
+
+test('agent-complete finds its result behind 64 newer sibling results sharing the request key', async t => {
+  const f = fixture(t);
+  enroll(f);
+  enroll(f, '104');
+  acceptRequest(f, '8101', true, { ...source, channelId: '103' }, 'shared-request-key');
+  acceptRequest(f, '8102', false, { ...source, channelId: '104' }, 'shared-request-key');
+  assert.equal(f.state.claimDispatch('8101').claimed, true);
+  f.state.markSubmitted('8101');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8101', nativeId: source.nativeId, generation: 1 });
+  let posted = 0;
+  const sendResult = (child, requestId, dedupeKey) => runDirectPost(input(f, {
+    agentThreadId: child, dedupeKey, agentKind: KINDS.RESULT, agentReplyTo: requestId,
+    fetchImpl: async (_url, options) => ({ ok: true, status: 200,
+      json: async () => options.method === 'GET' ? { id: '202', guild_id: '100' } : { id: `result-${++posted}` } })
+  }));
+  assert.equal((await sendResult('103', '8101', 'matching-result')).status, 'sent');
+  for (let index = 0; index < 64; index++) {
+    assert.equal((await sendResult('104', '8102', `sibling-result-${index}`)).status, 'sent');
+  }
+  const completed = agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8101', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  });
+  assert.equal(completed.completed, true);
+  assert.equal(completed.evidence.messageId, 'result-1');
+  assert.equal(completed.evidence.source.channelId, '103');
+  assert.equal(f.state.getMessage('8101').state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
+  assert.equal(f.state.getMessage('8102').state, MESSAGE_STATES.ACCEPTED);
 });

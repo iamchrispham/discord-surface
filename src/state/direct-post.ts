@@ -406,7 +406,18 @@ export function querySentAgentResultRows(
   ];
   const parameters: unknown[] = [outcomeKind, attemptKind, channelId];
   for (const [field, value] of packetFields) {
-    if (allowLegacyChildSource && field === 'source.channelId') continue;
+    if (allowLegacyChildSource && field === 'source.channelId') {
+      const requestTargetFields = packetFields.filter(([key]) => key.startsWith('source.'));
+      for (const receipt of ['attempt', 'outcome']) {
+        const sourceChannel = `json_extract(${receipt}.detail, '$.agentPacket.source.channelId')`;
+        const originalTarget = requestTargetFields.map(([key]) =>
+          `json_extract(${receipt}.detail, '$.agentRequestTarget.${key.slice('source.'.length)}')=?`);
+        clauses.push(`(${sourceChannel}=? OR (${sourceChannel}<>? AND ${originalTarget.join(' AND ')}))`);
+        parameters.push(value, value, ...requestTargetFields.map(([, targetValue]) => targetValue));
+      }
+      clauses.push("json_extract(attempt.detail, '$.agentPacket.source.channelId')=json_extract(outcome.detail, '$.agentPacket.source.channelId')");
+      continue;
+    }
     clauses.push(`json_extract(attempt.detail, '$.agentPacket.${field}')=?`);
     parameters.push(value);
     clauses.push(`json_extract(outcome.detail, '$.agentPacket.${field}')=?`);
