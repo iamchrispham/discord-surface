@@ -69,6 +69,7 @@ const multipartOptions: FetchOptions = {
 };
 const agentPresentation: AgentPresentation = AGENT_PRESENTATIONS.ATTACHMENT;
 const agentTarget: AgentAddressEnvelope = {
+  version: 2,
   address: {
     guildId: binding.guildId,
     channelId: 'target-channel',

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, KINDS } = require('../src/agent-message');
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, verifyAgentAddress, KINDS } = require('../src/agent-message');
 
 const source = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
 const target = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222', generation: 2 };
@@ -13,6 +13,17 @@ test('agent packet retains source, destination and task across authenticated enc
   const result = { ...packet, id: 'result-1', kind: KINDS.RESULT, source: target, target: source, replyTo: packet.id, text: 'Found the cause.' };
   assert.deepEqual(decodeAgentMessage(encodeAgentMessage(result, token), token, source), result);
   assert.equal(decodeAgentMessage('Milestone landed. work-1', token, target), null);
+});
+
+test('address exports require the current signed envelope version', () => {
+  const current = issueAgentAddress(target, token);
+  assert.equal(current.version, 2);
+  assert.deepEqual(verifyAgentAddress(current, token), target);
+  const signingKey = crypto.createHmac('sha256', token).update('discord-tether/agent-message/v1').digest();
+  const legacyProof = crypto.createHmac('sha256', signingKey)
+    .update(`address/v1\0${JSON.stringify(target)}`).digest('base64url');
+  assert.throws(() => verifyAgentAddress({ address: target, proof: legacyProof }, token), /complete binding address/);
+  assert.throws(() => verifyAgentAddress({ version: 2, address: target, proof: legacyProof }, token), /invalid agent address signature/);
 });
 
 test('forged contents, credentials and stale destination cannot authenticate', () => {
@@ -768,6 +779,39 @@ test('agent routes refuse the parent channel before custody or network access', 
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('retries return pre-upgrade parent-sourced outcomes without child migration or resend', async () => {
+  for (const outcome of ['sent', 'unknown']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `agent-legacy-retry-${outcome}-`));
+    const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+    try {
+      state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+      state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+      const requestId = `legacy-${outcome}`;
+      const legacyPacket = { ...packet, id: requestId, source, target };
+      const attempt = {
+        journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, sourcePath: path.join(dir, 'missing.txt'),
+        textHash: crypto.createHash('sha256').update(JSON.stringify(legacyPacket)).digest('hex'), operatorId: '900',
+        partHash: 'legacy-part-hash', channelId: source.channelId, guildId: source.guildId, provider: source.provider,
+        nativeId: source.nativeId, generation: source.generation, conductorId: 'fixture', repoKey: 'repo:fixture',
+        partIndex: 0, partCount: 1, nonce: `${requestId}-nonce`, deliveryChannelId: target.channelId,
+        presentation: 'legacy', agentPacket: legacyPacket, status: 'attempted'
+      };
+      state.receipt(null, 'direct-post-attempt', attempt);
+      state.receipt(null, 'direct-post-outcome', { ...attempt, outcome, ...(outcome === 'sent' ? { messageId: `${requestId}-message` } : {}) });
+      const legacyEnvelope = { address: target, proof: 'A'.repeat(43) };
+      let networkCalls = 0;
+      const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
+        channelId: source.channelId, provider: source.provider, requestId, textFile: path.join(dir, 'missing.txt'),
+        agentTarget: legacyEnvelope, fetchImpl: async () => { networkCalls += 1; throw new Error('legacy retry must not send'); } });
+      assert.equal(result.status, outcome);
+      assert.equal(result.duplicate, outcome === 'sent');
+      assert.deepEqual(result.messageIds, outcome === 'sent' ? [`${requestId}-message`] : []);
+      assert.equal(networkCalls, 0);
+      assert.equal(state.listReceipts().filter(row => row.kind === 'direct-post-attempt' || row.kind === 'direct-post-outcome').length, 2);
+    } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
 
 test('invalid destination proof refuses before custody and source revocation during lookup prevents POST', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-proof-'));
@@ -891,6 +935,41 @@ test('results reverse an accepted request and reject unrelated or unknown correl
     assert.equal((await runDirectPost(input)).duplicate, true);
     assert.equal((await runDirectPost({ ...input, dedupeKey: 'result-no-target', agentTarget: null })).status, 'sent');
     assert.equal(calls, 4);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('results can answer a parent-targeted request accepted before child routing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-result-legacy-parent-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const sourceChild = enrollChild(state, source, '103');
+    const request = { ...packet, id: 'legacy-parent-request', source: target, target: source };
+    const intake = state.acceptDiscordMessage({ id: '8102', guildId: source.guildId, channelId: source.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token });
+    assert.equal(intake.accepted, true);
+    const textFile = path.join(dir, 'result.txt');
+    fs.writeFileSync(textFile, 'Legacy result');
+    const calls = [];
+    let wire;
+    const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: 1,
+      channelId: source.channelId, provider: source.provider, agentThreadId: sourceChild.channelId, textFile,
+      dedupeKey: 'legacy-parent-result', agentKind: KINDS.RESULT, agentReplyTo: request.id,
+      fetchImpl: async (url, options) => {
+        calls.push({ url, method: options.method });
+        if (options.method === 'POST') wire = JSON.parse(options.body).content;
+        return { ok: true, status: 200, json: async () => options.method === 'GET'
+          ? { id: target.channelId, guild_id: target.guildId } : { id: '8202' } };
+      } });
+    assert.equal(result.status, 'sent');
+    assert.equal(calls.length, 2);
+    assert.ok(calls[0].url.endsWith(`/channels/${target.channelId}`));
+    assert.ok(calls[1].url.endsWith(`/channels/${target.channelId}/messages`));
+    assert.deepEqual(decodeAgentMessage(wire, token, target), {
+      id: 'legacy-parent-result', kind: KINDS.RESULT, source: sourceChild, target,
+      replyTo: request.id, text: 'Legacy result'
+    });
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

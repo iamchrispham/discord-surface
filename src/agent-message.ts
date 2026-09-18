@@ -31,6 +31,7 @@ export type AgentMessage =
   | (AgentMessageFields & { kind: typeof KINDS.RESULT; replyTo: string });
 
 export interface AgentAddressEnvelope {
+  version: 2;
   address: AgentAddress;
   proof: string;
 }
@@ -117,12 +118,12 @@ export function decodeAgentMessage(wire: unknown, token: string, target: AgentAd
 export function issueAgentAddress(binding: AgentAddress, token: string): AgentAddressEnvelope {
   const address = Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation'].map(key => [key, binding[key as keyof AgentAddress]]));
   if (!validAddress(address)) throw new Error('invalid agent address');
-  const proof = crypto.createHmac('sha256', signingKey(token)).update('address/v1\0' + JSON.stringify(address)).digest('base64url');
-  return { address, proof };
+  const proof = crypto.createHmac('sha256', signingKey(token)).update('address/v2\0' + JSON.stringify(address)).digest('base64url');
+  return { version: 2, address, proof };
 }
 
 export function verifyAgentAddress(envelope: unknown, token: string): AgentAddress {
-  if (!exactKeys(envelope, ['address', 'proof'])) {
+  if (!exactKeys(envelope, ['version', 'address', 'proof']) || envelope.version !== 2) {
     throw new Error('agent target file must contain a complete binding address and proof');
   }
   if (!validAddress(envelope.address) ||
