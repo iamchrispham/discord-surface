@@ -445,6 +445,13 @@ interface LegacyParentSourcedReceipt {
   result: DirectPostResult;
 }
 
+const LEGACY_RETRYABLE_OUTCOMES = new Set<DirectPostOutcome>([
+  DIRECT_POST_OUTCOMES.NOT_SENT,
+  DIRECT_POST_OUTCOMES.REJECTED,
+  DIRECT_POST_OUTCOMES.RATE_LIMITED,
+  DIRECT_POST_OUTCOMES.STALE
+]);
+
 function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostBinding, requestId: string): LegacyParentSourcedReceipt | null {
   const rows = state.listReceipts();
   const attempts = new Map<string, Record<string, unknown>>();
@@ -455,15 +462,22 @@ function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostB
     if (detail?.requestId !== requestId || typeof attemptId !== 'string') continue;
     attempts.set(attemptId, detail);
   }
-  const parent = canonicalAddress(binding);
-  for (let index = rows.length - 1; index >= 0; index -= 1) {
-    const row = rows[index];
-    if (!row || row.kind !== 'direct-post-outcome') continue;
+  const latestOutcomes = new Map<string, { row: DirectPostReceiptRow; detail: Record<string, unknown> }>();
+  for (const row of rows) {
+    if (row.kind !== 'direct-post-outcome') continue;
     const detail = receiptDetail(row);
     const outcome = detail?.outcome;
     const attemptId = detail?.attemptId;
     if (detail?.requestId !== requestId || typeof attemptId !== 'string' ||
         !Object.values(DIRECT_POST_OUTCOMES).includes(outcome as DirectPostOutcome)) continue;
+    latestOutcomes.set(attemptId, { row, detail });
+  }
+  const parent = canonicalAddress(binding);
+  const candidates = [...latestOutcomes.values()].sort((left, right) => (right.row.id || 0) - (left.row.id || 0));
+  for (const candidate of candidates) {
+    const detail = candidate.detail;
+    const outcome = detail.outcome as DirectPostOutcome;
+    const attemptId = detail.attemptId as string;
     const attempt = attempts.get(attemptId);
     const attemptPacket = attempt?.legacyAgentPacket ?? attempt?.agentPacket;
     const packet = detail.legacyAgentPacket ?? detail.agentPacket ?? attemptPacket;
@@ -836,6 +850,9 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       agentKind, agentTarget, agentReplyTo });
     if (legacy.outcome === DIRECT_POST_OUTCOMES.SENT || legacy.outcome === DIRECT_POST_OUTCOMES.UNKNOWN) {
       return legacy.result;
+    }
+    if (!LEGACY_RETRYABLE_OUTCOMES.has(legacy.outcome)) {
+      throw new BindingError('direct post legacy custody has an unsupported retry outcome');
     }
     legacyPacket = legacy.packet;
   }
