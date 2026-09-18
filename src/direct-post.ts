@@ -471,7 +471,7 @@ function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostB
     if (detail?.requestId !== requestId ||
         !Object.values(DIRECT_POST_OUTCOMES).includes(outcome as DirectPostOutcome)) continue;
     if (typeof attemptId === 'string') latestOutcomes.set(attemptId, { row, detail });
-    else if (outcome === DIRECT_POST_OUTCOMES.NOT_SENT) preflightOutcomes.push({ row, detail });
+    else preflightOutcomes.push({ row, detail });
   }
   const parent = canonicalAddress(binding);
   const candidates = [...latestOutcomes.values(), ...preflightOutcomes]
@@ -842,16 +842,20 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   let agentPacket: AgentMessage | null = null;
   let agentRequestTarget: AgentAddress | null = null;
   let legacyPacket: AgentMessage | null = null;
+  let terminalLegacyResult: DirectPostResult | null = null;
   if (legacy) {
     assertLegacyParentSourcedIdentity({ state, binding, token, requestId: explicitRequestId as string, packet: legacy.packet, sourceText: source.text,
       agentKind, agentTarget, agentReplyTo });
     if (legacy.outcome === DIRECT_POST_OUTCOMES.SENT || legacy.outcome === DIRECT_POST_OUTCOMES.UNKNOWN) {
-      return legacy.result;
+      const migratedPacket = legacy.detail.agentPacket;
+      if (!migratedPacket || typeof migratedPacket !== 'object' || Array.isArray(migratedPacket)) return legacy.result;
+      legacyPacket = legacy.packet;
+      terminalLegacyResult = legacy.result;
     }
-    if (!LEGACY_RETRYABLE_OUTCOMES.has(legacy.outcome)) {
+    if (terminalLegacyResult === null && !LEGACY_RETRYABLE_OUTCOMES.has(legacy.outcome)) {
       throw new BindingError('direct post legacy custody has an unsupported retry outcome');
     }
-    legacyPacket = legacy.packet;
+    if (terminalLegacyResult === null) legacyPacket = legacy.packet;
   }
   let address = canonicalAddress(binding);
   if (!watcherNotice && isAgentMessage) address = resolveAgentAddress(state, binding, agentThreadId);
@@ -921,6 +925,15 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     };
   }
   const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, effectiveReplyTarget);
+  if (terminalLegacyResult !== null) {
+    const legacyPartIndex = legacy?.detail.partIndex;
+    const partIndex = Number.isSafeInteger(legacyPartIndex) ? legacyPartIndex as number : 0;
+    const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex,
+      address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null, legacyPacket, agentRequestTarget);
+    if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
+    state.inspectDirectPostPart(meta);
+    return terminalLegacyResult;
+  }
   state.recoverDirectPostReceipts();
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;

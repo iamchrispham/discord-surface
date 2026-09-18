@@ -54,6 +54,12 @@ function input(f, extra = {}) {
     textFile: f.textFile, dedupeKey: 'legacy-post', agentThreadId: '103', agentTarget: issueAgentAddress(target, token), ...extra };
 }
 
+function legacyPreflight(f, requestId, outcome) {
+  const attempt = f.state.directPostRows(requestId).find(row => row.kind === 'direct-post-attempt');
+  assert.ok(attempt);
+  return f.state.recordDirectPostPreflight(attempt.detail, outcome, { reason: `fixture ${outcome}` });
+}
+
 function acceptRequest(f, id, legacy, requestTarget = source, packetId = `request-${id}`) {
   const packet = { id: packetId, kind: KINDS.REQUEST, source: target, target: requestTarget, replyTo: null, text: 'Pending request.' };
   assert.equal(f.state.acceptDiscordMessage({ id, guildId: '100', channelId: requestTarget.channelId, authorId: '901', isBot: true,
@@ -109,6 +115,8 @@ test('known-unsent legacy custody moves only the wire source and survives restar
     const retry = await runDirectPost(input(f, { state: reopened, fetchImpl: async () => { throw new Error('unknown must not resend'); } }));
     assert.equal(retry.status, 'unknown');
     assert.equal(reopened.directPostRows(original.id).length, rows.length);
+    enroll({ ...f, state: reopened }, '104');
+    await assert.rejects(runDirectPost(input(f, { state: reopened, agentThreadId: '104', fetchImpl: async () => { throw new Error('sibling must not send'); } })), /identity conflicts/);
     await assert.rejects(runDirectPost(input(f, { state: reopened, agentTarget: issueAgentAddress({ ...target, channelId: '203' }, token) })), /identity conflicts/);
     fs.writeFileSync(f.textFile, 'Changed task');
     await assert.rejects(runDirectPost(input(f, { state: reopened })), /identity conflicts/);
@@ -159,6 +167,20 @@ test('legacy parent requests complete through agent-complete regardless of earli
       assert.equal(f.state.getMessage('8102').state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
     });
   }
+});
+
+test('newer attemptless terminal legacy custody controls retry', async t => {
+  const f = fixture(t);
+  const packet = legacyPost(f, 'not_sent');
+  legacyPreflight(f, packet.id, 'not_sent');
+  legacyPreflight(f, packet.id, 'rate_limited');
+  enroll(f);
+  let posts = 0;
+  await assert.rejects(runDirectPost(input(f, { fetchImpl: async (_url, options) => {
+    if (options.method === 'POST') posts++;
+    return { ok: true, status: 200, json: async () => ({ id: 'unexpected', guild_id: '100' }) };
+  } })), /unsupported retry outcome/);
+  assert.equal(posts, 0);
 });
 
 test('legacy parent requests complete from a received child result without local send custody', async t => {
