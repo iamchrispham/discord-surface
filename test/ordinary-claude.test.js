@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { createOrdinaryClaudeRequest, ordinaryBindingDecision, resolveExistingChannel } = require('../src/ordinary-codex');
+const { ClaudeChannel } = require('../src/claude-channel');
 const { createClaudeMonitor, createMonitorMcp } = require('../src/claude-monitor');
 const { attachOrdinaryListener, detachOrdinaryListener, ordinaryClaudeBind, servedOrdinaryBinding } = require('../src/cli');
 const { DiscordGateway } = require('../src/discord');
@@ -565,6 +566,73 @@ test('ordinary Claude Monitor startup preserves unrelated recovery-unavailable s
   observed.close();
 });
 
+for (const terminalState of [READINESS.UNAVAILABLE, READINESS.GAP]) {
+  test(`ordinary Claude channel does not promote an unresolved ${terminalState} intake boundary when Gateway wake fails`, t => {
+    const f = fixture(t);
+    const detail = `prior ${terminalState} recovery failure`;
+    f.state.markIntakeBoundary(f.binding.channelId, terminalState, detail, null, null, f.binding);
+    const stderr = [];
+    const identity = {
+      channelId: f.binding.channelId, guildId: f.binding.guildId, provider: f.binding.provider,
+      nativeId: f.binding.nativeId, workspace: f.binding.workspace, endpoint: f.binding.endpoint,
+      generation: f.binding.generation
+    };
+    const wake = attachOrdinaryListener({
+      state: f.state,
+      paths: { stateDir: f.dir, db: f.db },
+      startupBinding: f.binding,
+      identity,
+      label: 'Claude channel',
+      requestRecovery: () => ({ requested: false, reason: 'gateway-not-running' }),
+      stderr: { write(chunk) { stderr.push(String(chunk)); } }
+    });
+    assert.deepEqual(wake, { requested: false, reason: 'gateway-not-running' });
+    assert.equal(f.state.getBinding(f.binding.channelId).readiness, terminalState);
+    const watermark = f.state.getIntakeWatermark(f.binding.channelId);
+    assert.equal(watermark.state, terminalState);
+    assert.equal(watermark.detail, detail);
+    assert.match(stderr.join(''), /Claude channel startup could not wake Gateway/);
+  });
+}
+
+test('ordinary Claude channel attach fails when the running Gateway cannot be woken', t => {
+  const f = fixture(t);
+  f.state.setBindingReadiness(f.binding.channelId, READINESS.UNAVAILABLE, 'Claude channel unavailable', f.binding);
+  const identity = {
+    channelId: f.binding.channelId, guildId: f.binding.guildId, provider: f.binding.provider,
+    nativeId: f.binding.nativeId, workspace: f.binding.workspace, endpoint: f.binding.endpoint,
+    generation: f.binding.generation
+  };
+  assert.throws(() => attachOrdinaryListener({
+    state: f.state,
+    paths: { stateDir: f.dir, db: f.db },
+    startupBinding: f.binding,
+    identity,
+    label: 'Claude channel',
+    requestRecovery: () => ({ requested: false, reason: 'gateway-wake-unsupported', capability: 'ordinary-bind-wake-v1' }),
+    stderr: { write() {} }
+  }), /Claude channel startup could not wake Gateway \(gateway-wake-unsupported\)/);
+  assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
+});
+
+test('Claude transport close runs the listener revoke before releasing its socket', async t => {
+  const f = fixture(t);
+  const events = [];
+  const mcp = { notification: async () => {}, close: async () => {} };
+  const channel = new ClaudeChannel({
+    state: f.state, nativeId: CLAUDE, socketPath: f.socketPath, mcp,
+    beforeTransportClose: () => events.push({ phase: 'before', socket: fs.existsSync(f.socketPath) }),
+    onTransportClose: () => events.push({ phase: 'after', socket: fs.existsSync(f.socketPath) })
+  });
+  await channel.start();
+  mcp.onclose();
+  await waitFor(() => events.length === 2);
+  assert.deepEqual(events, [
+    { phase: 'before', socket: true },
+    { phase: 'after', socket: false }
+  ]);
+});
+
 test('ordinary Claude Monitor startup reopens an endpoint-unavailable recovery watermark', async t => {
   const f = fixture(t);
   f.state.markIntakeBoundary(f.binding.channelId, 'unavailable', 'Claude endpoint unavailable before event write: connect ENOENT', null, null, f.binding);
@@ -1094,6 +1162,7 @@ test('every CLI listener that serves a Claude binding routes through the ordinar
     listeners.push(command);
     assert.match(body, /attachOrdinaryListener\(/, `${command} must attach through the ordinary lifecycle owner`);
     assert.match(body, /detachOrdinaryListener\(/, `${command} must detach through the ordinary lifecycle owner`);
+    if (command === 'claude-channel') assert.match(body, /beforeTransportClose: detach/, `${command} must revoke before transport close releases its socket`);
   }
   assert.deepEqual(listeners.sort(), ['claude-channel', 'claude-monitor']);
   // A listener built anywhere but a command function would escape the check above.

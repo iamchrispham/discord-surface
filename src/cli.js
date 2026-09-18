@@ -1697,7 +1697,10 @@ function servedOrdinaryBinding(state, identity) {
     binding.generation === identity.generation ? binding : null;
 }
 
-function attachOrdinaryListener({ state, paths, startupBinding, identity, label, requestRecovery = requestGatewayRecovery, stderr = process.stderr, restoreReadinessOnWakeFailure = label === 'Claude channel' }) {
+// Readiness `ready` is written only by the Gateway once it has probed the listener. A wake
+// the Gateway cannot honour leaves a started listener nobody will ever deliver to, so that
+// case fails the attach instead of logging past it.
+function attachOrdinaryListener({ state, paths, startupBinding, identity, label, requestRecovery = requestGatewayRecovery, stderr = process.stderr }) {
   if (!startupBinding) return null;
   if (!servedOrdinaryBinding(state, identity)) throw new Error(`${label} binding changed during startup`);
   const watermark = state.getIntakeWatermark(startupBinding.channelId);
@@ -1713,9 +1716,8 @@ function attachOrdinaryListener({ state, paths, startupBinding, identity, label,
   const gatewayWake = requestRecovery(paths);
   if (!gatewayWake.requested) {
     stderr.write(`discord-surface: ${label} startup could not wake Gateway (${gatewayWake.reason})\n`);
-    if (restoreReadinessOnWakeFailure && !endpointUnavailable &&
-      !state.setBindingReadiness(startupBinding.channelId, READINESS.READY, null, startupBinding)) {
-      throw new Error(`${label} binding changed during startup`);
+    if (gatewayWake.reason === 'gateway-wake-unsupported') {
+      throw new Error(`${label} startup could not wake Gateway (${gatewayWake.reason})`);
     }
   }
   return gatewayWake;
@@ -1734,16 +1736,19 @@ function detachOrdinaryListener({ state, startupBinding, reason }) {
 async function claudeChannel(args) {
   const { paths, state } = openState(args);
   let channel;
-  let channelStarted = false;
+  let ordinaryListenerAttached = false;
   let ordinaryStartupBinding = null;
   let stopPromise;
+  const detach = () => {
+    if (!ordinaryListenerAttached) return false;
+    ordinaryListenerAttached = false;
+    return detachOrdinaryListener({ state, startupBinding: ordinaryStartupBinding, reason: 'Claude channel unavailable' });
+  };
   const stop = async () => {
     if (stopPromise) return stopPromise;
     stopPromise = (async () => {
       try {
-        if (channelStarted) {
-          detachOrdinaryListener({ state, startupBinding: ordinaryStartupBinding, reason: 'Claude channel unavailable' });
-        }
+        detach();
       } finally {
         try { await channel?.stop(); } finally { state.close(); }
       }
@@ -1765,12 +1770,12 @@ async function claudeChannel(args) {
       state,
       nativeId: required(args, 'native-id'),
       socketPath: path.resolve(required(args, 'socket')),
+      beforeTransportClose: detach,
       onTransportClose: stop
     });
     ordinaryStartupBinding = servedOrdinaryBinding(state, channel.bindingIdentity);
     await channel.start();
-    channelStarted = true;
-    attachOrdinaryListener({ state, paths, startupBinding: ordinaryStartupBinding, identity: channel.bindingIdentity, label: 'Claude channel' });
+    ordinaryListenerAttached = attachOrdinaryListener({ state, paths, startupBinding: ordinaryStartupBinding, identity: channel.bindingIdentity, label: 'Claude channel' }) !== null;
   }
   catch (error) { await stop(); throw error; }
 }
