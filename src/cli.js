@@ -1697,17 +1697,26 @@ function servedOrdinaryBinding(state, identity) {
     binding.generation === identity.generation ? binding : null;
 }
 
-function attachOrdinaryListener({ state, paths, startupBinding, identity, label, requestRecovery = requestGatewayRecovery, stderr = process.stderr }) {
+function attachOrdinaryListener({ state, paths, startupBinding, identity, label, requestRecovery = requestGatewayRecovery, stderr = process.stderr, restoreReadinessOnWakeFailure = label === 'Claude channel' }) {
   if (!startupBinding) return null;
   if (!servedOrdinaryBinding(state, identity)) throw new Error(`${label} binding changed during startup`);
   const watermark = state.getIntakeWatermark(startupBinding.channelId);
   const endpointUnavailable = watermark?.state === READINESS.UNAVAILABLE &&
     typeof watermark.detail === 'string' &&
     watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX);
-  if (endpointUnavailable) state.reconcileIntake(startupBinding.channelId, startupBinding);
+  if (endpointUnavailable) {
+    state.reconcileIntake(startupBinding.channelId, startupBinding, {
+      states: [READINESS.UNAVAILABLE],
+      detailPrefix: CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX
+    });
+  }
   const gatewayWake = requestRecovery(paths);
   if (!gatewayWake.requested) {
     stderr.write(`discord-surface: ${label} startup could not wake Gateway (${gatewayWake.reason})\n`);
+    if (restoreReadinessOnWakeFailure && !endpointUnavailable &&
+      !state.setBindingReadiness(startupBinding.channelId, READINESS.READY, null, startupBinding)) {
+      throw new Error(`${label} binding changed during startup`);
+    }
   }
   return gatewayWake;
 }
