@@ -1684,29 +1684,117 @@ function start(args, dependencies = {}) {
   process.exitCode = result.status ?? 1;
 }
 
+// One owner for the ordinary-binding lifecycle every Claude listener shares. A listener
+// that serves an ordinary binding owns that binding's attach and detach; the Gateway holds
+// intake until something reopens the watermark and wakes it, so a listener that skips this
+// leaves its session attached and silent.
+function servedOrdinaryBinding(state, identity) {
+  const binding = identity ? state.getBinding(identity.channelId) : null;
+  return binding?.active && state.isOrdinaryBinding(binding) &&
+    binding.channelId === identity.channelId && binding.guildId === identity.guildId &&
+    binding.provider === identity.provider && binding.nativeId === identity.nativeId &&
+    binding.workspace === identity.workspace && binding.endpoint === identity.endpoint &&
+    binding.generation === identity.generation ? binding : null;
+}
+
+// Readiness `ready` is written only by the Gateway once it has probed the listener. A wake
+// the Gateway cannot honour leaves a started listener nobody will ever deliver to, so that
+// case fails the attach instead of logging past it.
+function attachOrdinaryListener({ state, paths, startupBinding, identity, label, requestRecovery = requestGatewayRecovery, stderr = process.stderr }) {
+  if (!startupBinding) return null;
+  if (!servedOrdinaryBinding(state, identity)) throw new Error(`${label} binding changed during startup`);
+  const watermark = state.getIntakeWatermark(startupBinding.channelId);
+  const endpointUnavailable = watermark?.state === READINESS.UNAVAILABLE &&
+    typeof watermark.detail === 'string' &&
+    watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX);
+  if (endpointUnavailable) {
+    state.reconcileIntake(startupBinding.channelId, startupBinding, {
+      states: [READINESS.UNAVAILABLE],
+      detailPrefix: CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX
+    });
+  }
+  const gatewayWake = requestRecovery(paths);
+  if (!gatewayWake.requested) {
+    stderr.write(`discord-surface: ${label} startup could not wake Gateway (${gatewayWake.reason})\n`);
+    if (gatewayWake.reason === 'gateway-wake-unsupported') {
+      // The reconcile above already moved the binding to pending. Nothing will ever
+      // resolve that, so the owner puts readiness back before the caller unwinds.
+      detachOrdinaryListener({ state, startupBinding, reason: `${label} unavailable` });
+      throw new Error(`${label} startup could not wake Gateway (${gatewayWake.reason})`);
+    }
+  }
+  return gatewayWake;
+}
+
+// Declines when the binding it revokes is no longer the one it attached to. A successor
+// generation owns its own readiness, so a departing listener must not demote it.
+function detachOrdinaryListener({ state, startupBinding, reason }) {
+  if (!startupBinding) return false;
+  const current = state.getBinding(startupBinding.channelId);
+  if (!current || !current.active || current.provider !== PROVIDERS.CLAUDE || current.nativeId !== startupBinding.nativeId ||
+    current.workspace !== startupBinding.workspace || current.endpoint !== startupBinding.endpoint) return false;
+  return Boolean(state.setBindingReadiness(startupBinding.channelId, READINESS.UNAVAILABLE, reason, startupBinding));
+}
+
 async function claudeChannel(args) {
-  const { state } = openState(args);
+  const { paths, state } = openState(args);
   let channel;
+  let ordinaryListenerAttached = false;
+  let ordinaryStartupBinding = null;
   let stopPromise;
+  let revokeFailureReported = false;
+  const reportRevokeFailure = error => {
+    if (revokeFailureReported) return;
+    revokeFailureReported = true;
+    process.stderr.write(`discord-surface: Claude channel readiness revoke failed: ${error.message}\n`);
+  };
+  const detach = () => {
+    if (!ordinaryListenerAttached) return false;
+    try {
+      const revoked = detachOrdinaryListener({ state, startupBinding: ordinaryStartupBinding, reason: 'Claude channel unavailable' });
+      ordinaryListenerAttached = false;
+      return revoked;
+    } catch (error) {
+      reportRevokeFailure(error);
+      throw error;
+    }
+  };
   const stop = async () => {
     if (stopPromise) return stopPromise;
     stopPromise = (async () => {
-      try { await channel?.stop(); } finally { state.close(); }
+      try {
+        detach();
+      } finally {
+        try { await channel?.stop(); } finally { state.close(); }
+      }
     })();
     return stopPromise;
   };
-  process.once('SIGINT', () => stop().then(() => process.exit(0)));
-  process.once('SIGTERM', () => stop().then(() => process.exit(0)));
-  process.stdin.once('end', () => stop().then(() => process.exit(0)));
-  process.stdin.once('close', () => stop().then(() => process.exit(0)));
+  // Readiness revoke and channel teardown both run inside stop, so an exit path must report
+  // a stop failure rather than leaving it as an unhandled rejection.
+  const handleStopFailure = error => {
+    process.stderr.write(`discord-surface: Claude channel stop failed: ${error.message}\n`);
+    process.exitCode = 1;
+  };
+  const exit = () => stop().then(() => process.exit(0)).catch(error => {
+    handleStopFailure(error);
+    process.exit(1);
+  });
+  process.once('SIGINT', exit);
+  process.once('SIGTERM', exit);
+  process.stdin.once('end', exit);
+  process.stdin.once('close', exit);
   try {
     channel = new ClaudeChannel({
       state,
       nativeId: required(args, 'native-id'),
       socketPath: path.resolve(required(args, 'socket')),
-      onTransportClose: stop
+      beforeTransportClose: detach,
+      onTransportClose: () => { stop().catch(handleStopFailure); }
     });
+    ordinaryStartupBinding = servedOrdinaryBinding(state, channel.bindingIdentity);
     await channel.start();
+    ordinaryListenerAttached = attachOrdinaryListener({ state, paths, startupBinding: ordinaryStartupBinding, identity: channel.bindingIdentity, label: 'Claude channel' }) !== null;
   }
   catch (error) { await stop(); throw error; }
 }
@@ -1721,11 +1809,8 @@ async function claudeMonitor(args) {
   let stopPromise;
   let detachStdoutTransport = () => {};
   const revokeOrdinaryReadiness = () => {
-    if (!monitorStarted || !ordinaryStartupBinding) return;
-    const current = state.getBinding(ordinaryStartupBinding.channelId);
-    if (!current || !current.active || current.provider !== PROVIDERS.CLAUDE || current.nativeId !== ordinaryStartupBinding.nativeId ||
-      current.workspace !== ordinaryStartupBinding.workspace || current.endpoint !== ordinaryStartupBinding.endpoint) return;
-    state.setBindingReadiness(ordinaryStartupBinding.channelId, READINESS.UNAVAILABLE, 'Claude Monitor unavailable', ordinaryStartupBinding);
+    if (!monitorStarted) return;
+    detachOrdinaryListener({ state, startupBinding: ordinaryStartupBinding, reason: 'Claude Monitor unavailable' });
   };
   const stop = async () => {
     if (stopPromise) return stopPromise;
@@ -1771,36 +1856,10 @@ async function claudeMonitor(args) {
       cliPath: __filename,
       onTransportClose: stop
     });
-    const servedIdentity = monitor?.bindingIdentity;
-    const servedBinding = servedIdentity ? state.getBinding(servedIdentity.channelId) : null;
-    ordinaryStartupBinding = servedBinding?.active && state.isOrdinaryBinding(servedBinding) &&
-      servedBinding.channelId === servedIdentity.channelId && servedBinding.guildId === servedIdentity.guildId &&
-      servedBinding.provider === servedIdentity.provider && servedBinding.nativeId === servedIdentity.nativeId &&
-      servedBinding.workspace === servedIdentity.workspace && servedBinding.endpoint === servedIdentity.endpoint &&
-      servedBinding.generation === servedIdentity.generation ? servedBinding : null;
+    ordinaryStartupBinding = servedOrdinaryBinding(state, monitor?.bindingIdentity);
     await monitor.start();
     monitorStarted = true;
-    if (ordinaryStartupBinding) {
-      const startedIdentity = monitor?.bindingIdentity;
-      const startedBinding = startedIdentity ? state.getBinding(startedIdentity.channelId) : null;
-      const bindingStillCurrent = startedBinding?.active && state.isOrdinaryBinding(startedBinding) &&
-        startedBinding.channelId === startedIdentity?.channelId && startedBinding.guildId === startedIdentity?.guildId &&
-        startedBinding.provider === startedIdentity?.provider && startedBinding.nativeId === startedIdentity?.nativeId &&
-        startedBinding.workspace === startedIdentity?.workspace && startedBinding.endpoint === startedIdentity?.endpoint &&
-        startedBinding.generation === startedIdentity?.generation;
-      if (!bindingStillCurrent) throw new Error('Claude Monitor binding changed during startup');
-      const watermark = state.getIntakeWatermark(ordinaryStartupBinding.channelId);
-      const endpointUnavailable = watermark?.state === READINESS.UNAVAILABLE &&
-        typeof watermark.detail === 'string' &&
-        watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX);
-      if (endpointUnavailable) {
-        state.reconcileIntake(ordinaryStartupBinding.channelId, ordinaryStartupBinding);
-      }
-      const gatewayWake = requestGatewayRecovery(paths);
-      if (!gatewayWake.requested) {
-        process.stderr.write(`discord-surface: Claude Monitor startup could not wake Gateway (${gatewayWake.reason})\n`);
-      }
-    }
+    attachOrdinaryListener({ state, paths, startupBinding: ordinaryStartupBinding, identity: monitor?.bindingIdentity, label: 'Claude Monitor' });
   } catch (error) {
     await stop();
     throw error;
@@ -2325,7 +2384,7 @@ async function main() {
   }
 }
 
-module.exports = { agentComplete, bindingArgs, boardRefresh, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
+module.exports = { agentComplete, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
 
 if (require.main === module) {
   main().catch(error => {

@@ -283,6 +283,19 @@ Run this as the native Monitor tool, not as an unrelated background shell. The c
 
 The Monitor marks ordinary binding readiness unavailable with `Claude Monitor unavailable` when it stops. On startup, if intake is unavailable because the Claude endpoint was unavailable before event write, it reconciles that intake and requests a Gateway wake.
 
+`claude-channel` is the other listener for the same binding. It serves the same socket and delivers each accepted instruction as an MCP notification, with `acknowledge` and `reply` as tools rather than as commands read from a payload file:
+
+```sh
+node /absolute/path/to/discord-surface/src/cli.js claude-channel \
+  --state-dir "$HOME/.config/discord-surface" \
+  --native-id BINDING_NATIVE_ID \
+  --socket BINDING_ENDPOINT
+```
+
+It carries the same ordinary-binding lifecycle as the Monitor, against the same identity checks on native UUID, workspace, endpoint, and generation: on startup it reconciles an intake left unavailable by a Claude endpoint failure and requests a Gateway wake, and when it stops it marks ordinary binding readiness unavailable, with the reason `Claude channel unavailable`. If the binding changed between construction and start, it refuses instead of writing. Neither listener revokes readiness for a binding that is no longer the one it attached to, so a successor generation keeps its own readiness.
+
+Run one listener at a time. Both own the same socket, and the second to start fails on the socket the first already holds. A binding whose listener is a conductor rather than an ordinary session is unaffected by any of this: the lifecycle runs only for ordinary bindings.
+
 For an explicit milestone from the same ordinary Claude session, write the text to an owner-controlled file and run:
 
 ```sh
