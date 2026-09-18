@@ -633,9 +633,12 @@ may omit `--target-file`; a supplied target file is still checked when present.
 Receiving a packet does not automatically send another packet. Legacy accepted requests remain answerable from an explicitly
 selected child, including requests recorded after child enrollment. New intake
 receipts record the routing version, so new parent-targeted requests cannot use
-that compatibility path. A known-unsent legacy retry keeps its original custody
-and records the selected child as the new wire source. Sent and unknown outcomes
-remain non-sending on retry.
+that compatibility path. A known-unsent legacy retry means a matching persisted
+`direct-post-outcome` receipt whose `outcome` is `not_sent`; a
+`direct-post-attempt` without that outcome, a missing outcome, or an `unknown`
+outcome is not known-unsent and is never safe to retry. A known-unsent retry
+keeps its original custody and records the selected child as the new wire
+source. Sent and unknown outcomes remain non-sending on retry.
 Existing native acknowledgment and reply delivery remain separate from intake.
 
 Receiving installations pin the exact destination generation and deduplicate the

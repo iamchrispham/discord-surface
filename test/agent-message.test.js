@@ -1093,3 +1093,37 @@ test('CLI lets a receipt-bound v1 retry reach legacy custody before v2 validatio
     assert.equal(JSON.parse(result.stdout).status, 'sent');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('CLI recovers an interrupted v1 retry before v2 validation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-cli-legacy-interrupted-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const secret = path.join(dir, 'secret');
+  const textFile = path.join(dir, 'gone.txt');
+  const destination = path.join(dir, 'destination.json');
+  const state = new SurfaceState(db);
+  try {
+    fs.writeFileSync(secret, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secret });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const requestId = 'cli-legacy-interrupted';
+    const legacyPacket = { ...packet, id: requestId, source, target };
+    state.receipt(null, 'direct-post-attempt', {
+      journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, sourcePath: textFile,
+      textHash: crypto.createHash('sha256').update(JSON.stringify(legacyPacket)).digest('hex'), operatorId: '900',
+      partHash: 'legacy-part-hash', channelId: source.channelId, guildId: source.guildId, provider: source.provider,
+      nativeId: source.nativeId, generation: source.generation, conductorId: 'fixture', repoKey: 'repo:fixture',
+      partIndex: 0, partCount: 1, nonce: `${requestId}-nonce`, deliveryChannelId: target.channelId,
+      presentation: 'legacy', agentPacket: legacyPacket, status: 'attempted'
+    });
+    fs.writeFileSync(destination, JSON.stringify({ address: target, proof: 'A'.repeat(43) }));
+  } finally { state.close(); }
+  try {
+    const cli = path.resolve(__dirname, '../src/cli.js');
+    const result = require('node:child_process').spawnSync(process.execPath, [cli, 'agent-send', '--db', db,
+      '--provider', source.provider, '--channel-id', source.channelId, '--native-id', source.nativeId,
+      '--generation', '1', '--target-file', destination, '--text-file', textFile, '--dedupe-key', 'cli-legacy-interrupted'],
+    { encoding: 'utf8', timeout: 5000 });
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(JSON.parse(result.stdout).status, 'unknown');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

@@ -2,6 +2,7 @@ import { isLegacyAgentReceipt } from './state/agent-routing';
 
 type AgentAddress = import('./agent-message').AgentAddress;
 type AgentAddressEnvelope = import('./agent-message').AgentAddressEnvelope;
+type LegacyAgentAddressEnvelope = import('./agent-message').LegacyAgentAddressEnvelope;
 type AgentMessage = import('./agent-message').AgentMessage;
 type AgentMessageKind = import('./agent-message').AgentMessageKind;
 type AgentProvider = import('./agent-message').AgentProvider;
@@ -265,8 +266,9 @@ interface DirectPostRoute {
   ready: boolean;
 }
 
-const { encodeAgentMessage, sameAddress, verifyAgentAddress, KINDS } = require('../src/agent-message') as {
+const { encodeAgentMessage, isLegacyAgentAddressEnvelope, sameAddress, verifyAgentAddress, KINDS } = require('../src/agent-message') as {
   encodeAgentMessage: (packet: AgentMessage, token: string) => string;
+  isLegacyAgentAddressEnvelope: (value: unknown) => value is LegacyAgentAddressEnvelope;
   sameAddress: (left: unknown, right: unknown) => boolean;
   verifyAgentAddress: (envelope: unknown, token: string) => AgentAddress;
   KINDS: Readonly<{ REQUEST: 'request'; RESULT: 'result' }>;
@@ -516,13 +518,8 @@ function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostB
 
 function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | null, token: string, requireProof: boolean): AgentAddress | null {
   if (agentTarget === null) return null;
+  if (isLegacyAgentAddressEnvelope(agentTarget)) return agentTarget.address;
   const hasProof = typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
-  const version = typeof agentTarget === 'object' && agentTarget !== null
-    ? (agentTarget as unknown as { version?: unknown }).version
-    : undefined;
-  if (hasProof && Object.hasOwn(agentTarget, 'address') && (version === undefined || version === 1)) {
-    return (agentTarget as AgentAddressEnvelope).address;
-  }
   if (hasProof || requireProof) return verifyAgentAddress(agentTarget, token);
   return agentTarget as AgentAddress;
 }

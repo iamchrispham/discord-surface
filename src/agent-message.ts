@@ -36,6 +36,12 @@ export interface AgentAddressEnvelope {
   proof: string;
 }
 
+export interface LegacyAgentAddressEnvelope {
+  address: AgentAddress;
+  proof: string;
+  version?: 1;
+}
+
 function messageLimitError(encodedLength: number): Error {
   return new Error(
     `agent message exceeds Discord message limit: encoded size ${encodedLength} characters, maximum ${AGENT_MESSAGE_MAX_ENCODED_LENGTH} characters`
@@ -120,6 +126,16 @@ export function issueAgentAddress(binding: AgentAddress, token: string): AgentAd
   if (!validAddress(address)) throw new Error('invalid agent address');
   const proof = crypto.createHmac('sha256', signingKey(token)).update('address/v2\0' + JSON.stringify(address)).digest('base64url');
   return { version: 2, address, proof };
+}
+
+export function isLegacyAgentAddressEnvelope(value: unknown): value is LegacyAgentAddressEnvelope {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const envelope = value as Record<string, unknown>;
+  const hasVersion = Object.hasOwn(envelope, 'version');
+  if (Object.keys(envelope).length !== (hasVersion ? 3 : 2) ||
+      !Object.hasOwn(envelope, 'address') || !Object.hasOwn(envelope, 'proof') ||
+      (hasVersion && envelope.version !== 1)) return false;
+  return validAddress(envelope.address) && typeof envelope.proof === 'string' && /^[A-Za-z0-9_-]{43}$/.test(envelope.proof);
 }
 
 export function verifyAgentAddress(envelope: unknown, token: string): AgentAddress {
