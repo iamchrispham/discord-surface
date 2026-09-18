@@ -1,3 +1,5 @@
+import { isLegacyAgentReceipt } from './state/agent-routing';
+
 type AgentAddress = import('./agent-message').AgentAddress;
 type AgentAddressEnvelope = import('./agent-message').AgentAddressEnvelope;
 type AgentMessage = import('./agent-message').AgentMessage;
@@ -79,6 +81,8 @@ interface DirectPostPartMeta {
   binding: DirectPostBinding;
   deliveryChannelId?: string;
   agentPacket?: AgentMessage;
+  legacyAgentPacket?: AgentMessage;
+  agentRequestTarget?: AgentAddress;
   watcherNotice?: WatcherNotice;
   presentation: AgentPresentation;
   caption?: string;
@@ -207,6 +211,7 @@ interface DirectPostInputBase {
   fetchImpl?: FetchImplementation;
   timeoutMs?: number;
   ordinary?: boolean;
+  agentMode?: boolean;
   watcherNotice?: { packet: WatcherNotice; binding: DirectPostBinding } | null;
 }
 
@@ -460,8 +465,8 @@ function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostB
     if (detail?.requestId !== requestId || typeof attemptId !== 'string' ||
         !Object.values(DIRECT_POST_OUTCOMES).includes(outcome as DirectPostOutcome)) continue;
     const attempt = attempts.get(attemptId);
-    const attemptPacket = attempt?.agentPacket;
-    const packet = detail.agentPacket ?? attemptPacket;
+    const attemptPacket = attempt?.legacyAgentPacket ?? attempt?.agentPacket;
+    const packet = detail.legacyAgentPacket ?? detail.agentPacket ?? attemptPacket;
     if (!attempt || !attemptPacket || !packet || typeof attemptPacket !== 'object' || typeof packet !== 'object' ||
         !sameAddress((attemptPacket as Record<string, unknown>).source, parent) ||
         !sameAddress((packet as Record<string, unknown>).source, parent) ||
@@ -503,13 +508,6 @@ function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | nu
   }
   if (hasProof || requireProof) return verifyAgentAddress(agentTarget, token);
   return agentTarget as AgentAddress;
-}
-
-function receiptBefore(left: { id?: number; created_at?: string }, right: { id?: number; created_at?: string }): boolean {
-  const leftId = left.id;
-  const rightId = right.id;
-  if (Number.isSafeInteger(leftId) && Number.isSafeInteger(rightId)) return (leftId as number) < (rightId as number);
-  return typeof left.created_at === 'string' && typeof right.created_at === 'string' && left.created_at < right.created_at;
 }
 
 function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, packet, sourceText, agentKind, agentTarget, agentReplyTo }:
@@ -591,26 +589,19 @@ async function verifyAgentDestination({ token, agentTarget, fetchImpl, signal, t
 function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, source: AgentAddress, target: AgentAddress | null = null,
   legacyParent: AgentAddress | null = null): AgentMessage {
   const rows = state.listReceipts();
-  const firstChildEnrollment = legacyParent === null ? null : rows
-    .filter(row => row.kind === 'thread-enrolled')
-    .map(row => ({ row, detail: receiptDetail(row) }))
-    .filter(({ detail }) => detail?.parentChannelId === legacyParent.channelId && detail?.guildId === legacyParent.guildId)
-    .sort((left, right) => (Number(left.row.id || 0) - Number(right.row.id || 0)) ||
-      String(left.row.created_at || '').localeCompare(String(right.row.created_at || '')))[0]?.row || null;
   const candidates = rows
     .filter(row => row.kind === 'agent-message')
     .map(row => {
       try {
         const detail: unknown = JSON.parse(row.detail);
         const packet = detail && typeof detail === 'object' ? (detail as Record<string, unknown>).packet || null : null;
-        return packet ? { packet: packet as Record<string, unknown>, discordId: row.discord_id, id: row.id, createdAt: row.created_at } : null;
+        return packet ? { packet: packet as Record<string, unknown>, discordId: row.discord_id, legacy: isLegacyAgentReceipt(detail) } : null;
       } catch { return null; }
     })
-    .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; id: number | undefined; createdAt: string | undefined } => candidate !== null &&
+    .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; legacy: boolean } => candidate !== null &&
       candidate.packet.kind === KINDS.REQUEST &&
       (target === null || sameAddress(candidate.packet.source, target)) &&
-      (sameAddress(candidate.packet.target, source) || (legacyParent !== null && firstChildEnrollment !== null &&
-        receiptBefore({ id: candidate.id, created_at: candidate.createdAt }, firstChildEnrollment) &&
+      (sameAddress(candidate.packet.target, source) || (legacyParent !== null && candidate.legacy &&
         sameAddress(candidate.packet.target, legacyParent))));
   const matches = candidates.filter(candidate => candidate.discordId === replyTo || candidate.packet.id === replyTo);
   if (matches.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
@@ -629,7 +620,8 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
   presentation: AgentPresentation = AGENT_PRESENTATIONS.LEGACY,
   agentPacket: AgentMessage | null = null,
   fileManifest: DirectPostFileManifest | null = null,
-  watcherNotice: WatcherNotice | null = null): DirectPostPartMeta {
+  watcherNotice: WatcherNotice | null = null, legacyAgentPacket: AgentMessage | null = null,
+  agentRequestTarget: AgentAddress | null = null): DirectPostPartMeta {
   const nonceScope = agentTarget === null
     ? `direct:${requestId}:${partIndex}`
     : agentNonceScope(sourceAddress, agentTarget, requestId, partIndex);
@@ -655,6 +647,8 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
     presentation,
     ...(fileManifest ? { caption: fileManifest.caption, fileManifest } : {}),
     ...(agentPacket ? { agentPacket } : {}),
+    ...(legacyAgentPacket ? { legacyAgentPacket } : {}),
+    ...(agentRequestTarget ? { agentRequestTarget } : {}),
     ...(watcherNotice ? { watcherNotice } : {})
   };
 }
@@ -775,7 +769,7 @@ function prepareFileSource({ state, requestId, textFile, attachmentFile, resume,
 
 async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> {
   let { state, token, nativeId, generation, channelId = null, provider = null, textFile,
-    agentThreadId = null,
+    agentThreadId = null, agentMode = false,
     dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
     agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
     agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null } =
@@ -794,7 +788,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   }
   const operatorId = state.requireConfig().operatorId;
   const replyTarget = inReplyToValue(inReplyTo);
-  const isAgentMessage = watcherNotice !== null || agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT;
+  const isAgentMessage = agentMode || watcherNotice !== null || agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT;
   const fileRequested = attachmentFile !== undefined || resume;
   if (!Object.values(AGENT_PRESENTATIONS).includes(agentPresentation)) {
     throw new BindingError(`unsupported agent presentation: ${agentPresentation}`);
@@ -832,6 +826,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   const effectiveReplyTarget = source.filePreparation?.inReplyTo ?? replyTarget;
   let deliveryTarget: AgentAddress | null = null;
   let agentPacket: AgentMessage | null = null;
+  let agentRequestTarget: AgentAddress | null = null;
   let legacyPacket: AgentMessage | null = null;
   if (legacy) {
     assertLegacyParentSourcedIdentity({ state, binding, token, requestId: explicitRequestId as string, packet: legacy.packet, sourceText: source.text,
@@ -862,13 +857,17 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     deliveryTarget = legacyPacket.target;
     agentTarget = deliveryTarget;
     agentReplyTo = legacyPacket.replyTo;
-    agentPacket = legacyPacket;
-    const wire = encodeAgentMessage(legacyPacket, token);
+    agentPacket = { ...legacyPacket, source: address };
+    if (legacyPacket.kind === KINDS.RESULT) {
+      const request = resolveAgentReplyRequest(state, legacyPacket.replyTo, canonicalAddress(binding), legacyPacket.target);
+      agentRequestTarget = sameAddress(request.target, address) ? null : request.target;
+    }
+    const wire = encodeAgentMessage(agentPacket, token);
     source = {
       ...source,
-      textHash: hash(JSON.stringify(legacyPacket)),
+      textHash: hash(JSON.stringify(agentPacket)),
       parts: [wire],
-      displayParts: [agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT ? agentMessagePreview(legacyPacket) : wire]
+      displayParts: [agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT ? agentMessagePreview(agentPacket) : wire]
     };
   } else if (isAgentMessage) {
     if (replyTarget !== null) throw new BindingError('agent messages use agent reply correlation, not Discord reply targets');
@@ -878,6 +877,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       if (hasProof) agentTarget = verifyAgentAddress(agentTarget, token);
       const request = resolveAgentReplyRequest(state, replyTo, address,
         agentTarget as AgentAddress | null, canonicalAddress(binding));
+      agentRequestTarget = sameAddress(request.target, address) ? null : request.target;
       deliveryTarget = request.source;
       agentTarget = deliveryTarget;
       agentReplyTo = request.id;
@@ -922,7 +922,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
       break;
     }
-    const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null);
+    const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null, legacyPacket, agentRequestTarget);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     if (deliveryTarget !== null) {
       let existing;

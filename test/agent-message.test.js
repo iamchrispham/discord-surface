@@ -977,6 +977,7 @@ test('results can answer a parent-targeted request accepted before child routing
     const intake = state.acceptDiscordMessage({ id: '8102', guildId: source.guildId, channelId: source.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token });
     assert.equal(intake.accepted, true);
+    state.db.prepare("UPDATE receipts SET detail=json_remove(detail, '$.routingVersion') WHERE discord_id=? AND kind='agent-message'").run('8102');
     const sourceChild = enrollChild(state, source, '103');
     const textFile = path.join(dir, 'result.txt');
     fs.writeFileSync(textFile, 'Legacy result');

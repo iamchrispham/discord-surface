@@ -1881,6 +1881,7 @@ async function agentSend(args) {
   }
   return directPost(args, provider, ordinary, {
     agentTarget,
+    agentMode: true,
     agentThreadId: Object.hasOwn(args, 'agent-thread-id') ? args['agent-thread-id'] : null,
     agentPresentation: args['agent-presentation']
   });
@@ -1945,6 +1946,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       resume,
       stateDir: paths.stateDir,
       agentTarget: dependencies.agentTarget ?? null,
+      agentMode: dependencies.agentMode === true,
       agentPresentation: dependencies.agentPresentation,
       agentKind: hasAgentReplyTo ? 'result' : 'request',
       agentReplyTo: hasAgentReplyTo ? args['agent-reply-to'] : null,

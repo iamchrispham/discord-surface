@@ -65,6 +65,7 @@
     "test/issue-thread-types.ts",
     "test/direct-post-types.ts",
     "test/decision-types.ts",
-    "test/discord-decision-types.ts"
+    "test/discord-decision-types.ts",
+    "src/state/agent-routing.ts"
   ]
 }
