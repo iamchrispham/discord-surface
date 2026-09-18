@@ -1094,7 +1094,7 @@ test('CLI lets a receipt-bound v1 retry reach legacy custody before v2 validatio
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('CLI recovers an interrupted v1 retry before v2 validation', () => {
+test('an interrupted v1 retry recovers before v2 validation without posting', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-cli-legacy-interrupted-'));
   const db = path.join(dir, 'surface.sqlite');
   const secret = path.join(dir, 'secret');
@@ -1118,12 +1118,20 @@ test('CLI recovers an interrupted v1 retry before v2 validation', () => {
     fs.writeFileSync(destination, JSON.stringify({ address: target, proof: 'A'.repeat(43) }));
   } finally { state.close(); }
   try {
-    const cli = path.resolve(__dirname, '../src/cli.js');
-    const result = require('node:child_process').spawnSync(process.execPath, [cli, 'agent-send', '--db', db,
-      '--provider', source.provider, '--channel-id', source.channelId, '--native-id', source.nativeId,
-      '--generation', '1', '--target-file', destination, '--text-file', textFile, '--dedupe-key', 'cli-legacy-interrupted'],
-    { encoding: 'utf8', timeout: 5000 });
-    assert.equal(result.status, 1, result.stderr);
-    assert.equal(JSON.parse(result.stdout).status, 'unknown');
+    const resumed = new SurfaceState(db);
+    const methods = [];
+    const legacyTarget = JSON.parse(fs.readFileSync(destination, 'utf8'));
+    try {
+      const result = await runDirectPost({ state: resumed, token, nativeId: source.nativeId,
+        generation: 1, channelId: source.channelId, provider: source.provider, textFile,
+        dedupeKey: 'cli-legacy-interrupted', agentMode: true,
+        agentTarget: legacyTarget, fetchImpl: async (_url, options) => {
+          methods.push(options.method);
+          if (options.method === 'POST') throw new Error('unexpected Discord POST');
+          return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+        } });
+      assert.equal(result.status, 'unknown');
+      assert.equal(methods.filter(method => method === 'POST').length, 0);
+    } finally { resumed.close(); }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
