@@ -465,22 +465,25 @@ function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostB
     attempts.set(attemptId, detail);
   }
   const latestOutcomes = new Map<string, { row: DirectPostReceiptRow; detail: Record<string, unknown> }>();
+  const preflightOutcomes: Array<{ row: DirectPostReceiptRow; detail: Record<string, unknown> }> = [];
   for (const row of rows) {
     if (row.kind !== 'direct-post-outcome') continue;
     const detail = receiptDetail(row);
     const outcome = detail?.outcome;
     const attemptId = detail?.attemptId;
-    if (detail?.requestId !== requestId || typeof attemptId !== 'string' ||
+    if (detail?.requestId !== requestId ||
         !Object.values(DIRECT_POST_OUTCOMES).includes(outcome as DirectPostOutcome)) continue;
-    latestOutcomes.set(attemptId, { row, detail });
+    if (typeof attemptId === 'string') latestOutcomes.set(attemptId, { row, detail });
+    else if (outcome === DIRECT_POST_OUTCOMES.NOT_SENT) preflightOutcomes.push({ row, detail });
   }
   const parent = canonicalAddress(binding);
-  const candidates = [...latestOutcomes.values()].sort((left, right) => (right.row.id || 0) - (left.row.id || 0));
+  const candidates = [...latestOutcomes.values(), ...preflightOutcomes]
+    .sort((left, right) => (right.row.id || 0) - (left.row.id || 0));
   for (const candidate of candidates) {
     const detail = candidate.detail;
     const outcome = detail.outcome as DirectPostOutcome;
-    const attemptId = detail.attemptId as string;
-    const attempt = attempts.get(attemptId);
+    const attemptId = typeof detail.attemptId === 'string' ? detail.attemptId : null;
+    const attempt = attemptId ? attempts.get(attemptId) : detail;
     const attemptPacket = attempt?.legacyAgentPacket ?? attempt?.agentPacket;
     const packet = detail.legacyAgentPacket ?? detail.agentPacket ?? attemptPacket;
     if (!attempt || !attemptPacket || !packet || typeof attemptPacket !== 'object' || typeof packet !== 'object' ||
