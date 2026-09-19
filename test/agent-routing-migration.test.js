@@ -307,8 +307,9 @@ test('legacy parent requests accept a normal intake baseline before later ready 
   assert.equal(f.state.claimDispatch('8112').claimed, true);
   f.state.markSubmitted('8112');
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8112', nativeId: source.nativeId, generation: 1 });
-  f.state.setIntakeBaseline('101', '1', 'fixture baseline', f.state.getBinding('101'));
+  f.state.setIntakeBaseline('101', '2', 'fixture baseline', f.state.getBinding('101'));
   f.state.markIntakeBoundary('101', READINESS.READY, 'fixture baseline ready', null, null, f.state.getBinding('101'));
+  f.state.checkpointIntake('101', '2', f.state.getBinding('101'));
   const receivedPacket = { id: 'received-after-baseline', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
   const intakePacket = { id: 'normal-after-baseline', kind: KINDS.REQUEST, source: target, target: source,

@@ -268,8 +268,8 @@ function hasReadyLegacyChildAtReceipt(
   if (bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
 
   // Legacy databases may have crossed a readiness demotion before that
-  // transition was receipt-backed. A recovery cutoff without a migration
-  // receipt therefore cannot trust an older ready receipt across that gap.
+  // transition was receipt-backed. Only a cutoff following an explicit
+  // non-ready receipt fences that gap; healthy checkpoints do not.
   const migration = state.db.prepare(`SELECT id FROM receipts
     WHERE kind='legacy-intake-migration'
       AND json_extract(detail, '$.channelId')=?
@@ -298,10 +298,27 @@ function hasReadyLegacyChildAtReceipt(
     cutoffReceipt?.lastSeenId
   ].find((value): value is string => typeof value === 'string' && value.length > 0) ?? null;
   const cutoffReceiptId = cutoffReceipt?.id;
-  const cutoffPostdatesReadyEvidence = recoveryCutoff !== null &&
-    (!Number.isSafeInteger(cutoffReceiptId) || !Number.isSafeInteger(bindingReadiness?.id) ||
-      Number(bindingReadiness.id) <= Number(cutoffReceiptId));
-  if ((!migration && cutoffPostdatesReadyEvidence) || (migration &&
+  const explicitDemotion = state.db.prepare(`SELECT id FROM receipts
+    WHERE kind IN (
+      'binding-readiness', 'intake-boundary', 'intake-reconcile-requested',
+      'topic-publication-started', 'topic-publication', 'topic-publication-reconciled',
+      'ordinary-root-relocated', 'rebound', 'unbound', 'conductor-handoff',
+      'bound', 'ordinary-bound'
+    )
+      AND json_extract(detail, '$.channelId')=?
+      AND id < ?
+      AND (
+        (json_extract(detail, '$.readiness') IS NOT NULL AND json_extract(detail, '$.readiness') <> 'ready')
+        OR (json_extract(detail, '$.state') IS NOT NULL AND json_extract(detail, '$.state') <> 'ready')
+      )
+    ORDER BY id DESC
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number } | undefined;
+  const cutoffFollowsExplicitDemotion = recoveryCutoff !== null &&
+    Number.isSafeInteger(cutoffReceiptId) && Number.isSafeInteger(explicitDemotion?.id) &&
+    Number.isSafeInteger(bindingReadiness?.id) &&
+    Number(explicitDemotion?.id) < Number(cutoffReceiptId) &&
+    Number(cutoffReceiptId) < Number(bindingReadiness?.id);
+  if ((!migration && cutoffFollowsExplicitDemotion) || (migration &&
       (!Number.isSafeInteger(bindingReadiness?.id) || Number(bindingReadiness.id) <= Number(migration.id)))) {
     return false;
   }
