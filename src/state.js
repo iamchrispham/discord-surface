@@ -2146,6 +2146,13 @@ class SurfaceState {
           return { accepted: false, duplicate: true, reason: 'watcher-notice-duplicate', message: this.getMessage(prior.messageId) };
         }
       }
+      if (agent && !enrollment && agent.routingVersion === AGENT_ROUTING_VERSION) {
+        this.receipt(null, 'intake-rejected', {
+          discordId: event.id, channelId: authorityChannelId,
+          reason: 'agent-child-route-required', ready
+        });
+        return this.reject('agent-child-route-required');
+      }
       if (this.failNextIntakeFlag) {
         this.failNextIntakeFlag = false;
         throw new Error('injected intake transaction failure');
