@@ -2171,7 +2171,10 @@ class SurfaceState {
             agent.source.guildId, agent.source.channelId, agent.source.provider, agent.source.nativeId, agent.source.generation,
             agent.target.guildId, agent.target.channelId, agent.target.provider, agent.target.nativeId, agent.target.generation
           );
-      if (agent && !enrollment && !legacyCorrelatedResult) {
+      const legacyParentRoute = agent && !enrollment &&
+        agent.target.channelId === authorityChannelId &&
+        agent.routingVersion !== AGENT_ROUTING_VERSION;
+      if (agent && !enrollment && !legacyParentRoute && !legacyCorrelatedResult) {
         this.receipt(null, 'intake-rejected', {
           discordId: event.id, channelId: authorityChannelId,
           reason: 'agent-child-route-required', ready
