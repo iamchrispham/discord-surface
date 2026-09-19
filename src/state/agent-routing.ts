@@ -121,7 +121,13 @@ export function legacyParentSourcedReceipt(state: DirectPostState, binding: Dire
   }
   const parent = canonicalAddress(binding);
   const candidates = [...latestOutcomes.values(), ...preflightOutcomes]
-    .sort((left, right) => (right.row.id || 0) - (left.row.id || 0));
+    .sort((left, right) => {
+      const leftAttemptBacked = typeof left.detail.attemptId === 'string' &&
+        (left.detail.outcome === 'sent' || left.detail.outcome === 'unknown') ? 1 : 0;
+      const rightAttemptBacked = typeof right.detail.attemptId === 'string' &&
+        (right.detail.outcome === 'sent' || right.detail.outcome === 'unknown') ? 1 : 0;
+      return rightAttemptBacked - leftAttemptBacked || (right.row.id || 0) - (left.row.id || 0);
+    });
   for (const candidate of candidates) {
     const detail = candidate.detail;
     const outcome = detail.outcome as DirectPostOutcome;

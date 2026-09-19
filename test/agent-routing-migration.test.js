@@ -224,6 +224,22 @@ test('newer attemptless terminal legacy custody controls retry', async t => {
   assert.equal(posts, 0);
 });
 
+test('attempt-backed terminal custody outranks a later preflight', async t => {
+  for (const outcome of ['sent', 'unknown']) {
+    await t.test(outcome, async t => {
+      const f = fixture(t);
+      const packet = legacyPost(f, outcome);
+      legacyPreflight(f, packet.id, 'rate_limited');
+      enroll(f);
+      const result = await runDirectPost(input(f, { fetchImpl: async () => {
+        throw new Error('terminal custody must not resend');
+      } }));
+      assert.equal(result.status, outcome);
+      if (outcome === 'sent') assert.equal(result.duplicate, true);
+    });
+  }
+});
+
 test('overlapping legacy retries honor a newer attemptless preflight inside the claim', async t => {
   const f = fixture(t);
   legacyPost(f, 'not_sent');
@@ -282,6 +298,35 @@ test('legacy parent requests complete from a received child result without local
   assert.equal(completed.completed, true);
   assert.equal(completed.evidence.kind, 'received-result');
   assert.equal(completed.evidence.discordId, 'received-child-result-discord');
+});
+
+test('legacy parent requests accept a normal intake baseline before later ready evidence', async t => {
+  const f = fixture(t);
+  const request = acceptRequest(f, '8112', true);
+  enroll(f);
+  assert.equal(f.state.claimDispatch('8112').claimed, true);
+  f.state.markSubmitted('8112');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8112', nativeId: source.nativeId, generation: 1 });
+  f.state.setIntakeBaseline('101', '1', 'fixture baseline', f.state.getBinding('101'));
+  f.state.markIntakeBoundary('101', READINESS.READY, 'fixture baseline ready', null, null, f.state.getBinding('101'));
+  const receivedPacket = { id: 'received-after-baseline', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
+    replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
+  const intakePacket = { id: 'normal-after-baseline', kind: KINDS.REQUEST, source: target, target: source,
+    replyTo: null, text: 'Normal intake fixture.' };
+  const receivedEvent = { id: '8113', guildId: '100', channelId: '101', authorId: '901', isBot: true,
+    content: encodeAgentMessage(intakePacket, token) };
+  const accepted = f.state.acceptDiscordMessage(receivedEvent, { agentToken: token });
+  assert.equal(accepted.accepted, true, JSON.stringify(accepted));
+  assert.equal(f.state.getAgentMessage('8113').routingVersion, AGENT_ROUTING_VERSION);
+  f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+    .run(JSON.stringify({ packet: receivedPacket }), '8113');
+  const completed = agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8112', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  });
+  assert.equal(completed.completed, true);
+  assert.equal(completed.evidence.kind, 'received-result');
 });
 
 test('legacy parent requests reject a result received before child readiness', async t => {
