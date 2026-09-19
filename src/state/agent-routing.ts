@@ -180,7 +180,7 @@ function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | nu
 
 export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, source: AgentAddress,
   target: AgentAddress | null = null, legacyParent: AgentAddress | null = null,
-  BindingError: BindingErrorConstructor): AgentMessage {
+  BindingError: BindingErrorConstructor, requireLegacy = false): AgentMessage {
   const rows = state.listReceipts();
   const candidates = rows
     .filter(row => row.kind === 'agent-message')
@@ -193,6 +193,7 @@ export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string
     })
     .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; legacy: boolean } => candidate !== null &&
       candidate.packet.kind === KINDS.REQUEST &&
+      (!requireLegacy || candidate.legacy) &&
       (target === null || sameAddress(candidate.packet.source, target)) &&
       (sameAddress(candidate.packet.target, source) || (legacyParent !== null && candidate.legacy &&
         sameAddress(candidate.packet.target, legacyParent))));

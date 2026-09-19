@@ -173,7 +173,7 @@ function hasReadyLegacyChildAtReceipt(
   if (enrollment?.state !== 'ready') return false;
 
   // Receipt ids monotonically fence readiness changes from the candidate result.
-  const bindingReadiness = state.db.prepare(`SELECT
+  const bindingReadiness = state.db.prepare(`SELECT kind,
       json_extract(detail, '$.readiness') AS readiness,
       json_extract(detail, '$.state') AS state
     FROM receipts
@@ -186,8 +186,10 @@ function hasReadyLegacyChildAtReceipt(
       AND json_extract(detail, '$.channelId')=?
       AND id < ?
     ORDER BY id DESC
-    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { readiness?: unknown; state?: unknown } | undefined;
-  if (bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { kind?: unknown; readiness?: unknown; state?: unknown } | undefined;
+  const fieldlessBoundIsReady = bindingReadiness?.kind === 'bound' &&
+    bindingReadiness.readiness === null && bindingReadiness.state === null;
+  if (!fieldlessBoundIsReady && bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
 
   const row = state.db.prepare(`SELECT 1 FROM bindings AS binding
     WHERE binding.channel_id=? AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1

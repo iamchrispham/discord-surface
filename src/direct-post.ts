@@ -763,9 +763,13 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     if (agentKind === KINDS.RESULT) {
       const replyTo = requiredString(agentReplyTo, 'agent-reply-to', 128);
       const hasProof = agentTarget !== null && typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
-      if (hasProof) agentTarget = verifyAgentAddress(agentTarget, token);
+      const legacyTargetEnvelope = agentTarget !== null && isLegacyAgentAddressEnvelope(agentTarget) ? agentTarget : null;
+      let resolvedTarget = agentTarget as AgentAddress | null;
+      if (legacyTargetEnvelope !== null) resolvedTarget = legacyTargetEnvelope.address;
+      else if (hasProof) resolvedTarget = verifyAgentAddress(agentTarget, token);
       const request = resolveAgentReplyRequest(state, replyTo, address,
-        agentTarget as AgentAddress | null, canonicalAddress(binding), BindingError);
+        resolvedTarget, canonicalAddress(binding), BindingError, legacyTargetEnvelope !== null);
+      agentTarget = resolvedTarget;
       agentRequestTarget = sameAddress(request.target, address) ? null : request.target;
       deliveryTarget = request.source;
       agentTarget = deliveryTarget;
