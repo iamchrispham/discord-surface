@@ -278,15 +278,25 @@ function hasReadyLegacyChildAtReceipt(
     LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number } | undefined;
   const cutoffReceipt = state.db.prepare(`SELECT
       id,
-      json_extract(detail, '$.recoveredThroughId') AS recoveredThroughId
+      json_extract(detail, '$.recoveredThroughId') AS recoveredThroughId,
+      json_extract(detail, '$.lastSeenId') AS lastSeenId,
+      json_extract(detail, '$.coverageId') AS coverageId
     FROM receipts
     WHERE kind IN ('intake-baseline', 'intake-checkpoint')
       AND json_extract(detail, '$.channelId')=?
       AND id < ?
     ORDER BY id DESC
-    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number; recoveredThroughId?: unknown } | undefined;
-  const recoveryCutoff = typeof cutoffReceipt?.recoveredThroughId === 'string' && cutoffReceipt.recoveredThroughId.length > 0
-    ? cutoffReceipt.recoveredThroughId : null;
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as {
+      id?: number;
+      recoveredThroughId?: unknown;
+      lastSeenId?: unknown;
+      coverageId?: unknown;
+    } | undefined;
+  const recoveryCutoff = [
+    cutoffReceipt?.recoveredThroughId,
+    cutoffReceipt?.coverageId,
+    cutoffReceipt?.lastSeenId
+  ].find((value): value is string => typeof value === 'string' && value.length > 0) ?? null;
   const cutoffReceiptId = cutoffReceipt?.id;
   const cutoffPostdatesReadyEvidence = recoveryCutoff !== null &&
     (!Number.isSafeInteger(cutoffReceiptId) || !Number.isSafeInteger(bindingReadiness?.id) ||
