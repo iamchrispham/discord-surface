@@ -431,6 +431,18 @@ test('new intake stamps its route version and cannot use legacy parent-result co
   assert.equal(f.state.directPostRows('new-parent-result').length, 0);
 });
 
+test('legacy-correlated v2 parent results remain admissible after upgrade', async t => {
+  const f = fixture(t);
+  const packet = { id: 'legacy-parent-result', kind: KINDS.RESULT, source: target, target: source,
+    replyTo: 'legacy-parent-request', routingVersion: AGENT_ROUTING_VERSION, text: 'Completed task.' };
+  f.state.receipt(null, 'direct-post-outcome', {
+    legacyAgentPacket: { ...packet, routingVersion: undefined }, agentPacket: packet
+  });
+  const accepted = f.state.acceptDiscordMessage({ id: 'legacy-parent-result-discord', guildId: '100', channelId: '101',
+    authorId: '901', isBot: true, content: encodeAgentMessage(packet, token) }, { agentToken: token });
+  assert.equal(accepted.accepted, true, JSON.stringify(accepted));
+});
+
 test('previous child-result custody remains idempotent without migration metadata', async t => {
   const f = fixture(t);
   enroll(f);

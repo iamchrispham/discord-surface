@@ -2146,7 +2146,15 @@ class SurfaceState {
           return { accepted: false, duplicate: true, reason: 'watcher-notice-duplicate', message: this.getMessage(prior.messageId) };
         }
       }
-      if (agent && !enrollment && agent.routingVersion === AGENT_ROUTING_VERSION) {
+      const legacyCorrelatedResult = agent && agent.kind === 'result' && !enrollment &&
+        agent.target.channelId === authorityChannelId &&
+        this.db.prepare(`SELECT 1 FROM receipts
+          WHERE kind='direct-post-outcome'
+            AND json_extract(detail, '$.legacyAgentPacket.id')=?
+            AND json_extract(detail, '$.agentPacket.id')=?
+            AND json_extract(detail, '$.agentPacket.replyTo')=?
+          LIMIT 1`).get(agent.id, agent.id, agent.replyTo);
+      if (agent && !enrollment && agent.routingVersion === AGENT_ROUTING_VERSION && !legacyCorrelatedResult) {
         this.receipt(null, 'intake-rejected', {
           discordId: event.id, channelId: authorityChannelId,
           reason: 'agent-child-route-required', ready
