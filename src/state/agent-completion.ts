@@ -359,11 +359,7 @@ function sentReplyEvidence(
     const candidate = row.outcomeDetail.agentPacket;
     if (!validAgentPacket(attemptPacket, KINDS.RESULT) || !validAgentPacket(candidate, KINDS.RESULT) ||
         !sameAgentPacket(candidate, attemptPacket)) continue;
-    const recordedTargets = [row.attemptDetail.agentRequestTarget, row.outcomeDetail.agentRequestTarget];
-    const hasRecordedRequestTarget = recordedTargets.some((target) => target !== null && target !== undefined &&
-      sameAddress(target, request.target));
-    const exact = sameReverseAddresses(candidate, request) &&
-      (hasUniqueRequestTarget(state, request) || hasRecordedRequestTarget);
+    const exact = sameReverseAddresses(candidate, request);
     const migrated = allowLegacyChildSource &&
       isLegacyChildResult(candidate, request, parentTarget, true) &&
       isLegacyChildResult(candidate, request, row.attemptDetail.agentRequestTarget, true) &&
