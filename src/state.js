@@ -1783,8 +1783,11 @@ class SurfaceState {
     if (!ready) {
       const binding = this.getBinding(event.channelId);
       if (binding?.active && binding.guildId === event.guildId) {
-        this.db.prepare("UPDATE bindings SET readiness='recovering', updated_at=? WHERE channel_id=? AND active=1 AND readiness='ready'")
+        const updated = this.db.prepare("UPDATE bindings SET readiness='recovering', updated_at=? WHERE channel_id=? AND active=1 AND readiness='ready'")
           .run(now(), event.channelId);
+        if (Number(updated.changes) === 1) {
+          this.receipt(null, 'binding-readiness', { channelId: event.channelId, readiness: READINESS.RECOVERING });
+        }
       }
     }
   }

@@ -244,6 +244,8 @@ test('legacy parent requests reject results received during parent readiness tra
         f.state.reconcileIntake('101', f.state.getBinding('101'));
       } else {
         f.state.upsertIntakeWatermark({ channelId: '101', guildId: '100', id: '8115-recovery' }, false);
+        assert.equal(f.state.listReceipts().some(row => row.kind === 'binding-readiness' &&
+          JSON.parse(row.detail).readiness === READINESS.RECOVERING), true);
       }
       assert.notEqual(f.state.getBinding('101').readiness, READINESS.READY);
       const receivedPacket = { id: `received-during-${scenarioKey}`, kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
