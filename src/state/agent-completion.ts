@@ -276,16 +276,17 @@ function hasReadyLegacyChildAtReceipt(
       AND id < ?
     ORDER BY id DESC
     LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number } | undefined;
-  const watermark = state.db.prepare('SELECT recovered_through_id AS recoveredThroughId FROM intake_watermarks WHERE channel_id=?')
-    .get(parent.channelId) as { recoveredThroughId?: unknown } | undefined;
-  const recoveryCutoff = typeof watermark?.recoveredThroughId === 'string' && watermark.recoveredThroughId.length > 0
-    ? watermark.recoveredThroughId : null;
-  const cutoffReceipt = state.db.prepare(`SELECT id FROM receipts
+  const cutoffReceipt = state.db.prepare(`SELECT
+      id,
+      json_extract(detail, '$.recoveredThroughId') AS recoveredThroughId
+    FROM receipts
     WHERE kind IN ('intake-baseline', 'intake-checkpoint')
       AND json_extract(detail, '$.channelId')=?
       AND id < ?
     ORDER BY id DESC
-    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number } | undefined;
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number; recoveredThroughId?: unknown } | undefined;
+  const recoveryCutoff = typeof cutoffReceipt?.recoveredThroughId === 'string' && cutoffReceipt.recoveredThroughId.length > 0
+    ? cutoffReceipt.recoveredThroughId : null;
   const cutoffReceiptId = cutoffReceipt?.id;
   const cutoffPostdatesReadyEvidence = recoveryCutoff !== null &&
     (!Number.isSafeInteger(cutoffReceiptId) || !Number.isSafeInteger(bindingReadiness?.id) ||

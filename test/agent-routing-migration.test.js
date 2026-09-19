@@ -329,6 +329,30 @@ test('legacy parent requests accept a normal intake baseline before later ready 
   assert.equal(completed.evidence.kind, 'received-result');
 });
 
+test('legacy parent requests ignore a recovery cutoff recorded after the result', async t => {
+  const f = fixture(t);
+  const request = acceptRequest(f, '8112-after', true);
+  enroll(f);
+  assert.equal(f.state.claimDispatch('8112-after').claimed, true);
+  f.state.markSubmitted('8112-after');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8112-after', nativeId: source.nativeId, generation: 1 });
+  const receivedPacket = { id: 'received-before-cutoff', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
+    replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
+  acceptRequest(f, 'received-before-cutoff-discord', false);
+  f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+    .run(JSON.stringify({ packet: receivedPacket }), 'received-before-cutoff-discord');
+  f.state.upsertIntakeWatermark({ channelId: '101', guildId: '100', id: '8112-after-cutoff' }, false);
+  assert.equal(f.state.getBinding('101').readiness, READINESS.RECOVERING);
+  f.state.setBindingReadiness('101', READINESS.READY, 'fixture recovered', f.state.getBinding('101'));
+  const completed = agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8112-after', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  });
+  assert.equal(completed.completed, true);
+  assert.equal(completed.evidence.kind, 'received-result');
+});
+
 test('legacy parent requests reject a result received before child readiness', async t => {
   const f = fixture(t);
   const request = acceptRequest(f, '8114', true);
