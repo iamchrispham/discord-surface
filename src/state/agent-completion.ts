@@ -168,6 +168,31 @@ function requestProvenanceReceiptId(state: CompletionState, messageId: string): 
   return row && Number.isSafeInteger(row.id) ? Number(row.id) : 0;
 }
 
+function hasUniqueRequestTarget(
+  state: CompletionState,
+  request: AgentMessage
+): boolean {
+  // A reused packet id cannot safely promote a child result across routes.
+  const row = state.db.prepare(`SELECT COUNT(DISTINCT json_extract(detail, '$.packet.target.channelId')) AS count
+    FROM receipts
+    WHERE kind='agent-message'
+      AND json_extract(detail, '$.packet.kind')=?
+      AND json_extract(detail, '$.packet.id')=?
+      AND json_extract(detail, '$.packet.source.guildId')=?
+      AND json_extract(detail, '$.packet.source.provider')=?
+      AND json_extract(detail, '$.packet.source.nativeId')=?
+      AND json_extract(detail, '$.packet.source.generation')=?
+      AND json_extract(detail, '$.packet.target.guildId')=?
+      AND json_extract(detail, '$.packet.target.provider')=?
+      AND json_extract(detail, '$.packet.target.nativeId')=?
+      AND json_extract(detail, '$.packet.target.generation')=?`).get(
+    KINDS.REQUEST, request.id,
+    request.source.guildId, request.source.provider, request.source.nativeId, request.source.generation,
+    request.target.guildId, request.target.provider, request.target.nativeId, request.target.generation
+  ) as { count?: number } | undefined;
+  return Number(row?.count) === 1;
+}
+
 function hasReadyLegacyChildAtReceipt(
   state: CompletionState,
   child: AgentAddress,
@@ -243,16 +268,19 @@ function hasReadyLegacyChildAtReceipt(
   if (bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
 
   // Legacy databases may have crossed a readiness demotion before that
-  // transition was receipt-backed. Require a post-migration readiness receipt
-  // before trusting a legacy result, otherwise an older ready receipt can span
-  // the unrecorded gap.
+  // transition was receipt-backed. A recovery cutoff without a migration
+  // receipt therefore cannot trust an older ready receipt across that gap.
   const migration = state.db.prepare(`SELECT id FROM receipts
     WHERE kind='legacy-intake-migration'
       AND json_extract(detail, '$.channelId')=?
       AND id < ?
     ORDER BY id DESC
     LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number } | undefined;
-  if (migration && (!Number.isSafeInteger(bindingReadiness?.id) || Number(bindingReadiness.id) <= Number(migration.id))) {
+  const watermark = state.db.prepare('SELECT recovered_through_id AS recoveredThroughId FROM intake_watermarks WHERE channel_id=?')
+    .get(parent.channelId) as { recoveredThroughId?: unknown } | undefined;
+  const hasRecoveryCutoff = typeof watermark?.recoveredThroughId === 'string' && watermark.recoveredThroughId.length > 0;
+  if ((!migration && hasRecoveryCutoff) || (migration &&
+      (!Number.isSafeInteger(bindingReadiness?.id) || Number(bindingReadiness.id) <= Number(migration.id)))) {
     return false;
   }
 
@@ -294,7 +322,8 @@ function receivedReplyEvidence(
     const detail = deps.parseJson(candidateRow.detail, null);
     const candidate = detail?.packet;
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
-    const migrated = allowLegacyChildSource && isLegacyChildResult(candidate, request, parentTarget,
+    const migrated = allowLegacyChildSource && hasUniqueRequestTarget(state, request) &&
+      isLegacyChildResult(candidate, request, parentTarget,
       hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id), candidateRow.discord_id));
     if (!sameReverseAddresses(candidate, request) && !migrated) continue;
     return {
