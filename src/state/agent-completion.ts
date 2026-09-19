@@ -155,6 +155,12 @@ function receivedResultEvidence(
   };
 }
 
+function requestProvenanceReceiptId(state: CompletionState, messageId: string): number {
+  const row = state.db.prepare("SELECT MIN(id) AS id FROM receipts WHERE kind='agent-message' AND discord_id=?")
+    .get(messageId) as { id?: number } | undefined;
+  return row && Number.isSafeInteger(row.id) ? Number(row.id) : 0;
+}
+
 function hasReadyLegacyChildAtReceipt(
   state: CompletionState,
   child: AgentAddress,
@@ -249,7 +255,8 @@ function sentReplyEvidence(
   channelId: string,
   deps: AgentCompletionDependencies,
   allowLegacyChildSource: boolean,
-  parentTarget: AgentAddress
+  parentTarget: AgentAddress,
+  requestReceiptId: number
 ): Record<string, unknown> | null {
   const rows: SentAgentResultRow[] = querySentAgentResultRows({
     db: state.db,
@@ -258,7 +265,7 @@ function sentReplyEvidence(
     assertText: deps.assertText,
     attemptKind: deps.DIRECT_POST_ATTEMPT,
     outcomeKind: deps.DIRECT_POST_OUTCOME
-  }, request, channelId, 64, allowLegacyChildSource);
+  }, request, channelId, 64, allowLegacyChildSource, requestReceiptId);
   for (const row of rows) {
     const attemptPacket = row.attemptDetail.agentPacket;
     const candidate = row.outcomeDetail.agentPacket;
@@ -366,8 +373,9 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
       } else {
         const allowLegacyChildSource = isLegacyAgentReceipt(provenance);
         const parentTarget = { ...target, channelId: binding.channelId };
+        const provenanceReceiptId = requestProvenanceReceiptId(state, messageId);
         evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget) ||
-          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacyChildSource, parentTarget);
+          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacyChildSource, parentTarget, provenanceReceiptId);
         if (!evidence) throw new deps.BindingError('agent request lacks an immutable correlated result');
       }
       const detail = {

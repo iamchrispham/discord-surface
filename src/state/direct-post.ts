@@ -374,7 +374,8 @@ export function querySentAgentResultRows(
   request: AgentMessage,
   channelId: string,
   limit = 64,
-  allowLegacyChildSource = false
+  allowLegacyChildSource = false,
+  requestReceiptId = 0
 ): SentAgentResultRow[] {
   const source = request.target;
   const target = request.source;
@@ -405,6 +406,10 @@ export function querySentAgentResultRows(
     "json_extract(attempt.detail, '$.channelId')=?"
   ];
   const parameters: unknown[] = [outcomeKind, attemptKind, channelId];
+  if (Number.isSafeInteger(requestReceiptId) && requestReceiptId > 0) {
+    clauses.push('outcome.id > ?');
+    parameters.push(requestReceiptId);
+  }
   for (const [field, value] of packetFields) {
     if (allowLegacyChildSource && field === 'source.channelId') {
       const requestTargetFields = packetFields.filter(([key]) => key.startsWith('source.'));

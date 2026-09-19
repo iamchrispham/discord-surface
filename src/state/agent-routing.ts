@@ -200,7 +200,12 @@ export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string
       (target === null || sameAddress(candidate.packet.source, target)) &&
       (sameAddress(candidate.packet.target, source) || (legacyParent !== null && candidate.legacy &&
         sameAddress(candidate.packet.target, legacyParent))));
-  const matches = candidates.filter(candidate => candidate.discordId === replyTo || candidate.packet.id === replyTo);
+  const identified = candidates.filter(candidate => candidate.discordId === replyTo || candidate.packet.id === replyTo);
+  const exactMatches = identified.filter(candidate => sameAddress(candidate.packet.target, source));
+  const matches = exactMatches.length > 0
+    ? exactMatches
+    : identified.filter(candidate => legacyParent !== null && candidate.legacy &&
+      sameAddress(candidate.packet.target, legacyParent));
   if (matches.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
   const match = matches[0];
   if (!match) throw new BindingError('agent reply target is unknown or does not match the active request');
