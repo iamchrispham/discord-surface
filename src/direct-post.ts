@@ -801,6 +801,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       source: address,
       target: packetTarget,
       replyTo: (agentReplyTo ?? null) as string | null,
+      routingVersion: AGENT_ROUTING_VERSION,
       text: source.text
     } as unknown as AgentMessage;
     agentPacket = packet;

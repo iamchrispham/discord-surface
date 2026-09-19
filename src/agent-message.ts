@@ -23,6 +23,7 @@ interface AgentMessageFields {
   id: string;
   source: AgentAddress;
   target: AgentAddress;
+  routingVersion?: number;
   text: string;
 }
 
@@ -68,20 +69,27 @@ export function sameAddress(left: unknown, right: unknown): boolean {
 }
 
 export function validateAgentMessage(packet: unknown): asserts packet is AgentMessage {
-  if (!exactKeys(packet, ['id', 'kind', 'source', 'target', 'replyTo', 'text'])) {
+  if (packet === null || typeof packet !== 'object' || Array.isArray(packet)) {
     throw new Error('invalid agent message');
   }
-  if (typeof packet.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(packet.id) ||
-      !Object.values(KINDS).includes(packet.kind as AgentMessageKind) || !validAddress(packet.source) || !validAddress(packet.target)) {
+  const value = packet as Record<string, unknown>;
+  const keys = Object.keys(value);
+  if (keys.length !== 6 && keys.length !== 7 ||
+      !['id', 'kind', 'source', 'target', 'replyTo', 'text'].every(key => Object.hasOwn(value, key)) ||
+      (keys.length === 7 && (!Object.hasOwn(value, 'routingVersion') || value.routingVersion !== 2))) {
     throw new Error('invalid agent message');
   }
-  const source = packet.source;
-  const target = packet.target;
+  if (typeof value.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.id) ||
+      !Object.values(KINDS).includes(value.kind as AgentMessageKind) || !validAddress(value.source) || !validAddress(value.target)) {
+    throw new Error('invalid agent message');
+  }
+  const source = value.source as AgentAddress;
+  const target = value.target as AgentAddress;
   if (source.guildId !== target.guildId ||
       (source.provider === target.provider && source.nativeId === target.nativeId) ||
-      typeof packet.text !== 'string' || !packet.text.trim() ||
-      ((packet.kind as AgentMessageKind) === KINDS.REQUEST ? packet.replyTo !== null :
-        typeof packet.replyTo !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(packet.replyTo as string))) {
+      typeof value.text !== 'string' || !value.text.trim() ||
+      ((value.kind as AgentMessageKind) === KINDS.REQUEST ? value.replyTo !== null :
+        typeof value.replyTo !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.replyTo as string))) {
     throw new Error('invalid agent message');
   }
 }
