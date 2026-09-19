@@ -527,6 +527,8 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       .map(row => [row.detail.attemptId, row]));
     const latest = attempts.at(-1);
     const latestAttemptOutcome = latest ? outcomes.get(latest.detail.attemptId) : undefined;
+    const latestConfirmedOutcome = rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId && row.detail.partIndex === meta.partIndex && row.detail.phase !== 'preflight' &&
+      ['sent', 'unknown'].includes(row.detail.outcome as string)).sort((a, b) => a.id - b.id).at(-1);
     const assertParentCurrent = (): void => {
       if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
     };
@@ -536,10 +538,10 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       }
     };
     const latestPreflight = preflights.at(-1);
-    if (latestPreflight && (!latest || (latestPreflight.id > latest.id &&
+    if (latestPreflight && !latestConfirmedOutcome && (!latest || (latestPreflight.id > latest.id &&
       (!latestAttemptOutcome || latestPreflight.id > latestAttemptOutcome.id)))) {
       const status = latestPreflight.detail.outcome as string;
-      const retryableRateLimit = status === 'rate_limited' && meta.presentation !== 'legacy' && !meta.legacyAgentPacket;
+      const retryableRateLimit = status === 'rate_limited' && !meta.legacyAgentPacket;
       if (status !== 'not_sent' && !retryableRateLimit) {
         assertRouteCurrent();
         return { claimed: false, status, attemptId: meta.attemptId, nonce: meta.nonce, outcome: latestPreflight.detail };

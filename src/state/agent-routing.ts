@@ -8,7 +8,8 @@ import {
   type AgentAddress,
   type AgentAddressEnvelope,
   type AgentMessage,
-  type AgentMessageKind
+  type AgentMessageKind,
+  type LegacyAgentAddressEnvelope
 } from '../agent-message';
 import type {
   DirectPostBinding,
@@ -170,7 +171,7 @@ export function isLegacyRetryableOutcome(outcome: DirectPostOutcome): boolean {
   return outcome === 'not_sent';
 }
 
-function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | null, token: string,
+function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | LegacyAgentAddressEnvelope | null, token: string,
   requireProof: boolean, verifyLegacyProof: boolean): AgentAddress | null {
   if (agentTarget === null) return null;
   if (isLegacyAgentAddressEnvelope(agentTarget)) {
@@ -210,7 +211,7 @@ export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string
 export function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, packet, sourceText, agentKind,
   agentTarget, agentReplyTo, sourceAddress = null, allowRecordedTarget = false, verifyLegacyProof = false, BindingError }:
   { state: DirectPostState; binding: DirectPostBinding; token: string; requestId: string; packet: AgentMessage; sourceText: string;
-    agentKind: AgentMessageKind; agentTarget: AgentAddress | AgentAddressEnvelope | null; agentReplyTo: string | null;
+    agentKind: AgentMessageKind; agentTarget: AgentAddress | AgentAddressEnvelope | LegacyAgentAddressEnvelope | null; agentReplyTo: string | null;
     sourceAddress?: AgentAddress | null; allowRecordedTarget?: boolean; verifyLegacyProof?: boolean; BindingError: BindingErrorConstructor;
   }): void {
   const parent = canonicalAddress(binding);

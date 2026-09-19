@@ -247,10 +247,19 @@ interface AgentResultDirectPostInput extends DirectPostInputBase {
   agentPresentation?: AgentPresentation;
 }
 
+interface LegacyAgentResultDirectPostInput extends DirectPostInputBase {
+  agentThreadId?: string;
+  agentKind: Extract<AgentMessageKind, 'result'>;
+  agentTarget?: LegacyAgentAddressEnvelope | null;
+  agentReplyTo: string;
+  agentPresentation?: AgentPresentation;
+}
+
 export type DirectPostInput =
   | OrdinaryDirectPostInput
   | AgentRequestDirectPostInput
-  | AgentResultDirectPostInput;
+  | AgentResultDirectPostInput
+  | LegacyAgentResultDirectPostInput;
 
 interface DiscordChannel {
   id: string;
