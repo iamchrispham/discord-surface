@@ -53,6 +53,7 @@ export interface DirectPostPartMeta {
   agentPacket?: AgentMessage;
   legacyAgentPacket?: AgentMessage;
   agentRequestTarget?: AgentAddress;
+  routingVersion?: number;
   presentation?: string;
   watcherNotice?: WatcherNotice;
   caption?: string;

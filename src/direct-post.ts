@@ -1,4 +1,5 @@
 import {
+  AGENT_ROUTING_VERSION,
   assertLegacyParentSourcedIdentity,
   isLegacyRetryableOutcome,
   legacyParentSourcedReceipt,
@@ -500,7 +501,7 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
   agentPacket: AgentMessage | null = null,
   fileManifest: DirectPostFileManifest | null = null,
   watcherNotice: WatcherNotice | null = null, legacyAgentPacket: AgentMessage | null = null,
-  agentRequestTarget: AgentAddress | null = null): DirectPostPartMeta {
+  agentRequestTarget: AgentAddress | null = null, routingVersion: number | null = null): DirectPostPartMeta {
   const nonceScope = agentTarget === null
     ? `direct:${requestId}:${partIndex}`
     : agentNonceScope(sourceAddress, agentTarget, requestId, partIndex);
@@ -528,6 +529,7 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
     ...(agentPacket ? { agentPacket } : {}),
     ...(legacyAgentPacket ? { legacyAgentPacket } : {}),
     ...(agentRequestTarget ? { agentRequestTarget } : {}),
+    ...(routingVersion !== null ? { routingVersion } : {}),
     ...(watcherNotice ? { watcherNotice } : {})
   };
 }
@@ -816,7 +818,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     const partIndex = Number.isSafeInteger(legacyPartIndex) ? legacyPartIndex as number : 0;
     const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex,
       address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null,
-      legacyChildAddress === null ? legacyPacket : null, agentRequestTarget);
+      legacyChildAddress === null ? legacyPacket : null, agentRequestTarget,
+      legacy === null && isAgentMessage ? AGENT_ROUTING_VERSION : null);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     state.inspectDirectPostPart(meta);
     return terminalLegacyResult;
@@ -840,7 +843,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       break;
     }
     const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null,
-      legacyChildAddress === null ? legacyPacket : null, agentRequestTarget);
+      legacyChildAddress === null ? legacyPacket : null, agentRequestTarget,
+      legacy === null && isAgentMessage ? AGENT_ROUTING_VERSION : null);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     if (deliveryTarget !== null) {
       let existing;

@@ -138,8 +138,10 @@ export function legacyParentSourcedReceipt(state: DirectPostState, binding: Dire
     if (!attempt || !attemptPacket || !packet || typeof attemptPacket !== 'object' || typeof packet !== 'object') continue;
     const attemptSource = (attemptPacket as Record<string, unknown>).source;
     const packetSource = (packet as Record<string, unknown>).source;
-    const parentSourced = sameAddress(attemptSource, parent) && sameAddress(packetSource, parent);
-    const childSourced = allowLegacyChildRoute && sameAddress(attemptSource, packetSource) && !sameAddress(packetSource, parent) &&
+    const legacyReceipt = isLegacyAgentReceipt(attempt) && isLegacyAgentReceipt(detail);
+    const parentSourced = legacyReceipt && sameAddress(attemptSource, parent) && sameAddress(packetSource, parent);
+    const childSourced = allowLegacyChildRoute && legacyReceipt &&
+      sameAddress(attemptSource, packetSource) && !sameAddress(packetSource, parent) &&
       persistedBindingMatches(attempt, binding) && persistedBindingMatches(detail, binding) &&
       persistedChildParentMatches(attempt, parent) && persistedChildParentMatches(detail, parent);
     if ((!parentSourced && !childSourced) ||

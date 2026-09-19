@@ -477,6 +477,26 @@ test('legacy retry migration only sends for known-unsent custody', async t => {
   }
 });
 
+test('v2 child retry does not enter legacy recovery after a rate limit', async t => {
+  const f = fixture(t);
+  enroll(f);
+  let posts = 0;
+  const first = await runDirectPost(input(f, { fetchImpl: async (_url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+    posts++;
+    return { ok: false, status: 429, json: async () => ({}) };
+  } }));
+  assert.equal(first.status, 'rate_limited');
+  const second = await runDirectPost(input(f, { fetchImpl: async (_url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+    posts++;
+    return { ok: true, status: 200, json: async () => ({ id: 'v2-retry' }) };
+  } }));
+  assert.equal(second.status, 'sent');
+  assert.equal(posts, 2);
+  assert.equal(f.state.directPostRows('legacy-post').some(row => row.detail.routingVersion === AGENT_ROUTING_VERSION), true);
+});
+
 test('legacy child-targeted requests reject sibling child promotion', async t => {
   const f = fixture(t);
   enroll(f, '103');
