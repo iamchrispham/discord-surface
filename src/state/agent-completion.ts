@@ -370,8 +370,7 @@ function receivedReplyEvidence(
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
     const requestReceiptId = requestProvenanceReceiptId(state, requestMessageId);
     const uniqueRequestTarget = hasUniqueRequestTarget(state, request, Number(candidateRow.id), requestReceiptId);
-    const childSourced = candidate.source.channelId !== parentTarget.channelId;
-    const exact = sameReverseAddresses(candidate, request) && (!childSourced || uniqueRequestTarget);
+    const exact = sameReverseAddresses(candidate, request);
     const migrated = allowLegacyChildSource && uniqueRequestTarget &&
       isLegacyChildResult(candidate, request, parentTarget,
       hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id), candidateRow.discord_id));
