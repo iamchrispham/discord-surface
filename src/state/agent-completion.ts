@@ -198,7 +198,24 @@ function hasReadyLegacyChildAtReceipt(
     } | undefined;
   if (enrollment?.state !== 'ready') return false;
 
+  const baseline = state.db.prepare(`SELECT
+      json_extract(detail, '$.latestId') AS latestId,
+      json_extract(detail, '$.recoveredThroughId') AS recoveredThroughId
+    FROM receipts
+    WHERE kind='thread-baseline'
+      AND json_extract(detail, '$.threadId')=?
+      AND json_extract(detail, '$.parentChannelId')=?
+      AND (json_extract(detail, '$.guildId')=? OR json_extract(detail, '$.guildId') IS NULL)
+      AND id < ?
+    ORDER BY id DESC
+    LIMIT 1`).get(child.channelId, parent.channelId, parent.guildId, candidateReceiptId) as {
+      latestId?: unknown;
+      recoveredThroughId?: unknown;
+    } | undefined;
+
   const adoptionCutoff = [
+    baseline?.latestId,
+    baseline?.recoveredThroughId,
     enrollment.adoptedThroughId,
     enrollment.recoveryCutoffId,
     enrollment.adoptedThroughDiscordId,
