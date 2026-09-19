@@ -319,7 +319,7 @@ function hasReadyLegacyChildAtReceipt(
     Number(explicitDemotion?.id) < Number(cutoffReceiptId) &&
     Number(cutoffReceiptId) < Number(bindingReadiness?.id);
   const candidateIsAfterRecoveryCutoff = recoveryCutoff !== null &&
-    candidateDiscordId !== null && candidateDiscordId > recoveryCutoff;
+    candidateDiscordId !== null && discordIdAfter(candidateDiscordId, recoveryCutoff);
   if ((!migration && cutoffFollowsExplicitDemotion && !candidateIsAfterRecoveryCutoff) || (migration &&
       (!Number.isSafeInteger(bindingReadiness?.id) || Number(bindingReadiness.id) <= Number(migration.id)))) {
     return false;

@@ -551,7 +551,8 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       (!latestAttemptOutcome || latestPreflight.id > latestAttemptOutcome.id)))) {
       const status = latestPreflight.detail.outcome as string;
       const retryableRateLimit = status === 'rate_limited' && !meta.legacyAgentPacket;
-      if (status !== 'not_sent' && !retryableRateLimit) {
+      const retryableStale = status === 'stale' && !meta.legacyAgentPacket;
+      if (status !== 'not_sent' && !retryableRateLimit && !retryableStale) {
         assertRouteCurrent();
         return { claimed: false, status, attemptId: meta.attemptId, nonce: meta.nonce, outcome: latestPreflight.detail };
       }
