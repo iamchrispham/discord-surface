@@ -520,6 +520,8 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     const rows = state.directPostRows(meta.requestId);
     assertRequestIdentity(rows, meta);
     const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
+    const preflights = rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.partIndex === meta.partIndex &&
+      row.detail.phase === 'preflight').sort((a, b) => a.id - b.id);
     const outcomes = new Map<unknown, DirectPostReceiptRow>(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId)
       .map(row => [row.detail.attemptId, row]));
     const latest = attempts.at(-1);
@@ -531,6 +533,14 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
         throw new StaleGenerationError('direct post binding is stale');
       }
     };
+    const latestPreflight = preflights.at(-1);
+    if (latestPreflight && (!latest || latestPreflight.id > latest.id)) {
+      const status = latestPreflight.detail.outcome as string;
+      if (status !== 'not_sent') {
+        assertRouteCurrent();
+        return { claimed: false, status, attemptId: meta.attemptId, nonce: meta.nonce, outcome: latestPreflight.detail };
+      }
+    }
     if (!latest) {
       assertRouteCurrent();
       return null;

@@ -224,6 +224,43 @@ test('newer attemptless terminal legacy custody controls retry', async t => {
   assert.equal(posts, 0);
 });
 
+test('overlapping legacy retries honor a newer attemptless preflight inside the claim', async t => {
+  const f = fixture(t);
+  legacyPost(f, 'not_sent');
+  enroll(f);
+  let releaseFirst;
+  let releaseSecond;
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  const secondGate = new Promise(resolve => { releaseSecond = resolve; });
+  let lookups = 0;
+  let posts = 0;
+  const fetchImpl = async (_url, options) => {
+    if (options.method === 'POST') {
+      posts += 1;
+      throw new Error('legacy retry must not post after a preflight outcome');
+    }
+    lookups += 1;
+    if (lookups === 1) {
+      await firstGate;
+      return { ok: false, status: 429, json: async () => ({}) };
+    }
+    await secondGate;
+    return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+  };
+  const first = runDirectPost(input(f, { fetchImpl }));
+  while (lookups < 1) await new Promise(resolve => setTimeout(resolve, 1));
+  const second = runDirectPost(input(f, { fetchImpl }));
+  while (lookups < 2) await new Promise(resolve => setTimeout(resolve, 1));
+  releaseFirst();
+  const firstResult = await first;
+  assert.equal(firstResult.parts[0].status, 'rate_limited');
+  releaseSecond();
+  const secondResult = await second;
+  assert.equal(secondResult.parts[0].status, 'rate_limited');
+  assert.equal(posts, 0);
+  assert.equal(f.state.directPostRows('legacy-post').filter(row => row.kind === 'direct-post-attempt').length, 1);
+});
+
 test('legacy parent requests complete from a received child result without local send custody', async t => {
   const f = fixture(t);
   const request = acceptRequest(f, '8111', true);
