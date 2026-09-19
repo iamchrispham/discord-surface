@@ -322,7 +322,7 @@ function receivedReplyEvidence(
     const detail = deps.parseJson(candidateRow.detail, null);
     const candidate = detail?.packet;
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
-    const exact = sameReverseAddresses(candidate, request) && hasUniqueRequestTarget(state, request);
+    const exact = sameReverseAddresses(candidate, request);
     const migrated = allowLegacyChildSource && hasUniqueRequestTarget(state, request) &&
       isLegacyChildResult(candidate, request, parentTarget,
       hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id), candidateRow.discord_id));
@@ -359,7 +359,10 @@ function sentReplyEvidence(
     const candidate = row.outcomeDetail.agentPacket;
     if (!validAgentPacket(attemptPacket, KINDS.RESULT) || !validAgentPacket(candidate, KINDS.RESULT) ||
         !sameAgentPacket(candidate, attemptPacket)) continue;
-    const exact = sameReverseAddresses(candidate, request);
+    const recordedTargetsMatch = [row.attemptDetail.agentRequestTarget, row.outcomeDetail.agentRequestTarget]
+      .every((target) => target == null || sameAddress(target, request.target));
+    const exact = sameReverseAddresses(candidate, request) &&
+      (hasUniqueRequestTarget(state, request) || recordedTargetsMatch);
     const migrated = allowLegacyChildSource &&
       isLegacyChildResult(candidate, request, parentTarget, true) &&
       isLegacyChildResult(candidate, request, row.attemptDetail.agentRequestTarget, true) &&

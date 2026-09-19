@@ -53,6 +53,7 @@ export interface DirectPostPartMeta {
   agentPacket?: AgentMessage;
   legacyAgentPacket?: AgentMessage;
   agentRequestTarget?: AgentAddress;
+  presentation?: string;
   watcherNotice?: WatcherNotice;
   caption?: string;
   fileManifest?: DirectPostFileManifest;
@@ -538,7 +539,8 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     if (latestPreflight && (!latest || (latestPreflight.id > latest.id &&
       (!latestAttemptOutcome || latestPreflight.id > latestAttemptOutcome.id)))) {
       const status = latestPreflight.detail.outcome as string;
-      if (status !== 'not_sent') {
+      const retryableRateLimit = status === 'rate_limited' && meta.presentation !== 'legacy' && !meta.legacyAgentPacket;
+      if (status !== 'not_sent' && !retryableRateLimit) {
         assertRouteCurrent();
         return { claimed: false, status, attemptId: meta.attemptId, nonce: meta.nonce, outcome: latestPreflight.detail };
       }

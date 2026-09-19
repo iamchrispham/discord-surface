@@ -155,12 +155,19 @@ export function verifyLegacyAgentAddress(envelope: unknown, token: string): Agen
   if (!isLegacyAgentAddressEnvelope(envelope)) {
     throw new Error('agent target file must contain a complete binding address and proof');
   }
+  const address = {
+    guildId: envelope.address.guildId,
+    channelId: envelope.address.channelId,
+    provider: envelope.address.provider,
+    nativeId: envelope.address.nativeId,
+    generation: envelope.address.generation
+  };
   const expected = crypto.createHmac('sha256', signingKey(token))
-    .update('address/v1\0' + JSON.stringify(envelope.address)).digest('base64url');
+    .update('address/v1\0' + JSON.stringify(address)).digest('base64url');
   if (!crypto.timingSafeEqual(Buffer.from(envelope.proof), Buffer.from(expected))) {
     throw new Error('invalid agent address signature');
   }
-  return envelope.address;
+  return address;
 }
 
 export { PREFIX };
