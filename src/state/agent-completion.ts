@@ -318,7 +318,9 @@ function hasReadyLegacyChildAtReceipt(
     Number.isSafeInteger(bindingReadiness?.id) &&
     Number(explicitDemotion?.id) < Number(cutoffReceiptId) &&
     Number(cutoffReceiptId) < Number(bindingReadiness?.id);
-  if ((!migration && cutoffFollowsExplicitDemotion) || (migration &&
+  const candidateIsAfterRecoveryCutoff = recoveryCutoff !== null &&
+    candidateDiscordId !== null && candidateDiscordId > recoveryCutoff;
+  if ((!migration && cutoffFollowsExplicitDemotion && !candidateIsAfterRecoveryCutoff) || (migration &&
       (!Number.isSafeInteger(bindingReadiness?.id) || Number(bindingReadiness.id) <= Number(migration.id)))) {
     return false;
   }
