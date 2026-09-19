@@ -961,7 +961,7 @@ test('results reverse an accepted request and reject unrelated or unknown correl
     assert.equal(state.directPostRows('result-check').length, 0);
     assert.equal((await runDirectPost(input)).status, 'sent');
     const resultRows = state.directPostRows('result-check');
-    const resultPacket = { id: 'result-check', kind: KINDS.RESULT, source: sourceChild, target, replyTo: request.id, text: 'Useful result' };
+    const resultPacket = { id: 'result-check', kind: KINDS.RESULT, source: sourceChild, target, replyTo: request.id, text: 'Useful result', routingVersion: 2 };
     assert.deepEqual(resultRows.find(row => row.kind === 'direct-post-attempt').detail.agentPacket, resultPacket);
     assert.deepEqual(resultRows.find(row => row.kind === 'direct-post-outcome').detail.agentPacket, resultPacket);
     assert.equal((await runDirectPost(input)).duplicate, true);
@@ -1001,7 +1001,7 @@ test('results can answer a parent-targeted request accepted before child routing
     assert.ok(calls[1].url.endsWith(`/channels/${target.channelId}/messages`));
     assert.deepEqual(decodeAgentMessage(wire, token, target), {
       id: 'legacy-parent-result', kind: KINDS.RESULT, source: sourceChild, target,
-      replyTo: request.id, text: 'Legacy result'
+      replyTo: request.id, text: 'Legacy result', routingVersion: 2
     });
     const postUpgradeRequest = { ...packet, id: 'post-upgrade-parent-request', source: target, target: source };
     assert.equal(state.acceptDiscordMessage({ id: '8103', guildId: source.guildId, channelId: source.channelId,
@@ -1051,7 +1051,7 @@ test('child result correlation returns to the peer child address', async () => {
     assert.equal(result.status, 'sent');
     assert.deepEqual(decodeAgentMessage(wire, token, peerChild), {
       id: 'result-child', kind: KINDS.RESULT, source: localChild, target: peerChild,
-      replyTo: request.id, text: 'Useful child result'
+      replyTo: request.id, text: 'Useful child result', routingVersion: 2
     });
     const resultIntake = receiver.acceptDiscordMessage({ id: '8201', guildId: peerChild.guildId, channelId: peerChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: wire }, { agentToken: token });
