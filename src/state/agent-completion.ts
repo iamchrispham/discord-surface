@@ -179,7 +179,7 @@ function hasReadyLegacyChildAtReceipt(
   if (enrollment?.state !== 'ready') return false;
 
   // Receipt ids monotonically fence readiness changes from the candidate result.
-  const bindingReadiness = state.db.prepare(`SELECT kind,
+  const bindingReadiness = state.db.prepare(`SELECT id, kind,
       json_extract(detail, '$.readiness') AS readiness,
       json_extract(detail, '$.state') AS state
     FROM receipts
@@ -192,8 +192,22 @@ function hasReadyLegacyChildAtReceipt(
       AND json_extract(detail, '$.channelId')=?
       AND id < ?
     ORDER BY id DESC
-    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { kind?: unknown; readiness?: unknown; state?: unknown } | undefined;
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number; kind?: unknown; readiness?: unknown; state?: unknown } | undefined;
   if (bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
+
+  // Legacy databases may have crossed a readiness demotion before that
+  // transition was receipt-backed. Require a post-migration readiness receipt
+  // before trusting a legacy result, otherwise an older ready receipt can span
+  // the unrecorded gap.
+  const migration = state.db.prepare(`SELECT id FROM receipts
+    WHERE kind='legacy-intake-migration'
+      AND json_extract(detail, '$.channelId')=?
+      AND id < ?
+    ORDER BY id DESC
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number } | undefined;
+  if (migration && (!Number.isSafeInteger(bindingReadiness?.id) || Number(bindingReadiness.id) <= Number(migration.id))) {
+    return false;
+  }
 
   const row = state.db.prepare(`SELECT 1 FROM bindings AS binding
     WHERE binding.channel_id=? AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1
