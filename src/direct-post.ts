@@ -273,11 +273,12 @@ interface DirectPostRoute {
   ready: boolean;
 }
 
-const { encodeAgentMessage, isLegacyAgentAddressEnvelope, sameAddress, verifyAgentAddress, KINDS } = require('../src/agent-message') as {
+const { encodeAgentMessage, isLegacyAgentAddressEnvelope, sameAddress, verifyAgentAddress, verifyLegacyAgentAddress, KINDS } = require('../src/agent-message') as {
   encodeAgentMessage: (packet: AgentMessage, token: string) => string;
   isLegacyAgentAddressEnvelope: (value: unknown) => value is LegacyAgentAddressEnvelope;
   sameAddress: (left: unknown, right: unknown) => boolean;
   verifyAgentAddress: (envelope: unknown, token: string) => AgentAddress;
+  verifyLegacyAgentAddress: (envelope: unknown, token: string) => AgentAddress;
   KINDS: Readonly<{ REQUEST: 'request'; RESULT: 'result' }>;
 };
 const { createWatcherNotice, encodeWatcherNotice, sameWatcherAddress, WATCHER_NOTICE_PROVIDERS } = require('../src/watcher-notice') as {
@@ -767,7 +768,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       const hasProof = agentTarget !== null && typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
       const legacyTargetEnvelope = agentTarget !== null && isLegacyAgentAddressEnvelope(agentTarget) ? agentTarget : null;
       let resolvedTarget = agentTarget as AgentAddress | null;
-      if (legacyTargetEnvelope !== null) resolvedTarget = legacyTargetEnvelope.address;
+      if (legacyTargetEnvelope !== null) resolvedTarget = verifyLegacyAgentAddress(legacyTargetEnvelope, token);
       else if (hasProof) resolvedTarget = verifyAgentAddress(agentTarget, token);
       const request = resolveAgentReplyRequest(state, replyTo, address,
         resolvedTarget, canonicalAddress(binding), BindingError, legacyTargetEnvelope !== null);

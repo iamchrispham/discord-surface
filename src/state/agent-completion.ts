@@ -199,6 +199,7 @@ function hasReadyLegacyChildAtReceipt(
 function receivedReplyEvidence(
   state: CompletionState,
   request: AgentMessage,
+  requestMessageId: string,
   deps: AgentCompletionDependencies,
   allowLegacyChildSource: boolean,
   parentTarget: AgentAddress
@@ -215,10 +216,14 @@ function receivedReplyEvidence(
       AND json_extract(detail, '$.packet.target.provider')=?
       AND json_extract(detail, '$.packet.target.nativeId')=?
       AND json_extract(detail, '$.packet.target.generation')=?
+      AND id > COALESCE((SELECT MIN(provenance.id) FROM receipts AS provenance
+        WHERE provenance.kind='agent-message'
+          AND provenance.discord_id=?), 0)
     ORDER BY id`).all(
     KINDS.RESULT, request.id,
     request.target.guildId, request.target.provider, request.target.nativeId, request.target.generation,
-    request.source.guildId, request.source.channelId, request.source.provider, request.source.nativeId, request.source.generation
+    request.source.guildId, request.source.channelId, request.source.provider, request.source.nativeId, request.source.generation,
+    requestMessageId
   ) as Array<{ id?: number; discord_id?: unknown; detail?: unknown }>;
   for (const candidateRow of candidateRows) {
     if (typeof candidateRow.discord_id !== 'string' || !candidateRow.discord_id || !Number.isSafeInteger(candidateRow.id)) continue;
@@ -361,7 +366,7 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
       } else {
         const allowLegacyChildSource = isLegacyAgentReceipt(provenance);
         const parentTarget = { ...target, channelId: binding.channelId };
-        evidence = receivedReplyEvidence(state, packet, deps, allowLegacyChildSource, parentTarget) ||
+        evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget) ||
           sentReplyEvidence(state, packet, message.channelId, deps, allowLegacyChildSource, parentTarget);
         if (!evidence) throw new deps.BindingError('agent request lacks an immutable correlated result');
       }
