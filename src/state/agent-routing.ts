@@ -1,4 +1,22 @@
-import { sameAddress, validateAgentMessage, KINDS, type AgentAddress, type AgentMessage } from '../agent-message';
+import {
+  isLegacyAgentAddressEnvelope,
+  sameAddress,
+  validateAgentMessage,
+  verifyAgentAddress,
+  KINDS,
+  type AgentAddress,
+  type AgentAddressEnvelope,
+  type AgentMessage,
+  type AgentMessageKind
+} from '../agent-message';
+import type {
+  DirectPostBinding,
+  DirectPostOutcome,
+  DirectPostPartStatus,
+  DirectPostReceiptRow,
+  DirectPostResult,
+  DirectPostState
+} from '../direct-post';
 
 export const AGENT_ROUTING_VERSION = 2;
 
@@ -23,4 +41,179 @@ export function isLegacyChildResult(packet: AgentMessage, request: AgentMessage,
   return childRouteProven && packet.kind === KINDS.RESULT && packet.replyTo === request.id && sameAddress(packet.target, request.source) &&
     sameAddress(requestTarget, request.target) && packet.source.channelId !== request.target.channelId &&
     sameOwner(packet.source, request.target);
+}
+
+type BindingErrorConstructor = new (message?: string) => Error;
+
+export interface LegacyParentSourcedReceipt {
+  attempt: Record<string, unknown>;
+  detail: Record<string, unknown>;
+  packet: AgentMessage;
+  outcome: DirectPostOutcome;
+  result: DirectPostResult;
+}
+
+const ADDRESS_KEYS = Object.freeze(['guildId', 'channelId', 'provider', 'nativeId', 'generation'] as const);
+
+function canonicalAddress(address: DirectPostBinding | AgentAddress): AgentAddress {
+  return Object.fromEntries(ADDRESS_KEYS.map(key => [key, address[key]])) as unknown as AgentAddress;
+}
+
+function requiredString(value: unknown, name: string, max: number, BindingError: BindingErrorConstructor): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new BindingError(`${name} must be a non-empty string`);
+  }
+  return value;
+}
+
+function receiptDetail(row: DirectPostReceiptRow): Record<string, unknown> | null {
+  const raw: unknown = row.detail;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>;
+  if (typeof raw !== 'string') return null;
+  try {
+    const detail: unknown = JSON.parse(raw);
+    return detail && typeof detail === 'object' && !Array.isArray(detail)
+      ? detail as Record<string, unknown>
+      : null;
+  } catch { return null; }
+}
+
+export function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostBinding, requestId: string,
+  validOutcomes: readonly DirectPostOutcome[], allowLegacyChildRoute = false): LegacyParentSourcedReceipt | null {
+  const rows = state.listReceipts();
+  const attempts = new Map<string, Record<string, unknown>>();
+  for (const row of rows) {
+    if (row.kind !== 'direct-post-attempt') continue;
+    const detail = receiptDetail(row);
+    const attemptId = detail?.attemptId;
+    if (detail?.requestId !== requestId || typeof attemptId !== 'string') continue;
+    attempts.set(attemptId, detail);
+  }
+  const latestOutcomes = new Map<string, { row: DirectPostReceiptRow; detail: Record<string, unknown> }>();
+  const preflightOutcomes: Array<{ row: DirectPostReceiptRow; detail: Record<string, unknown> }> = [];
+  for (const row of rows) {
+    if (row.kind !== 'direct-post-outcome') continue;
+    const detail = receiptDetail(row);
+    const outcome = detail?.outcome;
+    const attemptId = detail?.attemptId;
+    if (detail?.requestId !== requestId || !validOutcomes.includes(outcome as DirectPostOutcome)) continue;
+    if (typeof attemptId === 'string') latestOutcomes.set(attemptId, { row, detail });
+    else preflightOutcomes.push({ row, detail });
+  }
+  const parent = canonicalAddress(binding);
+  const candidates = [...latestOutcomes.values(), ...preflightOutcomes]
+    .sort((left, right) => (right.row.id || 0) - (left.row.id || 0));
+  for (const candidate of candidates) {
+    const detail = candidate.detail;
+    const outcome = detail.outcome as DirectPostOutcome;
+    const attemptId = typeof detail.attemptId === 'string' ? detail.attemptId : null;
+    const attempt = attemptId ? attempts.get(attemptId) : detail;
+    const attemptPacket = attempt?.legacyAgentPacket ?? attempt?.agentPacket;
+    const packet = detail.legacyAgentPacket ?? detail.agentPacket ?? attemptPacket;
+    if (!attempt || !attemptPacket || !packet || typeof attemptPacket !== 'object' || typeof packet !== 'object') continue;
+    const attemptSource = (attemptPacket as Record<string, unknown>).source;
+    const packetSource = (packet as Record<string, unknown>).source;
+    const parentSourced = sameAddress(attemptSource, parent) && sameAddress(packetSource, parent);
+    const childSourced = allowLegacyChildRoute && sameAddress(attemptSource, packetSource) && !sameAddress(packetSource, parent);
+    if ((!parentSourced && !childSourced) ||
+        !sameAddress((packet as Record<string, unknown>).target, (attemptPacket as Record<string, unknown>).target)) continue;
+    const target = (packet as Record<string, unknown>).target as AgentAddress;
+    const partIndex = Number.isSafeInteger(detail.partIndex) ? detail.partIndex as number : 0;
+    const messageId = typeof detail.messageId === 'string' && detail.messageId.length > 0 ? detail.messageId : null;
+    const status = outcome as DirectPostPartStatus;
+    return {
+      attempt,
+      detail,
+      packet: packet as AgentMessage,
+      outcome,
+      result: {
+        requestId,
+        dedupeKey: requestId,
+        inReplyTo: typeof detail.inReplyTo === 'string' ? detail.inReplyTo : null,
+        channelId: target.channelId,
+        provider: binding.provider,
+        nativeId: binding.nativeId,
+        generation: binding.generation,
+        status,
+        state: status,
+        recorded: false,
+        duplicate: status === 'sent',
+        messageIds: messageId ? [messageId] : [],
+        parts: [{ index: partIndex, status, messageId }]
+      }
+    };
+  }
+  return null;
+}
+
+export function isLegacyRetryableOutcome(outcome: DirectPostOutcome): boolean {
+  return outcome === 'not_sent';
+}
+
+function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | null, token: string,
+  requireProof: boolean): AgentAddress | null {
+  if (agentTarget === null) return null;
+  if (isLegacyAgentAddressEnvelope(agentTarget)) return agentTarget.address;
+  const hasProof = typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
+  if (hasProof || requireProof) return verifyAgentAddress(agentTarget, token);
+  return agentTarget as AgentAddress;
+}
+
+export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, source: AgentAddress,
+  target: AgentAddress | null = null, legacyParent: AgentAddress | null = null,
+  BindingError: BindingErrorConstructor): AgentMessage {
+  const rows = state.listReceipts();
+  const candidates = rows
+    .filter(row => row.kind === 'agent-message')
+    .map(row => {
+      try {
+        const detail: unknown = JSON.parse(row.detail);
+        const packet = detail && typeof detail === 'object' ? (detail as Record<string, unknown>).packet || null : null;
+        return packet ? { packet: packet as Record<string, unknown>, discordId: row.discord_id, legacy: isLegacyAgentReceipt(detail) } : null;
+      } catch { return null; }
+    })
+    .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; legacy: boolean } => candidate !== null &&
+      candidate.packet.kind === KINDS.REQUEST &&
+      (target === null || sameAddress(candidate.packet.source, target)) &&
+      (sameAddress(candidate.packet.target, source) || (legacyParent !== null && candidate.legacy &&
+        sameAddress(candidate.packet.target, legacyParent))));
+  const matches = candidates.filter(candidate => candidate.discordId === replyTo || candidate.packet.id === replyTo);
+  if (matches.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
+  const match = matches[0];
+  if (!match) throw new BindingError('agent reply target is unknown or does not match the active request');
+  return match.packet as unknown as AgentMessage;
+}
+
+export function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, packet, sourceText, agentKind,
+  agentTarget, agentReplyTo, sourceAddress = null, allowRecordedTarget = false, BindingError }:
+  { state: DirectPostState; binding: DirectPostBinding; token: string; requestId: string; packet: AgentMessage; sourceText: string;
+    agentKind: AgentMessageKind; agentTarget: AgentAddress | AgentAddressEnvelope | null; agentReplyTo: string | null;
+    sourceAddress?: AgentAddress | null; allowRecordedTarget?: boolean; BindingError: BindingErrorConstructor;
+  }): void {
+  const parent = canonicalAddress(binding);
+  const expectedSource = sourceAddress ?? parent;
+  if (packet.id !== requestId || !sameAddress(packet.source, expectedSource) || packet.kind !== agentKind || packet.text !== sourceText) {
+    throw new BindingError('direct post request identity conflicts with existing custody');
+  }
+  const requestedTarget = legacyAgentTarget(agentTarget, token, agentKind === KINDS.REQUEST);
+  const expectedTarget = requestedTarget ?? (allowRecordedTarget ? packet.target : null);
+  if (expectedTarget !== null && !sameAddress(packet.target, expectedTarget)) {
+    throw new BindingError('direct post request identity conflicts with existing custody');
+  }
+  if (agentKind === KINDS.REQUEST) {
+    if (packet.replyTo !== null || expectedTarget === null) {
+      throw new BindingError('direct post request identity conflicts with existing custody');
+    }
+  } else {
+    try {
+      const replyTo = requiredString(agentReplyTo, 'agent-reply-to', 128, BindingError);
+      const request = resolveAgentReplyRequest(state, replyTo, expectedSource, expectedTarget, parent, BindingError);
+      if (packet.replyTo !== request.id || !sameAddress(packet.target, request.source)) {
+        throw new BindingError('direct post request identity conflicts with existing custody');
+      }
+    } catch (error) {
+      if (error instanceof BindingError && error.message === 'direct post request identity conflicts with existing custody') throw error;
+      throw new BindingError('direct post request identity conflicts with existing custody');
+    }
+  }
 }

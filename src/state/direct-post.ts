@@ -514,13 +514,24 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
   function inspectPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null {
     const rows = state.directPostRows(meta.requestId);
     assertRequestIdentity(rows, meta);
-    if (!state.directPostBindingCurrent(meta.binding, meta.operatorId, meta.agentPacket?.source.channelId)) throw new StaleGenerationError('direct post binding is stale');
     const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
     const outcomes = new Map<unknown, DirectPostReceiptRow>(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId)
       .map(row => [row.detail.attemptId, row]));
     const latest = attempts.at(-1);
-    if (!latest) return null;
+    const assertParentCurrent = (): void => {
+      if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
+    };
+    const assertRouteCurrent = (): void => {
+      if (!state.directPostBindingCurrent(meta.binding, meta.operatorId, meta.agentPacket?.source.channelId)) {
+        throw new StaleGenerationError('direct post binding is stale');
+      }
+    };
+    if (!latest) {
+      assertRouteCurrent();
+      return null;
+    }
     const outcome = outcomes.get(latest.detail.attemptId);
+    assertParentCurrent();
     if (!outcome) return { claimed: false, status: 'in_flight', attemptId: latest.detail.attemptId as string, nonce: latest.detail.nonce as string };
     const status = outcome.detail.outcome as string;
     if (status === 'sent' || status === 'unknown') {
@@ -529,6 +540,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     if (!['not_sent', 'rejected', 'rate_limited', 'stale'].includes(status)) {
       return { claimed: false, status, attemptId: latest.detail.attemptId as string, nonce: latest.detail.nonce as string, outcome: outcome.detail };
     }
+    assertRouteCurrent();
     return null;
   }
 
