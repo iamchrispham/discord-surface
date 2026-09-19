@@ -55,6 +55,23 @@ export interface LegacyParentSourcedReceipt {
 
 const ADDRESS_KEYS = Object.freeze(['guildId', 'channelId', 'provider', 'nativeId', 'generation'] as const);
 
+function persistedBindingMatches(detail: Record<string, unknown>, binding: DirectPostBinding): boolean {
+  const persisted = detail.binding;
+  const authority = persisted && typeof persisted === 'object' && !Array.isArray(persisted)
+    ? persisted as Record<string, unknown>
+    : detail;
+  return ADDRESS_KEYS.every(key => authority[key] === binding[key]) &&
+    (authority.conductorId ?? null) === (binding.conductorId ?? null) &&
+    (authority.repoKey ?? null) === (binding.repoKey ?? null);
+}
+
+function persistedChildParentMatches(detail: Record<string, unknown>, parent: AgentAddress): boolean {
+  const childParent = detail.agentRequestTarget;
+  if (childParent === undefined || childParent === null) return true;
+  return Boolean(childParent && typeof childParent === 'object' && !Array.isArray(childParent) &&
+    sameAddress(childParent, parent));
+}
+
 function canonicalAddress(address: DirectPostBinding | AgentAddress): AgentAddress {
   return Object.fromEntries(ADDRESS_KEYS.map(key => [key, address[key]])) as unknown as AgentAddress;
 }
@@ -114,7 +131,9 @@ export function legacyParentSourcedReceipt(state: DirectPostState, binding: Dire
     const attemptSource = (attemptPacket as Record<string, unknown>).source;
     const packetSource = (packet as Record<string, unknown>).source;
     const parentSourced = sameAddress(attemptSource, parent) && sameAddress(packetSource, parent);
-    const childSourced = allowLegacyChildRoute && sameAddress(attemptSource, packetSource) && !sameAddress(packetSource, parent);
+    const childSourced = allowLegacyChildRoute && sameAddress(attemptSource, packetSource) && !sameAddress(packetSource, parent) &&
+      persistedBindingMatches(attempt, binding) && persistedBindingMatches(detail, binding) &&
+      persistedChildParentMatches(attempt, parent) && persistedChildParentMatches(detail, parent);
     if ((!parentSourced && !childSourced) ||
         !sameAddress((packet as Record<string, unknown>).target, (attemptPacket as Record<string, unknown>).target)) continue;
     const target = (packet as Record<string, unknown>).target as AgentAddress;

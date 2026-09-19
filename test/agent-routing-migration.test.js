@@ -136,6 +136,25 @@ test('a retryable migrated request cannot move to another child', async t => {
   await assert.rejects(runDirectPost(input(f, { agentThreadId: '104', fetchImpl: async () => { throw new Error('must not lookup'); } })), /identity conflicts/);
 });
 
+test('pre-upgrade child-sourced retry preserves its recorded packet hash', async t => {
+  const f = fixture(t);
+  enroll(f);
+  const child = { ...source, channelId: '103' };
+  const packet = legacyPost(f, 'not_sent', { id: 'legacy-child-request', kind: KINDS.REQUEST, source: child, target,
+    replyTo: null, text: fs.readFileSync(f.textFile, 'utf8') });
+  const legacyTarget = { address: target,
+    proof: crypto.createHmac('sha256', token).update(`address/v1\0${JSON.stringify(target)}`).digest('base64url') };
+  let posted;
+  const result = await runDirectPost(input(f, { dedupeKey: packet.id, agentThreadId: null,
+    agentTarget: legacyTarget, fetchImpl: async (_url, options) => {
+      if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+      posted = decodeAgentMessage(JSON.parse(options.body).content, token, target);
+      return { ok: true, status: 200, json: async () => ({ id: 'legacy-child-retry' }) };
+    } }));
+  assert.equal(result.status, 'sent');
+  assert.deepEqual(posted, packet);
+});
+
 test('legacy parent requests complete through agent-complete regardless of earlier child enrollment', async t => {
   for (const scenario of ['child after request', 'existing child before upgrade', 'retry an old result']) {
     await t.test(scenario, async t => {

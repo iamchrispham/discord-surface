@@ -177,7 +177,12 @@ function hasReadyLegacyChildAtReceipt(
       json_extract(detail, '$.readiness') AS readiness,
       json_extract(detail, '$.state') AS state
     FROM receipts
-    WHERE kind IN ('binding-readiness', 'intake-boundary', 'intake-reconcile-requested')
+    WHERE kind IN (
+      'binding-readiness', 'intake-boundary', 'intake-reconcile-requested',
+      'topic-publication-started', 'topic-publication', 'topic-publication-reconciled',
+      'ordinary-root-relocated', 'legacy-intake-migration', 'rebound', 'unbound',
+      'conductor-handoff', 'bound', 'ordinary-bound'
+    )
       AND json_extract(detail, '$.channelId')=?
       AND id < ?
     ORDER BY id DESC

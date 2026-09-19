@@ -748,9 +748,13 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       agentRequestTarget = sameAddress(request.target, address) ? null : request.target;
     }
     const wire = encodeAgentMessage(agentPacket, token);
+    const unchangedLegacyChild = legacyChildAddress !== null && sameAddress(legacyPacket.source, address);
+    const legacyTextHash = unchangedLegacyChild && typeof legacy?.attempt.textHash === 'string'
+      ? legacy.attempt.textHash
+      : null;
     source = {
       ...source,
-      textHash: hash(agentPacket),
+      textHash: legacyTextHash ?? hash(agentPacket),
       parts: [wire],
       displayParts: [agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT ? agentMessagePreview(agentPacket) : wire]
     };
