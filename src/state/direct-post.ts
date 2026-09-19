@@ -536,7 +536,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       .map(row => [row.detail.attemptId, row]));
     const latest = attempts.at(-1);
     const latestAttemptOutcome = latest ? outcomes.get(latest.detail.attemptId) : undefined;
-    const latestConfirmedOutcome = rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId && row.detail.partIndex === meta.partIndex && row.detail.phase !== 'preflight' &&
+    const latestConfirmedOutcome = Array.from(outcomes.values()).filter(row => row.detail.partIndex === meta.partIndex && row.detail.phase !== 'preflight' &&
       ['sent', 'unknown'].includes(row.detail.outcome as string)).sort((a, b) => a.id - b.id).at(-1);
     const assertParentCurrent = (): void => {
       if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
