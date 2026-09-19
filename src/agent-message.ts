@@ -151,4 +151,16 @@ export function verifyAgentAddress(envelope: unknown, token: string): AgentAddre
   return expected.address;
 }
 
+export function verifyLegacyAgentAddress(envelope: unknown, token: string): AgentAddress {
+  if (!isLegacyAgentAddressEnvelope(envelope)) {
+    throw new Error('agent target file must contain a complete binding address and proof');
+  }
+  const expected = crypto.createHmac('sha256', token)
+    .update('address/v1\0' + JSON.stringify(envelope.address)).digest('base64url');
+  if (!crypto.timingSafeEqual(Buffer.from(envelope.proof), Buffer.from(expected))) {
+    throw new Error('invalid agent address signature');
+  }
+  return envelope.address;
+}
+
 export { PREFIX };

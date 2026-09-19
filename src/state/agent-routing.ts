@@ -3,6 +3,7 @@ import {
   sameAddress,
   validateAgentMessage,
   verifyAgentAddress,
+  verifyLegacyAgentAddress,
   KINDS,
   type AgentAddress,
   type AgentAddressEnvelope,
@@ -170,9 +171,11 @@ export function isLegacyRetryableOutcome(outcome: DirectPostOutcome): boolean {
 }
 
 function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | null, token: string,
-  requireProof: boolean): AgentAddress | null {
+  requireProof: boolean, verifyLegacyProof: boolean): AgentAddress | null {
   if (agentTarget === null) return null;
-  if (isLegacyAgentAddressEnvelope(agentTarget)) return agentTarget.address;
+  if (isLegacyAgentAddressEnvelope(agentTarget)) {
+    return verifyLegacyProof ? verifyLegacyAgentAddress(agentTarget, token) : agentTarget.address;
+  }
   const hasProof = typeof agentTarget === 'object' && Object.hasOwn(agentTarget, 'proof');
   if (hasProof || requireProof) return verifyAgentAddress(agentTarget, token);
   return agentTarget as AgentAddress;
@@ -205,17 +208,17 @@ export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string
 }
 
 export function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, packet, sourceText, agentKind,
-  agentTarget, agentReplyTo, sourceAddress = null, allowRecordedTarget = false, BindingError }:
+  agentTarget, agentReplyTo, sourceAddress = null, allowRecordedTarget = false, verifyLegacyProof = false, BindingError }:
   { state: DirectPostState; binding: DirectPostBinding; token: string; requestId: string; packet: AgentMessage; sourceText: string;
     agentKind: AgentMessageKind; agentTarget: AgentAddress | AgentAddressEnvelope | null; agentReplyTo: string | null;
-    sourceAddress?: AgentAddress | null; allowRecordedTarget?: boolean; BindingError: BindingErrorConstructor;
+    sourceAddress?: AgentAddress | null; allowRecordedTarget?: boolean; verifyLegacyProof?: boolean; BindingError: BindingErrorConstructor;
   }): void {
   const parent = canonicalAddress(binding);
   const expectedSource = sourceAddress ?? parent;
   if (packet.id !== requestId || !sameAddress(packet.source, expectedSource) || packet.kind !== agentKind || packet.text !== sourceText) {
     throw new BindingError('direct post request identity conflicts with existing custody');
   }
-  const requestedTarget = legacyAgentTarget(agentTarget, token, agentKind === KINDS.REQUEST);
+  const requestedTarget = legacyAgentTarget(agentTarget, token, agentKind === KINDS.REQUEST, verifyLegacyProof);
   const expectedTarget = requestedTarget ?? (allowRecordedTarget ? packet.target : null);
   if (expectedTarget !== null && !sameAddress(packet.target, expectedTarget)) {
     throw new BindingError('direct post request identity conflicts with existing custody');

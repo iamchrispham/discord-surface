@@ -187,9 +187,7 @@ function hasReadyLegacyChildAtReceipt(
       AND id < ?
     ORDER BY id DESC
     LIMIT 1`).get(parent.channelId, candidateReceiptId) as { kind?: unknown; readiness?: unknown; state?: unknown } | undefined;
-  const fieldlessBoundIsReady = bindingReadiness?.kind === 'bound' &&
-    bindingReadiness.readiness === null && bindingReadiness.state === null;
-  if (!fieldlessBoundIsReady && bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
+  if (bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
 
   const row = state.db.prepare(`SELECT 1 FROM bindings AS binding
     WHERE binding.channel_id=? AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1
