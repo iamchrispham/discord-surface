@@ -279,7 +279,7 @@ test('overlapping legacy retries honor a newer attemptless preflight inside the 
 
 test('legacy parent requests complete from a received child result without local send custody', async t => {
   const f = fixture(t);
-  const request = acceptRequest(f, '8111', true);
+  const request = acceptRequest(f, '8111', true, source, 'shared-request-key');
   enroll(f);
   assert.equal(f.state.claimDispatch('8111').claimed, true);
   f.state.markSubmitted('8111');
@@ -290,6 +290,10 @@ test('legacy parent requests complete from a received child result without local
   f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
     .run(JSON.stringify({ packet: receivedPacket }), 'received-child-result-discord');
   assert.deepEqual(f.state.directPostRows(receivedPacket.id), []);
+  f.state.receipt(null, 'agent-message', {
+    packet: { ...request, target: { ...source, channelId: '104' } },
+    routingVersion: AGENT_ROUTING_VERSION
+  });
   const completed = agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8111', provider: 'codex',
     'native-id': source.nativeId, generation: '1' }, {
     gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
@@ -520,12 +524,11 @@ test('legacy child-targeted requests reject sibling child promotion', async t =>
   assert.equal(f.state.getMessage('8112').state, MESSAGE_STATES.SUBMITTED);
 });
 
-test('agent-complete finds its result behind 64 newer sibling results sharing the request key', async t => {
+test('agent-complete preserves earlier custody across later request-target reuse', async t => {
   const f = fixture(t);
   enroll(f);
   enroll(f, '104');
   acceptRequest(f, '8101', true, { ...source, channelId: '103' }, 'shared-request-key');
-  acceptRequest(f, '8102', false, { ...source, channelId: '104' }, 'shared-request-key');
   assert.equal(f.state.claimDispatch('8101').claimed, true);
   f.state.markSubmitted('8101');
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8101', nativeId: source.nativeId, generation: 1 });
@@ -536,6 +539,7 @@ test('agent-complete finds its result behind 64 newer sibling results sharing th
       json: async () => options.method === 'GET' ? { id: '202', guild_id: '100' } : { id: `result-${++posted}` } })
   }));
   assert.equal((await sendResult('103', '8101', 'matching-result')).status, 'sent');
+  acceptRequest(f, '8102', false, { ...source, channelId: '104' }, 'shared-request-key');
   for (let index = 0; index < 64; index++) {
     assert.equal((await sendResult('104', '8102', `sibling-result-${index}`)).status, 'sent');
   }

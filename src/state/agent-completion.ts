@@ -170,7 +170,8 @@ function requestProvenanceReceiptId(state: CompletionState, messageId: string): 
 
 function hasUniqueRequestTarget(
   state: CompletionState,
-  request: AgentMessage
+  request: AgentMessage,
+  candidateReceiptId: number
 ): boolean {
   // A reused packet id cannot safely promote a child result across routes.
   const row = state.db.prepare(`SELECT COUNT(DISTINCT json_extract(detail, '$.packet.target.channelId')) AS count
@@ -185,10 +186,12 @@ function hasUniqueRequestTarget(
       AND json_extract(detail, '$.packet.target.guildId')=?
       AND json_extract(detail, '$.packet.target.provider')=?
       AND json_extract(detail, '$.packet.target.nativeId')=?
-      AND json_extract(detail, '$.packet.target.generation')=?`).get(
+      AND json_extract(detail, '$.packet.target.generation')=?
+      AND id <= ?`).get(
     KINDS.REQUEST, request.id,
     request.source.guildId, request.source.provider, request.source.nativeId, request.source.generation,
-    request.target.guildId, request.target.provider, request.target.nativeId, request.target.generation
+    request.target.guildId, request.target.provider, request.target.nativeId, request.target.generation,
+    candidateReceiptId
   ) as { count?: number } | undefined;
   return Number(row?.count) === 1;
 }
@@ -364,7 +367,7 @@ function receivedReplyEvidence(
     const candidate = detail?.packet;
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
     const exact = sameReverseAddresses(candidate, request);
-    const migrated = allowLegacyChildSource && hasUniqueRequestTarget(state, request) &&
+    const migrated = allowLegacyChildSource && hasUniqueRequestTarget(state, request, Number(candidateRow.id)) &&
       isLegacyChildResult(candidate, request, parentTarget,
       hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id), candidateRow.discord_id));
     if (!exact && !migrated) continue;
@@ -403,7 +406,7 @@ function sentReplyEvidence(
     const recordedTargetsMatch = [row.attemptDetail.agentRequestTarget, row.outcomeDetail.agentRequestTarget]
       .every((target) => target == null || sameAddress(target, request.target));
     const exact = sameReverseAddresses(candidate, request) &&
-      (hasUniqueRequestTarget(state, request) || recordedTargetsMatch);
+      (hasUniqueRequestTarget(state, request, row.outcomeReceiptId) || recordedTargetsMatch);
     const migrated = allowLegacyChildSource &&
       isLegacyChildResult(candidate, request, parentTarget, true) &&
       isLegacyChildResult(candidate, request, row.attemptDetail.agentRequestTarget, true) &&
