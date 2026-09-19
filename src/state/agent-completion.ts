@@ -176,12 +176,26 @@ function hasReadyLegacyChildAtReceipt(
       json_extract(detail, '$.readiness') AS readiness,
       json_extract(detail, '$.state') AS state
     FROM receipts
-    WHERE kind IN ('binding-readiness', 'intake-boundary')
+    WHERE kind IN ('binding-readiness', 'intake-boundary', 'intake-reconcile-requested')
       AND json_extract(detail, '$.channelId')=?
       AND id < ?
     ORDER BY id DESC
     LIMIT 1`).get(parent.channelId, candidateReceiptId) as { readiness?: unknown; state?: unknown } | undefined;
   if (bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
+
+  // Recovery can change readiness without writing a receipt, so the binding timestamp fences the candidate.
+  const bindingAtReceipt = state.db.prepare(`SELECT readiness, updated_at,
+      (SELECT created_at FROM receipts WHERE id=?) AS receipt_created_at
+    FROM bindings
+    WHERE channel_id=? AND guild_id=? AND provider=? AND native_id=? AND generation=? AND active=1
+    LIMIT 1`).get(
+    candidateReceiptId,
+    parent.channelId, parent.guildId, parent.provider, parent.nativeId, parent.generation
+  ) as { readiness?: unknown; updated_at?: unknown; receipt_created_at?: unknown } | undefined;
+  if (bindingAtReceipt?.readiness !== 'ready' ||
+      typeof bindingAtReceipt.updated_at !== 'string' ||
+      typeof bindingAtReceipt.receipt_created_at !== 'string' ||
+      bindingAtReceipt.updated_at > bindingAtReceipt.receipt_created_at) return false;
 
   const row = state.db.prepare(`SELECT 1 FROM bindings AS binding
     WHERE binding.channel_id=? AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1

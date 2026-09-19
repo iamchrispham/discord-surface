@@ -228,6 +228,44 @@ test('legacy parent requests reject a result received before child readiness', a
   assert.equal(f.state.getMessage('8114').state, MESSAGE_STATES.SUBMITTED);
 });
 
+test('legacy parent requests reject results received during parent readiness transitions', async t => {
+  for (const scenario of ['intake reconciliation', 'disconnect recovery']) {
+    await t.test(scenario, async t => {
+      const f = fixture(t);
+      const scenarioKey = scenario.replaceAll(' ', '-');
+      const requestMessageId = `8115-${scenarioKey}`;
+      const request = acceptRequest(f, requestMessageId, true);
+      enroll(f);
+      assert.equal(f.state.claimDispatch(requestMessageId).claimed, true);
+      f.state.markSubmitted(requestMessageId);
+      recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: requestMessageId, nativeId: source.nativeId, generation: 1 });
+      if (scenario === 'intake reconciliation') {
+        f.state.markIntakeBoundary('101', READINESS.READY, 'fixture intake ready', null, null, f.state.getBinding('101'));
+        f.state.reconcileIntake('101', f.state.getBinding('101'));
+      } else {
+        f.state.upsertIntakeWatermark({ channelId: '101', guildId: '100', id: '8115-recovery' }, false);
+      }
+      assert.notEqual(f.state.getBinding('101').readiness, READINESS.READY);
+      const receivedPacket = { id: `received-during-${scenarioKey}`, kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
+        replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
+      acceptRequest(f, `received-during-${scenarioKey}-discord`, false);
+      f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+        .run(JSON.stringify({ packet: receivedPacket }), `received-during-${scenarioKey}-discord`);
+      if (scenario === 'intake reconciliation') {
+        f.state.markIntakeBoundary('101', READINESS.READY, 'fixture intake recovered', null, null, f.state.getBinding('101'));
+      } else {
+        f.state.setBindingReadiness('101', READINESS.READY, 'fixture recovered', f.state.getBinding('101'));
+      }
+      assert.throws(() => agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': requestMessageId, provider: 'codex',
+        'native-id': source.nativeId, generation: '1' }, {
+        gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+        requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+      }), /immutable correlated result/);
+      assert.equal(f.state.getMessage(requestMessageId).state, MESSAGE_STATES.SUBMITTED);
+    });
+  }
+});
+
 test('new intake stamps its route version and cannot use legacy parent-result compatibility', async t => {
   const f = fixture(t);
   const request = acceptRequest(f, '8103', false);
