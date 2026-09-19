@@ -139,6 +139,13 @@ function sameReverseAddresses(candidate: AgentMessage, request: AgentMessage): b
     sameAddress(candidate.target, request.source);
 }
 
+function discordIdAfter(candidateId: string, referenceId: string): boolean {
+  if (/^\d+$/.test(candidateId) && /^\d+$/.test(referenceId)) {
+    return BigInt(candidateId) > BigInt(referenceId);
+  }
+  return candidateId !== referenceId;
+}
+
 function receivedResultEvidence(
   state: CompletionState,
   messageId: string,
@@ -165,9 +172,15 @@ function hasReadyLegacyChildAtReceipt(
   state: CompletionState,
   child: AgentAddress,
   parent: AgentAddress,
-  candidateReceiptId: number
+  candidateReceiptId: number,
+  candidateDiscordId: string
 ): boolean {
-  const enrollment = state.db.prepare(`SELECT json_extract(detail, '$.state') AS state
+  const enrollment = state.db.prepare(`SELECT json_extract(detail, '$.state') AS state,
+      json_extract(detail, '$.adoptedThroughId') AS adoptedThroughId,
+      json_extract(detail, '$.recoveryCutoffId') AS recoveryCutoffId,
+      json_extract(detail, '$.recoveryCutoff') AS recoveryCutoff,
+      json_extract(detail, '$.adoptedThrough.discordId') AS adoptedThroughDiscordId,
+      json_extract(detail, '$.recoveryCutoff.discordId') AS recoveryCutoffDiscordId
     FROM receipts
     WHERE kind IN ('thread-enrolled', 'thread-boundary')
       AND json_extract(detail, '$.threadId')=?
@@ -175,8 +188,25 @@ function hasReadyLegacyChildAtReceipt(
       AND (kind='thread-boundary' OR json_extract(detail, '$.guildId')=?)
       AND id < ?
     ORDER BY id DESC
-    LIMIT 1`).get(child.channelId, parent.channelId, parent.guildId, candidateReceiptId) as { state?: unknown } | undefined;
+    LIMIT 1`).get(child.channelId, parent.channelId, parent.guildId, candidateReceiptId) as {
+      state?: unknown;
+      adoptedThroughId?: unknown;
+      recoveryCutoffId?: unknown;
+      recoveryCutoff?: unknown;
+      adoptedThroughDiscordId?: unknown;
+      recoveryCutoffDiscordId?: unknown;
+    } | undefined;
   if (enrollment?.state !== 'ready') return false;
+
+  const adoptionCutoff = [
+    enrollment.adoptedThroughId,
+    enrollment.recoveryCutoffId,
+    enrollment.adoptedThroughDiscordId,
+    enrollment.recoveryCutoffDiscordId,
+    enrollment.recoveryCutoff
+  ].find((value): value is string => typeof value === 'string' && value.length > 0 &&
+    !value.startsWith('{') && !value.startsWith('['));
+  if (adoptionCutoff && !discordIdAfter(candidateDiscordId, adoptionCutoff)) return false;
 
   // Receipt ids monotonically fence readiness changes from the candidate result.
   const bindingReadiness = state.db.prepare(`SELECT id, kind,
@@ -236,22 +266,19 @@ function receivedReplyEvidence(
       AND json_extract(detail, '$.packet.target.provider')=?
       AND json_extract(detail, '$.packet.target.nativeId')=?
       AND json_extract(detail, '$.packet.target.generation')=?
-      AND id > COALESCE((SELECT MIN(provenance.id) FROM receipts AS provenance
-        WHERE provenance.kind='agent-message'
-          AND provenance.discord_id=?), 0)
     ORDER BY id`).all(
     KINDS.RESULT, request.id,
     request.target.guildId, request.target.provider, request.target.nativeId, request.target.generation,
-    request.source.guildId, request.source.channelId, request.source.provider, request.source.nativeId, request.source.generation,
-    requestMessageId
+    request.source.guildId, request.source.channelId, request.source.provider, request.source.nativeId, request.source.generation
   ) as Array<{ id?: number; discord_id?: unknown; detail?: unknown }>;
   for (const candidateRow of candidateRows) {
     if (typeof candidateRow.discord_id !== 'string' || !candidateRow.discord_id || !Number.isSafeInteger(candidateRow.id)) continue;
+    if (!discordIdAfter(candidateRow.discord_id, requestMessageId)) continue;
     const detail = deps.parseJson(candidateRow.detail, null);
     const candidate = detail?.packet;
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
     const migrated = allowLegacyChildSource && isLegacyChildResult(candidate, request, parentTarget,
-      hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id)));
+      hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id), candidateRow.discord_id));
     if (!sameReverseAddresses(candidate, request) && !migrated) continue;
     return {
       kind: 'received-result',

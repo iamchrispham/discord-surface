@@ -525,6 +525,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     const outcomes = new Map<unknown, DirectPostReceiptRow>(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId)
       .map(row => [row.detail.attemptId, row]));
     const latest = attempts.at(-1);
+    const latestAttemptOutcome = latest ? outcomes.get(latest.detail.attemptId) : undefined;
     const assertParentCurrent = (): void => {
       if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
     };
@@ -534,7 +535,8 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       }
     };
     const latestPreflight = preflights.at(-1);
-    if (latestPreflight && (!latest || latestPreflight.id > latest.id)) {
+    if (latestPreflight && (!latest || (latestPreflight.id > latest.id &&
+      (!latestAttemptOutcome || latestPreflight.id > latestAttemptOutcome.id)))) {
       const status = latestPreflight.detail.outcome as string;
       if (status !== 'not_sent') {
         assertRouteCurrent();
