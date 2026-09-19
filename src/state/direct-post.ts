@@ -243,7 +243,6 @@ const identityKeys: readonly (keyof DirectPostPartMeta)[] = [
 
 function identityKeyValueMatches(key: string, left: unknown, right: unknown): boolean {
   if (key === 'agentPacket' && (left === undefined || left === null || right === undefined || right === null)) return true;
-  if (key === 'agentRequestTarget' && (left === undefined || left === null)) return true;
   return identityValueMatches(left, right);
 }
 
@@ -432,7 +431,7 @@ export function querySentAgentResultRows(
     parameters.push(value);
   }
   const boundedLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 64) : 64;
-  const rows = db.prepare(`SELECT attempt.id AS attempt_receipt_id, outcome.id AS outcome_receipt_id,
+  const query = `SELECT attempt.id AS attempt_receipt_id, outcome.id AS outcome_receipt_id,
       outcome.detail AS outcome_detail, attempt.detail AS attempt_detail
     FROM receipts AS attempt
     JOIN receipts AS outcome
@@ -440,7 +439,15 @@ export function querySentAgentResultRows(
      AND outcome.kind=?
      AND json_extract(outcome.detail, '$.attemptId')=json_extract(attempt.detail, '$.attemptId')
     WHERE ${clauses.filter(clause => clause !== 'outcome.kind=?').join(' AND ')}
-    ORDER BY outcome.id DESC LIMIT ?`).all(parameters[0], ...parameters.slice(1), boundedLimit) as RawAgentResultRow[];
+    ORDER BY outcome.id DESC LIMIT ? OFFSET ?`;
+  const rows: RawAgentResultRow[] = [];
+  let offset = 0;
+  while (true) {
+    const page = db.prepare(query).all(parameters[0], ...parameters.slice(1), boundedLimit, offset) as RawAgentResultRow[];
+    rows.push(...page);
+    if (!allowLegacyChildSource || page.length < boundedLimit) break;
+    offset += page.length;
+  }
   return rows.flatMap(row => {
     const attemptDetail = parseJson(row.attempt_detail, null);
     const outcomeDetail = parseJson(row.outcome_detail, null);
