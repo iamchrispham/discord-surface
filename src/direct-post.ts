@@ -117,6 +117,7 @@ export interface DirectPostState {
   listBindings(): DirectPostBinding[];
   isOrdinaryBinding(binding: DirectPostBinding): boolean;
   getMessageRoute?(deliveryChannelId: string): DirectPostRoute | null;
+  directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
   listReceipts(): DirectPostReceiptRow[];
   recoverDirectPostReceipts(): void;
   inspectDirectPostPart(meta: DirectPostPartMeta): DirectPostInspection | null;
@@ -708,7 +709,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     assertLegacyParentSourcedIdentity({ state, binding, token, requestId: explicitRequestId as string, packet: legacy.packet, sourceText: source.text,
       agentKind, agentTarget, agentReplyTo, sourceAddress: legacy.packet.source,
       allowRecordedTarget: legacyChildAddress !== null,
-      verifyLegacyProof: legacyChildAddress !== null && isLegacyRetryableOutcome(legacy.outcome), BindingError });
+      verifyLegacyProof: isLegacyRetryableOutcome(legacy.outcome), BindingError });
     if (legacy.outcome === DIRECT_POST_OUTCOMES.SENT || legacy.outcome === DIRECT_POST_OUTCOMES.UNKNOWN) {
       const legacyMarker = legacy.detail.legacyAgentPacket;
       const migratedPacket = legacy.detail.agentPacket;

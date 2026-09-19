@@ -143,7 +143,8 @@ test('pre-upgrade child-sourced retry preserves its recorded packet hash', async
   const packet = legacyPost(f, 'not_sent', { id: 'legacy-child-request', kind: KINDS.REQUEST, source: child, target,
     replyTo: null, text: fs.readFileSync(f.textFile, 'utf8') });
   const legacyTarget = { address: target,
-    proof: crypto.createHmac('sha256', token).update(`address/v1\0${JSON.stringify(target)}`).digest('base64url') };
+    proof: crypto.createHmac('sha256', crypto.createHmac('sha256', token).update('discord-tether/agent-message/v1').digest())
+      .update(`address/v1\0${JSON.stringify(target)}`).digest('base64url') };
   let posted;
   const result = await runDirectPost(input(f, { dedupeKey: packet.id, agentThreadId: null,
     agentTarget: legacyTarget, fetchImpl: async (_url, options) => {
@@ -161,6 +162,15 @@ test('pre-upgrade child-sourced retry rejects a forged legacy target proof', asy
   const child = { ...source, channelId: '103' };
   const packet = legacyPost(f, 'not_sent', { id: 'legacy-child-forged', kind: KINDS.REQUEST, source: child, target,
     replyTo: null, text: fs.readFileSync(f.textFile, 'utf8') });
+  let networkCalls = 0;
+  await assert.rejects(runDirectPost(input(f, { dedupeKey: packet.id, agentThreadId: null,
+    agentTarget: { address: target, proof: 'A'.repeat(43) }, fetchImpl: async () => { networkCalls++; } })), /invalid agent address signature/);
+  assert.equal(networkCalls, 0);
+});
+
+test('pre-upgrade parent-sourced retry rejects a forged legacy target proof', async t => {
+  const f = fixture(t);
+  const packet = legacyPost(f, 'not_sent');
   let networkCalls = 0;
   await assert.rejects(runDirectPost(input(f, { dedupeKey: packet.id, agentThreadId: null,
     agentTarget: { address: target, proof: 'A'.repeat(43) }, fetchImpl: async () => { networkCalls++; } })), /invalid agent address signature/);

@@ -155,7 +155,7 @@ export function verifyLegacyAgentAddress(envelope: unknown, token: string): Agen
   if (!isLegacyAgentAddressEnvelope(envelope)) {
     throw new Error('agent target file must contain a complete binding address and proof');
   }
-  const expected = crypto.createHmac('sha256', token)
+  const expected = crypto.createHmac('sha256', signingKey(token))
     .update('address/v1\0' + JSON.stringify(envelope.address)).digest('base64url');
   if (!crypto.timingSafeEqual(Buffer.from(envelope.proof), Buffer.from(expected))) {
     throw new Error('invalid agent address signature');

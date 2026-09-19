@@ -98,7 +98,7 @@ function receiptDetail(row: DirectPostReceiptRow): Record<string, unknown> | nul
 
 export function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostBinding, requestId: string,
   validOutcomes: readonly DirectPostOutcome[], allowLegacyChildRoute = false): LegacyParentSourcedReceipt | null {
-  const rows = state.listReceipts();
+  const rows = state.directPostRows(requestId);
   const attempts = new Map<string, Record<string, unknown>>();
   for (const row of rows) {
     if (row.kind !== 'direct-post-attempt') continue;

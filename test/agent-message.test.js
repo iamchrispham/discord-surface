@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, verifyAgentAddress, KINDS } = require('../src/agent-message');
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, verifyAgentAddress, verifyLegacyAgentAddress, KINDS } = require('../src/agent-message');
 
 const source = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
 const target = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222', generation: 2 };
@@ -22,6 +22,7 @@ test('address exports require the current signed envelope version', () => {
   const signingKey = crypto.createHmac('sha256', token).update('discord-tether/agent-message/v1').digest();
   const legacyProof = crypto.createHmac('sha256', signingKey)
     .update(`address/v1\0${JSON.stringify(target)}`).digest('base64url');
+  assert.deepEqual(verifyLegacyAgentAddress({ address: target, proof: legacyProof }, token), target);
   assert.throws(() => verifyAgentAddress({ address: target, proof: legacyProof }, token), /complete binding address/);
   assert.throws(() => verifyAgentAddress({ version: 2, address: target, proof: legacyProof }, token), /invalid agent address signature/);
 });
@@ -835,7 +836,8 @@ test('retryable pre-upgrade custody requires a child route before resend', async
     let networkCalls = 0;
     await assert.rejects(runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
       channelId: source.channelId, provider: source.provider, requestId, textFile: path.join(dir, 'missing.txt'),
-      agentTarget: { address: target, proof: 'A'.repeat(43) },
+      agentTarget: { address: target, proof: crypto.createHmac('sha256', crypto.createHmac('sha256', token)
+        .update('discord-tether/agent-message/v1').digest()).update(`address/v1\0${JSON.stringify(target)}`).digest('base64url') },
       fetchImpl: async () => { networkCalls += 1; throw new Error('legacy retry must not reach network'); } }),
     /agent messages require --agent-thread-id/);
     assert.equal(networkCalls, 0);

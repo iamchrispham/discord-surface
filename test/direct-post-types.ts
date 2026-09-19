@@ -29,6 +29,7 @@ const state: DirectPostState = {
   requireConfig: () => ({ guildId: binding.guildId, operatorId: 'operator' }),
   listBindings: () => [binding],
   isOrdinaryBinding: () => false,
+  directPostRows: () => [],
   listReceipts: () => [],
   recoverDirectPostReceipts: () => undefined,
   inspectDirectPostPart: () => null,
