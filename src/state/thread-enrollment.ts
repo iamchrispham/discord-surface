@@ -99,6 +99,17 @@ interface SqlStatement {
   run(...parameters: unknown[]): unknown;
 }
 
+function enrollmentBoundaryMatches(existing: ThreadEnrollment | null, expected: ThreadEnrollment | null | undefined): boolean {
+  if (expected === undefined) return true;
+  if (expected === null) return existing === null;
+  if (!existing) return false;
+  return [
+    'threadId', 'parentChannelId', 'guildId', 'state', 'active',
+    'adoptedThroughId', 'adoptedAt', 'lastSeenId', 'recoveredThroughId',
+    'lastAcceptedId', 'gapFrom', 'gapTo', 'detail', 'createdAt'
+  ].every(field => existing[field as keyof ThreadEnrollment] === expected[field as keyof ThreadEnrollment]);
+}
+
 export interface ThreadEnrollmentDatabase {
   prepare(sql: string): SqlStatement;
 }
@@ -168,7 +179,7 @@ export interface ThreadEnrollmentHandlers {
   listThreadEnrollments(state: ThreadEnrollmentState, parentChannelId?: string | null): ThreadEnrollment[];
   assertEnrollmentCoverage(state: ThreadEnrollmentState, parentChannelId: string, proof: ThreadEnrollmentCoverageProof): void;
   deactivateThreadEnrollments(state: ThreadEnrollmentState, parentChannelId: string, expectedBinding?: ThreadBinding | null, detail?: ThreadDeactivationDetail): number;
-  setThreadBaseline(state: ThreadEnrollmentState, threadId: string, latestId: string | null, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
+  setThreadBaseline(state: ThreadEnrollmentState, threadId: string, latestId: string | null, expectedBinding?: ThreadBinding | null, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
   markThreadBoundary(
     state: ThreadEnrollmentState,
     threadId: string,
@@ -178,9 +189,10 @@ export interface ThreadEnrollmentHandlers {
     gapTo?: string | null,
     expectedBinding?: ThreadBinding | null,
     coverageId?: string | null,
-    lastSeenBaselineId?: string | null
+    lastSeenBaselineId?: string | null,
+    expectedEnrollment?: ThreadEnrollment | null
   ): ThreadEnrollment | null;
-  checkpointThread(state: ThreadEnrollmentState, threadId: string, coverageId: string, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
+  checkpointThread(state: ThreadEnrollmentState, threadId: string, coverageId: string, expectedBinding?: ThreadBinding | null, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
   reconcileThread(state: ThreadEnrollmentState, threadId: string, expectedBinding?: ThreadBinding | null): ThreadEnrollment | null;
   noteThreadMessage(state: ThreadEnrollmentState, threadId: string, messageId: string, accepted?: boolean, coverageId?: string | null): ThreadEnrollment | null;
 }
@@ -343,13 +355,14 @@ export function createThreadEnrollmentHandlers({
       return rows.length;
     },
 
-    setThreadBaseline(state, threadId, latestId, expectedBinding = null) {
+    setThreadBaseline(state, threadId, latestId, expectedBinding = null, expectedEnrollment = undefined) {
       assertText(threadId, 'threadId', 128);
       if (latestId !== null) assertText(latestId, 'latestId', 128);
       return state.transaction(() => {
         const existing = requireEnrollment(state, threadId);
         const binding = currentParent(state, existing, expectedBinding);
         if (!binding || !binding.active) return null;
+        if (!enrollmentBoundaryMatches(existing, expectedEnrollment)) return null;
         const timestamp = now();
         const adoptedAt = existing.adoptedAt || timestamp;
         const adoptionCursor = existing.adoptedAt ? latestId : maxId(compareDiscordIds, existing.lastSeenId, latestId);
@@ -368,7 +381,7 @@ export function createThreadEnrollmentHandlers({
       });
     },
 
-    markThreadBoundary(state, threadId, nextState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined) {
+    markThreadBoundary(state, threadId, nextState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined, expectedEnrollment = undefined) {
       assertText(threadId, 'threadId', 128);
       if (!validStates.has(nextState)) throw new BindingError('invalid thread enrollment state');
       if (gapFrom !== null) assertText(gapFrom, 'gapFrom', 128);
@@ -378,6 +391,7 @@ export function createThreadEnrollmentHandlers({
         const existing = requireEnrollment(state, threadId);
         const binding = currentParent(state, existing, expectedBinding);
         if (!binding || !binding.active) return null;
+        if (!enrollmentBoundaryMatches(existing, expectedEnrollment)) return null;
         if (nextState === states.READY && coverageId !== undefined && lastSeenBaselineId !== undefined && existing.lastSeenId &&
           (!coverageId || compareDiscordIds(existing.lastSeenId, coverageId) > 0) &&
           (!lastSeenBaselineId || compareDiscordIds(existing.lastSeenId, lastSeenBaselineId) > 0)) return existing;
@@ -394,13 +408,14 @@ export function createThreadEnrollmentHandlers({
       });
     },
 
-    checkpointThread(state, threadId, coverageId, expectedBinding = null) {
+    checkpointThread(state, threadId, coverageId, expectedBinding = null, expectedEnrollment = undefined) {
       assertText(threadId, 'threadId', 128);
       const checkedCoverageId = assertText(coverageId, 'coverageId', 128);
       return state.transaction(() => {
         const existing = requireEnrollment(state, threadId);
         const binding = currentParent(state, existing, expectedBinding);
         if (!binding || !binding.active) return null;
+        if (!enrollmentBoundaryMatches(existing, expectedEnrollment)) return null;
         if (existing.lastSeenId && compareDiscordIds(existing.lastSeenId, checkedCoverageId) < 0) return existing;
         const recoveredThroughId = maxId(compareDiscordIds, existing.recoveredThroughId, checkedCoverageId);
         const timestamp = now();

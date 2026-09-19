@@ -37,6 +37,7 @@ const {
 const {
   createIntakeHandlers,
   intakeCutoffDecision,
+  intakeBoundaryMatches,
   pauseOrdinaryHandoffIntake,
   restoreOrdinaryHandoffIntake,
   recoverInterruptedOrdinaryHandoffIntake
@@ -1547,16 +1548,16 @@ class SurfaceState {
     return Boolean(this.db.prepare('SELECT 1 FROM thread_enrollments WHERE parent_channel_id=? AND active=1 LIMIT 1').get(parentChannelId));
   }
 
-  setThreadBaseline(threadId, latestId, expectedBinding = null) {
-    return threadEnrollmentHandlers.setThreadBaseline(this, threadId, latestId, expectedBinding);
+  setThreadBaseline(threadId, latestId, expectedBinding = null, expectedEnrollment = undefined) {
+    return threadEnrollmentHandlers.setThreadBaseline(this, threadId, latestId, expectedBinding, expectedEnrollment);
   }
 
-  markThreadBoundary(threadId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined) {
-    return threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding, coverageId, lastSeenBaselineId);
+  markThreadBoundary(threadId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined, expectedEnrollment = undefined) {
+    return threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding, coverageId, lastSeenBaselineId, expectedEnrollment);
   }
 
-  checkpointThread(threadId, coverageId, expectedBinding = null) {
-    return threadEnrollmentHandlers.checkpointThread(this, threadId, coverageId, expectedBinding);
+  checkpointThread(threadId, coverageId, expectedBinding = null, expectedEnrollment = undefined) {
+    return threadEnrollmentHandlers.checkpointThread(this, threadId, coverageId, expectedBinding, expectedEnrollment);
   }
 
   registerCourierRoute(...args) {
@@ -1801,7 +1802,7 @@ class SurfaceState {
     return intakeHandlers.checkpointIntake(this, channelId, coverageId, expectedBinding);
   }
 
-  setIntakeBaseline(channelId, lastSeenId, detail, expectedBinding = null) {
+  setIntakeBaseline(channelId, lastSeenId, detail, expectedBinding = null, expectedBoundary = undefined, expectedReadiness = undefined) {
     assertText(channelId, 'channelId', 128);
     assertText(lastSeenId, 'lastSeenId', 128);
     return this.transaction(() => {
@@ -1809,6 +1810,7 @@ class SurfaceState {
       if (!binding) throw new BindingError('intake channel is unknown');
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       const existing = this.getIntakeWatermark(channelId);
+      if (!intakeBoundaryMatches(existing, expectedBoundary, binding, expectedReadiness)) return null;
       const retainedLastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
         ? existing.last_seen_id
         : lastSeenId;
@@ -1841,8 +1843,8 @@ class SurfaceState {
     return intakeHandlers.listPendingOrdinaryHandoffChannels(this);
   }
 
-  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null) {
-    return intakeHandlers.markIntakeBoundary(this, channelId, state, detail, gapFrom, gapTo, expectedBinding, pauseMetadata);
+  markIntakeBoundary(channelId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null, expectedBoundary = undefined, expectedReadiness = undefined) {
+    return intakeHandlers.markIntakeBoundary(this, channelId, state, detail, gapFrom, gapTo, expectedBinding, pauseMetadata, expectedBoundary, expectedReadiness);
   }
 
   pauseOrdinaryHandoffIntake(channelId, expectedBinding = null) {
