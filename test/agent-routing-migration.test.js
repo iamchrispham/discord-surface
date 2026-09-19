@@ -206,6 +206,28 @@ test('legacy parent requests complete from a received child result without local
   assert.equal(completed.evidence.discordId, 'received-child-result-discord');
 });
 
+test('legacy parent requests reject a result received before child readiness', async t => {
+  const f = fixture(t);
+  const request = acceptRequest(f, '8114', true);
+  f.state.enrollThread({ threadId: '103', parentChannelId: '101', guildId: '100' }, f.binding);
+  f.state.setThreadBaseline('103', '0', f.binding);
+  assert.equal(f.state.claimDispatch('8114').claimed, true);
+  f.state.markSubmitted('8114');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8114', nativeId: source.nativeId, generation: 1 });
+  const receivedPacket = { id: 'received-before-ready', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
+    replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
+  acceptRequest(f, 'received-before-ready-discord', false);
+  f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+    .run(JSON.stringify({ packet: receivedPacket }), 'received-before-ready-discord');
+  f.state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture became ready', null, null, f.binding);
+  assert.throws(() => agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8114', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  }), /immutable correlated result/);
+  assert.equal(f.state.getMessage('8114').state, MESSAGE_STATES.SUBMITTED);
+});
+
 test('new intake stamps its route version and cannot use legacy parent-result compatibility', async t => {
   const f = fixture(t);
   const request = acceptRequest(f, '8103', false);

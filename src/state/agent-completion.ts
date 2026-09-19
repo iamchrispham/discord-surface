@@ -155,13 +155,38 @@ function receivedResultEvidence(
   };
 }
 
-function hasEnrolledLegacyChild(state: CompletionState, child: AgentAddress, parent: AgentAddress): boolean {
-  const row = state.db.prepare(`SELECT 1 FROM thread_enrollments AS enrollment
-    JOIN bindings AS binding ON binding.channel_id=enrollment.parent_channel_id
-    WHERE enrollment.thread_id=? AND enrollment.parent_channel_id=? AND enrollment.guild_id=? AND enrollment.active=1
-      AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1
+function hasReadyLegacyChildAtReceipt(
+  state: CompletionState,
+  child: AgentAddress,
+  parent: AgentAddress,
+  candidateReceiptId: number
+): boolean {
+  const enrollment = state.db.prepare(`SELECT json_extract(detail, '$.state') AS state
+    FROM receipts
+    WHERE kind IN ('thread-enrolled', 'thread-boundary')
+      AND json_extract(detail, '$.threadId')=?
+      AND json_extract(detail, '$.parentChannelId')=?
+      AND (kind='thread-boundary' OR json_extract(detail, '$.guildId')=?)
+      AND id < ?
+    ORDER BY id DESC
+    LIMIT 1`).get(child.channelId, parent.channelId, parent.guildId, candidateReceiptId) as { state?: unknown } | undefined;
+  if (enrollment?.state !== 'ready') return false;
+
+  const bindingReadiness = state.db.prepare(`SELECT
+      json_extract(detail, '$.readiness') AS readiness,
+      json_extract(detail, '$.state') AS state
+    FROM receipts
+    WHERE kind IN ('binding-readiness', 'intake-boundary')
+      AND json_extract(detail, '$.channelId')=?
+      AND id < ?
+    ORDER BY id DESC
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { readiness?: unknown; state?: unknown } | undefined;
+  if (bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
+
+  const row = state.db.prepare(`SELECT 1 FROM bindings AS binding
+    WHERE binding.channel_id=? AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1
     LIMIT 1`)
-    .get(child.channelId, parent.channelId, parent.guildId, parent.guildId, parent.provider, parent.nativeId, parent.generation);
+    .get(parent.channelId, parent.guildId, parent.provider, parent.nativeId, parent.generation);
   return Boolean(row);
 }
 
@@ -195,7 +220,7 @@ function receivedReplyEvidence(
     const candidate = detail?.packet;
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
     const migrated = allowLegacyChildSource && isLegacyChildResult(candidate, request, parentTarget,
-      hasEnrolledLegacyChild(state, candidate.source, parentTarget));
+      hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id)));
     if (!sameReverseAddresses(candidate, request) && !migrated) continue;
     return {
       kind: 'received-result',
