@@ -1,4 +1,5 @@
 const { PREFIX: AGENT_PREFIX, decodeAgentMessage } = require('./agent-message');
+const { AGENT_ROUTING_VERSION } = require('./state/agent-routing');
 const { WATCHER_NOTICE_PREFIX, decodeWatcherNotice, sameWatcherNotice, validateWatcherNotice } = require('./watcher-notice');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -1782,8 +1783,11 @@ class SurfaceState {
     if (!ready) {
       const binding = this.getBinding(event.channelId);
       if (binding?.active && binding.guildId === event.guildId) {
-        this.db.prepare("UPDATE bindings SET readiness='recovering', updated_at=? WHERE channel_id=? AND active=1 AND readiness='ready'")
+        const updated = this.db.prepare("UPDATE bindings SET readiness='recovering', updated_at=? WHERE channel_id=? AND active=1 AND readiness='ready'")
           .run(now(), event.channelId);
+        if (Number(updated.changes) === 1) {
+          this.receipt(null, 'binding-readiness', { channelId: event.channelId, readiness: READINESS.RECOVERING });
+        }
       }
     }
   }
@@ -2160,7 +2164,7 @@ class SurfaceState {
             .run(event.id, timestamp, authorityChannelId);
         }
       }
-      if (agent) this.receipt(event.id, 'agent-message', { packet: agent, authorId: event.authorId });
+      if (agent) this.receipt(event.id, 'agent-message', { packet: agent, authorId: event.authorId, routingVersion: AGENT_ROUTING_VERSION });
       if (notice) {
         this.receipt(event.id, WATCHER_NOTICE_RECEIPTS.PROVENANCE, {
           journal: WATCHER_NOTICE_JOURNAL, packet: notice, authorId: event.authorId,

@@ -29,6 +29,7 @@ const state: DirectPostState = {
   requireConfig: () => ({ guildId: binding.guildId, operatorId: 'operator' }),
   listBindings: () => [binding],
   isOrdinaryBinding: () => false,
+  directPostRows: () => [],
   listReceipts: () => [],
   recoverDirectPostReceipts: () => undefined,
   inspectDirectPostPart: () => null,
@@ -69,6 +70,7 @@ const multipartOptions: FetchOptions = {
 };
 const agentPresentation: AgentPresentation = AGENT_PRESENTATIONS.ATTACHMENT;
 const agentTarget: AgentAddressEnvelope = {
+  version: 2,
   address: {
     guildId: binding.guildId,
     channelId: 'target-channel',
@@ -81,6 +83,7 @@ const agentTarget: AgentAddressEnvelope = {
 const agentInput: DirectPostInput = {
   ...input,
   dedupeKey: 'agent-request',
+  agentThreadId: 'thread',
   agentTarget,
   agentPresentation
 };

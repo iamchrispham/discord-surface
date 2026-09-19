@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { issueAgentAddress, encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { SurfaceState, MESSAGE_STATES, READINESS, StateCorruptError } = require('../src/state');
+const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { acknowledgmentCommand, recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { agentComplete, GATEWAY_CAPABILITIES } = require('../src/cli');
 const { agentCompletionCommand, claudeEvent, codexPrompt } = require('../src/native');
@@ -50,15 +51,16 @@ test('agent retry preserves a predecessor journal without inventing completion e
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
-    const request = { id: 'a2-upgrade-request', kind: KINDS.REQUEST, source: owners.source, target: owners.target, replyTo: null, text: 'Handle this predecessor request.' };
-    const requestMessageId = 'a2-upgrade-request-event';
-    assert.equal(state.acceptDiscordMessage({ id: requestMessageId, guildId: owners.target.guildId, channelId: owners.target.channelId,
+    const request = { id: 'a2-upgrade-request', kind: KINDS.REQUEST, source: owners.source, target: owners.targetChild, replyTo: null, text: 'Handle this predecessor request.' };
+    const requestMessageId = '8100';
+    assert.equal(state.acceptDiscordMessage({ id: requestMessageId, guildId: owners.target.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token }).accepted, true);
     const textFile = path.join(dir, 'a2-upgrade-result.txt');
     fs.writeFileSync(textFile, 'Predecessor-compatible result.');
     let sends = 0;
     const input = { state, token, nativeId: owners.target.nativeId, generation: owners.target.generation,
-      channelId: owners.target.channelId, provider: owners.target.provider, textFile, dedupeKey: 'a2-upgrade-result',
+      channelId: owners.target.channelId, provider: owners.target.provider, agentThreadId: owners.targetChild.channelId,
+      textFile, dedupeKey: 'a2-upgrade-result',
       agentTarget: issueAgentAddress(owners.source, token), agentKind: KINDS.RESULT, agentReplyTo: request.id,
       fetchImpl: async (_url, options) => {
         if (options.method === 'POST') sends += 1;
@@ -103,9 +105,17 @@ function bindAgentOwners(state, dir) {
   let targetBinding = state.getBinding(target.channelId);
   sourceBinding = state.setBindingReadiness(source.channelId, READINESS.READY, 'A2 fixture ready', sourceBinding);
   targetBinding = state.setBindingReadiness(target.channelId, READINESS.READY, 'A2 fixture ready', targetBinding);
+  state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, sourceBinding);
+  state.setThreadBaseline('103', '7000', sourceBinding);
+  state.markThreadBoundary('103', THREAD_STATES.READY, 'A2 fixture child ready', null, null, sourceBinding);
+  state.enrollThread({ threadId: '104', parentChannelId: target.channelId, guildId: target.guildId }, targetBinding);
+  state.setThreadBaseline('104', '7000', targetBinding);
+  state.markThreadBoundary('104', THREAD_STATES.READY, 'A2 fixture child ready', null, null, targetBinding);
   return {
     source: { ...source, generation: sourceBinding.generation },
-    target: { ...target, generation: targetBinding.generation }
+    target: { ...target, generation: targetBinding.generation },
+    sourceChild: { ...source, channelId: '103', generation: sourceBinding.generation },
+    targetChild: { ...target, channelId: '104', generation: targetBinding.generation }
   };
 }
 
@@ -276,9 +286,9 @@ test('request completion accepts a Discord-id alias with nonce-only direct-resul
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
-    const request = { id: 'a2-unknown-request', kind: KINDS.REQUEST, source: owners.source, target: owners.target, replyTo: null, text: 'Wait for a reliable result.' };
-    const messageId = 'a2-unknown-request-event';
-    assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.target.guildId, channelId: owners.target.channelId,
+    const request = { id: 'a2-unknown-request', kind: KINDS.REQUEST, source: owners.source, target: owners.targetChild, replyTo: null, text: 'Wait for a reliable result.' };
+    const messageId = '8102';
+    assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.target.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token }).accepted, true);
     assert.equal(state.claimDispatch(messageId).claimed, true);
     state.markSubmitted(messageId);
@@ -287,7 +297,8 @@ test('request completion accepts a Discord-id alias with nonce-only direct-resul
     const textFile = path.join(dir, 'a2-unknown-result.txt');
     fs.writeFileSync(textFile, 'Uncertain result.');
     const result = await runDirectPost({ state, token, nativeId: owners.target.nativeId, generation: owners.target.generation,
-      channelId: owners.target.channelId, provider: owners.target.provider, textFile, dedupeKey: 'a2-unknown-result',
+      channelId: owners.target.channelId, provider: owners.target.provider, agentThreadId: owners.targetChild.channelId,
+      textFile, dedupeKey: 'a2-unknown-result',
       agentTarget: issueAgentAddress(owners.source, token), agentKind: KINDS.RESULT, agentReplyTo: messageId,
       fetchImpl: async (_url, options) => {
         if (options.method === 'POST') throw Object.assign(new Error('transport outcome unknown'), { outcome: 'unknown' });
@@ -318,10 +329,10 @@ test('agent-complete guards mutation on Gateway capability and requests a wake',
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
-    const request = { id: 'a2-cli-request', kind: KINDS.REQUEST, source: owners.source, target: owners.target, replyTo: null, text: 'Complete from CLI.' };
-    const messageId = 'a2-cli-request-event';
+    const request = { id: 'a2-cli-request', kind: KINDS.REQUEST, source: owners.source, target: owners.targetChild, replyTo: null, text: 'Complete from CLI.' };
+    const messageId = '8103';
     assert.equal(state.acceptDiscordMessage({
-      id: messageId, guildId: owners.target.guildId, channelId: owners.target.channelId,
+      id: messageId, guildId: owners.target.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token)
     }, { agentToken: token }).accepted, true);
     assert.equal(state.claimDispatch(messageId).claimed, true);
@@ -331,7 +342,7 @@ test('agent-complete guards mutation on Gateway capability and requests a wake',
     fs.writeFileSync(resultFile, 'CLI result.');
     const sent = await runDirectPost({
       state, token, nativeId: owners.target.nativeId, generation: owners.target.generation,
-      channelId: owners.target.channelId, provider: owners.target.provider, textFile: resultFile,
+      channelId: owners.target.channelId, provider: owners.target.provider, agentThreadId: owners.targetChild.channelId, textFile: resultFile,
       dedupeKey: 'a2-cli-result', agentTarget: issueAgentAddress(owners.source, token),
       agentKind: KINDS.RESULT, agentReplyTo: request.id,
       fetchImpl: async (_url, options) => ({ ok: true, status: 200, json: async () => options.method === 'GET'
@@ -340,11 +351,11 @@ test('agent-complete guards mutation on Gateway capability and requests a wake',
     assert.equal(sent.status, 'sent');
     const argsFor = id => ({ 'message-id': id, provider: owners.target.provider,
       'native-id': owners.target.nativeId, generation: String(owners.target.generation) });
-    const stoppedResult = { id: 'a2-cli-stopped-result', kind: KINDS.RESULT, source: owners.source, target: owners.target,
+    const stoppedResult = { id: 'a2-cli-stopped-result', kind: KINDS.RESULT, source: owners.source, target: owners.targetChild,
       replyTo: 'remote-request', text: 'Complete while Gateway is stopped.' };
-    const stoppedMessageId = 'a2-cli-stopped-result-event';
+    const stoppedMessageId = '8104';
     assert.equal(state.acceptDiscordMessage({
-      id: stoppedMessageId, guildId: owners.target.guildId, channelId: owners.target.channelId,
+      id: stoppedMessageId, guildId: owners.target.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(stoppedResult, token)
     }, { agentToken: token }).accepted, true);
     assert.equal(state.claimDispatch(stoppedMessageId).claimed, true);
