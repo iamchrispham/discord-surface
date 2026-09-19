@@ -243,6 +243,7 @@ const identityKeys: readonly (keyof DirectPostPartMeta)[] = [
 
 function identityKeyValueMatches(key: string, left: unknown, right: unknown): boolean {
   if (key === 'agentPacket' && (left === undefined || left === null || right === undefined || right === null)) return true;
+  if (key === 'agentRequestTarget' && (left === undefined || left === null)) return true;
   return identityValueMatches(left, right);
 }
 
@@ -416,9 +417,10 @@ export function querySentAgentResultRows(
       const requestTargetFields = packetFields.filter(([key]) => key.startsWith('source.'));
       for (const receipt of ['attempt', 'outcome']) {
         const sourceChannel = `json_extract(${receipt}.detail, '$.agentPacket.source.channelId')`;
+        const requestTarget = `json_extract(${receipt}.detail, '$.agentRequestTarget')`;
         const originalTarget = requestTargetFields.map(([key]) =>
           `json_extract(${receipt}.detail, '$.agentRequestTarget.${key.slice('source.'.length)}')=?`);
-        clauses.push(`(${sourceChannel}=? OR (${sourceChannel}<>? AND ${originalTarget.join(' AND ')}))`);
+        clauses.push(`(${sourceChannel}=? OR (${sourceChannel}<>? AND (${requestTarget} IS NULL OR ${originalTarget.join(' AND ')})))`);
         parameters.push(value, value, ...requestTargetFields.map(([, targetValue]) => targetValue));
       }
       clauses.push("json_extract(attempt.detail, '$.agentPacket.source.channelId')=json_extract(outcome.detail, '$.agentPacket.source.channelId')");
