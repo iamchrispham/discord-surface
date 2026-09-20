@@ -763,6 +763,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     }
     address = resolvedAddress;
   }
+  if (legacyPacket?.kind === KINDS.REQUEST) verifyAgentAddress(agentTarget, token);
   if (watcherNotice) {
     if (agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT || agentReplyTo !== null) {
       throw new BindingError('watcher notices do not accept agent message options');

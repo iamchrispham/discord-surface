@@ -102,7 +102,7 @@ test('public agent-send refuses a null destination without becoming an ordinary 
   } finally { process.argv = previousArgv; globalThis.fetch = previousFetch; }
 });
 
-test('public agent-send recovers signed v1 custody before new-address validation', async t => {
+test('public legacy retry requires refreshed child proof but preserves terminal recovery', async t => {
   const f = fixture(t);
   enroll(f);
   const original = legacyPost(f, 'not_sent');
@@ -115,6 +115,11 @@ test('public agent-send recovers signed v1 custody before new-address validation
     'native-id': source.nativeId, generation: '1', 'agent-thread-id': '103', 'target-file': targetFile,
     'text-file': f.textFile, 'dedupe-key': original.id };
   let posts = 0;
+  const before = f.state.directPostRows(original.id);
+  await assert.rejects(agentSend(args, { print() {}, fetchImpl: async () => { posts++; throw new Error('must not send'); } }), /invalid agent target|proof|routing/i);
+  assert.equal(posts, 0);
+  assert.deepEqual(f.state.directPostRows(original.id), before);
+  fs.writeFileSync(targetFile, JSON.stringify(issueAgentAddress(target, token)));
   const result = await agentSend(args, { print() {}, fetchImpl: async (_url, options) => {
     if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
     posts++;
@@ -124,6 +129,7 @@ test('public agent-send recovers signed v1 custody before new-address validation
   } });
   assert.equal(result.status, 'sent');
   assert.equal(posts, 1);
+  fs.writeFileSync(targetFile, JSON.stringify(legacyTarget));
   const repeat = await agentSend(args, { print() {}, fetchImpl: async () => { throw new Error('terminal custody must not send again'); } });
   assert.deepEqual(repeat.messageIds, ['legacy-cli-sent']);
   await assert.rejects(agentSend({ ...args, 'dedupe-key': 'new-request' }, { print() {},
@@ -200,12 +206,9 @@ test('pre-upgrade child-sourced retry preserves its recorded packet hash', async
   const child = { ...source, channelId: '103' };
   const packet = legacyPost(f, 'not_sent', { id: 'legacy-child-request', kind: KINDS.REQUEST, source: child, target,
     replyTo: null, text: fs.readFileSync(f.textFile, 'utf8') });
-  const legacyTarget = { address: target,
-    proof: crypto.createHmac('sha256', crypto.createHmac('sha256', token).update('discord-tether/agent-message/v1').digest())
-      .update(`address/v1\0${JSON.stringify(target)}`).digest('base64url') };
   let posted;
   const result = await runDirectPost(input(f, { dedupeKey: packet.id, agentThreadId: '103',
-    agentTarget: legacyTarget, fetchImpl: async (_url, options) => {
+    agentTarget: issueAgentAddress(target, token), fetchImpl: async (_url, options) => {
       if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
       posted = decodeAgentMessage(JSON.parse(options.body).content, token, target);
       return { ok: true, status: 200, json: async () => ({ id: 'legacy-child-retry' }) };
@@ -529,7 +532,7 @@ test('legacy results use receiver request custody across separate installations'
     replyTo: null, text: 'Original task.' };
   const packet = { id: 'legacy-parent-result', kind: KINDS.RESULT,
     source: { ...target, channelId: '203' }, target: source,
-    replyTo: request.id, routingVersion: AGENT_ROUTING_VERSION, text: 'Completed task.' };
+    replyTo: request.id, routingVersion: AGENT_ROUTING_VERSION, sourceParentChannelId: target.channelId, text: 'Completed task.' };
   receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', agentPacket: request });
   sender.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', agentPacket: packet });
   const ingest = (value, id) => receiver.state.acceptDiscordMessage({ id, guildId: '100', channelId: '101',
@@ -539,9 +542,13 @@ test('legacy results use receiver request custody across separate installations'
     ['parent-source', { ...packet, source: target }],
     ['owner', { ...packet, source: { ...packet.source, nativeId: source.nativeId } }],
     ['generation', { ...packet, source: { ...packet.source, generation: 2 } }]
-  ]) assert.equal(ingest(value, suffix).accepted, false);
+  ]) {
+    if (suffix === 'parent-source') delete value.sourceParentChannelId;
+    assert.equal(ingest(value, suffix).accepted, false);
+  }
   const legacyWire = { ...packet };
   delete legacyWire.routingVersion;
+  delete legacyWire.sourceParentChannelId;
   assert.equal(ingest(legacyWire, 'legacy-wire').accepted, false);
   receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', routingVersion: 2,
     agentPacket: { ...request, id: 'new-request', routingVersion: 2 } });
@@ -549,6 +556,14 @@ test('legacy results use receiver request custody across separate installations'
   receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'unknown', phase: 'preflight',
     agentPacket: { ...request, id: 'never-posted' } });
   assert.equal(ingest({ ...packet, replyTo: 'never-posted' }, 'preflight-result').accepted, false);
+  receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'sent',
+    agentPacket: { ...request, id: 'child-request', target: packet.source } });
+  assert.equal(ingest({ ...packet, replyTo: 'child-request', source: { ...packet.source, channelId: '204' } }, 'sibling-result').accepted, false);
+  assert.equal(ingest({ ...packet, sourceParentChannelId: '999' }, 'wrong-parent-result').accepted, false);
+  const reconciled = { ...request, id: 'reconciled-request' };
+  legacyPost(receiver, 'unknown', reconciled);
+  receiver.state.reconcileDirectPostOutcome(reconciled.id, 'legacy-attempt', 'not_sent', { source: 'confirmed absent' });
+  assert.equal(ingest({ ...packet, replyTo: reconciled.id }, 'reconciled-result').accepted, false);
   const accepted = ingest(packet, 'legacy-parent-result-discord');
   assert.equal(accepted.accepted, true, JSON.stringify(accepted));
   assert.equal(receiver.state.directPostRows(packet.id).length, 0, 'receiver has no sender result custody');
