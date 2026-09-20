@@ -2880,7 +2880,7 @@ class DiscordGateway {
     const makeResult = (waiter, fallback = null) => {
       if (waiter.stopped || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (scopeIsReady(waiter.scope)) return { ready: true, state: 'ready' };
-      if (waiter.childCount === 0 && waiter.ownResult?.ready === true) return waiter.ownResult;
+      if (waiter.scope === null && waiter.childCount === 0 && waiter.ownResult?.ready === true) return waiter.ownResult;
       const result = fallback || waiter.lastResult || waiter.ownResult || { ready: false, state: 'unavailable' };
       return result?.ready === true ? { ready: false, state: 'unavailable', error: result.error } : result;
     };

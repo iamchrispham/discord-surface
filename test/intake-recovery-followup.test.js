@@ -356,3 +356,12 @@ test('live custody arriving after the ready write is covered before recovery set
   assert.equal(f.state.getMessage('101').state, 'accepted');
   assert.equal(f.dispatched.length, 0);
 });
+
+test('selected thread recovery reports failure while its route remains held', async t => {
+  const f = fixture(t);
+  f.fail({ kind: 'channel', id: '2000', status: 403 });
+  const result = await settleRecovery(f.gateway.recoverTransport('selected', f.gateway.lifecycleEpoch, ['2000']));
+  assert.equal(f.boundary('2000').state, 'unavailable');
+  assert.equal(result.ready, false);
+  assert.equal(f.dispatched.length, 0);
+});
