@@ -106,10 +106,8 @@ function bindAgentOwners(state, dir) {
   sourceBinding = state.setBindingReadiness(source.channelId, READINESS.READY, 'A2 fixture ready', sourceBinding);
   targetBinding = state.setBindingReadiness(target.channelId, READINESS.READY, 'A2 fixture ready', targetBinding);
   state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, sourceBinding);
-  state.setThreadBaseline('103', '7000', sourceBinding);
   state.markThreadBoundary('103', THREAD_STATES.READY, 'A2 fixture child ready', null, null, sourceBinding);
   state.enrollThread({ threadId: '104', parentChannelId: target.channelId, guildId: target.guildId }, targetBinding);
-  state.setThreadBaseline('104', '7000', targetBinding);
   state.markThreadBoundary('104', THREAD_STATES.READY, 'A2 fixture child ready', null, null, targetBinding);
   return {
     source: { ...source, generation: sourceBinding.generation },
@@ -126,12 +124,12 @@ test('authenticated agent result reaches an explicit no-post terminal state', ()
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
     const resultPacket = {
-      id: 'a2-result', kind: KINDS.RESULT, source: owners.source, target: owners.target,
+      id: 'a2-result', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'remote-request', text: 'Authenticated result.'
     };
     const messageId = 'a2-result-event';
     const intake = state.acceptDiscordMessage({
-      id: messageId, guildId: owners.target.guildId, channelId: owners.target.channelId,
+      id: messageId, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(resultPacket, token)
     }, { agentToken: token });
     assert.equal(intake.accepted, true);
@@ -182,10 +180,10 @@ test('agent completion refuses native file custody admitted before reply record'
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
-    const packet = { id: 'a2-file-result', kind: KINDS.RESULT, source: owners.source, target: owners.target,
+    const packet = { id: 'a2-file-result', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'remote-request', text: 'File result.' };
     const messageId = 'a2-file-result-event';
-    assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.target.guildId, channelId: owners.target.channelId,
+    assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
     assert.equal(state.claimDispatch(messageId).claimed, true);
     state.markSubmitted(messageId);
@@ -207,10 +205,10 @@ test('agent completion fails closed on malformed native file custody', () => {
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
-    const packet = { id: 'a2-corrupt-file-result', kind: KINDS.RESULT, source: owners.source, target: owners.target,
+    const packet = { id: 'a2-corrupt-file-result', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'remote-request', text: 'Corrupt file result.' };
     const messageId = 'a2-corrupt-file-result-event';
-    assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.target.guildId, channelId: owners.target.channelId,
+    assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
     assert.equal(state.claimDispatch(messageId).claimed, true);
     state.markSubmitted(messageId);
@@ -231,10 +229,10 @@ test('agent request completion requires a full reversed result receipt', () => {
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
-    const request = { id: 'a2-request', kind: KINDS.REQUEST, source: owners.source, target: owners.target, replyTo: null, text: 'Handle this request.' };
+    const request = { id: 'a2-request', kind: KINDS.REQUEST, source: owners.sourceChild, target: owners.targetChild, replyTo: null, text: 'Handle this request.' };
     const requestMessageId = 'a2-request-event';
     assert.equal(state.acceptDiscordMessage({
-      id: requestMessageId, guildId: owners.target.guildId, channelId: owners.target.channelId,
+      id: requestMessageId, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token)
     }, { agentToken: token }).accepted, true);
     assert.equal(state.claimDispatch(requestMessageId).claimed, true);
@@ -246,11 +244,11 @@ test('agent request completion requires a full reversed result receipt', () => {
     assert.equal(state.getMessage(requestMessageId).state, MESSAGE_STATES.SUBMITTED);
 
     const wrongReply = {
-      id: 'a2-wrong-reply-result', kind: KINDS.RESULT, source: owners.target, target: owners.source,
+      id: 'a2-wrong-reply-result', kind: KINDS.RESULT, source: owners.targetChild, target: owners.sourceChild,
       replyTo: 'a2-different-request', text: 'Unrelated result.'
     };
     assert.equal(state.acceptDiscordMessage({
-      id: 'a2-wrong-reply-event', guildId: owners.source.guildId, channelId: owners.source.channelId,
+      id: 'a2-wrong-reply-event', guildId: owners.sourceChild.guildId, channelId: owners.sourceChild.channelId,
       authorId: '902', isBot: true, attachments: [], content: encodeAgentMessage(wrongReply, token)
     }, { agentToken: token }).accepted, true);
     assert.throws(() => state.completeAgentHandledWithoutPost({
@@ -258,12 +256,12 @@ test('agent request completion requires a full reversed result receipt', () => {
     }), /immutable correlated result/);
 
     const result = {
-      id: 'a2-received-result', kind: KINDS.RESULT, source: owners.target, target: owners.source,
+      id: 'a2-received-result', kind: KINDS.RESULT, source: owners.targetChild, target: owners.sourceChild,
       replyTo: request.id, text: 'The request is complete.'
     };
     const resultMessageId = 'a2-received-result-event';
     assert.equal(state.acceptDiscordMessage({
-      id: resultMessageId, guildId: owners.source.guildId, channelId: owners.source.channelId,
+      id: resultMessageId, guildId: owners.sourceChild.guildId, channelId: owners.sourceChild.channelId,
       authorId: '902', isBot: true, attachments: [], content: encodeAgentMessage(result, token)
     }, { agentToken: token }).accepted, true);
     const completed = state.completeAgentHandledWithoutPost({
@@ -416,9 +414,9 @@ test('no-post completion releases a queued same-owner message through the wake p
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
-    const firstPacket = { id: 'a2-queue-first', kind: KINDS.RESULT, source: owners.source, target: owners.target,
+    const firstPacket = { id: 'a2-queue-first', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'first-request', text: 'First result.' };
-    const secondPacket = { id: 'a2-queue-second', kind: KINDS.RESULT, source: owners.source, target: owners.target,
+    const secondPacket = { id: 'a2-queue-second', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'second-request', text: 'Second result.' };
     const dispatches = [];
     const observations = [];
@@ -443,7 +441,7 @@ test('no-post completion releases a queued same-owner message through the wake p
       sendTransportReceipt: async () => ({ id: 'transport-receipt' }),
       sendReply: async (message, reply) => { replies.push(message.id); return { id: `reply-${reply.id}` }; }
     });
-    const eventFor = (id, value) => ({ id, guildId: owners.target.guildId, channelId: owners.target.channelId,
+    const eventFor = (id, value) => ({ id, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       author: { id: '901', bot: true }, content: encodeAgentMessage(value, token), attachments: [], channel: {} });
     const first = consumer.handleMessage(eventFor('a2-queue-first-event', firstPacket));
     await firstObserveStarted;
@@ -475,11 +473,11 @@ test('handled completion leaves later accepted owner work recoverable after rest
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
-    const eventFor = (id, packetValue) => ({ id, guildId: owners.target.guildId, channelId: owners.target.channelId,
+    const eventFor = (id, packetValue) => ({ id, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(packetValue, token) });
-    const firstPacket = { id: 'a2-restart-first', kind: KINDS.RESULT, source: owners.source, target: owners.target,
+    const firstPacket = { id: 'a2-restart-first', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'restart-first-request', text: 'First result is consumed.' };
-    const secondPacket = { id: 'a2-restart-second', kind: KINDS.RESULT, source: owners.source, target: owners.target,
+    const secondPacket = { id: 'a2-restart-second', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'restart-second-request', text: 'Second result remains queued.' };
     assert.equal(state.acceptDiscordMessage(eventFor('a2-restart-first-event', firstPacket), { agentToken: token }).accepted, true);
     assert.equal(state.acceptDiscordMessage(eventFor('a2-restart-second-event', secondPacket), { agentToken: token }).accepted, true);
@@ -505,7 +503,9 @@ test('agent completion stays eligible after newest capacity refusal cleanup and 
     try {
       state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
       const bound = bindAgentOwners(state, dir);
-      const owners = provider === 'claude' ? bound : { source: bound.target, target: bound.source };
+      const owners = provider === 'claude' ? bound : {
+        source: bound.target, target: bound.source, sourceChild: bound.targetChild, targetChild: bound.sourceChild
+      };
       const ownerIdentity = state.directPostOwnerIdentity(process.pid);
       for (let index = 0; index < 8; index += 1) {
         const preparationId = `55555555-5555-4555-8555-${String(index).padStart(12, '0')}`;
@@ -519,9 +519,9 @@ test('agent completion stays eligible after newest capacity refusal cleanup and 
       }
       const messageId = 'released-refusal-result-event';
       const packet = { id: 'released-refusal-result', kind: KINDS.RESULT,
-        source: owners.source, target: owners.target, replyTo: 'remote-request', text: 'Result.' };
-      assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.target.guildId,
-        channelId: owners.target.channelId, authorId: '901', isBot: true, attachments: [],
+        source: owners.sourceChild, target: owners.targetChild, replyTo: 'remote-request', text: 'Result.' };
+      assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.targetChild.guildId,
+        channelId: owners.targetChild.channelId, authorId: '901', isBot: true, attachments: [],
         content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
       assert.equal(state.claimDispatch(messageId).claimed, true);
       state.markSubmitted(messageId);

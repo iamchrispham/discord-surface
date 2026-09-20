@@ -101,6 +101,13 @@ const legacyRetryInput: DirectPostInput = {
   agentThreadId: null,
   agentTarget: legacyAgentTarget
 };
+const legacyChildRetryInput: DirectPostInput = {
+  ...input,
+  dedupeKey: 'legacy-child-retry',
+  agentMode: true,
+  agentThreadId: 'thread',
+  agentTarget: legacyAgentTarget
+};
 const dedupeKey: string | undefined = resolveDedupeKey({ dedupeKey: 'request' });
 const requestId: string = requestIdFor(binding, 'operator', sourcePath, 'hash', dedupeKey);
 const resolvedBinding: DirectPostBinding = resolveDirectBinding(state, {
@@ -118,6 +125,7 @@ void missingAgentThreadInput;
 void missingAgentModeRouteInput;
 void ordinaryAttachmentInput;
 void legacyRetryInput;
+void legacyChildRetryInput;
 void incompleteFetchImpl;
 void requestId;
 void resolvedBinding;

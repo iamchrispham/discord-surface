@@ -2168,7 +2168,7 @@ class SurfaceState {
             AND json_extract(detail, '$.agentPacket.target.nativeId')=?
             AND json_extract(detail, '$.agentPacket.target.generation')=?
           LIMIT 1`).get(
-            DIRECT_POST_OUTCOMES.SENT, DIRECT_POST_OUTCOMES.UNKNOWN,
+            'sent', 'unknown',
             agent.id, agent.id, agent.replyTo, agent.kind, AGENT_ROUTING_VERSION, agent.text,
             agent.source.guildId, agent.source.channelId, agent.source.provider, agent.source.nativeId, agent.source.generation,
             agent.target.guildId, agent.target.channelId, agent.target.provider, agent.target.nativeId, agent.target.generation

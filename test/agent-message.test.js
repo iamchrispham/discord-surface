@@ -106,7 +106,7 @@ function enrollChild(state, parent, threadId, baseline = '7000') {
   let binding = state.getBinding(parent.channelId);
   binding = state.setBindingReadiness(parent.channelId, READINESS.READY, 'fixture ready', binding);
   state.enrollThread({ threadId, parentChannelId: parent.channelId, guildId: parent.guildId }, binding);
-  state.setThreadBaseline(threadId, baseline, binding);
+  if (baseline !== null) state.setThreadBaseline(threadId, baseline, binding);
   state.markThreadBoundary(threadId, THREAD_STATES.READY, 'fixture adoption', null, null, binding);
   return { ...parent, channelId: threadId, generation: binding.generation };
 }
@@ -118,8 +118,7 @@ test('durable agent intake survives reopen, preserves provenance and deduplicate
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
-    const binding = state.getBinding(target.channelId);
-    const destination = { ...target, generation: binding.generation };
+    const destination = enrollChild(state, target, '103', null);
     const addressed = { ...packet, target: destination };
     const event = { id: '1001', guildId: destination.guildId, channelId: destination.channelId, authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(addressed, token) };
     assert.equal(state.acceptDiscordMessage(event, { agentToken: 'wrong' }).accepted, false);
@@ -188,7 +187,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
-    const destination = { ...target, generation: state.getBinding(target.channelId).generation };
+    const destination = enrollChild(state, target, '103', null);
     const resultPacket = {
       ...packet,
       id: 'result-1',
@@ -634,10 +633,10 @@ test('history consumer verifies credential before durable intake', async () => {
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
-    const destination = { ...target, generation: state.getBinding(target.channelId).generation };
+    const destination = enrollChild(state, target, '103', null);
     const consumer = createSurfaceConsumer({ state, providers: {}, agentCredential: () => token });
     const content = encodeAgentMessage({ ...packet, target: destination }, token);
-    const incoming = { id: '7000', guildId: target.guildId, channelId: target.channelId, author: { id: '901', bot: true }, content };
+    const incoming = { id: '7000', guildId: target.guildId, channelId: destination.channelId, author: { id: '901', bot: true }, content };
     const accepted = await consumer.intakeMessage(incoming, false);
     assert.equal(accepted.accepted, true);
     assert.deepEqual(accepted.message.agentMessage.source, source);
@@ -977,10 +976,16 @@ test('results can answer a parent-targeted request accepted before child routing
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
     const request = { ...packet, id: 'legacy-parent-request', source: target, target: source };
-    const intake = state.acceptDiscordMessage({ id: '8102', guildId: source.guildId, channelId: source.channelId,
-      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token });
-    assert.equal(intake.accepted, true);
-    state.db.prepare("UPDATE receipts SET detail=json_remove(detail, '$.routingVersion') WHERE discord_id=? AND kind='agent-message'").run('8102');
+    const binding = state.getBinding(source.channelId);
+    const content = encodeAgentMessage(request, token);
+    const timestamp = new Date().toISOString();
+    state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      '8102', request.target.guildId, source.channelId, source.channelId, '901', content, '[]', binding.provider, binding.nativeId,
+      binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+    );
+    state.receipt('8102', 'agent-message', { packet: request, authorId: '901' });
+    state.receipt('8102', 'accepted', { channelId: source.channelId, conductorId: binding.conductorId, generation: binding.generation, readiness: 'ready' });
     const sourceChild = enrollChild(state, source, '103');
     const textFile = path.join(dir, 'result.txt');
     fs.writeFileSync(textFile, 'Legacy result');
@@ -1005,7 +1010,7 @@ test('results can answer a parent-targeted request accepted before child routing
     });
     const postUpgradeRequest = { ...packet, id: 'post-upgrade-parent-request', source: target, target: source };
     assert.equal(state.acceptDiscordMessage({ id: '8103', guildId: source.guildId, channelId: source.channelId,
-      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(postUpgradeRequest, token) }, { agentToken: token }).accepted, true);
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(postUpgradeRequest, token) }, { agentToken: token }).accepted, false);
     await assert.rejects(runDirectPost({ state, token, nativeId: source.nativeId, generation: 1,
       channelId: source.channelId, provider: source.provider, agentThreadId: sourceChild.channelId, textFile,
       dedupeKey: 'post-upgrade-parent-result', agentKind: KINDS.RESULT, agentReplyTo: postUpgradeRequest.id,

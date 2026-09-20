@@ -35,6 +35,8 @@ const packet: AgentMessage = {
   replyTo: null,
   text: 'Inspect the reported failure.'
 };
+// @ts-expect-error v1 routing packets are not part of the current public type
+const legacyRoutingVersion: AgentMessage = { ...packet, routingVersion: 1 };
 const kind: AgentMessageKind = KINDS.RESULT;
 const wire: string = encodeAgentMessage(packet, 'test-token');
 const decoded: AgentMessage | null = decodeAgentMessage(wire, 'test-token', target);
@@ -61,3 +63,4 @@ void verified;
 void equal;
 void requestWithReply;
 void resultWithoutReply;
+void legacyRoutingVersion;

@@ -243,7 +243,7 @@ interface AgentRequestDirectPostInput extends DirectPostInputBase {
 
 interface LegacyAgentRequestDirectPostInput extends DirectPostInputBase {
   agentMode?: boolean;
-  agentThreadId: null;
+  agentThreadId: string | null;
   agentKind?: Extract<AgentMessageKind, 'request'>;
   agentTarget: LegacyAgentAddressEnvelope;
   agentReplyTo?: null;

@@ -23,7 +23,7 @@ interface AgentMessageFields {
   id: string;
   source: AgentAddress;
   target: AgentAddress;
-  routingVersion?: number;
+  routingVersion?: 2;
   text: string;
 }
 

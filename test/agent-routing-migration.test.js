@@ -8,7 +8,7 @@ const { SurfaceState, READINESS, MESSAGE_STATES } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { AGENT_ROUTING_VERSION } = require('../src/state/agent-routing');
 const { runDirectPost } = require('../src/direct-post');
-const { main, agentComplete } = require('../src/cli');
+const { main, agentComplete, agentSend } = require('../src/cli');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { encodeAgentMessage, decodeAgentMessage, issueAgentAddress, KINDS } = require('../src/agent-message');
 
@@ -34,7 +34,6 @@ function fixture(t) {
 
 function enroll(f, threadId = '103') {
   f.state.enrollThread({ threadId, parentChannelId: '101', guildId: '100' }, f.binding);
-  f.state.setThreadBaseline(threadId, '0', f.binding);
   f.state.markThreadBoundary(threadId, THREAD_STATES.READY, 'fixture ready', null, null, f.binding);
 }
 
@@ -62,9 +61,22 @@ function legacyPreflight(f, requestId, outcome) {
 
 function acceptRequest(f, id, legacy, requestTarget = source, packetId = `request-${id}`) {
   const packet = { id: packetId, kind: KINDS.REQUEST, source: target, target: requestTarget, replyTo: null, text: 'Pending request.' };
-  assert.equal(f.state.acceptDiscordMessage({ id, guildId: '100', channelId: requestTarget.channelId, authorId: '901', isBot: true,
-    content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
-  assert.equal(f.state.getAgentMessage(id).routingVersion, AGENT_ROUTING_VERSION);
+  const content = encodeAgentMessage(packet, token);
+  if (legacy && requestTarget.channelId === source.channelId) {
+    const binding = f.state.getBinding(source.channelId);
+    const timestamp = new Date().toISOString();
+    f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      id, packet.target.guildId, source.channelId, source.channelId, '901', content, '[]', binding.provider, binding.nativeId,
+      binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+    );
+    f.state.receipt(id, 'agent-message', { packet, authorId: '901' });
+    f.state.receipt(id, 'accepted', { channelId: source.channelId, conductorId: binding.conductorId, generation: binding.generation, readiness: 'ready' });
+  } else {
+    assert.equal(f.state.acceptDiscordMessage({ id, guildId: '100', channelId: requestTarget.channelId, authorId: '901', isBot: true,
+      content }, { agentToken: token }).accepted, true);
+  }
+  if (!legacy) assert.equal(f.state.getAgentMessage(id).routingVersion, AGENT_ROUTING_VERSION);
   if (legacy) {
     // Model a receipt written by the pre-upgrade intake owner.
     f.state.db.prepare("UPDATE receipts SET detail=json_remove(detail, '$.routingVersion') WHERE discord_id=? AND kind='agent-message'").run(id);
@@ -88,6 +100,34 @@ test('public agent-send refuses a null destination without becoming an ordinary 
     assert.equal(posts, 0);
     assert.deepEqual(f.state.directPostRows('null-target'), []);
   } finally { process.argv = previousArgv; globalThis.fetch = previousFetch; }
+});
+
+test('public agent-send recovers signed v1 custody before new-address validation', async t => {
+  const f = fixture(t);
+  enroll(f);
+  const original = legacyPost(f, 'not_sent');
+  const targetFile = path.join(f.dir, 'legacy-target.json');
+  const legacyTarget = { address: target,
+    proof: crypto.createHmac('sha256', crypto.createHmac('sha256', token).update('discord-tether/agent-message/v1').digest())
+      .update(`address/v1\0${JSON.stringify(target)}`).digest('base64url') };
+  fs.writeFileSync(targetFile, JSON.stringify(legacyTarget));
+  const args = { db: f.db, 'state-dir': f.dir, provider: source.provider, 'channel-id': source.channelId,
+    'native-id': source.nativeId, generation: '1', 'agent-thread-id': '103', 'target-file': targetFile,
+    'text-file': f.textFile, 'dedupe-key': original.id };
+  let posts = 0;
+  const result = await agentSend(args, { print() {}, fetchImpl: async (_url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+    posts++;
+    const sent = decodeAgentMessage(JSON.parse(options.body).content, token, target);
+    assert.deepEqual(sent, { ...original, source: { ...source, channelId: '103' } });
+    return { ok: true, status: 200, json: async () => ({ id: 'legacy-cli-sent' }) };
+  } });
+  assert.equal(result.status, 'sent');
+  assert.equal(posts, 1);
+  const repeat = await agentSend(args, { print() {}, fetchImpl: async () => { throw new Error('terminal custody must not send again'); } });
+  assert.deepEqual(repeat.messageIds, ['legacy-cli-sent']);
+  await assert.rejects(agentSend({ ...args, 'dedupe-key': 'new-request' }, { print() {},
+    fetchImpl: async () => { throw new Error('new v1 request must not reach network'); } }), /invalid agent target|proof|routing/i);
 });
 
 test('known-unsent legacy custody moves only the wire source and survives restart without resend', async t => {
@@ -314,7 +354,7 @@ test('legacy parent requests complete from a received child result without local
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8111', nativeId: source.nativeId, generation: 1 });
   const receivedPacket = { id: 'received-child-result', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
-  acceptRequest(f, 'received-child-result-discord', false);
+  acceptRequest(f, 'received-child-result-discord', false, { ...source, channelId: '103' });
   f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
     .run(JSON.stringify({ packet: receivedPacket }), 'received-child-result-discord');
   assert.deepEqual(f.state.directPostRows(receivedPacket.id), []);
@@ -344,9 +384,9 @@ test('legacy parent requests accept a normal intake baseline before later ready 
   f.state.checkpointIntake('101', '2', f.state.getBinding('101'));
   const receivedPacket = { id: 'received-after-baseline', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
-  const intakePacket = { id: 'normal-after-baseline', kind: KINDS.REQUEST, source: target, target: source,
+  const intakePacket = { id: 'normal-after-baseline', kind: KINDS.REQUEST, source: target, target: { ...source, channelId: '103' },
     replyTo: null, text: 'Normal intake fixture.' };
-  const receivedEvent = { id: '8113', guildId: '100', channelId: '101', authorId: '901', isBot: true,
+  const receivedEvent = { id: '8113', guildId: '100', channelId: '103', authorId: '901', isBot: true,
     content: encodeAgentMessage(intakePacket, token) };
   const accepted = f.state.acceptDiscordMessage(receivedEvent, { agentToken: token });
   assert.equal(accepted.accepted, true, JSON.stringify(accepted));
@@ -371,7 +411,7 @@ test('legacy parent requests ignore a recovery cutoff recorded after the result'
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8112-after', nativeId: source.nativeId, generation: 1 });
   const receivedPacket = { id: 'received-before-cutoff', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
-  acceptRequest(f, 'received-before-cutoff-discord', false);
+  acceptRequest(f, 'received-before-cutoff-discord', false, { ...source, channelId: '103' });
   f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
     .run(JSON.stringify({ packet: receivedPacket }), 'received-before-cutoff-discord');
   f.state.upsertIntakeWatermark({ channelId: '101', guildId: '100', id: '8112-after-cutoff' }, false);
@@ -390,13 +430,12 @@ test('legacy parent requests reject a result received before child readiness', a
   const f = fixture(t);
   const request = acceptRequest(f, '8114', true);
   f.state.enrollThread({ threadId: '103', parentChannelId: '101', guildId: '100' }, f.binding);
-  f.state.setThreadBaseline('103', '0', f.binding);
   assert.equal(f.state.claimDispatch('8114').claimed, true);
   f.state.markSubmitted('8114');
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8114', nativeId: source.nativeId, generation: 1 });
   const receivedPacket = { id: 'received-before-ready', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
-  acceptRequest(f, 'received-before-ready-discord', false);
+  acceptRequest(f, 'received-before-ready-discord', false, { ...source, channelId: '103' });
   f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
     .run(JSON.stringify({ packet: receivedPacket }), 'received-before-ready-discord');
   f.state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture became ready', null, null, f.binding);
@@ -417,8 +456,8 @@ test('legacy parent requests reject held child results until their message is su
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8116', nativeId: source.nativeId, generation: 1 });
   const childResult = { id: 'held-child-result', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
-  const intakePacket = { id: childResult.id, kind: childResult.kind, source: target, target: source, replyTo: childResult.replyTo, text: childResult.text };
-  const accepted = f.state.acceptDiscordMessage({ id: childResult.id, guildId: '100', channelId: '101', authorId: '901', isBot: true,
+  const intakePacket = { id: childResult.id, kind: childResult.kind, source: target, target: { ...source, channelId: '103' }, replyTo: childResult.replyTo, text: childResult.text };
+  const accepted = f.state.acceptDiscordMessage({ id: childResult.id, guildId: '100', channelId: '103', authorId: '901', isBot: true,
     content: encodeAgentMessage(intakePacket, token) }, { agentToken: token, ready: false });
   assert.equal(accepted.accepted, true);
   f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
@@ -454,7 +493,7 @@ test('legacy parent requests reject results received during parent readiness tra
       assert.notEqual(f.state.getBinding('101').readiness, READINESS.READY);
       const receivedPacket = { id: `received-during-${scenarioKey}`, kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
         replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
-      acceptRequest(f, `received-during-${scenarioKey}-discord`, false);
+      acceptRequest(f, `received-during-${scenarioKey}-discord`, false, { ...source, channelId: '103' });
       f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
         .run(JSON.stringify({ packet: receivedPacket }), `received-during-${scenarioKey}-discord`);
       if (scenario === 'intake reconciliation') {
@@ -474,11 +513,11 @@ test('legacy parent requests reject results received during parent readiness tra
 
 test('new intake stamps its route version and cannot use legacy parent-result compatibility', async t => {
   const f = fixture(t);
-  const request = acceptRequest(f, '8103', false);
   enroll(f);
+  const request = acceptRequest(f, '8103', false, { ...source, channelId: '103' });
   let networkCalls = 0;
-  await assert.rejects(runDirectPost(input(f, { dedupeKey: 'new-parent-result', agentKind: KINDS.RESULT,
-    agentTarget: null, agentReplyTo: request.id, fetchImpl: async () => { networkCalls++; throw new Error('must not send'); } })), /unknown or does not match/);
+  await assert.rejects(runDirectPost(input(f, { dedupeKey: 'new-parent-result', agentThreadId: null, agentKind: KINDS.RESULT,
+    agentTarget: null, agentReplyTo: request.id, fetchImpl: async () => { networkCalls++; throw new Error('must not send'); } })), /unknown or does not match|require --agent-thread-id/);
   assert.equal(networkCalls, 0);
   assert.equal(f.state.directPostRows('new-parent-result').length, 0);
 });
@@ -488,7 +527,7 @@ test('legacy-correlated v2 parent results remain admissible after upgrade', asyn
   const packet = { id: 'legacy-parent-result', kind: KINDS.RESULT, source: target, target: source,
     replyTo: 'legacy-parent-request', routingVersion: AGENT_ROUTING_VERSION, text: 'Completed task.' };
   f.state.receipt(null, 'direct-post-outcome', {
-    legacyAgentPacket: { ...packet, routingVersion: undefined }, agentPacket: packet
+    outcome: 'sent', legacyAgentPacket: { ...packet, routingVersion: undefined }, agentPacket: packet
   });
   const accepted = f.state.acceptDiscordMessage({ id: 'legacy-parent-result-discord', guildId: '100', channelId: '101',
     authorId: '901', isBot: true, content: encodeAgentMessage(packet, token) }, { agentToken: token });
@@ -518,7 +557,7 @@ test('legacy parent requests reject received results from an unenrolled child', 
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8113', nativeId: source.nativeId, generation: 1 });
   const receivedPacket = { id: 'unenrolled-child-result', kind: KINDS.RESULT, source: { ...source, channelId: '999' }, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
-  acceptRequest(f, 'unenrolled-child-result-discord', false);
+  acceptRequest(f, 'unenrolled-child-result-discord', true);
   f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
     .run(JSON.stringify({ packet: receivedPacket }), 'unenrolled-child-result-discord');
   assert.throws(() => agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8113', provider: 'codex',
@@ -577,7 +616,7 @@ test('legacy child-targeted requests reject sibling child promotion', async t =>
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8112', nativeId: source.nativeId, generation: 1 });
   const receivedPacket = { id: 'received-sibling-child-result', kind: KINDS.RESULT, source: childB, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
-  acceptRequest(f, 'received-sibling-child-result-discord', false);
+  acceptRequest(f, 'received-sibling-child-result-discord', false, childA);
   f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
     .run(JSON.stringify({ packet: receivedPacket }), 'received-sibling-child-result-discord');
   assert.throws(() => agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8112', provider: 'codex',
