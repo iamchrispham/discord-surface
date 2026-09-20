@@ -2151,27 +2151,23 @@ class SurfaceState {
         this.db.prepare(`SELECT 1 FROM receipts
           WHERE kind='direct-post-outcome'
             AND json_extract(detail, '$.outcome') IN (?, ?)
-            AND json_extract(detail, '$.legacyAgentPacket.id')=?
+            AND json_type(detail, '$.routingVersion') IS NULL
+            AND json_type(detail, '$.agentPacket.routingVersion') IS NULL
             AND json_extract(detail, '$.agentPacket.id')=?
-            AND json_extract(detail, '$.agentPacket.replyTo')=?
-            AND json_extract(detail, '$.agentPacket.kind')=?
-            AND json_extract(detail, '$.agentPacket.routingVersion')=?
-            AND json_extract(detail, '$.agentPacket.text')=?
+            AND json_extract(detail, '$.agentPacket.kind')='request'
             AND json_extract(detail, '$.agentPacket.source.guildId')=?
             AND json_extract(detail, '$.agentPacket.source.channelId')=?
             AND json_extract(detail, '$.agentPacket.source.provider')=?
             AND json_extract(detail, '$.agentPacket.source.nativeId')=?
             AND json_extract(detail, '$.agentPacket.source.generation')=?
             AND json_extract(detail, '$.agentPacket.target.guildId')=?
-            AND json_extract(detail, '$.agentPacket.target.channelId')=?
             AND json_extract(detail, '$.agentPacket.target.provider')=?
             AND json_extract(detail, '$.agentPacket.target.nativeId')=?
             AND json_extract(detail, '$.agentPacket.target.generation')=?
           LIMIT 1`).get(
-            'sent', 'unknown',
-            agent.id, agent.id, agent.replyTo, agent.kind, AGENT_ROUTING_VERSION, agent.text,
-            agent.source.guildId, agent.source.channelId, agent.source.provider, agent.source.nativeId, agent.source.generation,
-            agent.target.guildId, agent.target.channelId, agent.target.provider, agent.target.nativeId, agent.target.generation
+            'sent', 'unknown', agent.replyTo,
+            agent.target.guildId, agent.target.channelId, agent.target.provider, agent.target.nativeId, agent.target.generation,
+            agent.source.guildId, agent.source.provider, agent.source.nativeId, agent.source.generation
           );
       if (agent && !enrollment && !legacyCorrelatedResult) {
         this.receipt(null, 'intake-rejected', {
