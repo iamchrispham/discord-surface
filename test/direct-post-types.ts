@@ -130,3 +130,9 @@ void incompleteFetchImpl;
 void requestId;
 void resolvedBinding;
 void invalidBinding;
+
+const terminalLegacyResult: DirectPostInput = {
+  ...input, dedupeKey: 'terminal-result', agentKind: 'result',
+  agentReplyTo: 'legacy-request', agentThreadId: null, agentTarget: null
+};
+void terminalLegacyResult;

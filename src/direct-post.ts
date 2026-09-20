@@ -261,7 +261,8 @@ interface AgentResultDirectPostInput extends DirectPostInputBase {
 
 interface LegacyAgentResultDirectPostInput extends DirectPostInputBase {
   agentMode?: boolean;
-  agentThreadId: string;
+  // Null only recovers terminal legacy custody. A new send still requires a child.
+  agentThreadId: string | null;
   agentKind: Extract<AgentMessageKind, 'result'>;
   agentTarget?: LegacyAgentAddressEnvelope | null;
   agentReplyTo: string;
