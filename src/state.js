@@ -2152,6 +2152,7 @@ class SurfaceState {
         agent.target.channelId === authorityChannelId &&
         this.db.prepare(`SELECT 1 FROM receipts
           WHERE kind='direct-post-outcome'
+            AND COALESCE(json_extract(detail, '$.phase'), '')<>'preflight'
             AND json_extract(detail, '$.outcome') IN (?, ?)
             AND json_type(detail, '$.routingVersion') IS NULL
             AND json_type(detail, '$.agentPacket.routingVersion') IS NULL
@@ -2163,14 +2164,14 @@ class SurfaceState {
             AND json_extract(detail, '$.agentPacket.source.nativeId')=?
             AND json_extract(detail, '$.agentPacket.source.generation')=?
             AND json_extract(detail, '$.agentPacket.target.guildId')=?
-            AND json_extract(detail, '$.agentPacket.target.channelId')<>?
+            AND (json_extract(detail, '$.agentPacket.target.channelId')<>? OR ? IS NOT NULL)
             AND json_extract(detail, '$.agentPacket.target.provider')=?
             AND json_extract(detail, '$.agentPacket.target.nativeId')=?
             AND json_extract(detail, '$.agentPacket.target.generation')=?
           LIMIT 1`).get(
             'sent', 'unknown', agent.replyTo,
             agent.target.guildId, agent.target.channelId, agent.target.provider, agent.target.nativeId, agent.target.generation,
-            agent.source.guildId, agent.source.channelId, agent.source.provider, agent.source.nativeId, agent.source.generation
+            agent.source.guildId, agent.source.channelId, agent.sourceParentChannelId ?? null, agent.source.provider, agent.source.nativeId, agent.source.generation
           );
       if (agent && !enrollment && !legacyCorrelatedResult) {
         this.receipt(null, 'intake-rejected', {

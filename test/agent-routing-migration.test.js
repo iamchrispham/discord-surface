@@ -546,6 +546,9 @@ test('legacy results use receiver request custody across separate installations'
   receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', routingVersion: 2,
     agentPacket: { ...request, id: 'new-request', routingVersion: 2 } });
   assert.equal(ingest({ ...packet, replyTo: 'new-request' }, 'new-request-result').accepted, false);
+  receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'unknown', phase: 'preflight',
+    agentPacket: { ...request, id: 'never-posted' } });
+  assert.equal(ingest({ ...packet, replyTo: 'never-posted' }, 'preflight-result').accepted, false);
   const accepted = ingest(packet, 'legacy-parent-result-discord');
   assert.equal(accepted.accepted, true, JSON.stringify(accepted));
   assert.equal(receiver.state.directPostRows(packet.id).length, 0, 'receiver has no sender result custody');
@@ -674,3 +677,38 @@ test('agent-complete preserves earlier custody across later request-target reuse
   assert.equal(f.state.getMessage('8101').state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
   assert.equal(f.state.getMessage('8102').state, MESSAGE_STATES.ACCEPTED);
 });
+
+for (const targetedChild of [false, true]) {
+  test(`known-unsent legacy result reaches separate origin (${targetedChild ? 'child' : 'parent'} request target)`, async t => {
+    const sender = fixture(t);
+    enroll(sender);
+    const requestTarget = targetedChild ? { ...source, channelId: '103' } : source;
+    const request = acceptRequest(sender, '9200', true, requestTarget);
+    const original = legacyPost(sender, 'not_sent', { id: 'result-migration', kind: KINDS.RESULT,
+      source: requestTarget, target, replyTo: request.id, text: fs.readFileSync(sender.textFile, 'utf8') });
+    const receiver = fixture(t);
+    receiver.state.bind({ ...target, workspace: receiver.dir, endpoint: '/tmp/legacy-result-fixture.sock', conductorId: 'receiver', repoKey: 'receiver' });
+    receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', agentPacket: request });
+    let wire;
+    const result = await runDirectPost(input(sender, { dedupeKey: original.id, agentKind: KINDS.RESULT,
+      agentReplyTo: request.id, agentTarget: null, fetchImpl: async (_url, options) => {
+        if (options.method === 'POST') wire = JSON.parse(options.body).content;
+        return { ok: true, status: 200, json: async () => options.method === 'GET'
+          ? { id: target.channelId, guild_id: target.guildId } : { id: '9300' } };
+      } }));
+    assert.equal(result.status, 'sent');
+    const packet = decodeAgentMessage(wire, token, target);
+    assert.equal(packet.routingVersion, 2);
+    assert.equal(packet.source.channelId, '103');
+    assert.equal(packet.sourceParentChannelId, source.channelId);
+    const accepted = receiver.state.acceptDiscordMessage({ id: '9300', guildId: target.guildId,
+      channelId: target.channelId, authorId: '901', isBot: true, content: wire }, { agentToken: token });
+    assert.equal(accepted.accepted, true, JSON.stringify(accepted));
+    assert.throws(() => encodeAgentMessage({ ...packet, sourceParentChannelId: packet.source.channelId }, token), /invalid agent message/);
+    const repeated = await runDirectPost(input(sender, { dedupeKey: original.id, agentKind: KINDS.RESULT,
+      agentReplyTo: request.id, agentTarget: null, agentThreadId: null,
+      fetchImpl: async () => { throw new Error('terminal migration must not resend'); } }));
+    assert.equal(repeated.status, 'sent');
+    assert.equal(repeated.duplicate, true);
+  });
+}
