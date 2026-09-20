@@ -26,13 +26,24 @@ interface AgentMessageFields {
   text: string;
 }
 
+type AgentRoutingFields =
+  | { routingVersion?: never; sourceParentChannelId?: never }
+  | { routingVersion: 2; sourceParentChannelId?: string };
+
 export type AgentMessage =
-  | (AgentMessageFields & { kind: typeof KINDS.REQUEST; replyTo: null })
-  | (AgentMessageFields & { kind: typeof KINDS.RESULT; replyTo: string });
+  | (AgentMessageFields & AgentRoutingFields & { kind: typeof KINDS.REQUEST; replyTo: null })
+  | (AgentMessageFields & AgentRoutingFields & { kind: typeof KINDS.RESULT; replyTo: string });
 
 export interface AgentAddressEnvelope {
+  version: 2;
   address: AgentAddress;
   proof: string;
+}
+
+export interface LegacyAgentAddressEnvelope {
+  address: AgentAddress;
+  proof: string;
+  version?: 1;
 }
 
 function messageLimitError(encodedLength: number): Error {
@@ -61,20 +72,31 @@ export function sameAddress(left: unknown, right: unknown): boolean {
 }
 
 export function validateAgentMessage(packet: unknown): asserts packet is AgentMessage {
-  if (!exactKeys(packet, ['id', 'kind', 'source', 'target', 'replyTo', 'text'])) {
+  if (packet === null || typeof packet !== 'object' || Array.isArray(packet)) {
     throw new Error('invalid agent message');
   }
-  if (typeof packet.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(packet.id) ||
-      !Object.values(KINDS).includes(packet.kind as AgentMessageKind) || !validAddress(packet.source) || !validAddress(packet.target)) {
+  const value = packet as Record<string, unknown>;
+  const keys = Object.keys(value);
+  const required = ['id', 'kind', 'source', 'target', 'replyTo', 'text'];
+  if (!required.every(key => Object.hasOwn(value, key)) ||
+      keys.some(key => ![...required, 'routingVersion', 'sourceParentChannelId'].includes(key)) ||
+      (Object.hasOwn(value, 'routingVersion') && value.routingVersion !== 2) ||
+      (Object.hasOwn(value, 'sourceParentChannelId') &&
+        (value.routingVersion !== 2 || typeof value.sourceParentChannelId !== 'string' ||
+          !/^\d{1,20}$/.test(value.sourceParentChannelId)))) {
     throw new Error('invalid agent message');
   }
-  const source = packet.source;
-  const target = packet.target;
-  if (source.guildId !== target.guildId ||
+  if (typeof value.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.id) ||
+      !Object.values(KINDS).includes(value.kind as AgentMessageKind) || !validAddress(value.source) || !validAddress(value.target)) {
+    throw new Error('invalid agent message');
+  }
+  const source = value.source as AgentAddress;
+  const target = value.target as AgentAddress;
+  if (value.sourceParentChannelId === source.channelId || source.guildId !== target.guildId ||
       (source.provider === target.provider && source.nativeId === target.nativeId) ||
-      typeof packet.text !== 'string' || !packet.text.trim() ||
-      ((packet.kind as AgentMessageKind) === KINDS.REQUEST ? packet.replyTo !== null :
-        typeof packet.replyTo !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(packet.replyTo as string))) {
+      typeof value.text !== 'string' || !value.text.trim() ||
+      ((value.kind as AgentMessageKind) === KINDS.REQUEST ? value.replyTo !== null :
+        typeof value.replyTo !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.replyTo as string))) {
     throw new Error('invalid agent message');
   }
 }
@@ -117,12 +139,22 @@ export function decodeAgentMessage(wire: unknown, token: string, target: AgentAd
 export function issueAgentAddress(binding: AgentAddress, token: string): AgentAddressEnvelope {
   const address = Object.fromEntries(['guildId', 'channelId', 'provider', 'nativeId', 'generation'].map(key => [key, binding[key as keyof AgentAddress]]));
   if (!validAddress(address)) throw new Error('invalid agent address');
-  const proof = crypto.createHmac('sha256', signingKey(token)).update('address/v1\0' + JSON.stringify(address)).digest('base64url');
-  return { address, proof };
+  const proof = crypto.createHmac('sha256', signingKey(token)).update('address/v2\0' + JSON.stringify(address)).digest('base64url');
+  return { version: 2, address, proof };
+}
+
+export function isLegacyAgentAddressEnvelope(value: unknown): value is LegacyAgentAddressEnvelope {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const envelope = value as Record<string, unknown>;
+  const hasVersion = Object.hasOwn(envelope, 'version');
+  if (Object.keys(envelope).length !== (hasVersion ? 3 : 2) ||
+      !Object.hasOwn(envelope, 'address') || !Object.hasOwn(envelope, 'proof') ||
+      (hasVersion && envelope.version !== 1)) return false;
+  return validAddress(envelope.address) && typeof envelope.proof === 'string' && /^[A-Za-z0-9_-]{43}$/.test(envelope.proof);
 }
 
 export function verifyAgentAddress(envelope: unknown, token: string): AgentAddress {
-  if (!exactKeys(envelope, ['address', 'proof'])) {
+  if (!exactKeys(envelope, ['version', 'address', 'proof']) || envelope.version !== 2) {
     throw new Error('agent target file must contain a complete binding address and proof');
   }
   if (!validAddress(envelope.address) ||
@@ -132,6 +164,25 @@ export function verifyAgentAddress(envelope: unknown, token: string): AgentAddre
   const expected = issueAgentAddress(envelope.address, token);
   if (!crypto.timingSafeEqual(Buffer.from(envelope.proof), Buffer.from(expected.proof))) throw new Error('invalid agent address signature');
   return expected.address;
+}
+
+export function verifyLegacyAgentAddress(envelope: unknown, token: string): AgentAddress {
+  if (!isLegacyAgentAddressEnvelope(envelope)) {
+    throw new Error('agent target file must contain a complete binding address and proof');
+  }
+  const address = {
+    guildId: envelope.address.guildId,
+    channelId: envelope.address.channelId,
+    provider: envelope.address.provider,
+    nativeId: envelope.address.nativeId,
+    generation: envelope.address.generation
+  };
+  const expected = crypto.createHmac('sha256', signingKey(token))
+    .update('address/v1\0' + JSON.stringify(address)).digest('base64url');
+  if (!crypto.timingSafeEqual(Buffer.from(envelope.proof), Buffer.from(expected))) {
+    throw new Error('invalid agent address signature');
+  }
+  return address;
 }
 
 export { PREFIX };

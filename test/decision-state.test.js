@@ -887,6 +887,8 @@ test('getMessage exposes validated decision context and rejects malformed decisi
     const agentFixtureState = fixture({ guildId: '100', channelId: '102' });
     const agentState = agentFixtureState.state;
     const agentBinding = agentState.getBinding('102');
+    agentState.enrollThread({ threadId: '103', parentChannelId: '102', guildId: '100' }, agentBinding);
+    agentState.markThreadBoundary('103', 'ready', 'fixture ready', null, null, agentBinding);
     const agentPacket = {
       id: 'agent-request-1',
       kind: KINDS.REQUEST,
@@ -895,7 +897,7 @@ test('getMessage exposes validated decision context and rejects malformed decisi
         nativeId: '22222222-2222-2222-2222-222222222222', generation: 1
       },
       target: {
-        guildId: agentBinding.guildId, channelId: agentBinding.channelId, provider: agentBinding.provider,
+        guildId: agentBinding.guildId, channelId: '103', provider: agentBinding.provider,
         nativeId: agentBinding.nativeId, generation: agentBinding.generation
       },
       replyTo: null,
@@ -903,7 +905,7 @@ test('getMessage exposes validated decision context and rejects malformed decisi
     };
     try {
       const agent = agentState.acceptDiscordMessage({
-        id: 'agent-message-1', guildId: agentBinding.guildId, channelId: agentBinding.channelId, authorId: 'agent-author',
+        id: 'agent-message-1', guildId: agentBinding.guildId, channelId: '103', authorId: 'agent-author',
         isBot: true, attachments: [], content: encodeAgentMessage(agentPacket, 'decision-agent-token')
       }, { agentToken: 'decision-agent-token' });
       assert.equal(agent.accepted, true);

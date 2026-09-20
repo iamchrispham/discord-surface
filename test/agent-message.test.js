@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, KINDS } = require('../src/agent-message');
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, verifyAgentAddress, verifyLegacyAgentAddress, KINDS } = require('../src/agent-message');
 
 const source = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
 const target = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222', generation: 2 };
@@ -13,6 +13,18 @@ test('agent packet retains source, destination and task across authenticated enc
   const result = { ...packet, id: 'result-1', kind: KINDS.RESULT, source: target, target: source, replyTo: packet.id, text: 'Found the cause.' };
   assert.deepEqual(decodeAgentMessage(encodeAgentMessage(result, token), token, source), result);
   assert.equal(decodeAgentMessage('Milestone landed. work-1', token, target), null);
+});
+
+test('address exports require the current signed envelope version', () => {
+  const current = issueAgentAddress(target, token);
+  assert.equal(current.version, 2);
+  assert.deepEqual(verifyAgentAddress(current, token), target);
+  const signingKey = crypto.createHmac('sha256', token).update('discord-tether/agent-message/v1').digest();
+  const legacyProof = crypto.createHmac('sha256', signingKey)
+    .update(`address/v1\0${JSON.stringify(target)}`).digest('base64url');
+  assert.deepEqual(verifyLegacyAgentAddress({ address: target, proof: legacyProof }, token), target);
+  assert.throws(() => verifyAgentAddress({ address: target, proof: legacyProof }, token), /complete binding address/);
+  assert.throws(() => verifyAgentAddress({ version: 2, address: target, proof: legacyProof }, token), /invalid agent address signature/);
 });
 
 test('forged contents, credentials and stale destination cannot authenticate', () => {
@@ -90,6 +102,15 @@ const { agentCompletionCommand, codexPrompt, claudeEvent, messageRequest } = req
 const { staticConductorMarker } = require('../src/topic');
 const { createMonitorMcp, monitorEvent } = require('../src/claude-monitor');
 
+function enrollChild(state, parent, threadId, baseline = '7000') {
+  let binding = state.getBinding(parent.channelId);
+  binding = state.setBindingReadiness(parent.channelId, READINESS.READY, 'fixture ready', binding);
+  state.enrollThread({ threadId, parentChannelId: parent.channelId, guildId: parent.guildId }, binding);
+  if (baseline !== null) state.setThreadBaseline(threadId, baseline, binding);
+  state.markThreadBoundary(threadId, THREAD_STATES.READY, 'fixture adoption', null, null, binding);
+  return { ...parent, channelId: threadId, generation: binding.generation };
+}
+
 test('durable agent intake survives reopen, preserves provenance and deduplicates replay', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-packet-'));
   const db = path.join(dir, 'surface.sqlite');
@@ -97,8 +118,7 @@ test('durable agent intake survives reopen, preserves provenance and deduplicate
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
-    const binding = state.getBinding(target.channelId);
-    const destination = { ...target, generation: binding.generation };
+    const destination = enrollChild(state, target, '103', null);
     const addressed = { ...packet, target: destination };
     const event = { id: '1001', guildId: destination.guildId, channelId: destination.channelId, authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(addressed, token) };
     assert.equal(state.acceptDiscordMessage(event, { agentToken: 'wrong' }).accepted, false);
@@ -167,7 +187,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
-    const destination = { ...target, generation: state.getBinding(target.channelId).generation };
+    const destination = enrollChild(state, target, '103', null);
     const resultPacket = {
       ...packet,
       id: 'result-1',
@@ -280,6 +300,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
 });
 
 const { runDirectPost } = require('../src/direct-post');
+const { agentSend } = require('../src/cli');
 
 test('explicit sender posts one authenticated packet to recipient and retains source custody', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-send-'));
@@ -288,32 +309,45 @@ test('explicit sender posts one authenticated packet to recipient and retains so
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') });
-    const destination = { ...target, generation: state.getBinding(target.channelId).generation };
+    let sourceBinding = state.getBinding(source.channelId);
+    sourceBinding = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', sourceBinding);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, sourceBinding);
+    state.setThreadBaseline('103', '4000', sourceBinding);
+    state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, sourceBinding);
+    let targetBinding = state.getBinding(target.channelId);
+    targetBinding = state.setBindingReadiness(target.channelId, READINESS.READY, 'fixture ready', targetBinding);
+    state.enrollThread({ threadId: '202', parentChannelId: target.channelId, guildId: target.guildId }, targetBinding);
+    state.setThreadBaseline('202', '4000', targetBinding);
+    state.markThreadBoundary('202', THREAD_STATES.READY, 'fixture adoption', null, null, targetBinding);
+    const destination = { ...target, channelId: '202', generation: targetBinding.generation };
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
     const requests = [];
     const input = { state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId, provider: source.provider,
-      textFile, dedupeKey: 'send-1', agentTarget: issueAgentAddress(destination, token),
+      agentThreadId: '103', textFile, dedupeKey: 'send-1', agentTarget: issueAgentAddress(destination, token),
       fetchImpl: async (url, options) => {
         requests.push({ url, body: options.method === 'GET' ? null : JSON.parse(options.body) });
         return { ok: true, status: 200, json: async () => options.method === 'GET'
-          ? { id: target.channelId, guild_id: target.guildId }
+          ? { id: destination.channelId, guild_id: destination.guildId }
           : { id: '5000' } };
       } };
     const sent = await runDirectPost(input);
     assert.equal(sent.status, 'sent');
-    assert.equal(sent.channelId, target.channelId);
+    assert.equal(sent.channelId, destination.channelId);
     assert.equal(requests.length, 2);
-    assert.ok(requests[0].url.endsWith(`/channels/${target.channelId}`));
-    assert.ok(requests[1].url.endsWith(`/channels/${target.channelId}/messages`));
+    assert.ok(requests[0].url.endsWith(`/channels/${destination.channelId}`));
+    assert.ok(requests[1].url.endsWith(`/channels/${destination.channelId}/messages`));
     const decoded = decodeAgentMessage(requests[1].body.content, token, destination);
     assert.equal(decoded.source.nativeId, source.nativeId);
+    assert.equal(decoded.source.channelId, '103');
     assert.equal(decoded.text, packet.text);
     assert.equal(state.hasIntakeEvidence('5000'), false);
     const inbound = { id: '5000', guildId: destination.guildId, channelId: destination.channelId,
       authorId: '901', isBot: true, content: requests[1].body.content, attachments: [] };
     assert.equal(state.acceptDiscordMessage(inbound, { agentToken: token }).accepted, true);
     assert.equal(state.getMessage('5000').nativeId, target.nativeId);
+    assert.equal(state.getMessage('5000').channelId, target.channelId);
+    assert.equal(state.getMessage('5000').deliveryChannelId, destination.channelId);
     assert.equal(state.acceptDiscordMessage({ ...inbound, id: '5001' }, { agentToken: token }).accepted, false);
 
     assert.equal((await runDirectPost(input)).duplicate, true);
@@ -431,10 +465,13 @@ test('public destination export routes across separate installation databases', 
     for (const store of [state, receiver]) store.setConfig({ operatorId: '900', guildId: source.guildId, secretFile });
     state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' });
     receiver.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock'), conductorId: 'target-conductor', repoKey: 'repo:target' });
+    const sourceChild = enrollChild(state, source, '103');
+    const targetChild = enrollChild(receiver, target, '203', '5000');
     const binding = receiver.getBinding(target.channelId);
     const cli = path.resolve(__dirname, '../src/cli.js');
     const args = [cli, 'agent-address', '--db', path.join(dir, 'receiver.sqlite'), '--provider', target.provider,
-      '--channel-id', target.channelId, '--native-id', target.nativeId, '--generation', String(binding.generation)];
+      '--channel-id', target.channelId, '--agent-thread-id', targetChild.channelId,
+      '--native-id', target.nativeId, '--generation', String(binding.generation)];
     const exported = require('node:child_process').spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 5000 });
     assert.equal(exported.status, 0, exported.stderr);
     const envelope = JSON.parse(exported.stdout);
@@ -445,14 +482,15 @@ test('public destination export routes across separate installation databases', 
     fs.writeFileSync(textFile, packet.text);
     let wire;
     const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
-      channelId: source.channelId, provider: source.provider, textFile, dedupeKey: 'remote-target', agentTarget: envelope,
+      channelId: source.channelId, provider: source.provider, agentThreadId: sourceChild.channelId,
+      textFile, dedupeKey: 'remote-target', agentTarget: envelope,
       fetchImpl: async (_url, options) => {
         if (options.method === 'POST') wire = JSON.parse(options.body).content;
         return { ok: true, status: 200, json: async () => options.method === 'GET'
-          ? { id: target.channelId, guild_id: target.guildId } : { id: '5100' } };
+          ? { id: targetChild.channelId, guild_id: target.guildId } : { id: '5100' } };
       } });
     assert.equal(result.status, 'sent');
-    const event = { id: '5100', guildId: target.guildId, channelId: target.channelId, authorId: '901', isBot: true, content: wire, attachments: [] };
+    const event = { id: '5100', guildId: target.guildId, channelId: targetChild.channelId, authorId: '901', isBot: true, content: wire, attachments: [] };
     assert.equal(receiver.acceptDiscordMessage(event, { agentToken: token }).accepted, true);
     assert.equal(receiver.acceptDiscordMessage({ ...event, id: '5101' }, { agentToken: token }).accepted, false);
     assert.equal(receiver.listMessages().length, 1);
@@ -469,6 +507,7 @@ test('public child destination export preserves parent authority across installa
     for (const store of [state, receiver]) store.setConfig({ operatorId: '900', guildId: source.guildId, secretFile });
     state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' });
     receiver.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-child-target.sock', conductorId: 'target-conductor', repoKey: 'repo:target' });
+    const sourceChild = enrollChild(state, source, '105');
     const binding = receiver.getBinding(target.channelId);
     receiver.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId }, binding);
     receiver.setThreadBaseline('103', '5000', binding);
@@ -487,7 +526,8 @@ test('public child destination export preserves parent authority across installa
     fs.writeFileSync(textFile, packet.text);
     let wire;
     const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
-      channelId: source.channelId, provider: source.provider, textFile, dedupeKey: 'remote-child-target', agentTarget: envelope,
+      channelId: source.channelId, provider: source.provider, agentThreadId: sourceChild.channelId,
+      textFile, dedupeKey: 'remote-child-target', agentTarget: envelope,
       fetchImpl: async (_url, options) => {
         if (options.method === 'POST') wire = JSON.parse(options.body).content;
         return { ok: true, status: 200, json: async () => options.method === 'GET'
@@ -510,11 +550,12 @@ test('agent sender rejects a channel outside the declared destination guild befo
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') });
+    const sourceChild = enrollChild(state, source, '103');
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
     const calls = [];
     const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId,
-      provider: source.provider, textFile, dedupeKey: 'guild-check', agentTarget: issueAgentAddress(target, token),
+      provider: source.provider, agentThreadId: sourceChild.channelId, textFile, dedupeKey: 'guild-check', agentTarget: issueAgentAddress(target, token),
       fetchImpl: async (url, options) => {
         calls.push({ url, method: options.method });
         return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: '999' }) };
@@ -531,10 +572,11 @@ test('agent sender retries after a destination lookup failure classified as unse
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
+    const sourceChild = enrollChild(state, source, '103');
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
     const input = { state, token, nativeId: source.nativeId, generation: source.generation, channelId: source.channelId,
-      provider: source.provider, textFile, dedupeKey: 'lookup-retry', agentTarget: issueAgentAddress(target, token) };
+      provider: source.provider, agentThreadId: sourceChild.channelId, textFile, dedupeKey: 'lookup-retry', agentTarget: issueAgentAddress(target, token) };
     let attemptsDuringLookup = null;
     const first = await runDirectPost({ ...input, fetchImpl: async (_url, options) => {
       if (options.method === 'GET') attemptsDuringLookup = state.directPostRows('lookup-retry').filter(row => row.kind === 'direct-post-attempt').length;
@@ -560,18 +602,19 @@ test('agent nonces include source and destination identity', async () => {
     { source, target: { ...target, channelId: '103' } },
     { source: { ...source, channelId: '104' }, target: { ...target, channelId: '102' } }
   ];
-  for (const testCase of cases) {
+  for (const [index, testCase] of cases.entries()) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-nonce-'));
     const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
     try {
       state.setConfig({ operatorId: '900', guildId: testCase.source.guildId, secretFile: path.join(dir, 'secret') });
       state.bind({ ...testCase.source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
       state.bind({ ...testCase.target, workspace: dir, endpoint: path.join(dir, 'target.sock') });
+      const sourceChild = enrollChild(state, testCase.source, String(201 + index));
       const destination = { ...testCase.target, generation: state.getBinding(testCase.target.channelId).generation };
       const textFile = path.join(dir, 'task.txt');
       fs.writeFileSync(textFile, packet.text);
       const result = await runDirectPost({ state, token, nativeId: testCase.source.nativeId, generation: testCase.source.generation,
-        channelId: testCase.source.channelId, provider: testCase.source.provider, textFile, dedupeKey: 'same-key',
+        channelId: testCase.source.channelId, provider: testCase.source.provider, agentThreadId: sourceChild.channelId, textFile, dedupeKey: 'same-key',
         agentTarget: issueAgentAddress(destination, token), fetchImpl: async (url, options) => {
           if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: destination.channelId, guild_id: destination.guildId }) };
           nonces.push(JSON.parse(options.body).nonce);
@@ -590,10 +633,10 @@ test('history consumer verifies credential before durable intake', async () => {
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
-    const destination = { ...target, generation: state.getBinding(target.channelId).generation };
+    const destination = enrollChild(state, target, '103', null);
     const consumer = createSurfaceConsumer({ state, providers: {}, agentCredential: () => token });
     const content = encodeAgentMessage({ ...packet, target: destination }, token);
-    const incoming = { id: '7000', guildId: target.guildId, channelId: target.channelId, author: { id: '901', bot: true }, content };
+    const incoming = { id: '7000', guildId: target.guildId, channelId: destination.channelId, author: { id: '901', bot: true }, content };
     const accepted = await consumer.intakeMessage(incoming, false);
     assert.equal(accepted.accepted, true);
     assert.deepEqual(accepted.message.agentMessage.source, source);
@@ -612,25 +655,43 @@ test('public agent-send command reaches authenticated outbound transport', () =>
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secret });
     state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
     state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') });
+    let sourceBinding = state.getBinding(source.channelId);
+    sourceBinding = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', sourceBinding);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, sourceBinding);
+    state.setThreadBaseline('103', '7000', sourceBinding);
+    state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, sourceBinding);
+    let targetBinding = state.getBinding(target.channelId);
+    targetBinding = state.setBindingReadiness(target.channelId, READINESS.READY, 'fixture ready', targetBinding);
+    state.enrollThread({ threadId: '202', parentChannelId: target.channelId, guildId: target.guildId }, targetBinding);
+    state.setThreadBaseline('202', '7000', targetBinding);
+    state.markThreadBoundary('202', THREAD_STATES.READY, 'fixture adoption', null, null, targetBinding);
     const destination = path.join(dir, 'destination.json');
     const textFile = path.join(dir, 'text.txt');
-    fs.writeFileSync(destination, JSON.stringify(issueAgentAddress(target, token)));
+    fs.writeFileSync(destination, JSON.stringify(issueAgentAddress({ ...target, channelId: '202' }, token)));
     fs.writeFileSync(textFile, 'CLI task');
     const cli = path.resolve(__dirname, '../src/cli.js');
     const argv = [process.execPath, cli, 'agent-send', '--db', db, '--provider', source.provider,
       '--channel-id', source.channelId, '--native-id', source.nativeId, '--generation', '1',
+      '--agent-thread-id', '103',
       '--target-file', destination, '--text-file', textFile, '--dedupe-key', 'cli-1'];
     const script = `process.argv=${JSON.stringify(argv)};
       globalThis.fetch=async(url,options)=>{
         if (options.method === 'GET') {
-          if (!String(url).endsWith('/channels/102')) throw new Error('wrong destination');
-          return {ok:true,status:200,json:async()=>({id:'102',guild_id:'100'})};
+          if (!String(url).endsWith('/channels/202')) throw new Error('wrong destination');
+          return {ok:true,status:200,json:async()=>({id:'202',guild_id:'100'})};
         }
-        if (!String(url).endsWith('/channels/102/messages')) throw new Error('wrong destination');
+        if (!String(url).endsWith('/channels/202/messages')) throw new Error('wrong destination');
         if (!JSON.parse(options.body).content.startsWith('discord-tether:agent:v1:')) throw new Error('unsigned payload');
         return {ok:true,status:200,json:async()=>({id:'8000'})};
       };
       require(${JSON.stringify(cli)}).main().catch(e=>{console.error(e);process.exitCode=1});`;
+    const noChildArgv = argv.filter((value, index) => value !== '--agent-thread-id' && argv[index - 1] !== '--agent-thread-id')
+      .map(value => value === 'cli-1' ? 'cli-no-child' : value);
+    const noChildScript = script.replace(JSON.stringify(argv), JSON.stringify(noChildArgv));
+    const noChild = require('node:child_process').spawnSync(process.execPath, ['-e', noChildScript], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(noChild.status, 1);
+    assert.match(noChild.stderr, /agent messages require --agent-thread-id/);
+    assert.equal(state.directPostRows('cli-no-child').length, 0);
     for (const invalid of [null, false, '', {}, { ...target, generation: 0 }]) {
       fs.writeFileSync(destination, JSON.stringify(invalid));
       const refused = require('node:child_process').spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 5000 });
@@ -638,19 +699,20 @@ test('public agent-send command reaches authenticated outbound transport', () =>
       assert.equal(state.directPostRows('cli-1').length, 0);
       assert.match(refused.stderr, /complete binding address/);
     }
-    fs.writeFileSync(destination, JSON.stringify(issueAgentAddress(target, token)));
+    fs.writeFileSync(destination, JSON.stringify(issueAgentAddress({ ...target, channelId: '202' }, token)));
     const child = require('node:child_process').spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 5000 });
     assert.equal(child.status, 0, child.stderr);
     assert.equal(JSON.parse(child.stdout).status, 'sent');
     assert.equal(state.directPostRows('cli-1').at(-1).detail.messageId, '8000');
 
-    const request = { ...packet, id: 'cli-request', source: target, target: source };
-    assert.equal(state.acceptDiscordMessage({ id: '8050', guildId: source.guildId, channelId: source.channelId,
+    const request = { ...packet, id: 'cli-request', source: { ...target, channelId: '202' }, target: { ...source, channelId: '103' } };
+    assert.equal(state.acceptDiscordMessage({ id: '8050', guildId: source.guildId, channelId: '103',
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token }).accepted, true);
     const replyText = path.join(dir, 'reply.txt');
     fs.writeFileSync(replyText, 'CLI result');
     const replyArgv = [process.execPath, cli, 'agent-send', '--db', db, '--provider', source.provider,
       '--channel-id', source.channelId, '--native-id', source.nativeId, '--generation', '1',
+      '--agent-thread-id', '103',
       '--text-file', replyText, '--dedupe-key', 'cli-result', '--agent-reply-to', request.id];
     const replyScript = script.replace(JSON.stringify(argv), JSON.stringify(replyArgv));
     const reply = require('node:child_process').spawnSync(process.execPath, ['-e', replyScript], { encoding: 'utf8', timeout: 5000 });
@@ -679,6 +741,108 @@ test('public agent-send command reaches authenticated outbound transport', () =>
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('agent routes refuse the parent channel before custody or network access', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-parent-fallback-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    const secretFile = path.join(dir, 'secret');
+    fs.writeFileSync(secretFile, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secretFile });
+    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:source' });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock'), conductorId: 'target-conductor', repoKey: 'repo:target' });
+    const textFile = path.join(dir, 'task.txt');
+    fs.writeFileSync(textFile, packet.text);
+    let fetches = 0;
+    await assert.rejects(runDirectPost({
+      state,
+      token,
+      nativeId: source.nativeId,
+      generation: source.generation,
+      channelId: source.channelId,
+      provider: source.provider,
+      textFile,
+      dedupeKey: 'parent-fallback',
+      agentTarget: issueAgentAddress(target, token),
+      fetchImpl: async () => {
+        fetches += 1;
+        throw new Error('network must not be reached');
+      }
+    }), /agent messages require --agent-thread-id for an actively enrolled child route/);
+    assert.equal(fetches, 0);
+    assert.equal(state.directPostRows('parent-fallback').length, 0);
+    const cli = path.resolve(__dirname, '../src/cli.js');
+    const address = require('node:child_process').spawnSync(process.execPath, [cli, 'agent-address', '--db', path.join(dir, 'surface.sqlite'),
+      '--provider', target.provider, '--channel-id', target.channelId, '--native-id', target.nativeId, '--generation', String(target.generation)], {
+      encoding: 'utf8', timeout: 5000
+    });
+    assert.equal(address.status, 1);
+    assert.match(address.stderr, /agent messages require --agent-thread-id/);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('retries return pre-upgrade parent-sourced outcomes without child migration or resend', async () => {
+  for (const outcome of ['sent', 'unknown']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `agent-legacy-retry-${outcome}-`));
+    const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+    try {
+      state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+      state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+      const requestId = `legacy-${outcome}`;
+      const legacyPacket = { ...packet, id: requestId, source, target };
+      const attempt = {
+        journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, sourcePath: path.join(dir, 'missing.txt'),
+        textHash: crypto.createHash('sha256').update(JSON.stringify(legacyPacket)).digest('hex'), operatorId: '900',
+        partHash: 'legacy-part-hash', channelId: source.channelId, guildId: source.guildId, provider: source.provider,
+        nativeId: source.nativeId, generation: source.generation, conductorId: 'fixture', repoKey: 'repo:fixture',
+        partIndex: 0, partCount: 1, nonce: `${requestId}-nonce`, deliveryChannelId: target.channelId,
+        presentation: 'legacy', agentPacket: legacyPacket, status: 'attempted'
+      };
+      state.receipt(null, 'direct-post-attempt', attempt);
+      state.receipt(null, 'direct-post-outcome', { ...attempt, outcome, ...(outcome === 'sent' ? { messageId: `${requestId}-message` } : {}) });
+      const legacyEnvelope = { address: target, proof: 'A'.repeat(43) };
+      let networkCalls = 0;
+      const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
+        channelId: source.channelId, provider: source.provider, requestId,
+        textFile: path.relative(process.cwd(), path.join(dir, 'missing.txt')),
+        agentTarget: legacyEnvelope, fetchImpl: async () => { networkCalls += 1; throw new Error('legacy retry must not send'); } });
+      assert.equal(result.status, outcome);
+      assert.equal(result.duplicate, outcome === 'sent');
+      assert.deepEqual(result.messageIds, outcome === 'sent' ? [`${requestId}-message`] : []);
+      assert.equal(networkCalls, 0);
+      assert.equal(state.listReceipts().filter(row => row.kind === 'direct-post-attempt' || row.kind === 'direct-post-outcome').length, 2);
+    } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('retryable pre-upgrade custody requires a child route before resend', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-legacy-retryable-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const requestId = 'legacy-not-sent';
+    const legacyPacket = { ...packet, id: requestId, source, target };
+    const attempt = {
+      journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, sourcePath: path.join(dir, 'missing.txt'),
+      textHash: crypto.createHash('sha256').update(JSON.stringify(legacyPacket)).digest('hex'), operatorId: '900',
+      partHash: 'legacy-part-hash', channelId: source.channelId, guildId: source.guildId, provider: source.provider,
+      nativeId: source.nativeId, generation: source.generation, conductorId: 'fixture', repoKey: 'repo:fixture',
+      partIndex: 0, partCount: 1, nonce: `${requestId}-nonce`, deliveryChannelId: target.channelId,
+      presentation: 'legacy', agentPacket: legacyPacket, status: 'attempted'
+    };
+    state.receipt(null, 'direct-post-attempt', attempt);
+    state.receipt(null, 'direct-post-outcome', { ...attempt, outcome: 'not_sent' });
+    let networkCalls = 0;
+    await assert.rejects(runDirectPost({ state, token, nativeId: source.nativeId, generation: source.generation,
+      channelId: source.channelId, provider: source.provider, requestId, textFile: path.join(dir, 'missing.txt'),
+      agentTarget: { address: target, proof: crypto.createHmac('sha256', crypto.createHmac('sha256', token)
+        .update('discord-tether/agent-message/v1').digest()).update(`address/v1\0${JSON.stringify(target)}`).digest('base64url') },
+      fetchImpl: async () => { networkCalls += 1; throw new Error('legacy retry must not reach network'); } }),
+    /agent messages require --agent-thread-id/);
+    assert.equal(networkCalls, 0);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 
 test('invalid destination proof refuses before custody and source revocation during lookup prevents POST', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-proof-'));
@@ -686,11 +850,12 @@ test('invalid destination proof refuses before custody and source revocation dur
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const sourceChild = enrollChild(state, source, '103');
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
     let posts = 0;
     const input = { state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId,
-      provider: source.provider, textFile, dedupeKey: 'proof-check', agentTarget: issueAgentAddress(target, token),
+      provider: source.provider, agentThreadId: sourceChild.channelId, textFile, dedupeKey: 'proof-check', agentTarget: issueAgentAddress(target, token),
       fetchImpl: async (_url, options) => {
         if (options.method === 'POST') posts++;
         state.unbind(source.channelId);
@@ -773,15 +938,16 @@ test('results reverse an accepted request and reject unrelated or unknown correl
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
-    const request = { ...packet, source: target, target: source };
-    const intake = state.acceptDiscordMessage({ id: '8100', guildId: source.guildId, channelId: source.channelId,
+    const sourceChild = enrollChild(state, source, '103');
+    const request = { ...packet, source: target, target: sourceChild };
+    const intake = state.acceptDiscordMessage({ id: '8100', guildId: source.guildId, channelId: sourceChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token) }, { agentToken: token });
     assert.equal(intake.accepted, true);
     const textFile = path.join(dir, 'result.txt');
     fs.writeFileSync(textFile, 'Useful result');
     let calls = 0;
     const input = { state, token, nativeId: source.nativeId, generation: 1, channelId: source.channelId,
-      provider: source.provider, textFile, dedupeKey: 'result-check', agentTarget: request.source,
+      provider: source.provider, agentThreadId: sourceChild.channelId, textFile, dedupeKey: 'result-check', agentTarget: request.source,
       agentKind: KINDS.RESULT, agentReplyTo: request.id,
       fetchImpl: async (_url, options) => {
         calls++;
@@ -794,12 +960,61 @@ test('results reverse an accepted request and reject unrelated or unknown correl
     assert.equal(state.directPostRows('result-check').length, 0);
     assert.equal((await runDirectPost(input)).status, 'sent');
     const resultRows = state.directPostRows('result-check');
-    const resultPacket = { id: 'result-check', kind: KINDS.RESULT, source, target, replyTo: request.id, text: 'Useful result' };
+    const resultPacket = { id: 'result-check', kind: KINDS.RESULT, source: sourceChild, target, replyTo: request.id, text: 'Useful result', routingVersion: 2, sourceParentChannelId: source.channelId };
     assert.deepEqual(resultRows.find(row => row.kind === 'direct-post-attempt').detail.agentPacket, resultPacket);
     assert.deepEqual(resultRows.find(row => row.kind === 'direct-post-outcome').detail.agentPacket, resultPacket);
     assert.equal((await runDirectPost(input)).duplicate, true);
     assert.equal((await runDirectPost({ ...input, dedupeKey: 'result-no-target', agentTarget: null })).status, 'sent');
     assert.equal(calls, 4);
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('results can answer a parent-targeted request accepted before child routing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-result-legacy-parent-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const request = { ...packet, id: 'legacy-parent-request', source: target, target: source };
+    const binding = state.getBinding(source.channelId);
+    const content = encodeAgentMessage(request, token);
+    const timestamp = new Date().toISOString();
+    state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      '8102', request.target.guildId, source.channelId, source.channelId, '901', content, '[]', binding.provider, binding.nativeId,
+      binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+    );
+    state.receipt('8102', 'agent-message', { packet: request, authorId: '901' });
+    state.receipt('8102', 'accepted', { channelId: source.channelId, conductorId: binding.conductorId, generation: binding.generation, readiness: 'ready' });
+    const sourceChild = enrollChild(state, source, '103');
+    const textFile = path.join(dir, 'result.txt');
+    fs.writeFileSync(textFile, 'Legacy result');
+    const calls = [];
+    let wire;
+    const result = await runDirectPost({ state, token, nativeId: source.nativeId, generation: 1,
+      channelId: source.channelId, provider: source.provider, agentThreadId: sourceChild.channelId, textFile,
+      dedupeKey: 'legacy-parent-result', agentKind: KINDS.RESULT, agentReplyTo: request.id,
+      fetchImpl: async (url, options) => {
+        calls.push({ url, method: options.method });
+        if (options.method === 'POST') wire = JSON.parse(options.body).content;
+        return { ok: true, status: 200, json: async () => options.method === 'GET'
+          ? { id: target.channelId, guild_id: target.guildId } : { id: '8202' } };
+      } });
+    assert.equal(result.status, 'sent');
+    assert.equal(calls.length, 2);
+    assert.ok(calls[0].url.endsWith(`/channels/${target.channelId}`));
+    assert.ok(calls[1].url.endsWith(`/channels/${target.channelId}/messages`));
+    assert.deepEqual(decodeAgentMessage(wire, token, target), {
+      id: 'legacy-parent-result', kind: KINDS.RESULT, source: sourceChild, target,
+      replyTo: request.id, text: 'Legacy result', routingVersion: 2, sourceParentChannelId: source.channelId
+    });
+    const postUpgradeRequest = { ...packet, id: 'post-upgrade-parent-request', source: target, target: source };
+    assert.equal(state.acceptDiscordMessage({ id: '8103', guildId: source.guildId, channelId: source.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(postUpgradeRequest, token) }, { agentToken: token }).accepted, false);
+    await assert.rejects(runDirectPost({ state, token, nativeId: source.nativeId, generation: 1,
+      channelId: source.channelId, provider: source.provider, agentThreadId: sourceChild.channelId, textFile,
+      dedupeKey: 'post-upgrade-parent-result', agentKind: KINDS.RESULT, agentReplyTo: postUpgradeRequest.id,
+      fetchImpl: async () => { throw new Error('post-upgrade parent request must not send'); } }), /unknown or does not match/);
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -841,7 +1056,7 @@ test('child result correlation returns to the peer child address', async () => {
     assert.equal(result.status, 'sent');
     assert.deepEqual(decodeAgentMessage(wire, token, peerChild), {
       id: 'result-child', kind: KINDS.RESULT, source: localChild, target: peerChild,
-      replyTo: request.id, text: 'Useful child result'
+      replyTo: request.id, text: 'Useful child result', routingVersion: 2, sourceParentChannelId: source.channelId
     });
     const resultIntake = receiver.acceptDiscordMessage({ id: '8201', guildId: peerChild.guildId, channelId: peerChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: wire }, { agentToken: token });
@@ -849,4 +1064,90 @@ test('child result correlation returns to the peer child address', async () => {
     assert.equal(receiver.getMessage('8201').channelId, target.channelId);
     assert.equal(receiver.getMessage('8201').deliveryChannelId, peerChild.channelId);
   } finally { state.close(); receiver.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI lets a receipt-bound v1 retry reach legacy custody before v2 validation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-cli-legacy-retry-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const secret = path.join(dir, 'secret');
+  const textFile = path.join(dir, 'gone.txt');
+  const destination = path.join(dir, 'destination.json');
+  const state = new SurfaceState(db);
+  try {
+    fs.writeFileSync(secret, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secret });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const requestId = 'cli-legacy-retry';
+    const legacyPacket = { ...packet, id: requestId, source, target };
+    const attempt = {
+      journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, sourcePath: textFile,
+      textHash: crypto.createHash('sha256').update(JSON.stringify(legacyPacket)).digest('hex'), operatorId: '900',
+      partHash: 'legacy-part-hash', channelId: source.channelId, guildId: source.guildId, provider: source.provider,
+      nativeId: source.nativeId, generation: source.generation, conductorId: 'fixture', repoKey: 'repo:fixture',
+      partIndex: 0, partCount: 1, nonce: `${requestId}-nonce`, deliveryChannelId: target.channelId,
+      presentation: 'legacy', agentPacket: legacyPacket, status: 'attempted'
+    };
+    state.receipt(null, 'direct-post-attempt', attempt);
+    state.receipt(null, 'direct-post-outcome', { ...attempt, outcome: 'sent', messageId: `${requestId}-message` });
+    fs.writeFileSync(destination, JSON.stringify({ address: target, proof: 'A'.repeat(43) }));
+  } finally { state.close(); }
+  try {
+    const cli = path.resolve(__dirname, '../src/cli.js');
+    const result = require('node:child_process').spawnSync(process.execPath, [cli, 'agent-send', '--db', db,
+      '--provider', source.provider, '--channel-id', source.channelId, '--native-id', source.nativeId,
+      '--generation', '1', '--target-file', destination, '--text-file', textFile, '--dedupe-key', 'cli-legacy-retry'],
+    { encoding: 'utf8', timeout: 5000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).status, 'sent');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an interrupted v1 retry recovers before v2 validation without posting', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-cli-legacy-interrupted-'));
+  const db = path.join(dir, 'surface.sqlite');
+  const secret = path.join(dir, 'secret');
+  const textFile = path.join(dir, 'gone.txt');
+  const destination = path.join(dir, 'destination.json');
+  const state = new SurfaceState(db);
+  try {
+    fs.writeFileSync(secret, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secret });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    const requestId = 'cli-legacy-interrupted';
+    const legacyPacket = { ...packet, id: requestId, source, target };
+    state.receipt(null, 'direct-post-attempt', {
+      journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, sourcePath: textFile,
+      textHash: crypto.createHash('sha256').update(JSON.stringify(legacyPacket)).digest('hex'), operatorId: '900',
+      partHash: 'legacy-part-hash', channelId: source.channelId, guildId: source.guildId, provider: source.provider,
+      nativeId: source.nativeId, generation: source.generation, conductorId: 'fixture', repoKey: 'repo:fixture',
+      partIndex: 0, partCount: 1, nonce: `${requestId}-nonce`, deliveryChannelId: target.channelId,
+      presentation: 'legacy', agentPacket: legacyPacket, status: 'attempted'
+    });
+    fs.writeFileSync(destination, JSON.stringify({ address: target, proof: 'A'.repeat(43) }));
+  } finally { state.close(); }
+  const methods = [];
+  const printed = [];
+  const previousExitCode = process.exitCode;
+  try {
+    // Public agent-send entrypoint: the v1 destination file must reach legacy custody
+    // recovery instead of failing exact-v2 prevalidation before runDirectPost.
+    const result = await agentSend({ db, provider: source.provider, 'channel-id': source.channelId,
+      'native-id': source.nativeId, generation: '1', 'target-file': destination, 'text-file': textFile,
+      'dedupe-key': 'cli-legacy-interrupted' }, {
+      print: value => printed.push(value),
+      fetchImpl: async (_url, options) => {
+        methods.push(options.method);
+        if (options.method === 'POST') throw new Error('unexpected Discord POST');
+        return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+      }
+    });
+    assert.equal(result.status, 'unknown');
+    assert.equal(printed.length, 1);
+    assert.equal(printed[0].status, 'unknown');
+    assert.equal(process.exitCode, 1);
+    assert.equal(methods.filter(method => method === 'POST').length, 0);
+  } finally {
+    process.exitCode = previousExitCode;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

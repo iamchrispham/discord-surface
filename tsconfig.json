@@ -47,6 +47,7 @@
     "src/decision-canonical.ts",
     "src/decision-present.ts",
     "src/state/decision.ts",
-    "src/state/courier-route/index.ts"
+    "src/state/courier-route/index.ts",
+    "src/state/agent-routing.ts"
   ]
 }

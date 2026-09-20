@@ -15,7 +15,7 @@ if (require.main === module && startup.command === 'courier-guard' && !startup.a
   return;
 }
 
-const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, issueAgentAddress, verifyAgentAddress } = require('./agent-message');
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, issueAgentAddress } = require('./agent-message');
 const { resolveAgentAddress, resolveDedupeKey, resolveDirectBinding, runDirectPost, runWatcherNoticePost } = require('./direct-post');
 const { runBoardRefresh } = require('./board-refresh');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
@@ -132,10 +132,11 @@ Use \"discord-surface agent-send --help\" for addressed agent-message options.
 
 const AGENT_SEND_USAGE = `Usage: discord-surface agent-send --provider PROVIDER --channel-id CHANNEL_ID \\
   --native-id NATIVE_UUID --generation GENERATION --target-file ADDRESS_FILE \\
-  --text-file TEXT_FILE --dedupe-key KEY [--agent-thread-id THREAD_ID] \\
+  --text-file TEXT_FILE --dedupe-key KEY --agent-thread-id THREAD_ID \\
   [--agent-presentation MODE]
 
 For an agent result, use --agent-reply-to REQUEST_ID instead of --target-file.
+Agent requests and results require an actively enrolled child route.
 MODE must be legacy or attachment-v1.
 Agent packets must fit in one Discord message. The limit is ${AGENT_MESSAGE_MAX_ENCODED_LENGTH} encoded characters, including the envelope and signature.
 Usable text varies with envelope metadata, UTF-8 width, and JSON escaping.
@@ -1905,15 +1906,13 @@ function claudeReply(args) {
   return nativeReply(args, 'claude');
 }
 
-async function agentSend(args) {
+async function agentSend(args, dependencies = {}) {
   const provider = required(args, 'provider');
   if (!['codex', 'claude'].includes(provider)) throw new Error('invalid agent provider');
   const { state } = openState(args);
   let ordinary;
-  let agentCredential;
   try {
     ordinary = state.isOrdinaryBindingRecord(state.getBinding(required(args, 'channel-id')));
-    agentCredential = readSecret(state.requireConfig().secretFile);
   }
   finally { state.close(); }
   const isReply = Object.hasOwn(args, 'agent-reply-to');
@@ -1936,14 +1935,16 @@ async function agentSend(args) {
       }
     } finally { fs.closeSync(fd); }
     agentTarget = JSON.parse(Buffer.concat(chunks, bytesRead).toString('utf8'));
-    if (!isReply) verifyAgentAddress(agentTarget, agentCredential);
   } else if (!isReply) {
     required(args, 'target-file');
   }
   return directPost(args, provider, ordinary, {
     agentTarget,
+    agentMode: true,
     agentThreadId: Object.hasOwn(args, 'agent-thread-id') ? args['agent-thread-id'] : null,
-    agentPresentation: args['agent-presentation']
+    agentPresentation: args['agent-presentation'],
+    fetchImpl: dependencies.fetchImpl,
+    print: dependencies.print
   });
 }
 
@@ -1966,6 +1967,7 @@ async function assertOrdinaryPostCaller(state, { provider, nativeId, generation,
 }
 
 async function directPost(args, provider = null, ordinary = false, dependencies = {}) {
+  const output = dependencies.print || print;
   const { paths, state } = openState(args);
   const controller = new AbortController();
   let receivedSignal = null;
@@ -1990,7 +1992,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       const binding = resolveDirectBinding(state, { nativeId, generation: Number(generation), channelId, provider, ordinary });
       const address = resolveAgentAddress(state, binding, dependencies.agentThreadId ?? null);
       const envelope = issueAgentAddress(address, readSecret(config.secretFile));
-      print(envelope);
+      output(envelope);
       return envelope;
     }
     const result = await runDirectPost({
@@ -2006,15 +2008,17 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
       resume,
       stateDir: paths.stateDir,
       agentTarget: dependencies.agentTarget ?? null,
+      agentMode: dependencies.agentMode === true,
       agentPresentation: dependencies.agentPresentation,
       agentKind: hasAgentReplyTo ? 'result' : 'request',
       agentReplyTo: hasAgentReplyTo ? args['agent-reply-to'] : null,
       dedupeKey,
       inReplyTo: args['in-reply-to'],
       signal: controller.signal,
+      fetchImpl: dependencies.fetchImpl,
       ordinary
     });
-    print(result);
+    output(result);
     if (result.status !== 'sent') process.exitCode = 1;
     if (receivedSignal) process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
     return result;
@@ -2384,7 +2388,7 @@ async function main() {
   }
 }
 
-module.exports = { agentComplete, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
+module.exports = { agentComplete, agentSend, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
 
 if (require.main === module) {
   main().catch(error => {

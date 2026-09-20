@@ -587,6 +587,14 @@ belong to the same trusted operator fleet and use the same Discord bot credentia
 The signature proves possession of that credential, not independent native-session
 identity. Agent input is explicitly labeled and grants no operator authority.
 
+Version-2 result packets carry a signed `sourceParentChannelId`, derived from the
+sender's binding after child enrollment is validated. It must differ from the
+source child. This lets a separate receiving installation distinguish an exact
+legacy child reply from a parent-route fallback. Sent or unknown legacy result
+custody is returned without another send or a live child lookup. Activate this
+wire change only through the coordinated fleet release, after receivers support
+this field.
+
 On the receiving installation, export an authenticated address from its active
 binding. This uses the existing ordinary-session or conductor owner checks:
 
@@ -630,7 +638,15 @@ and milestone posts remain excluded. A result may be explicitly sent with
 `--agent-reply-to task-123` and a new dedupe key, using the accepted request
 receipt to recover the original source as its destination. The result command
 may omit `--target-file`; a supplied target file is still checked when present.
-Receiving a packet does not automatically send another packet.
+Receiving a packet does not automatically send another packet. Legacy accepted requests remain answerable from an explicitly
+selected child, including requests recorded after child enrollment. New intake
+receipts record the routing version, so new parent-targeted requests cannot use
+that compatibility path. A known-unsent legacy retry means a matching persisted
+`direct-post-outcome` receipt whose `outcome` is `not_sent`; a
+`direct-post-attempt` without that outcome, a missing outcome, or an `unknown`
+outcome is not known-unsent and is never safe to retry. A known-unsent retry
+keeps its original custody and records the selected child as the new wire
+source. Sent and unknown outcomes remain non-sending on retry.
 Existing native acknowledgment and reply delivery remain separate from intake.
 
 Receiving installations pin the exact destination generation and deduplicate the
@@ -641,3 +657,5 @@ signature cannot be verified with a replacement credential.
 
 This slice is under local validation. No cross-OS or live agent delivery claim is
 made by these examples.
+
+Legacy known-unsent request retries require a freshly exported v2 child destination proof matching the recorded target. A v1 destination does not establish that it is a child and is refused before sending. Terminal sent/unknown recovery still accepts its original recorded identity without resending. Legacy result compatibility uses the latest outcome per attempt, excludes preflight receipts, and matches the exact original child or its signed parent.
