@@ -204,7 +204,8 @@ function hasReadyLegacyChildAtReceipt(
   parent: AgentAddress,
   candidateReceiptId: number,
   candidateDiscordId: string,
-  submittedState: string
+  submittedState: string,
+  submittedTerminalState: string
 ): boolean {
   const enrollment = state.db.prepare(`SELECT json_extract(detail, '$.state') AS state,
       json_extract(detail, '$.adoptedThroughId') AS adoptedThroughId,
@@ -229,6 +230,7 @@ function hasReadyLegacyChildAtReceipt(
     } | undefined;
   if (enrollment?.state !== 'ready') return false;
 
+  // A later adoption baseline must still fence an older candidate result.
   const baseline = state.db.prepare(`SELECT
       json_extract(detail, '$.latestId') AS latestId,
       json_extract(detail, '$.recoveredThroughId') AS recoveredThroughId
@@ -237,9 +239,8 @@ function hasReadyLegacyChildAtReceipt(
       AND json_extract(detail, '$.threadId')=?
       AND json_extract(detail, '$.parentChannelId')=?
       AND (json_extract(detail, '$.guildId')=? OR json_extract(detail, '$.guildId') IS NULL)
-      AND id < ?
     ORDER BY id DESC
-    LIMIT 1`).get(child.channelId, parent.channelId, parent.guildId, candidateReceiptId) as {
+    LIMIT 1`).get(child.channelId, parent.channelId, parent.guildId) as {
       latestId?: unknown;
       recoveredThroughId?: unknown;
     } | undefined;
@@ -337,7 +338,8 @@ function hasReadyLegacyChildAtReceipt(
     FROM messages
     WHERE discord_id=?
     LIMIT 1`).get(candidateDiscordId) as { state?: unknown; held?: unknown } | undefined;
-  if (candidateLifecycle?.held && candidateLifecycle.state !== submittedState) return false;
+  const submittedLifecycleStates = new Set<unknown>([submittedState, submittedTerminalState]);
+  if (candidateLifecycle?.held && !submittedLifecycleStates.has(candidateLifecycle.state)) return false;
 
   const row = state.db.prepare(`SELECT 1 FROM bindings AS binding
     WHERE binding.channel_id=? AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1
@@ -383,7 +385,7 @@ function receivedReplyEvidence(
     const migrated = allowLegacyChildSource && uniqueRequestTarget &&
       isLegacyChildResult(candidate, request, parentTarget,
       hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id), candidateRow.discord_id,
-        deps.MESSAGE_STATES.SUBMITTED));
+        deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST));
     if (!exact && !migrated) continue;
     return {
       kind: 'received-result',

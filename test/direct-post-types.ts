@@ -12,7 +12,7 @@ import {
   type FetchOptions
 } from '../src/direct-post';
 import { AGENT_PRESENTATIONS, type AgentPresentation } from '../src/agent-presentation';
-import type { AgentAddressEnvelope } from '../src/agent-message';
+import type { AgentAddressEnvelope, LegacyAgentAddressEnvelope } from '../src/agent-message';
 
 const binding: DirectPostBinding = {
   active: true,
@@ -89,8 +89,18 @@ const agentInput: DirectPostInput = {
 };
 // @ts-expect-error agent requests and results require an enrolled child route
 const missingAgentThreadInput: DirectPostInput = { ...input, dedupeKey: 'missing-agent-thread', agentTarget };
+// @ts-expect-error agent mode cannot be enabled without an enrolled child route
+const missingAgentModeRouteInput: DirectPostInput = { ...input, dedupeKey: 'missing-agent-mode-route', agentMode: true };
 // @ts-expect-error ordinary direct posts expose only the legacy presentation
 const ordinaryAttachmentInput: DirectPostInput = { ...input, agentPresentation: AGENT_PRESENTATIONS.ATTACHMENT };
+const legacyAgentTarget: LegacyAgentAddressEnvelope = { address: agentTarget.address, proof: agentTarget.proof };
+const legacyRetryInput: DirectPostInput = {
+  ...input,
+  dedupeKey: 'legacy-retry',
+  agentMode: true,
+  agentThreadId: null,
+  agentTarget: legacyAgentTarget
+};
 const dedupeKey: string | undefined = resolveDedupeKey({ dedupeKey: 'request' });
 const requestId: string = requestIdFor(binding, 'operator', sourcePath, 'hash', dedupeKey);
 const resolvedBinding: DirectPostBinding = resolveDirectBinding(state, {
@@ -105,7 +115,9 @@ void result;
 void multipartOptions;
 void agentInput;
 void missingAgentThreadInput;
+void missingAgentModeRouteInput;
 void ordinaryAttachmentInput;
+void legacyRetryInput;
 void incompleteFetchImpl;
 void requestId;
 void resolvedBinding;

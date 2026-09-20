@@ -2150,6 +2150,7 @@ class SurfaceState {
         agent.target.channelId === authorityChannelId &&
         this.db.prepare(`SELECT 1 FROM receipts
           WHERE kind='direct-post-outcome'
+            AND json_extract(detail, '$.outcome') IN (?, ?)
             AND json_extract(detail, '$.legacyAgentPacket.id')=?
             AND json_extract(detail, '$.agentPacket.id')=?
             AND json_extract(detail, '$.agentPacket.replyTo')=?
@@ -2167,14 +2168,12 @@ class SurfaceState {
             AND json_extract(detail, '$.agentPacket.target.nativeId')=?
             AND json_extract(detail, '$.agentPacket.target.generation')=?
           LIMIT 1`).get(
+            DIRECT_POST_OUTCOMES.SENT, DIRECT_POST_OUTCOMES.UNKNOWN,
             agent.id, agent.id, agent.replyTo, agent.kind, AGENT_ROUTING_VERSION, agent.text,
             agent.source.guildId, agent.source.channelId, agent.source.provider, agent.source.nativeId, agent.source.generation,
             agent.target.guildId, agent.target.channelId, agent.target.provider, agent.target.nativeId, agent.target.generation
           );
-      const legacyParentRoute = agent && !enrollment &&
-        agent.target.channelId === authorityChannelId &&
-        agent.routingVersion !== AGENT_ROUTING_VERSION;
-      if (agent && !enrollment && !legacyParentRoute && !legacyCorrelatedResult) {
+      if (agent && !enrollment && !legacyCorrelatedResult) {
         this.receipt(null, 'intake-rejected', {
           discordId: event.id, channelId: authorityChannelId,
           reason: 'agent-child-route-required', ready

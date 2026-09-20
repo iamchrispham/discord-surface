@@ -220,11 +220,11 @@ interface DirectPostInputBase {
   fetchImpl?: FetchImplementation;
   timeoutMs?: number;
   ordinary?: boolean;
-  agentMode?: boolean;
   watcherNotice?: { packet: WatcherNotice; binding: DirectPostBinding } | null;
 }
 
 interface OrdinaryDirectPostInput extends DirectPostInputBase {
+  agentMode?: false;
   agentThreadId?: never;
   agentKind?: Extract<AgentMessageKind, 'request'>;
   agentTarget?: null;
@@ -233,6 +233,7 @@ interface OrdinaryDirectPostInput extends DirectPostInputBase {
 }
 
 interface AgentRequestDirectPostInput extends DirectPostInputBase {
+  agentMode?: boolean;
   agentThreadId: string;
   agentKind?: Extract<AgentMessageKind, 'request'>;
   agentTarget: AgentAddressEnvelope;
@@ -240,7 +241,17 @@ interface AgentRequestDirectPostInput extends DirectPostInputBase {
   agentPresentation?: AgentPresentation;
 }
 
+interface LegacyAgentRequestDirectPostInput extends DirectPostInputBase {
+  agentMode?: boolean;
+  agentThreadId: null;
+  agentKind?: Extract<AgentMessageKind, 'request'>;
+  agentTarget: LegacyAgentAddressEnvelope;
+  agentReplyTo?: null;
+  agentPresentation?: AgentPresentation;
+}
+
 interface AgentResultDirectPostInput extends DirectPostInputBase {
+  agentMode?: boolean;
   agentThreadId: string;
   agentKind: Extract<AgentMessageKind, 'result'>;
   agentTarget?: AgentAddress | AgentAddressEnvelope | null;
@@ -249,6 +260,7 @@ interface AgentResultDirectPostInput extends DirectPostInputBase {
 }
 
 interface LegacyAgentResultDirectPostInput extends DirectPostInputBase {
+  agentMode?: boolean;
   agentThreadId: string;
   agentKind: Extract<AgentMessageKind, 'result'>;
   agentTarget?: LegacyAgentAddressEnvelope | null;
@@ -259,6 +271,7 @@ interface LegacyAgentResultDirectPostInput extends DirectPostInputBase {
 export type DirectPostInput =
   | OrdinaryDirectPostInput
   | AgentRequestDirectPostInput
+  | LegacyAgentRequestDirectPostInput
   | AgentResultDirectPostInput
   | LegacyAgentResultDirectPostInput;
 
