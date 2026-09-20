@@ -249,7 +249,7 @@ interface AgentResultDirectPostInput extends DirectPostInputBase {
 }
 
 interface LegacyAgentResultDirectPostInput extends DirectPostInputBase {
-  agentThreadId?: string;
+  agentThreadId: string;
   agentKind: Extract<AgentMessageKind, 'result'>;
   agentTarget?: LegacyAgentAddressEnvelope | null;
   agentReplyTo: string;
@@ -738,7 +738,13 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     if (terminalLegacyResult === null) legacyPacket = legacy.packet;
   }
   let address = canonicalAddress(binding);
-  if (!watcherNotice && isAgentMessage) address = legacyChildAddress ?? resolveAgentAddress(state, binding, agentThreadId);
+  if (!watcherNotice && isAgentMessage) {
+    const resolvedAddress = resolveAgentAddress(state, binding, agentThreadId);
+    if (legacyChildAddress !== null && !sameAddress(resolvedAddress, legacyChildAddress)) {
+      throw new BindingError('direct post request identity conflicts with existing custody');
+    }
+    address = resolvedAddress;
+  }
   if (watcherNotice) {
     if (agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT || agentReplyTo !== null) {
       throw new BindingError('watcher notices do not accept agent message options');

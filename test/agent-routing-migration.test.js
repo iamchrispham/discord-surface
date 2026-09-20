@@ -123,6 +123,24 @@ test('known-unsent legacy custody moves only the wire source and survives restar
   } finally { reopened.close(); }
 });
 
+test('attemptless legacy preflight custody migrates after child enrollment', async t => {
+  const f = fixture(t);
+  const packet = legacyPost(f, 'not_sent', { id: 'legacy-preflight-only', kind: KINDS.REQUEST, source, target,
+    replyTo: null, text: fs.readFileSync(f.textFile, 'utf8') });
+  const attempt = f.state.directPostRows(packet.id).find(row => row.kind === 'direct-post-attempt').detail;
+  f.state.db.prepare("DELETE FROM receipts WHERE discord_id IS NULL AND kind IN ('direct-post-attempt', 'direct-post-outcome') AND json_extract(detail, '$.requestId')=?")
+    .run(packet.id);
+  f.state.recordDirectPostPreflight(attempt, 'not_sent', { reason: 'legacy preflight only' });
+  enroll(f);
+  const result = await runDirectPost(input(f, { dedupeKey: packet.id, fetchImpl: async (_url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
+    return { ok: true, status: 200, json: async () => ({ id: 'legacy-preflight-migrated' }) };
+  } }));
+  assert.equal(result.status, 'sent');
+  assert.equal(f.state.directPostRows(packet.id).some(row => row.kind === 'direct-post-attempt' &&
+    row.detail.legacyAgentPacket && row.detail.agentPacket?.source.channelId === '103'), true);
+});
+
 test('a retryable migrated request cannot move to another child', async t => {
   const f = fixture(t);
   legacyPost(f);
@@ -146,7 +164,7 @@ test('pre-upgrade child-sourced retry preserves its recorded packet hash', async
     proof: crypto.createHmac('sha256', crypto.createHmac('sha256', token).update('discord-tether/agent-message/v1').digest())
       .update(`address/v1\0${JSON.stringify(target)}`).digest('base64url') };
   let posted;
-  const result = await runDirectPost(input(f, { dedupeKey: packet.id, agentThreadId: null,
+  const result = await runDirectPost(input(f, { dedupeKey: packet.id, agentThreadId: '103',
     agentTarget: legacyTarget, fetchImpl: async (_url, options) => {
       if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: target.channelId, guild_id: target.guildId }) };
       posted = decodeAgentMessage(JSON.parse(options.body).content, token, target);
@@ -154,6 +172,16 @@ test('pre-upgrade child-sourced retry preserves its recorded packet hash', async
     } }));
   assert.equal(result.status, 'sent');
   assert.deepEqual(posted, packet);
+});
+
+test('pre-upgrade child-sourced retry requires an explicit enrolled child', async t => {
+  const f = fixture(t);
+  enroll(f);
+  const child = { ...source, channelId: '103' };
+  const packet = legacyPost(f, 'not_sent', { id: 'legacy-child-requires-route', kind: KINDS.REQUEST, source: child, target,
+    replyTo: null, text: fs.readFileSync(f.textFile, 'utf8') });
+  await assert.rejects(runDirectPost(input(f, { dedupeKey: packet.id, agentThreadId: null,
+    agentTarget: issueAgentAddress(target, token), fetchImpl: async () => { throw new Error('child retry must not send'); } })), /require --agent-thread-id/);
 });
 
 test('pre-upgrade child-sourced retry rejects a forged legacy target proof', async t => {
@@ -378,6 +406,30 @@ test('legacy parent requests reject a result received before child readiness', a
     requestGatewayRecovery: () => ({ requested: false }), print: () => {}
   }), /immutable correlated result/);
   assert.equal(f.state.getMessage('8114').state, MESSAGE_STATES.SUBMITTED);
+});
+
+test('legacy parent requests reject held child results until their message is submitted', async t => {
+  const f = fixture(t);
+  const request = acceptRequest(f, '8116', true);
+  enroll(f);
+  assert.equal(f.state.claimDispatch('8116').claimed, true);
+  f.state.markSubmitted('8116');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8116', nativeId: source.nativeId, generation: 1 });
+  const childResult = { id: 'held-child-result', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
+    replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
+  const intakePacket = { id: childResult.id, kind: childResult.kind, source: target, target: source, replyTo: childResult.replyTo, text: childResult.text };
+  const accepted = f.state.acceptDiscordMessage({ id: childResult.id, guildId: '100', channelId: '101', authorId: '901', isBot: true,
+    content: encodeAgentMessage(intakePacket, token) }, { agentToken: token, ready: false });
+  assert.equal(accepted.accepted, true);
+  f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+    .run(JSON.stringify({ packet: childResult }), childResult.id);
+  assert.equal(f.state.listReceipts().some(row => row.discord_id === childResult.id && row.kind === 'intake-held-not-ready'), true);
+  assert.throws(() => agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8116', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  }), /immutable correlated result/);
+  assert.equal(f.state.getMessage('8116').state, MESSAGE_STATES.SUBMITTED);
 });
 
 test('legacy parent requests reject results received during parent readiness transitions', async t => {

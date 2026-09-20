@@ -87,6 +87,8 @@ const agentInput: DirectPostInput = {
   agentTarget,
   agentPresentation
 };
+// @ts-expect-error agent requests and results require an enrolled child route
+const missingAgentThreadInput: DirectPostInput = { ...input, dedupeKey: 'missing-agent-thread', agentTarget };
 // @ts-expect-error ordinary direct posts expose only the legacy presentation
 const ordinaryAttachmentInput: DirectPostInput = { ...input, agentPresentation: AGENT_PRESENTATIONS.ATTACHMENT };
 const dedupeKey: string | undefined = resolveDedupeKey({ dedupeKey: 'request' });
@@ -102,6 +104,7 @@ const invalidBinding: DirectPostBinding = { ...binding, provider: 'other' };
 void result;
 void multipartOptions;
 void agentInput;
+void missingAgentThreadInput;
 void ordinaryAttachmentInput;
 void incompleteFetchImpl;
 void requestId;

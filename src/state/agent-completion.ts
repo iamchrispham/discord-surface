@@ -203,7 +203,8 @@ function hasReadyLegacyChildAtReceipt(
   child: AgentAddress,
   parent: AgentAddress,
   candidateReceiptId: number,
-  candidateDiscordId: string
+  candidateDiscordId: string,
+  submittedState: string
 ): boolean {
   const enrollment = state.db.prepare(`SELECT json_extract(detail, '$.state') AS state,
       json_extract(detail, '$.adoptedThroughId') AS adoptedThroughId,
@@ -330,6 +331,14 @@ function hasReadyLegacyChildAtReceipt(
     return false;
   }
 
+  const candidateLifecycle = state.db.prepare(`SELECT state,
+      EXISTS(SELECT 1 FROM receipts AS held
+        WHERE held.discord_id=messages.discord_id AND held.kind='intake-held-not-ready') AS held
+    FROM messages
+    WHERE discord_id=?
+    LIMIT 1`).get(candidateDiscordId) as { state?: unknown; held?: unknown } | undefined;
+  if (candidateLifecycle?.held && candidateLifecycle.state !== submittedState) return false;
+
   const row = state.db.prepare(`SELECT 1 FROM bindings AS binding
     WHERE binding.channel_id=? AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1
     LIMIT 1`)
@@ -373,7 +382,8 @@ function receivedReplyEvidence(
     const exact = sameReverseAddresses(candidate, request);
     const migrated = allowLegacyChildSource && uniqueRequestTarget &&
       isLegacyChildResult(candidate, request, parentTarget,
-      hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id), candidateRow.discord_id));
+      hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id), candidateRow.discord_id,
+        deps.MESSAGE_STATES.SUBMITTED));
     if (!exact && !migrated) continue;
     return {
       kind: 'received-result',
