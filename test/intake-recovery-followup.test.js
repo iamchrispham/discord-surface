@@ -365,3 +365,17 @@ test('selected thread recovery reports failure while its route remains held', as
   assert.equal(result.ready, false);
   assert.equal(f.dispatched.length, 0);
 });
+
+for (const kind of ['channel', 'history']) {
+  test(`selected pre-adoption ${kind} 503 remains unresolved without a retry loop`, async t => {
+    const f = fixture(t, { adoptThread: false });
+    f.fail({ kind, id: '2000', status: 503 });
+    const result = await settleRecovery(f.gateway.recoverTransport('selected', f.gateway.lifecycleEpoch, ['2000']));
+    assert.equal(result.ready, false);
+    assert.equal(f.state.getThreadEnrollment('2000').state, 'pending');
+    assert.equal(f.state.getThreadEnrollment('2000').adoptedAt, null);
+    assert.equal(f.calls.filter(c => c.kind === kind && c.id === '2000').length, 1);
+    assert.equal(Boolean(f.gateway.liveCheckpointRetryTimer), false);
+    assert.equal(f.dispatched.length, 0);
+  });
+}

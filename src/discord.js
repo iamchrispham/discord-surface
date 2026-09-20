@@ -2859,14 +2859,12 @@ class DiscordGateway {
         const watermark = this.state.getIntakeWatermark(channelId);
         if (binding?.active && binding.readiness === READINESS.READY && watermark?.state === READINESS.READY) continue;
         const enrollment = this.state.getThreadEnrollment(channelId);
-        if (enrollment?.active && (enrollment.state === THREAD_STATES.READY ||
-            this.isPreAdoptionRetryableThread(enrollment.threadId))) continue;
+        if (enrollment?.active && enrollment.state === THREAD_STATES.READY) continue;
         return false;
       }
       if (expanded === null) {
         for (const enrollment of this.state.listThreadEnrollments()) {
-          if (enrollment.active && enrollment.state !== THREAD_STATES.READY &&
-              !this.isPreAdoptionRetryableThread(enrollment.threadId)) return false;
+          if (enrollment.active && enrollment.state !== THREAD_STATES.READY) return false;
         }
       }
       return true;
