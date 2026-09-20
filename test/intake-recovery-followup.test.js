@@ -334,3 +334,25 @@ for (let hops = 0; hops <= 8; hops++) {
     assert.equal(f.gateway.pendingRecoveryRequests.length, 0);
   });
 }
+
+test('live custody arriving after the ready write is covered before recovery settles', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const original = f.state.markIntakeBoundary.bind(f.state);
+  let injected = false;
+  f.state.markIntakeBoundary = (...args) => {
+    const result = original(...args);
+    if (!injected && args[0] === '1000' && args[1] === 'ready' && result) {
+      injected = true;
+      const message = { ...f.message('101', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+      assert.equal(f.state.acceptDiscordMessage(message, { expectedBinding: f.state.getBinding('1000'), ready: false }).accepted, true);
+      f.history.set('1000', [f.message('101', '1000')]);
+    }
+    return result;
+  };
+  await settleRecovery(f.gateway.recoverTransport('startup'));
+  assert.ok(injected);
+  assert.equal(f.state.getBinding('1000').readiness, 'ready');
+  assert.equal(f.cursor('1000'), '101');
+  assert.equal(f.state.getMessage('101').state, 'accepted');
+  assert.equal(f.dispatched.length, 0);
+});

@@ -2419,6 +2419,9 @@ class DiscordGateway {
       if (currentBoundary?.state === READINESS.UNAVAILABLE &&
           !isRetryableFetchBoundary(currentBoundary.state, currentBoundary.detail)) return READINESS.UNAVAILABLE;
       if (currentBinding?.readiness === READINESS.PENDING || currentBoundary?.state === READINESS.PENDING) return READINESS.PENDING;
+      if (currentBinding?.readiness === READINESS.RECOVERING && currentBoundary?.state === READINESS.READY &&
+          currentBoundary.last_seen_id && (!currentBoundary.recovered_through_id ||
+            compareDiscordIds(currentBoundary.last_seen_id, currentBoundary.recovered_through_id) > 0)) return READINESS.PENDING;
       if (isRetryableFetchBoundary(currentBoundary?.state, currentBoundary?.detail)) return READINESS.PENDING;
       if (currentBoundary?.state === READINESS.UNAVAILABLE) return READINESS.UNAVAILABLE;
       return null;
@@ -2526,6 +2529,7 @@ class DiscordGateway {
         }
         const result = await this.recordBoundary(owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary, ownedReadiness);
         if (result?.watermark) ownedReadiness = result.watermark.state;
+        if (result && !currentRecovery()) queueRecoveryIfPending();
         if (!result) {
           const current = adoptCurrentReadiness();
           if (current?.state === READINESS.READY) return { watermark: current.watermark, concurrentReady: true };
