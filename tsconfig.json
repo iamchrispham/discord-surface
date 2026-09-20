@@ -19,6 +19,7 @@
     "src/ordinary-bind/gateway-capability.ts",
     "src/native-transcript.ts",
     "src/native.ts",
+    "src/native/prompts.ts",
     "src/agent-message.ts",
     "src/watcher-notice.ts",
     "src/agent-presentation.ts",
