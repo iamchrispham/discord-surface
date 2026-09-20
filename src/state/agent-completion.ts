@@ -1,3 +1,4 @@
+import { isLegacyAgentReceipt, isLegacyChildResult } from './agent-routing';
 import {
   KINDS,
   sameAddress,
@@ -54,6 +55,7 @@ interface MessageBindingCheck {
 }
 
 interface AgentMessageProvenance {
+  routingVersion?: unknown;
   packet?: unknown;
 }
 
@@ -137,6 +139,13 @@ function sameReverseAddresses(candidate: AgentMessage, request: AgentMessage): b
     sameAddress(candidate.target, request.source);
 }
 
+function discordIdAfter(candidateId: string, referenceId: string): boolean {
+  if (/^\d+$/.test(candidateId) && /^\d+$/.test(referenceId)) {
+    return BigInt(candidateId) > BigInt(referenceId);
+  }
+  return candidateId !== referenceId;
+}
+
 function receivedResultEvidence(
   state: CompletionState,
   messageId: string,
@@ -153,16 +162,204 @@ function receivedResultEvidence(
   };
 }
 
+function requestProvenanceReceiptId(state: CompletionState, messageId: string): number {
+  const row = state.db.prepare("SELECT MIN(id) AS id FROM receipts WHERE kind='agent-message' AND discord_id=?")
+    .get(messageId) as { id?: number } | undefined;
+  return row && Number.isSafeInteger(row.id) ? Number(row.id) : 0;
+}
+
+function hasUniqueRequestTarget(
+  state: CompletionState,
+  request: AgentMessage,
+  candidateReceiptId: number,
+  requestReceiptId: number
+): boolean {
+  // A reused packet id cannot safely promote a child result across routes.
+  const row = state.db.prepare(`SELECT COUNT(DISTINCT json_extract(detail, '$.packet.target.channelId')) AS count
+    FROM receipts
+    WHERE kind='agent-message'
+      AND json_extract(detail, '$.packet.kind')=?
+      AND json_extract(detail, '$.packet.id')=?
+      AND json_extract(detail, '$.packet.source.guildId')=?
+      AND json_extract(detail, '$.packet.source.channelId')=?
+      AND json_extract(detail, '$.packet.source.provider')=?
+      AND json_extract(detail, '$.packet.source.nativeId')=?
+      AND json_extract(detail, '$.packet.source.generation')=?
+      AND json_extract(detail, '$.packet.target.guildId')=?
+      AND json_extract(detail, '$.packet.target.provider')=?
+      AND json_extract(detail, '$.packet.target.nativeId')=?
+      AND json_extract(detail, '$.packet.target.generation')=?
+      AND (id <= ? OR id = ?)`).get(
+    KINDS.REQUEST, request.id,
+    request.source.guildId, request.source.channelId, request.source.provider, request.source.nativeId, request.source.generation,
+    request.target.guildId, request.target.provider, request.target.nativeId, request.target.generation,
+    candidateReceiptId, requestReceiptId
+  ) as { count?: number } | undefined;
+  return Number(row?.count) === 1;
+}
+
+function hasReadyLegacyChildAtReceipt(
+  state: CompletionState,
+  child: AgentAddress,
+  parent: AgentAddress,
+  candidateReceiptId: number,
+  candidateDiscordId: string,
+  submittedState: string,
+  submittedTerminalState: string
+): boolean {
+  const enrollment = state.db.prepare(`SELECT json_extract(detail, '$.state') AS state,
+      json_extract(detail, '$.adoptedThroughId') AS adoptedThroughId,
+      json_extract(detail, '$.recoveryCutoffId') AS recoveryCutoffId,
+      json_extract(detail, '$.recoveryCutoff') AS recoveryCutoff,
+      json_extract(detail, '$.adoptedThrough.discordId') AS adoptedThroughDiscordId,
+      json_extract(detail, '$.recoveryCutoff.discordId') AS recoveryCutoffDiscordId
+    FROM receipts
+    WHERE kind IN ('thread-enrolled', 'thread-boundary')
+      AND json_extract(detail, '$.threadId')=?
+      AND json_extract(detail, '$.parentChannelId')=?
+      AND (kind='thread-boundary' OR json_extract(detail, '$.guildId')=?)
+      AND id < ?
+    ORDER BY id DESC
+    LIMIT 1`).get(child.channelId, parent.channelId, parent.guildId, candidateReceiptId) as {
+      state?: unknown;
+      adoptedThroughId?: unknown;
+      recoveryCutoffId?: unknown;
+      recoveryCutoff?: unknown;
+      adoptedThroughDiscordId?: unknown;
+      recoveryCutoffDiscordId?: unknown;
+    } | undefined;
+  if (enrollment?.state !== 'ready') return false;
+
+  // A later adoption baseline must still fence an older candidate result.
+  const baseline = state.db.prepare(`SELECT
+      json_extract(detail, '$.latestId') AS latestId,
+      json_extract(detail, '$.recoveredThroughId') AS recoveredThroughId
+    FROM receipts
+    WHERE kind='thread-baseline'
+      AND json_extract(detail, '$.threadId')=?
+      AND json_extract(detail, '$.parentChannelId')=?
+      AND (json_extract(detail, '$.guildId')=? OR json_extract(detail, '$.guildId') IS NULL)
+    ORDER BY id DESC
+    LIMIT 1`).get(child.channelId, parent.channelId, parent.guildId) as {
+      latestId?: unknown;
+      recoveredThroughId?: unknown;
+    } | undefined;
+
+  const adoptionCutoff = [
+    baseline?.latestId,
+    baseline?.recoveredThroughId,
+    enrollment.adoptedThroughId,
+    enrollment.recoveryCutoffId,
+    enrollment.adoptedThroughDiscordId,
+    enrollment.recoveryCutoffDiscordId,
+    enrollment.recoveryCutoff
+  ].find((value): value is string => typeof value === 'string' && value.length > 0 &&
+    !value.startsWith('{') && !value.startsWith('['));
+  if (adoptionCutoff && !discordIdAfter(candidateDiscordId, adoptionCutoff)) return false;
+
+  // Receipt ids monotonically fence readiness changes from the candidate result.
+  const bindingReadiness = state.db.prepare(`SELECT id, kind,
+      json_extract(detail, '$.readiness') AS readiness,
+      json_extract(detail, '$.state') AS state
+    FROM receipts
+    WHERE kind IN (
+      'binding-readiness', 'intake-boundary', 'intake-reconcile-requested',
+      'topic-publication-started', 'topic-publication', 'topic-publication-reconciled',
+      'ordinary-root-relocated', 'legacy-intake-migration', 'rebound', 'unbound',
+      'conductor-handoff', 'bound', 'ordinary-bound'
+    )
+      AND json_extract(detail, '$.channelId')=?
+      AND id < ?
+    ORDER BY id DESC
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number; kind?: unknown; readiness?: unknown; state?: unknown } | undefined;
+  if (bindingReadiness?.readiness !== 'ready' && bindingReadiness?.state !== 'ready') return false;
+
+  // Legacy databases may have crossed a readiness demotion before that
+  // transition was receipt-backed. Only a cutoff following an explicit
+  // non-ready receipt fences that gap; healthy checkpoints do not.
+  const migration = state.db.prepare(`SELECT id FROM receipts
+    WHERE kind='legacy-intake-migration'
+      AND json_extract(detail, '$.channelId')=?
+      AND id < ?
+    ORDER BY id DESC
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number } | undefined;
+  const cutoffReceipt = state.db.prepare(`SELECT
+      id,
+      json_extract(detail, '$.recoveredThroughId') AS recoveredThroughId,
+      json_extract(detail, '$.lastSeenId') AS lastSeenId,
+      json_extract(detail, '$.coverageId') AS coverageId
+    FROM receipts
+    WHERE kind IN ('intake-baseline', 'intake-checkpoint')
+      AND json_extract(detail, '$.channelId')=?
+      AND id < ?
+    ORDER BY id DESC
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as {
+      id?: number;
+      recoveredThroughId?: unknown;
+      lastSeenId?: unknown;
+      coverageId?: unknown;
+    } | undefined;
+  const recoveryCutoff = [
+    cutoffReceipt?.recoveredThroughId,
+    cutoffReceipt?.coverageId,
+    cutoffReceipt?.lastSeenId
+  ].find((value): value is string => typeof value === 'string' && value.length > 0) ?? null;
+  const cutoffReceiptId = cutoffReceipt?.id;
+  const explicitDemotion = state.db.prepare(`SELECT id FROM receipts
+    WHERE kind IN (
+      'binding-readiness', 'intake-boundary', 'intake-reconcile-requested',
+      'topic-publication-started', 'topic-publication', 'topic-publication-reconciled',
+      'ordinary-root-relocated', 'rebound', 'unbound', 'conductor-handoff',
+      'bound', 'ordinary-bound'
+    )
+      AND json_extract(detail, '$.channelId')=?
+      AND id < ?
+      AND (
+        (json_extract(detail, '$.readiness') IS NOT NULL AND json_extract(detail, '$.readiness') <> 'ready')
+        OR (json_extract(detail, '$.state') IS NOT NULL AND json_extract(detail, '$.state') <> 'ready')
+      )
+    ORDER BY id DESC
+    LIMIT 1`).get(parent.channelId, candidateReceiptId) as { id?: number } | undefined;
+  const cutoffFollowsExplicitDemotion = recoveryCutoff !== null &&
+    Number.isSafeInteger(cutoffReceiptId) && Number.isSafeInteger(explicitDemotion?.id) &&
+    Number.isSafeInteger(bindingReadiness?.id) &&
+    Number(explicitDemotion?.id) < Number(cutoffReceiptId) &&
+    Number(cutoffReceiptId) < Number(bindingReadiness?.id);
+  const candidateIsAfterRecoveryCutoff = recoveryCutoff !== null &&
+    candidateDiscordId !== null && discordIdAfter(candidateDiscordId, recoveryCutoff);
+  if ((!migration && cutoffFollowsExplicitDemotion && !candidateIsAfterRecoveryCutoff) || (migration &&
+      (!Number.isSafeInteger(bindingReadiness?.id) || Number(bindingReadiness.id) <= Number(migration.id)))) {
+    return false;
+  }
+
+  const candidateLifecycle = state.db.prepare(`SELECT state,
+      EXISTS(SELECT 1 FROM receipts AS held
+        WHERE held.discord_id=messages.discord_id AND held.kind='intake-held-not-ready') AS held
+    FROM messages
+    WHERE discord_id=?
+    LIMIT 1`).get(candidateDiscordId) as { state?: unknown; held?: unknown } | undefined;
+  const submittedLifecycleStates = new Set<unknown>([submittedState, submittedTerminalState]);
+  if (candidateLifecycle?.held && !submittedLifecycleStates.has(candidateLifecycle.state)) return false;
+
+  const row = state.db.prepare(`SELECT 1 FROM bindings AS binding
+    WHERE binding.channel_id=? AND binding.guild_id=? AND binding.provider=? AND binding.native_id=? AND binding.generation=? AND binding.active=1
+    LIMIT 1`)
+    .get(parent.channelId, parent.guildId, parent.provider, parent.nativeId, parent.generation);
+  return Boolean(row);
+}
+
 function receivedReplyEvidence(
   state: CompletionState,
   request: AgentMessage,
-  deps: AgentCompletionDependencies
+  requestMessageId: string,
+  deps: AgentCompletionDependencies,
+  allowLegacyChildSource: boolean,
+  parentTarget: AgentAddress
 ): Record<string, unknown> | null {
-  const candidateRow = state.db.prepare(`SELECT id, discord_id, detail FROM receipts
+  const candidateRows = state.db.prepare(`SELECT id, discord_id, detail FROM receipts
     WHERE kind='agent-message' AND json_extract(detail, '$.packet.kind')=?
       AND json_extract(detail, '$.packet.replyTo')=?
       AND json_extract(detail, '$.packet.source.guildId')=?
-      AND json_extract(detail, '$.packet.source.channelId')=?
       AND json_extract(detail, '$.packet.source.provider')=?
       AND json_extract(detail, '$.packet.source.nativeId')=?
       AND json_extract(detail, '$.packet.source.generation')=?
@@ -171,28 +368,43 @@ function receivedReplyEvidence(
       AND json_extract(detail, '$.packet.target.provider')=?
       AND json_extract(detail, '$.packet.target.nativeId')=?
       AND json_extract(detail, '$.packet.target.generation')=?
-    ORDER BY id LIMIT 1`).get(
+    ORDER BY id`).all(
     KINDS.RESULT, request.id,
-    request.target.guildId, request.target.channelId, request.target.provider, request.target.nativeId, request.target.generation,
+    request.target.guildId, request.target.provider, request.target.nativeId, request.target.generation,
     request.source.guildId, request.source.channelId, request.source.provider, request.source.nativeId, request.source.generation
-  ) as { id?: number; discord_id?: unknown; detail?: unknown } | undefined;
-  if (!candidateRow || typeof candidateRow.discord_id !== 'string' || !candidateRow.discord_id || !Number.isSafeInteger(candidateRow.id)) return null;
-  const detail = deps.parseJson(candidateRow.detail, null);
-  const candidate = detail?.packet;
-  if (!validAgentPacket(candidate, KINDS.RESULT) || !sameReverseAddresses(candidate, request)) return null;
-  return {
-    kind: 'received-result',
-    receiptId: Number(candidateRow.id),
-    discordId: candidateRow.discord_id,
-    ...agentPacketEvidence(candidate)
-  };
+  ) as Array<{ id?: number; discord_id?: unknown; detail?: unknown }>;
+  for (const candidateRow of candidateRows) {
+    if (typeof candidateRow.discord_id !== 'string' || !candidateRow.discord_id || !Number.isSafeInteger(candidateRow.id)) continue;
+    if (!discordIdAfter(candidateRow.discord_id, requestMessageId)) continue;
+    const detail = deps.parseJson(candidateRow.detail, null);
+    const candidate = detail?.packet;
+    if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
+    const requestReceiptId = requestProvenanceReceiptId(state, requestMessageId);
+    const uniqueRequestTarget = hasUniqueRequestTarget(state, request, Number(candidateRow.id), requestReceiptId);
+    const exact = sameReverseAddresses(candidate, request);
+    const migrated = allowLegacyChildSource && uniqueRequestTarget &&
+      isLegacyChildResult(candidate, request, parentTarget,
+      hasReadyLegacyChildAtReceipt(state, candidate.source, parentTarget, Number(candidateRow.id), candidateRow.discord_id,
+        deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST));
+    if (!exact && !migrated) continue;
+    return {
+      kind: 'received-result',
+      receiptId: Number(candidateRow.id),
+      discordId: candidateRow.discord_id,
+      ...agentPacketEvidence(candidate)
+    };
+  }
+  return null;
 }
 
 function sentReplyEvidence(
   state: CompletionState,
   request: AgentMessage,
   channelId: string,
-  deps: AgentCompletionDependencies
+  deps: AgentCompletionDependencies,
+  allowLegacyChildSource: boolean,
+  parentTarget: AgentAddress,
+  requestReceiptId: number
 ): Record<string, unknown> | null {
   const rows: SentAgentResultRow[] = querySentAgentResultRows({
     db: state.db,
@@ -201,12 +413,21 @@ function sentReplyEvidence(
     assertText: deps.assertText,
     attemptKind: deps.DIRECT_POST_ATTEMPT,
     outcomeKind: deps.DIRECT_POST_OUTCOME
-  }, request, channelId);
+  }, request, channelId, 64, allowLegacyChildSource, requestReceiptId);
   for (const row of rows) {
     const attemptPacket = row.attemptDetail.agentPacket;
     const candidate = row.outcomeDetail.agentPacket;
     if (!validAgentPacket(attemptPacket, KINDS.RESULT) || !validAgentPacket(candidate, KINDS.RESULT) ||
-        !sameAgentPacket(candidate, attemptPacket) || !sameReverseAddresses(candidate, request)) continue;
+        !sameAgentPacket(candidate, attemptPacket)) continue;
+    const recordedTargetsMatch = [row.attemptDetail.agentRequestTarget, row.outcomeDetail.agentRequestTarget]
+      .every((target) => target == null || sameAddress(target, request.target));
+    const exact = sameReverseAddresses(candidate, request) &&
+      (hasUniqueRequestTarget(state, request, row.outcomeReceiptId, requestReceiptId) || recordedTargetsMatch);
+    const migrated = allowLegacyChildSource &&
+      isLegacyChildResult(candidate, request, parentTarget, true) &&
+      isLegacyChildResult(candidate, request, row.attemptDetail.agentRequestTarget, true) &&
+      isLegacyChildResult(candidate, request, row.outcomeDetail.agentRequestTarget, true);
+    if (!exact && !migrated) continue;
     return {
       kind: 'sent-result',
       attemptReceiptId: row.attemptReceiptId,
@@ -302,7 +523,11 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
       if (packet.kind === KINDS.RESULT) {
         evidence = receivedResultEvidence(state, messageId, packet);
       } else {
-        evidence = receivedReplyEvidence(state, packet, deps) || sentReplyEvidence(state, packet, message.channelId, deps);
+        const allowLegacyChildSource = isLegacyAgentReceipt(provenance);
+        const parentTarget = { ...target, channelId: binding.channelId };
+        const provenanceReceiptId = requestProvenanceReceiptId(state, messageId);
+        evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget) ||
+          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacyChildSource, parentTarget, provenanceReceiptId);
         if (!evidence) throw new deps.BindingError('agent request lacks an immutable correlated result');
       }
       const detail = {

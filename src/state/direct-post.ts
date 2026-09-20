@@ -1,4 +1,6 @@
-import type { AgentMessage, AgentProvider } from '../agent-message';
+import { createHash } from 'node:crypto';
+import { isAgentSourcePromotion } from './agent-routing';
+import type { AgentAddress, AgentMessage, AgentProvider } from '../agent-message';
 import type { WatcherNotice } from '../watcher-notice';
 import { DIRECT_POST_FILE_LIMITS, DIRECT_POST_FILE_PHASES, stagedDirectPostFilePath } from '../direct-post-file';
 import type { DirectPostFileManifest, DirectPostFilePreparation } from '../direct-post-file';
@@ -49,6 +51,10 @@ export interface DirectPostPartMeta {
   binding: DirectPostBinding;
   deliveryChannelId?: string;
   agentPacket?: AgentMessage;
+  legacyAgentPacket?: AgentMessage;
+  agentRequestTarget?: AgentAddress;
+  routingVersion?: number;
+  presentation?: string;
   watcherNotice?: WatcherNotice;
   caption?: string;
   fileManifest?: DirectPostFileManifest;
@@ -76,7 +82,7 @@ export interface DirectPostState {
   activeFilePreparationCount?(): number;
   transaction<T>(operation: () => T): T;
   directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
-  directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null): boolean;
+  directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null, deliveryChannelId?: string | null): boolean;
   directPostOwnerIdentity(pid: number): DirectPostOwnerIdentity | null;
   directPostOwnerAlive(pid: number, expectedIdentity: DirectPostOwnerIdentity): boolean;
   receipt(discordId: string | null, kind: string, detail: Record<string, unknown>): void;
@@ -233,7 +239,7 @@ interface DirectPostDependencies {
 
 const identityKeys: readonly (keyof DirectPostPartMeta)[] = [
   'textHash', 'inReplyTo', 'channelId', 'guildId', 'provider', 'nativeId', 'generation',
-  'conductorId', 'repoKey', 'partCount', 'deliveryChannelId', 'agentPacket', 'watcherNotice', 'caption', 'fileManifest'
+  'conductorId', 'repoKey', 'partCount', 'deliveryChannelId', 'agentPacket', 'agentRequestTarget', 'watcherNotice', 'caption', 'fileManifest'
 ];
 
 function identityKeyValueMatches(key: string, left: unknown, right: unknown): boolean {
@@ -250,7 +256,7 @@ function identityValueMatches(left: unknown, right: unknown): boolean {
 
 function assertImmutableDetail(expected: DirectPostPartMeta, detail: Record<string, unknown>, BindingError: DirectPostErrorConstructor): void {
   if (!detail || typeof detail !== 'object' || Array.isArray(detail)) throw new BindingError('direct post outcome detail is invalid');
-  const keys: readonly string[] = [...identityKeys, 'attemptId', 'ownerPid', 'ownerStartTime', 'ownerCommand', 'journal'];
+  const keys: readonly string[] = [...identityKeys, 'legacyAgentPacket', 'attemptId', 'ownerPid', 'ownerStartTime', 'ownerCommand', 'journal'];
   for (const key of keys) {
     if (!Object.hasOwn(detail, key)) continue;
     const expectedValue = key === 'journal' ? 'direct-post-v1' : (expected as unknown as Record<string, unknown>)[key];
@@ -369,7 +375,9 @@ export function querySentAgentResultRows(
   { db, parseJson, attemptKind, outcomeKind }: DirectPostQueryDependencies,
   request: AgentMessage,
   channelId: string,
-  limit = 64
+  limit = 64,
+  allowLegacyChildSource = false,
+  requestReceiptId = 0
 ): SentAgentResultRow[] {
   const source = request.target;
   const target = request.source;
@@ -400,14 +408,31 @@ export function querySentAgentResultRows(
     "json_extract(attempt.detail, '$.channelId')=?"
   ];
   const parameters: unknown[] = [outcomeKind, attemptKind, channelId];
+  if (Number.isSafeInteger(requestReceiptId) && requestReceiptId > 0) {
+    clauses.push('outcome.id > ?');
+    parameters.push(requestReceiptId);
+  }
   for (const [field, value] of packetFields) {
+    if (allowLegacyChildSource && field === 'source.channelId') {
+      const requestTargetFields = packetFields.filter(([key]) => key.startsWith('source.'));
+      for (const receipt of ['attempt', 'outcome']) {
+        const sourceChannel = `json_extract(${receipt}.detail, '$.agentPacket.source.channelId')`;
+        const requestTarget = `json_extract(${receipt}.detail, '$.agentRequestTarget')`;
+        const originalTarget = requestTargetFields.map(([key]) =>
+          `json_extract(${receipt}.detail, '$.agentRequestTarget.${key.slice('source.'.length)}')=?`);
+        clauses.push(`(${sourceChannel}=? OR (${sourceChannel}<>? AND (${requestTarget} IS NULL OR ${originalTarget.join(' AND ')})))`);
+        parameters.push(value, value, ...requestTargetFields.map(([, targetValue]) => targetValue));
+      }
+      clauses.push("json_extract(attempt.detail, '$.agentPacket.source.channelId')=json_extract(outcome.detail, '$.agentPacket.source.channelId')");
+      continue;
+    }
     clauses.push(`json_extract(attempt.detail, '$.agentPacket.${field}')=?`);
     parameters.push(value);
     clauses.push(`json_extract(outcome.detail, '$.agentPacket.${field}')=?`);
     parameters.push(value);
   }
   const boundedLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 64) : 64;
-  const rows = db.prepare(`SELECT attempt.id AS attempt_receipt_id, outcome.id AS outcome_receipt_id,
+  const query = `SELECT attempt.id AS attempt_receipt_id, outcome.id AS outcome_receipt_id,
       outcome.detail AS outcome_detail, attempt.detail AS attempt_detail
     FROM receipts AS attempt
     JOIN receipts AS outcome
@@ -415,7 +440,15 @@ export function querySentAgentResultRows(
      AND outcome.kind=?
      AND json_extract(outcome.detail, '$.attemptId')=json_extract(attempt.detail, '$.attemptId')
     WHERE ${clauses.filter(clause => clause !== 'outcome.kind=?').join(' AND ')}
-    ORDER BY outcome.id DESC LIMIT ?`).all(parameters[0], ...parameters.slice(1), boundedLimit) as RawAgentResultRow[];
+    ORDER BY outcome.id DESC LIMIT ? OFFSET ?`;
+  const rows: RawAgentResultRow[] = [];
+  let offset = 0;
+  while (true) {
+    const page = db.prepare(query).all(parameters[0], ...parameters.slice(1), boundedLimit, offset) as RawAgentResultRow[];
+    rows.push(...page);
+    if (!allowLegacyChildSource || page.length < boundedLimit) break;
+    offset += page.length;
+  }
   return rows.flatMap(row => {
     const attemptDetail = parseJson(row.attempt_detail, null);
     const outcomeDetail = parseJson(row.outcome_detail, null);
@@ -458,20 +491,79 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     now
   } = dependencies;
 
-  function inspectPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null {
-    const rows = state.directPostRows(meta.requestId);
-    for (const row of rows) {
-      for (const key of identityKeys) {
-        if (!identityKeyValueMatches(key, row.detail[key], meta[key])) throw new BindingError('direct post request identity conflicts with existing custody');
+  function normalizedIdentity(detail: DirectPostReceiptDetail): DirectPostReceiptDetail {
+    const original = detail.legacyAgentPacket;
+    if (!isAgentSourcePromotion(original, detail.agentPacket, String(detail.channelId))) return detail;
+    return { ...detail, agentPacket: original, agentRequestTarget: undefined,
+      textHash: createHash('sha256').update(JSON.stringify(original)).digest('hex') };
+  }
+
+  function normalizedLegacyRow(detail: DirectPostReceiptDetail, original: AgentMessage | undefined, channelId: string): DirectPostReceiptDetail {
+    if (!original || (!identityValueMatches(detail.agentPacket, original) && !isAgentSourcePromotion(original, detail.agentPacket, channelId))) {
+      return normalizedIdentity(detail);
+    }
+    return { ...normalizedIdentity(detail), textHash: createHash('sha256').update(JSON.stringify(original)).digest('hex') };
+  }
+
+  function assertRequestIdentity(rows: DirectPostReceiptRow[], meta: DirectPostPartMeta): void {
+    if (meta.legacyAgentPacket) {
+      if (!isAgentSourcePromotion(meta.legacyAgentPacket, meta.agentPacket, meta.channelId) ||
+          !rows.some(row => identityValueMatches(normalizedIdentity(row.detail).agentPacket, meta.legacyAgentPacket))) {
+        throw new BindingError('direct post source migration lacks matching legacy custody');
+      }
+      const prior = rows.find(row => row.detail.legacyAgentPacket);
+      if (prior && !identityValueMatches(prior.detail.agentPacket, meta.agentPacket)) {
+        throw new BindingError('direct post request identity conflicts with existing custody');
       }
     }
-    if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
+    const incoming = normalizedIdentity(meta as unknown as DirectPostReceiptDetail);
+    for (const row of rows) {
+      const existing = normalizedLegacyRow(row.detail, meta.legacyAgentPacket, meta.channelId);
+      for (const key of identityKeys) {
+        if (!identityKeyValueMatches(key, existing[key], incoming[key])) {
+          throw new BindingError('direct post request identity conflicts with existing custody');
+        }
+      }
+    }
+  }
+
+  function inspectPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null {
+    const rows = state.directPostRows(meta.requestId);
+    assertRequestIdentity(rows, meta);
     const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
+    const preflights = rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.partIndex === meta.partIndex &&
+      row.detail.phase === 'preflight').sort((a, b) => a.id - b.id);
     const outcomes = new Map<unknown, DirectPostReceiptRow>(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId)
       .map(row => [row.detail.attemptId, row]));
     const latest = attempts.at(-1);
-    if (!latest) return null;
+    const latestAttemptOutcome = latest ? outcomes.get(latest.detail.attemptId) : undefined;
+    const latestConfirmedOutcome = Array.from(outcomes.values()).filter(row => row.detail.partIndex === meta.partIndex && row.detail.phase !== 'preflight' &&
+      ['sent', 'unknown'].includes(row.detail.outcome as string)).sort((a, b) => a.id - b.id).at(-1);
+    const assertParentCurrent = (): void => {
+      if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
+    };
+    const assertRouteCurrent = (): void => {
+      if (!state.directPostBindingCurrent(meta.binding, meta.operatorId, meta.agentPacket?.source.channelId)) {
+        throw new StaleGenerationError('direct post binding is stale');
+      }
+    };
+    const latestPreflight = preflights.at(-1);
+    if (latestPreflight && !latestConfirmedOutcome && (!latest || (latestPreflight.id > latest.id &&
+      (!latestAttemptOutcome || latestPreflight.id > latestAttemptOutcome.id)))) {
+      const status = latestPreflight.detail.outcome as string;
+      const retryableRateLimit = status === 'rate_limited' && !meta.legacyAgentPacket;
+      const retryableStale = status === 'stale' && !meta.legacyAgentPacket;
+      if (status !== 'not_sent' && !retryableRateLimit && !retryableStale) {
+        assertRouteCurrent();
+        return { claimed: false, status, attemptId: meta.attemptId, nonce: meta.nonce, outcome: latestPreflight.detail };
+      }
+    }
+    if (!latest) {
+      assertRouteCurrent();
+      return null;
+    }
     const outcome = outcomes.get(latest.detail.attemptId);
+    assertParentCurrent();
     if (!outcome) return { claimed: false, status: 'in_flight', attemptId: latest.detail.attemptId as string, nonce: latest.detail.nonce as string };
     const status = outcome.detail.outcome as string;
     if (status === 'sent' || status === 'unknown') {
@@ -480,6 +572,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     if (!['not_sent', 'rejected', 'rate_limited', 'stale'].includes(status)) {
       return { claimed: false, status, attemptId: latest.detail.attemptId as string, nonce: latest.detail.nonce as string, outcome: outcome.detail };
     }
+    assertRouteCurrent();
     return null;
   }
 
@@ -528,11 +621,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       assertImmutableDetail(meta, detail, BindingError);
       return state.transaction(() => {
         const rows = state.directPostRows(meta.requestId);
-        for (const row of rows) {
-          for (const key of identityKeys) {
-            if (!identityKeyValueMatches(key, row.detail[key], meta[key])) throw new BindingError('direct post request identity conflicts with existing custody');
-          }
-        }
+        assertRequestIdentity(rows, meta);
         const { attemptId: _attemptId, ...preflightMeta } = meta;
         const next = { journal: 'direct-post-v1', ...preflightMeta, ...detail, phase: 'preflight', outcome };
         state.receipt(null, DIRECT_POST_OUTCOME, next);

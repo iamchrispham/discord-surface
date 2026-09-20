@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { encodeAgentMessage, KINDS } = require('../src/agent-message');
+const { encodeAgentMessage, decodeAgentMessage, KINDS } = require('../src/agent-message');
 const { ChannelType, Collection } = require('discord.js');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -17,6 +17,15 @@ const source = { guildId: '100', channelId: '101', provider: 'codex', nativeId: 
 const target = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222', generation: 2 };
 const packet = { id: 'work-1', kind: KINDS.REQUEST, source, target, replyTo: null, text: 'Inspect the reported failure. Do not change ownership.' };
 const token = 'isolated-test-credential';
+
+// Parent recovery still handles results whose immutable custody predates child routing.
+function encodeLegacyParentResult(state, value, credential) {
+  const result = { ...value, kind: KINDS.RESULT, replyTo: `request-${value.id}`, routingVersion: 2 };
+  state.receipt(null, 'direct-post-outcome', {
+    outcome: 'sent', legacyAgentPacket: { ...result, routingVersion: undefined }, agentPacket: result
+  });
+  return encodeAgentMessage(result, credential);
+}
 
 async function waitForCondition(predicate, message, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs;
@@ -95,7 +104,7 @@ test('Discord omitted attachment MIME reaches signed packet intake', async t => 
   const binding = state.getBinding(target.channelId);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
   const destination = { ...target, generation: binding.generation };
-  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const wire = encodeLegacyParentResult(state, { ...packet, target: destination }, token);
   let fetchCalls = 0;
   let credentialCalls = 0;
   const consumer = createSurfaceConsumer({
@@ -269,7 +278,7 @@ test('live attachment failure with no cursor recovers the failed packet', async 
   const binding = state.getBinding(target.channelId);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
   const destination = { ...target, generation: binding.generation };
-  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const wire = encodeLegacyParentResult(state, { ...packet, target: destination }, token);
   const message = {
     id: '7000', guildId: destination.guildId, channelId: destination.channelId,
     author: { id: '901', bot: true }, content: 'readable preview',
@@ -590,8 +599,8 @@ test('live attachment failure fences later same-channel intake until recovery', 
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
   const destination = { ...target, generation: binding.generation };
-  const firstWire = encodeAgentMessage({ ...packet, target: destination }, token);
-  const secondWire = encodeAgentMessage({ ...packet, id: 'work-2', target: destination }, token);
+  const firstWire = encodeLegacyParentResult(state, { ...packet, target: destination }, token);
+  const secondWire = encodeLegacyParentResult(state, { ...packet, id: 'work-2', target: destination }, token);
   const makeMessage = (id, url, size) => ({
     id, guildId: destination.guildId, channelId: destination.channelId,
     author: { id: '901', bot: true }, content: 'readable preview',
@@ -708,8 +717,8 @@ test('live attachment normalization preserves channel order', async t => {
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
   const destination = { ...target, generation: binding.generation };
-  const wireOne = encodeAgentMessage({ ...packet, target: destination }, token);
-  const wireTwo = encodeAgentMessage({ ...packet, id: 'work-2', target: destination }, token);
+  const wireOne = encodeLegacyParentResult(state, { ...packet, target: destination }, token);
+  const wireTwo = encodeLegacyParentResult(state, { ...packet, id: 'work-2', target: destination }, token);
   let firstStarted;
   const firstStartedPromise = new Promise(resolve => { firstStarted = resolve; });
   let releaseFirst;
@@ -805,7 +814,7 @@ test('accepted attachment duplicate skips CDN fetch and advances intake coverage
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(destination.channelId, 'ready', null, null, null, binding);
-  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const wire = encodeLegacyParentResult(state, { ...packet, target: destination }, token);
   const message = {
     id: '7000', guildId: destination.guildId, channelId: destination.channelId,
     author: { id: '901', bot: true }, content: 'Agent request from codex to claude: Inspect the reported failure.',
@@ -845,7 +854,7 @@ test('attachment intake stays outside coverage until refreshed recovery, then na
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(destination.channelId, 'ready', null, null, null, binding);
-  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const wire = encodeLegacyParentResult(state, { ...packet, target: destination }, token);
   const attachment = {
     url: 'https://cdn.discordapp.com/attachments/100/102/agent-message.tether',
     filename: 'agent-message.tether',
@@ -922,7 +931,7 @@ test('attachment intake stays outside coverage until refreshed recovery, then na
   assert.equal(fetchAttempts, 2);
   assert.equal(state.getMessage(agentMessage.id).content, wire);
   assert.deepEqual(state.getMessage(agentMessage.id).attachments, []);
-  assert.deepEqual(state.getMessage(agentMessage.id).agentMessage, { ...packet, target: destination });
+  assert.deepEqual(state.getMessage(agentMessage.id).agentMessage, decodeAgentMessage(wire, token, destination));
   assert.equal(state.listReceipts().filter(row => row.kind === 'agent-message').length, 1);
   assert.ok(messageRequest(state.getMessage(agentMessage.id)).includes(packet.text));
 
@@ -968,7 +977,7 @@ test('live attachment recovery reconciles accepted packet to native provider', a
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(destination.channelId, 'ready', null, null, null, binding);
-  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const wire = encodeLegacyParentResult(state, { ...packet, target: destination }, token);
   const message = {
     id: '7000', guildId: destination.guildId, channelId: destination.channelId,
     author: { id: '901', bot: true }, content: 'readable preview',
@@ -1082,7 +1091,7 @@ test('held-ready attachment recovery fences later same-channel admission until h
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(destination.channelId, 'ready', null, null, null, binding);
-  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const wire = encodeLegacyParentResult(state, { ...packet, target: destination }, token);
   const message = {
     id: '7000', guildId: destination.guildId, channelId: destination.channelId,
     author: { id: '901', bot: true }, content: 'readable preview',
@@ -1184,7 +1193,7 @@ test('live attachment readiness drop during download holds durable intake and sk
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(destination.channelId, 'ready', null, null, null, binding);
-  const wire = encodeAgentMessage({ ...packet, target: destination }, token);
+  const wire = encodeLegacyParentResult(state, { ...packet, target: destination }, token);
   const message = {
     id: '7000', guildId: destination.guildId, channelId: destination.channelId,
     author: { id: '901', bot: true }, content: 'readable preview',
@@ -1400,7 +1409,7 @@ test('live stale attachment failure releases obsolete generation barrier before 
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
   const firstTarget = { ...target, nativeId: binding.nativeId, generation: binding.generation };
   const successorNativeId = '33333333-3333-3333-3333-333333333333';
-  const firstWire = encodeAgentMessage({ ...packet, target: firstTarget }, token);
+  const firstWire = encodeLegacyParentResult(state, { ...packet, target: firstTarget }, token);
   let fetchAttempts = 0;
   const fetchUrls = [];
   let successorWire;
@@ -1468,7 +1477,7 @@ test('live stale attachment failure releases obsolete generation barrier before 
   const successor = state.rebind({ ...binding, nativeId: successorNativeId });
   state.markIntakeBoundary(successor.channelId, 'ready', null, null, null, successor);
   const successorTarget = { ...target, nativeId: successor.nativeId, generation: successor.generation };
-  successorWire = encodeAgentMessage({ ...packet, id: 'work-2', target: successorTarget }, token);
+  successorWire = encodeLegacyParentResult(state, { ...packet, id: 'work-2', target: successorTarget }, token);
   const successorMessage = {
     id: '7001',
     guildId: successor.guildId,
@@ -1669,7 +1678,7 @@ async function createStaleBarrierScenario({ holdBoundary = false, holdRecovery =
   const binding = state.getBinding(target.channelId);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
-  const firstWire = encodeAgentMessage({ ...packet, target: { ...target, nativeId: binding.nativeId, generation: binding.generation } }, token);
+  const firstWire = encodeLegacyParentResult(state, { ...packet, target: { ...target, nativeId: binding.nativeId, generation: binding.generation } }, token);
   const firstMessage = {
     id: '7000',
     guildId: binding.guildId,
@@ -1749,7 +1758,7 @@ async function createStaleBarrierScenario({ holdBoundary = false, holdRecovery =
     const successor = state.rebind({ ...binding, nativeId: '33333333-3333-3333-3333-333333333333' });
     if (ready) state.markIntakeBoundary(successor.channelId, 'ready', null, null, null, successor);
     const successorTarget = { ...target, nativeId: successor.nativeId, generation: successor.generation };
-    successorWire = encodeAgentMessage({ ...packet, id: 'work-2', target: successorTarget }, token);
+    successorWire = encodeLegacyParentResult(state, { ...packet, id: 'work-2', target: successorTarget }, token);
     return {
       successor,
       message: {

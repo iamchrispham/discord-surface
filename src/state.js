@@ -1,4 +1,5 @@
 const { PREFIX: AGENT_PREFIX, decodeAgentMessage } = require('./agent-message');
+const { AGENT_ROUTING_VERSION } = require('./state/agent-routing');
 const { WATCHER_NOTICE_PREFIX, decodeWatcherNotice, sameWatcherNotice, validateWatcherNotice } = require('./watcher-notice');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -1783,8 +1784,11 @@ class SurfaceState {
     if (!ready) {
       const binding = this.getBinding(event.channelId);
       if (binding?.active && binding.guildId === event.guildId) {
-        this.db.prepare("UPDATE bindings SET readiness='recovering', updated_at=? WHERE channel_id=? AND active=1 AND readiness='ready'")
+        const updated = this.db.prepare("UPDATE bindings SET readiness='recovering', updated_at=? WHERE channel_id=? AND active=1 AND readiness='ready'")
           .run(now(), event.channelId);
+        if (Number(updated.changes) === 1) {
+          this.receipt(null, 'binding-readiness', { channelId: event.channelId, readiness: READINESS.RECOVERING });
+        }
       }
     }
   }
@@ -2144,6 +2148,40 @@ class SurfaceState {
           return { accepted: false, duplicate: true, reason: 'watcher-notice-duplicate', message: this.getMessage(prior.messageId) };
         }
       }
+      const legacyCorrelatedResult = agent && agent.kind === 'result' && !enrollment &&
+        agent.target.channelId === authorityChannelId &&
+        this.db.prepare(`SELECT 1 FROM receipts
+          WHERE kind='direct-post-outcome'
+            AND json_extract(detail, '$.outcome') IN (?, ?)
+            AND json_extract(detail, '$.legacyAgentPacket.id')=?
+            AND json_extract(detail, '$.agentPacket.id')=?
+            AND json_extract(detail, '$.agentPacket.replyTo')=?
+            AND json_extract(detail, '$.agentPacket.kind')=?
+            AND json_extract(detail, '$.agentPacket.routingVersion')=?
+            AND json_extract(detail, '$.agentPacket.text')=?
+            AND json_extract(detail, '$.agentPacket.source.guildId')=?
+            AND json_extract(detail, '$.agentPacket.source.channelId')=?
+            AND json_extract(detail, '$.agentPacket.source.provider')=?
+            AND json_extract(detail, '$.agentPacket.source.nativeId')=?
+            AND json_extract(detail, '$.agentPacket.source.generation')=?
+            AND json_extract(detail, '$.agentPacket.target.guildId')=?
+            AND json_extract(detail, '$.agentPacket.target.channelId')=?
+            AND json_extract(detail, '$.agentPacket.target.provider')=?
+            AND json_extract(detail, '$.agentPacket.target.nativeId')=?
+            AND json_extract(detail, '$.agentPacket.target.generation')=?
+          LIMIT 1`).get(
+            'sent', 'unknown',
+            agent.id, agent.id, agent.replyTo, agent.kind, AGENT_ROUTING_VERSION, agent.text,
+            agent.source.guildId, agent.source.channelId, agent.source.provider, agent.source.nativeId, agent.source.generation,
+            agent.target.guildId, agent.target.channelId, agent.target.provider, agent.target.nativeId, agent.target.generation
+          );
+      if (agent && !enrollment && !legacyCorrelatedResult) {
+        this.receipt(null, 'intake-rejected', {
+          discordId: event.id, channelId: authorityChannelId,
+          reason: 'agent-child-route-required', ready
+        });
+        return this.reject('agent-child-route-required');
+      }
       if (this.failNextIntakeFlag) {
         this.failNextIntakeFlag = false;
         throw new Error('injected intake transaction failure');
@@ -2162,7 +2200,7 @@ class SurfaceState {
             .run(event.id, timestamp, authorityChannelId);
         }
       }
-      if (agent) this.receipt(event.id, 'agent-message', { packet: agent, authorId: event.authorId });
+      if (agent) this.receipt(event.id, 'agent-message', { packet: agent, authorId: event.authorId, routingVersion: AGENT_ROUTING_VERSION });
       if (notice) {
         this.receipt(event.id, WATCHER_NOTICE_RECEIPTS.PROVENANCE, {
           journal: WATCHER_NOTICE_JOURNAL, packet: notice, authorId: event.authorId,
