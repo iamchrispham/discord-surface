@@ -18,6 +18,7 @@ const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { DIRECT_POST_FILE_LIMITS, readDirectPostFileSnapshot } = require('./direct-post-file');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
+const { isPreAdoptionRetryableThread, isRetryableFetchBoundary, recoveryFetch } = require('./discord/recovery-fetch');
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer } = require('./discord/decision');
@@ -29,6 +30,7 @@ const LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS = 1000;
 const LIVE_CHECKPOINT_RETRY_MAX_DELAY_MS = 30_000;
 const PENDING_HANDOFF_RECOVERY_POLL_MS = 100;
 const INTERACTION_CALLBACK_TIMEOUT_MS = 2500;
+const RECOVERY_WAITER_DEADLINE_GRACE_MS = 250;
 const INTERACTION_REJECTION_MESSAGES = Object.freeze({
   'inactive-binding': 'This channel is not connected to an active status session.',
   'binding-not-ready': 'The status session is still recovering. Try again shortly.',
@@ -1210,7 +1212,11 @@ class DiscordGateway {
     this.decisionRecoveryPromise = null;
     this.decisionRecoveryController = null;
     this.recoveryFollowupPromise = null;
+    this.recoveryFollowupScope = null;
+    this.recoveryActiveWaiters = new Set();
+    this.recoveryRetryScheduledChannels = new Set();
     this.pendingRecoveryChannels = new Set();
+    this.pendingRecoveryRequests = [];
     this.pendingFullRecovery = false;
     this.liveCheckpointController = null;
     this.liveCheckpointPromise = null;
@@ -1529,8 +1535,14 @@ class DiscordGateway {
     if (!stored?.deliveryChannelId || stored.deliveryChannelId === stored.channelId) return;
     const binding = this.state.getBinding(stored.channelId);
     if (!bindingIdentityMatches(stored, binding)) return;
-    this.state.markThreadBoundary(stored.deliveryChannelId, THREAD_STATES.UNAVAILABLE,
-      error.message, null, null, binding);
+    const enrollment = this.state.getThreadEnrollment(stored.deliveryChannelId);
+    if (!enrollment) return;
+    const retryableBoundary = isRetryableFetchBoundary(enrollment.state, enrollment.detail);
+    const retryableFetch = isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, error.message);
+    if (['gap', 'unavailable'].includes(enrollment.state) && !retryableBoundary) return;
+    const nextState = !enrollment.adoptedAt && retryableFetch ? THREAD_STATES.PENDING : THREAD_STATES.UNAVAILABLE;
+    this.state.markThreadBoundary(stored.deliveryChannelId, nextState,
+      error.message, null, null, binding, undefined, undefined, enrollment);
   }
 
   async threadDeliveryMessage(message) {
@@ -1542,7 +1554,7 @@ class DiscordGateway {
     let channel;
     try {
       channel = message.channel?.id === stored.deliveryChannelId ? message.channel :
-        await this.client.channels.fetch(stored.deliveryChannelId);
+        await recoveryFetch(() => this.client.channels.fetch(stored.deliveryChannelId));
       assertPublicThread(channel, binding, stored.deliveryChannelId, this.client.user);
     }
     catch (error) {
@@ -1843,15 +1855,15 @@ class DiscordGateway {
     return historyPermission(channel, this.client.user, requireSend);
   }
 
-  async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null) {
+  async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null, deadline = null, expectedBoundary = undefined, expectedReadiness = undefined) {
     if (signal?.aborted || !this.isCurrentBinding(binding)) return null;
     let watermark;
     try {
-      watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo, binding);
+      watermark = this.state.markIntakeBoundary(binding.channelId, state, detail, gapFrom, gapTo, binding, null, expectedBoundary, expectedReadiness);
     } catch (error) {
       if (!(error instanceof UnresolvedWorkError) || state !== 'ready') throw error;
       const blockedDetail = `${detail}; legacy topic migration custody is unresolved`;
-      watermark = this.state.markIntakeBoundary(binding.channelId, READINESS.UNAVAILABLE, blockedDetail, gapFrom, gapTo, binding);
+      watermark = this.state.markIntakeBoundary(binding.channelId, READINESS.UNAVAILABLE, blockedDetail, gapFrom, gapTo, binding, null, expectedBoundary, expectedReadiness);
       return watermark ? { watermark, topicPublished: false, publication: null, blocked: true, error } : null;
     }
     if (!watermark) return null;
@@ -2029,9 +2041,14 @@ class DiscordGateway {
     }
   }
 
+  isPreAdoptionRetryableThread(channelId) {
+    return isPreAdoptionRetryableThread(this.state.getThreadEnrollment?.(channelId));
+  }
+
   noteLiveIntake(message) {
     const channelId = typeof message?.channelId === 'string' ? message.channelId : null;
     if (!channelId || this.stopping || !this.state.getMessageRoute(channelId)?.binding.active) return;
+    if (this.isPreAdoptionRetryableThread(channelId)) return;
     const count = (this.liveIntakeCounts.get(channelId) || 0) + 1;
     this.liveIntakeCounts.set(channelId, count);
     if (count < this.liveCheckpointThreshold || this.liveCheckpointPromise || this.recoveryPromise) return;
@@ -2048,7 +2065,7 @@ class DiscordGateway {
   scheduleHeldLiveCheckpoints() {
     if (this.stopping || this.recoveryPromise || this.liveCheckpointPromise) return;
     const heldChannels = [...this.liveIntakeCounts.entries()]
-      .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getMessageRoute(channelId)?.binding.active);
+      .filter(([channelId, count]) => count >= this.liveCheckpointThreshold && this.state.getMessageRoute(channelId)?.binding.active && !this.isPreAdoptionRetryableThread(channelId));
     if (!heldChannels.length) return;
     if (this.liveCheckpointRetryTimer) {
       const retryChannels = this.liveCheckpointRetryChannels || new Set();
@@ -2194,6 +2211,11 @@ class DiscordGateway {
           deferredCounts.set(channelId, count);
           this.liveIntakeCounts.set(channelId, 0);
         }
+        for (const channelId of deferredCounts.keys()) {
+          if (!this.isPreAdoptionRetryableThread(channelId)) continue;
+          deferredCounts.delete(channelId);
+          this.liveIntakeCounts.delete(channelId);
+        }
         if (this.recoveryPromise) {
           for (const [channelId, count] of deferredCounts) {
             const currentCount = this.liveIntakeCounts.get(channelId) || 0;
@@ -2207,7 +2229,7 @@ class DiscordGateway {
         }
         const immediateCounts = new Map();
         for (const [channelId, count] of deferredCounts) {
-          const pendingRecovery = allowPendingRecovery && this.state.getThreadEnrollment(channelId)?.state === THREAD_STATES.PENDING;
+          const pendingRecovery = allowPendingRecovery && this.state.getThreadEnrollment(channelId)?.state === THREAD_STATES.PENDING && !this.isPreAdoptionRetryableThread(channelId);
           if (!advancedChannels.has(channelId) && !pendingRecovery) continue;
           immediateCounts.set(channelId, count);
           deferredCounts.delete(channelId);
@@ -2239,6 +2261,7 @@ class DiscordGateway {
       const retryCounts = new Map();
       for (const channelId of channels) {
         if (!this.state.getMessageRoute(channelId)?.binding.active) continue;
+        if (this.isPreAdoptionRetryableThread(channelId)) continue;
         const count = this.liveIntakeCounts.get(channelId) || 0;
         if (count < this.liveCheckpointThreshold) continue;
         retryCounts.set(channelId, count);
@@ -2314,6 +2337,7 @@ class DiscordGateway {
     for (const enrollment of this.state.listThreadEnrollments()) {
       if (!enrollment.active || ![THREAD_STATES.READY, THREAD_STATES.PENDING].includes(enrollment.state) ||
           (triggeredChannels.size && !triggeredChannels.has(enrollment.threadId))) continue;
+      if (this.isPreAdoptionRetryableThread(enrollment.threadId)) continue;
       const checkpointOnly = enrollment.state === THREAD_STATES.READY;
       const recovered = await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, checkpointOnly, deadline);
       if (recovered) {
@@ -2377,17 +2401,60 @@ class DiscordGateway {
     return proof;
   }
 
-  async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
-    const deadline = Date.now() + this.recoveryTimeoutMs;
+  async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null) {
+    const deadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
+    let baseReason = String(reason || '');
+    let previousReason;
+    do {
+      previousReason = baseReason;
+      baseReason = baseReason.replace(/(?: full follow-up| boundary retry| follow-up)$/, '');
+    } while (baseReason !== previousReason);
     const selectedChannels = channelIds ? new Set(channelIds) : null;
     const bindings = this.state.listBindings().filter(binding => binding.active &&
       (!selectedChannels || selectedChannels.has(binding.channelId)));
+    const classifyReadiness = (currentBinding, currentBoundary) => {
+      if (currentBinding?.readiness === READINESS.READY && currentBoundary?.state === READINESS.READY) return READINESS.READY;
+      if (currentBinding?.readiness === READINESS.GAP || currentBoundary?.state === READINESS.GAP) return READINESS.GAP;
+      if (currentBinding?.readiness === READINESS.UNAVAILABLE) return READINESS.UNAVAILABLE;
+      if (currentBoundary?.state === READINESS.UNAVAILABLE &&
+          !isRetryableFetchBoundary(currentBoundary.state, currentBoundary.detail)) return READINESS.UNAVAILABLE;
+      if (currentBinding?.readiness === READINESS.PENDING || currentBoundary?.state === READINESS.PENDING) return READINESS.PENDING;
+      if (currentBinding?.readiness === READINESS.RECOVERING && currentBoundary?.state === READINESS.READY &&
+          currentBoundary.last_seen_id && (!currentBoundary.recovered_through_id ||
+            compareDiscordIds(currentBoundary.last_seen_id, currentBoundary.recovered_through_id) > 0)) return READINESS.PENDING;
+      if (isRetryableFetchBoundary(currentBoundary?.state, currentBoundary?.detail)) return READINESS.PENDING;
+      if (currentBoundary?.state === READINESS.UNAVAILABLE) return READINESS.UNAVAILABLE;
+      return null;
+    };
+    const isInterruptedRetryBoundary = boundary => boundary?.state === READINESS.PENDING &&
+      typeof boundary.detail === 'string' &&
+      boundary.detail.endsWith('retry after Discord HTTP 503');
+    const isRetryableRecoveryBoundary = boundary => boundary &&
+      (isRetryableFetchBoundary(boundary.state, boundary.detail) || isInterruptedRetryBoundary(boundary));
     let failure = null;
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (Date.now() >= deadline) {
-        await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline);
-        failure ||= { ready: false, state: 'gap' };
+        const watermark = this.state.getIntakeWatermark(binding.channelId);
+        if (isRetryableRecoveryBoundary(watermark)) {
+          if (isInterruptedRetryBoundary(watermark)) {
+            failure ||= { ready: false, state: 'unavailable' };
+            continue;
+          }
+          const expired = this.state.markIntakeBoundary(binding.channelId, READINESS.UNAVAILABLE,
+            watermark.detail || `${reason} intake unavailable`, watermark.gap_from, watermark.gap_to,
+            binding, null, watermark, binding.readiness);
+          if (expired) failure ||= { ready: false, state: 'unavailable' };
+          else {
+            const currentBinding = this.state.getBinding(binding.channelId);
+            const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+            const currentState = classifyReadiness(currentBinding, currentBoundary);
+            failure ||= { ready: false, state: currentState || 'unavailable' };
+          }
+        } else {
+          await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline, watermark);
+          failure ||= { ready: false, state: 'gap' };
+        }
         continue;
       }
       const handoffRecovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(binding.channelId, binding);
@@ -2397,11 +2464,84 @@ class DiscordGateway {
       }
       const recovering = this.state.setBindingReadiness(binding.channelId, READINESS.RECOVERING, `${reason} intake recovery in progress`, binding);
       if (!recovering) {
-        failure ||= { ready: false, state: 'unavailable' };
+        const currentBinding = this.state.getBinding(binding.channelId);
+        const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+        const currentState = classifyReadiness(currentBinding, currentBoundary);
+        if (currentState === READINESS.READY) continue;
+        if (currentState === READINESS.PENDING && !this.stopping) {
+          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], deadline).catch(error => {
+            this.logger(`Discord intake readiness retry failed: ${error.message}`);
+          });
+        }
+        failure ||= { ready: false, state: currentState || 'unavailable' };
         continue;
       }
       let watermark = this.state.getIntakeWatermark(binding.channelId);
-      if (watermark && ['gap', 'unavailable'].includes(watermark.state)) {
+      let ownedBoundary = watermark;
+      let ownedReadiness = recovering.readiness;
+      const currentRecovery = () => this.isCurrentBinding(binding) &&
+        this.state.getBinding(binding.channelId)?.readiness === ownedReadiness;
+      const classifyCurrentReadiness = () => {
+        if (!this.isCurrentBinding(binding)) return null;
+        const currentBinding = this.state.getBinding(binding.channelId);
+        const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+        const state = classifyReadiness(currentBinding, currentBoundary);
+        return state ? { state, binding: currentBinding, watermark: currentBoundary } : null;
+      };
+      const adoptCurrentReadiness = () => {
+        const current = classifyCurrentReadiness();
+        if (!current) return null;
+        if (current.state === READINESS.READY || current.state === READINESS.PENDING) {
+          ownedReadiness = current.state;
+          ownedBoundary = current.watermark;
+          watermark = current.watermark;
+        }
+        return current;
+      };
+      const queueRecoveryIfPending = () => {
+        if (this.stopping) return;
+        const current = classifyCurrentReadiness();
+        if (current?.state !== READINESS.PENDING) return;
+        if (this.recoveryRetryScheduledChannels.has(binding.channelId)) return;
+        this.recoveryRetryScheduledChannels.add(binding.channelId);
+        queueMicrotask(() => {
+          this.recoveryRetryScheduledChannels.delete(binding.channelId);
+          if (this.stopping || !this.isCurrentLifecycle(lifecycleEpoch)) return;
+          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], deadline).catch(error => {
+            this.logger(`Discord intake boundary retry failed: ${error.message}`);
+          });
+        });
+      };
+      const recordOwnedBoundary = async (owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary) => {
+        if (nextState === READINESS.GAP || nextState === READINESS.UNAVAILABLE) {
+          if (!currentRecovery()) {
+            const current = adoptCurrentReadiness();
+            if (current?.state === READINESS.READY) return { watermark: current.watermark, concurrentReady: true };
+            if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
+            return null;
+          }
+          const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+          if (currentBoundary?.state === READINESS.GAP || currentBoundary?.state === READINESS.UNAVAILABLE) return null;
+          if (currentBoundary) {
+            expectedBoundary = currentBoundary;
+            gapFrom = currentBoundary.recovered_through_id;
+          }
+        }
+        const result = await this.recordBoundary(owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary, ownedReadiness);
+        if (result?.watermark) ownedReadiness = result.watermark.state;
+        if (result && !currentRecovery()) queueRecoveryIfPending();
+        if (!result) {
+          const current = adoptCurrentReadiness();
+          if (current?.state === READINESS.READY) return { watermark: current.watermark, concurrentReady: true };
+          queueRecoveryIfPending();
+        }
+        return result;
+      };
+      let retryBoundary = null;
+      if (isRetryableRecoveryBoundary(watermark)) {
+        retryBoundary = watermark;
+      }
+      if (watermark && ['gap', 'unavailable'].includes(watermark.state) && !retryBoundary) {
         const terminalReadiness = watermark.state === READINESS.GAP ? READINESS.GAP : READINESS.UNAVAILABLE;
         this.state.setBindingReadiness(binding.channelId, terminalReadiness,
           watermark.detail || `${reason} intake ${watermark.state}`, binding);
@@ -2409,25 +2549,65 @@ class DiscordGateway {
         continue;
       }
       let channel;
+      let recoveryAttempted = false;
       try {
-        channel = await waitForRecoveryOperation(() => this.client.channels.fetch(binding.channelId), signal, deadline);
+        channel = await waitForRecoveryOperation(() => {
+          if (retryBoundary) {
+            const retrying = this.state.markIntakeBoundary(binding.channelId, 'pending', `${reason} retry after Discord HTTP 503`,
+              retryBoundary.gap_from, retryBoundary.gap_to, binding, null, retryBoundary, ownedReadiness);
+            if (!retrying) throw recoveryError('stale', 'Discord intake boundary changed before channel recovery');
+            watermark = retrying;
+            ownedBoundary = retrying;
+            ownedReadiness = retrying.state;
+            retryBoundary = null;
+          }
+          recoveryAttempted = true;
+          return recoveryFetch(() => this.client.channels.fetch(binding.channelId));
+        }, signal, deadline);
         if (!channel) throw new Error('Discord channel is unavailable');
       } catch (error) {
         const kind = recoveryKind(error);
         if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
-        await this.recordBoundary(binding, null, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-        failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
+        if (kind === CODEX_VALIDATION_KINDS.DEADLINE && retryBoundary && !recoveryAttempted) {
+          const restored = this.state.markIntakeBoundary(binding.channelId, retryBoundary.state,
+            retryBoundary.detail || `${reason} retry deadline expired`, retryBoundary.gap_from,
+            retryBoundary.gap_to, binding, null, retryBoundary, ownedReadiness);
+          if (restored) failure ||= { ready: false, state: 'unavailable' };
+          else {
+            const current = adoptCurrentReadiness();
+            if (current?.state === READINESS.READY) continue;
+            failure ||= { ready: false, state: current?.state || 'unavailable' };
+          }
+          continue;
+        }
+        if (kind === 'stale') {
+          const current = adoptCurrentReadiness();
+          if (current?.state === READINESS.READY) continue;
+          if (current?.state === READINESS.PENDING) {
+            retryBoundary = current.watermark;
+            queueRecoveryIfPending();
+          }
+          failure ||= { ready: false, state: current?.state || 'unavailable', error };
+          continue;
+        }
+        const recorded = await recordOwnedBoundary(binding, null, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+        if (recorded?.watermark) ownedBoundary = recorded.watermark;
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
         continue;
       }
-      if (!this.isCurrentBinding(binding)) {
-        failure ||= { ready: false, state: 'unavailable' };
+      if (!currentRecovery()) {
+        const current = adoptCurrentReadiness();
+        if (current?.state === READINESS.READY) continue;
+        if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
+        failure ||= { ready: false, state: current?.state || 'unavailable' };
         continue;
       }
       const ordinary = this.state.isOrdinaryBinding?.(binding);
       if (ordinary && channel.guildId && channel.guildId !== binding.guildId) {
         const error = new Error('Discord channel is outside the configured guild');
-        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-        failure ||= { ready: false, state: 'unavailable', error };
+        const recorded = await recordOwnedBoundary(binding, channel, 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+        if (recorded?.watermark) ownedBoundary = recorded.watermark;
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'unavailable', error };
         continue;
       }
       if (ordinary) {
@@ -2445,18 +2625,22 @@ class DiscordGateway {
           const kind = recoveryKind(error);
           if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
           if (kind === 'stale') {
-            failure ||= { ready: false, state: 'unavailable', error };
+            const current = adoptCurrentReadiness();
+            if (current?.state === READINESS.READY) continue;
+            if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
+            failure ||= { ready: false, state: current?.state || 'unavailable', error };
             continue;
           }
-          const preflightReason = ['Claude endpoint unavailable', 'Claude endpoint unavailable follow-up', 'ordinary-bind', 'reconnect', 'startup'].includes(reason);
+          const preflightReason = ['Claude endpoint unavailable', 'ordinary-bind', 'reconnect', 'startup'].includes(baseReason);
           let detail = error.message;
           if (preflightReason && binding.provider === 'claude') {
             detail = `${CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX} ${error.message}`;
           } else if (preflightReason && binding.provider === 'codex') {
             detail = `Codex transcript proof unavailable before event write: ${error.message}`;
           }
-          await this.recordBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', detail, watermark?.recovered_through_id, null, signal, deadline);
-          failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+          const recorded = await recordOwnedBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', detail, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+          if (recorded?.watermark) ownedBoundary = recorded.watermark;
+          if (!recorded?.concurrentReady) failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
           continue;
         } finally {
           signal?.removeEventListener('abort', relayAbort);
@@ -2465,14 +2649,16 @@ class DiscordGateway {
       }
       if (!ordinary && !conductorMarkerMatchesTopic(channel.topic, binding)) {
         const error = new Error('Discord channel topic does not identify the current conductor and native generation');
-        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-        failure ||= { ready: false, state: 'unavailable', error };
+        const recorded = await recordOwnedBoundary(binding, channel, 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+        if (recorded?.watermark) ownedBoundary = recorded.watermark;
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'unavailable', error };
         continue;
       }
       if (!this.fetchHistoryInjected && typeof channel.messages?.fetch !== 'function') {
         const error = new Error('Discord history fetch is unavailable for intake recovery');
-        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-        failure ||= { ready: false, state: 'unavailable', error };
+        const recorded = await recordOwnedBoundary(binding, channel, 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+        if (recorded?.watermark) ownedBoundary = recorded.watermark;
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'unavailable', error };
         continue;
       }
       const permission = this.historyPermission(channel, { requireSend: ordinary });
@@ -2481,50 +2667,75 @@ class DiscordGateway {
         if (permission.known && ordinary) detail = 'Discord channel lacks history or reply permission';
         else if (permission.known) detail = 'Discord channel lacks ViewChannel or ReadMessageHistory';
         const error = new Error(detail);
-        await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-        failure ||= { ready: false, state: 'unavailable', error };
+        const recorded = await recordOwnedBoundary(binding, channel, 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+        if (recorded?.watermark) ownedBoundary = recorded.watermark;
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'unavailable', error };
         continue;
       }
       if (!watermark?.recovered_through_id) {
         let baseline;
-        try { baseline = this.historyMessages(await waitForRecoveryOperation(() => this.fetchHistory(channel, { limit: 1, signal }), signal, deadline)); }
+        try { baseline = this.historyMessages(await waitForRecoveryOperation(() => recoveryFetch(() => this.fetchHistory(channel, { limit: 1, signal })), signal, deadline)); }
         catch (error) {
           const kind = recoveryKind(error);
           if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
-          await this.recordBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-          failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
+          const recorded = await recordOwnedBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+          if (recorded?.watermark) ownedBoundary = recorded.watermark;
+          if (!recorded?.concurrentReady) failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
           continue;
         }
         if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-        if (!this.isCurrentBinding(binding)) {
-          failure ||= { ready: false, state: 'unavailable' };
+        if (!currentRecovery()) {
+          const current = adoptCurrentReadiness();
+          if (current?.state === READINESS.READY) continue;
+          if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
+          failure ||= { ready: false, state: current?.state || 'unavailable' };
           continue;
+        }
+        const fetchedBoundary = this.state.getIntakeWatermark(binding.channelId);
+        if (fetchedBoundary?.state === READINESS.GAP || fetchedBoundary?.state === READINESS.UNAVAILABLE) {
+          failure ||= { ready: false, state: fetchedBoundary.state };
+          continue;
+        }
+        if (fetchedBoundary) {
+          ownedBoundary = fetchedBoundary;
+          watermark = fetchedBoundary;
         }
         if (baseline.some(message => typeof message?.id !== 'string' || !message.id)) {
           const error = new Error('Discord history message has no stable ID');
-          await this.recordBoundary(binding, channel, 'unavailable', error.message, watermark?.recovered_through_id, null, signal, deadline);
-          failure ||= { ready: false, state: 'unavailable', error };
+          const recorded = await recordOwnedBoundary(binding, channel, 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+          if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'unavailable', error };
           continue;
         }
         const newest = baseline.sort((a, b) => compareDiscordIds(b.id, a.id))[0];
         if (newest?.id) {
-          const baseline = this.state.setIntakeBaseline(binding.channelId, newest.id, `${reason} cutoff excludes pre-adoption backlog`, binding);
-          if (!baseline) {
-            failure ||= { ready: false, state: 'unavailable' };
+          const baselineWatermark = this.state.setIntakeBaseline(binding.channelId, newest.id, `${reason} cutoff excludes pre-adoption backlog`, binding, ownedBoundary, ownedReadiness);
+          if (!baselineWatermark) {
+            const current = adoptCurrentReadiness();
+            if (current?.state === READINESS.READY) continue;
+            queueRecoveryIfPending();
+            failure ||= { ready: false, state: current?.state || 'unavailable' };
             continue;
           }
+          ownedBoundary = baselineWatermark;
         } else {
           watermark = this.state.getIntakeWatermark(binding.channelId);
           if (!watermark?.last_seen_id) {
-            const boundary = await this.recordBoundary(binding, channel, 'ready', `${reason} empty channel baseline`, null, null, signal, deadline);
-            if (!boundary || boundary.stale || boundary.blocked) failure ||= { ready: false, state: 'unavailable', error: boundary?.error };
+            const boundary = await recordOwnedBoundary(binding, channel, 'ready', `${reason} empty channel baseline`, null, null, signal, deadline, ownedBoundary);
+            if (boundary?.watermark) ownedBoundary = boundary.watermark;
+            if (!boundary || (!boundary.concurrentReady && (boundary.stale || boundary.blocked))) {
+              failure ||= { ready: false, state: 'unavailable', error: boundary?.error };
+            }
             continue;
           }
-          const baseline = this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`, binding);
-          if (!baseline) {
-            failure ||= { ready: false, state: 'unavailable' };
+          const baselineWatermark = this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`, binding, ownedBoundary, ownedReadiness);
+          if (!baselineWatermark) {
+            const current = adoptCurrentReadiness();
+            if (current?.state === READINESS.READY) continue;
+            queueRecoveryIfPending();
+            failure ||= { ready: false, state: current?.state || 'unavailable' };
             continue;
           }
+          ownedBoundary = baselineWatermark;
         }
         watermark = this.state.getIntakeWatermark(binding.channelId);
       }
@@ -2538,8 +2749,13 @@ class DiscordGateway {
           if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
           const options = { limit: this.historyPageLimit, signal };
           if (after) options.after = after;
-          const page = this.historyMessages(await waitForRecoveryOperation(() => this.fetchHistory(channel, options), signal, deadline));
-          if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'Discord recovery binding changed during history fetch');
+          const page = this.historyMessages(await waitForRecoveryOperation(() => recoveryFetch(() => this.fetchHistory(channel, options)), signal, deadline));
+          if (!currentRecovery()) throw recoveryError('stale', 'Discord recovery binding changed during history fetch');
+          const fetchedBoundary = this.state.getIntakeWatermark(binding.channelId);
+          if (fetchedBoundary?.state === READINESS.GAP || fetchedBoundary?.state === READINESS.UNAVAILABLE) {
+            throw recoveryError('stale', 'Discord intake boundary changed during history fetch');
+          }
+          if (fetchedBoundary) ownedBoundary = fetchedBoundary;
           pages += 1;
           if (!page.length) { complete = true; break; }
           if (page.some(message => typeof message?.id !== 'string' || !message.id)) throw new Error('Discord history message has no stable ID');
@@ -2553,7 +2769,12 @@ class DiscordGateway {
             attemptedId = message.id;
             const admitted = await this.consumer.intakeMessage(this.normalizeFetchedMessage(message, channel), false, message.id, binding, false, signal, deadline, true);
             if (admitted?.stale) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
-            if (!this.isCurrentBinding(binding)) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
+            if (!currentRecovery()) throw recoveryError('stale', 'Discord recovery binding changed during history intake');
+            const afterIntake = this.state.getIntakeWatermark(binding.channelId);
+            if (afterIntake?.state === READINESS.GAP || afterIntake?.state === READINESS.UNAVAILABLE) {
+              throw recoveryError('stale', 'Discord intake boundary changed during history intake');
+            }
+            if (afterIntake) ownedBoundary = afterIntake;
             total += 1;
             if (!after || compareDiscordIds(message.id, after) > 0) after = message.id;
           }
@@ -2567,21 +2788,26 @@ class DiscordGateway {
         const kind = recoveryKind(error);
         if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
         if (kind === 'stale') {
-          failure ||= { ready: false, state: 'unavailable', error };
+          const current = adoptCurrentReadiness();
+          if (current?.state === READINESS.READY) continue;
+          if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
+          failure ||= { ready: false, state: current?.state || 'unavailable', error };
           continue;
         }
-        await this.recordBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, watermark?.recovered_through_id, attemptedId || after, signal, deadline);
-        failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
+        const recorded = await recordOwnedBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, ownedBoundary?.recovered_through_id, attemptedId || after, signal, deadline, ownedBoundary);
+        if (recorded?.watermark) ownedBoundary = recorded.watermark;
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
         continue;
       }
       if (!complete) {
         const detail = pages >= this.historyMaxPages ? `history page bound ${this.historyMaxPages} reached` : total >= this.historyMaxMessages ? `history message bound ${this.historyMaxMessages} reached` : `history recovery deadline ${this.recoveryTimeoutMs}ms reached`;
-        await this.recordBoundary(binding, channel, 'gap', detail, watermark?.recovered_through_id, after, signal, deadline);
-        failure ||= { ready: false, state: 'gap' };
+        const recorded = await recordOwnedBoundary(binding, channel, 'gap', detail, ownedBoundary?.recovered_through_id, after, signal, deadline, ownedBoundary);
+        if (recorded?.watermark) ownedBoundary = recorded.watermark;
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'gap' };
         continue;
       }
-      const boundary = await this.recordBoundary(binding, channel, 'ready', `${reason} watermark backfill complete`, null, null, signal, deadline);
-      if (!boundary || boundary.stale || boundary.blocked || !this.isCurrentBinding(binding)) {
+      const boundary = await recordOwnedBoundary(binding, channel, 'ready', `${reason} watermark backfill complete`, null, null, signal, deadline, ownedBoundary);
+      if (!boundary || boundary.stale || boundary.blocked || (!boundary.concurrentReady && !currentRecovery())) {
         failure ||= { ready: false, state: 'unavailable' };
         continue;
       }
@@ -2592,82 +2818,263 @@ class DiscordGateway {
         const detail = liveCustodyAhead
           ? 'live Discord custody arrived while recovery readiness was closing'
           : 'binding readiness changed while recovery readiness was closing';
-        await this.recordBoundary(binding, channel, 'gap', detail, finalWatermark?.recovered_through_id, finalWatermark?.last_seen_id, signal, deadline);
-        failure ||= { ready: false, state: 'gap' };
+        const recorded = await recordOwnedBoundary(binding, channel, 'gap', detail, finalWatermark?.recovered_through_id, finalWatermark?.last_seen_id, signal, deadline, finalWatermark);
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'gap' };
       }
     }
     for (const enrollment of this.state.listThreadEnrollments()) {
       if (!enrollment.active || (selectedChannels && !selectedChannels.has(enrollment.parentChannelId) && !selectedChannels.has(enrollment.threadId))) continue;
       const recovered = await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, false, deadline);
       const currentEnrollment = this.state.getThreadEnrollment(enrollment.threadId);
-      if (!recovered && currentEnrollment?.active && currentEnrollment.state === THREAD_STATES.PENDING) {
-        const currentCount = this.liveIntakeCounts.get(enrollment.threadId) || 0;
-        this.liveIntakeCounts.set(enrollment.threadId, Math.max(currentCount, this.liveCheckpointThreshold));
+      if (!recovered) {
+        if (currentEnrollment?.active && currentEnrollment.state === THREAD_STATES.PENDING && !this.isPreAdoptionRetryableThread(enrollment.threadId)) {
+          const currentCount = this.liveIntakeCounts.get(enrollment.threadId) || 0;
+          this.liveIntakeCounts.set(enrollment.threadId, Math.max(currentCount, this.liveCheckpointThreshold));
+        }
       }
     }
     return failure || { ready: true, state: 'ready' };
   }
 
-  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null) {
+  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-    const fullRecovery = channelIds === null || channelIds === undefined;
-    if (fullRecovery) {
-      this.ready = false;
-      if (this.recoveryPromise) this.pendingFullRecovery = true;
-    }
-    if (channelIds) {
-      for (const channelId of channelIds) {
-        if (typeof channelId === 'string') this.pendingRecoveryChannels.add(channelId);
+    const overallDeadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
+    const callerScope = channelIds === null || channelIds === undefined ? null : new Set(channelIds);
+    const expandScope = scope => {
+      if (scope === null) return null;
+      const expanded = new Set(scope);
+      for (const enrollment of this.state.listThreadEnrollments()) {
+        if (!enrollment.active) continue;
+        if (expanded.has(enrollment.parentChannelId) || expanded.has(enrollment.threadId)) expanded.add(enrollment.threadId);
       }
-    }
-    if (this.recoveryPromise) {
-      if (!this.pendingRecoveryChannels.size && !this.pendingFullRecovery) return this.recoveryPromise;
-      if (!this.recoveryFollowupPromise) {
-        const activeRecovery = this.recoveryPromise;
-        this.recoveryFollowupPromise = activeRecovery.then(result => {
-          this.recoveryFollowupPromise = null;
-          if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-          const runFullRecovery = this.pendingFullRecovery;
-          const queuedChannels = new Set(this.pendingRecoveryChannels);
-          this.pendingFullRecovery = false;
-          this.pendingRecoveryChannels.clear();
-          if (runFullRecovery) return this.recoverTransport(`${reason} follow-up`, lifecycleEpoch);
-          return queuedChannels.size ? this.recoverTransport(`${reason} follow-up`, lifecycleEpoch, queuedChannels) : result;
-        }, error => {
-          this.recoveryFollowupPromise = null;
-          throw error;
-        });
+      return expanded;
+    };
+    const scopeIsReady = scope => {
+      const expanded = expandScope(scope);
+      const scopedChannels = expanded === null
+        ? new Set(this.state.listBindings().filter(binding => binding.active).map(binding => binding.channelId))
+        : expanded;
+      for (const channelId of scopedChannels) {
+        const binding = this.state.getBinding(channelId);
+        const watermark = this.state.getIntakeWatermark(channelId);
+        if (binding?.active && binding.readiness === READINESS.READY && watermark?.state === READINESS.READY) continue;
+        const enrollment = this.state.getThreadEnrollment(channelId);
+        if (enrollment?.active && enrollment.state === THREAD_STATES.READY) continue;
+        return false;
       }
-      return this.recoveryFollowupPromise;
+      if (expanded === null) {
+        for (const enrollment of this.state.listThreadEnrollments()) {
+          if (enrollment.active && enrollment.state !== THREAD_STATES.READY) return false;
+        }
+      }
+      return true;
+    };
+    const scopesIntersect = (left, right) => {
+      if (left === null || right === null) return true;
+      const leftScope = expandScope(left);
+      const rightScope = expandScope(right);
+      return [...leftScope].some(channelId => rightScope.has(channelId));
+    };
+    const makeResult = (waiter, fallback = null) => {
+      if (waiter.stopped || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
+      if (scopeIsReady(waiter.scope)) return { ready: true, state: 'ready' };
+      if (waiter.scope === null && waiter.childCount === 0 && waiter.ownResult?.ready === true) return waiter.ownResult;
+      const result = fallback || waiter.lastResult || waiter.ownResult || { ready: false, state: 'unavailable' };
+      return result?.ready === true ? { ready: false, state: 'unavailable', error: result.error } : result;
+    };
+    const makeWaiter = (scope, deadline) => {
+      let resolveWaiter;
+      const waiter = {
+        scope,
+        deadline,
+        parents: new Set(),
+        childCount: 0,
+        pending: 1,
+        ownDone: false,
+        ownResult: null,
+        lastResult: null,
+        settled: false,
+        stopped: false,
+        timer: null,
+        promise: new Promise(resolve => { resolveWaiter = resolve; })
+      };
+      const notifyParents = result => {
+        for (const parent of waiter.parents) parent.childFinished(result);
+      };
+      waiter.settle = fallback => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        const result = makeResult(waiter, fallback);
+        resolveWaiter(result);
+        notifyParents(result);
+      };
+      waiter.stop = () => {
+        if (waiter.settled) return;
+        waiter.stopped = true;
+        waiter.settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        const result = { ready: false, state: 'stopped' };
+        resolveWaiter(result);
+        notifyParents(result);
+      };
+      waiter.maybeSettle = () => {
+        if (waiter.ownDone && waiter.pending === 0) waiter.settle();
+      };
+      waiter.childFinished = result => {
+        if (waiter.settled) return;
+        if (result?.state === 'stopped') {
+          waiter.stop();
+          return;
+        }
+        waiter.lastResult = result;
+        waiter.pending = Math.max(0, waiter.pending - 1);
+        waiter.maybeSettle();
+      };
+      waiter.completeOwn = result => {
+        if (waiter.settled || waiter.ownDone) return;
+        waiter.ownDone = true;
+        waiter.ownResult = result;
+        waiter.lastResult = result;
+        if (result?.state === 'stopped') {
+          waiter.stop();
+          return;
+        }
+        waiter.pending = Math.max(0, waiter.pending - 1);
+        waiter.maybeSettle();
+      };
+      if (Number.isFinite(deadline)) {
+        waiter.timer = setTimeout(() => waiter.settle({ ready: false, state: 'unavailable' }),
+          Math.max(0, deadline - Date.now()) + RECOVERY_WAITER_DEADLINE_GRACE_MS);
+      }
+      return waiter;
+    };
+    const attachParents = waiter => {
+      for (const parent of this.recoveryActiveWaiters) {
+        if (parent === waiter || parent.settled || !scopesIntersect(parent.scope, waiter.scope)) continue;
+        parent.pending += 1;
+        parent.childCount += 1;
+        waiter.parents.add(parent);
+      }
+    };
+    const startRecoveryPass = (scope, deadline, passReason, passLifecycle, activeWaiters) => {
+      if (Date.now() >= deadline || activeWaiters.every(waiter => waiter.settled)) {
+        return Promise.resolve({ ready: false, state: 'unavailable' });
+      }
+      this.recoveryActiveWaiters = new Set(activeWaiters.filter(waiter => !waiter.settled));
+      this.recoveryController = new AbortController();
+      const controller = this.recoveryController;
+      let resolvePass;
+      let rejectPass;
+      const activeRecovery = new Promise((resolve, reject) => {
+        resolvePass = resolve;
+        rejectPass = reject;
+      });
+      this.recoveryPromise = activeRecovery;
+      Promise.resolve().then(async () => {
+        try {
+          const result = await this.recoverInbound(controller.signal, passReason, passLifecycle,
+            scope === null ? null : new Set(scope), deadline);
+          const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
+          if (!this.isCurrentLifecycle(passLifecycle)) {
+            resolvePass({ ready: false, state: 'stopped' });
+            return;
+          }
+          this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
+          resolvePass(result);
+        } catch (error) {
+          rejectPass(error);
+        }
+      });
+      const cleanup = () => {
+        if (this.recoveryPromise !== activeRecovery) return;
+        this.recoveryPromise = null;
+        this.recoveryController = null;
+        this.releaseRecoveredAttachmentIntake();
+        this.scheduleHeldLiveCheckpoints();
+      };
+      activeRecovery.then(cleanup, cleanup).catch(() => {});
+      return activeRecovery;
+    };
+    const drainRecoveryFollowups = async () => {
+      while (true) {
+        if (!this.pendingRecoveryRequests.length) {
+          await Promise.resolve();
+          if (!this.pendingRecoveryRequests.length) break;
+        }
+        const request = this.pendingRecoveryRequests.shift();
+        if (!request) continue;
+        if (!this.isCurrentLifecycle(request.lifecycleEpoch)) {
+          request.waiter.stop();
+          continue;
+        }
+        const activeWaiters = [request.waiter, ...request.waiter.parents].filter(waiter => !waiter.settled);
+        this.recoveryActiveWaiters = new Set(activeWaiters);
+        let result;
+        try {
+          result = await startRecoveryPass(request.scope, request.deadline, request.reason,
+            request.lifecycleEpoch, activeWaiters);
+        } catch (error) {
+          result = { ready: false, state: recoveryKind(error) || 'unavailable', error };
+        }
+        request.waiter.completeOwn(result);
+        this.recoveryActiveWaiters = new Set(activeWaiters.filter(waiter => !waiter.settled));
+        if (result?.state === 'stopped') {
+          for (const pending of this.pendingRecoveryRequests.splice(0)) pending.waiter.stop();
+          break;
+        }
+      }
+      return { ready: true, state: 'ready' };
+    };
+    const ensureFollowupCoordinator = () => {
+      if (this.recoveryFollowupPromise) return;
+      const activeRecovery = this.recoveryPromise || Promise.resolve();
+      const coordinator = activeRecovery.then(
+        () => drainRecoveryFollowups(),
+        () => drainRecoveryFollowups()
+      );
+      this.recoveryFollowupPromise = coordinator;
+      const finishCoordinator = () => {
+        if (this.recoveryFollowupPromise !== coordinator) return;
+        this.recoveryFollowupPromise = null;
+        this.recoveryFollowupScope = null;
+        this.recoveryActiveWaiters.clear();
+        if (this.pendingRecoveryRequests.length) ensureFollowupCoordinator();
+      };
+      coordinator.then(finishCoordinator, finishCoordinator).catch(() => {});
+    };
+
+    const waiter = makeWaiter(callerScope, overallDeadline);
+    if (this.recoveryPromise || this.recoveryFollowupPromise) {
+      if (callerScope === null) this.ready = false;
+      attachParents(waiter);
+      this.pendingRecoveryRequests.push({
+        scope: callerScope === null ? null : new Set(callerScope),
+        deadline: overallDeadline,
+        reason,
+        lifecycleEpoch,
+        waiter
+      });
+      this.recoveryFollowupScope = callerScope === null ? null : new Set(callerScope);
+      ensureFollowupCoordinator();
+      return waiter.promise;
     }
-    const selectedChannels = this.pendingFullRecovery ? null :
-      (this.pendingRecoveryChannels.size ? new Set(this.pendingRecoveryChannels) : channelIds);
-    this.pendingFullRecovery = false;
-    this.pendingRecoveryChannels.clear();
-    this.recoveryController = new AbortController();
-    const controller = this.recoveryController;
-    this.recoveryPromise = (async () => {
-      const result = await this.recoverInbound(controller.signal, reason, lifecycleEpoch, selectedChannels);
-      const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
-      if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-      this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
-      this.releaseRecoveredAttachmentIntake();
-      return result;
-    })();
-    try { return await this.recoveryPromise; }
-    finally {
-      this.recoveryPromise = null;
-      this.recoveryController = null;
-      this.releaseRecoveredAttachmentIntake();
-      this.scheduleHeldLiveCheckpoints();
-    }
+
+    if (callerScope === null) this.ready = false;
+    const activeRecovery = startRecoveryPass(callerScope, overallDeadline, reason,
+      lifecycleEpoch, [waiter]);
+    activeRecovery.then(
+      result => waiter.completeOwn(result),
+      error => waiter.completeOwn({ ready: false, state: recoveryKind(error) || 'unavailable', error })
+    ).catch(() => {});
+    return waiter.promise;
   }
 
   async reconcilePending(before = undefined, { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
     const lifecycleEpoch = this.lifecycleEpoch;
     const connectionEpoch = this.connectionEpoch;
-    while (this.recoveryPromise) {
-      await this.recoveryPromise.catch(() => {});
+    while (this.recoveryPromise || this.recoveryFollowupPromise) {
+      await (this.recoveryFollowupPromise || this.recoveryPromise).catch(() => {});
       if (!this.isCurrentLifecycle(lifecycleEpoch) || connectionEpoch !== this.connectionEpoch) return [];
     }
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return [];
@@ -2702,9 +3109,20 @@ class DiscordGateway {
       const key = `${message.provider}:${message.nativeId}`;
       if (blockedOwners.has(key)) continue;
       let channel;
-      try { channel = await waitForRecoveryOperation(() => this.client.channels.fetch(message.deliveryChannelId || message.channelId), signal, deadline); } catch (error) {
+      let channelFetchStarted = false;
+      try {
+        channel = await waitForRecoveryOperation(
+          () => recoveryFetch(() => {
+            channelFetchStarted = true;
+            return this.client.channels.fetch(message.deliveryChannelId || message.channelId);
+          }),
+          signal,
+          deadline
+        );
+      } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         blockedOwners.add(key);
+        if (!channelFetchStarted) continue;
         this.markThreadDeliveryUnavailable(message, error);
         this.state.markObservationUnavailable(message.id, error);
         continue;
@@ -2740,11 +3158,16 @@ class DiscordGateway {
       let result;
       try {
         if (message.state === 'accepted') {
-          result = await waitForRecoveryOperation(
-            () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true, awaitDispatchOutcome: true }),
-            signal,
-            deadline
-          );
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            result = await waitForRecoveryOperation(
+              () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true, awaitDispatchOutcome: true }),
+              signal,
+              deadline
+            );
+            const stillAccepted = result?.status === DISPATCH_OUTCOMES.NOT_SUBMITTED &&
+              this.state.getMessage(message.id)?.state === 'accepted';
+            if (!stillAccepted || !this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready) break;
+          }
         } else if (message.state === 'submitted') {
           result = await waitForRecoveryOperation(
             () => this.consumer.resumeSubmitted(storedMessage, signal, { continueUntilFinal: true }),
@@ -2814,6 +3237,8 @@ class DiscordGateway {
     this.pendingHandoffRecoveryChannels.clear();
     this.pendingFullRecovery = false;
     this.pendingRecoveryChannels.clear();
+    for (const request of this.pendingRecoveryRequests.splice(0)) request.waiter?.stop?.();
+    this.recoveryRetryScheduledChannels.clear();
     this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.stopPromise = (async () => {
       this.ready = false;

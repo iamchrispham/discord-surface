@@ -153,6 +153,17 @@ function intakeCutoffDecision(eventId, cutoffId, compare) {
   return compare(eventId, cutoffId) <= 0 ? 'before-intake-cutoff' : null;
 }
 
+function intakeBoundaryMatches(existing, expected, binding, expectedReadiness = undefined) {
+  if (expectedReadiness !== undefined && binding?.readiness !== expectedReadiness) return false;
+  if (expected === undefined) return true;
+  if (expected === null) return existing == null;
+  if (!existing) return false;
+  return [
+    'channel_id', 'guild_id', 'last_seen_id', 'recovered_through_id',
+    'state', 'detail', 'gap_from', 'gap_to'
+  ].every(field => (existing[field] ?? null) === (expected[field] ?? null));
+}
+
 function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatchesExpected, compareDiscordIds, now }) {
   return {
     hasIntakeEvidence(state, discordId) {
@@ -240,13 +251,14 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
       return state.getIntakeWatermark(channelId);
     },
 
-    markIntakeBoundary(state, channelId, boundaryState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null) {
+    markIntakeBoundary(state, channelId, boundaryState, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, pauseMetadata = null, expectedBoundary = undefined, expectedReadiness = undefined) {
       assertText(channelId, 'channelId', 128);
       if (!['pending', 'ready', 'gap', 'unavailable'].includes(boundaryState)) throw new BindingError('invalid intake watermark state');
       return state.transaction(() => {
         const binding = state.getBinding(channelId);
         const existing = state.getIntakeWatermark(channelId);
         if (!bindingMatchesExpected(binding, expectedBinding)) return null;
+        if (!intakeBoundaryMatches(existing, expectedBoundary, binding, expectedReadiness)) return null;
         if (!intakePauseAllowsUpdate(state, channelId, pauseMetadata)) return null;
         if (pauseMetadata && Object.prototype.hasOwnProperty.call(pauseMetadata, 'expectedReadiness')
           && binding?.readiness !== pauseMetadata.expectedReadiness) return null;
@@ -310,6 +322,7 @@ function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatc
 }
 
 module.exports = {
+  intakeBoundaryMatches,
   createIntakeHandlers,
   intakeCutoffDecision,
   pauseOrdinaryHandoffIntake,

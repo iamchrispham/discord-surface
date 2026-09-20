@@ -1300,7 +1300,7 @@ test('stop clears queued recovery channels and preserves healthy sibling custody
   const stopping = gateway.stop();
   releaseFirst();
   await Promise.allSettled([first, second, stopping]);
-  assert.equal(gateway.pendingRecoveryChannels.size, 0);
+  assert.equal(gateway.pendingRecoveryRequests.length, 0);
   assert.equal(state.getIntakeWatermark(channelA).gap_to, '7000');
   assert.equal(state.getBinding(channelB).readiness, 'ready');
 
