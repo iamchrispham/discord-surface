@@ -536,9 +536,13 @@ test('legacy results use receiver request custody across separate installations'
     authorId: '901', isBot: true, content: encodeAgentMessage(value, token) }, { agentToken: token });
   for (const [suffix, value] of [
     ['correlation', { ...packet, replyTo: 'unknown-request' }],
+    ['parent-source', { ...packet, source: target }],
     ['owner', { ...packet, source: { ...packet.source, nativeId: source.nativeId } }],
     ['generation', { ...packet, source: { ...packet.source, generation: 2 } }]
   ]) assert.equal(ingest(value, suffix).accepted, false);
+  const legacyWire = { ...packet };
+  delete legacyWire.routingVersion;
+  assert.equal(ingest(legacyWire, 'legacy-wire').accepted, false);
   receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', routingVersion: 2,
     agentPacket: { ...request, id: 'new-request', routingVersion: 2 } });
   assert.equal(ingest({ ...packet, replyTo: 'new-request' }, 'new-request-result').accepted, false);

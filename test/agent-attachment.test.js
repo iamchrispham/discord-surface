@@ -20,10 +20,10 @@ const token = 'isolated-test-credential';
 
 // Parent recovery still handles results whose immutable custody predates child routing.
 function encodeLegacyParentResult(state, value, credential) {
-  const result = { ...value, kind: KINDS.RESULT, replyTo: `request-${value.id}`, routingVersion: 2 };
+  const result = { ...value, source: { ...value.source, channelId: `${value.source.channelId}99` }, kind: KINDS.RESULT, replyTo: `request-${value.id}`, routingVersion: 2 };
   state.receipt(null, 'direct-post-outcome', {
     outcome: 'sent', agentPacket: { id: result.replyTo, kind: KINDS.REQUEST,
-      source: result.target, target: result.source, replyTo: null, text: 'Original request.' }
+      source: result.target, target: value.source, replyTo: null, text: 'Original request.' }
   });
   return encodeAgentMessage(result, credential);
 }

@@ -2148,7 +2148,7 @@ class SurfaceState {
           return { accepted: false, duplicate: true, reason: 'watcher-notice-duplicate', message: this.getMessage(prior.messageId) };
         }
       }
-      const legacyCorrelatedResult = agent && agent.kind === 'result' && !enrollment &&
+      const legacyCorrelatedResult = agent && agent.kind === 'result' && agent.routingVersion === AGENT_ROUTING_VERSION && !enrollment &&
         agent.target.channelId === authorityChannelId &&
         this.db.prepare(`SELECT 1 FROM receipts
           WHERE kind='direct-post-outcome'
@@ -2163,13 +2163,14 @@ class SurfaceState {
             AND json_extract(detail, '$.agentPacket.source.nativeId')=?
             AND json_extract(detail, '$.agentPacket.source.generation')=?
             AND json_extract(detail, '$.agentPacket.target.guildId')=?
+            AND json_extract(detail, '$.agentPacket.target.channelId')<>?
             AND json_extract(detail, '$.agentPacket.target.provider')=?
             AND json_extract(detail, '$.agentPacket.target.nativeId')=?
             AND json_extract(detail, '$.agentPacket.target.generation')=?
           LIMIT 1`).get(
             'sent', 'unknown', agent.replyTo,
             agent.target.guildId, agent.target.channelId, agent.target.provider, agent.target.nativeId, agent.target.generation,
-            agent.source.guildId, agent.source.provider, agent.source.nativeId, agent.source.generation
+            agent.source.guildId, agent.source.channelId, agent.source.provider, agent.source.nativeId, agent.source.generation
           );
       if (agent && !enrollment && !legacyCorrelatedResult) {
         this.receipt(null, 'intake-rejected', {
