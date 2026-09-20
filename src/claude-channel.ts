@@ -178,6 +178,7 @@ type ClaudeRuntimeMcp = ClaudeChannelMcpBase & {
 interface ClaudeChannelOptionsBase {
   nativeId: string;
   socketPath: string;
+  beforeTransportClose?: (() => void | Promise<void>) | null;
   onTransportClose?: (() => void) | null;
   logger?: (message: string) => void;
 }
@@ -328,11 +329,12 @@ export class ClaudeChannel<
   declare stopPromise: Promise<void> | null;
   declare ready: boolean;
   declare transportClosed: boolean;
+  declare beforeTransportClose: (() => void | Promise<void>) | null;
   declare onTransportClose: (() => void) | null;
   declare logger: (message: string) => void;
 
   constructor(options: ClaudeChannelOptions<TProvidedMcp, TState>) {
-    const { state, nativeId, socketPath, mcp, onTransportClose, logger = () => {} } = options || {} as ClaudeChannelOptions<TProvidedMcp>;
+    const { state, nativeId, socketPath, mcp, beforeTransportClose, onTransportClose, logger = () => {} } = options || {} as ClaudeChannelOptions<TProvidedMcp>;
     if (!state) throw new TypeError('state is required');
     validateNativeId(nativeId);
     assertSocketPath(socketPath);
@@ -360,16 +362,20 @@ export class ClaudeChannel<
     this.stopPromise = null;
     this.ready = false;
     this.transportClosed = false;
+    this.beforeTransportClose = typeof beforeTransportClose === 'function' ? beforeTransportClose : null;
     this.onTransportClose = typeof onTransportClose === 'function' ? onTransportClose : null;
     this.logger = logger;
-    (this.mcp as unknown as ClaudeRuntimeMcp).onclose = () => {
+    const handleTransportClose = () => {
       this.transportClosed = true;
-      if (this.started && !this.stopPromise) this.stop().catch(() => {}).finally(() => this.onTransportClose?.());
+      if (this.started && !this.stopPromise) {
+        Promise.resolve()
+          .then(() => this.beforeTransportClose?.())
+          .catch(() => {})
+          .finally(() => this.stop().catch(() => {}).finally(() => this.onTransportClose?.()));
+      }
     };
-    (this.mcp as unknown as ClaudeRuntimeMcp).onerror = () => {
-      this.transportClosed = true;
-      if (this.started && !this.stopPromise) this.stop().catch(() => {}).finally(() => this.onTransportClose?.());
-    };
+    (this.mcp as unknown as ClaudeRuntimeMcp).onclose = handleTransportClose;
+    (this.mcp as unknown as ClaudeRuntimeMcp).onerror = handleTransportClose;
   }
 
   async handleEvent(body: ClaudeChannelEvent): Promise<void> {
