@@ -2148,10 +2148,15 @@ class SurfaceState {
           return { accepted: false, duplicate: true, reason: 'watcher-notice-duplicate', message: this.getMessage(prior.messageId) };
         }
       }
-      const legacyCorrelatedResult = agent && agent.kind === 'result' && agent.routingVersion === AGENT_ROUTING_VERSION && !enrollment &&
+      const legacyCorrelatedResult = agent && agent.kind === 'result' && agent.routingVersion === AGENT_ROUTING_VERSION &&
+        typeof agent.sourceParentChannelId === 'string' && !enrollment &&
         agent.target.channelId === authorityChannelId &&
-        this.db.prepare(`SELECT 1 FROM receipts
+        this.db.prepare(`SELECT 1 FROM receipts AS publication
           WHERE kind='direct-post-outcome'
+            AND NOT EXISTS (SELECT 1 FROM receipts AS later
+              WHERE later.kind='direct-post-outcome' AND later.id>publication.id
+                AND json_extract(later.detail, '$.agentPacket.id')=json_extract(publication.detail, '$.agentPacket.id')
+                AND json_extract(later.detail, '$.attemptId') IS json_extract(publication.detail, '$.attemptId'))
             AND COALESCE(json_extract(detail, '$.phase'), '')<>'preflight'
             AND json_extract(detail, '$.outcome') IN (?, ?)
             AND json_type(detail, '$.routingVersion') IS NULL
@@ -2164,7 +2169,7 @@ class SurfaceState {
             AND json_extract(detail, '$.agentPacket.source.nativeId')=?
             AND json_extract(detail, '$.agentPacket.source.generation')=?
             AND json_extract(detail, '$.agentPacket.target.guildId')=?
-            AND (json_extract(detail, '$.agentPacket.target.channelId')<>? OR ? IS NOT NULL)
+            AND (json_extract(detail, '$.agentPacket.target.channelId')=? OR json_extract(detail, '$.agentPacket.target.channelId')=?)
             AND json_extract(detail, '$.agentPacket.target.provider')=?
             AND json_extract(detail, '$.agentPacket.target.nativeId')=?
             AND json_extract(detail, '$.agentPacket.target.generation')=?

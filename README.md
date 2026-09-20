@@ -659,3 +659,5 @@ signature cannot be verified with a replacement credential.
 
 This slice is under local validation. No cross-OS or live agent delivery claim is
 made by these examples.
+
+Legacy known-unsent request retries require a freshly exported v2 child destination proof matching the recorded target. A v1 destination does not establish that it is a child and is refused before sending. Terminal sent/unknown recovery still accepts its original recorded identity without resending. Legacy result compatibility uses the latest outcome per attempt, excludes preflight receipts, and matches the exact original child or its signed parent.
