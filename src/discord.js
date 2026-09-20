@@ -3025,26 +3025,21 @@ class DiscordGateway {
       return { ready: true, state: 'ready' };
     };
     const ensureFollowupCoordinator = () => {
-      if (this.recoveryFollowupPromise || !this.recoveryPromise) return;
-      const activeRecovery = this.recoveryPromise;
+      if (this.recoveryFollowupPromise) return;
+      const activeRecovery = this.recoveryPromise || Promise.resolve();
       const coordinator = activeRecovery.then(
         () => drainRecoveryFollowups(),
         () => drainRecoveryFollowups()
       );
       this.recoveryFollowupPromise = coordinator;
-      coordinator.then(() => {
-        if (this.recoveryFollowupPromise === coordinator) {
-          this.recoveryFollowupPromise = null;
-          this.recoveryFollowupScope = null;
-          this.recoveryActiveWaiters.clear();
-        }
-      }, () => {
-        if (this.recoveryFollowupPromise === coordinator) {
-          this.recoveryFollowupPromise = null;
-          this.recoveryFollowupScope = null;
-          this.recoveryActiveWaiters.clear();
-        }
-      }).catch(() => {});
+      const finishCoordinator = () => {
+        if (this.recoveryFollowupPromise !== coordinator) return;
+        this.recoveryFollowupPromise = null;
+        this.recoveryFollowupScope = null;
+        this.recoveryActiveWaiters.clear();
+        if (this.pendingRecoveryRequests.length) ensureFollowupCoordinator();
+      };
+      coordinator.then(finishCoordinator, finishCoordinator).catch(() => {});
     };
 
     const waiter = makeWaiter(callerScope, overallDeadline);
@@ -3076,8 +3071,8 @@ class DiscordGateway {
   async reconcilePending(before = undefined, { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
     const lifecycleEpoch = this.lifecycleEpoch;
     const connectionEpoch = this.connectionEpoch;
-    while (this.recoveryPromise) {
-      await this.recoveryPromise.catch(() => {});
+    while (this.recoveryPromise || this.recoveryFollowupPromise) {
+      await (this.recoveryFollowupPromise || this.recoveryPromise).catch(() => {});
       if (!this.isCurrentLifecycle(lifecycleEpoch) || connectionEpoch !== this.connectionEpoch) return [];
     }
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return [];

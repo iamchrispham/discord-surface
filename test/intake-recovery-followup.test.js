@@ -287,3 +287,50 @@ for (const settled of [false, true]) {
     } finally { release(); }
   });
 }
+
+for (let hops = 0; hops <= 8; hops++) {
+  test(`reconciliation and followup remain serialized at microtask ${hops}`, { timeout: 3000 }, async t => {
+    const f = fixture(t);
+    let release, entered, active = 0, peak = 0;
+    const held = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    const operation = async reason => {
+      active++; peak = Math.max(peak, active);
+      if (reason === 'first') { entered(); await held; }
+      else for (let step = 0; step < 5; step++) await Promise.resolve();
+      active--;
+      return { ready: true, state: 'ready' };
+    };
+    f.gateway.recoverInbound = async (_signal, reason) => operation(reason);
+    f.gateway._reconcilePending = async () => { await operation('reconcile'); return []; };
+    const first = f.gateway.recoverTransport('first');
+    await started;
+    const reconciliation = f.gateway.reconcilePending(undefined, { allowPaused: true });
+    let late = Promise.resolve();
+    for (let hop = 0; hop < hops; hop++) late = late.then(() => {});
+    late = late.then(() => f.gateway.recoverTransport('followup'));
+    release();
+    await settleRecovery(Promise.all([first, late, reconciliation]));
+    assert.equal(peak, 1, 'recovery and reconciliation must never own the slot together');
+  });
+}
+
+for (let hops = 0; hops <= 8; hops++) {
+  test(`coordinator drains arrivals ${hops} microtasks after completion`, { timeout: 3000 }, async t => {
+    const f = fixture(t);
+    const seen = [];
+    f.gateway.recoverInbound = async (_signal, reason) => {
+      seen.push(reason);
+      return { ready: true, state: 'ready' };
+    };
+    const first = f.gateway.recoverTransport('first');
+    const queued = f.gateway.recoverTransport('queued');
+    let late = queued;
+    for (let hop = 0; hop < hops; hop++) late = late.then(() => {});
+    late = late.then(() => f.gateway.recoverTransport('late'));
+    await settleRecovery(Promise.all([first, queued, late]));
+    assert.deepEqual(seen, ['first', 'queued', 'late']);
+    await f.gateway.recoveryFollowupPromise;
+    assert.equal(f.gateway.pendingRecoveryRequests.length, 0);
+  });
+}
