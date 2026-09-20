@@ -64,3 +64,7 @@ void equal;
 void requestWithReply;
 void resultWithoutReply;
 void legacyRoutingVersion;
+
+// @ts-expect-error source parent metadata requires the current routing version
+const parentWithoutVersion: AgentMessage = { ...packet, sourceParentChannelId: "100" };
+void parentWithoutVersion;

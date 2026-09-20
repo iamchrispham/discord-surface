@@ -587,6 +587,14 @@ belong to the same trusted operator fleet and use the same Discord bot credentia
 The signature proves possession of that credential, not independent native-session
 identity. Agent input is explicitly labeled and grants no operator authority.
 
+Version-2 result packets carry a signed `sourceParentChannelId`, derived from the
+sender's binding after child enrollment is validated. It must differ from the
+source child. This lets a separate receiving installation distinguish an exact
+legacy child reply from a parent-route fallback. Sent or unknown legacy result
+custody is returned without another send or a live child lookup. Activate this
+wire change only through the coordinated fleet release, after receivers support
+this field.
+
 On the receiving installation, export an authenticated address from its active
 binding. This uses the existing ordinary-session or conductor owner checks:
 

@@ -33,7 +33,11 @@ function sameOwner(left: AgentAddress, right: AgentAddress): boolean {
 export function isAgentSourcePromotion(original: unknown, packet: unknown, parentChannelId: string): original is AgentMessage {
   try { validateAgentMessage(original); validateAgentMessage(packet); }
   catch { return false; }
-  return original.source.channelId === parentChannelId && packet.source.channelId !== parentChannelId &&
+  const parentPromotion = original.source.channelId === parentChannelId;
+  const childMetadataUpgrade = original.kind === KINDS.RESULT && original.routingVersion === undefined &&
+    sameAddress(original.source, packet.source) && packet.routingVersion === AGENT_ROUTING_VERSION &&
+    packet.sourceParentChannelId === parentChannelId;
+  return (parentPromotion || childMetadataUpgrade) && packet.source.channelId !== parentChannelId &&
     sameOwner(packet.source, original.source) && sameAddress(packet.target, original.target) &&
     packet.id === original.id && packet.kind === original.kind && packet.replyTo === original.replyTo && packet.text === original.text;
 }

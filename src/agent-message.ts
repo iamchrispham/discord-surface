@@ -23,13 +23,16 @@ interface AgentMessageFields {
   id: string;
   source: AgentAddress;
   target: AgentAddress;
-  routingVersion?: 2;
   text: string;
 }
 
+type AgentRoutingFields =
+  | { routingVersion?: never; sourceParentChannelId?: never }
+  | { routingVersion: 2; sourceParentChannelId?: string };
+
 export type AgentMessage =
-  | (AgentMessageFields & { kind: typeof KINDS.REQUEST; replyTo: null })
-  | (AgentMessageFields & { kind: typeof KINDS.RESULT; replyTo: string });
+  | (AgentMessageFields & AgentRoutingFields & { kind: typeof KINDS.REQUEST; replyTo: null })
+  | (AgentMessageFields & AgentRoutingFields & { kind: typeof KINDS.RESULT; replyTo: string });
 
 export interface AgentAddressEnvelope {
   version: 2;
@@ -74,9 +77,13 @@ export function validateAgentMessage(packet: unknown): asserts packet is AgentMe
   }
   const value = packet as Record<string, unknown>;
   const keys = Object.keys(value);
-  if (keys.length !== 6 && keys.length !== 7 ||
-      !['id', 'kind', 'source', 'target', 'replyTo', 'text'].every(key => Object.hasOwn(value, key)) ||
-      (keys.length === 7 && (!Object.hasOwn(value, 'routingVersion') || value.routingVersion !== 2))) {
+  const required = ['id', 'kind', 'source', 'target', 'replyTo', 'text'];
+  if (!required.every(key => Object.hasOwn(value, key)) ||
+      keys.some(key => ![...required, 'routingVersion', 'sourceParentChannelId'].includes(key)) ||
+      (Object.hasOwn(value, 'routingVersion') && value.routingVersion !== 2) ||
+      (Object.hasOwn(value, 'sourceParentChannelId') &&
+        (value.routingVersion !== 2 || typeof value.sourceParentChannelId !== 'string' ||
+          !/^\d{1,20}$/.test(value.sourceParentChannelId)))) {
     throw new Error('invalid agent message');
   }
   if (typeof value.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.id) ||
@@ -85,7 +92,7 @@ export function validateAgentMessage(packet: unknown): asserts packet is AgentMe
   }
   const source = value.source as AgentAddress;
   const target = value.target as AgentAddress;
-  if (source.guildId !== target.guildId ||
+  if (value.sourceParentChannelId === source.channelId || source.guildId !== target.guildId ||
       (source.provider === target.provider && source.nativeId === target.nativeId) ||
       typeof value.text !== 'string' || !value.text.trim() ||
       ((value.kind as AgentMessageKind) === KINDS.REQUEST ? value.replyTo !== null :

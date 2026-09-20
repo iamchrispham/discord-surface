@@ -2,6 +2,7 @@ import {
   AGENT_ROUTING_VERSION,
   assertLegacyParentSourcedIdentity,
   isLegacyRetryableOutcome,
+  isAgentSourcePromotion,
   legacyParentSourcedReceipt,
   resolveAgentReplyRequest,
   type LegacyParentSourcedReceipt
@@ -726,7 +727,6 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   let agentPacket: AgentMessage | null = null;
   let agentRequestTarget: AgentAddress | null = null;
   let legacyPacket: AgentMessage | null = null;
-  let terminalLegacyResult: DirectPostResult | null = null;
   const legacyChildAddress = legacy && !sameAddress(legacy.packet.source, canonicalAddress(binding))
     ? legacy.packet.source
     : null;
@@ -743,14 +743,18 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       const migratedPacket = legacy.detail.agentPacket;
       if (!legacyMarker || typeof legacyMarker !== 'object' || Array.isArray(legacyMarker) ||
           !migratedPacket || typeof migratedPacket !== 'object' || Array.isArray(migratedPacket)) return legacy.result;
-      legacyPacket = legacy.packet;
-      terminalLegacyResult = legacy.result;
+      if (!isAgentSourcePromotion(legacy.packet, migratedPacket, binding.channelId) ||
+          (agentThreadId !== null && agentThreadId !== (migratedPacket as AgentMessage).source.channelId)) {
+        throw new BindingError('direct post request identity conflicts with existing custody');
+      }
+      return legacy.result;
     }
-    if (terminalLegacyResult === null && !isLegacyRetryableOutcome(legacy.outcome)) {
+    if (!isLegacyRetryableOutcome(legacy.outcome)) {
       throw new BindingError('direct post legacy custody has an unsupported retry outcome');
     }
-    if (terminalLegacyResult === null) legacyPacket = legacy.packet;
+    legacyPacket = legacy.packet;
   }
+
   let address = canonicalAddress(binding);
   if (!watcherNotice && isAgentMessage) {
     const resolvedAddress = resolveAgentAddress(state, binding, agentThreadId);
@@ -778,7 +782,9 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     deliveryTarget = legacyPacket.target;
     agentTarget = deliveryTarget;
     agentReplyTo = legacyPacket.replyTo;
-    agentPacket = { ...legacyPacket, source: address };
+    agentPacket = legacyPacket.kind === KINDS.RESULT
+      ? { ...legacyPacket, source: address, routingVersion: AGENT_ROUTING_VERSION, sourceParentChannelId: binding.channelId }
+      : { ...legacyPacket, source: address };
     if (legacyPacket.kind === KINDS.RESULT) {
       const request = resolveAgentReplyRequest(state, legacyPacket.replyTo, legacyPacket.source, legacyPacket.target, null, BindingError);
       agentRequestTarget = sameAddress(request.target, address) ? null : request.target;
@@ -822,6 +828,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       target: packetTarget,
       replyTo: (agentReplyTo ?? null) as string | null,
       routingVersion: AGENT_ROUTING_VERSION,
+      ...(agentKind === KINDS.RESULT ? { sourceParentChannelId: binding.channelId } : {}),
       text: source.text
     } as unknown as AgentMessage;
     agentPacket = packet;
@@ -833,18 +840,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       displayParts: [agentPresentation === AGENT_PRESENTATIONS.ATTACHMENT ? agentMessagePreview(packet) : wire]
     };
   }
+  const legacyMigration = legacyChildAddress === null || legacyPacket?.kind === KINDS.RESULT ? legacyPacket : null;
   const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, effectiveReplyTarget);
-  if (terminalLegacyResult !== null) {
-    const legacyPartIndex = legacy?.detail.partIndex;
-    const partIndex = Number.isSafeInteger(legacyPartIndex) ? legacyPartIndex as number : 0;
-    const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex,
-      address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null,
-      legacyChildAddress === null ? legacyPacket : null, agentRequestTarget,
-      legacy === null && isAgentMessage ? AGENT_ROUTING_VERSION : null);
-    if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
-    state.inspectDirectPostPart(meta);
-    return terminalLegacyResult;
-  }
   state.recoverDirectPostReceipts();
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;
@@ -864,7 +861,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       break;
     }
     const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null,
-      legacyChildAddress === null ? legacyPacket : null, agentRequestTarget,
+      legacyMigration, agentRequestTarget,
       legacy === null && isAgentMessage ? AGENT_ROUTING_VERSION : null);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     if (deliveryTarget !== null) {
