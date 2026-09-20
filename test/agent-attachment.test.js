@@ -22,7 +22,8 @@ const token = 'isolated-test-credential';
 function encodeLegacyParentResult(state, value, credential) {
   const result = { ...value, kind: KINDS.RESULT, replyTo: `request-${value.id}`, routingVersion: 2 };
   state.receipt(null, 'direct-post-outcome', {
-    outcome: 'sent', legacyAgentPacket: { ...result, routingVersion: undefined }, agentPacket: result
+    outcome: 'sent', agentPacket: { id: result.replyTo, kind: KINDS.REQUEST,
+      source: result.target, target: result.source, replyTo: null, text: 'Original request.' }
   });
   return encodeAgentMessage(result, credential);
 }

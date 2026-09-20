@@ -522,16 +522,29 @@ test('new intake stamps its route version and cannot use legacy parent-result co
   assert.equal(f.state.directPostRows('new-parent-result').length, 0);
 });
 
-test('legacy-correlated v2 parent results remain admissible after upgrade', async t => {
-  const f = fixture(t);
-  const packet = { id: 'legacy-parent-result', kind: KINDS.RESULT, source: target, target: source,
-    replyTo: 'legacy-parent-request', routingVersion: AGENT_ROUTING_VERSION, text: 'Completed task.' };
-  f.state.receipt(null, 'direct-post-outcome', {
-    outcome: 'sent', legacyAgentPacket: { ...packet, routingVersion: undefined }, agentPacket: packet
-  });
-  const accepted = f.state.acceptDiscordMessage({ id: 'legacy-parent-result-discord', guildId: '100', channelId: '101',
-    authorId: '901', isBot: true, content: encodeAgentMessage(packet, token) }, { agentToken: token });
+test('legacy results use receiver request custody across separate installations', async t => {
+  const receiver = fixture(t);
+  const sender = fixture(t);
+  const request = { id: 'legacy-parent-request', kind: KINDS.REQUEST, source, target,
+    replyTo: null, text: 'Original task.' };
+  const packet = { id: 'legacy-parent-result', kind: KINDS.RESULT,
+    source: { ...target, channelId: '203' }, target: source,
+    replyTo: request.id, routingVersion: AGENT_ROUTING_VERSION, text: 'Completed task.' };
+  receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', agentPacket: request });
+  sender.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', agentPacket: packet });
+  const ingest = (value, id) => receiver.state.acceptDiscordMessage({ id, guildId: '100', channelId: '101',
+    authorId: '901', isBot: true, content: encodeAgentMessage(value, token) }, { agentToken: token });
+  for (const [suffix, value] of [
+    ['correlation', { ...packet, replyTo: 'unknown-request' }],
+    ['owner', { ...packet, source: { ...packet.source, nativeId: source.nativeId } }],
+    ['generation', { ...packet, source: { ...packet.source, generation: 2 } }]
+  ]) assert.equal(ingest(value, suffix).accepted, false);
+  receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', routingVersion: 2,
+    agentPacket: { ...request, id: 'new-request', routingVersion: 2 } });
+  assert.equal(ingest({ ...packet, replyTo: 'new-request' }, 'new-request-result').accepted, false);
+  const accepted = ingest(packet, 'legacy-parent-result-discord');
   assert.equal(accepted.accepted, true, JSON.stringify(accepted));
+  assert.equal(receiver.state.directPostRows(packet.id).length, 0, 'receiver has no sender result custody');
 });
 
 test('previous child-result custody remains idempotent without migration metadata', async t => {
