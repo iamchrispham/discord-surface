@@ -254,3 +254,36 @@ test('selected recovery remains selected after an arrival followup', { timeout: 
   assert.equal(f.state.getMessage('101').state, 'accepted');
   assert.equal(f.dispatched.length, 0);
 });
+
+for (const settled of [false, true]) {
+  test(`expired queued recovery preserves healthy custody (${settled ? 'settled' : 'unsettled'} caller)`, { timeout: 3000 }, async t => {
+    const f = fixture(t);
+    f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
+      nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace });
+    f.state.setIntakeBaseline('3000', '100', 'fixture');
+    f.state.markIntakeBoundary('3000', 'ready');
+    const before = f.state.getIntakeWatermark('3000');
+    let entered, release;
+    const started = new Promise(resolve => { entered = resolve; });
+    const held = new Promise(resolve => { release = resolve; });
+    const original = f.gateway.fetchHistory;
+    let paused = false;
+    f.gateway.fetchHistory = async (channel, options) => {
+      if (!paused) { paused = true; entered(); await held; }
+      return original(channel, options);
+    };
+    try {
+      const active = f.gateway.recoverTransport('active', f.gateway.lifecycleEpoch, ['1000']);
+      await started;
+      const queued = f.gateway.recoverTransport('expired', f.gateway.lifecycleEpoch, ['3000'], Date.now() - 1);
+      if (settled) await settleRecovery(queued);
+      release();
+      await settleRecovery(active);
+      await settleRecovery(queued);
+      await f.gateway.recoveryFollowupPromise;
+      assert.deepEqual(f.state.getIntakeWatermark('3000'), before);
+      assert.equal(f.calls.some(call => call.id === '3000'), false);
+      assert.equal(f.dispatched.length, 0);
+    } finally { release(); }
+  });
+}

@@ -2956,6 +2956,9 @@ class DiscordGateway {
       }
     };
     const startRecoveryPass = (scope, deadline, passReason, passLifecycle, activeWaiters) => {
+      if (Date.now() >= deadline || activeWaiters.every(waiter => waiter.settled)) {
+        return Promise.resolve({ ready: false, state: 'unavailable' });
+      }
       this.recoveryActiveWaiters = new Set(activeWaiters.filter(waiter => !waiter.settled));
       this.recoveryController = new AbortController();
       const controller = this.recoveryController;
