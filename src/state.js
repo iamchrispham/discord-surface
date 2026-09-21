@@ -1,4 +1,4 @@
-const { createSchemaHandlers } = require('./state/schema');
+const createSchemaHandlers = (...args) => require('./state/schema').createSchemaHandlers(...args);
 const { PREFIX: AGENT_PREFIX, decodeAgentMessage } = require('./agent-message');
 const { AGENT_ROUTING_VERSION } = require('./state/agent-routing');
 const { WATCHER_NOTICE_PREFIX, decodeWatcherNotice, sameWatcherNotice, validateWatcherNotice } = require('./watcher-notice');
