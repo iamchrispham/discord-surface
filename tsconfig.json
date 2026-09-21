@@ -21,6 +21,8 @@
     "src/native.ts",
     "src/native/final-answer.ts",
     "src/native/contracts.ts",
+    "src/native/claude-identity.ts",
+    "src/native/errors.ts",
     "src/native/prompts.ts",
     "src/agent-message.ts",
     "src/watcher-notice.ts",
