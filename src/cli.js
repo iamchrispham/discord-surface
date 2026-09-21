@@ -1458,7 +1458,7 @@ async function handoffFromLockInternal(args) {
   }
 }
 
-function writePid(pidFile, guildId, stateDir, db) {
+function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
   fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
   fs.writeFileSync(pidFile, JSON.stringify({
     pid: process.pid,
@@ -1466,6 +1466,7 @@ function writePid(pidFile, guildId, stateDir, db) {
     stateDir,
     db,
     command: 'run',
+    courierRouteId,
     startedAt: new Date().toISOString(),
     capabilities: [
       GATEWAY_CAPABILITIES.ordinaryBindWake,
@@ -1637,7 +1638,7 @@ async function runRuntime(args) {
     if (stopping || !startupLock) return;
     const courierRoute = resolveCourierRoute(state, args);
     state.recoverAfterRestart();
-    writePid(paths.pid, config.guildId, paths.stateDir, paths.db);
+    writePid(paths.pid, config.guildId, paths.stateDir, paths.db, courierRoute?.routeId || null);
     gateway = new DiscordGateway({
       state,
       stateDir: paths.stateDir,
@@ -2215,7 +2216,14 @@ function readProcessCommand(pid) {
 function pidMatches(value, stateDir, db, command) {
   if (!value || value.command !== 'run' || value.stateDir !== stateDir) return false;
   try {
-    const actualCommand = (command ?? readProcessCommand(value.pid)).trim();
+    let actualCommand = (command ?? readProcessCommand(value.pid)).trim();
+    if (value.courierRouteId != null) {
+      if (typeof value.courierRouteId !== 'string' || !value.courierRouteId.trim()) return false;
+      const routeSuffix = [` --courier-route-id=${value.courierRouteId}`, ` --courier-route-id ${value.courierRouteId}`]
+        .find(suffix => actualCommand.endsWith(suffix));
+      if (!routeSuffix) return false;
+      actualCommand = actualCommand.slice(0, -routeSuffix.length);
+    }
     const expectedPrefix = `${process.execPath} ${__filename} run --state-dir ${stateDir}`;
     if (actualCommand === expectedPrefix) {
       return (value.db == null || value.db === db) && db === path.join(stateDir, 'surface.sqlite');
