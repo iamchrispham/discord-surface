@@ -38,6 +38,7 @@
     "src/state/interaction.ts",
     "src/board-text.ts",
     "src/state/board-refresh.ts",
+    "src/state/board-refresh/receipt-projection.ts",
     "src/state/board-refresh/contracts.ts",
     "src/discord/board-refresh.ts",
     "src/board-refresh.ts",
