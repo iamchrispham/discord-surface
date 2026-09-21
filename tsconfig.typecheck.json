@@ -23,6 +23,7 @@
     "src/agent-presentation.ts",
     "src/agent-attachment.ts",
     "src/acknowledgment.ts",
+    "src/acknowledgment/contracts.ts",
     "src/claude-channel.ts",
     "src/discord/handoff-fence.ts",
     "src/discord/decision.ts",
