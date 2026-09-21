@@ -41,6 +41,8 @@
     "src/discord/thread-enrollment.ts",
     "src/direct-post.ts",
     "src/direct-post/contracts.ts",
+    "src/direct-post/source.ts",
+    "src/direct-post/request-values.ts",
     "src/decision-canonical.ts",
     "src/decision-present.ts",
     "src/state/decision.ts",
