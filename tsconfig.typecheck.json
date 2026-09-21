@@ -53,6 +53,8 @@
     "src/direct-post/delivery-identity.ts",
     "src/direct-post/request-values.ts",
     "src/decision-canonical.ts",
+    "src/decision-canonical/contracts.ts",
+    "src/decision-canonical/process.ts",
     "src/decision-present.ts",
     "src/state/decision.ts",
     "src/state/courier-route/index.ts",
