@@ -9,9 +9,9 @@ const {
   normalizeAgentMessage
 } = require('./agent-attachment');
 const fs = require('node:fs');
-const { ACK_WAITING, REACTION, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
+const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, codexPrompt, dispatchAndObserve, agentCompletionCommand, watcherNoticeCompletionCommand, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, readInitialCursor, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
-const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, TRANSPORT_RECEIPT_OUTCOMES, UnresolvedWorkError } = require('./state');
+const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { COURIER_OUTCOMES, COURIER_RESULT_STATUSES, isCourierOriginAllowed } = require('./state/courier-route');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
@@ -22,6 +22,7 @@ const { THREAD_STATES } = require('./state/thread-enrollment');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer } = require('./discord/decision');
 const { cancelResponseBody, readRetryAfter, sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
+const { createTransportReceiptDelivery } = require('./discord/transport-receipts');
 
 const requireInstalled = require;
 const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
@@ -175,23 +176,10 @@ function classifyReplyError(error) {
   return 'unknown';
 }
 
-function classifyTransportReceiptError(error) {
-  if (error?.outcome === 'not_sent') return 'not_sent';
-  if (error?.outcome !== 'sent' && TRANSPORT_RECEIPT_OUTCOMES.includes(error?.outcome)) return error.outcome;
-  if (error?.status === 429 || error?.code === 429 || /^RateLimitError(?:\[|$)/.test(String(error?.name || '')) || /^RateLimitError(?:\[|$)/.test(String(error?.message || ''))) return 'rate_limited';
-  if ([400, 401, 403, 404].includes(error?.status) || error?.code === 50013) return 'rejected';
-  return 'unknown';
-}
-
-function transportReceiptText(message, attempt) {
-  if (attempt.readiness === 'ready') return 'Receipt: saved for this conductor.';
-  return 'Receipt: saved. Delivery was paused when this receipt was prepared.';
-}
-
 function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), providers, sendReply, sendTransportReceipt, prepareReply, trackReceipt, observeOptions = {},
   agentCredential = () => null, agentAttachmentFetch = globalThis.fetch,
   agentAttachmentTimeoutMs = RECOVERY_LIMITS.timeoutMs, agentBotId = () => null, readyForLiveIntake = null, courierRoute = null }) {
-  const receiptWork = new Set();
+  const { issueTransportReceipt, launchTransportReceipt, waitForReceipts } = createTransportReceiptDelivery({ state, sendTransportReceipt, trackReceipt });
   const nativeWork = new Map();
   const ownerQueues = new Map();
   const queuedNativeWork = new Map();
@@ -209,56 +197,6 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
 
   function connectedBotId() {
     return typeof agentBotId === 'function' ? agentBotId() : agentBotId;
-  }
-
-  function trackReceiptWork(work) {
-    const tracked = Promise.resolve(work).catch(() => null);
-    receiptWork.add(tracked);
-    tracked.finally(() => receiptWork.delete(tracked)).catch(() => {});
-    trackReceipt?.(tracked);
-    return tracked;
-  }
-
-  async function issueTransportReceipt(message) {
-    const started = state.beginTransportReceipt(message.id);
-    if (!started.started) return started;
-    const authorized = state.authorizeTransportReceipt(message.id, started.binding);
-    if (!authorized) return state.recordTransportReceiptOutcome(message.id, 'stale', { reason: 'authorization changed before receipt send' });
-    const payload = {
-      ...authorized.attempt,
-      content: transportReceiptText(message, authorized.attempt),
-      reaction: authorized.attempt.readiness === READINESS.READY ? REACTION.SAVED : null,
-      nonce: authorized.nonce,
-      enforceNonce: true,
-      allowedMentions: { parse: [], repliedUser: false },
-      reply: { messageReference: message.id, failIfNotExists: false }
-    };
-    const sender = sendTransportReceipt || (async (source, receipt) => {
-      if (!receipt.reaction) return source.channel?.send(receipt);
-      let target = source;
-      if (typeof target.react !== 'function') {
-        target = await source.channel?.messages?.fetch?.(source.id);
-      }
-      if (typeof target?.react !== 'function') {
-        throw new Error('Discord source message does not support reactions');
-      }
-      await target.react(receipt.reaction);
-      return { messageId: source.id };
-    });
-    try {
-      const sent = await sender(message, payload);
-      const receiptMessageId = sent?.id || sent?.messageId;
-      if (!receiptMessageId) throw new Error('Discord did not return a transport receipt message id');
-      return state.recordTransportReceiptOutcome(message.id, 'sent', payload.reaction
-        ? { reaction: payload.reaction, targetMessageId: message.id }
-        : { receiptMessageId });
-    } catch (error) {
-      return state.recordTransportReceiptOutcome(message.id, classifyTransportReceiptError(error), { error: String(error?.message || error).slice(0, 200) });
-    }
-  }
-
-  function launchTransportReceipt(message) {
-    return trackReceiptWork(issueTransportReceipt(message));
   }
 
   function storedAttachmentInput(message) {
@@ -956,10 +894,6 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     }, awaitExisting, continueUntilFinal);
     releaseAcknowledged(message.id);
     return work;
-  }
-
-  async function waitForReceipts() {
-    await Promise.allSettled([...receiptWork]);
   }
 
   return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted,
