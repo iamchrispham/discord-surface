@@ -12,6 +12,7 @@
     "src/ordinary-bind/gateway-capability.ts",
     "src/native-transcript.ts",
     "src/native.ts",
+    "src/native/observation.ts",
     "src/native/final-answer.ts",
     "src/native/contracts.ts",
     "src/native/claude-identity.ts",
