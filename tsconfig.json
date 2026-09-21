@@ -48,6 +48,7 @@
     "src/direct-post-file.ts",
     "src/state/agent-completion.ts",
     "src/state/watcher-notice.ts",
+    "src/state/watcher-notice/contracts.ts",
     "src/state/ordinary-binding.ts",
     "src/state/ordinary-binding/contracts.ts",
     "src/ordinary/constants.ts",
