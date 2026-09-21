@@ -38,6 +38,7 @@
     "src/state/thread-enrollment.ts",
     "src/discord/thread-enrollment.ts",
     "src/direct-post.ts",
+    "src/direct-post/contracts.ts",
     "src/decision-canonical.ts",
     "src/decision-present.ts",
     "src/state/decision.ts",
