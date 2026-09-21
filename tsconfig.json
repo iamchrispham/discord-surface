@@ -42,6 +42,7 @@
     "src/board-refresh.ts",
     "src/state/direct-post.ts",
     "src/state/direct-post/contracts.ts",
+    "src/state/direct-post/receipt-queries.ts",
     "src/state/native-reply-file.ts",
     "src/direct-post-file.ts",
     "src/state/agent-completion.ts",
