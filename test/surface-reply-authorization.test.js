@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { MESSAGE_STATES } = require('../src/state');
+const { MESSAGE_STATES, SurfaceState } = require('../src/state');
 const { DiscordGateway, readSecret } = require('../src/discord');
 const { CODEX_ID, CLAUDE_ID, fixture, discordMessage } = require('./surface-fixtures');
 
@@ -116,4 +116,21 @@ test('simulated: unbind tombstones history and rebind increments the generation'
   assert.equal(rebound.generation, 2);
   assert.equal(rebound.active, true);
   state.close();
+});
+
+
+test('reply facade reads caller properties only once', () => {
+  const stop = new Error('transaction boundary');
+  const receiver = { transaction() { throw stop; } };
+  let providerReads = 0;
+  assert.throws(() => SurfaceState.prototype.recordNativeReply.call(receiver, {
+    get provider() { providerReads++; return 'codex'; },
+    messageId: 'getter-reply', nativeId: CODEX_ID, generation: 1, text: 'reply'
+  }), error => error === stop);
+  assert.equal(providerReads, 1);
+  let partReads = 0;
+  assert.throws(() => SurfaceState.prototype.reconcileReplyDelivery.call(receiver, 'getter-reply', 'sent', {
+    get partIndex() { partReads++; return 0; }, replyMessageId: 'sent-reply'
+  }), error => error === stop);
+  assert.equal(partReads, 1);
 });
