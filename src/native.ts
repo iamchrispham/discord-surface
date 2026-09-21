@@ -1,3 +1,6 @@
+import { parseFinalAnswer, type FinalAnswer } from './native/final-answer';
+export { finalText } from './native/final-answer';
+export type { TranscriptPart, TranscriptItem, TranscriptPayload, TranscriptRow } from './native/final-answer';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as net from 'node:net';
@@ -55,7 +58,7 @@ export {
   watcherNoticeCompletionCommand
 };
 
-const { MESSAGE_STATES, PROVIDERS, splitReply, validateNativeId } = require('../src/state') as {
+const { MESSAGE_STATES, PROVIDERS, validateNativeId } = require('../src/state') as {
   MESSAGE_STATES: {
     ACCEPTED: 'accepted';
     DISPATCHING: 'dispatching';
@@ -74,7 +77,6 @@ const { MESSAGE_STATES, PROVIDERS, splitReply, validateNativeId } = require('../
     CODEX: 'codex';
     CLAUDE: 'claude';
   };
-  splitReply: (text: string) => string[];
   validateNativeId: (value: unknown) => unknown;
 };
 
@@ -322,28 +324,6 @@ export interface DispatchReport {
   error?: unknown;
 }
 
-export interface TranscriptPart {
-  type?: unknown;
-  text?: unknown;
-}
-
-export interface TranscriptItem {
-  phase?: unknown;
-  content?: TranscriptPart[] | null;
-}
-
-export interface TranscriptPayload {
-  type?: unknown;
-  item?: TranscriptItem | null;
-  phase?: unknown;
-  content?: TranscriptPart[] | null;
-}
-
-export interface TranscriptRow {
-  type?: unknown;
-  payload?: TranscriptPayload | null;
-}
-
 function asNativeError(error: unknown): NativeError {
   if (error instanceof Error) return error as NativeError;
   const typed = Object.assign(new Error(String(error)), { cause: error }) as NativeError;
@@ -373,84 +353,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     timer = setTimeout(finish, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
   });
-}
-
-const CREATED_THREAD_DIRECTIVE = /^::created-thread\{(?:threadId|clientThreadId)="[^"\r\n]+"\}$/;
-
-type CodeFence = { marker: '`' | '~'; length: number };
-
-function readFenceStart(line: string): CodeFence | null {
-  const match = /^ {0,3}([`~]{3,})([^\r\n]*)$/.exec(line);
-  if (!match) return null;
-  const run = match[1];
-  const marker = run[0] as CodeFence['marker'];
-  if (!run.split('').every(char => char === marker)) return null;
-  if (marker === '`' && match[2].includes('`')) return null;
-  return { marker, length: run.length };
-}
-
-function isFenceClose(line: string, fence: CodeFence): boolean {
-  const match = /^ {0,3}([`~]{3,})[ \t]*$/.exec(line);
-  if (!match) return false;
-  const run = match[1];
-  return run[0] === fence.marker && run.length >= fence.length && run.split('').every(char => char === fence.marker);
-}
-
-function stripCreatedThreadDirectivePart(text: string, initialFence: CodeFence | null, initialLineStart: boolean): { text: string; fence: CodeFence | null; lineStart: boolean } {
-  let fence = initialFence;
-  let lineStart = initialLineStart;
-  const lines: string[] = [];
-  const rawLines = text.split('\n');
-  for (const [index, rawLine] of rawLines.entries()) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
-    if (fence) {
-      if (lineStart && isFenceClose(line, fence)) fence = null;
-    } else {
-      if (lineStart && CREATED_THREAD_DIRECTIVE.test(line)) {
-        continue;
-      }
-      if (lineStart) fence = readFenceStart(line);
-    }
-    lines.push(rawLine);
-    lineStart = index < rawLines.length - 1;
-  }
-  return { text: lines.join('\n'), fence, lineStart: text.endsWith('\n') };
-}
-
-type FinalAnswer = { text: string; parts: string[] };
-
-function sanitizeCreatedThreadDirective(text: string): FinalAnswer {
-  const sanitized = stripCreatedThreadDirectivePart(text, null, true).text.trim();
-  if (!sanitized) return { text: '', parts: [] };
-  return { text: sanitized, parts: splitReply(sanitized) };
-}
-
-function parseFinalAnswer(row: TranscriptRow, marker: string): FinalAnswer | null {
-  const payload = row.payload;
-  let item = null;
-  let phase = null;
-  if (row.type === 'event_msg' && payload?.type === 'item_completed') {
-    item = payload.item;
-    phase = item?.phase;
-  } else if (row.type === 'response_item' && payload?.type === 'message') {
-    item = payload;
-    phase = payload.phase;
-  }
-  if (!item || phase !== 'final_answer') return null;
-  const text = (item.content || [])
-    .filter(part => part.type === 'Text' || part.type === 'output_text')
-    .map(part => part.text)
-    .filter((value): value is string => typeof value === 'string')
-    .join('')
-    .trim();
-  if (!text || text.split(/\r?\n/, 1)[0].trim() !== marker) return null;
-  const newline = text.indexOf('\n');
-  if (newline < 0) return null;
-  return sanitizeCreatedThreadDirective(text.slice(newline + 1));
-}
-
-export function finalText(row: TranscriptRow, marker: string): string | null {
-  return parseFinalAnswer(row, marker)?.text ?? null;
 }
 
 function cursorTailBytes(cursor: PersistedObserverCursor | null | undefined): Buffer {
