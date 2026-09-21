@@ -2216,14 +2216,16 @@ function readProcessCommand(pid) {
 function pidMatches(value, stateDir, db, command) {
   if (!value || value.command !== 'run' || value.stateDir !== stateDir) return false;
   try {
-    let actualCommand = (command ?? readProcessCommand(value.pid)).trim();
+    // ps adds one newline; trailing route whitespace belongs to the argument.
+    let actualCommand = (command ?? readProcessCommand(value.pid)).replace(/\n$/, '').trimStart();
     if (value.courierRouteId != null) {
-      if (typeof value.courierRouteId !== 'string' || !value.courierRouteId.trim()) return false;
+      if (typeof value.courierRouteId !== 'string' || value.courierRouteId.length === 0) return false;
       const routeSuffix = [` --courier-route-id=${value.courierRouteId}`, ` --courier-route-id ${value.courierRouteId}`]
         .find(suffix => actualCommand.endsWith(suffix));
       if (!routeSuffix) return false;
       actualCommand = actualCommand.slice(0, -routeSuffix.length);
     }
+    actualCommand = actualCommand.trim();
     const expectedPrefix = `${process.execPath} ${__filename} run --state-dir ${stateDir}`;
     if (actualCommand === expectedPrefix) {
       return (value.db == null || value.db === db) && db === path.join(stateDir, 'surface.sqlite');

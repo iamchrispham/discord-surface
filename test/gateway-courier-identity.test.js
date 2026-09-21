@@ -8,14 +8,14 @@ const { once } = require('node:events');
 const { SurfaceState, THREAD_STATES } = require('../src/state');
 const { gatewayProcessStatus, pathsFor, requestGatewayRecovery } = require('../src/cli');
 
+for (const routeId of ['fixture route', 'fixture route ', ' ']) {
 for (const explicitDb of [false, true]) {
-  test(`selected courier Gateway retains runtime identity, explicit database=${explicitDb}`, async t => {
+  test(`selected courier Gateway retains runtime identity, explicit database=${explicitDb}, route=${JSON.stringify(routeId)}`, async t => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'courier identity '));
     const db = path.join(dir, explicitDb ? 'custom database.sqlite' : 'surface.sqlite');
     const paths = pathsFor({ 'state-dir': dir, db });
     const state = new SurfaceState(db);
     const nativeId = '11111111-1111-1111-1111-111111111111';
-    const routeId = 'fixture route';
     state.setConfig({ guildId: '100', operatorId: 'operator', secretFile: path.join(dir, 'unused') });
     state.bind({ guildId: '100', channelId: '1000', provider: 'codex', nativeId, workspace: dir });
     const binding = state.getBinding('1000');
@@ -67,4 +67,5 @@ for (const explicitDb of [false, true]) {
     }
     fs.writeFileSync(paths.pid, JSON.stringify(record));
   });
+}
 }
