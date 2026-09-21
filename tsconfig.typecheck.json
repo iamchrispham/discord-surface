@@ -13,6 +13,7 @@
     "src/native-transcript.ts",
     "src/native.ts",
     "src/native/final-answer.ts",
+    "src/native/contracts.ts",
     "src/native/prompts.ts",
     "src/agent-message.ts",
     "src/watcher-notice.ts",
