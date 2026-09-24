@@ -929,6 +929,7 @@ class DiscordGateway {
     this.recoveryFollowupScope = null;
     this.recoveryActiveWaiters = new Set();
     this.recoveryRetryScheduledChannels = new Set();
+    this.closingCustodyRetries = new Map();
     this.pendingRecoveryChannels = new Set();
     this.pendingRecoveryRequests = [];
     this.pendingFullRecovery = false;
@@ -2193,8 +2194,11 @@ class DiscordGateway {
       let watermark = this.state.getIntakeWatermark(binding.channelId);
       let ownedBoundary = watermark;
       let ownedReadiness = recovering.readiness;
-      // A pass that starts from the closing-custody marker is the one retry: it records gap if custody is still ahead.
-      const closingCustodyRetry = typeof watermark?.detail === 'string' && watermark.detail.endsWith(CLOSING_CUSTODY_DETAIL);
+      // A pass that starts from the closing-custody marker under the attempt that queued it is the one retry: it records
+      // gap if custody is still ahead. A pass under another lifecycle or deadline gets its own retry.
+      const closingCustodyAttempt = this.closingCustodyRetries.get(binding.channelId);
+      const closingCustodyRetry = typeof watermark?.detail === 'string' && watermark.detail.endsWith(CLOSING_CUSTODY_DETAIL) &&
+        closingCustodyAttempt?.lifecycleEpoch === lifecycleEpoch && closingCustodyAttempt.deadline === deadline;
       const currentRecovery = () => this.isCurrentBinding(binding) &&
         this.state.getBinding(binding.channelId)?.readiness === ownedReadiness;
       const classifyCurrentReadiness = () => {
@@ -2532,6 +2536,7 @@ class DiscordGateway {
       const liveCustodyAhead = finalWatermark?.last_seen_id && (!finalWatermark.recovered_through_id || compareDiscordIds(finalWatermark.last_seen_id, finalWatermark.recovered_through_id) > 0);
       if (liveCustodyAhead && !closingCustodyRetry) {
         // Custody accepted during the close is still in Discord history, so re-read it under this pass's deadline.
+        this.closingCustodyRetries.set(binding.channelId, { lifecycleEpoch, deadline });
         const retrying = await recordOwnedBoundary(binding, channel, READINESS.PENDING, `${reason} ${CLOSING_CUSTODY_DETAIL}`,
           null, null, signal, deadline, finalWatermark);
         queueRecoveryIfPending();
@@ -2961,6 +2966,7 @@ class DiscordGateway {
     this.pendingRecoveryChannels.clear();
     for (const request of this.pendingRecoveryRequests.splice(0)) request.waiter?.stop?.();
     this.recoveryRetryScheduledChannels.clear();
+    this.closingCustodyRetries.clear();
     this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.stopPromise = (async () => {
       this.ready = false;

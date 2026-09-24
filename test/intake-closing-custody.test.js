@@ -119,6 +119,33 @@ test('channel custody that history never shows records gap after one extra pass'
   assert.equal(f.state.getMessage('101').state, 'accepted');
 });
 
+test('a closing retry skipped by stop leaves the next recovery its own retry', { timeout: 8000 }, async t => {
+  const f = fixture(t);
+  landDuringFinalFetch(f, '101', '1000');
+  const mark = f.state.markIntakeBoundary.bind(f.state);
+  let stopped = null;
+  f.state.markIntakeBoundary = (...args) => {
+    const result = mark(...args);
+    if (!stopped && result && args[0] === '1000' && args[1] === 'pending' &&
+        String(args[2]).endsWith('live Discord custody arrived while recovery readiness was closing')) {
+      stopped = f.gateway.stop();
+    }
+    return result;
+  };
+  await settle(f.gateway.recoverTransport('startup'));
+  await stopped;
+  assert.equal(f.boundary('1000').state, 'pending');
+  assert.match(f.boundary('1000').detail, /live Discord custody arrived while recovery readiness was closing$/);
+  await f.reopen();
+  const landed = landDuringFinalFetch(f, '102', '1000');
+  const result = await run(f, 'result');
+  assert.ok(landed());
+  assert.equal(f.boundary('1000').state, 'ready', f.boundary('1000').detail);
+  assert.equal(f.state.getBinding('1000').readiness, 'ready');
+  assert.equal(f.cursor('1000'), '102');
+  assert.equal(result.ready, true);
+});
+
 test('history beyond the page bound still records gap', { timeout: 8000 }, async t => {
   const f = fixture(t);
   f.history.set('1000', Array.from({ length: 11 }, (_, index) => f.message(String(101 + index), '1000')));
