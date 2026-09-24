@@ -411,7 +411,7 @@ test('thread recovery keeps an untouched child pending after deadline exhaustion
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
 });
 
-test('closing recovery refuses READY when live child custody overtakes its final page', async t => {
+test('closing recovery refuses READY when live child custody stays ahead of one extra history pass', async t => {
   const f = fixture(t);
   f.ready('100');
   f.gateway.historyPageLimit = 1;
@@ -419,6 +419,7 @@ test('closing recovery refuses READY when live child custody overtakes its final
   f.gateway.fetchHistory = async () => {
     calls += 1;
     if (calls === 1) return [f.message('101')];
+    if (calls > 2) return [];
     const live = f.state.acceptDiscordMessage({
       id: '102',
       guildId: 'guild',
@@ -442,7 +443,7 @@ test('closing recovery refuses READY when live child custody overtakes its final
   assert.equal(result, false);
   assert.equal(enrollment.state, THREAD_STATES.GAP);
   assert.equal(enrollment.gapTo, '102');
-  assert.equal(calls, 2);
+  assert.equal(calls, 3);
   assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
 });
 
