@@ -93,7 +93,8 @@ export async function enrollPublicThread(state: ThreadStateOwner, client: Thread
 }
 
 export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEnrollment, signal: AbortSignal,
-  epoch: number, wait: WaitOperation, checkpointOnly = false, deadline = Date.now() + gateway.recoveryTimeoutMs): Promise<boolean> {
+  epoch: number, wait: WaitOperation, checkpointOnly = false, deadline = Date.now() + gateway.recoveryTimeoutMs,
+  closingRetry = false): Promise<boolean> {
   const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
   if (!currentEnrollment?.active) return false;
   enrollment = currentEnrollment;
@@ -241,6 +242,8 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       (!after || compareIds(liveEnrollment.lastSeenId, after) > 0));
     if (liveCustodyAhead) {
       if (liveEnrollment.state !== THREAD_STATES.PENDING && liveEnrollment.state !== THREAD_STATES.READY) return false;
+      // Custody accepted during the close is still in Discord history, so re-read it once under the same deadline.
+      if (!closingRetry) return recoverThread(gateway, liveEnrollment, signal, epoch, wait, false, deadline, true);
       gateway.state.markThreadBoundary(
         enrollment.threadId,
         THREAD_STATES.GAP,
