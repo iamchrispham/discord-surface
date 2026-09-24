@@ -430,7 +430,7 @@ No native session, channel binding, automatic publication selection or phone con
 
 ### Direct-post local files
 
-The `post`, `ordinary-post`, `ordinary-claude-post` and `claude-post` commands can carry one regular local file beside one non-empty caption. Supply `--attachment-file FILE`, `--text-file CAPTION_FILE` and an explicit `--dedupe-key`. The file is copied into private state before the Discord request, hashed, and sent as the recorded snapshot. Files up to 20 MiB are accepted, including empty regular files. Eight file preparations can remain reserved at once.
+The `post`, `ordinary-post`, `ordinary-claude-post` and `claude-post` commands can carry one regular local file beside one non-empty caption. Supply `--attachment-file FILE`, `--text-file CAPTION_FILE` and an explicit `--dedupe-key`. The file is copied into private state before the Discord request, hashed, and sent as the recorded snapshot. Files up to 20 MiB are accepted, including empty regular files. Eight file preparations can remain reserved at once. A repeated `--attachment-file` is refused before any file is copied, as is any other repeated flag; send each additional file as its own post with its own dedupe key.
 
 ```sh
 node src/cli.js post \
@@ -474,7 +474,8 @@ cannot preserve native file metadata and intentionally refuse schema 1.8.
 `native-reply` records a reply for an existing submitted Discord message. An optional
 `--attachment-file` uploads one private staged snapshot beside the nonblank caption in
 `--text-file`. The file is limited to 20 MiB and uses the same eight-reservation pool as
-direct posts. `claude-reply` remains the Claude-only compatibility alias; `native-reply`
+direct posts. A repeated `--attachment-file` is refused before the reply is recorded.
+`claude-reply` remains the Claude-only compatibility alias; `native-reply`
 requires an explicit `--provider` of `codex` or `claude`.
 
 ```sh

@@ -720,7 +720,7 @@ test('public agent-send command reaches authenticated outbound transport', () =>
     assert.equal(JSON.parse(reply.stdout).status, 'sent');
     assert.equal(state.directPostRows('cli-result').at(-1).detail.messageId, '8000');
 
-    const emptyReplyArgv = [...argv, '--dedupe-key', 'cli-empty-reply', '--agent-reply-to='];
+    const emptyReplyArgv = [...argv.map(value => value === 'cli-1' ? 'cli-empty-reply' : value), '--agent-reply-to='];
     const emptyReplyScript = script.replace(JSON.stringify(argv), JSON.stringify(emptyReplyArgv));
     const emptyReply = require('node:child_process').spawnSync(process.execPath, ['-e', emptyReplyScript], { encoding: 'utf8', timeout: 5000 });
     assert.equal(emptyReply.status, 1);

@@ -68,10 +68,11 @@ function readHookEvent(fd) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-function courierGuard(args, pathsFor) {
+function courierGuard(args, pathsFor, argumentError = null) {
   let state;
   let event;
   try {
+    if (argumentError) throw argumentError;
     if (typeof args['courier-route-id'] !== 'string' || !args['courier-route-id']) {
       throw new Error('missing --courier-route-id');
     }

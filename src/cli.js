@@ -4,10 +4,12 @@ const os = require('node:os');
 const path = require('node:path');
 
 // Hook startup failures must block the tool, including a missing runtime build.
-const startup = parseArgs(process.argv.slice(2));
+let startup;
+try { startup = parseArgs(process.argv.slice(2)); }
+catch (error) { startup = { command: process.argv[2], args: {}, error }; }
 if (require.main === module && startup.command === 'courier-guard' && !startup.args.help) {
   try {
-    require('./courier-guard').courierGuard(startup.args, pathsFor);
+    require('./courier-guard').courierGuard(startup.args, pathsFor, startup.error);
   } catch (error) {
     process.stderr.write(`discord-surface courier guard: ${error.message}\n`);
     process.exitCode = 2;
@@ -75,6 +77,8 @@ function parseArgs(argv) {
     const equalsIndex = raw.indexOf('=');
     const key = equalsIndex === -1 ? raw : raw.slice(0, equalsIndex);
     const inline = equalsIndex === -1 ? undefined : raw.slice(equalsIndex + 1);
+    // Every flag is single-valued, so a repeat is refused rather than letting the last one win.
+    if (Object.hasOwn(args, key)) throw new Error(`--${key} was given more than once; each flag takes one value`);
     if (inline !== undefined) args[key] = inline;
     else if (argv[i + 1] && !argv[i + 1].startsWith('--')) args[key] = argv[++i];
     else args[key] = true;
