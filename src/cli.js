@@ -4,10 +4,12 @@ const os = require('node:os');
 const path = require('node:path');
 
 // Hook startup failures must block the tool, including a missing runtime build.
-const startup = parseArgs(process.argv.slice(2));
+let startup;
+try { startup = parseArgs(process.argv.slice(2)); }
+catch (error) { startup = { command: error.command, args: {}, error }; }
 if (require.main === module && startup.command === 'courier-guard' && !startup.args.help) {
   try {
-    require('./courier-guard').courierGuard(startup.args, pathsFor);
+    require('./courier-guard').courierGuard(startup.args, pathsFor, startup.error);
   } catch (error) {
     process.stderr.write(`discord-surface courier guard: ${error.message}\n`);
     process.exitCode = 2;
@@ -65,6 +67,7 @@ const { provisionMarker, conductorMarker, legacyAdoptionTopic, validateLegacyMet
 function parseArgs(argv) {
   const args = {};
   const positional = [];
+  let repeated = null;
   for (let i = 0; i < argv.length; i += 1) {
     const value = argv[i];
     if (!value.startsWith('--')) {
@@ -75,9 +78,15 @@ function parseArgs(argv) {
     const equalsIndex = raw.indexOf('=');
     const key = equalsIndex === -1 ? raw : raw.slice(0, equalsIndex);
     const inline = equalsIndex === -1 ? undefined : raw.slice(equalsIndex + 1);
+    if (repeated === null && Object.hasOwn(args, key)) repeated = key;
     if (inline !== undefined) args[key] = inline;
     else if (argv[i + 1] && !argv[i + 1].startsWith('--')) args[key] = argv[++i];
     else args[key] = true;
+  }
+  // Every flag is single-valued, so a repeat is refused rather than letting the last one win.
+  // The scan finishes first so the refusal still names the command, wherever the repeat sits.
+  if (repeated !== null) {
+    throw Object.assign(new Error(`--${repeated} was given more than once; each flag takes one value`), { command: positional[0] });
   }
   return { command: positional[0], subcommand: positional[1], args };
 }

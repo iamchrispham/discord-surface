@@ -63,12 +63,17 @@ function fixture(t, options = {}) {
   };
 }
 
-function invoke(f, event = f.event, extra = []) {
-  const r = spawnSync(process.execPath, [...f.argv, ...extra], {
+function invoke(f, event = f.event, argv = f.argv) {
+  const r = spawnSync(process.execPath, argv, {
     input: typeof event === 'string' ? event : JSON.stringify(event), encoding: 'utf8', timeout: 5000, maxBuffer: 2 * 1024 * 1024
   });
   assert.equal(r.error, undefined, r.error?.message);
   return { ...r, decision: r.stdout ? JSON.parse(r.stdout).hookSpecificOutput : null };
+}
+
+function withFlag(argv, flag, ...value) {
+  const index = argv.indexOf(flag);
+  return [...argv.slice(0, index), flag, ...value, ...argv.slice(index + 2)];
 }
 
 function denied(r, reason) {
@@ -360,13 +365,19 @@ test('malformed and oversized input, missing route and unusable database deny ex
   const f = fixture(t);
   denied(invoke(f, '{'));
   denied(invoke(f, 'x'.repeat(1024 * 1024 + 1)), /exceeds/);
-  denied(invoke(f, f.event, ['--courier-route-id', 'missing']));
+  denied(invoke(f, f.event, withFlag(f.argv, '--courier-route-id', 'missing')));
   const missing = path.join(f.dir, 'missing.sqlite');
-  denied(invoke(f, f.event, ['--db', missing]));
+  denied(invoke(f, f.event, withFlag(f.argv, '--db', missing)));
   assert.equal(fs.existsSync(missing), false);
   const corrupt = path.join(f.dir, 'corrupt.sqlite'); fs.writeFileSync(corrupt, 'not a database');
-  denied(invoke(f, f.event, ['--db', corrupt]));
-  denied(invoke(f, f.event, ['--courier-route-id']));
+  denied(invoke(f, f.event, withFlag(f.argv, '--db', corrupt)));
+  denied(invoke(f, f.event, withFlag(f.argv, '--courier-route-id')));
+  denied(invoke(f, f.event, [...f.argv, '--courier-route-id', f.route.routeId]), /--courier-route-id was given more than once/);
+  const [runtimeFlag, cli] = f.argv;
+  denied(invoke(f, f.event, [runtimeFlag, cli, '--db', f.db, 'courier-guard',
+    '--courier-route-id', f.route.routeId, '--courier-route-id', f.route.routeId]), /--courier-route-id was given more than once/);
+  denied(invoke(f, f.event, [runtimeFlag, cli, '--db', f.db, '--db', f.db, 'courier-guard',
+    '--courier-route-id', f.route.routeId]), /--db was given more than once/);
   assert.equal(f.claims().length, 0);
 });
 
