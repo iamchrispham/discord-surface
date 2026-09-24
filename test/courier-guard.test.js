@@ -373,6 +373,11 @@ test('malformed and oversized input, missing route and unusable database deny ex
   denied(invoke(f, f.event, withFlag(f.argv, '--db', corrupt)));
   denied(invoke(f, f.event, withFlag(f.argv, '--courier-route-id')));
   denied(invoke(f, f.event, [...f.argv, '--courier-route-id', f.route.routeId]), /--courier-route-id was given more than once/);
+  const [runtimeFlag, cli] = f.argv;
+  denied(invoke(f, f.event, [runtimeFlag, cli, '--db', f.db, 'courier-guard',
+    '--courier-route-id', f.route.routeId, '--courier-route-id', f.route.routeId]), /--courier-route-id was given more than once/);
+  denied(invoke(f, f.event, [runtimeFlag, cli, '--db', f.db, '--db', f.db, 'courier-guard',
+    '--courier-route-id', f.route.routeId]), /--db was given more than once/);
   assert.equal(f.claims().length, 0);
 });
 
