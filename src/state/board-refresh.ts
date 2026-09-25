@@ -110,6 +110,32 @@ function operationEndedAt(value: unknown): string {
   return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : new Date().toISOString();
 }
 
+function readbackInstant(value: unknown): string {
+  const input = text(value, 'observedAt', 64).replace(/[t ]/, 'T').replace(/z$/, 'Z');
+  const match = /^([+-]\d{6}|\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|([+-])(\d{2}):?(\d{2}))$/.exec(input);
+  if (!match || /-00:?00$/.test(input)) throw new Error('observedAt must be a timezone-qualified ISO timestamp');
+  const hours = Number(match[9] || 0);
+  const minutes = Number(match[10] || 0);
+  const instant = Date.parse(input.replace(/([+-]\d{2})(\d{2})$/, '$1:$2'));
+  const offsetMinutes = (match[8] === '-' ? -1 : 1) * (hours * 60 + minutes);
+  if (hours > 23 || minutes > 59 || !Number.isFinite(instant)) {
+    throw new Error('observedAt must be a timezone-qualified ISO timestamp');
+  }
+  const localInstant = instant + offsetMinutes * 60_000;
+  const localDate = new Date(localInstant);
+  const sameCalendar = (date: Date): boolean => date.getUTCFullYear() === Number(match[1]) &&
+    date.getUTCMonth() + 1 === Number(match[2]) && date.getUTCDate() === Number(match[3]);
+  const sameTime = sameCalendar(localDate) && localDate.getUTCHours() === Number(match[4]) &&
+    localDate.getUTCMinutes() === Number(match[5]) && localDate.getUTCSeconds() === Number(match[6] || 0);
+  const endOfDay = /T24:00(?::00(?:\.0+)?)?(?:Z|[+-]\d{2}:?\d{2})$/.test(input) &&
+    localDate.getUTCHours() === 0 && localDate.getUTCMinutes() === 0 && localDate.getUTCSeconds() === 0 &&
+    sameCalendar(new Date(localInstant - 86_400_000));
+  if (!sameTime && !endOfDay) {
+    throw new Error('observedAt must be a timezone-qualified ISO timestamp');
+  }
+  return new Date(instant).toISOString();
+}
+
 function validateMeta(meta: BoardRefreshMeta): BoardRefreshMeta {
   text(meta?.requestId, 'requestId', 256);
   const target = assertTarget(meta?.target);
@@ -342,6 +368,13 @@ function beginBoardRefresh(state: BoardState, metaInput: BoardRefreshMeta, captu
   });
 }
 
+function persistBoardOutcome(state: BoardState, attemptId: string, detail: Record<string, unknown>): BoardRefreshRecord {
+  state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, detail);
+  const persisted = latestOutcome(readReceipts(state, [BOARD_RECEIPT_KINDS.OUTCOME]), attemptId);
+  if (!persisted) throw new Error('board refresh outcome receipt was not persisted');
+  return { ...(detail as unknown as BoardRefreshRecord), recordedAt: persisted.createdAt };
+}
+
 function recordBoardRefreshOutcome(state: BoardState, targetInput: BoardTarget, attemptIdInput: string, outcomeInput: unknown, detail: Record<string, unknown> = {}): BoardRefreshRecord {
   const target = assertTarget(targetInput);
   const attemptId = text(attemptIdInput, 'attemptId', 128);
@@ -362,8 +395,7 @@ function recordBoardRefreshOutcome(state: BoardState, targetInput: BoardTarget, 
       status: outcome,
       operationEndedAt: ended
     };
-    state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, next);
-    return { ...(next as unknown as BoardRefreshRecord), recordedAt: ended };
+    return persistBoardOutcome(state, attemptId, next);
   });
 }
 
@@ -372,8 +404,7 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
   const attemptId = text(attemptIdInput, 'attemptId', 128);
   if (resolution !== BOARD_OUTCOMES.APPLIED) throw new Error('board refresh reconciliation only accepts applied evidence');
   const scope = text(evidence?.evidenceScope, 'evidenceScope', 2000);
-  const observedAt = text(evidence?.observedAt, 'observedAt', 64);
-  if (!Number.isFinite(Date.parse(observedAt))) throw new Error('observedAt must be an ISO timestamp');
+  const observedAt = readbackInstant(evidence?.observedAt);
   const readbackContent = boardContent(evidence?.readbackContent, 'readbackContent');
   if (!evidence.soleWriter || !evidence.singleAttempt || !evidence.noHiddenRetry) {
     throw new Error('positive board readback requires sole-writer, single-attempt, and no-hidden-retry evidence');
@@ -409,8 +440,7 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
       noHiddenRetry: true,
       operationEndedAt: endedAt
     };
-    state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, next);
-    return { ...(next as unknown as BoardRefreshRecord), recordedAt: observedAt };
+    return persistBoardOutcome(state, attemptId, next);
   });
 }
 
