@@ -133,7 +133,7 @@ export interface BoardRefreshRecord extends Omit<BoardRefreshAttempt, 'outcome' 
   outcome: BoardOutcome;
   status: BoardOutcome;
   historical?: boolean;
-  recordedAt?: string;
+  recordedAt: string;
   operationEndedAt?: string | null;
   [key: string]: unknown;
 }
