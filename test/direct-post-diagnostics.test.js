@@ -72,13 +72,27 @@ for (const boundary of ['preflight', 'outcome']) {
       : state.recordDirectPostOutcome(meta.requestId, meta.attemptId, 'unknown', detail);
     const beforeReceipts = state.listReceipts();
     const beforeRows = state.directPostRows(meta.requestId);
-    const detail = {
+    const target = {
       reason: 'diagnostic',
       toJSON() {
         return { journal: 'foreign', requestId: 'foreign' };
       }
     };
+    let descriptorReads = 0;
+    let spreading = false;
+    const detail = new Proxy(target, {
+      ownKeys(object) {
+        spreading = true;
+        return Reflect.ownKeys(object);
+      },
+      getOwnPropertyDescriptor(object, key) {
+        descriptorReads++;
+        if (key === 'toJSON' && !spreading) return undefined;
+        return Reflect.getOwnPropertyDescriptor(object, key);
+      }
+    });
     assert.throws(() => record(detail), /cannot define toJSON/);
+    assert.ok(descriptorReads >= 1);
     assert.deepEqual(state.listReceipts(), beforeReceipts);
     assert.deepEqual(state.directPostRows(meta.requestId), beforeRows);
     assert.equal(state.directPostRows('foreign').length, 0);

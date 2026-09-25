@@ -102,9 +102,9 @@ const immutableDetailKeys: Record<DirectPostCustodyKey, true> = {
 
 function validatedOutcomeDetail(expected: DirectPostPartMeta, input: Record<string, unknown>, BindingError: DirectPostErrorConstructor, snapshots = new WeakMap<object, unknown>()): Record<string, unknown> {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new BindingError('direct post outcome detail is invalid');
-  if (Object.hasOwn(input, 'toJSON')) throw new BindingError('direct post outcome detail cannot define toJSON');
   const expectedSnapshot = snapshotCustodyFields(expected, snapshots);
   const detail = snapshotCustodyFields(input, snapshots);
+  if (Object.hasOwn(detail, 'toJSON')) throw new BindingError('direct post outcome detail cannot define toJSON');
   for (const key of Object.keys(immutableDetailKeys)) {
     if (!Object.hasOwn(detail, key)) continue;
     const expectedValue = key === 'journal' ? 'direct-post-v1' : (expectedSnapshot as unknown as Record<string, unknown>)[key];
