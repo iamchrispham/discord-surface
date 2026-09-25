@@ -12,6 +12,7 @@ const { waitForRecoveryOperation } = require('../src/discord');
 const { CASES, operatorMessage } = require('./helpers/intake-recovery-scenarios');
 
 const LEGACY_TIMEOUT_DETAIL = 'ordinary-bind recovery exceeded 30000ms';
+const LEGACY_THREAD_TIMEOUT_DETAIL = 'Discord recovery deadline exceeded';
 
 test('R4: deadline between full pages stays retryable after one real admission', CASES, async t => {
     const f = fixture(t);
@@ -182,6 +183,25 @@ for (const reason of ['startup', 'reconnect', 'restart']) {
     assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
   });
 }
+
+test('R7c: legacy child timeout gap retries after database reopen', CASES, async t => {
+  const f = fixture(t);
+  const owner = f.state.getBinding('1000');
+  assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, '101', '2000')).accepted, true);
+  f.state.markThreadBoundary('2000', 'gap', LEGACY_THREAD_TIMEOUT_DETAIL, null, null, owner);
+  assert.equal(f.cursor('2000'), '100');
+  f.history.set('2000', [f.message('101', '2000')]);
+  await f.reopen();
+
+  f.enableDelivery();
+  const result = await f.recover();
+  assert.equal(result.ready, true, JSON.stringify(result));
+  assert.equal(f.boundary('2000').state, 'ready');
+  await f.gateway.reconcilePending(undefined, { readyOnly: true });
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getMessage('101').state, 'replied');
+  assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
+});
 
 const LEGACY_NEGATIVE_CONTROLS = [
   { name: 'page-bound detail', detail: 'history page bound 100 reached', gapFrom: '100', gapTo: '101' },

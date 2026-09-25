@@ -3,7 +3,7 @@ import { CODEX_VALIDATION_KINDS } from '../native-transcript';
 import {
   classifyRecoveryFailure,
   isPreAdoptionRetryableThread,
-  isRetryableFetchBoundary,
+  isRetryableIntakeBoundary,
   isRetryableHttp503Boundary,
   recoveryFetch,
   retryPendingBoundaryDetail
@@ -81,6 +81,13 @@ interface ThreadGateway {
 
 type WaitOperation = <T>(operation: () => Promise<T>, signal: AbortSignal, deadline: number) => Promise<T>;
 const compareIds = (a: string, b: string) => BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0;
+const isRetryableThreadBoundary = (enrollment: ThreadEnrollment) => isRetryableIntakeBoundary({
+  state: enrollment.state,
+  detail: enrollment.detail,
+  gap_from: enrollment.gapFrom,
+  gap_to: enrollment.gapTo,
+  recovered_through_id: enrollment.recoveredThroughId
+});
 
 export async function enrollPublicThread(state: ThreadStateOwner, client: ThreadGateway['client'], parentId: string, threadId: string, signal?: AbortSignal) {
   if (signal?.aborted) throw new Error('Thread enrollment stopped');
@@ -108,7 +115,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   const parent = gateway.state.getMessageRoute(enrollment.parentChannelId);
   if (!parent?.ready) return false;
   const binding = parent.binding;
-  const retryableBoundary = isRetryableFetchBoundary(enrollment.state, enrollment.detail);
+  const retryableBoundary = isRetryableThreadBoundary(enrollment);
   const preAdoptionRetryBoundary = isPreAdoptionRetryableThread(enrollment);
   const retryableHold = retryableBoundary || preAdoptionRetryBoundary;
   if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state) &&
@@ -283,7 +290,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       if (recoveryKind === 'stale') {
         const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
         const retryable = currentEnrollment?.active && (
-          isRetryableFetchBoundary(currentEnrollment.state, currentEnrollment.detail) ||
+          isRetryableThreadBoundary(currentEnrollment) ||
           isPreAdoptionRetryableThread(currentEnrollment)
         );
         if (retryable && gateway.recoverTransport) {

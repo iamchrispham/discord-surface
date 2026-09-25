@@ -2,6 +2,7 @@ import { THREAD_STATES, type ThreadEnrollment } from '../state/thread-enrollment
 
 const RETRYABLE_FETCH_PREFIX = 'Discord HTTP 503 during recovery: ';
 const LEGACY_DEADLINE_DETAIL_SUFFIX = ' recovery exceeded 30000ms';
+const LEGACY_THREAD_DEADLINE_DETAIL = 'Discord recovery deadline exceeded';
 
 export const RECOVERY_DEADLINE_MARKER_PREFIX = 'Discord recovery deadline: ';
 export const RECOVERY_RETRY_PENDING_PREFIX = 'Discord recovery retry pending: ';
@@ -44,8 +45,9 @@ export function isRetryableHttp503Boundary(state: string, detail: string | null 
 }
 
 function isLegacyDeadlineDetail(detail: string | null | undefined): boolean {
-  return typeof detail === 'string' && detail.length > LEGACY_DEADLINE_DETAIL_SUFFIX.length &&
-    detail.endsWith(LEGACY_DEADLINE_DETAIL_SUFFIX);
+  return detail === LEGACY_THREAD_DEADLINE_DETAIL ||
+    (typeof detail === 'string' && detail.length > LEGACY_DEADLINE_DETAIL_SUFFIX.length &&
+      detail.endsWith(LEGACY_DEADLINE_DETAIL_SUFFIX));
 }
 
 export function isRetryableIntakeBoundary(boundary: IntakeBoundaryLike | null | undefined): boolean {
