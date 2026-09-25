@@ -188,7 +188,7 @@ function canonicalSocketPath(socketPath: string): string {
     const comparableEntry = normalizationInsensitive ? entry.normalize('NFC') : entry;
     return (caseInsensitive ? comparableEntry.toLowerCase() : comparableEntry) === comparableBasename;
   });
-  return path.join(canonicalParentPath, existing || comparableBasename);
+  return path.join(canonicalParentPath, comparableBasename);
 }
 
 function pathIsWithin(parentPath: string, childPath: string): boolean {
@@ -209,6 +209,17 @@ function lockNamespaceCandidate(parentPath: string, prefix: string): string {
   return path.join(parentPath, component);
 }
 
+function ensureUsableLockNamespaceCandidate(directoryPath: string): boolean {
+  try {
+    fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
+    const directory = fs.lstatSync(directoryPath);
+    const owner = process.getuid?.();
+    return directory.isDirectory() && (directory.mode & 0o077) === 0 && (owner === undefined || directory.uid === owner);
+  } catch {
+    return false;
+  }
+}
+
 function lockNamespacePath(socketPath: string, key: string): string {
   let temporaryRoot = process.platform === 'win32' ? os.tmpdir() : '/tmp';
   try { temporaryRoot = fs.realpathSync(temporaryRoot); } catch {}
@@ -221,7 +232,7 @@ function lockNamespacePath(socketPath: string, key: string): string {
     lockNamespaceCandidate(temporaryRoot, `${LOCK_NAMESPACE}-fallback-${ownerName}-${key}`)
   ];
   for (const candidate of candidates) {
-    if (!pathsOverlap(socketPath, candidate)) return candidate;
+    if (!pathsOverlap(socketPath, candidate) && ensureUsableLockNamespaceCandidate(candidate)) return candidate;
   }
   throw new Error('Claude channel socket lock namespace conflicts with socket path');
 }
