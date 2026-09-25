@@ -46,9 +46,21 @@ function fileIdentity(filePath: string): FileIdentity {
   return { dev: stats.dev, ino: stats.ino };
 }
 
+function canonicalSocketPath(socketPath: string): string {
+  const parentPath = path.dirname(socketPath);
+  let canonicalParentPath = parentPath;
+  try {
+    canonicalParentPath = fs.realpathSync(parentPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return path.join(canonicalParentPath, path.basename(socketPath));
+}
+
 function lockPathForSocket(socketPath: string): string {
-  const key = createHash('sha256').update(socketPath).digest('hex').slice(0, 32);
-  return path.join(path.dirname(socketPath), LOCK_NAMESPACE, `${key}.lock`);
+  const identityPath = canonicalSocketPath(socketPath);
+  const key = createHash('sha256').update(identityPath).digest('hex').slice(0, 32);
+  return path.join(path.dirname(identityPath), LOCK_NAMESPACE, `${key}.lock`);
 }
 
 function ownerPathForLock(lockPath: string): string {
