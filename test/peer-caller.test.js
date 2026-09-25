@@ -36,6 +36,14 @@ test('Claude peer caller rechecks the native resolver and binding on every call'
   await assert.rejects(resolvePeerCaller(f.state, 'claude', { resolveClaudeCaller: async () => ({ harness: 'codex', sessionId: id }) }), /wrong harness/);
 });
 
+test('Claude peer caller resolution observes shutdown cancellation', async () => {
+  const f = fixture('claude');
+  const stop = new AbortController();
+  const pending = resolvePeerCaller(f.state, 'claude', { resolveClaudeCaller: () => new Promise(() => {}) }, stop.signal);
+  stop.abort();
+  await assert.rejects(pending, /aborted|closing/);
+});
+
 test('ambiguous, foreign guild, inactive and wrong-provider bindings never authorize', async () => {
   const f = fixture(); const dependencies = { environment: { CODEX_THREAD_ID: id } };
   f.rows.push({ ...f.rows[0], channelId: '102' });

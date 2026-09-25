@@ -30,14 +30,14 @@ const invalidSelector: PeerSelector = { repoKey: 'repo', provider: 'other' };
 const invalidBinding: PeerBinding = { ...binding, readiness: 'online' };
 
 const state: Parameters<typeof resolvePeerBinding>[0] = {
-  db: { prepare: () => ({ get: () => ({ detail: '{}' }) }) },
   requireConfig: () => ({ guildId: binding.guildId }),
   listBindings: () => [binding],
   listThreadEnrollments: () => [{
     threadId: 'thread', parentChannelId: binding.channelId, guildId: binding.guildId,
     active: true, state: 'ready'
   }],
-  getIntakeWatermark: () => ({ state: 'ready' })
+  getIntakeWatermark: () => ({ state: 'ready' }),
+  getBindingReadinessReceipt: () => null
 };
 
 // @ts-expect-error thread enrollment states use the existing finite vocabulary

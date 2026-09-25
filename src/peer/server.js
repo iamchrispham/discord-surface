@@ -16,10 +16,17 @@ const selector = { oneOf: [
   { type: 'object', properties: { channelName: { type: 'string' } }, required: ['channelName'], additionalProperties: false }
 ] };
 const postInputSchema = { type: 'object', properties: { role: { enum: ['announce', 'board', 'child'] }, text_file: { type: 'string' },
-  dedupe_key: { type: 'string' }, message_id: { type: 'string' }, peer: selector, reply_to: { type: 'string' } },
+  dedupe_key: { type: 'string' }, message_id: { type: 'string' }, peer: selector, reply_to: packetId },
   required: ['role', 'text_file', 'dedupe_key'], additionalProperties: false, oneOf: [
-    { properties: { role: { enum: ['child'] }, dedupe_key: packetId, reply_to: packetId }, required: ['role'] },
-    { properties: { role: { enum: ['announce', 'board'] } }, required: ['role'] }
+    { properties: { role: { const: 'announce' } }, required: ['role'],
+      not: { anyOf: [{ required: ['message_id'] }, { required: ['peer'] }, { required: ['reply_to'] }] } },
+    { properties: { role: { const: 'board' } }, required: ['role', 'message_id'],
+      not: { anyOf: [{ required: ['peer'] }, { required: ['reply_to'] }] } },
+    { properties: { role: { const: 'child' }, dedupe_key: packetId, peer: selector, reply_to: packetId }, required: ['role'],
+      not: { required: ['message_id'] }, oneOf: [
+        { required: ['peer'], not: { required: ['reply_to'] } },
+        { required: ['reply_to'], not: { required: ['peer'] } }
+      ] }
   ] };
 const tools = [
   { name: 'post', description: 'Post an announcement to the caller parent, update a known board message, or send an authenticated child packet. Board requires message_id. Child requires peer or reply_to.',
@@ -30,7 +37,16 @@ const tools = [
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'peer_send', description: 'Send an authenticated agent request to a current peer, or a result using reply_to. Reuse dedupe_key on retry. Sent is not native pickup or completion.',
     inputSchema: { type: 'object', properties: { peer: selector, reply_to: packetId, text: { type: 'string' }, text_file: { type: 'string' }, dedupe_key: packetId },
-      required: ['dedupe_key'], additionalProperties: false } }
+      required: ['dedupe_key'], additionalProperties: false, allOf: [
+        { oneOf: [
+          { required: ['text'], not: { required: ['text_file'] } },
+          { required: ['text_file'], not: { required: ['text'] } }
+        ] },
+        { oneOf: [
+          { required: ['peer'], not: { required: ['reply_to'] } },
+          { required: ['reply_to'], not: { required: ['peer'] } }
+        ] }
+      ] } }
 ];
 
 function createPeerMcp(service) {
@@ -41,10 +57,10 @@ function createPeerMcp(service) {
       let result;
       if (params.name === 'peer_list') {
         if (Object.keys(params.arguments || {}).length) throw new Error('peer_list takes no arguments');
-        result = await service.list();
+        result = await service.list(extra.signal);
       } else if (params.name === 'peer_result') {
         if (Object.keys(params.arguments || {}).some(key => key !== 'correlation_id')) throw new Error('invalid peer_result arguments');
-        result = await service.result(params.arguments?.correlation_id);
+        result = await service.result(params.arguments?.correlation_id, extra.signal);
       } else if (params.name === 'post') {
         result = await service.post(params.arguments, extra.signal);
       } else if (params.name === 'peer_send') {
@@ -91,7 +107,10 @@ async function startPeerMcp(args) {
     });
     const tracked = Object.fromEntries(['list', 'send', 'result', 'post'].map(name => [name, (...values) => {
       if (stop.signal.aborted) return Promise.reject(new Error('peer server is closing'));
-      if (name === 'send' || name === 'post') values[1] = AbortSignal.any([values[1], stop.signal].filter(Boolean));
+      const requestSignal = name === 'list' ? values[0] : values[1];
+      const signal = AbortSignal.any([requestSignal, stop.signal].filter(Boolean));
+      if (name === 'list') values[0] = signal;
+      else values[1] = signal;
       const promise = Promise.resolve().then(() => service[name](...values));
       pending.add(promise);
       promise.then(() => pending.delete(promise), () => pending.delete(promise));

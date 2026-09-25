@@ -34,7 +34,7 @@ async function postByRole(context, input, signal, send) {
   if (Object.keys(args).some(key => !keys.includes(key)) ||
       keys.some(key => typeof args[key] !== 'string' || !args[key].trim())) throw new Error(`invalid ${role} arguments`);
   const { state, provider, token, stateDir, callerDependencies, fetchImpl } = context;
-  const binding = await resolvePeerCaller(state, provider, callerDependencies);
+  const binding = await resolvePeerCaller(state, provider, callerDependencies, signal);
   requireReadyBinding(state, binding);
   const ordinary = state.isOrdinaryBindingRecord(binding);
   const common = { state, token, nativeId: binding.nativeId, generation: binding.generation,

@@ -25,10 +25,10 @@ function deliveryEvidence(state, messageId, packet) {
       message.generation !== packet.target.generation || message.guildId !== packet.target.guildId ||
       (message.deliveryChannelId || message.channelId) !== packet.target.channelId) return null;
   const kind = packet.kind === KINDS.RESULT ? AGENT_COMPLETION_RECEIPTS.RESULT_CONSUMED : AGENT_COMPLETION_RECEIPTS.REQUEST_HANDLED_WITHOUT_POST;
-  const completions = state.db.prepare('SELECT id, detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id').all(messageId, kind);
+  const completions = state.listAgentCompletionReceipts(messageId, kind);
   const completion = completions.find(row => {
-    const detail = JSON.parse(row.detail);
-    return detail.packetId === packet.id && detail.disposition === kind &&
+    const detail = row.detail;
+    return detail && detail.packetId === packet.id && detail.disposition === kind &&
       detail.nativeId === packet.target.nativeId && detail.provider === packet.target.provider &&
       detail.generation === packet.target.generation && sameAddress(detail.source, packet.source) && sameAddress(detail.target, packet.target);
   });
@@ -48,18 +48,17 @@ function inspectPeerResult(state, source, correlationId) {
   const packet = packets[0];
   if (!packet) throw new Error('correlation is unknown for this caller');
   if (packets.some(candidate => !packetMatches(candidate, packet))) throw new Error('correlation has conflicting custody');
-  const receipts = state.db.prepare(`SELECT discord_id FROM receipts WHERE kind='agent-message' AND
-    (json_extract(detail, '$.packet.id')=? OR json_extract(detail, '$.packet.replyTo')=?) ORDER BY id`).all(packet.id, packet.id);
+  const receipts = state.listAgentMessageReceiptIds(packet.id);
   const deliveries = [];
   const results = [];
   const seen = new Set();
-  for (const row of receipts) {
-    if (seen.has(row.discord_id)) continue;
-    seen.add(row.discord_id);
-    const candidate = state.getAgentMessage(row.discord_id)?.packet;
+  for (const discordId of receipts) {
+    if (seen.has(discordId)) continue;
+    seen.add(discordId);
+    const candidate = state.getAgentMessage(discordId)?.packet;
     if (!candidate) continue;
     validateAgentMessage(candidate);
-    const evidence = deliveryEvidence(state, row.discord_id, candidate);
+    const evidence = deliveryEvidence(state, discordId, candidate);
     if (!evidence) continue;
     if (packetMatches(candidate, packet)) deliveries.push(evidence);
     else if (packet.kind === KINDS.REQUEST && candidate.kind === KINDS.RESULT && candidate.replyTo === packet.id &&

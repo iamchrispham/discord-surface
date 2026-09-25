@@ -24,13 +24,20 @@ test('public MCP stdio omits the caller and refuses an unready send', { timeout:
     assert.deepEqual(tools.map(tool => tool.name), ['post', 'peer_result', 'peer_list', 'peer_send']);
     const postSchema = tools.find(tool => tool.name === 'post').inputSchema;
     const peerSendSchema = tools.find(tool => tool.name === 'peer_send').inputSchema;
-    const childSchema = postSchema.oneOf.find(branch => branch.properties.role.enum[0] === 'child');
-    const nonChildSchema = postSchema.oneOf.find(branch => branch.properties.role.enum.includes('announce'));
-    assert.deepEqual(childSchema.properties.dedupe_key, peerSendSchema.properties.dedupe_key);
+    const childSchema = postSchema.oneOf.find(branch => branch.properties.role.const === 'child');
+    const announceSchema = postSchema.oneOf.find(branch => branch.properties.role.const === 'announce');
+    const boardSchema = postSchema.oneOf.find(branch => branch.properties.role.const === 'board');
     assert.deepEqual(childSchema.properties.reply_to, peerSendSchema.properties.reply_to);
-    assert.deepEqual(nonChildSchema.properties.role.enum, ['announce', 'board']);
+    assert.deepEqual(childSchema.oneOf.map(branch => branch.required), [['peer'], ['reply_to']]);
+    assert.deepEqual(announceSchema.not.anyOf.map(branch => branch.required), [['message_id'], ['peer'], ['reply_to']]);
+    assert.deepEqual(boardSchema.required, ['role', 'message_id']);
+    assert.deepEqual(boardSchema.not.anyOf.map(branch => branch.required), [['peer'], ['reply_to']]);
     assert.equal(postSchema.properties.dedupe_key.type, 'string');
     assert.equal(postSchema.properties.reply_to.type, 'string');
+    assert.equal(peerSendSchema.properties.dedupe_key.maxLength, 128);
+    assert.deepEqual(peerSendSchema.allOf.map(branch => branch.oneOf.map(option => option.required)), [
+      [['text'], ['text_file']], [['peer'], ['reply_to']]
+    ]);
     const listed = await client.callTool({ name: 'peer_list', arguments: {} });
     const peers = JSON.parse(listed.content[0].text);
     assert.deepEqual(peers, []);

@@ -76,12 +76,12 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
 
 function createPeerService(context) {
   const { state, provider, token, stateDir, loadChannels, callerDependencies, fetchImpl } = context;
-  const caller = () => resolvePeerCaller(state, provider, callerDependencies);
+  const caller = signal => resolvePeerCaller(state, provider, callerDependencies, signal);
   const service = {
     async post(input, signal) { return postByRole(context, input, signal, service.send); },
-    async result(correlationId) { return inspectPeerResult(state, await caller(), correlationId); },
-    async list() {
-      const current = await caller();
+    async result(correlationId, signal) { return inspectPeerResult(state, await caller(signal), correlationId); },
+    async list(signal) {
+      const current = await caller(signal);
       const { guildId } = state.requireConfig();
       return state.listBindings().filter(binding => binding.active && binding.guildId === guildId &&
         !(binding.provider === current.provider && canonicalNativeId(binding.nativeId) === canonicalNativeId(current.nativeId))).map(binding => {
@@ -95,7 +95,7 @@ function createPeerService(context) {
       });
     },
     async send(input, signal) {
-      const initial = await caller();
+      const initial = await caller(signal);
       if (!input || typeof input !== 'object' || Array.isArray(input) ||
           Object.keys(input).some(key => !['peer', 'text', 'text_file', 'dedupe_key', 'reply_to'].includes(key))) {
         throw new Error('invalid peer send arguments');
@@ -107,7 +107,7 @@ function createPeerService(context) {
       if (input.text !== undefined && (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > 10000)) throw new Error('text must be non-empty and at most 10000 bytes');
       if (input.text_file !== undefined && (typeof input.text_file !== 'string' || !input.text_file.trim())) throw new Error('text_file must be non-empty');
       const channels = input.peer?.channelName ? await loadChannels(signal) : [];
-      const source = await caller();
+      const source = await caller(signal);
       if (source.channelId !== initial.channelId || canonicalNativeId(source.nativeId) !== canonicalNativeId(initial.nativeId) || source.generation !== initial.generation) {
         throw new Error('peer caller changed during resolution');
       }

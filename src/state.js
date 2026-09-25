@@ -1707,6 +1707,29 @@ class SurfaceState {
     }, requestId, channelId);
   }
 
+  getBindingReadinessReceipt(channelId) {
+    assertText(channelId, 'channelId', 128);
+    const row = this.db.prepare(`SELECT detail FROM receipts WHERE kind='binding-readiness'
+      AND json_extract(detail, '$.channelId')=? ORDER BY id DESC LIMIT 1`).get(channelId);
+    return row ? parseJson(row.detail, null) : null;
+  }
+
+  listAgentCompletionReceipts(messageId, kind) {
+    assertText(messageId, 'messageId', 128);
+    assertText(kind, 'kind', 128);
+    return this.db.prepare('SELECT id, detail FROM receipts WHERE discord_id=? AND kind=? ORDER BY id')
+      .all(messageId, kind)
+      .map(row => ({ id: Number(row.id), detail: parseJson(row.detail, null) }));
+  }
+
+  listAgentMessageReceiptIds(packetId) {
+    assertText(packetId, 'packetId', 128);
+    return this.db.prepare(`SELECT discord_id FROM receipts WHERE kind='agent-message' AND
+      (json_extract(detail, '$.packet.id')=? OR json_extract(detail, '$.packet.replyTo')=?) ORDER BY id`)
+      .all(packetId, packetId)
+      .map(row => row.discord_id);
+  }
+
   directPostFilePreparation(requestId) {
     return directPostHandlers.findDirectPostFilePreparation(this, requestId);
   }

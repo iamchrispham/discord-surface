@@ -9,11 +9,11 @@ export type PeerSelector = { repoKey: string; provider: 'codex' | 'claude' } |
 export interface PeerChannel { id: string; guildId: string; name: string }
 interface Enrollment { threadId: string; parentChannelId: string; guildId: string; active: boolean; state: ThreadState; detail?: string | null }
 interface PeerState {
-  db: { prepare(sql: string): { get(...parameters: string[]): unknown } };
   requireConfig(): { guildId: string };
   listBindings(): PeerBinding[];
   listThreadEnrollments(parentChannelId: string): Enrollment[];
   getIntakeWatermark(channelId: string): { state: Readiness; detail?: string | null } | null;
+  getBindingReadinessReceipt(channelId: string): Record<string, unknown> | null;
 }
 
 function selectorValues(selector: PeerSelector): [string, string][] {
@@ -54,9 +54,7 @@ export function requireReadyBinding(state: PeerState, binding: PeerBinding): voi
     throw new Error(`peer is not ready: ${watermark.detail || watermark.state}`);
   }
   if (binding.readiness !== READINESS.READY) {
-    const row = state.db.prepare(`SELECT detail FROM receipts WHERE kind='binding-readiness'
-      AND json_extract(detail, '$.channelId')=? ORDER BY id DESC LIMIT 1`).get(binding.channelId) as { detail: string } | undefined;
-    const receipt = row ? JSON.parse(row.detail) : null;
+    const receipt = state.getBindingReadinessReceipt(binding.channelId);
     const current = receipt && ['guildId', 'provider', 'nativeId', 'generation', 'conductorId', 'readiness']
       .every(key => receipt[key] === binding[key as keyof PeerBinding]);
     const reason = current && typeof receipt.detail === 'string' && receipt.detail.trim() ? receipt.detail : binding.readiness;
