@@ -105,16 +105,18 @@ function validatedOutcomeDetail(expected: DirectPostPartMeta, input: Record<stri
   const expectedSnapshot = snapshotCustodyFields(expected, snapshots);
   const detail = snapshotCustodyFields(input, snapshots);
   if (Object.hasOwn(detail, 'toJSON')) throw new BindingError('direct post outcome detail cannot define toJSON');
-  assertSerializableOutcomeDetail(detail, BindingError);
+  const serializedDetail = assertSerializableOutcomeDetail(detail, BindingError);
   for (const key of Object.keys(immutableDetailKeys)) {
     if (!Object.hasOwn(detail, key)) continue;
     const expectedValue = key === 'journal' ? 'direct-post-v1' : (expectedSnapshot as unknown as Record<string, unknown>)[key];
-    if (!identityValueMatches(detail[key], expectedValue)) {
+    const hasSerializedValue = Object.hasOwn(serializedDetail, key);
+    if ((!hasSerializedValue && (detail[key] !== undefined || expectedValue !== undefined))
+      || (hasSerializedValue && !identityValueMatches(serializedDetail[key], expectedValue))) {
       throw new BindingError(`direct post outcome cannot override immutable ${key}`);
     }
   }
   if (Object.hasOwn(detail, 'outcome')) throw new BindingError('direct post outcome cannot override immutable outcome');
-  return detail;
+  return serializedDetail;
 }
 
 function snapshotCustodyValue(value: unknown, snapshots: WeakMap<object, unknown>): unknown {
@@ -134,9 +136,13 @@ function snapshotCustodyFields<T>(input: T, snapshots = new WeakMap<object, unkn
   return snapshot as T;
 }
 
-function assertSerializableOutcomeDetail(detail: Record<string, unknown>, BindingError: DirectPostErrorConstructor): void {
+function assertSerializableOutcomeDetail(detail: Record<string, unknown>, BindingError: DirectPostErrorConstructor): Record<string, unknown> {
   try {
-    JSON.stringify(detail);
+    const serialized = JSON.stringify(detail);
+    if (serialized === undefined) throw new Error('detail serialization returned no value');
+    const snapshot = JSON.parse(serialized) as unknown;
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) throw new Error('detail serialization returned a non-object');
+    return snapshot as Record<string, unknown>;
   } catch {
     throw new BindingError('direct post outcome detail is unserializable');
   }

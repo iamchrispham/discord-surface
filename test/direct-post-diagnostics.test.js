@@ -64,6 +64,31 @@ for (const boundary of ['preflight', 'outcome']) {
     }
   });
 
+  test(`${boundary} persists the validated nested diagnostic snapshot`, t => {
+    const { state, meta } = fixture(t);
+    if (boundary === 'outcome') state.beginDirectPostPart(meta);
+    let calls = 0;
+    const detail = {
+      error: {
+        toJSON() {
+          calls++;
+          if (calls > 1) throw new Error('diagnostic serializer called twice');
+          return { message: 'transport failed' };
+        }
+      }
+    };
+    const result = boundary === 'preflight'
+      ? state.recordDirectPostPreflight(meta, 'not_sent', detail)
+      : state.recordDirectPostOutcome(meta.requestId, meta.attemptId, 'unknown', detail);
+    assert.equal(calls, 1);
+    assert.equal(result.requestId, meta.requestId);
+    assert.deepEqual(result.error, { message: 'transport failed' });
+    const rows = state.directPostRows(meta.requestId);
+    assert.equal(rows.length, boundary === 'outcome' ? 2 : 1);
+    assert.equal(rows.at(-1).detail.requestId, meta.requestId);
+    assert.deepEqual(rows.at(-1).detail.error, { message: 'transport failed' });
+  });
+
   test(`${boundary} rejects diagnostic serializers before persistence`, t => {
     const { state, meta } = fixture(t);
     if (boundary === 'outcome') state.beginDirectPostPart(meta);
