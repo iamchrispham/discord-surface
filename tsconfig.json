@@ -31,6 +31,7 @@
     "src/agent-attachment.ts",
     "src/acknowledgment.ts",
     "src/acknowledgment/contracts.ts",
+    "src/acknowledgment/pickup.ts",
     "src/claude-channel.ts",
     "src/claude/socket-ownership.ts",
     "src/discord/handoff-fence.ts",
