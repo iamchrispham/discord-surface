@@ -286,6 +286,21 @@ test('an earlier native proof deadline advances the shared recovery timer', { ti
   assert.ok(f.gateway.deferredHandoffRecoveryTimerDeadline < slowDeadline);
 });
 
+test('a proof retry timer stays before its owner deadline', { timeout: 5000 }, async t => {
+  const f = boundedRetryFixture(t, '12121212-1212-4121-8121-121212121212');
+  await f.gateway.start(f.secret);
+  f.gateway.recoveryTimeoutMs = 50;
+  f.gateway.deferredHandoffRecoveryDelayMs = 5000;
+  f.state.markIntakeBoundary('1000', 'unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now() + 1000), null, null, f.binding);
+
+  f.gateway.scheduleDeferredHandoffRecovery('1000');
+
+  const retry = f.gateway.deferredHandoffRecoveryDeadlines.get('1000');
+  assert.ok(retry);
+  assert.ok(f.gateway.deferredHandoffRecoveryTimerDeadline < retry.deadline);
+});
+
 test('an expired native proof owner keeps its original deadline across a new marker', { timeout: 5000 }, async t => {
   const f = boundedRetryFixture(t, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
   await f.gateway.start(f.secret);
@@ -370,6 +385,7 @@ test('stopping cancels a pending native proof retry owner', { timeout: 5000 }, a
 test('handoff fence wins over an expired native proof retry owner', { timeout: 5000 }, async t => {
   const f = boundedRetryFixture(t, '77777777-7777-4777-8777-777777777777');
   await f.gateway.start(f.secret);
+  const preflightsBefore = f.preflights;
   f.setFailProof(true);
   f.gateway.recoveryTimeoutMs = 60;
   f.gateway.deferredHandoffRecoveryDelayMs = 5;
@@ -385,4 +401,27 @@ test('handoff fence wins over an expired native proof retry owner', { timeout: 5
   }
 
   assert.equal(f.state.getIntakeWatermark('1000').detail, 'ordinary handoff fence');
+  assert.equal(f.state.getBinding('1000').readiness, 'pending');
+  assert.equal(f.preflights, preflightsBefore);
+});
+
+test('concurrent ready recovery clears a stale proof owner', { timeout: 5000 }, async t => {
+  const f = boundedRetryFixture(t, '13131313-1313-4131-8131-131313131313');
+  await f.gateway.start(f.secret);
+  f.gateway.recoveryTimeoutMs = 1000;
+  f.gateway.deferredHandoffRecoveryDelayMs = 0;
+  f.state.markIntakeBoundary('1000', 'unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now() + 1000), null, null, f.binding);
+  f.gateway.scheduleDeferredHandoffRecovery('1000');
+  assert.equal(f.gateway.deferredHandoffRecoveryDeadlines.has('1000'), true);
+
+  f.state.markIntakeBoundary('1000', 'ready', 'concurrent recovery', null, null, f.binding);
+
+  const waitDeadline = Date.now() + 2000;
+  while (f.gateway.deferredHandoffRecoveryDeadlines.has('1000')) {
+    if (Date.now() >= waitDeadline) throw new Error('concurrent ready recovery did not clear owner');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+
+  assert.equal(f.state.getBinding('1000').readiness, 'ready');
 });

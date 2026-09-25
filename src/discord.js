@@ -28,6 +28,7 @@ const { createTransportReceiptDelivery } = require('./discord/transport-receipts
 const requireInstalled = require;
 const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
 const DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS = 5000;
+const DEFERRED_HANDOFF_RECOVERY_DEADLINE_GUARD_MS = 1;
 const LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS = 1000;
 const LIVE_CHECKPOINT_RETRY_MAX_DELAY_MS = 30_000;
 const PENDING_HANDOFF_RECOVERY_POLL_MS = 100;
@@ -1862,10 +1863,12 @@ class DiscordGateway {
     const channels = pendingGeneration ? this.pendingHandoffRecoveryChannels : this.deferredHandoffRecoveryChannels;
     channels.add(channelId);
     const retry = this.deferredHandoffRecoveryDeadlines.get(channelId);
+    const now = Date.now();
+    const retryRemainingMs = retry ? retry.deadline - now : null;
     const delay = retry
-      ? Math.min(this.deferredHandoffRecoveryDelayMs, Math.max(0, retry.deadline - Date.now()))
+      ? Math.min(this.deferredHandoffRecoveryDelayMs, Math.max(0, retryRemainingMs - DEFERRED_HANDOFF_RECOVERY_DEADLINE_GUARD_MS))
       : this.deferredHandoffRecoveryDelayMs;
-    const timerDeadline = Date.now() + delay;
+    const timerDeadline = now + delay;
     if (this.deferredHandoffRecoveryTimer) {
       const currentDeadline = this.deferredHandoffRecoveryTimerDeadline ?? Number.POSITIVE_INFINITY;
       if (timerDeadline >= currentDeadline) return;
@@ -1905,10 +1908,13 @@ class DiscordGateway {
         for (const channelId of new Set([...deferredChannels, ...pendingChannels])) {
           const binding = this.state.getBinding(channelId);
           const recovery = this.state.recoverInterruptedOrdinaryHandoffIntake?.(channelId, binding);
+          const liveHandoffFence = this.state.ordinaryHandoffPauses?.has(channelId);
           if (recovery?.deferred) {
             this.deferredHandoffRecoveryChannels.add(channelId);
           } else if (recovery && binding?.active) {
             recoverableChannels.add(channelId);
+          } else if (liveHandoffFence) {
+            this.deferredHandoffRecoveryDeadlines.delete(channelId);
           } else if (binding?.active && this.state.isOrdinaryBinding?.(binding) &&
             ([READINESS.PENDING, READINESS.RECOVERING].includes(binding.readiness) ||
               this.isRetryableNativeProofBoundary(binding))) {
@@ -1934,6 +1940,9 @@ class DiscordGateway {
           }
         }
         if (reconcileOnlyChannels.size) {
+          for (const channelId of reconcileOnlyChannels) {
+            this.deferredHandoffRecoveryDeadlines.delete(channelId);
+          }
           await this.reconcilePending(undefined, {
             allowPaused: !this.ready,
             readyOnly: true,
