@@ -33,6 +33,8 @@ test('public MCP stdio omits the caller and refuses an unready send', { timeout:
     assert.deepEqual(boardSchema.required, ['role', 'message_id']);
     assert.deepEqual(boardSchema.not.anyOf.map(branch => branch.required), [['peer'], ['reply_to']]);
     assert.equal(postSchema.properties.dedupe_key.type, 'string');
+    assert.equal(postSchema.properties.dedupe_key.maxLength, 256);
+    assert.equal(postSchema.properties.message_id.maxLength, 128);
     assert.equal(postSchema.properties.reply_to.type, 'string');
     assert.equal(peerSendSchema.properties.dedupe_key.maxLength, 128);
     assert.deepEqual(peerSendSchema.allOf.map(branch => branch.oneOf.map(option => option.required)), [

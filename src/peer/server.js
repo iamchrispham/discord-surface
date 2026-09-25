@@ -18,7 +18,7 @@ const selector = { oneOf: [
   { type: 'object', properties: { channelName: nonBlankString }, required: ['channelName'], additionalProperties: false }
 ] };
 const postInputSchema = { type: 'object', properties: { role: { enum: ['announce', 'board', 'child'] }, text_file: nonBlankString,
-  dedupe_key: nonBlankString, message_id: nonBlankString, peer: selector, reply_to: packetId },
+  dedupe_key: { ...nonBlankString, maxLength: 256 }, message_id: { ...nonBlankString, maxLength: 128 }, peer: selector, reply_to: packetId },
   required: ['role', 'text_file', 'dedupe_key'], additionalProperties: false, oneOf: [
     { properties: { role: { const: 'announce' } }, required: ['role'],
       not: { anyOf: [{ required: ['message_id'] }, { required: ['peer'] }, { required: ['reply_to'] }] } },
