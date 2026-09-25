@@ -34,6 +34,7 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
     let dispatches = 0;
     let historyReads = 0;
     let cancelNextPreflight = false;
+    let transcriptOpenStarted = false;
     const replies = [];
     const channel = { id: '1000', guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }),
       messages: { async fetch() { return { async react() {} }; } },
@@ -72,16 +73,18 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
           options = { ...options, signal: AbortSignal.abort() };
         }
         if (expire && phase === 'preflight') {
-          const originalOpen = fs.promises.open;
-          fs.promises.open = async (...args) => {
-            await new Promise(resolve => setTimeout(resolve, 10));
-            return originalOpen(...args);
+          const originalOpendir = fs.promises.opendir;
+          fs.promises.opendir = async (...args) => {
+            transcriptOpenStarted = true;
+            const opening = originalOpendir(...args);
+            await new Promise(resolve => setTimeout(resolve, 25));
+            return opening;
           };
           try {
             return await validateCodexSessionIdentityAsync(current.nativeId, current.workspace, root,
-              { ...options, deadline: Date.now() + 1 });
+              { ...options, deadline: Date.now() + 10 });
           } finally {
-            fs.promises.open = originalOpen;
+            fs.promises.opendir = originalOpendir;
           }
         }
         return validateCodexSessionIdentityAsync(current.nativeId, current.workspace, root,
@@ -110,12 +113,16 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
       ? await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch)
       : await gateway.recoverInbound(new AbortController().signal, 'reconnect', gateway.lifecycleEpoch, null, Date.now() - 1);
     if (phase === 'existing-gap') {
+      assert.equal(first.ready, false);
+      assert.equal(first.state, 'unavailable');
+      assert.equal(preflights, 0);
       expire = false;
       const retry = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
       assert.equal(retry.ready, false);
       assert.equal(state.getIntakeWatermark('1000').state, 'gap');
       assert.match(state.getIntakeWatermark('1000').detail, /history page bound/);
       assert.equal(preflights, 1);
+      assert.doesNotMatch(state.getIntakeWatermark('1000').detail, /Native proof recovery v1:/);
       assert.ok(historyReads > 0);
       assert.equal(dispatches, 0);
       assert.equal(state.getMessage('101').state, 'accepted');
@@ -154,45 +161,26 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
       fs.chmodSync(blockedTranscriptDirectory, 0o000);
     }
     if (phase === 'cancelled') cancelNextPreflight = true;
-    const recover = phase === 'permission'
-      ? async (operation) => {
-        const originalOpendir = fs.promises.opendir;
-        const deniedRoot = path.resolve(root);
-        fs.promises.opendir = async (...args) => {
-          const candidate = args[0];
-          const resolvedCandidate = typeof candidate === 'string' ? path.resolve(candidate) : null;
-          if (resolvedCandidate === deniedRoot || resolvedCandidate?.startsWith(`${deniedRoot}${path.sep}`)) {
-            const error = new Error(`EACCES: permission denied, opendir '${candidate}'`);
-            error.code = 'EACCES';
-            throw error;
-          }
-          return originalOpendir.apply(fs.promises, args);
-        };
-        try {
-          return await operation();
-        } finally {
-          fs.promises.opendir = originalOpendir;
-        }
-      }
-      : async operation => operation();
     const second = phase === 'concurrent'
       ? (await Promise.all([gateway.recoverTransport('reconnect', gateway.lifecycleEpoch), gateway.recoverTransport('reconnect', gateway.lifecycleEpoch)]))[0]
-      : await recover(() => gateway.recoverTransport('reconnect', gateway.lifecycleEpoch));
+      : await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
     if (['missing', 'workspace-mismatch', 'ambiguous', 'permission', 'identity-mismatch', 'cancelled'].includes(phase)) {
       assert.equal(second.ready, false);
       assert.equal(dispatches, 0);
       assert.equal(state.getMessage('101').state, 'accepted');
       assert.equal(state.getBinding('1000').generation, binding.generation);
       if (['missing', 'workspace-mismatch', 'ambiguous', 'permission', 'identity-mismatch'].includes(phase)) {
+        const beforeReopenPreflights = preflights;
         await gateway.stop();
         state.close();
         state = new SurfaceState(path.join(dir, 'surface.sqlite'));
         gateway = new DiscordGateway({ ...gatewayOptions, state });
-        const reopened = await recover(() => gateway.recoverTransport('reconnect', gateway.lifecycleEpoch));
+        const reopened = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
         assert.equal(reopened.ready, false);
         assert.equal(state.getMessage('101').state, 'accepted');
         assert.equal(state.getIntakeWatermark('1000').state, 'unavailable');
         assert.equal(state.getBinding('1000').generation, binding.generation);
+        assert.equal(preflights, beforeReopenPreflights);
       } else {
         await gateway.stop();
         state.close();
@@ -212,6 +200,7 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
     assert.equal(preflights, expectedPreflights[phase] || 2, 'each recovery pass must validate native identity');
     assert.equal(state.getMessage('101').state, 'accepted');
     assert.equal(state.getBinding('1000').generation, binding.generation);
+    if (phase === 'preflight') assert.equal(transcriptOpenStarted, true);
     assert.equal(dispatches, 0);
     await gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
     await gateway.consumer.waitForNativeWork();
@@ -248,6 +237,7 @@ async function runSharedBudget(slowFirst) {
     }
     const preflights = [];
     let dispatches = 0;
+    let transcriptOpenStarted = false;
     gateway = new DiscordGateway({ state,
       client: { user: { id: 'bot' }, channels: { fetch: async id => ({ id, guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) }) }, on() {}, off() {}, async destroy() {} },
       fetchHistory: async (channel, options) => {
@@ -260,10 +250,21 @@ async function runSharedBudget(slowFirst) {
       recoveryOptions: { timeoutMs: 1000, ordinaryNativePreflight: async (binding, options) => {
         preflights.push(binding.channelId);
         if (slowFirst && binding.channelId === '1000') {
-          await new Promise(resolve => {
-            const timer = setTimeout(() => { timers.delete(timer); resolve(); }, 1100);
-            timers.add(timer);
-          });
+          const originalOpen = fs.promises.open;
+          fs.promises.open = async (...args) => {
+            transcriptOpenStarted = true;
+            const opening = originalOpen(...args);
+            await new Promise(resolve => {
+              const timer = setTimeout(() => { timers.delete(timer); resolve(); }, 1100);
+              timers.add(timer);
+            });
+            return opening;
+          };
+          try {
+            return await validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
+          } finally {
+            fs.promises.open = originalOpen;
+          }
         }
         return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
       } }
@@ -275,6 +276,7 @@ async function runSharedBudget(slowFirst) {
       assert.equal(held.state, 'unavailable');
       assert.match(held.detail, /Native proof recovery v1:/);
       assert.deepEqual(preflights, ['1000']);
+      assert.equal(transcriptOpenStarted, true);
     } else {
       assert.equal(first.ready, true);
       assert.equal(held.state, 'ready');
@@ -303,6 +305,110 @@ async function runSharedBudget(slowFirst) {
 test('shared deadline does not permanently hold an unattempted binding', async () => {
   await runSharedBudget(false);
   await runSharedBudget(true);
+});
+
+test('stopping before-binding recovery during shared deadline preserves custody across restart', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-shared-interrupted-'));
+  const root = path.join(dir, 'sessions');
+  const db = path.join(dir, 'surface.sqlite');
+  const ids = ['66666666-6666-4666-8666-666666666666', '77777777-7777-4777-8777-777777777777'];
+  const channels = ['1000', '2000'];
+  fs.mkdirSync(root);
+  for (const id of ids) {
+    fs.writeFileSync(path.join(root, `${id}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id, cwd: dir } }) + '\n');
+  }
+  let state = new SurfaceState(db);
+  let gateway;
+  const timers = new Set();
+  const preflights = [];
+  let resolveOpenStarted;
+  const openStarted = new Promise(resolve => { resolveOpenStarted = resolve; });
+  let resolveBeforeBinding;
+  const beforeBindingStarted = new Promise(resolve => { resolveBeforeBinding = resolve; });
+  let releaseBeforeBinding;
+  const beforeBindingGate = new Promise(resolve => { releaseBeforeBinding = resolve; });
+  const makeGateway = () => new DiscordGateway({
+    state,
+    client: {
+      user: { id: 'bot' },
+      channels: { fetch: async id => ({ id, guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) }) },
+      on() {}, off() {}, async destroy() {}
+    },
+    fetchHistory: async (channel, options) => {
+      const id = channel.id === '1000' ? '101' : '102';
+      return BigInt(options.after || '0') < BigInt(id)
+        ? [{ id, channelId: channel.id, guildId: 'guild', content: 'retained instruction', author: { id: 'operator', bot: false }, channel }]
+        : [];
+    },
+    providers: { codex: { async dispatch() { throw new Error('interrupted recovery must not dispatch'); } } },
+    recoveryOptions: {
+      timeoutMs: 1000,
+      ordinaryNativePreflight: async (binding, options) => {
+        preflights.push(binding.channelId);
+        if (binding.channelId !== '1000') return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
+        const originalOpen = fs.promises.open;
+        fs.promises.open = async (...args) => {
+          resolveOpenStarted();
+          const opening = originalOpen(...args);
+          await new Promise(resolve => {
+            const timer = setTimeout(() => { timers.delete(timer); resolve(); }, 1100);
+            timers.add(timer);
+          });
+          return opening;
+        };
+        try {
+          return await validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
+        } finally {
+          fs.promises.open = originalOpen;
+        }
+      }
+    }
+  });
+  try {
+    state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
+    for (let i = 0; i < channels.length; i++) {
+      state.bindOrdinary({ channelId: channels[i], guildId: 'guild', provider: 'codex', nativeId: ids[i], workspace: dir },
+        { sessionId: ids[i], threadId: ids[i] });
+      state.setIntakeBaseline(channels[i], '100', 'fixture baseline');
+      assert.equal(state.acceptDiscordMessage({ id: String(101 + i), channelId: channels[i], guildId: 'guild',
+        authorId: 'operator', isBot: false, content: 'retained instruction' }, { ready: false }).accepted, true);
+    }
+    gateway = makeGateway();
+    const originalRecordBoundary = gateway.recordBoundary.bind(gateway);
+    gateway.recordBoundary = async (...args) => {
+      const [binding, , boundaryState, detail] = args;
+      if (binding.channelId === '2000' && boundaryState === 'unavailable' && String(detail).startsWith('Native proof recovery v1:')) {
+        resolveBeforeBinding();
+        await beforeBindingGate;
+      }
+      return originalRecordBoundary(...args);
+    };
+    const recovery = gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+    await openStarted;
+    await beforeBindingStarted;
+    const stopping = gateway.stop();
+    releaseBeforeBinding();
+    await stopping;
+    const stopped = await recovery;
+    assert.equal(stopped.ready, false);
+    assert.equal(stopped.state, 'stopped');
+    assert.equal(state.getMessage('101').state, 'accepted');
+    assert.equal(state.getMessage('102').state, 'accepted');
+    state.close();
+    state = new SurfaceState(db);
+    gateway = makeGateway();
+    const reopened = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch, ['2000']);
+    assert.equal(reopened.ready, true);
+    assert.equal(state.getIntakeWatermark('2000').state, 'ready');
+    assert.equal(state.getMessage('102').state, 'accepted');
+    assert.deepEqual(preflights.slice(-1), ['2000']);
+  } finally {
+    releaseBeforeBinding?.();
+    if (gateway) await gateway.stop();
+    for (const timer of timers) clearTimeout(timer);
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('stopping native retry during preflight preserves custody across restart', async () => {
@@ -345,8 +451,18 @@ test('stopping native retry during preflight preserves custody across restart', 
     } },
     recoveryOptions: { ordinaryNativePreflight: async (binding, options) => {
       if (block) {
-        preflightStarted();
-        await Promise.race([gate, new Promise(resolve => options.signal?.addEventListener('abort', resolve, { once: true }))]);
+        const originalOpen = fs.promises.open;
+        fs.promises.open = async (...args) => {
+          preflightStarted();
+          const opening = originalOpen(...args);
+          await Promise.race([gate, new Promise(resolve => options.signal?.addEventListener('abort', resolve, { once: true }))]);
+          return opening;
+        };
+        try {
+          return await validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
+        } finally {
+          fs.promises.open = originalOpen;
+        }
       }
       return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
     } }
