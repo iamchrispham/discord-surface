@@ -10,6 +10,58 @@ const { createBindingWakeController } = require(path.join(installed, 'src/cli'))
 const { validateCodexSessionIdentityAsync } = require(path.join(installed, 'src/native'));
 const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail } = require(path.join(installed, 'src/discord/native-proof-recovery'));
 
+function boundedRetryFixture(t, nativeId) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-bounded-retry-'));
+  const root = path.join(dir, 'sessions');
+  const db = path.join(dir, 'surface.sqlite');
+  const secret = path.join(dir, 'discord.env');
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, `${nativeId}.jsonl`), JSON.stringify({
+    type: 'session_meta', payload: { id: nativeId, cwd: dir }
+  }) + '\n');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  const state = new SurfaceState(db);
+  state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: secret });
+  const binding = state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
+    { sessionId: nativeId, threadId: nativeId });
+  state.setIntakeBaseline('1000', '100', 'fixture baseline');
+  let failProof = false;
+  let preflights = 0;
+  const channel = { id: '1000', guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) };
+  const gateway = new DiscordGateway({
+    state,
+    client: {
+      user: { id: 'bot' },
+      channels: { fetch: async () => channel },
+      application: { commands: { async fetch() { return []; }, async create() {} } },
+      async login() {}, on() {}, off() {}, async destroy() {}
+    },
+    fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { throw new Error('bounded retry fixture must not dispatch'); } } },
+    recoveryOptions: {
+      codexSessionRoot: root,
+      ordinaryNativePreflight: async (current, options) => {
+        preflights += 1;
+        const proofOptions = failProof ? { ...options, deadline: Date.now() - 1 } : options;
+        return validateCodexSessionIdentityAsync(current.nativeId, current.workspace, root, proofOptions);
+      }
+    }
+  });
+  t.after(async () => {
+    await gateway.stop();
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  return {
+    state,
+    gateway,
+    binding,
+    secret,
+    setFailProof(value) { failProof = value; },
+    get preflights() { return preflights; }
+  };
+}
+
 test('startup schedules a retry for a native proof deadline marker', { timeout: 5000 }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-startup-retry-'));
   const root = path.join(dir, 'sessions');
@@ -188,4 +240,95 @@ test('Claude endpoint recovery schedules a Codex native proof retry', { timeout:
 
   assert.equal(result.state, 'unavailable');
   assert.equal(gateway.deferredHandoffRecoveryChannels.has('1000'), true);
+});
+
+test('scheduled native proof retry expires at its owner deadline without making a gap', { timeout: 5000 }, async t => {
+  const f = boundedRetryFixture(t, '55555555-5555-4555-8555-555555555555');
+  await f.gateway.start(f.secret);
+  f.setFailProof(true);
+  f.gateway.recoveryTimeoutMs = 60;
+  f.gateway.deferredHandoffRecoveryDelayMs = 5;
+  f.state.markIntakeBoundary('1000', 'unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now() - 1), null, null, f.binding);
+  f.gateway.scheduleDeferredHandoffRecovery('1000');
+
+  const waitDeadline = Date.now() + 2000;
+  while (f.gateway.deferredHandoffRecoveryDeadlines.has('1000') ||
+      f.gateway.deferredHandoffRecoveryChannels.has('1000') || f.gateway.deferredHandoffRecoveryTimer) {
+    if (Date.now() >= waitDeadline) throw new Error('bounded native proof retry did not expire');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+
+  const boundary = f.state.getIntakeWatermark('1000');
+  assert.equal(boundary.state, 'unavailable');
+  assert.match(boundary.detail, /^Native proof recovery v1: /);
+  const detail = JSON.parse(boundary.detail.replace(/^Native proof recovery v1: /, ''));
+  assert.equal(detail.phase, NATIVE_PROOF_PHASES.PREFLIGHT);
+  assert.ok(detail.deadline <= Date.now());
+  assert.equal(f.state.getBinding('1000').readiness, 'unavailable');
+  assert.ok(f.preflights > 0);
+});
+
+test('ordinary-handoff keeps the native proof reason across transient channel failures', { timeout: 5000 }, async t => {
+  const f = boundedRetryFixture(t, '88888888-8888-4888-8888-888888888888');
+  await f.gateway.start(f.secret);
+  f.setFailProof(true);
+  f.gateway.recoveryTimeoutMs = 60;
+  f.gateway.deferredHandoffRecoveryDelayMs = 5;
+  f.gateway.client.channels.fetch = async () => {
+    const error = new Error('temporary channel outage');
+    error.status = 503;
+    throw error;
+  };
+  f.state.markIntakeBoundary('1000', 'unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now() - 1), null, null, f.binding);
+  f.gateway.scheduleDeferredHandoffRecovery('1000');
+
+  const waitDeadline = Date.now() + 2000;
+  while (f.gateway.deferredHandoffRecoveryDeadlines.has('1000')) {
+    if (Date.now() >= waitDeadline) throw new Error('channel-failure retry owner did not expire');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+
+  assert.equal(f.state.getIntakeWatermark('1000').state, 'unavailable');
+  assert.match(f.state.getIntakeWatermark('1000').detail, /^Native proof recovery v1: /);
+  assert.equal(f.preflights, 1, 'channel failures must not start a second native preflight');
+});
+
+test('stopping cancels a pending native proof retry owner', { timeout: 5000 }, async t => {
+  const f = boundedRetryFixture(t, '66666666-6666-4666-8666-666666666666');
+  await f.gateway.start(f.secret);
+  f.setFailProof(true);
+  f.gateway.deferredHandoffRecoveryDelayMs = 60_000;
+  f.state.markIntakeBoundary('1000', 'unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now() - 1), null, null, f.binding);
+  f.gateway.scheduleDeferredHandoffRecovery('1000');
+  assert.equal(f.gateway.deferredHandoffRecoveryDeadlines.has('1000'), true);
+
+  await f.gateway.stop();
+
+  assert.equal(f.gateway.deferredHandoffRecoveryDeadlines.size, 0);
+  assert.equal(f.gateway.deferredHandoffRecoveryChannels.size, 0);
+  assert.equal(f.gateway.pendingHandoffRecoveryChannels.size, 0);
+  assert.equal(f.gateway.deferredHandoffRecoveryTimer, null);
+});
+
+test('handoff fence wins over an expired native proof retry owner', { timeout: 5000 }, async t => {
+  const f = boundedRetryFixture(t, '77777777-7777-4777-8777-777777777777');
+  await f.gateway.start(f.secret);
+  f.setFailProof(true);
+  f.gateway.recoveryTimeoutMs = 60;
+  f.gateway.deferredHandoffRecoveryDelayMs = 5;
+  f.state.markIntakeBoundary('1000', 'unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now() - 1), null, null, f.binding);
+  f.gateway.scheduleDeferredHandoffRecovery('1000');
+  assert.ok(f.state.pauseOrdinaryHandoffIntake('1000', f.binding));
+
+  const waitDeadline = Date.now() + 2000;
+  while (f.gateway.deferredHandoffRecoveryDeadlines.has('1000')) {
+    if (Date.now() >= waitDeadline) throw new Error('handoff retry owner did not expire');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+
+  assert.equal(f.state.getIntakeWatermark('1000').detail, 'ordinary handoff fence');
 });

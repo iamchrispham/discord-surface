@@ -950,6 +950,7 @@ class DiscordGateway {
     this.pendingHandoffRecoveryPollTimer = null;
     this.deferredHandoffRecoveryChannels = new Set();
     this.pendingHandoffRecoveryChannels = new Set();
+    this.deferredHandoffRecoveryDeadlines = new Map();
     this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
     this.transportReady = false;
     this.interactionRecoveryPromise = null;
@@ -1779,6 +1780,39 @@ class DiscordGateway {
     return isNativeProofRetryBoundary(watermark?.state, watermark?.detail);
   }
 
+  ensureDeferredNativeProofRecovery(channelId) {
+    const binding = this.state.getBinding(channelId);
+    const watermark = this.state.getIntakeWatermark(channelId);
+    if (!binding?.active || !this.state.isOrdinaryBinding?.(binding) ||
+        !isNativeProofRetryBoundary(watermark?.state, watermark?.detail)) return null;
+    const existing = this.deferredHandoffRecoveryDeadlines.get(channelId);
+    if (existing && existing.deadline > Date.now() && existing.generation === binding.generation &&
+        existing.nativeId === binding.nativeId) return existing;
+    const retry = {
+      detail: watermark.detail,
+      deadline: Date.now() + this.recoveryTimeoutMs,
+      generation: binding.generation,
+      nativeId: binding.nativeId
+    };
+    this.deferredHandoffRecoveryDeadlines.set(channelId, retry);
+    return retry;
+  }
+
+  expireDeferredNativeProofRecovery(channelId) {
+    const retry = this.deferredHandoffRecoveryDeadlines.get(channelId);
+    if (!retry || retry.deadline > Date.now()) return false;
+    this.deferredHandoffRecoveryDeadlines.delete(channelId);
+    const binding = this.state.getBinding(channelId);
+    const watermark = this.state.getIntakeWatermark(channelId);
+    if (binding?.active && binding.generation === retry.generation && binding.nativeId === retry.nativeId &&
+        [READINESS.PENDING, READINESS.RECOVERING, READINESS.UNAVAILABLE].includes(binding.readiness) &&
+        watermark?.detail === retry.detail &&
+        isNativeProofRetryBoundary(watermark.state, watermark.detail)) {
+      this.state.setBindingReadiness(channelId, READINESS.UNAVAILABLE, watermark.detail, binding);
+    }
+    return true;
+  }
+
   noteLiveIntake(message) {
     const channelId = typeof message?.channelId === 'string' ? message.channelId : null;
     if (!channelId || this.stopping || !this.state.getMessageRoute(channelId)?.binding.active) return;
@@ -1814,15 +1848,20 @@ class DiscordGateway {
 
   scheduleDeferredHandoffRecovery(channelId, { pendingGeneration = false } = {}) {
     if (this.stopping || typeof channelId !== 'string') return;
+    if (!pendingGeneration) this.ensureDeferredNativeProofRecovery(channelId);
     const channels = pendingGeneration ? this.pendingHandoffRecoveryChannels : this.deferredHandoffRecoveryChannels;
     channels.add(channelId);
     if (this.deferredHandoffRecoveryTimer) return;
-    const delay = this.deferredHandoffRecoveryDelayMs;
+    const retry = this.deferredHandoffRecoveryDeadlines.get(channelId);
+    const delay = retry
+      ? Math.min(this.deferredHandoffRecoveryDelayMs, Math.max(0, retry.deadline - Date.now()))
+      : this.deferredHandoffRecoveryDelayMs;
     this.deferredHandoffRecoveryDelayMs = Math.min(delay * 2, DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS);
     const timer = setTimeout(() => {
       if (this.deferredHandoffRecoveryTimer === timer) this.deferredHandoffRecoveryTimer = null;
       if (this.stopping || (!this.deferredHandoffRecoveryChannels.size && !this.pendingHandoffRecoveryChannels.size)) return;
-      const deferredChannels = [...this.deferredHandoffRecoveryChannels];
+      const deferredChannels = [...this.deferredHandoffRecoveryChannels]
+        .filter(deferredChannelId => !this.expireDeferredNativeProofRecovery(deferredChannelId));
       const pendingChannels = [...this.pendingHandoffRecoveryChannels];
       this.deferredHandoffRecoveryChannels.clear();
       this.pendingHandoffRecoveryChannels.clear();
@@ -1863,12 +1902,16 @@ class DiscordGateway {
         if (recoverableChannels.size) {
           for (const channelId of recoverableChannels) {
             const channelIds = new Set([channelId]);
-            const recovery = await this.recoverTransport('ordinary-handoff', this.lifecycleEpoch, channelIds);
+            const retry = this.deferredHandoffRecoveryDeadlines.get(channelId);
+            const recovery = await this.recoverTransport('ordinary-handoff', this.lifecycleEpoch, channelIds, retry?.deadline);
             if (recovery.ready) await this.reconcilePending(undefined, { channelIds });
             else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true, channelIds });
             const binding = this.state.getBinding(channelId);
             if (binding?.active && this.isRetryableNativeProofBoundary(binding)) {
+              this.ensureDeferredNativeProofRecovery(channelId);
               this.deferredHandoffRecoveryChannels.add(channelId);
+            } else {
+              this.deferredHandoffRecoveryDeadlines.delete(channelId);
             }
           }
         }
@@ -1882,7 +1925,12 @@ class DiscordGateway {
       }).catch(error => this.logger(`Deferred ordinary handoff recovery failed: ${error.message}`)).finally(() => {
         if (this.stopping) return;
         if (this.deferredHandoffRecoveryChannels.size || this.pendingHandoffRecoveryChannels.size) {
-          if (this.deferredHandoffRecoveryChannels.size) requeue([...this.deferredHandoffRecoveryChannels]);
+          const deferredChannels = [];
+          for (const channelId of this.deferredHandoffRecoveryChannels) {
+            if (this.expireDeferredNativeProofRecovery(channelId)) this.deferredHandoffRecoveryChannels.delete(channelId);
+            else deferredChannels.push(channelId);
+          }
+          if (deferredChannels.length) requeue(deferredChannels);
           if (this.pendingHandoffRecoveryChannels.size) requeue([...this.pendingHandoffRecoveryChannels], true);
         } else {
           this.deferredHandoffRecoveryDelayMs = DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS;
@@ -2297,6 +2345,8 @@ class DiscordGateway {
       if (isRetryableRecoveryBoundary(watermark)) {
         retryBoundary = watermark;
       }
+      let nativeProofRetryDetail = retryBoundary && isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)
+        ? retryBoundary.detail : null;
       if (watermark && ['gap', 'unavailable'].includes(watermark.state) && !retryBoundary) {
         const terminalReadiness = watermark.state === READINESS.GAP ? READINESS.GAP : READINESS.UNAVAILABLE;
         this.state.setBindingReadiness(binding.channelId, terminalReadiness,
@@ -2311,6 +2361,7 @@ class DiscordGateway {
           if (retryBoundary) {
             const retryDetail = isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)
               ? retryBoundary.detail : `${reason} retry after Discord HTTP 503`;
+            if (isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)) nativeProofRetryDetail = retryDetail;
             const retrying = this.state.markIntakeBoundary(binding.channelId, 'pending', retryDetail,
               retryBoundary.gap_from, retryBoundary.gap_to, binding, null, retryBoundary, ownedReadiness);
             if (!retrying) throw recoveryError('stale', 'Discord intake boundary changed before channel recovery');
@@ -2348,9 +2399,14 @@ class DiscordGateway {
           failure ||= { ready: false, state: current?.state || 'unavailable', error };
           continue;
         }
-        const recorded = await recordOwnedBoundary(binding, null, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+        const nativeProofRetry = typeof nativeProofRetryDetail === 'string';
+        const retryState = nativeProofRetry ? READINESS.UNAVAILABLE
+          : kind === CODEX_VALIDATION_KINDS.DEADLINE ? READINESS.GAP : READINESS.UNAVAILABLE;
+        const retryDetail = nativeProofRetry ? nativeProofRetryDetail : error.message;
+        const recorded = await recordOwnedBoundary(binding, null, retryState, retryDetail,
+          ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
         if (recorded?.watermark) ownedBoundary = recorded.watermark;
-        if (!recorded?.concurrentReady) failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: retryState, error };
         continue;
       }
       if (!currentRecovery()) {
@@ -3003,6 +3059,7 @@ class DiscordGateway {
     this.pendingHandoffRecoveryPollTimer = null;
     this.deferredHandoffRecoveryChannels.clear();
     this.pendingHandoffRecoveryChannels.clear();
+    this.deferredHandoffRecoveryDeadlines.clear();
     this.pendingFullRecovery = false;
     this.pendingRecoveryChannels.clear();
     for (const request of this.pendingRecoveryRequests.splice(0)) request.waiter?.stop?.();

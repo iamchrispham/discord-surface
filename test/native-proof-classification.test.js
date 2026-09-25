@@ -63,6 +63,21 @@ test('identity readers mark mismatched candidates instead of returning them as m
   }
 });
 
+test('identity readers ignore mismatches whose native id appears only in a parent directory', async t => {
+  const f = fixture(t);
+  const nested = path.join(f.root, ID, 'sessions');
+  fs.mkdirSync(nested, { recursive: true });
+  fs.writeFileSync(path.join(nested, 'unrelated.jsonl'), JSON.stringify({
+    type: 'session_meta', payload: { id: ID, session_id: '99999999-9999-4999-8999-999999999999', cwd: f.dir }
+  }) + '\n');
+
+  const identities = [readCodexSessionIdentity(ID, f.root), await readCodexSessionIdentityAsync(ID, f.root)];
+  assert.deepEqual(identities, [null, null]);
+  for (const validate of [validateCodexSessionIdentity, validateCodexSessionIdentityAsync]) {
+    await assert.rejects(async () => validate(ID, f.dir, f.root), error => error.recoveryKind === K.UNAVAILABLE);
+  }
+});
+
 test('async proof preserves deadline and cancellation kinds through unavailable wrapper', async t => {
   const f = fixture(t);
   f.write(`${ID}.jsonl`);

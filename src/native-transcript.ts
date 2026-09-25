@@ -224,6 +224,10 @@ export async function* walkAsync(dir: string, depth = 0, rawOptions: RawValidati
   }
 }
 
+function transcriptFilenameMatchesNativeId(file: string, nativeId: string): boolean {
+  return path.basename(file).includes(nativeId);
+}
+
 const CODEX_SESSION_DISCOVERY_TIMEOUT_MS = 5000;
 
 export async function readCodexSessionIdentityAsync(
@@ -242,6 +246,7 @@ export async function readCodexSessionIdentityAsync(
   for await (const file of walkAsync(root, 0, options)) {
     assertValidationActive(options);
     if (!file.includes(nativeId)) continue;
+    const filenameMatchesNativeId = transcriptFilenameMatchesNativeId(file, nativeId);
     const controller = new AbortController();
     const relayAbort = () => controller.abort();
     options.signal?.addEventListener('abort', relayAbort, { once: true });
@@ -260,11 +265,13 @@ export async function readCodexSessionIdentityAsync(
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
       if (sessionId && threadId && sessionId !== threadId) {
-        mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        if (filenameMatchesNativeId) {
+          mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        }
         continue;
       }
       if ((sessionId || threadId) !== nativeId) {
-        if (sessionId || threadId) {
+        if ((sessionId || threadId) && filenameMatchesNativeId) {
           mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
         }
         continue;
@@ -345,6 +352,7 @@ export function readCodexSessionIdentity(nativeId: string, root = sessionRoot())
   const mismatches: MismatchedCodexSessionIdentity[] = [];
   for (const file of walk(root)) {
     if (!file.includes(nativeId)) continue;
+    const filenameMatchesNativeId = transcriptFilenameMatchesNativeId(file, nativeId);
     try {
       const row = JSON.parse(readSessionHeader(file)) as { type?: unknown; payload?: unknown };
       const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object'
@@ -353,11 +361,13 @@ export function readCodexSessionIdentity(nativeId: string, root = sessionRoot())
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
       if (sessionId && threadId && sessionId !== threadId) {
-        mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        if (filenameMatchesNativeId) {
+          mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        }
         continue;
       }
       if ((sessionId || threadId) !== nativeId) {
-        if (sessionId || threadId) {
+        if ((sessionId || threadId) && filenameMatchesNativeId) {
           mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
         }
         continue;
