@@ -1592,6 +1592,9 @@ class DiscordGateway {
       return watermark ? { watermark, topicPublished: false, publication: null, blocked: true, error } : null;
     }
     if (!watermark) return null;
+    if (isNativeProofRetryBoundary(watermark.state, watermark.detail)) {
+      this.scheduleDeferredHandoffRecovery(binding.channelId);
+    }
     return { watermark, topicPublished: true, publication: null };
   }
 
@@ -2196,10 +2199,6 @@ class DiscordGateway {
           await this.recordBoundary(binding, null, READINESS.UNAVAILABLE,
             nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, deadline),
             watermark?.recovered_through_id, null, signal, deadline, watermark);
-          if (baseReason === 'ordinary-bind' || baseReason === 'endpoint-recovery' ||
-              baseReason === 'Claude endpoint unavailable') {
-            this.scheduleDeferredHandoffRecovery(binding.channelId);
-          }
           failure ||= { ready: false, state: READINESS.UNAVAILABLE };
         } else {
           await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline, watermark);
@@ -2400,9 +2399,6 @@ class DiscordGateway {
           const heldState = kind === CODEX_VALIDATION_KINDS.DEADLINE && !nativeDeadline ? READINESS.GAP : READINESS.UNAVAILABLE;
           const recorded = await recordOwnedBoundary(binding, channel, heldState, detail, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
           if (recorded?.watermark) ownedBoundary = recorded.watermark;
-          if (nativeDeadline) {
-            this.scheduleDeferredHandoffRecovery(binding.channelId);
-          }
           if (!recorded?.concurrentReady) failure ||= { ready: false, state: heldState, error };
           continue;
         } finally {

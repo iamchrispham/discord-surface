@@ -10,6 +10,8 @@ function renderDeadline(phase: NativeProofPhase, deadline: number): string {
   return nativeProofDeadlineDetail(phase, deadline);
 }
 
+const renderDeadlineFromOwner: (phase: NativeProofPhase, deadline: number) => string = nativeProofDeadlineDetail;
+
 const phases: readonly NativeProofPhase[] = Object.values(NATIVE_PROOF_PHASES);
 const preflight = renderDeadline(NATIVE_PROOF_PHASES.PREFLIGHT, 100);
 const beforeBinding = renderDeadline(NATIVE_PROOF_PHASES.BEFORE_BINDING, 200);
@@ -17,6 +19,7 @@ const retryable: boolean = isNativeProofRetryBoundary('unavailable', preflight);
 const notRetryable: boolean = isNativeProofRetryBoundary('ready', beforeBinding);
 
 void phases;
+void renderDeadlineFromOwner;
 void retryable;
 void notRetryable;
 
