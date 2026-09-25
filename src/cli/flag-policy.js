@@ -5,6 +5,14 @@
 // it at parse time, ahead of the courier-guard startup path and main dispatch.
 
 const COMMON_FLAGS = Object.freeze(['state-dir', 'db', 'help']);
+const DIRECT_HANDOFF_FLAGS = Object.freeze(['provider', 'conductor-id', 'repo-key', 'from-native-id', 'native-id',
+  'from-generation', 'endpoint', 'workspace', 'channel-id', 'handoff-id', 'category-id']);
+const ORDINARY_HANDOFF_FLAGS = Object.freeze(['ordinary', 'provider', 'from-native-id', 'native-id',
+  'from-generation', 'workspace', 'channel-id', 'handoff-id', 'session-root']);
+const LOCK_HANDOFF_FLAGS = Object.freeze(['from-lock', 'repo', 'provider', 'conductor-id', 'repo-key',
+  'native-id', 'endpoint', 'workspace', 'session-file', 'worker-file', 'category-id']);
+const LOCAL_HANDOFF_FLAGS = Object.freeze(['provider', 'conductor-id', 'repo-key', 'from-native-id', 'native-id',
+  'from-generation', 'endpoint', 'workspace', 'channel-id', 'handoff-id', 'enrollment-proof', 'intake-cutoff', 'reuse']);
 
 // FIXED inventory from the issue-110 build brief. Group identical families; the
 // policy is per selected command, never one global set. A missing entry fails
@@ -26,12 +34,9 @@ const COMMAND_FLAGS = Object.freeze({
   'board-refresh': ['channel-id', 'dedupe-key', 'generation', 'message-id', 'native-id', 'request-id', 'text-file'],
   provision: ['provider', 'native-id', 'conductor-id', 'repo-key', 'channel-id', 'task-name', 'workspace', 'endpoint', 'category-id', 'migrate-legacy-topic'],
   'provision-run': ['provider', 'native-id', 'conductor-id', 'repo-key', 'channel-id', 'task-name', 'workspace', 'endpoint', 'category-id', 'migrate-legacy-topic'],
-  handoff: ['provider', 'conductor-id', 'repo-key', 'from-native-id', 'native-id', 'from-generation', 'endpoint', 'workspace', 'channel-id',
-    'handoff-id', 'category-id', 'ordinary', 'from-lock', 'repo', 'session-file', 'worker-file', 'enrollment-proof', 'intake-cutoff', 'reuse', 'session-root'],
-  'handoff-run': ['provider', 'conductor-id', 'repo-key', 'from-native-id', 'native-id', 'from-generation', 'endpoint', 'workspace', 'channel-id',
-    'handoff-id', 'category-id', 'ordinary', 'from-lock', 'repo', 'session-file', 'worker-file', 'enrollment-proof', 'intake-cutoff', 'reuse', 'session-root'],
-  'handoff-local': ['provider', 'conductor-id', 'repo-key', 'from-native-id', 'native-id', 'from-generation', 'endpoint', 'workspace', 'channel-id',
-    'handoff-id', 'category-id', 'ordinary', 'from-lock', 'repo', 'session-file', 'worker-file', 'enrollment-proof', 'intake-cutoff', 'reuse', 'session-root'],
+  handoff: DIRECT_HANDOFF_FLAGS,
+  'handoff-run': DIRECT_HANDOFF_FLAGS,
+  'handoff-local': LOCAL_HANDOFF_FLAGS,
   start: ['courier-route-id'],
   run: ['courier-route-id', 'reply-timeout-ms'],
   stop: [],
@@ -39,7 +44,7 @@ const COMMAND_FLAGS = Object.freeze({
   'claude-monitor': ['native-id', 'socket'],
   'native-ack': ['provider', 'message-id', 'native-id', 'generation'],
   'native-reply': ['provider', 'generation', 'message-id', 'native-id', 'text-file', 'attachment-file'],
-  'claude-reply': ['provider', 'generation', 'message-id', 'native-id', 'text-file', 'attachment-file'],
+  'claude-reply': ['generation', 'message-id', 'native-id', 'text-file', 'attachment-file'],
   'agent-address': ['provider', 'channel-id', 'agent-thread-id', 'native-id', 'generation'],
   'agent-send': ['provider', 'channel-id', 'agent-thread-id', 'native-id', 'generation', 'target-file', 'text-file', 'attachment-file',
     'dedupe-key', 'request-id', 'agent-presentation', 'agent-reply-to', 'resume', 'in-reply-to'],
@@ -66,8 +71,12 @@ const SUBCOMMAND_FLAGS = Object.freeze({
   'liaison draft': ['receipt-id']
 });
 
-function allowedFlags(command, subcommand) {
+function allowedFlags(command, subcommand, args) {
   if (command === 'liaison' && subcommand === 'draft') return SUBCOMMAND_FLAGS['liaison draft'];
+  if (command === 'handoff' || command === 'handoff-run') {
+    if (args?.ordinary === true || args?.ordinary === 'true') return ORDINARY_HANDOFF_FLAGS;
+    if (args?.['from-lock'] === true || args?.['from-lock'] === 'true') return LOCK_HANDOFF_FLAGS;
+  }
   const entry = Object.hasOwn(COMMAND_FLAGS, command) ? COMMAND_FLAGS[command] : null;
   if (entry === null) return null;
   return entry;
@@ -111,14 +120,13 @@ function suggestionFor(unknown, allowed) {
 // duplicate-flag check. Throws an Error with .command set so the courier-guard
 // startup path can keep its existing deny JSON and exit code 2.
 function validateFlags({ command, subcommand, args } = {}) {
-  if (command === 'help' || args?.help !== undefined) return;
+  if (command === 'help' || Boolean(args?.help)) return;
+  const allowed = allowedFlags(command, subcommand, args);
   const unknown = Object.keys(args || {}).find(key => {
-    const allowed = allowedFlags(command, subcommand);
     if (allowed === null) return true;
     return !COMMON_FLAGS.includes(key) && !allowed.includes(key);
   });
   if (unknown === undefined) return;
-  const allowed = allowedFlags(command, subcommand);
   // Common flags are options for this command too, so they are candidate suggestions.
   const candidates = allowed === null ? null : [...allowed, ...COMMON_FLAGS];
   const suggestion = candidates === null ? null : suggestionFor(unknown, candidates);

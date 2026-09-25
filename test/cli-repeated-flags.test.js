@@ -114,6 +114,50 @@ test('ordinary-bind refuses an ignored guild override before opening state', asy
   assert.equal(fs.existsSync(path.join(dir, 'surface.sqlite')), false);
 });
 
+test('handoff modes refuse options consumed only by another mode', () => {
+  const invalid = [
+    [['handoff', '--ordinary'], '--endpoint'],
+    [['handoff-run', '--ordinary'], '--category-id'],
+    [['handoff', '--from-lock'], '--reuse'],
+    [['handoff-run', '--from-lock'], '--session-root'],
+    [['handoff'], '--session-root'],
+    [['handoff-local'], '--repo'],
+    [['handoff-local'], '--session-file']
+  ];
+  for (const [command, flag] of invalid) {
+    assert.throws(() => parseArgs([...command, flag, 'wrong']), error => {
+      assert.match(error.message, new RegExp(`unknown ${flag} for ${command[0]}`));
+      return true;
+    });
+  }
+  for (const command of [
+    ['handoff', '--ordinary', '--session-root', '/tmp/root'],
+    ['handoff', '--from-lock', '--session-file', '/tmp/session'],
+    ['handoff', '--endpoint', '/tmp/socket'],
+    ['handoff-local', '--intake-cutoff', '100']
+  ]) assert.doesNotThrow(() => parseArgs(command));
+});
+
+test('ordinary handoff rejects an ignored endpoint before creating state', t => {
+  const dir = path.join(os.tmpdir(), `cli-handoff-unknown-${process.pid}-${Date.now()}`);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const result = spawnSync(process.execPath, [CLI, 'handoff', '--state-dir', dir,
+    '--ordinary', '--endpoint', '/tmp/wrong'], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /unknown --endpoint for handoff/);
+  assert.equal(fs.existsSync(dir), false);
+});
+
+test('claude-reply rejects a provider override before opening state', t => {
+  const dir = path.join(os.tmpdir(), `cli-reply-unknown-${process.pid}-${Date.now()}`);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const result = spawnSync(process.execPath, [CLI, 'claude-reply', '--state-dir', dir,
+    '--provider', 'codex'], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /unknown --provider for claude-reply/);
+  assert.equal(fs.existsSync(dir), false);
+});
+
 test('claude-post suggests the exact nearest same-command flag for --attachment', () => {
   assert.throws(() => parseArgs(['claude-post', '--attachment', 'x']), error => {
     assert.equal(error.command, 'claude-post');
@@ -140,16 +184,49 @@ test('misspelled attachment refuses before claude-post touches state or network'
   assert.equal(fs.existsSync(path.join(dir, 'surface.sqlite')), false);
 });
 
+test('empty help cannot bypass an unknown attachment on a configured post', async t => {
+  const f = fixture(t, 'claude');
+  const caption = path.join(f.dir, 'caption.txt');
+  const image = path.join(f.dir, 'frame.png');
+  fs.writeFileSync(caption, 'milestone');
+  fs.writeFileSync(image, 'frame');
+  const before = f.state.listReceipts();
+  const oldArgv = process.argv;
+  const oldFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    return { ok: true, status: 200, body: { cancel() {} }, json: async () => ({ id: 'posted' }) };
+  };
+  process.argv = ['node', CLI, 'claude-post', '--db', path.join(f.dir, 'surface.sqlite'),
+    '--native-id', f.nativeId, '--generation', '1', '--text-file', caption, '--dedupe-key', 'empty-help',
+    '--attachment', image, '--help='];
+  let error;
+  try {
+    await main();
+  } catch (caught) {
+    error = caught;
+  } finally {
+    globalThis.fetch = oldFetch;
+    process.argv = oldArgv;
+  }
+  assert.equal(fetches, 0);
+  assert.match(error?.message || '', /unknown --attachment for claude-post; did you mean --attachment-file\?/);
+  assert.deepEqual(f.state.listReceipts(), before);
+});
+
 test('courier-guard rejects an unknown flag with the deny hook JSON before state exists', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-unknown-flag-'));
   try {
-    const result = spawnSync(process.execPath, [CLI, 'courier-guard', '--state-dir', dir,
-      '--courier-route-id', 'guard-route', '--surprise', 'y'], { encoding: 'utf8', timeout: 10000 });
-    assert.equal(result.status, 2, result.stderr);
-    const output = JSON.parse(result.stdout);
-    assert.equal(output.hookSpecificOutput.hookEventName, 'PreToolUse');
-    assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
-    assert.match(output.hookSpecificOutput.permissionDecisionReason, /unknown --surprise for courier-guard/);
+    for (const help of [[], ['--help=']]) {
+      const result = spawnSync(process.execPath, [CLI, 'courier-guard', '--state-dir', dir,
+        '--courier-route-id', 'guard-route', '--surprise', 'y', ...help], { encoding: 'utf8', timeout: 10000 });
+      assert.equal(result.status, 2, result.stderr);
+      const output = JSON.parse(result.stdout);
+      assert.equal(output.hookSpecificOutput.hookEventName, 'PreToolUse');
+      assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
+      assert.match(output.hookSpecificOutput.permissionDecisionReason, /unknown --surprise for courier-guard/);
+    }
     assert.equal(fs.existsSync(path.join(dir, 'surface.sqlite')), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
