@@ -111,7 +111,7 @@ function operationEndedAt(value: unknown): string {
 }
 
 function readbackInstant(value: unknown): string {
-  const input = text(value, 'observedAt', 64).replace('t', 'T').replace(/z$/, 'Z');
+  const input = text(value, 'observedAt', 64).replace(/[t ]/, 'T').replace(/z$/, 'Z');
   const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|([+-])(\d{2}):?(\d{2}))$/.exec(input);
   if (!match || /-00:?00$/.test(input)) throw new Error('observedAt must be a timezone-qualified ISO timestamp');
   const hours = Number(match[5] || 0);
