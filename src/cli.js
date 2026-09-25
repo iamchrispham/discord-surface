@@ -1471,7 +1471,8 @@ async function runRuntime(args) {
     });
     await gateway.start(config.secretFile);
     const recoveryCutoff = new Date().toISOString();
-    await gateway.reconcilePending(recoveryCutoff);
+    // Ready-only reconciliation still drains durable submitted and reply-ready custody.
+    await gateway.reconcilePending(recoveryCutoff, { allowPaused: true, readyOnly: true });
     gatewayReady = true;
     bindingWake.start();
   } catch (error) {
