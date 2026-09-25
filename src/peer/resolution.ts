@@ -34,7 +34,10 @@ export function resolvePeerBinding(state: PeerState, selector: PeerSelector, cha
   const bindings = state.listBindings().filter(binding => binding.active && binding.guildId === guildId);
   let candidates: PeerBinding[];
   if ('channelName' in selector) {
-    const matches = channels.filter(channel => channel.guildId === guildId && channel.name === selector.channelName);
+    const matches = channels.filter(channel =>
+      channel.guildId === guildId &&
+      channel.name === selector.channelName &&
+      bindings.some(binding => binding.channelId === channel.id));
     if (matches.length !== 1) throw new Error(matches.length ? 'peer channel name is ambiguous' : 'peer channel name is unknown');
     candidates = bindings.filter(binding => binding.channelId === matches[0].id);
   } else if ('conductorId' in selector) {

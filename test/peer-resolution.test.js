@@ -25,11 +25,11 @@ test('gap and ambiguous children never select an arbitrary route', t => {
   assert.throws(() => requireReadyPeer(f.state, resolvePeerBinding(f.state, { conductorId: 'test-conductor' })), /ambiguous/);
 });
 
-test('channel names resolve inside the configured guild and refuse collisions', t => {
+test('channel names resolve inside the configured guild and ignore unbound collisions', t => {
   const f = fixture(t); const selector = { channelName: 'advisor' };
   const channels = [{ id: '101', guildId: '100', name: 'advisor' }, { id: '999', guildId: '200', name: 'advisor' }];
   assert.equal(resolvePeerBinding(f.state, selector, channels).channelId, '101');
-  assert.throws(() => resolvePeerBinding(f.state, selector, [...channels, { id: '103', guildId: '100', name: 'advisor' }]), /ambiguous/);
+  assert.equal(resolvePeerBinding(f.state, selector, [...channels, { id: '103', guildId: '100', name: 'advisor' }]).channelId, '101');
   assert.throws(() => resolvePeerBinding(f.state, selector, []), /unknown/);
 });
 
