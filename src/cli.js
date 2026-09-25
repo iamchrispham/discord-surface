@@ -92,6 +92,11 @@ function parseArgs(argv) {
     throw Object.assign(new Error(`--${repeated} was given more than once; each flag takes one value`), { command: positional[0] });
   }
   const command = positional[0];
+  const optionLikePositional = positional.find(token => /^-[^-]/.test(token));
+  if (optionLikePositional !== undefined) {
+    throw Object.assign(new Error(`unknown option ${optionLikePositional} for ${command}`), { command });
+  }
+
   // Reject flags the selected command does not consume here, before state, custody,
   // or network work. `help`/`--help` is read-only and bypasses this after the repeat
   // check. The error carries .command so the courier-guard startup path keeps its

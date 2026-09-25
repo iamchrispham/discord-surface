@@ -134,11 +134,19 @@ function suggestionFor(unknown, allowed) {
   return winner;
 }
 
+const BOOLEAN_FLAGS = new Set(['resume']);
+const BOOLEAN_VALUES = new Set([true, false, 'true', 'false']);
+
 // Validates the parsed args for one selected command. `help` and `--help` are
 // read-only and bypass unknown-flag validation; callers run that check after the
 // duplicate-flag check. Throws an Error with .command set so the courier-guard
 // startup path can keep its existing deny JSON and exit code 2.
 function validateFlags({ command, subcommand, args } = {}) {
+  for (const flag of BOOLEAN_FLAGS) {
+    if (Object.hasOwn(args || {}, flag) && !BOOLEAN_VALUES.has(args[flag])) {
+      throw Object.assign(new Error(`--${flag} takes only true or false`), { command });
+    }
+  }
   if (command === 'help' || args?.help === true) return;
   const allowed = allowedFlags(command, subcommand, args);
   const unknown = Object.keys(args || {}).find(key => {
