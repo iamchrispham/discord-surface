@@ -79,9 +79,12 @@ function parseArgs(argv) {
     const key = equalsIndex === -1 ? raw : raw.slice(0, equalsIndex);
     const inline = equalsIndex === -1 ? undefined : raw.slice(equalsIndex + 1);
     if (repeated === null && Object.hasOwn(args, key)) repeated = key;
-    if (inline !== undefined) args[key] = inline;
-    else if (argv[i + 1] && !argv[i + 1].startsWith('--')) args[key] = argv[++i];
-    else args[key] = true;
+    let parsedValue;
+    if (inline !== undefined) parsedValue = inline;
+    else if (argv[i + 1] && !argv[i + 1].startsWith('--')) parsedValue = argv[++i];
+    else parsedValue = true;
+    // Keep --__proto__ enumerable so the command policy can reject it.
+    Object.defineProperty(args, key, { value: parsedValue, enumerable: true, configurable: true, writable: true });
   }
   // Every flag is single-valued, so a repeat is refused rather than letting the last one win.
   // The scan finishes first so the refusal still names the command, wherever the repeat sits.

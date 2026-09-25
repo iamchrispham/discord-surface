@@ -9,8 +9,9 @@ const {
   submitted
 } = require('./native-reply-file-fixture');
 const os = require('node:os');
+const Module = require('node:module');
 const { main, parseArgs } = require('../src/cli');
-const { allowedFlags } = require('../src/cli/flag-policy');
+const { allowedFlags, COMMON_FLAGS } = require('../src/cli/flag-policy');
 
 const CLI = path.join(__dirname, '..', 'src', 'cli.js');
 const REPEATED = /--attachment-file was given more than once/;
@@ -90,12 +91,53 @@ test('claude-post rejects an unrecognized flag without inventing a suggestion', 
   });
 });
 
+test('prototype-named flags are rejected rather than lost while parsing', () => {
+  for (const flag of ['--__proto__', '--__proto__=x']) {
+    const argv = flag.includes('=') ? ['claude-post', flag] : ['claude-post', flag, 'x'];
+    assert.throws(() => parseArgs(argv), /unknown --__proto__ for claude-post/);
+  }
+});
+
+test('ordinary-bind refuses an ignored guild override before opening state', async t => {
+  for (const command of ['ordinary-bind', 'ordinary-bind-run']) {
+    assert.throws(() => parseArgs([command, '--guild-id', 'other']), new RegExp(`unknown --guild-id for ${command}`));
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-ordinary-unknown-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const oldArgv = process.argv;
+  process.argv = ['node', CLI, 'ordinary-bind', '--state-dir', dir, '--guild-id', 'other'];
+  try {
+    await assert.rejects(main(), /unknown --guild-id for ordinary-bind/);
+  } finally {
+    process.argv = oldArgv;
+  }
+  assert.equal(fs.existsSync(path.join(dir, 'surface.sqlite')), false);
+});
+
 test('claude-post suggests the exact nearest same-command flag for --attachment', () => {
   assert.throws(() => parseArgs(['claude-post', '--attachment', 'x']), error => {
     assert.equal(error.command, 'claude-post');
     assert.equal(error.message, 'unknown --attachment for claude-post; did you mean --attachment-file?');
     return true;
   });
+});
+
+test('misspelled attachment refuses before claude-post touches state or network', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-post-unknown-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const oldArgv = process.argv;
+  const oldFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async () => { fetches += 1; throw new Error('network reached'); };
+  process.argv = ['node', CLI, 'claude-post', '--state-dir', dir, '--attachment', 'frame.png'];
+  try {
+    await assert.rejects(main(), /unknown --attachment for claude-post; did you mean --attachment-file\?/);
+  } finally {
+    globalThis.fetch = oldFetch;
+    process.argv = oldArgv;
+  }
+  assert.equal(fetches, 0);
+  assert.equal(fs.existsSync(path.join(dir, 'surface.sqlite')), false);
 });
 
 test('courier-guard rejects an unknown flag with the deny hook JSON before state exists', () => {
@@ -114,6 +156,27 @@ test('courier-guard rejects an unknown flag with the deny hook JSON before state
   }
 });
 
+test('degraded courier-guard fallback matches its allowed flags and denies extras', () => {
+  const load = Module._load;
+  Module._load = function (request, parent, isMain) {
+    if (request === './cli/flag-policy' && parent?.filename === CLI) {
+      const error = new Error('flag policy missing');
+      error.code = 'MODULE_NOT_FOUND';
+      throw error;
+    }
+    return load.call(this, request, parent, isMain);
+  };
+  try {
+    for (const key of [...COMMON_FLAGS, ...allowedFlags('courier-guard')]) {
+      assert.doesNotThrow(() => parseArgs(['courier-guard', `--${key}`, 'x']), `fallback rejected --${key}`);
+    }
+    assert.throws(() => parseArgs(['courier-guard', '--message-id', 'x']), /unknown --message-id for courier-guard/);
+    assert.throws(() => parseArgs(['courier-guard', '--__proto__', 'x']), /unknown --__proto__ for courier-guard/);
+  } finally {
+    Module._load = load;
+  }
+});
+
 test('every main dispatch case has a flag policy entry', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8');
   const mainBody = source.slice(source.indexOf('async function main()'));
@@ -122,5 +185,6 @@ test('every main dispatch case has a flag policy entry', () => {
   for (const command of cases) {
     assert.notEqual(allowedFlags(command), null, `no flag policy for main dispatch case ${command}`);
     assert.doesNotThrow(() => parseArgs([command]), `parseArgs(${command}) threw under the flag policy`);
+    assert.throws(() => parseArgs([command, '--frobnicate', 'x']), new RegExp(`unknown --frobnicate for ${command}`));
   }
 });
