@@ -64,6 +64,26 @@ for (const boundary of ['preflight', 'outcome']) {
     }
   });
 
+  test(`${boundary} rejects diagnostic serializers before persistence`, t => {
+    const { state, meta } = fixture(t);
+    if (boundary === 'outcome') state.beginDirectPostPart(meta);
+    const record = detail => boundary === 'preflight'
+      ? state.recordDirectPostPreflight(meta, 'not_sent', detail)
+      : state.recordDirectPostOutcome(meta.requestId, meta.attemptId, 'unknown', detail);
+    const beforeReceipts = state.listReceipts();
+    const beforeRows = state.directPostRows(meta.requestId);
+    const detail = {
+      reason: 'diagnostic',
+      toJSON() {
+        return { journal: 'foreign', requestId: 'foreign' };
+      }
+    };
+    assert.throws(() => record(detail), /cannot define toJSON/);
+    assert.deepEqual(state.listReceipts(), beforeReceipts);
+    assert.deepEqual(state.directPostRows(meta.requestId), beforeRows);
+    assert.equal(state.directPostRows('foreign').length, 0);
+  });
+
   test(`${boundary} freezes nested custody before receipt serialization`, t => {
     const { state, meta } = fixture(t);
     if (boundary === 'outcome') state.beginDirectPostPart(meta);
