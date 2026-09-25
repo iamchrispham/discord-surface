@@ -98,6 +98,36 @@ for (const boundary of ['preflight', 'outcome']) {
     assert.equal(state.directPostRows('foreign').length, 0);
   });
 
+  test(`${boundary} rejects nested unserializable diagnostics before persistence`, t => {
+    const cases = [
+      {
+        name: 'throwing nested serializer',
+        detail: { error: { toJSON() { throw new Error('diagnostic serializer failed'); } } }
+      },
+      {
+        name: 'cyclic diagnostic',
+        detail: (() => {
+          const cycle = {};
+          cycle.self = cycle;
+          return { error: cycle };
+        })()
+      },
+      { name: 'bigint diagnostic', detail: { error: 1n } }
+    ];
+    const { state, meta } = fixture(t);
+    if (boundary === 'outcome') state.beginDirectPostPart(meta);
+    const record = detail => boundary === 'preflight'
+      ? state.recordDirectPostPreflight(meta, 'not_sent', detail)
+      : state.recordDirectPostOutcome(meta.requestId, meta.attemptId, 'unknown', detail);
+    for (const { name, detail } of cases) {
+      const beforeReceipts = state.listReceipts();
+      const beforeRows = state.directPostRows(meta.requestId);
+      assert.throws(() => record(detail), /unserializable/, name);
+      assert.deepEqual(state.listReceipts(), beforeReceipts, name);
+      assert.deepEqual(state.directPostRows(meta.requestId), beforeRows, name);
+    }
+  });
+
   test(`${boundary} freezes nested custody before receipt serialization`, t => {
     const { state, meta } = fixture(t);
     if (boundary === 'outcome') state.beginDirectPostPart(meta);

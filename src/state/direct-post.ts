@@ -105,6 +105,7 @@ function validatedOutcomeDetail(expected: DirectPostPartMeta, input: Record<stri
   const expectedSnapshot = snapshotCustodyFields(expected, snapshots);
   const detail = snapshotCustodyFields(input, snapshots);
   if (Object.hasOwn(detail, 'toJSON')) throw new BindingError('direct post outcome detail cannot define toJSON');
+  assertSerializableOutcomeDetail(detail, BindingError);
   for (const key of Object.keys(immutableDetailKeys)) {
     if (!Object.hasOwn(detail, key)) continue;
     const expectedValue = key === 'journal' ? 'direct-post-v1' : (expectedSnapshot as unknown as Record<string, unknown>)[key];
@@ -131,6 +132,14 @@ function snapshotCustodyFields<T>(input: T, snapshots = new WeakMap<object, unkn
     if (Object.hasOwn(snapshot, key)) snapshot[key] = snapshotCustodyValue(snapshot[key], snapshots);
   }
   return snapshot as T;
+}
+
+function assertSerializableOutcomeDetail(detail: Record<string, unknown>, BindingError: DirectPostErrorConstructor): void {
+  try {
+    JSON.stringify(detail);
+  } catch {
+    throw new BindingError('direct post outcome detail is unserializable');
+  }
 }
 
 function assertFileSeed(seed: DirectPostFilePreparationSeed, BindingError: DirectPostErrorConstructor, assertText: DirectPostDependencies['assertText']): void {
