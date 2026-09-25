@@ -18,6 +18,7 @@ const { conductorMarkerMatches } = require('./topic');
 const { readDirectPostFileSnapshot } = require('./direct-post-file');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
 const { isPreAdoptionRetryableThread, isRetryableFetchBoundary, recoveryFetch } = require('./discord/recovery-fetch');
+const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail, isNativeProofRetryBoundary } = require('./discord/native-proof-recovery');
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer } = require('./discord/decision');
@@ -1515,6 +1516,7 @@ class DiscordGateway {
           const watermark = this.state.getIntakeWatermark(binding.channelId);
           return watermark?.state === READINESS.UNAVAILABLE &&
             typeof watermark.detail === 'string' && (
+              isNativeProofRetryBoundary(watermark.state, watermark.detail) ||
               watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX) ||
               watermark.detail.startsWith('Codex transcript proof unavailable before event write:')
             );
@@ -2145,7 +2147,8 @@ class DiscordGateway {
       typeof boundary.detail === 'string' &&
       boundary.detail.endsWith('retry after Discord HTTP 503');
     const isRetryableRecoveryBoundary = boundary => boundary &&
-      (isRetryableFetchBoundary(boundary.state, boundary.detail) || isInterruptedRetryBoundary(boundary));
+      (isRetryableFetchBoundary(boundary.state, boundary.detail) || isInterruptedRetryBoundary(boundary) ||
+        isNativeProofRetryBoundary(boundary.state, boundary.detail));
     let failure = null;
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
@@ -2166,6 +2169,13 @@ class DiscordGateway {
             const currentState = classifyReadiness(currentBinding, currentBoundary);
             failure ||= { ready: false, state: currentState || 'unavailable' };
           }
+        } else if (watermark && ['gap', 'unavailable'].includes(watermark.state)) {
+          failure ||= { ready: false, state: watermark.state };
+        } else if (binding.provider === 'codex' && this.state.isOrdinaryBinding(binding)) {
+          await this.recordBoundary(binding, null, READINESS.UNAVAILABLE,
+            nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, deadline),
+            watermark?.recovered_through_id, null, signal, deadline, watermark);
+          failure ||= { ready: false, state: READINESS.UNAVAILABLE };
         } else {
           await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline, watermark);
           failure ||= { ready: false, state: 'gap' };
@@ -2273,7 +2283,9 @@ class DiscordGateway {
       try {
         channel = await waitForRecoveryOperation(() => {
           if (retryBoundary) {
-            const retrying = this.state.markIntakeBoundary(binding.channelId, 'pending', `${reason} retry after Discord HTTP 503`,
+            const retryDetail = isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)
+              ? retryBoundary.detail : `${reason} retry after Discord HTTP 503`;
+            const retrying = this.state.markIntakeBoundary(binding.channelId, 'pending', retryDetail,
               retryBoundary.gap_from, retryBoundary.gap_to, binding, null, retryBoundary, ownedReadiness);
             if (!retrying) throw recoveryError('stale', 'Discord intake boundary changed before channel recovery');
             watermark = retrying;
@@ -2358,9 +2370,12 @@ class DiscordGateway {
           } else if (preflightReason && binding.provider === 'codex') {
             detail = `Codex transcript proof unavailable before event write: ${error.message}`;
           }
-          const recorded = await recordOwnedBoundary(binding, channel, kind === 'deadline' ? 'gap' : 'unavailable', detail, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+          const nativeDeadline = binding.provider === 'codex' && kind === CODEX_VALIDATION_KINDS.DEADLINE;
+          if (nativeDeadline) detail = nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, deadline);
+          const heldState = kind === CODEX_VALIDATION_KINDS.DEADLINE && !nativeDeadline ? READINESS.GAP : READINESS.UNAVAILABLE;
+          const recorded = await recordOwnedBoundary(binding, channel, heldState, detail, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
           if (recorded?.watermark) ownedBoundary = recorded.watermark;
-          if (!recorded?.concurrentReady) failure ||= { ready: false, state: kind === 'deadline' ? 'gap' : 'unavailable', error };
+          if (!recorded?.concurrentReady) failure ||= { ready: false, state: heldState, error };
           continue;
         } finally {
           signal?.removeEventListener('abort', relayAbort);

@@ -68,6 +68,7 @@
     "src/state/decision.ts",
     "src/state/courier-route/index.ts",
     "src/discord/recovery-fetch.ts",
+    "src/discord/native-proof-recovery.ts",
     "src/state/agent-routing.ts"
   ]
 }
