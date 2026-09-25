@@ -255,13 +255,7 @@ export function assertSocketDirectory(socketPath: string): void {
   ensureDirectoryOwnerOnly(path.dirname(lockPathForSocket(socketPath)));
 }
 
-function readSocketLockOwner(ownerPath: string): OwnerRecord {
-  let ownerValue: string;
-  try {
-    ownerValue = fs.readFileSync(ownerPath, 'utf8').trim();
-  } catch {
-    throw new Error('Claude channel socket preparation is already in progress');
-  }
+function parseSocketLockOwner(ownerValue: string): OwnerRecord {
   try {
     const owner = JSON.parse(ownerValue) as Partial<OwnerRecord>;
     const pid = owner.pid;
@@ -272,6 +266,35 @@ function readSocketLockOwner(ownerPath: string): OwnerRecord {
   const ownerPid = Number(ownerValue);
   if (Number.isInteger(ownerPid) && ownerPid > 0) return { pid: ownerPid };
   throw new Error('Claude channel socket preparation lock is invalid');
+}
+
+function readSocketLockOwner(ownerPath: string): OwnerRecord {
+  let ownerValue: string;
+  try {
+    ownerValue = fs.readFileSync(ownerPath, 'utf8').trim();
+  } catch {
+    throw new Error('Claude channel socket preparation is already in progress');
+  }
+  return parseSocketLockOwner(ownerValue);
+}
+
+function readSocketLockOwnerSnapshot(ownerPath: string): { owner: OwnerRecord; identity: FileIdentity } {
+  let descriptor: number | undefined;
+  let ownerValue: string;
+  let identity: FileIdentity;
+  try {
+    descriptor = fs.openSync(ownerPath, 'r');
+    const stats = fs.fstatSync(descriptor, { bigint: true });
+    ownerValue = fs.readFileSync(descriptor, 'utf8').trim();
+    identity = { dev: stats.dev, ino: stats.ino };
+  } catch {
+    throw new Error('Claude channel socket preparation is already in progress');
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+  }
+  return { owner: parseSocketLockOwner(ownerValue), identity };
 }
 
 function isSocketLockOwnerAlive(owner: OwnerRecord): boolean {
@@ -533,21 +556,17 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
         throw statError;
       }
       if (lockStats.isDirectory()) {
-        let owner: OwnerRecord;
-        try { owner = readSocketLockOwner(ownerPath); } catch (ownerError) {
+        let ownerSnapshot: { owner: OwnerRecord; identity: FileIdentity };
+        try { ownerSnapshot = readSocketLockOwnerSnapshot(ownerPath); } catch (ownerError) {
           if (errorMessage(ownerError) !== 'Claude channel socket preparation is already in progress') throw ownerError;
           if (reclaimOwnerlessLock(lockPath, ownerPath)) continue;
           throw ownerError;
         }
-        let ownerIdentityAtCheck: FileIdentity;
-        try { ownerIdentityAtCheck = fileIdentity(ownerPath); } catch (identityError) {
-          if ((identityError as NodeJS.ErrnoException).code === 'ENOENT') continue;
-          throw identityError;
-        }
+        const owner = ownerSnapshot.owner;
         if (isSocketLockOwnerAlive(owner)) {
           throw new Error('Claude channel socket preparation is already in progress');
         }
-        if (!reclaimOwnerlessLock(lockPath, ownerPath, ownerIdentityAtCheck)) {
+        if (!reclaimOwnerlessLock(lockPath, ownerPath, ownerSnapshot.identity)) {
           throw new Error('Claude channel socket preparation is already in progress');
         }
         continue;
