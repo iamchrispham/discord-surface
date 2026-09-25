@@ -100,18 +100,36 @@ const immutableDetailKeys: Record<DirectPostCustodyKey, true> = {
   journal: true,
 };
 
-function validatedOutcomeDetail(expected: DirectPostPartMeta, input: Record<string, unknown>, BindingError: DirectPostErrorConstructor): Record<string, unknown> {
+function validatedOutcomeDetail(expected: DirectPostPartMeta, input: Record<string, unknown>, BindingError: DirectPostErrorConstructor, snapshots = new WeakMap<object, unknown>()): Record<string, unknown> {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new BindingError('direct post outcome detail is invalid');
-  const detail = { ...input };
+  const expectedSnapshot = snapshotCustodyFields(expected, snapshots);
+  const detail = snapshotCustodyFields(input, snapshots);
   for (const key of Object.keys(immutableDetailKeys)) {
     if (!Object.hasOwn(detail, key)) continue;
-    const expectedValue = key === 'journal' ? 'direct-post-v1' : (expected as unknown as Record<string, unknown>)[key];
+    const expectedValue = key === 'journal' ? 'direct-post-v1' : (expectedSnapshot as unknown as Record<string, unknown>)[key];
     if (!identityValueMatches(detail[key], expectedValue)) {
       throw new BindingError(`direct post outcome cannot override immutable ${key}`);
     }
   }
   if (Object.hasOwn(detail, 'outcome')) throw new BindingError('direct post outcome cannot override immutable outcome');
   return detail;
+}
+
+function snapshotCustodyValue(value: unknown, snapshots: WeakMap<object, unknown>): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  if (snapshots.has(value)) return snapshots.get(value);
+  const serialized = JSON.stringify(value);
+  const snapshot = serialized === undefined ? undefined : JSON.parse(serialized);
+  snapshots.set(value, snapshot);
+  return snapshot;
+}
+
+function snapshotCustodyFields<T>(input: T, snapshots = new WeakMap<object, unknown>()): T {
+  const snapshot = { ...(input as object) } as Record<string, unknown>;
+  for (const key of Object.keys(immutableDetailKeys)) {
+    if (Object.hasOwn(snapshot, key)) snapshot[key] = snapshotCustodyValue(snapshot[key], snapshots);
+  }
+  return snapshot as T;
 }
 
 function assertFileSeed(seed: DirectPostFilePreparationSeed, BindingError: DirectPostErrorConstructor, assertText: DirectPostDependencies['assertText']): void {
@@ -317,11 +335,13 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     recordDirectPostPreflight(state, meta, outcome, detail = {}) {
       validateMeta(meta, BindingError, assertText);
       if (!DIRECT_POST_OUTCOMES.includes(outcome)) throw new BindingError('invalid direct post outcome');
-      detail = validatedOutcomeDetail(meta, detail, BindingError);
+      const snapshots = new WeakMap<object, unknown>();
+      const canonicalMeta = snapshotCustodyFields(meta, snapshots);
+      detail = validatedOutcomeDetail(canonicalMeta, detail, BindingError, snapshots);
       return state.transaction(() => {
-        const rows = state.directPostRows(meta.requestId);
-        assertRequestIdentity(rows, meta);
-        const { attemptId: _attemptId, ...preflightMeta } = meta;
+        const rows = state.directPostRows(canonicalMeta.requestId);
+        assertRequestIdentity(rows, canonicalMeta);
+        const { attemptId: _attemptId, ...preflightMeta } = canonicalMeta;
         const next = { journal: 'direct-post-v1', ...preflightMeta, ...detail, phase: 'preflight', outcome };
         state.receipt(null, DIRECT_POST_OUTCOME, next);
         return next;

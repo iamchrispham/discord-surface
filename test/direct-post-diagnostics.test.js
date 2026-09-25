@@ -63,4 +63,41 @@ for (const boundary of ['preflight', 'outcome']) {
       assert.equal(state.listReceipts().length, before);
     }
   });
+
+  test(`${boundary} freezes nested custody before receipt serialization`, t => {
+    const { state, meta } = fixture(t);
+    if (boundary === 'outcome') state.beginDirectPostPart(meta);
+    let reads = 0;
+    const detail = {
+      binding: {
+        ...meta.binding,
+        get readiness() {
+          return ++reads === 1 ? meta.binding.readiness : 'changed';
+        }
+      }
+    };
+    const result = boundary === 'preflight'
+      ? state.recordDirectPostPreflight(meta, 'sent', detail)
+      : state.recordDirectPostOutcome(meta.requestId, meta.attemptId, 'sent', detail);
+    assert.equal(reads, 1);
+    assert.equal(result.binding.readiness, meta.binding.readiness);
+  });
 }
+
+test('preflight freezes metadata before diagnostic accessors run', t => {
+  const { state, meta } = fixture(t);
+  const requestId = meta.requestId;
+  const channelId = meta.channelId;
+  const detail = {
+    get reason() {
+      meta.requestId = 'foreign-request';
+      meta.channelId = 'foreign-channel';
+      return 'diagnostic';
+    }
+  };
+  const result = state.recordDirectPostPreflight(meta, 'not_sent', detail);
+  assert.equal(result.requestId, requestId);
+  assert.equal(result.channelId, channelId);
+  assert.equal(state.directPostRows(requestId).length, 1);
+  assert.equal(state.directPostRows('foreign-request').length, 0);
+});
