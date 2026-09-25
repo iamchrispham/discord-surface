@@ -870,7 +870,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff, awaitDispatchOutcome });
   }
 
-  function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false } = {}) {
+  function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false, deferReply = false } = {}) {
     if (!state.isInteractionMessage?.(message.id)) launchTransportReceipt(message);
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) {
@@ -896,7 +896,8 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
         } finally {
           settleNative();
         }
-        return deliverReply(message, result, taskSignal);
+        const holdReply = typeof deferReply === 'function' ? deferReply() : deferReply;
+        return holdReply ? result : deliverReply(message, result, taskSignal);
       }, settleNative);
       if (continueUntilFinal) return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
       return work;
@@ -2887,6 +2888,32 @@ class DiscordGateway {
       if (signal?.aborted) return this.state.recoveryCandidates(before).filter(allowed);
       const key = `${message.provider}:${message.nativeId}`;
       if (blockedOwners.has(key)) continue;
+      const storedMessage = {
+        ...message,
+        id: message.id,
+        guildId: message.guildId,
+        channelId: message.deliveryChannelId || message.channelId,
+        content: message.content,
+        author: { id: message.authorId, bot: false }
+      };
+      let result;
+      if (message.state === 'submitted') {
+        try {
+          result = await waitForRecoveryOperation(
+            () => this.consumer.resumeSubmitted(storedMessage, signal, {
+              continueUntilFinal: true,
+              deferReply: () => !storedMessage.channel
+            }),
+            signal,
+            deadline
+          );
+        } catch (error) {
+          if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
+          blockedOwners.add(key);
+          this.state.markObservationUnavailable(message.id, error);
+          continue;
+        }
+      }
       let channel;
       let channelFetchStarted = false;
       try {
@@ -2921,21 +2948,12 @@ class DiscordGateway {
           continue;
         }
       }
-      const storedMessage = {
-        ...message,
-        id: message.id,
-        guildId: message.guildId,
-        channelId: message.deliveryChannelId || message.channelId,
-        content: message.content,
-        author: { id: message.authorId, bot: false },
-        channel
-      };
+      storedMessage.channel = channel;
       if (!this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready &&
           !isHeldDurable(message)) {
         blockedOwners.add(key);
         continue;
       }
-      let result;
       try {
         if (message.state === 'accepted') {
           for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -2949,11 +2967,11 @@ class DiscordGateway {
             if (!stillAccepted || !this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready) break;
           }
         } else if (message.state === 'submitted') {
-          result = await waitForRecoveryOperation(
-            () => this.consumer.resumeSubmitted(storedMessage, signal, { continueUntilFinal: true }),
-            signal,
-            deadline
-          );
+          const current = this.state.getMessage(message.id);
+          if (current?.state === 'reply_ready') {
+            this.state.recoverNativeReplyAcknowledgment(message.id);
+            result = await this.consumer.deliverReply(storedMessage, { status: current.state, message: current }, signal);
+          }
         } else {
           this.state.recoverNativeReplyAcknowledgment(message.id);
           result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
