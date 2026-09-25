@@ -15,7 +15,9 @@ type FileIdentity = {
   ino: bigint;
 };
 
-export type SocketPathIdentity = FileIdentity;
+type SocketIdentity = FileIdentity & { ctimeNs: bigint };
+
+export type SocketPathIdentity = SocketIdentity;
 
 export type SocketLockRelease = () => void;
 
@@ -91,13 +93,22 @@ function sameFile(left: FileIdentity, right: FileIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+function sameSocket(left: SocketIdentity, right: SocketIdentity): boolean {
+  return sameFile(left, right) && left.ctimeNs === right.ctimeNs;
+}
+
 function fileIdentity(filePath: string): FileIdentity {
   const stats = fs.lstatSync(filePath, { bigint: true });
   return { dev: stats.dev, ino: stats.ino };
 }
 
+function socketIdentity(filePath: string): SocketIdentity {
+  const stats = fs.lstatSync(filePath, { bigint: true });
+  return { dev: stats.dev, ino: stats.ino, ctimeNs: stats.ctimeNs };
+}
+
 export function socketPathIdentity(socketPath: string): SocketPathIdentity | undefined {
-  try { return fileIdentity(socketPath); } catch (error) {
+  try { return socketIdentity(socketPath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
@@ -105,12 +116,12 @@ export function socketPathIdentity(socketPath: string): SocketPathIdentity | und
 
 export function unlinkSocketIfOwned(socketPath: string, expected: SocketPathIdentity | null | undefined): void {
   if (!expected) return;
-  let observed: FileIdentity;
-  try { observed = fileIdentity(socketPath); } catch (error) {
+  let observed: SocketIdentity;
+  try { observed = socketIdentity(socketPath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
-  if (!sameFile(observed, expected)) return;
+  if (!sameSocket(observed, expected)) return;
   try { fs.unlinkSync(socketPath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
@@ -246,9 +257,7 @@ function lockNamespacePath(socketPath: string, key: string): string {
   ];
   for (const candidate of candidates) {
     if (pathsOverlap(socketPath, candidate)) continue;
-    if (!ensureUsableLockNamespaceCandidate(candidate)) {
-      throw new Error('Claude channel socket lock namespace conflicts with socket path');
-    }
+    if (!ensureUsableLockNamespaceCandidate(candidate)) continue;
     return candidate;
   }
   throw new Error('Claude channel socket lock namespace conflicts with socket path');
@@ -407,6 +416,13 @@ function removeLockDirectory(directoryPath: string): void {
   }
 }
 
+function removeEmptyDirectory(directoryPath: string): void {
+  try { fs.rmdirSync(directoryPath); } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') throw error;
+  }
+}
+
 function removeTransition(transitionPath: string): void {
   removeLockDirectory(transitionPath);
 }
@@ -547,10 +563,8 @@ function releaseSocketLock(lockPath: string, ownerPath: string, identity: FileId
   if (!reclaimOwnerFile(lockPath, ownerPath, identity)) {
     throw new Error('Claude channel socket preparation lock owner changed before release');
   }
-  try { fs.rmdirSync(lockPath); } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') throw error;
-  }
+  removeEmptyDirectory(lockPath);
+  removeEmptyDirectory(path.dirname(lockPath));
 }
 
 function reclaimLegacyLockFile(lockPath: string, expected: FileIdentity): boolean {

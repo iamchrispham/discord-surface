@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const net = require('node:net');
+const os = require('node:os');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
@@ -189,6 +190,23 @@ test('coordination artifacts stay outside a valid endpoint namespace', t => {
   }
 });
 
+test('socket locks fall back from an unusable home and remove empty namespaces', t => {
+  const root = fs.mkdtempSync('/tmp/dss-home-');
+  const homeFile = path.join(root, 'home');
+  fs.writeFileSync(homeFile, 'not a directory');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.mock.method(os, 'homedir', () => homeFile);
+
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const { release, lockPath } = acquireSocketLockWithPath(t, socket);
+  const namespacePath = path.dirname(lockPath);
+  const expectedRoot = process.platform === 'win32' ? fs.realpathSync(os.tmpdir()) : fs.realpathSync('/tmp');
+  assert.equal(path.dirname(namespacePath), expectedRoot);
+  release();
+  assert.equal(fs.existsSync(namespacePath), false);
+});
+
 test('coordination lock paths are rejected by the endpoint contract', t => {
   const socket = socketPath(t);
   const { release, lockPath } = acquireSocketLockWithPath(t, socket);
@@ -312,6 +330,7 @@ test('legacy lock reclamation preserves a replacement owner', t => {
   const lockPath = first.lockPath;
   first.release();
   t.after(() => fs.rmSync(lockPath, { recursive: true, force: true }));
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
   fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999999 }));
 
   const originalOpen = fs.openSync;
@@ -488,6 +507,8 @@ test('late stop cleanup preserves a replacement listener', { timeout: 8000 }, as
   await channel.start();
   const server = channel.server;
   assert.ok(server);
+  const originalIdentity = socketOwnership.socketPathIdentity(socket);
+  assert.equal(typeof originalIdentity?.ctimeNs, 'bigint');
   const originalClose = server.close.bind(server);
   let finishClose;
   let notifyClose;

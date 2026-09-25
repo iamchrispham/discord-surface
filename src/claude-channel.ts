@@ -575,6 +575,7 @@ export class ClaudeChannel<
         server.once('error', reject);
         server.listen(this.socketPath, () => {
           server.off('error', reject);
+          try { fs.chmodSync(this.socketPath, 0o600); } catch {}
           let socketIdentity: socketOwnership.SocketPathIdentity | undefined;
           try { socketIdentity = socketOwnership.socketPathIdentity(this.socketPath); } catch (error) {
             try { server.close(); } catch {}
@@ -592,7 +593,6 @@ export class ClaudeChannel<
             reject(new Error('Claude channel stopped during listener startup'));
             return;
           }
-          try { fs.chmodSync(this.socketPath, 0o600); } catch {}
           this.socketIdentity = socketIdentity;
           this.ownsSocket = true;
           resolve();
