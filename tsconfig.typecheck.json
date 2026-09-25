@@ -89,6 +89,7 @@
     "test/discord/native-proof-recovery-types.ts",
     "src/discord/recovery-fetch.ts",
     "src/discord/native-proof-recovery.ts",
+    "test/discord/recovery-fetch-types.ts",
     "test/discord/native-proof-recovery-consumer-types.ts",
     "src/state/agent-routing.ts"
   ]
