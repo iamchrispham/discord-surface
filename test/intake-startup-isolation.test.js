@@ -6,6 +6,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fixture } = require('./helpers/intake-recovery-fixture');
 const { CASES, operatorMessage } = require('./helpers/intake-recovery-scenarios');
+const { THREAD_STATES } = require('../src/state/thread-enrollment');
 
 function deferred() {
   let resolve;
@@ -95,6 +96,17 @@ test('R2: all-held public startup connects without a ready route', CASES, async 
     assert.equal(f.boundary('1000').state, 'gap');
     assert.equal(f.boundary('1000').gap_to, '102');
   });
+
+test('R2b: active thread hold does not abort public startup', CASES, async t => {
+  const f = fixture(t);
+  f.state.markThreadBoundary('2000', THREAD_STATES.GAP, 'explicit uncovered history', '101', '102');
+  f.enableDelivery();
+
+  await f.gateway.start(f.secret);
+  assert.equal(f.gateway.started, true);
+  assert.equal(f.gateway.transportReady, true);
+  assert.equal(f.state.getThreadEnrollment('2000').state, THREAD_STATES.GAP);
+});
 
 test('R3: active history deadline stays retryable and a later pass recovers custody', CASES, async t => {
     const f = fixture(t);
