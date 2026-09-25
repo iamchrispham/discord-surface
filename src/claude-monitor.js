@@ -141,15 +141,11 @@ function monitorEvent({ content, messageId, nativeId, generation, attachments = 
   return event;
 }
 
-function monitorPointer({ messageId, nativeId, generation, payloadPath, hasCompletion = false, watcherNotice = null }) {
-  let instructions;
-  if (watcherNotice) {
-    instructions = 'Read the payload at payloadPath with Read. Run acknowledgment.command, then run completion.command once. Do not use reply.command.';
-  } else if (hasCompletion) {
-    instructions = 'Read the payload at payloadPath with Read. Run acknowledgment.command, then use reply.command or completion.command as instructed.';
-  } else {
-    instructions = 'Read the payload at payloadPath with Read. Run acknowledgment.command, then answer through reply.command.';
-  }
+function monitorPointer({ messageId, nativeId, generation, payloadPath, watcherNotice = null }) {
+  // The pointer is transport metadata, not a second instruction surface. Every
+  // branch delegates to the payload's shared acknowledgment contract and never
+  // restates an unconditional reply, completion, or consume action.
+  const instructions = 'Read the payload at payloadPath with Read and follow payload.instructions exactly, including its acknowledgment step. Do not act beyond what it authorizes.';
   const pointer = {
     type: 'discord-surface/claude-monitor',
     payloadPath: path.resolve(payloadPath),
@@ -244,7 +240,6 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
           await writeStdoutLine(stdout, JSON.stringify(monitorPointer({
             ...values,
             payloadPath,
-            hasCompletion: Boolean(completion?.length),
             watcherNotice
           })));
         }

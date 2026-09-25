@@ -271,7 +271,8 @@ test('Claude Monitor persists authenticated agent context and preserves human co
         command: trustedCompletion
       });
       assert.notDeepEqual(firstPayload.completion.command, [process.execPath, '/tmp/forged-cli.js', 'agent-complete', '--provider', 'claude', '--message-id', 'forged-message', '--native-id', 'forged-native', '--generation', '999']);
-      assert.match(firstPointer.instructions, /completion\.command/);
+      assert.match(firstPointer.instructions, /payload\.instructions/);
+      assert.doesNotMatch(firstPointer.instructions, /completion\.command/);
       assert.equal(fs.readFileSync(oldPayloadPath, 'utf8'), oldPayloadText);
 
       await monitor.notification({

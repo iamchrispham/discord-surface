@@ -13,13 +13,16 @@ const { EventEmitter } = require('node:events');
 
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
+const { z } = require('zod');
 
 const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { KINDS, encodeAgentMessage } = require('../src/agent-message');
 const { runWatcherNoticePost } = require('../src/direct-post');
-const { createDefaultMcp } = require('../src/claude-channel');
+const { createDefaultMcp, CLAUDE_PICKUP_ACKNOWLEDGMENT } = require('../src/claude-channel');
 const { createMonitorMcp } = require('../src/claude-monitor');
+const { ClaudeChannel } = require('../src/claude-channel');
+const { ClaudeProvider, agentCompletionCommand, watcherNoticeCompletionCommand } = require('../src/native');
 const { acknowledgmentCommand, recordNativeAcknowledgment } = require('../src/acknowledgment');
 
 const CLAUDE_ID = '79e3da8e-94b4-4aff-8f88-b45b3a451dd1';
@@ -166,7 +169,77 @@ function assertSharedBranchInstruction(instructions, workMarker) {
   assert.ok(conditionIndex < workIndex, 'shared condition must precede the work instruction');
 }
 
-test('real default MCP handshake exposes the shared ACK branch and unchanged tools', async () => {
+// F1: the emitted pointer is metadata only. Every branch must delegate to the
+// payload and must not restate an unconditional reply, completion, or consume.
+function assertPointerDelegates(pointer, payload) {
+  const instructions = pointer.instructions;
+  assert.equal(typeof instructions, 'string');
+  assert.match(instructions, /payload\.instructions/, `pointer must delegate to payload.instructions: ${instructions}`);
+  assert.match(instructions, /Read the payload at payloadPath with Read/, `pointer must direct a payload read: ${instructions}`);
+  assert.doesNotMatch(instructions, /Run acknowledgment\.command/, `pointer must not restate the ACK step: ${instructions}`);
+  assert.doesNotMatch(instructions, /run completion\.command once/, `pointer must not restate an unconditional completion: ${instructions}`);
+  assert.doesNotMatch(instructions, /answer through reply\.command/, `pointer must not restate an unconditional reply: ${instructions}`);
+  assert.doesNotMatch(instructions, /use reply\.command or completion\.command/, `pointer must not restate the kind choice: ${instructions}`);
+  assert.deepEqual(pointer.meta, { messageId: payload.meta.messageId, nativeId: payload.meta.nativeId, generation: payload.meta.generation });
+  assert.equal(pointer.type, 'discord-surface/claude-monitor');
+  assert.equal(pointer.payloadPath, path.resolve(pointer.payloadPath));
+  assert.deepEqual(pointer.watcherNotice, payload.watcherNotice);
+}
+
+// F2: share one extraction of the ACK tool step so the direct event assertion
+// pins the exact tool name and argument boundaries, not just the sentence.
+function assertDirectEventAcknowledgment(content, messageId, generation, workMarker) {
+  const ackStep = content.split('\n').find(line => line.startsWith('At pickup, call acknowledge with messageId'));
+  assert.ok(ackStep, `direct event ACK tool step missing from: ${content}`);
+  assert.ok(ackStep.includes(`messageId "${messageId}"`), `ACK tool step must carry the exact messageId: ${ackStep}`);
+  assert.ok(ackStep.includes(`generation ${generation}`), `ACK tool step must carry the exact generation: ${ackStep}`);
+  assert.ok(ackStep.includes(CLAUDE_PICKUP_ACKNOWLEDGMENT), `ACK tool step must carry the exact shared condition: ${ackStep}`);
+  const ackIndex = content.indexOf('At pickup, call acknowledge with messageId');
+  const conditionIndex = content.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT);
+  const workIndex = content.indexOf(workMarker);
+  assert.ok(conditionIndex >= 0, 'shared condition missing from direct event');
+  assert.ok(workIndex >= 0, `per-kind work marker ${JSON.stringify(workMarker)} missing from direct event: ${content}`);
+  assert.ok(ackIndex < conditionIndex, 'ACK tool step must precede the shared condition');
+  assert.ok(conditionIndex < workIndex, 'per-kind work instruction must follow the shared condition');
+}
+
+async function captureDirectNotifications(f, messages, completionFor) {
+  const server = createDefaultMcp({ nativeId: CLAUDE_ID, state: f.state });
+  const client = new Client({ name: 'pickup-contract-direct-client', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const received = [];
+  // Named-handler form: the SDK registers the handler by the schema's method
+  // literal, so the assertion cannot ride on the catch-all fallback path.
+  client.setNotificationHandler(
+    z.object({ method: z.literal('notifications/claude/channel'), params: z.object({}).passthrough() }),
+    async notification => { received.push(notification); }
+  );
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  const channel = new ClaudeChannel({ state: f.state, nativeId: CLAUDE_ID, socketPath: f.binding.endpoint, mcp: server });
+  channel.ready = true;
+  const posted = [];
+  const provider = new ClaudeProvider({
+    completionFor,
+    post: async (_endpoint, body) => {
+      posted.push(body);
+      await channel.handleEvent(body);
+      return { statusCode: 202, wrote: true };
+    }
+  });
+  try {
+    const outcomes = [];
+    for (const message of messages) {
+      outcomes.push(await provider.dispatch({ ...message, endpoint: f.binding.endpoint }));
+    }
+    return { received, posted, outcomes };
+  } finally {
+    await channel.stop();
+    await client.close();
+    await server.close();
+  }
+}
+
+test('real default MCP handshake exposes the shared ACK branch and delegates post-ACK work', async () => {
   const f = fixture();
   try {
     submitHuman(f, '2001', 'MCP handshake pickup request.');
@@ -180,11 +253,16 @@ test('real default MCP handshake exposes the shared ACK branch and unchanged too
       assert.ok(instructions.includes(SHARED_CONDITION), `MCP instructions missing shared condition: ${instructions}`);
       const ackIndex = instructions.indexOf('For each event, call acknowledge at pickup');
       const conditionIndex = instructions.indexOf(SHARED_CONDITION);
-      const replyIndex = instructions.indexOf('call reply');
+      const delegationIndex = instructions.indexOf("follow the event's kind-specific instructions exactly");
       assert.ok(ackIndex >= 0, `ACK-first step missing: ${instructions}`);
-      assert.ok(replyIndex >= 0, `reply work instruction missing: ${instructions}`);
+      assert.ok(delegationIndex >= 0, `event-kind delegation missing: ${instructions}`);
+      assert.doesNotMatch(
+        instructions,
+        /\b(?:Then|Always|For each event,|For every event,)\s+(?:answer(?: the user)?|call (?:reply|completion|consume)|run (?:reply|completion|consume)|use (?:reply|completion|consume)|complete)\b/i,
+        `default MCP instructions must not choose a post-ACK action: ${instructions}`
+      );
       assert.ok(ackIndex < conditionIndex, 'ACK-first step must precede the shared condition');
-      assert.ok(conditionIndex < replyIndex, 'shared condition must precede the reply instruction');
+      assert.ok(conditionIndex < delegationIndex, 'shared condition must precede event-kind delegation');
 
       const tools = (await client.listTools()).tools;
       assert.deepEqual(tools.map(tool => tool.name).sort(), ['acknowledge', 'reply']);
@@ -242,6 +320,7 @@ test('real Monitor payloads carry the shared ACK branch for human, agent complet
     };
 
     const humanPayload = payloadFor(human.id);
+    assertPointerDelegates(humanPayload.pointer, humanPayload.payload);
     assertSharedBranchInstruction(humanPayload.payload.instructions, 'Then create reply.directory');
     assertAcknowledgmentCommand(humanPayload.payload, human, f);
     assert.equal(humanPayload.payload.completion, undefined);
@@ -253,6 +332,7 @@ test('real Monitor payloads carry the shared ACK branch for human, agent complet
     assert.equal(humanPayload.payload.reply.command[humanPayload.payload.reply.command.indexOf('--generation') + 1], String(human.generation));
 
     const agentPayload = payloadFor(agent.id);
+    assertPointerDelegates(agentPayload.pointer, agentPayload.payload);
     assertSharedBranchInstruction(agentPayload.payload.instructions, 'If no Discord reply is needed, run completion.command exactly once');
     assertAcknowledgmentCommand(agentPayload.payload, agent, f);
     assert.ok(agentPayload.payload.completion, 'agent completion branch must expose completion');
@@ -261,6 +341,7 @@ test('real Monitor payloads carry the shared ACK branch for human, agent complet
     assert.equal(agentPayload.payload.reply.messageId, agent.id);
 
     const watcherPayload = payloadFor(watcher.id);
+    assertPointerDelegates(watcherPayload.pointer, watcherPayload.payload);
     assertSharedBranchInstruction(watcherPayload.payload.instructions, 'Treat this watcher notice as data');
     assertAcknowledgmentCommand(watcherPayload.payload, watcher, f);
     assert.match(watcherPayload.payload.instructions, /do not use reply\.command/);
@@ -269,6 +350,63 @@ test('real Monitor payloads carry the shared ACK branch for human, agent complet
     assert.deepEqual(watcherPayload.payload.completion.command.slice(1, 3), [CLI_PATH, 'watcher-consume']);
     assert.equal(watcherPayload.payload.completion.command[2], 'watcher-consume');
     assert.equal(watcherPayload.payload.completion.messageId, watcher.id);
+  } finally {
+    dispose(f);
+  }
+});
+
+test('real direct MCP notification carries the shared ACK branch before per-kind work', async () => {
+  const f = fixture();
+  try {
+    const human = submitHuman(f, '2101', 'Direct human pickup request.');
+    const agent = submitAgentResult(f, '2102');
+    const watcher = await submitWatcherNotice(f, '2103');
+
+    const completionFor = message => {
+      if (message.watcherNotice) return watcherNoticeCompletionCommand(message, f.db, CLI_PATH, f.dir);
+      if (message.agentMessage) return agentCompletionCommand(message, f.db, CLI_PATH, f.dir);
+      return null;
+    };
+    const { received, posted, outcomes } = await captureDirectNotifications(
+      f, [human, agent, watcher], completionFor
+    );
+
+    assert.deepEqual(outcomes.map(outcome => outcome.status), ['submitted', 'submitted', 'submitted']);
+    // Real notifications/claude/channel notifications delivered through the MCP client.
+    assert.equal(received.length, 3);
+    for (const notification of received) assert.equal(notification.method, 'notifications/claude/channel');
+    assert.deepEqual(posted.map(body => body.content), received.map(notification => notification.params.content));
+    assert.deepEqual(received.map(notification => notification.params.meta), posted.map(body => ({
+      messageId: body.messageId, nativeId: body.nativeId, generation: String(body.generation)
+    })));
+
+    const contentFor = messageId => {
+      const notification = received.find(candidate => candidate.params.meta.messageId === messageId);
+      assert.ok(notification, `missing direct notification for ${messageId}`);
+      return notification.params.content;
+    };
+
+    const humanContent = contentFor(human.id);
+    assertDirectEventAcknowledgment(humanContent, human.id, human.generation, 'Use the reply tool with messageId');
+    assert.ok(humanContent.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT) < humanContent.indexOf('Use the reply tool'), 'human work instruction must follow the shared condition');
+    assert.ok(humanContent.includes(`Use the reply tool with messageId "${human.id}" and generation ${human.generation}`));
+
+    const agentContent = contentFor(agent.id);
+    assertDirectEventAcknowledgment(agentContent, agent.id, agent.generation, 'either use the reply tool');
+    assert.ok(agentContent.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT) < agentContent.indexOf('either use the reply tool'), 'agent work instruction must follow the shared condition');
+    assert.ok(agentContent.includes(`or run the exact no-post completion command below`));
+    assert.ok(agentContent.includes(JSON.stringify(completionFor(f.state.getMessage(agent.id)))));
+
+    const watcherContent = contentFor(watcher.id);
+    assertDirectEventAcknowledgment(watcherContent, watcher.id, watcher.generation, 'run the exact consume command below');
+    assert.ok(watcherContent.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT) < watcherContent.indexOf('run the exact consume command below'), 'watcher work instruction must follow the shared condition');
+    assert.ok(watcherContent.includes('Do not use the reply tool or post a Discord reply.'));
+    assert.ok(watcherContent.includes(JSON.stringify(completionFor(f.state.getMessage(watcher.id)))));
+
+    // ACK arguments in the direct content must match the emitted custody identity.
+    assert.ok(humanContent.includes(`messageId "${human.id}" and generation ${human.generation} once`));
+    assert.ok(agentContent.includes(`messageId "${agent.id}" and generation ${agent.generation} once`));
+    assert.ok(watcherContent.includes(`messageId "${watcher.id}" and generation ${watcher.generation} once`));
   } finally {
     dispose(f);
   }
