@@ -2196,7 +2196,7 @@ class DiscordGateway {
           await this.recordBoundary(binding, null, READINESS.UNAVAILABLE,
             nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, deadline),
             watermark?.recovered_through_id, null, signal, deadline, watermark);
-          if (baseReason === 'ordinary-bind') {
+          if (baseReason === 'ordinary-bind' || baseReason === 'endpoint-recovery') {
             this.scheduleDeferredHandoffRecovery(binding.channelId);
           }
           failure ||= { ready: false, state: READINESS.UNAVAILABLE };
