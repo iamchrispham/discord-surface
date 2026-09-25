@@ -2151,8 +2151,14 @@ class DiscordGateway {
     const selectedChannels = channelIds ? new Set(channelIds) : null;
     const bindings = this.state.listBindings().filter(binding => binding.active &&
       (!selectedChannels || selectedChannels.has(binding.channelId)));
+    const hasCoveredReadyWatermark = currentBoundary => currentBoundary?.state === READINESS.READY &&
+      typeof currentBoundary.last_seen_id === 'string' && currentBoundary.last_seen_id.length > 0 &&
+      typeof currentBoundary.recovered_through_id === 'string' && currentBoundary.recovered_through_id.length > 0 &&
+      compareDiscordIds(currentBoundary.recovered_through_id, currentBoundary.last_seen_id) >= 0;
     const classifyReadiness = (currentBinding, currentBoundary) => {
-      if (currentBinding?.readiness === READINESS.READY && currentBoundary?.state === READINESS.READY) return READINESS.READY;
+      if (currentBoundary?.state === READINESS.READY &&
+          (currentBinding?.readiness === READINESS.READY ||
+            (currentBinding?.readiness === READINESS.RECOVERING && hasCoveredReadyWatermark(currentBoundary)))) return READINESS.READY;
       const retryableBoundary = isRetryableIntakeBoundary(currentBoundary) || isInterruptedRetryBoundary(currentBoundary);
       if (currentBinding?.readiness === READINESS.GAP) return READINESS.GAP;
       if (currentBinding?.readiness === READINESS.UNAVAILABLE) return READINESS.UNAVAILABLE;
@@ -2185,7 +2191,12 @@ class DiscordGateway {
       if (Date.now() >= deadline) {
         const watermark = this.state.getIntakeWatermark(binding.channelId);
         const currentState = classifyReadiness(binding, watermark);
-        if (currentState === READINESS.READY) continue;
+        if (currentState === READINESS.READY) {
+          if (binding.readiness === READINESS.RECOVERING) {
+            scheduleRecoveryRetry(binding.channelId, Date.now() + this.recoveryTimeoutMs);
+          }
+          continue;
+        }
         if (isRetryableRecoveryBoundary(watermark) ||
             [READINESS.PENDING, READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark?.state)) {
           if (currentState === READINESS.PENDING || isRetryableRecoveryBoundary(watermark)) {

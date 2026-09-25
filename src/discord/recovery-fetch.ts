@@ -70,12 +70,18 @@ function hasLegacyCursorBounds(boundary: IntakeBoundaryLike): boolean {
     typeof boundary.gap_to === 'string' && boundary.gap_to.length > 0;
 }
 
+function hasLegacyBaselineGap(boundary: IntakeBoundaryLike): boolean {
+  return boundary.recovered_through_id == null && boundary.gap_from == null && boundary.gap_to == null;
+}
+
 export function isRetryableIntakeBoundary(boundary: IntakeBoundaryLike | null | undefined): boolean {
   if (!boundary) return false;
   if (isRetryableFetchBoundary(boundary.state || '', boundary.detail)) return true;
-  return boundary.state === 'gap' && isLegacyDeadlineDetail(boundary.detail) && hasConfirmedLegacyCursor(boundary) &&
-    ((boundary.gap_from == null && boundary.gap_to == null) ||
-      (isBoundedLegacyDeadlineDetail(boundary.detail) && hasLegacyCursorBounds(boundary)));
+  return boundary.state === 'gap' && isLegacyDeadlineDetail(boundary.detail) &&
+    (hasLegacyBaselineGap(boundary) ||
+      (hasConfirmedLegacyCursor(boundary) &&
+        (boundary.gap_from == null && boundary.gap_to == null ||
+          (isBoundedLegacyDeadlineDetail(boundary.detail) && hasLegacyCursorBounds(boundary)))));
 }
 
 export function retryPendingBoundaryDetail(reason: string, boundary: RetryBoundaryLike): string {

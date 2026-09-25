@@ -90,6 +90,43 @@ test('R4b: shared deadline preserves an unvisited ready binding', CASES, async t
   assert.equal(f.state.getBinding('3000').readiness, 'ready');
 });
 
+test('R4c: reconnect deadline preserves a ready watermark after pause', CASES, async t => {
+  const f = fixture(t);
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
+    nativeId: '33333333-3333-3333-3333-333333333333', workspace: f.secret });
+  f.state.setIntakeBaseline('3000', '100', 'fixture');
+  f.state.markIntakeBoundary('3000', 'ready');
+  const baseChannel = f.channels.get('1000');
+  f.channels.set('3000', { ...baseChannel, id: '3000' });
+  f.history.set('1000', [f.message('101', '1000')]);
+  f.history.set('3000', []);
+  const realNow = Date.now;
+  const realIntake = f.gateway.consumer.intakeMessage;
+  let advanced = false;
+  f.gateway.consumer.intakeMessage = async function (...args) {
+    const result = await realIntake.apply(f.gateway.consumer, args);
+    if (!advanced && args[0]?.id === '101') {
+      advanced = true;
+      Date.now = () => realNow() + 120000;
+    }
+    return result;
+  };
+
+  try {
+    f.gateway.pauseConnection('reconnect');
+    const result = await f.gateway.recoverTransport('reconnect');
+    assert.equal(result.ready, false);
+    assert.equal(f.state.getIntakeWatermark('3000').state, 'ready');
+    for (let attempt = 0; attempt < 8 && f.state.getBinding('3000').readiness !== 'ready'; attempt += 1) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(f.state.getBinding('3000').readiness, 'ready');
+  } finally {
+    Date.now = realNow;
+    f.gateway.consumer.intakeMessage = realIntake;
+  }
+});
+
 for (const adopted of [true, false]) {
   test(`R5: ${adopted ? 'adopted' : 'pre-adoption'} child deadline after fetch attempt is retryable`, CASES, async t => {
     const f = fixture(t, { adoptThread: adopted });
@@ -189,6 +226,26 @@ test('R7: old timeout gap with a confirmed cursor retries after database reopen'
   assert.equal(f.state.getMessage('101').state, 'replied');
   assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
   assert.equal(f.dispatched[0].generation, owner.generation);
+});
+
+test('R7a: old timeout gap without a baseline cursor retries after database reopen', CASES, async t => {
+  const f = fixture(t);
+  const owner = f.state.getBinding('1000');
+  f.state.markIntakeBoundary('1000', 'gap', LEGACY_TIMEOUT_DETAIL, null, null, owner);
+  f.state.db.prepare('UPDATE intake_watermarks SET recovered_through_id=NULL, gap_from=NULL, gap_to=NULL WHERE channel_id=?').run('1000');
+  assert.equal(f.state.getIntakeWatermark('1000').recovered_through_id, null);
+  assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, '101', '1000'), { ready: false }).accepted, true);
+  f.history.set('1000', [f.message('101', '1000')]);
+  await f.reopen();
+
+  f.enableDelivery();
+  const result = await f.recover();
+  assert.equal(result.ready, true, JSON.stringify(result));
+  assert.equal(f.boundary('1000').state, 'ready');
+  await f.gateway.reconcilePending(undefined, { readyOnly: true });
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getMessage('101').state, 'replied');
+  assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
 });
 
 for (const reason of ['startup', 'reconnect', 'restart']) {
@@ -309,8 +366,8 @@ const LEGACY_NEGATIVE_CONTROLS = [
   { name: 'page-bound detail', detail: 'history page bound 100 reached', gapFrom: '100', gapTo: '101' },
   { name: 'near-match timeout detail', detail: 'ordinary-bind recovery exceeded 30001ms', gapFrom: null, gapTo: null },
   { name: 'legacy detail with coverage bounds', detail: LEGACY_TIMEOUT_DETAIL, gapFrom: '100', gapTo: '101' },
-  { name: 'legacy detail without a confirmed cursor', detail: LEGACY_TIMEOUT_DETAIL, gapFrom: null, gapTo: null, clearCursor: true },
-  { name: 'native preflight detail without a confirmed cursor', detail: 'Codex native preflight deadline exceeded', gapFrom: null, gapTo: null, clearCursor: true }
+  { name: 'legacy detail without a confirmed cursor', detail: LEGACY_TIMEOUT_DETAIL, gapFrom: '100', gapTo: '101', clearCursor: true },
+  { name: 'native preflight detail without a confirmed cursor', detail: 'Codex native preflight deadline exceeded', gapFrom: '100', gapTo: '101', clearCursor: true }
 ];
 
 for (const control of LEGACY_NEGATIVE_CONTROLS) {
