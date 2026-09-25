@@ -246,7 +246,9 @@ function lockNamespacePath(socketPath: string, key: string): string {
   ];
   for (const candidate of candidates) {
     if (pathsOverlap(socketPath, candidate)) continue;
-    if (!ensureUsableLockNamespaceCandidate(candidate)) continue;
+    if (!ensureUsableLockNamespaceCandidate(candidate)) {
+      throw new Error('Claude channel socket lock namespace conflicts with socket path');
+    }
     return candidate;
   }
   throw new Error('Claude channel socket lock namespace conflicts with socket path');
@@ -419,9 +421,18 @@ function clearOrphanOwnerTemps(lockPath: string): boolean {
     const match = entry.match(/^\.owner-(\d+)-/);
     if (!match) continue;
     const pid = Number(match[1]);
-    const identity = processIdentity(pid);
-    if (isSocketLockOwnerAlive({ pid, identity })) return false;
-    unlinkIfPresent(path.join(lockPath, entry));
+    const ownerPath = path.join(lockPath, entry);
+    let marker: unknown;
+    try {
+      marker = JSON.parse(fs.readFileSync(ownerPath, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!marker || typeof marker !== 'object') continue;
+    const markerRecord = marker as { pid?: unknown; identity?: unknown };
+    if (markerRecord.pid !== pid || typeof markerRecord.identity !== 'string') continue;
+    if (isSocketLockOwnerAlive({ pid, identity: markerRecord.identity })) return false;
+    unlinkIfPresent(ownerPath);
   }
   return true;
 }
@@ -543,6 +554,15 @@ function releaseSocketLock(lockPath: string, ownerPath: string, identity: FileId
 }
 
 function reclaimLegacyLockFile(lockPath: string, expected: FileIdentity): boolean {
+  let current: FileIdentity;
+  try {
+    current = fileIdentity(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  if (!sameFile(current, expected)) return false;
+
   const tombstonePath = `${lockPath}.reclaim-${process.pid}-${randomUUID()}`;
   try {
     fs.renameSync(lockPath, tombstonePath);

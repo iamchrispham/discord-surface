@@ -45,15 +45,25 @@ function isCaseInsensitiveDirectory(directory) {
 }
 
 async function orphan(socket) {
+  const channelModule = path.resolve(__dirname, '../src/claude-channel');
+  const fixturesModule = path.resolve(__dirname, './surface-fixtures');
   const child = spawn(process.execPath, ['-e', `
+    const { ClaudeChannel } = require(process.argv[1]);
+    const { fixture, CLAUDE_ID } = require(process.argv[2]);
+    const socket = process.argv[3];
+    const { dir, state } = fixture();
+    state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+    const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
     setTimeout(() => process.exit(2), 3000);
-    require('node:net').createServer().listen(process.argv[1], () => {
-      process.stdout.write('ready');
-      process.kill(process.pid, 'SIGKILL');
+    channel.start().then(() => process.stdout.write('ready')).catch(error => {
+      process.stderr.write(String(error));
+      process.exit(1);
     });
-  `, socket], { stdio: ['ignore', 'pipe', 'pipe'] });
+  `, channelModule, fixturesModule, socket], { stdio: ['ignore', 'pipe', 'pipe'] });
   const deadline = setTimeout(() => child.kill('SIGKILL'), 4000);
   try {
+    await once(child.stdout, 'data');
+    child.kill('SIGKILL');
     const [code, signal] = await once(child, 'exit');
     assert.equal(code, null);
     assert.equal(signal, 'SIGKILL');
