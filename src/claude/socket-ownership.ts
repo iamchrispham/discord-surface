@@ -59,6 +59,10 @@ function transitionPathForLock(lockPath: string): string {
   return path.join(lockPath, `.transition-${process.pid}`);
 }
 
+function stagingPathForNamespace(namespacePath: string): string {
+  return path.join(namespacePath, `.staging-${process.pid}-${randomUUID()}`);
+}
+
 function ensureDirectoryOwnerOnly(directoryPath: string): void {
   fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
   const directory = fs.statSync(directoryPath);
@@ -146,22 +150,26 @@ function isTransitionAlive(transitionPath: string): boolean {
   if (owner) return isSocketLockOwnerAlive(owner);
   const match = path.basename(transitionPath).match(/^\.transition-(\d+)$/);
   if (!match) return true;
-  return isSocketLockOwnerAlive({ pid: Number(match[1]), identity: ownerIdentity });
+  return isSocketLockOwnerAlive({ pid: Number(match[1]) });
 }
 
-function removeTransition(transitionPath: string): void {
+function removeLockDirectory(directoryPath: string): void {
   try {
-    for (const entry of fs.readdirSync(transitionPath)) {
-      const entryPath = path.join(transitionPath, entry);
+    for (const entry of fs.readdirSync(directoryPath)) {
+      const entryPath = path.join(directoryPath, entry);
       if (fs.lstatSync(entryPath).isFile()) unlinkIfPresent(entryPath);
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
-  try { fs.rmdirSync(transitionPath); } catch (error) {
+  try { fs.rmdirSync(directoryPath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
+}
+
+function removeTransition(transitionPath: string): void {
+  removeLockDirectory(transitionPath);
 }
 
 function clearOrphanOwnerTemps(lockPath: string): boolean {
@@ -179,6 +187,34 @@ function clearOrphanOwnerTemps(lockPath: string): boolean {
     unlinkIfPresent(path.join(lockPath, entry));
   }
   return true;
+}
+
+function clearOrphanStagingDirs(namespacePath: string): void {
+  let entries: string[];
+  try { entries = fs.readdirSync(namespacePath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) {
+    const match = entry.match(/^\.staging-(\d+)-/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const identity = processIdentity(pid);
+    if (isSocketLockOwnerAlive({ pid, identity })) continue;
+    removeLockDirectory(path.join(namespacePath, entry));
+  }
+}
+
+function createStagingLock(namespacePath: string): string {
+  for (;;) {
+    const stagingPath = stagingPathForNamespace(namespacePath);
+    try {
+      fs.mkdirSync(stagingPath, { mode: 0o700 });
+      return stagingPath;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  }
 }
 
 function clearStaleTransitions(lockPath: string, currentPath: string): boolean {
@@ -260,7 +296,9 @@ function publishOwner(lockPath: string): { ownerPath: string; identity: FileIden
 }
 
 function releaseSocketLock(lockPath: string, ownerPath: string, identity: FileIdentity): void {
-  if (!reclaimOwnerFile(lockPath, ownerPath, identity)) return;
+  if (!reclaimOwnerFile(lockPath, ownerPath, identity)) {
+    throw new Error('Claude channel socket preparation lock owner changed before release');
+  }
   try { fs.rmdirSync(lockPath); } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') throw error;
@@ -293,10 +331,14 @@ function reclaimLegacyLockFile(lockPath: string, expected: FileIdentity): boolea
 export function acquireSocketLock(socketPath: string): SocketLockRelease {
   const lockPath = lockPathForSocket(socketPath);
   const ownerPath = ownerPathForLock(lockPath);
+  const namespacePath = path.dirname(lockPath);
   for (;;) {
+    clearOrphanStagingDirs(namespacePath);
+    const stagingPath = createStagingLock(namespacePath);
     try {
-      fs.mkdirSync(lockPath, { mode: 0o700 });
-      const owner = publishOwner(lockPath);
+      const stagedOwner = publishOwner(stagingPath);
+      fs.renameSync(stagingPath, lockPath);
+      const owner = { ownerPath, identity: stagedOwner.identity };
       let released = false;
       return () => {
         if (released) return;
@@ -304,7 +346,9 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
         releaseSocketLock(lockPath, owner.ownerPath, owner.identity);
       };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      removeLockDirectory(stagingPath);
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST' && code !== 'ENOTEMPTY' && code !== 'ENOTDIR') throw error;
       let lockStats: fs.Stats;
       try { lockStats = fs.lstatSync(lockPath); } catch (statError) {
         if ((statError as NodeJS.ErrnoException).code === 'ENOENT') continue;
@@ -368,6 +412,10 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
   if (original.uid !== process.getuid?.()) throw new Error('Claude channel socket belongs to another owner');
   if (signal?.aborted) throw new Error('Claude channel stopped during socket preparation');
   await new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Claude channel stopped during socket preparation'));
+      return;
+    }
     const probe = net.createConnection(socketPath);
     const timer = setTimeout(() => finish(new Error('Claude channel socket probe timed out')), 1000);
     let settled = false;
@@ -400,6 +448,7 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
       }
     }
     signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     probe.once('connect', () => finish(new Error('Claude channel socket already exists; stop its owner first')));
     probe.once('error', (error: Error) => {
       if ((error as NodeJS.ErrnoException).code === 'ECONNREFUSED') finish();

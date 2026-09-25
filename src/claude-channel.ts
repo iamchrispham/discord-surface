@@ -451,14 +451,16 @@ export class ClaudeChannel<
     let rejectStartup: ((error: Error) => void) | null = null;
     let startupCancelled = false;
     let startupPhase: ClaudeStartupPhase = 'socket preparation';
+    const startupController = new AbortController();
     this.startupPhase = startupPhase;
     const startupCancellation = new Promise<never>((_, reject) => {
       rejectStartup = reject;
     });
+    void startupCancellation.catch(() => {});
     const abortStartup = (): void => {
       if (startupCancelled) return;
-      if (startupPhase === 'socket preparation') return;
       startupCancelled = true;
+      startupController.abort();
       rejectStartup?.(new Error(`Claude channel stopped during ${startupPhase}`));
     };
     let releaseSocketLock: (() => void);
@@ -483,10 +485,10 @@ export class ClaudeChannel<
       this.startupPhase = null;
       throw error;
     }
-      this.socketLockRelease = releaseSocketLock;
+    this.socketLockRelease = releaseSocketLock;
     this.startupAbort = abortStartup;
     try {
-      await socketOwnership.prepareSocket(this.socketPath);
+      await socketOwnership.prepareSocket(this.socketPath, startupController.signal);
       if (this.transportClosed) throw new Error('Claude channel stopped during socket preparation');
       if (typeof (this.mcp as unknown as ClaudeRuntimeMcp).connect === 'function') {
         startupPhase = 'MCP connection';
@@ -603,13 +605,12 @@ export class ClaudeChannel<
     this.stopping = true;
     this.transportClosed = true;
     const startup = this.startupPromise;
-    const startupCanBeAborted = this.startupPhase !== 'socket preparation';
-    if (startupCanBeAborted) this.startupAbort?.();
+    this.startupAbort?.();
     this.stopPromise = (async () => {
       this.ready = false;
       const errors: unknown[] = [];
       try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch (error) { errors.push(error); }
-      if (startup && startupCanBeAborted) {
+      if (startup) {
         try { await startup; } catch (error) {
           if (!/^Claude channel stopped during /.test(errorMessage(error))) errors.push(error);
         }
@@ -626,11 +627,9 @@ export class ClaudeChannel<
         }
         this.ownsSocket = false;
       }
-      if (!startup || startupCanBeAborted) {
-        const release = this.socketLockRelease;
-        this.socketLockRelease = null;
-        try { release?.(); } catch (error) { errors.push(error); }
-      }
+      const release = this.socketLockRelease;
+      this.socketLockRelease = null;
+      try { release?.(); } catch (error) { errors.push(error); }
       this.started = false;
       this.stopping = false;
       if (errors.length) throw new AggregateError(errors, 'Claude channel stop failed');

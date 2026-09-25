@@ -107,10 +107,11 @@ test('stop during orphan probe prevents subsequent listener startup', { timeout:
   const socket = socketPath(t);
   await orphan(socket);
   const { EventEmitter } = require('node:events');
-  let probe;
+  const probes = [];
   t.mock.method(net, 'createConnection', () => {
-    probe = new EventEmitter();
+    const probe = new EventEmitter();
     probe.destroy = () => {};
+    probes.push(probe);
     return probe;
   });
   const { dir, state } = fixture();
@@ -120,9 +121,14 @@ test('stop during orphan probe prevents subsequent listener startup', { timeout:
   const starting = channel.start();
   const rejected = assert.rejects(starting, /stopped during socket preparation/);
   await channel.stop();
-  probe.emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
+  probes[0].emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
   await rejected;
   assert.equal(channel.ready, false);
+  const restarting = channel.start();
+  probes[1].emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
+  await restarting;
+  assert.equal(channel.ready, true);
+  await channel.stop();
   assert.equal(fs.existsSync(socket), false);
 });
 
@@ -134,8 +140,11 @@ test('ownerless preparation locks are reclaimed without deleting a replacement o
   const lockPath = path.join(namespace, fs.readdirSync(namespace)[0]);
   fs.unlinkSync(path.join(lockPath, 'owner'));
   const secondRelease = acquireSocketLock(socket);
+  assert.throws(firstRelease, /lock owner changed before release/);
+  assert.equal(fs.existsSync(path.join(lockPath, 'owner')), true);
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
   assert.doesNotThrow(secondRelease);
-  assert.doesNotThrow(firstRelease);
+  assert.equal(fs.existsSync(lockPath), false);
 });
 
 test('endpoint names ending in .lock do not collide with coordination artifacts', t => {
