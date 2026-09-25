@@ -2152,9 +2152,10 @@ class DiscordGateway {
     const bindings = this.state.listBindings().filter(binding => binding.active &&
       (!selectedChannels || selectedChannels.has(binding.channelId)));
     const hasCoveredReadyWatermark = currentBoundary => currentBoundary?.state === READINESS.READY &&
-      typeof currentBoundary.last_seen_id === 'string' && currentBoundary.last_seen_id.length > 0 &&
-      typeof currentBoundary.recovered_through_id === 'string' && currentBoundary.recovered_through_id.length > 0 &&
-      compareDiscordIds(currentBoundary.recovered_through_id, currentBoundary.last_seen_id) >= 0;
+      ((currentBoundary.last_seen_id === null && currentBoundary.recovered_through_id === null) ||
+        (typeof currentBoundary.last_seen_id === 'string' && currentBoundary.last_seen_id.length > 0 &&
+          typeof currentBoundary.recovered_through_id === 'string' && currentBoundary.recovered_through_id.length > 0 &&
+          compareDiscordIds(currentBoundary.recovered_through_id, currentBoundary.last_seen_id) >= 0));
     const classifyReadiness = (currentBinding, currentBoundary) => {
       if (currentBoundary?.state === READINESS.READY &&
           (currentBinding?.readiness === READINESS.READY ||

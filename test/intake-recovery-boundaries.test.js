@@ -90,11 +90,12 @@ test('R4b: shared deadline preserves an unvisited ready binding', CASES, async t
   assert.equal(f.state.getBinding('3000').readiness, 'ready');
 });
 
-test('R4c: reconnect deadline preserves a ready watermark after pause', CASES, async t => {
+for (const [label, empty] of [['R4c', false], ['R4d', true]]) {
+test(`${label}: reconnect deadline preserves ${empty ? 'an empty' : 'a'} ready watermark after pause`, CASES, async t => {
   const f = fixture(t);
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
     nativeId: '33333333-3333-3333-3333-333333333333', workspace: f.secret });
-  f.state.setIntakeBaseline('3000', '100', 'fixture');
+  if (!empty) f.state.setIntakeBaseline('3000', '100', 'fixture');
   f.state.markIntakeBoundary('3000', 'ready');
   const baseChannel = f.channels.get('1000');
   f.channels.set('3000', { ...baseChannel, id: '3000' });
@@ -126,6 +127,7 @@ test('R4c: reconnect deadline preserves a ready watermark after pause', CASES, a
     f.gateway.consumer.intakeMessage = realIntake;
   }
 });
+}
 
 for (const adopted of [true, false]) {
   test(`R5: ${adopted ? 'adopted' : 'pre-adoption'} child deadline after fetch attempt is retryable`, CASES, async t => {
@@ -228,7 +230,7 @@ test('R7: old timeout gap with a confirmed cursor retries after database reopen'
   assert.equal(f.dispatched[0].generation, owner.generation);
 });
 
-test('R7a: old timeout gap without a baseline cursor retries after database reopen', CASES, async t => {
+test('R7a: old timeout gap without a baseline cursor stays held after database reopen', CASES, async t => {
   const f = fixture(t);
   const owner = f.state.getBinding('1000');
   f.state.markIntakeBoundary('1000', 'gap', LEGACY_TIMEOUT_DETAIL, null, null, owner);
@@ -240,12 +242,13 @@ test('R7a: old timeout gap without a baseline cursor retries after database reop
 
   f.enableDelivery();
   const result = await f.recover();
-  assert.equal(result.ready, true, JSON.stringify(result));
-  assert.equal(f.boundary('1000').state, 'ready');
-  await f.gateway.reconcilePending(undefined, { readyOnly: true });
-  await f.gateway.consumer.waitForNativeWork();
-  assert.equal(f.state.getMessage('101').state, 'replied');
-  assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
+  assert.equal(result.ready, false, JSON.stringify(result));
+  assert.equal(result.state, 'gap');
+  assert.equal(f.boundary('1000').state, 'gap');
+  assert.equal(f.boundary('1000').detail, LEGACY_TIMEOUT_DETAIL);
+  assert.equal(f.calls.filter(call => call.kind === 'history' && call.id === '1000').length, 0);
+  assert.equal(f.dispatched.length, 0);
+  assert.equal(f.state.getMessage('101').state, 'accepted');
 });
 
 for (const reason of ['startup', 'reconnect', 'restart']) {
