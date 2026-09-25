@@ -36,10 +36,12 @@ function currentPeerDestination(state, target, expectedBinding = null, expectedC
       child.active && child.parentChannelId === binding.channelId && child.guildId === binding.guildId
     );
     const watermark = state.getIntakeWatermark(binding.channelId);
-    return children.length === 1 && binding.readiness === READINESS.READY &&
-      (!watermark || watermark.state === READINESS.READY) && children[0].state === THREAD_STATES.READY &&
+    const parentRoute = expectedBinding === null && expectedChildId === null && binding.channelId === target.channelId;
+    const childRoute = children.length === 1 && children[0].state === THREAD_STATES.READY &&
       children[0].threadId === target.channelId &&
       (expectedChildId === null || expectedChildId === target.channelId);
+    return binding.readiness === READINESS.READY &&
+      (!watermark || watermark.state === READINESS.READY) && (parentRoute || childRoute);
   });
   return routes.length === 1;
 }

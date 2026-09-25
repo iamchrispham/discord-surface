@@ -130,6 +130,33 @@ test('successful agent send targets the enrolled child and retry keeps one post'
   assert.equal((await peer.result(request.dedupe_key)).results[0].completed, true);
 });
 
+test('peer result preserves current and rejects stale legacy parent destinations', async t => {
+  const f = fixture(t); const target = addRecipient(f);
+  const sourceBinding = f.state.getBinding('101');
+  const request = {
+    id: 'legacy-parent-request', kind: 'request',
+    source: { guildId: '100', channelId: '101', provider: 'claude', nativeId: sourceBinding.nativeId, generation: sourceBinding.generation },
+    target: { guildId: '100', channelId: '201', provider: 'codex', nativeId: target.nativeId, generation: target.generation },
+    replyTo: null, text: 'legacy request'
+  };
+  f.state.receipt(null, 'agent-message', { packet: request });
+  const calls = [];
+  const recipient = createPeerService({ state: f.state, provider: 'codex', token: 'fixture',
+    callerDependencies: { environment: { CODEX_THREAD_ID: target.nativeId } },
+    fetchImpl: async (url, options) => {
+      calls.push({ url, method: options.method });
+      return { ok: true, status: 200, json: async () => options.method === 'GET'
+        ? { id: '101', guild_id: '100' } : { id: '10002' } };
+    } });
+  const result = await recipient.send({ reply_to: request.id, text: 'legacy result', dedupe_key: 'legacy-parent-result' });
+  assert.equal(result.status, 'sent');
+  assert.ok(calls[0].url.endsWith('/channels/101'));
+  assert.ok(calls[1].url.endsWith('/channels/101/messages'));
+  f.state.db.prepare("UPDATE bindings SET generation=generation+1 WHERE channel_id='101'").run();
+  const stale = await recipient.send({ reply_to: request.id, text: 'stale result', dedupe_key: 'legacy-parent-stale' });
+  assert.equal(stale.status, 'stale');
+});
+
 for (const outcome of ['sent', 'unknown']) {
   test(`concurrent peer sends retain one attempt when transport is ${outcome}`, async t => {
     const f = fixture(t); f.enroll('102'); addRecipient(f);
