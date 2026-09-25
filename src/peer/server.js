@@ -10,6 +10,7 @@ const { PEER_PACKET_ID_SCHEMA } = require('./result');
 const packetId = PEER_PACKET_ID_SCHEMA;
 const nonBlankString = { type: 'string', minLength: 1,
   pattern: '[^\\s\\u0000-\\u001F\\u007F-\\u009F]', not: { pattern: '[\\u0000-\\u001F\\u007F-\\u009F]' } };
+const textFile = { ...nonBlankString, maxLength: 4096 };
 const payloadText = { type: 'string', minLength: 1, pattern: '[^\\s]' };
 
 const selector = { oneOf: [
@@ -18,7 +19,7 @@ const selector = { oneOf: [
   { type: 'object', properties: { channelId: nonBlankString }, required: ['channelId'], additionalProperties: false },
   { type: 'object', properties: { channelName: nonBlankString }, required: ['channelName'], additionalProperties: false }
 ] };
-const postInputSchema = { type: 'object', properties: { role: { enum: ['announce', 'board', 'child'] }, text_file: nonBlankString,
+const postInputSchema = { type: 'object', properties: { role: { enum: ['announce', 'board', 'child'] }, text_file: textFile,
   dedupe_key: { ...nonBlankString, maxLength: 256 }, message_id: { ...nonBlankString, maxLength: 128 }, peer: selector, reply_to: packetId },
   required: ['role', 'text_file', 'dedupe_key'], additionalProperties: false, oneOf: [
     { properties: { role: { const: 'announce' } }, required: ['role'],
@@ -39,7 +40,7 @@ const tools = [
   { name: 'peer_list', description: 'List current bindings and whether each has one ready enrolled child.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'peer_send', description: 'Send an authenticated agent request to a current peer, or a result using reply_to. Reuse dedupe_key on retry. Sent is not native pickup or completion.',
-    inputSchema: { type: 'object', properties: { peer: selector, reply_to: packetId, text: payloadText, text_file: nonBlankString, dedupe_key: packetId },
+    inputSchema: { type: 'object', properties: { peer: selector, reply_to: packetId, text: payloadText, text_file: textFile, dedupe_key: packetId },
       required: ['dedupe_key'], additionalProperties: false, allOf: [
         { oneOf: [
           { required: ['text'], not: { required: ['text_file'] } },

@@ -2,7 +2,7 @@ import type { DirectPostBinding } from '../direct-post/contracts';
 import { THREAD_STATES, type ThreadState } from '../state/thread-enrollment';
 import { READINESS, type Readiness } from '../topic';
 
-export type PeerBinding = DirectPostBinding & { readiness: Readiness };
+export type PeerBinding = Omit<DirectPostBinding, 'readiness'> & { readiness: Readiness };
 
 export type PeerSelector = { repoKey: string; provider: 'codex' | 'claude' } |
   { conductorId: string } | { channelId: string } | { channelName: string };
