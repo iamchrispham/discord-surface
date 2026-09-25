@@ -318,6 +318,25 @@ test('R7e: degraded reconciliation drains submitted and reply-ready custody on a
   assert.equal(f.replies.length, 2);
 });
 
+test('R7g: reconnect recovery drains durable custody while every route stays held', CASES, async t => {
+  const f = fixture(t);
+  assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, '101', '1000')).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, MESSAGE_STATES.SUBMITTED);
+  f.fail({ kind: 'history', id: '1000', status: 503 });
+  f.gateway.pauseConnection('reconnect');
+  f.enableDelivery();
+
+  const result = await f.gateway.beginReconnectRecovery('probe');
+  assert.equal(result.ready, false, JSON.stringify(result));
+  assert.equal(f.gateway.ready, false);
+  assert.equal(f.boundary('1000').state, 'unavailable');
+  await f.gateway.consumer.waitForNativeWork();
+
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
+  assert.equal(f.replies.length, 1);
+});
+
 test('R7f: held thread delivery deadline remains retryable', CASES, async t => {
   const f = fixture(t);
   const owner = f.state.getBinding('1000');

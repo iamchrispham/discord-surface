@@ -1481,7 +1481,7 @@ class DiscordGateway {
       if (this.isCurrentLifecycle(lifecycleEpoch) && !this.stopping && connectionEpoch === this.connectionEpoch && result.state !== 'stopped') {
         this.transportReady = true;
         if (result.ready) await this.reconcilePending();
-        else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true });
+        else await this.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
         if (!this.stopping && connectionEpoch === this.connectionEpoch) this.onReady?.();
       }
       return result;
