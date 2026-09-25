@@ -49,7 +49,7 @@ function evidence(observedAt) {
 test('board recovery refuses unqualified or invalid instants without a receipt', t => {
   const { state, target, attemptId } = seededRecovery(t);
   const before = state.listReceipts();
-  for (const observedAt of ['2026-01-01T00:00:01', '2026-02-30T00:00:01Z', '2026-01-01T00:00:01-00:00']) {
+  for (const observedAt of ['2026-01-01T00:00:01', '2026-02-30T00:00:01Z', '2026-01-01T00:00:01-00:00', '2026-01-01T00:00:01-0000']) {
     assert.throws(
       () => state.reconcileBoardRefresh(target, attemptId, BOARD_OUTCOMES.APPLIED, evidence(observedAt)),
       /observedAt must be a timezone-qualified ISO timestamp/
@@ -95,7 +95,7 @@ test('CLI recovery prints the normalized readback and durable receipt time', t =
     '--board-attempt-id', attemptId,
     '--board-resolution', BOARD_OUTCOMES.APPLIED,
     '--board-evidence-scope', 'fixture readback',
-    '--board-readback-at', '2026-01-01T01:00:01+01:00',
+    '--board-readback-at', '2026-01-01T01:00:01+0100',
     '--board-readback', 'new board',
     '--board-sole-writer', 'true',
     '--board-single-attempt', 'true',
