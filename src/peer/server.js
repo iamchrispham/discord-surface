@@ -8,15 +8,17 @@ const { createPeerService } = require('./service');
 const { PEER_PACKET_ID_SCHEMA } = require('./result');
 
 const packetId = PEER_PACKET_ID_SCHEMA;
+const nonBlankString = { type: 'string', minLength: 1,
+  pattern: '[^\\s\\u0000-\\u001F\\u007F-\\u009F]', not: { pattern: '[\\u0000-\\u001F\\u007F-\\u009F]' } };
 
 const selector = { oneOf: [
-  { type: 'object', properties: { repoKey: { type: 'string' }, provider: { enum: ['codex', 'claude'] } }, required: ['repoKey', 'provider'], additionalProperties: false },
-  { type: 'object', properties: { conductorId: { type: 'string' } }, required: ['conductorId'], additionalProperties: false },
-  { type: 'object', properties: { channelId: { type: 'string' } }, required: ['channelId'], additionalProperties: false },
-  { type: 'object', properties: { channelName: { type: 'string' } }, required: ['channelName'], additionalProperties: false }
+  { type: 'object', properties: { repoKey: nonBlankString, provider: { enum: ['codex', 'claude'] } }, required: ['repoKey', 'provider'], additionalProperties: false },
+  { type: 'object', properties: { conductorId: nonBlankString }, required: ['conductorId'], additionalProperties: false },
+  { type: 'object', properties: { channelId: nonBlankString }, required: ['channelId'], additionalProperties: false },
+  { type: 'object', properties: { channelName: nonBlankString }, required: ['channelName'], additionalProperties: false }
 ] };
-const postInputSchema = { type: 'object', properties: { role: { enum: ['announce', 'board', 'child'] }, text_file: { type: 'string' },
-  dedupe_key: { type: 'string' }, message_id: { type: 'string' }, peer: selector, reply_to: packetId },
+const postInputSchema = { type: 'object', properties: { role: { enum: ['announce', 'board', 'child'] }, text_file: nonBlankString,
+  dedupe_key: nonBlankString, message_id: nonBlankString, peer: selector, reply_to: packetId },
   required: ['role', 'text_file', 'dedupe_key'], additionalProperties: false, oneOf: [
     { properties: { role: { const: 'announce' } }, required: ['role'],
       not: { anyOf: [{ required: ['message_id'] }, { required: ['peer'] }, { required: ['reply_to'] }] } },
