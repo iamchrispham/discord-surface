@@ -174,20 +174,7 @@ function canonicalSocketPath(socketPath: string): string {
   const normalizationInsensitive = isNormalizationInsensitiveDirectory(canonicalParentPath);
   const normalizedBasename = normalizationInsensitive ? basename.normalize('NFC') : basename;
   if (!caseInsensitive && !normalizationInsensitive) return path.join(canonicalParentPath, basename);
-  let entries: string[];
-  try {
-    entries = fs.readdirSync(canonicalParentPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return path.join(canonicalParentPath, caseInsensitive ? normalizedBasename.toLowerCase() : normalizedBasename);
-    }
-    throw error;
-  }
   const comparableBasename = caseInsensitive ? normalizedBasename.toLowerCase() : normalizedBasename;
-  const existing = entries.find(entry => {
-    const comparableEntry = normalizationInsensitive ? entry.normalize('NFC') : entry;
-    return (caseInsensitive ? comparableEntry.toLowerCase() : comparableEntry) === comparableBasename;
-  });
   return path.join(canonicalParentPath, comparableBasename);
 }
 
@@ -232,7 +219,11 @@ function lockNamespacePath(socketPath: string, key: string): string {
     lockNamespaceCandidate(temporaryRoot, `${LOCK_NAMESPACE}-fallback-${ownerName}-${key}`)
   ];
   for (const candidate of candidates) {
-    if (!pathsOverlap(socketPath, candidate) && ensureUsableLockNamespaceCandidate(candidate)) return candidate;
+    if (pathsOverlap(socketPath, candidate)) continue;
+    if (!ensureUsableLockNamespaceCandidate(candidate)) {
+      throw new Error('Claude channel socket lock namespace conflicts with socket path');
+    }
+    return candidate;
   }
   throw new Error('Claude channel socket lock namespace conflicts with socket path');
 }
@@ -466,8 +457,8 @@ function claimTransition(lockPath: string): string | null {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (isTransitionAlive(transitionPath)) return null;
-      removeTransition(transitionPath);
+      // Resume this process's deterministic transition after cleanup failed.
+      return transitionPath;
     }
   }
 }
