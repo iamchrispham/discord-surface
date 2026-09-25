@@ -1916,12 +1916,15 @@ async function agentWithdraw(args, dependencies = {}) {
     if (caller.sessionId !== nativeId || caller.threadId !== nativeId) {
       throw new Error('agent withdrawal requires the current Codex caller');
     }
-    await (dependencies.validateCodexSessionIdentity || validateCodexSessionIdentityAsync)(nativeId, undefined);
   } else {
     throw new Error('invalid agent provider');
   }
   const { paths, state } = openState(args);
   try {
+    if (provider === PROVIDERS.CODEX) {
+      const sessionRoot = state.agentWithdrawalRequesterSessionRoot(required(args, 'message-id'), required(args, 'packet-id'));
+      await (dependencies.validateCodexSessionIdentity || validateCodexSessionIdentityAsync)(nativeId, undefined, sessionRoot);
+    }
     const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
     const runtime = gatewayStatus(paths);
     const requiredCapability = GATEWAY_CAPABILITIES.agentHandledWithoutPost;

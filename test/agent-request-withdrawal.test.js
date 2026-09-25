@@ -15,7 +15,7 @@ const token = 'withdrawal-fixture-secret';
 const requester = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111' };
 const recipient = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222' };
 
-function setup(t, { acknowledge = true, kind = KINDS.REQUEST } = {}) {
+function setup(t, { acknowledge = true, kind = KINDS.REQUEST, customSessionRoot = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-withdraw-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   t.after(() => {
@@ -24,7 +24,9 @@ function setup(t, { acknowledge = true, kind = KINDS.REQUEST } = {}) {
   });
   state.setConfig({ operatorId: '900', guildId: '100', secretFile: path.join(dir, 'secret') });
   fs.writeFileSync(path.join(dir, 'secret'), token);
-  const sourceBinding = state.bind({ ...requester, workspace: dir, conductorId: 'withdraw-source', repoKey: 'repo:withdraw-source' });
+  const sourceSessionRoot = customSessionRoot ? path.join(dir, 'codex-sessions') : null;
+  const sourceBinding = state.bind({ ...requester, workspace: dir, sessionRoot: sourceSessionRoot,
+    conductorId: 'withdraw-source', repoKey: 'repo:withdraw-source' });
   const targetBinding = state.bind({ ...recipient, workspace: dir, endpoint: '/tmp/agent-withdraw-target.sock',
     conductorId: 'withdraw-target', repoKey: 'repo:withdraw-target' });
   for (const binding of [sourceBinding, targetBinding]) {
@@ -46,7 +48,7 @@ function setup(t, { acknowledge = true, kind = KINDS.REQUEST } = {}) {
   state.markSubmitted(messageId);
   if (acknowledge) recordNativeAcknowledgment(state, { provider: target.provider, messageId,
     nativeId: target.nativeId, generation: target.generation });
-  return { state, packet, messageId, source, target, dir };
+  return { state, packet, messageId, source, target, dir, sourceSessionRoot };
 }
 
 function withdrawal({ state, messageId, packet, source }) {
@@ -90,6 +92,39 @@ test('a late result cannot reopen withdrawn request custody', t => {
   assert.equal(fixture.state.getMessage('8101'), null);
   assert.equal(fixture.state.listReceipts().filter(row => row.kind === 'agent-message').length,
     before.filter(row => row.kind === 'agent-message').length);
+});
+
+test('withdrawal leaves a sibling child result with the same request id untouched', t => {
+  const fixture = setup(t);
+  const binding = fixture.state.getBinding(recipient.channelId);
+  fixture.state.enrollThread({ threadId: '105', parentChannelId: recipient.channelId, guildId: '100' }, binding);
+  fixture.state.markThreadBoundary('105', THREAD_STATES.READY, 'fixture child ready', null, null, binding);
+  const siblingTarget = { ...fixture.target, channelId: '105' };
+  const siblingRequest = { ...fixture.packet, target: siblingTarget };
+  assert.equal(fixture.state.acceptDiscordMessage({ id: '8102', guildId: '100',
+    channelId: siblingTarget.channelId, authorId: '901', isBot: true,
+    attachments: [], content: encodeAgentMessage(siblingRequest, token) }, { agentToken: token }).accepted, true);
+  const siblingResult = { id: 'sibling-result', kind: KINDS.RESULT, source: siblingTarget,
+    target: fixture.source, replyTo: fixture.packet.id, text: 'Sibling result.' };
+  fixture.state.receipt(null, 'direct-post-attempt', { agentPacket: siblingResult });
+  assert.equal(withdrawal(fixture).withdrawn, true);
+  assert.equal(fixture.state.isAgentResultForWithdrawnRequest(siblingResult), false);
+  assert.equal(fixture.state.getMessage('8102').state, MESSAGE_STATES.ACCEPTED);
+});
+
+test('legacy request custody still recognizes a child result from the same owner', t => {
+  const fixture = setup(t);
+  const row = fixture.state.db.prepare("SELECT id, detail FROM receipts WHERE discord_id=? AND kind='agent-message'")
+    .get(fixture.messageId);
+  const detail = JSON.parse(row.detail);
+  delete detail.routingVersion;
+  fixture.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(JSON.stringify(detail), row.id);
+  const legacyChildResult = { id: 'legacy-child-result', kind: KINDS.RESULT,
+    source: { ...fixture.target, channelId: '105' }, target: fixture.source,
+    replyTo: fixture.packet.id, text: 'Legacy child result.' };
+  fixture.state.receipt(null, 'direct-post-attempt', { agentPacket: legacyChildResult });
+  assert.throws(() => withdrawal(fixture), /reply or result custody/);
+  assert.equal(fixture.state.getMessage(fixture.messageId).state, MESSAGE_STATES.SUBMITTED);
 });
 
 test('a late result cannot create an outbound attempt or call Discord', async t => {
@@ -148,6 +183,27 @@ test('public withdrawal requires the current requester caller', async t => {
       threadId: fixture.source.nativeId }) });
   assert.equal(result.withdrawn, true);
   assert.equal(fixture.state.getMessage(fixture.messageId).state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
+});
+
+test('public withdrawal validates Codex against the request source session root', async t => {
+  const fixture = setup(t, { customSessionRoot: true });
+  const args = { 'state-dir': fixture.dir, db: fixture.state.dbPath,
+    'message-id': fixture.messageId, 'packet-id': fixture.packet.id,
+    provider: fixture.source.provider, 'native-id': fixture.source.nativeId,
+    generation: String(fixture.source.generation) };
+  let validatedRoot;
+  const result = await agentWithdraw(args, {
+    print: () => {}, gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    resolveInvocationIdentity: () => ({ sessionId: fixture.source.nativeId, threadId: fixture.source.nativeId }),
+    validateCodexSessionIdentity: async (nativeId, workspace, root) => {
+      assert.equal(nativeId, fixture.source.nativeId);
+      assert.equal(workspace, undefined);
+      validatedRoot = root;
+      return { sessionId: nativeId };
+    }
+  });
+  assert.equal(validatedRoot, fixture.sourceSessionRoot);
+  assert.equal(result.withdrawn, true);
 });
 
 test('withdrawal refuses the wrong requester, packet, generation and kind', t => {

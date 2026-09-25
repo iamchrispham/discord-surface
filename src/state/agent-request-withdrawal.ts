@@ -1,11 +1,12 @@
 import { KINDS, sameAddress, validateAgentMessage, type AgentAddress, type AgentMessage } from '../agent-message';
 import type { CompletionState, CompletionMessage, ErrorConstructor } from './agent-completion/contracts';
 import { NATIVE_REPLY_FILE_PHASES } from './native-reply-file';
+import { AGENT_ROUTING_VERSION } from './agent-routing';
 
 export const AGENT_WITHDRAWAL_RECEIPTS = Object.freeze({ REQUEST_WITHDRAWN: 'agent-request-withdrawn' } as const);
 
 interface WithdrawalState extends CompletionState {
-  getMessageRoute(channelId: string): { binding: AgentAddress & { active: boolean }; deliveryChannelId: string } | null;
+  getMessageRoute(channelId: string): { binding: AgentAddress & { active: boolean; sessionRoot?: string | null }; deliveryChannelId: string } | null;
 }
 
 interface WithdrawalInput {
@@ -41,9 +42,19 @@ function sameOwner(left: AgentAddress, right: unknown): boolean {
   return sameAddress({ ...left, channelId: (right as AgentAddress).channelId }, right);
 }
 
-function reverseResult(packet: AgentMessage, request: AgentMessage): boolean {
+function sourceRouteMatches(route: ReturnType<WithdrawalState['getMessageRoute']>, source: AgentAddress): boolean {
+  return Boolean(route?.binding.active && route.deliveryChannelId === source.channelId &&
+    sameAddress({ guildId: route.binding.guildId, channelId: route.deliveryChannelId,
+      provider: route.binding.provider, nativeId: route.binding.nativeId, generation: route.binding.generation }, source));
+}
+
+function resultSourceMatches(source: AgentAddress, target: AgentAddress, routingVersion: unknown): boolean {
+  return routingVersion === AGENT_ROUTING_VERSION ? sameAddress(source, target) : sameOwner(source, target);
+}
+
+function reverseResult(packet: AgentMessage, request: AgentMessage, routingVersion: unknown): boolean {
   return packet.kind === KINDS.RESULT && packet.replyTo === request.id &&
-    sameOwner(packet.source, request.target) && sameAddress(packet.target, request.source);
+    resultSourceMatches(packet.source, request.target, routingVersion) && sameAddress(packet.target, request.source);
 }
 
 function withdrawnRequestForResult(state: WithdrawalState, packet: AgentMessage,
@@ -56,12 +67,13 @@ function withdrawnRequestForResult(state: WithdrawalState, packet: AgentMessage,
     const detail = parseJson(row.detail, null);
     const source = detail?.source;
     const target = detail?.target;
-    if (source && target && sameOwner(packet.source, target) && sameAddress(packet.target, source)) return detail;
+    if (source && target && resultSourceMatches(packet.source, target as AgentAddress, detail.routingVersion) &&
+        sameAddress(packet.target, source)) return detail;
   }
   return null;
 }
 
-function resultCustody(state: WithdrawalState, request: AgentMessage,
+function resultCustody(state: WithdrawalState, request: AgentMessage, routingVersion: unknown,
   parseJson: WithdrawalDependencies['parseJson']): boolean {
   const rows = state.db.prepare(`SELECT kind, detail FROM receipts
     WHERE kind IN ('agent-message', 'direct-post-attempt', 'direct-post-outcome')
@@ -72,7 +84,7 @@ function resultCustody(state: WithdrawalState, request: AgentMessage,
   for (const row of rows) {
     const detail = parseJson(row.detail, null);
     for (const candidate of [detail?.packet, detail?.agentPacket, detail?.legacyAgentPacket]) {
-      if (validPacket(candidate, KINDS.RESULT) && reverseResult(candidate, request)) return true;
+      if (validPacket(candidate, KINDS.RESULT) && reverseResult(candidate, request, routingVersion)) return true;
     }
   }
   return false;
@@ -86,6 +98,16 @@ function replyCustody(state: WithdrawalState, message: CompletionMessage): boole
 }
 
 export function createAgentRequestWithdrawalHandlers(deps: WithdrawalDependencies) {
+  function requesterSessionRoot(state: WithdrawalState, messageId: string, packetId: string): string | undefined {
+    const rows = state.db.prepare("SELECT detail FROM receipts WHERE discord_id=? AND kind='agent-message' ORDER BY id")
+      .all(messageId);
+    if (rows.length !== 1) return undefined;
+    const packet = deps.parseJson(rows[0].detail, null)?.packet;
+    if (!validPacket(packet, KINDS.REQUEST) || packet.id !== packetId) return undefined;
+    const route = state.getMessageRoute(packet.source.channelId);
+    return sourceRouteMatches(route, packet.source) ? route?.binding.sessionRoot || undefined : undefined;
+  }
+
   function isAgentResultForWithdrawnRequest(state: WithdrawalState, packet: AgentMessage): boolean {
     return withdrawnRequestForResult(state, packet, deps.parseJson) !== null;
   }
@@ -110,7 +132,7 @@ export function createAgentRequestWithdrawalHandlers(deps: WithdrawalDependencie
     }
     return state.transaction(() => {
       const message = state.getMessage(messageId);
-      if (!message) throw new deps.BindingError('agent request is unknown');
+      if (!message) throw new deps.BindingError('agent request is unknown in this state database');
       const provenance = state.db.prepare(`SELECT id, detail FROM receipts
         WHERE discord_id=? AND kind='agent-message' ORDER BY id`).all(messageId);
       if (provenance.length !== 1) throw new deps.AuthorizationError('authenticated agent request provenance is missing or ambiguous');
@@ -129,9 +151,7 @@ export function createAgentRequestWithdrawalHandlers(deps: WithdrawalDependencie
       };
       if (!sameAddress(packet.target, target)) throw new deps.StateCorruptError('agent request target differs from accepted custody');
       const route = state.getMessageRoute(packet.source.channelId);
-      if (!route || !route.binding.active || route.deliveryChannelId !== packet.source.channelId ||
-          !sameAddress({ guildId: route.binding.guildId, channelId: route.deliveryChannelId,
-            provider: route.binding.provider, nativeId: route.binding.nativeId, generation: route.binding.generation }, packet.source) ||
+      if (!sourceRouteMatches(route, packet.source) ||
           input.provider !== packet.source.provider || input.nativeId !== packet.source.nativeId ||
           input.generation !== packet.source.generation) {
         throw new deps.StaleGenerationError('agent request requester is no longer current');
@@ -151,13 +171,15 @@ export function createAgentRequestWithdrawalHandlers(deps: WithdrawalDependencie
         throw new deps.BindingError(`agent request withdrawal requires submitted state, got ${message.state}`);
       }
       if (!state.hasNativeAcknowledgment(message)) throw new deps.BindingError('agent request withdrawal requires native acknowledgment');
-      if (replyCustody(state, message) || resultCustody(state, packet, deps.parseJson)) {
+      const routingVersion = original?.routingVersion === AGENT_ROUTING_VERSION ? AGENT_ROUTING_VERSION : null;
+      if (replyCustody(state, message) || resultCustody(state, packet, routingVersion, deps.parseJson)) {
         throw new deps.BindingError('agent request has reply or result custody');
       }
       const result = state.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
         .run(deps.MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST, deps.now(), messageId, deps.MESSAGE_STATES.SUBMITTED);
       if (Number(result.changes) !== 1) throw new deps.StateCorruptError('agent request changed concurrently');
       const detail = { packetId: packet.id, source: packet.source, target: packet.target,
+        routingVersion,
         requester: { provider: input.provider, nativeId: input.nativeId, generation: input.generation },
         provenanceReceiptId: provenance[0]?.id };
       state.receipt(messageId, AGENT_WITHDRAWAL_RECEIPTS.REQUEST_WITHDRAWN, detail);
@@ -166,5 +188,5 @@ export function createAgentRequestWithdrawalHandlers(deps: WithdrawalDependencie
     });
   }
 
-  return { isAgentRequestWithdrawn, isAgentResultForWithdrawnRequest, withdrawAgentRequest };
+  return { isAgentRequestWithdrawn, isAgentResultForWithdrawnRequest, requesterSessionRoot, withdrawAgentRequest };
 }

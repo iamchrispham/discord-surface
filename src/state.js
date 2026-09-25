@@ -1876,6 +1876,10 @@ class SurfaceState {
     return agentRequestWithdrawalHandlers.withdrawAgentRequest(this, args);
   }
 
+  agentWithdrawalRequesterSessionRoot(messageId, packetId) {
+    return agentRequestWithdrawalHandlers.requesterSessionRoot(this, messageId, packetId);
+  }
+
   isAgentResultForWithdrawnRequest(packet) {
     return agentRequestWithdrawalHandlers.isAgentResultForWithdrawnRequest(this, packet);
   }
