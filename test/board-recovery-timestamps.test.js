@@ -49,7 +49,7 @@ function evidence(observedAt) {
 test('board recovery refuses unqualified or invalid instants without a receipt', t => {
   const { state, target, attemptId } = seededRecovery(t);
   const before = state.listReceipts();
-  for (const observedAt of ['2026-01-01T00:00:01', '2026-02-30T00:00:01Z', '2026-02-30t00:00:01z', '2026-02-30T00:01Z', '2026-02-30T24:00Z', '2026-01-01T24:01Z', '2026-01-01T24:00:00.001Z', '2026-01-01T00:00:01-00:00', '2026-01-01T00:00:01-0000']) {
+  for (const observedAt of ['2026-01-01T00:00:01', '2026-02-30T00:00:01Z', '2026-02-30t00:00:01z', '2026-02-30T00:01Z', '2026-02-30T24:00Z', '2026-01-01T24:01Z', '2026-01-01T24:00:00.001Z', '2026-01-01T24:00:00.0000000001Z', '2026-01-01T00:00:01-00:00', '2026-01-01T00:00:01-0000']) {
     assert.throws(
       () => state.reconcileBoardRefresh(target, attemptId, BOARD_OUTCOMES.APPLIED, evidence(observedAt)),
       /observedAt must be a timezone-qualified ISO timestamp/
@@ -100,6 +100,19 @@ test('board recovery accepts lowercase time and UTC designators', t => {
     ['2026-01-01t00:00:01z', '2026-01-01T00:00:01.000Z'],
     ['2026-01-01t01:00:01+01:00', '2026-01-01T00:00:01.000Z'],
     ['2026-01-01t24:00z', '2026-01-02T00:00:00.000Z']
+  ]) {
+    const { state, target, attemptId } = seededRecovery(t);
+    const result = state.reconcileBoardRefresh(target, attemptId, BOARD_OUTCOMES.APPLIED, evidence(observedAt));
+    assert.equal(result.readbackAt, expected);
+    assert.equal(JSON.parse(state.listReceipts().at(-1).detail).readbackAt, expected);
+  }
+});
+
+test('board recovery accepts fractional seconds beyond nanosecond precision', t => {
+  for (const [observedAt, expected] of [
+    ['2026-01-01T00:00:01.1234567890Z', '2026-01-01T00:00:01.123Z'],
+    ['2026-01-01T01:00:01.1234567890+01:00', '2026-01-01T00:00:01.123Z'],
+    ['2026-01-01T24:00:00.0000000000Z', '2026-01-02T00:00:00.000Z']
   ]) {
     const { state, target, attemptId } = seededRecovery(t);
     const result = state.reconcileBoardRefresh(target, attemptId, BOARD_OUTCOMES.APPLIED, evidence(observedAt));

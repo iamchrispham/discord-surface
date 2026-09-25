@@ -112,7 +112,7 @@ function operationEndedAt(value: unknown): string {
 
 function readbackInstant(value: unknown): string {
   const input = text(value, 'observedAt', 64).replace('t', 'T').replace(/z$/, 'Z');
-  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|([+-])(\d{2}):?(\d{2}))$/.exec(input);
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|([+-])(\d{2}):?(\d{2}))$/.exec(input);
   if (!match || /-00:?00$/.test(input)) throw new Error('observedAt must be a timezone-qualified ISO timestamp');
   const hours = Number(match[5] || 0);
   const minutes = Number(match[6] || 0);
@@ -123,7 +123,7 @@ function readbackInstant(value: unknown): string {
   }
   const localInstant = instant + offsetMinutes * 60_000;
   const localTime = new Date(localInstant).toISOString().slice(0, 19);
-  const endOfDay = /T24:00(?::00(?:\.0{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/.test(input) &&
+  const endOfDay = /T24:00(?::00(?:\.0+)?)?(?:Z|[+-]\d{2}:?\d{2})$/.test(input) &&
     new Date(localInstant - 86_400_000).toISOString().slice(0, 19) === `${match[1].slice(0, 10)}T00:00:00`;
   if (localTime !== `${match[1]}:${match[2] || '00'}` && !endOfDay) {
     throw new Error('observedAt must be a timezone-qualified ISO timestamp');
