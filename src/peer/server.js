@@ -5,8 +5,9 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { ListToolsRequestSchema, CallToolRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const { readSecret } = require('../discord');
 const { createPeerService } = require('./service');
+const { PEER_PACKET_ID_SCHEMA } = require('./result');
 
-const packetId = { type: 'string', minLength: 1, maxLength: 128, pattern: '^[a-zA-Z0-9_-]{1,128}$' };
+const packetId = PEER_PACKET_ID_SCHEMA;
 
 const selector = { oneOf: [
   { type: 'object', properties: { repoKey: { type: 'string' }, provider: { enum: ['codex', 'claude'] } }, required: ['repoKey', 'provider'], additionalProperties: false },

@@ -3,6 +3,12 @@
 const { KINDS, sameAddress, validateAgentMessage } = require('../agent-message');
 const { DIRECT_POST_OUTCOME, AGENT_COMPLETION_RECEIPTS, MESSAGE_STATES } = require('../state');
 const PACKET_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
+const PEER_PACKET_ID_SCHEMA = Object.freeze({
+  type: 'string',
+  minLength: 1,
+  maxLength: 128,
+  pattern: PACKET_ID_PATTERN.source
+});
 
 function validPeerId(value) {
   return typeof value === 'string' && PACKET_ID_PATTERN.test(value);
@@ -65,4 +71,4 @@ function inspectPeerResult(state, source, correlationId) {
     deliveries, results };
 }
 
-module.exports = { inspectPeerResult, validPeerId };
+module.exports = { inspectPeerResult, validPeerId, PEER_PACKET_ID_SCHEMA };

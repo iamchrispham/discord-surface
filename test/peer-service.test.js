@@ -38,6 +38,13 @@ test('missing caller refuses listing and sends before network or custody', async
   assert.equal(f.state.listReceipts().length, before);
 });
 
+test('peer caller lookup tolerates native UUID casing from CLI bindings', async t => {
+  const f = fixture(t);
+  f.state.db.prepare("UPDATE bindings SET native_id=upper(native_id) WHERE channel_id='101'").run();
+  f.enroll('102');
+  assert.deepEqual(await service(f).list(), []);
+});
+
 test('peer list omits the caller even when its child is ready', async t => {
   const f = fixture(t); const peer = service(f);
   assert.deepEqual(await peer.list(), []);
@@ -292,6 +299,38 @@ test('peer send refuses publication after source intake gap during channel verif
   const peer = service(f, { fetchImpl: async (url, options) => {
     if (options.method === 'GET') {
       f.state.db.prepare("UPDATE intake_watermarks SET state='gap' WHERE channel_id='101'").run();
+      return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    }
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  const result = await peer.send({ ...request, peer: { conductorId: 'recipient' } });
+  assert.equal(result.status, 'stale');
+  assert.equal(posts, 0);
+  assert.equal(f.state.directPostRows(request.dedupe_key).filter(row => row.kind === 'direct-post-attempt').length, 0);
+});
+
+test('peer send refuses publication after source watermark changes during channel verification', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f); let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      f.state.upsertIntakeWatermark({ channelId: '101', guildId: '100', id: '1' }, true);
+      return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    }
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  const result = await peer.send({ ...request, peer: { conductorId: 'recipient' } });
+  assert.equal(result.status, 'stale');
+  assert.equal(posts, 0);
+  assert.equal(f.state.directPostRows(request.dedupe_key).filter(row => row.kind === 'direct-post-attempt').length, 0);
+});
+
+test('peer send refuses publication after destination child loses readiness during channel verification', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f); let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      f.state.db.prepare("UPDATE thread_enrollments SET state='pending' WHERE thread_id='202'").run();
       return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
     }
     posts += 1;

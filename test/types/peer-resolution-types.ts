@@ -4,6 +4,8 @@ import {
   type PeerBinding,
   type PeerSelector
 } from '../../src/peer/resolution';
+import type { ThreadState } from '../../src/state/thread-enrollment';
+import type { Readiness } from '../../src/topic';
 
 const binding: PeerBinding = {
   active: true,
@@ -38,6 +40,12 @@ const state: Parameters<typeof resolvePeerBinding>[0] = {
   getIntakeWatermark: () => ({ state: 'ready' })
 };
 
+// @ts-expect-error thread enrollment states use the existing finite vocabulary
+const invalidThreadState: ThreadState = 'online';
+
+// @ts-expect-error intake watermark states use the existing Readiness vocabulary
+const invalidWatermarkState: Readiness = 'online';
+
 const resolved: PeerBinding = resolvePeerBinding(state, selector);
 const ready = requireReadyPeer(state, resolved);
 const childId: string = ready.childId;
@@ -47,4 +55,6 @@ void byChannelId;
 void byChannel;
 void invalidSelector;
 void invalidBinding;
+void invalidThreadState;
+void invalidWatermarkState;
 void childId;

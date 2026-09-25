@@ -108,11 +108,12 @@ function createPeerService(context) {
       if (input.text_file !== undefined && (typeof input.text_file !== 'string' || !input.text_file.trim())) throw new Error('text_file must be non-empty');
       const channels = input.peer?.channelName ? await loadChannels(signal) : [];
       const source = await caller();
-      if (source.channelId !== initial.channelId || source.nativeId !== initial.nativeId || source.generation !== initial.generation) {
+      if (source.channelId !== initial.channelId || canonicalNativeId(source.nativeId) !== canonicalNativeId(initial.nativeId) || source.generation !== initial.generation) {
         throw new Error('peer caller changed during resolution');
       }
       const sourceRoute = requireReadyPeer(state, source);
       const sourceReadiness = source.readiness;
+      const sourceIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
       const sourceAddress = resolveAgentAddress(state, source, sourceRoute.childId);
       let agentTarget = null;
       let destination = null;
@@ -138,7 +139,8 @@ function createPeerService(context) {
           agentReplyTo: input.reply_to ?? null, agentPresentation: 'attachment-v1',
           agentDestinationCurrent: target => {
             const currentSource = state.getBinding(source.channelId);
-            if (!currentSource || currentSource.readiness !== sourceReadiness) return false;
+            const currentIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
+            if (!currentSource || currentSource.readiness !== sourceReadiness || currentIntakeState !== sourceIntakeState) return false;
             requireReadyPeer(state, currentSource);
             return currentPeerDestination(state, target, destination?.binding || null, destination?.childId || null);
           },
