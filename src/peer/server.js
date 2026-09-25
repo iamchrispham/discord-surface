@@ -11,6 +11,7 @@ const packetId = { type: 'string', minLength: 1, maxLength: 128, pattern: '^[a-z
 const selector = { oneOf: [
   { type: 'object', properties: { repoKey: { type: 'string' }, provider: { enum: ['codex', 'claude'] } }, required: ['repoKey', 'provider'], additionalProperties: false },
   { type: 'object', properties: { conductorId: { type: 'string' } }, required: ['conductorId'], additionalProperties: false },
+  { type: 'object', properties: { channelId: { type: 'string' } }, required: ['channelId'], additionalProperties: false },
   { type: 'object', properties: { channelName: { type: 'string' } }, required: ['channelName'], additionalProperties: false }
 ] };
 const tools = [

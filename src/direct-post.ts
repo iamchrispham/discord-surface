@@ -119,7 +119,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
     agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
     agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null,
-    agentDestinationCurrent = null } =
+    agentDestinationCurrent = null, bindingCurrent = null } =
     input as DirectPostInput & { agentThreadId?: string | null };
   const binding = watcherNotice
     ? watcherNotice.binding
@@ -307,6 +307,12 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       return false;
     }
   };
+  const currentReady = () => {
+    if (!currentBinding()) return false;
+    if (typeof bindingCurrent !== 'function') return true;
+    try { return bindingCurrent(); }
+    catch { return false; }
+  };
   const currentDestination = () => {
     if (deliveryTarget === null || typeof agentDestinationCurrent !== 'function') return true;
     try { return agentDestinationCurrent(deliveryTarget); }
@@ -360,6 +366,10 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       }
     }
     let claim;
+    if (deliveryTarget === null && !currentReady()) {
+      parts.push({ index: partIndex, status: 'stale', messageId: null });
+      break;
+    }
     try { claim = state.beginDirectPostPart(meta); }
     catch (error) {
       if (!(error instanceof StaleGenerationError)) throw error;
@@ -377,13 +387,13 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       continue;
     }
     claimedAny = true;
-    if (!currentBinding() || !currentDestination()) {
+    if (!currentReady() || !currentDestination()) {
       const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before network' });
       parts.push({ index: partIndex, status: stale.outcome });
       break;
     }
     try {
-      if (!currentBinding() || !currentDestination()) {
+      if (!currentReady() || !currentDestination()) {
         const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before send' });
         parts.push({ index: partIndex, status: stale.outcome });
         break;

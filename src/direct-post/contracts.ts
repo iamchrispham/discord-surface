@@ -211,6 +211,7 @@ export interface DirectPostInputBase {
   fetchImpl?: FetchImplementation;
   timeoutMs?: number;
   ordinary?: boolean;
+  bindingCurrent?: (() => boolean) | null;
   agentDestinationCurrent?: ((target: AgentAddress) => boolean) | null;
   watcherNotice?: { packet: WatcherNotice; binding: DirectPostBinding } | null;
 }

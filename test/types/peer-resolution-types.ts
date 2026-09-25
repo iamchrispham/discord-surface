@@ -19,6 +19,7 @@ const binding: PeerBinding = {
 
 const selector: PeerSelector = { repoKey: 'repo', provider: 'codex' };
 const byConductor: PeerSelector = { conductorId: 'conductor' };
+const byChannelId: PeerSelector = { channelId: 'channel' };
 const byChannel: PeerSelector = { channelName: 'peer' };
 
 // @ts-expect-error peer providers are finite
@@ -42,6 +43,7 @@ const ready = requireReadyPeer(state, resolved);
 const childId: string = ready.childId;
 
 void byConductor;
+void byChannelId;
 void byChannel;
 void invalidSelector;
 void invalidBinding;

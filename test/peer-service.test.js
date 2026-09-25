@@ -20,6 +20,14 @@ function addRecipient(f) {
   f.state.markThreadBoundary('202', 'ready', 'fixture', null, null, target);
   return target;
 }
+function addOrdinaryRecipient(f) {
+  f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: '33333333-3333-3333-3333-333333333333',
+    workspace: '/tmp' });
+  const target = f.state.setBindingReadiness('301', READINESS.READY, 'fixture', f.state.getBinding('301'));
+  f.state.enrollThread({ threadId: '302', parentChannelId: '301', guildId: '100' }, target);
+  f.state.markThreadBoundary('302', 'ready', 'fixture', null, null, target);
+  return target;
+}
 const request = { peer: { conductorId: 'test-conductor' }, text: 'hello', dedupe_key: 'fixture-request' };
 
 test('missing caller refuses listing and sends before network or custody', async t => {
@@ -40,6 +48,27 @@ test('peer list omits the caller even when its child is ready', async t => {
   const before = f.state.listReceipts().length;
   await assert.rejects(peer.send(request), /not ready/);
   assert.equal(f.state.listReceipts().length, before);
+});
+
+test('peer list returns a channel ID selector for ordinary peers', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addOrdinaryRecipient(f);
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '302', guild_id: '100' }) };
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  const listed = await peer.list();
+  assert.deepEqual(listed.find(entry => entry.channelId === target.channelId), {
+    repoKey: null,
+    provider: 'codex',
+    conductorId: null,
+    channelId: target.channelId,
+    generation: target.generation,
+    readiness: READINESS.READY,
+    childId: '302',
+    reachable: true,
+    reason: null
+  });
+  assert.equal((await peer.send({ peer: { channelId: target.channelId }, text: 'hello', dedupe_key: 'ordinary-channel' })).status, 'sent');
 });
 
 test('handoff during name lookup refuses before network send or custody', async t => {

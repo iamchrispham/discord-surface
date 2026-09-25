@@ -5,7 +5,7 @@ import { READINESS, type Readiness } from '../topic';
 export type PeerBinding = DirectPostBinding & { readiness: Readiness };
 
 export type PeerSelector = { repoKey: string; provider: 'codex' | 'claude' } |
-  { conductorId: string } | { channelName: string };
+  { conductorId: string } | { channelId: string } | { channelName: string };
 export interface PeerChannel { id: string; guildId: string; name: string }
 interface Enrollment { threadId: string; parentChannelId: string; guildId: string; active: boolean; state: ThreadState; detail?: string | null }
 interface PeerState {
@@ -20,10 +20,10 @@ function selectorValues(selector: PeerSelector): [string, string][] {
   if (!selector || typeof selector !== 'object' || Array.isArray(selector)) throw new Error('peer selector must be an object');
   const entries = Object.entries(selector);
   const keys = entries.map(([key]) => key).sort().join(',');
-  if (!['provider,repoKey', 'conductorId', 'channelName'].includes(keys) ||
+  if (!['provider,repoKey', 'conductorId', 'channelId', 'channelName'].includes(keys) ||
       entries.some(([, value]) => typeof value !== 'string' || !value.trim() || /[\u0000-\u001f\u007f]/.test(value)) ||
       ('provider' in selector && !['codex', 'claude'].includes(selector.provider))) {
-    throw new Error('peer selector requires exactly repoKey and provider, conductorId, or channelName');
+    throw new Error('peer selector requires exactly repoKey and provider, conductorId, channelId, or channelName');
   }
   return entries;
 }
@@ -39,6 +39,8 @@ export function resolvePeerBinding(state: PeerState, selector: PeerSelector, cha
     candidates = bindings.filter(binding => binding.channelId === matches[0].id);
   } else if ('conductorId' in selector) {
     candidates = bindings.filter(binding => binding.conductorId === selector.conductorId);
+  } else if ('channelId' in selector) {
+    candidates = bindings.filter(binding => binding.channelId === selector.channelId);
   } else {
     candidates = bindings.filter(binding => binding.repoKey === selector.repoKey && binding.provider === selector.provider);
   }
