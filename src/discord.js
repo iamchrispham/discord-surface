@@ -2399,7 +2399,7 @@ class DiscordGateway {
           const heldState = kind === CODEX_VALIDATION_KINDS.DEADLINE && !nativeDeadline ? READINESS.GAP : READINESS.UNAVAILABLE;
           const recorded = await recordOwnedBoundary(binding, channel, heldState, detail, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
           if (recorded?.watermark) ownedBoundary = recorded.watermark;
-          if (nativeDeadline && (baseReason === 'ordinary-bind' || baseReason === 'live-attachment-gap')) {
+          if (nativeDeadline) {
             this.scheduleDeferredHandoffRecovery(binding.channelId);
           }
           if (!recorded?.concurrentReady) failure ||= { ready: false, state: heldState, error };

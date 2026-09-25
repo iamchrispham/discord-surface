@@ -138,3 +138,54 @@ test('scheduled native proof deadline requeues until proof succeeds', { timeout:
   }
   assert.equal(preflights, 3);
 });
+
+test('Claude endpoint recovery schedules a Codex native proof retry', { timeout: 5000 }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-claude-retry-'));
+  const root = path.join(dir, 'sessions');
+  const db = path.join(dir, 'surface.sqlite');
+  const secret = path.join(dir, 'discord.env');
+  const nativeId = '44444444-4444-4444-8444-444444444444';
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, `${nativeId}.jsonl`), JSON.stringify({
+    type: 'session_meta', payload: { id: nativeId, cwd: dir }
+  }) + '\n');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  const state = new SurfaceState(db);
+  state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: secret });
+  state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
+    { sessionId: nativeId, threadId: nativeId });
+  state.setIntakeBaseline('1000', '100', 'fixture baseline');
+  let failPreflights = false;
+  const channel = { id: '1000', guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) };
+  const gateway = new DiscordGateway({
+    state,
+    client: {
+      user: { id: 'bot' },
+      channels: { fetch: async () => channel },
+      application: { commands: { async fetch() { return []; }, async create() {} } },
+      async login() {}, on() {}, off() {}, async destroy() {}
+    },
+    fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { throw new Error('Claude retry fixture must not dispatch'); } } },
+    recoveryOptions: {
+      codexSessionRoot: root,
+      ordinaryNativePreflight: async (binding, options) => {
+        const deadline = failPreflights ? Date.now() - 1 : Date.now() + 1000;
+        return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, { ...options, deadline });
+      }
+    }
+  });
+  t.after(async () => {
+    await gateway.stop();
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await gateway.start(secret);
+  failPreflights = true;
+  gateway.deferredHandoffRecoveryDelayMs = 60_000;
+  const result = await gateway.recoverTransport('Claude endpoint unavailable');
+
+  assert.equal(result.state, 'unavailable');
+  assert.equal(gateway.deferredHandoffRecoveryChannels.has('1000'), true);
+});
