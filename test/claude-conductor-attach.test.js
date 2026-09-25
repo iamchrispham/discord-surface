@@ -125,6 +125,8 @@ class FixtureClaudeProvider {
 }
 require.cache[require.resolve(nativePath)].exports = { ...native, ClaudeProvider: FixtureClaudeProvider };
 setInterval(() => {}, 1000);
+const deadline = setTimeout(() => process.exit(124), 20000);
+deadline.unref();
 `.replaceAll('__ARCHIVE__', JSON.stringify(archiveRoot))
     .replaceAll('__CHANNEL__', JSON.stringify(f.binding.channelId))
     .replaceAll('__MESSAGE_ID__', JSON.stringify(messageId))
@@ -157,7 +159,11 @@ setInterval(() => {}, 1000);
 }
 
 function spawnListener(t, f, command) {
+  const deadlineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cca-deadline-'));
+  const deadlinePreloadPath = path.join(deadlineDir, 'preload.cjs');
+  fs.writeFileSync(deadlinePreloadPath, 'const deadline = setTimeout(() => process.exit(124), 20000);\ndeadline.unref();\n', { mode: 0o600 });
   const child = spawn(process.execPath, [CLI_PATH, command, '--state-dir', f.dir, '--db', f.db, '--native-id', CLAUDE, '--socket', f.socketPath], {
+    env: { ...process.env, NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${deadlinePreloadPath}`].filter(Boolean).join(' ') },
     stdio: ['pipe', 'pipe', 'pipe']
   });
   let stdout = '';
@@ -176,6 +182,7 @@ function spawnListener(t, f, command) {
     clearTimeout(deadline);
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     await closed;
+    fs.rmSync(deadlineDir, { recursive: true, force: true });
   });
   return { child, stdout: () => stdout, stderr: () => stderr, async terminate() {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
