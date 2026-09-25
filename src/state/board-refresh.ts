@@ -112,20 +112,25 @@ function operationEndedAt(value: unknown): string {
 
 function readbackInstant(value: unknown): string {
   const input = text(value, 'observedAt', 64).replace(/[t ]/, 'T').replace(/z$/, 'Z');
-  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|([+-])(\d{2}):?(\d{2}))$/.exec(input);
+  const match = /^([+-]\d{6}|\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|([+-])(\d{2}):?(\d{2}))$/.exec(input);
   if (!match || /-00:?00$/.test(input)) throw new Error('observedAt must be a timezone-qualified ISO timestamp');
-  const hours = Number(match[5] || 0);
-  const minutes = Number(match[6] || 0);
+  const hours = Number(match[9] || 0);
+  const minutes = Number(match[10] || 0);
   const instant = Date.parse(input.replace(/([+-]\d{2})(\d{2})$/, '$1:$2'));
-  const offsetMinutes = (match[4] === '-' ? -1 : 1) * (hours * 60 + minutes);
+  const offsetMinutes = (match[8] === '-' ? -1 : 1) * (hours * 60 + minutes);
   if (hours > 23 || minutes > 59 || !Number.isFinite(instant)) {
     throw new Error('observedAt must be a timezone-qualified ISO timestamp');
   }
   const localInstant = instant + offsetMinutes * 60_000;
-  const localTime = new Date(localInstant).toISOString().slice(0, 19);
+  const localDate = new Date(localInstant);
+  const sameCalendar = (date: Date): boolean => date.getUTCFullYear() === Number(match[1]) &&
+    date.getUTCMonth() + 1 === Number(match[2]) && date.getUTCDate() === Number(match[3]);
+  const sameTime = sameCalendar(localDate) && localDate.getUTCHours() === Number(match[4]) &&
+    localDate.getUTCMinutes() === Number(match[5]) && localDate.getUTCSeconds() === Number(match[6] || 0);
   const endOfDay = /T24:00(?::00(?:\.0+)?)?(?:Z|[+-]\d{2}:?\d{2})$/.test(input) &&
-    new Date(localInstant - 86_400_000).toISOString().slice(0, 19) === `${match[1].slice(0, 10)}T00:00:00`;
-  if (localTime !== `${match[1]}:${match[2] || '00'}` && !endOfDay) {
+    localDate.getUTCHours() === 0 && localDate.getUTCMinutes() === 0 && localDate.getUTCSeconds() === 0 &&
+    sameCalendar(new Date(localInstant - 86_400_000));
+  if (!sameTime && !endOfDay) {
     throw new Error('observedAt must be a timezone-qualified ISO timestamp');
   }
   return new Date(instant).toISOString();
