@@ -8,6 +8,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { fixture } = require('./helpers/intake-recovery-fixture');
 const { MESSAGE_STATES } = require('../src/state');
+const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { recoverThread } = require('../src/discord/thread-enrollment');
 const { waitForRecoveryOperation } = require('../src/discord');
 const { CASES, operatorMessage } = require('./helpers/intake-recovery-scenarios');
@@ -255,6 +256,24 @@ test('R7e: degraded reconciliation drains submitted and reply-ready custody on a
   assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
   assert.equal(f.state.getMessage('102').state, MESSAGE_STATES.REPLIED);
   assert.equal(f.replies.length, 2);
+});
+
+test('R7f: held thread delivery deadline remains retryable', CASES, async t => {
+  const f = fixture(t);
+  const owner = f.state.getBinding('1000');
+  assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, '101', '2000'), { ready: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, MESSAGE_STATES.SUBMITTED);
+  f.state.markThreadBoundary('2000', THREAD_STATES.UNAVAILABLE,
+    'Discord recovery deadline: prior pass expired', null, null, owner);
+  f.gateway.recoveryTimeoutMs = 20;
+  f.gateway.client.channels.fetch = () => new Promise(() => {});
+
+  await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+
+  const enrollment = f.state.getThreadEnrollment('2000');
+  assert.equal(enrollment.state, THREAD_STATES.UNAVAILABLE);
+  assert.equal(enrollment.detail, 'Discord recovery deadline: Discord recovery deadline exceeded');
 });
 
 for (const legacy of [

@@ -1260,12 +1260,15 @@ class DiscordGateway {
     if (!bindingIdentityMatches(stored, binding)) return;
     const enrollment = this.state.getThreadEnrollment(stored.deliveryChannelId);
     if (!enrollment) return;
+    const detail = recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE
+      ? classifyRecoveryFailure(error).detail
+      : error.message;
     const retryableBoundary = isRetryableFetchBoundary(enrollment.state, enrollment.detail);
-    const retryableFetch = isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, error.message);
+    const retryableFetch = isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
     if (['gap', 'unavailable'].includes(enrollment.state) && !retryableBoundary) return;
     const nextState = !enrollment.adoptedAt && retryableFetch ? THREAD_STATES.PENDING : THREAD_STATES.UNAVAILABLE;
     this.state.markThreadBoundary(stored.deliveryChannelId, nextState,
-      error.message, null, null, binding, undefined, undefined, enrollment);
+      detail, null, null, binding, undefined, undefined, enrollment);
   }
 
   async threadDeliveryMessage(message) {
