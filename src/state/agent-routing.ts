@@ -217,6 +217,9 @@ export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string
   if (identified.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
   const match = identified[0];
   if (!match) throw new BindingError('agent reply target is unknown or does not match the active request');
+  if (state.isAgentRequestWithdrawn(match.packet as unknown as AgentMessage)) {
+    throw new BindingError('agent request was withdrawn');
+  }
   return match.packet as unknown as AgentMessage;
 }
 

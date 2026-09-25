@@ -31,6 +31,7 @@ const state: DirectPostState = {
   isOrdinaryBinding: () => false,
   directPostRows: () => [],
   listReceipts: () => [],
+  isAgentRequestWithdrawn: () => false,
   recoverDirectPostReceipts: () => undefined,
   inspectDirectPostPart: () => null,
   recordDirectPostPreflight: (_meta, outcome) => ({ outcome }),
