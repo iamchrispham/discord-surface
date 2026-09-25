@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as http from 'node:http';
+import * as net from 'node:net';
 import * as path from 'node:path';
 import type {
   AcknowledgmentState,
@@ -238,15 +239,41 @@ export function assertSocketPath(socketPath: string): void {
   if (socketPath.length > 90) throw new Error('Claude channel socket path is too long for macOS');
 }
 
-export function prepareSocket(socketPath: string): void {
+export async function prepareSocket(socketPath: string): Promise<void> {
   assertSocketPath(socketPath);
   fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
-  const mode = fs.statSync(path.dirname(socketPath)).mode & 0o777;
-  if (mode & 0o077) throw new Error('Claude channel socket directory must be owner-only');
-  if (fs.existsSync(socketPath)) {
-    if (!fs.lstatSync(socketPath).isSocket()) throw new Error('Claude channel path exists and is not a socket');
-    throw new Error('Claude channel socket already exists; stop its owner first');
+  const directory = fs.statSync(path.dirname(socketPath));
+  if ((directory.mode & 0o077) || directory.uid !== process.getuid?.()) {
+    throw new Error('Claude channel socket directory must be owner-only');
   }
+  let original: fs.Stats;
+  try { original = fs.lstatSync(socketPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (!original.isSocket()) throw new Error('Claude channel path exists and is not a socket');
+  if (original.uid !== process.getuid?.()) throw new Error('Claude channel socket belongs to another owner');
+  await new Promise<void>((resolve, reject) => {
+    const probe = net.createConnection(socketPath);
+    const timer = setTimeout(() => finish(new Error('Claude channel socket probe timed out')), 1000);
+    let settled = false;
+    function finish(error?: Error): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      probe.destroy();
+      if (error) reject(error); else resolve();
+    }
+    probe.once('connect', () => finish(new Error('Claude channel socket already exists; stop its owner first')));
+    probe.once('error', error => finish((error as NodeJS.ErrnoException).code === 'ECONNREFUSED' ? undefined : error));
+  });
+  // No asynchronous work between the identity check and removing the orphan.
+  const current = fs.lstatSync(socketPath);
+  if (!current.isSocket() || current.dev !== original.dev || current.ino !== original.ino ||
+      current.uid !== original.uid || current.ctimeMs !== original.ctimeMs) {
+    throw new Error('Claude channel socket changed during stale probe');
+  }
+  fs.unlinkSync(socketPath);
 }
 
 export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeDefaultMcpState }): ClaudeDefaultMcp<StdioServerTransport> {
@@ -417,7 +444,8 @@ export class ClaudeChannel<
     if (this.started) return;
     if (this.stopPromise) await this.stopPromise;
     this.transportClosed = false;
-    prepareSocket(this.socketPath);
+    await prepareSocket(this.socketPath);
+    if (this.transportClosed) throw new Error('Claude channel stopped during socket preparation');
     try {
       if (typeof (this.mcp as unknown as ClaudeRuntimeMcp).connect === 'function') await (this.mcp as unknown as ClaudeRuntimeMcp).connect!((this.mcp as unknown as ClaudeRuntimeMcp).transportFactory!());
       this.server = http.createServer(async (request, response) => {
@@ -504,6 +532,7 @@ export class ClaudeChannel<
   async stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
+    this.transportClosed = true;
     this.stopPromise = (async () => {
       this.ready = false;
       const errors: unknown[] = [];
