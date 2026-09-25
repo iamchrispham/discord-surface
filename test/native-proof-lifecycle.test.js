@@ -158,7 +158,18 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
       blockedTranscriptDirectory = path.join(root, 'blocked');
       fs.mkdirSync(blockedTranscriptDirectory);
       fs.renameSync(path.join(root, `${nativeId}.jsonl`), path.join(blockedTranscriptDirectory, `${nativeId}.jsonl`));
-      fs.chmodSync(blockedTranscriptDirectory, 0o000);
+      const nativeOpendir = fs.promises.opendir;
+      let permissionFailuresRemaining = 1;
+      fs.promises.opendir = async (directory, ...options) => {
+        if (directory === blockedTranscriptDirectory && permissionFailuresRemaining > 0) {
+          permissionFailuresRemaining -= 1;
+          if (permissionFailuresRemaining === 0) fs.promises.opendir = nativeOpendir;
+          const error = new Error(`EACCES: permission denied, opendir '${directory}'`);
+          error.code = 'EACCES';
+          throw error;
+        }
+        return nativeOpendir.call(fs.promises, directory, ...options);
+      };
     }
     if (phase === 'cancelled') cancelNextPreflight = true;
     const second = phase === 'concurrent'
