@@ -86,9 +86,9 @@
     "test/direct-post-types.ts",
     "test/decision-types.ts",
     "test/discord-decision-types.ts",
-    "test/discord/native-proof-recovery-types.ts",
     "src/discord/recovery-fetch.ts",
     "src/discord/native-proof-recovery.ts",
+    "test/discord/native-proof-recovery-types.ts",
     "test/discord/recovery-fetch-types.ts",
     "test/discord/native-proof-recovery-consumer-types.ts",
     "src/state/agent-routing.ts"
