@@ -6,6 +6,7 @@ const installed = path.resolve(__dirname, '..');
 const test = require('node:test');
 const { SurfaceState } = require(path.join(installed, 'src/state'));
 const { DiscordGateway } = require(path.join(installed, 'src/discord'));
+const { createBindingWakeController } = require(path.join(installed, 'src/cli'));
 const { validateCodexSessionIdentityAsync } = require(path.join(installed, 'src/native'));
 const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail } = require(path.join(installed, 'src/discord/native-proof-recovery'));
 
@@ -116,8 +117,19 @@ test('scheduled native proof deadline requeues until proof succeeds', { timeout:
   failPreflights = true;
   preflights = 0;
   gateway.deferredHandoffRecoveryDelayMs = 0;
-  const first = await gateway.recoverTransport('ordinary-bind', gateway.lifecycleEpoch, ['1000']);
-  assert.equal(first.ready, false);
+  const retryBoundaryClassifier = gateway.isRetryableNativeProofBoundary.bind(gateway);
+  let suppressRetryBoundaryClassifier = true;
+  gateway.isRetryableNativeProofBoundary = binding => suppressRetryBoundaryClassifier
+    ? false
+    : retryBoundaryClassifier(binding);
+  const wake = createBindingWakeController({
+    getGateway: () => gateway,
+    isReady: () => gateway.ready,
+    isStopping: () => gateway.stopping
+  });
+  wake.request();
+  await wake.wait();
+  suppressRetryBoundaryClassifier = false;
   assert.equal(state.getIntakeWatermark('1000').state, 'unavailable');
   const waitDeadline = Date.now() + 3000;
   while (state.getIntakeWatermark('1000').state !== 'ready') {
