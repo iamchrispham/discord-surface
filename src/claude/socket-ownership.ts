@@ -18,6 +18,8 @@ type FileIdentity = {
 export type SocketLockRelease = () => void;
 
 const LOCK_NAMESPACE = '.discord-surface-locks';
+const SOCKET_ENDPOINT_MAX_LENGTH = 90;
+const LOCK_NAMESPACE_SUFFIX = 'coordination';
 const caseSensitivityByDirectory = new Map<string, boolean>();
 const normalizationSensitivityByDirectory = new Map<string, boolean>();
 const linuxBootId = readLinuxBootId();
@@ -198,17 +200,25 @@ function pathsOverlap(leftPath: string, rightPath: string): boolean {
   return pathIsWithin(leftPath, rightPath) || pathIsWithin(rightPath, leftPath);
 }
 
+function lockNamespaceCandidate(parentPath: string, prefix: string): string {
+  const componentPrefix = `${prefix}-${LOCK_NAMESPACE_SUFFIX}`;
+  const minimumComponentLength = SOCKET_ENDPOINT_MAX_LENGTH + 1 - parentPath.length - path.sep.length;
+  const component = componentPrefix.length >= minimumComponentLength
+    ? componentPrefix
+    : `${componentPrefix}${'x'.repeat(minimumComponentLength - componentPrefix.length)}`;
+  return path.join(parentPath, component);
+}
+
 function lockNamespacePath(socketPath: string, key: string): string {
   let temporaryRoot = process.platform === 'win32' ? os.tmpdir() : '/tmp';
   try { temporaryRoot = fs.realpathSync(temporaryRoot); } catch {}
   const owner = process.getuid?.();
   const ownerName = owner === undefined ? 'shared' : String(owner);
-  const baseNamespace = path.join(temporaryRoot, `${LOCK_NAMESPACE}-${ownerName}`);
   const candidates = [
-    baseNamespace,
-    path.join(temporaryRoot, `.dss-locks-${ownerName}-${key.slice(0, 16)}`),
-    path.join(os.homedir(), `.dss-locks-${ownerName}-${key}`),
-    path.join(temporaryRoot, `${LOCK_NAMESPACE}-fallback-${ownerName}-${key}`)
+    lockNamespaceCandidate(temporaryRoot, `${LOCK_NAMESPACE}-${ownerName}`),
+    lockNamespaceCandidate(temporaryRoot, `.dss-locks-${ownerName}-${key.slice(0, 16)}`),
+    lockNamespaceCandidate(os.homedir(), `.dss-locks-${ownerName}-${key}`),
+    lockNamespaceCandidate(temporaryRoot, `${LOCK_NAMESPACE}-fallback-${ownerName}-${key}`)
   ];
   for (const candidate of candidates) {
     if (!pathsOverlap(socketPath, candidate)) return candidate;
@@ -247,7 +257,7 @@ export function assertSocketPath(socketPath: string): void {
   if (typeof socketPath !== 'string' || !path.isAbsolute(socketPath)) {
     throw new Error('Claude channel socket must be an absolute path');
   }
-  if (socketPath.length > 90) throw new Error('Claude channel socket path is too long for macOS');
+  if (socketPath.length > SOCKET_ENDPOINT_MAX_LENGTH) throw new Error('Claude channel socket path is too long for macOS');
 }
 
 export function assertSocketDirectory(socketPath: string): void {

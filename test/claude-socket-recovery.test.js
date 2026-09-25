@@ -8,7 +8,7 @@ const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { prepareSocket, prepareSocketAsync, ClaudeChannel } = require('../src/claude-channel');
 const socketOwnership = require('../src/claude/socket-ownership');
-const { acquireSocketLock, assertSocketDirectory } = socketOwnership;
+const { acquireSocketLock, assertSocketDirectory, assertSocketPath } = socketOwnership;
 const { fixture, CLAUDE_ID } = require('./surface-fixtures');
 
 function removeSocketDirectory(socket) {
@@ -114,6 +114,16 @@ test('coordination artifacts stay outside a valid endpoint namespace', t => {
     assert.equal(fs.existsSync(nestedEndpoint), false);
   } finally {
     second.release();
+  }
+});
+
+test('coordination lock paths are rejected by the endpoint contract', t => {
+  const socket = socketPath(t);
+  const { release, lockPath } = acquireSocketLockWithPath(t, socket);
+  try {
+    assert.throws(() => assertSocketPath(lockPath), /too long/);
+  } finally {
+    release();
   }
 });
 
