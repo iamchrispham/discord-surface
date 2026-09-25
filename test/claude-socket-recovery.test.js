@@ -5,7 +5,7 @@ const net = require('node:net');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
-const { prepareSocket, ClaudeChannel } = require('../src/claude-channel');
+const { prepareSocket, prepareSocketAsync, ClaudeChannel } = require('../src/claude-channel');
 const { fixture, CLAUDE_ID } = require('./surface-fixtures');
 
 function socketPath(t) {
@@ -52,18 +52,21 @@ test('preparation refuses a live socket without deleting it', async t => {
   await new Promise(resolve => server.listen(socket, resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const inode = fs.lstatSync(socket).ino;
-  await assert.rejects(prepareSocket(socket), /already exists/);
+  assert.throws(() => prepareSocket(socket), /already exists/);
+  await assert.rejects(prepareSocketAsync(socket), /already exists/);
   assert.equal(fs.lstatSync(socket).ino, inode);
 });
 
 test('preparation preserves regular files and symlinks', async t => {
   const socket = socketPath(t);
   fs.writeFileSync(socket, 'retained');
-  await assert.rejects(prepareSocket(socket), /not a socket/);
+  assert.throws(() => prepareSocket(socket), /not a socket/);
+  await assert.rejects(prepareSocketAsync(socket), /not a socket/);
   assert.equal(fs.readFileSync(socket, 'utf8'), 'retained');
   const link = socket + '.link';
   fs.symlinkSync(socket, link);
-  await assert.rejects(prepareSocket(link), /not a socket/);
+  assert.throws(() => prepareSocket(link), /not a socket/);
+  await assert.rejects(prepareSocketAsync(link), /not a socket/);
   assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
 });
 
@@ -95,7 +98,7 @@ test('socket replaced during refusal probe is preserved', { timeout: 8000 }, asy
     });
     return probe;
   });
-  await assert.rejects(prepareSocket(socket), /changed during stale probe/);
+  await assert.rejects(prepareSocketAsync(socket), /changed during stale probe/);
   assert.equal(fs.readFileSync(socket, 'utf8'), 'replacement');
 });
 
