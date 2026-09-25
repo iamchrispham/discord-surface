@@ -696,7 +696,7 @@ test('CLI --db and claude-post use the bound channel without native work', async
   assert.equal(recorder.calls.length, 1);
 });
 
-test('claude-post rejects unknown attachment flag with nearest valid flag', { todo: 'issue #110: unknown flags are not rejected yet' }, async t => {
+test('claude-post rejects unknown attachment flag with nearest valid flag', async t => {
   const f = fixture(t, 'claude');
   const imageFile = path.join(f.dir, 'frame.png');
   fs.writeFileSync(f.textFile, 'milestone');
@@ -715,7 +715,7 @@ test('claude-post rejects unknown attachment flag with nearest valid flag', { to
   }
 });
 
-test('claude-post unknown attachment flag cannot reach Discord', { todo: 'issue #110: unknown flags are not rejected yet' }, async t => {
+test('claude-post unknown attachment flag cannot reach Discord', async t => {
   const f = fixture(t, 'claude');
   const imageFile = path.join(f.dir, 'frame.png');
   fs.writeFileSync(f.textFile, 'milestone');
@@ -735,7 +735,7 @@ test('claude-post unknown attachment flag cannot reach Discord', { todo: 'issue 
   assert.equal(recorder.calls.length, 0);
 });
 
-test('claude-post unknown attachment flag leaves receipts unchanged', { todo: 'issue #110: unknown flags are not rejected yet' }, async t => {
+test('claude-post unknown attachment flag leaves receipts unchanged', async t => {
   const f = fixture(t, 'claude');
   const imageFile = path.join(f.dir, 'frame.png');
   fs.writeFileSync(f.textFile, 'milestone');

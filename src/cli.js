@@ -88,7 +88,30 @@ function parseArgs(argv) {
   if (repeated !== null) {
     throw Object.assign(new Error(`--${repeated} was given more than once; each flag takes one value`), { command: positional[0] });
   }
-  return { command: positional[0], subcommand: positional[1], args };
+  const command = positional[0];
+  // Reject flags the selected command does not consume here, before state, custody,
+  // or network work. `help`/`--help` is read-only and bypasses this after the repeat
+  // check. The error carries .command so the courier-guard startup path keeps its
+  // existing deny JSON and exit code 2. The policy module is loaded lazily so the hook
+  // entrypoint can still emit its own startup denial from a degraded checkout that is
+  // missing build companions; if the policy module itself is absent there, the hook
+  // still fails closed by only accepting its own flags.
+  let policy;
+  try {
+    policy = require('./cli/flag-policy');
+  } catch (error) {
+    if (command !== 'courier-guard') throw error;
+    policy = {
+      validateFlags: ({ args }) => {
+        const unknown = Object.keys(args).find(key => !['courier-route-id', 'state-dir', 'db', 'help'].includes(key));
+        if (unknown !== undefined) {
+          throw Object.assign(new Error(`unknown --${unknown} for courier-guard`), { command: 'courier-guard' });
+        }
+      }
+    };
+  }
+  if (policy) policy.validateFlags({ command, subcommand: positional[1], args });
+  return { command, subcommand: positional[1], args };
 }
 
 function pathsFor(args) {
