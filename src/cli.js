@@ -1296,6 +1296,7 @@ function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
       GATEWAY_CAPABILITIES.runtimeBindLock,
       GATEWAY_CAPABILITIES.ordinaryClaudeBind,
       GATEWAY_CAPABILITIES.agentHandledWithoutPost,
+      GATEWAY_CAPABILITIES.agentRequestWithdrawal,
       GATEWAY_CAPABILITIES.watcherNoticeIngress
     ]
   }), { mode: 0o600 });
@@ -1908,7 +1909,8 @@ async function agentWithdraw(args, dependencies = {}) {
   const nativeId = required(args, 'native-id');
   if (provider === PROVIDERS.CLAUDE) {
     const caller = await (dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies)))();
-    if (caller?.harness !== 'claude-code' || caller.sessionId !== nativeId || caller.threadId !== nativeId) {
+    if (caller?.harness !== 'claude-code' || caller.sessionId !== nativeId ||
+        (caller.threadId != null && caller.threadId !== nativeId)) {
       throw new Error('agent withdrawal requires the current Claude caller');
     }
   } else if (provider === PROVIDERS.CODEX) {
@@ -1927,7 +1929,7 @@ async function agentWithdraw(args, dependencies = {}) {
     }
     const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
     const runtime = gatewayStatus(paths);
-    const requiredCapability = GATEWAY_CAPABILITIES.agentHandledWithoutPost;
+    const requiredCapability = GATEWAY_CAPABILITIES.agentRequestWithdrawal;
     if (!runtime || !['running', 'stopped', 'stale'].includes(runtime.state) ||
         (runtime.state === 'running' && (!Number.isSafeInteger(Number(runtime.pid)) || Number(runtime.pid) <= 0))) {
       throw new Error('Gateway status is unknown; stop or restart it before agent withdrawal');

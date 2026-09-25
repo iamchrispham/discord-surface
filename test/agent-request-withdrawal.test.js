@@ -9,13 +9,13 @@ const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { runDirectPost } = require('../src/direct-post');
-const { agentWithdraw } = require('../src/cli');
+const { agentWithdraw, GATEWAY_CAPABILITIES } = require('../src/cli');
 
 const token = 'withdrawal-fixture-secret';
 const requester = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111' };
 const recipient = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222' };
 
-function setup(t, { acknowledge = true, kind = KINDS.REQUEST, customSessionRoot = false } = {}) {
+function setup(t, { acknowledge = true, kind = KINDS.REQUEST, customSessionRoot = false, sourceProvider = requester.provider } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-withdraw-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   t.after(() => {
@@ -25,7 +25,8 @@ function setup(t, { acknowledge = true, kind = KINDS.REQUEST, customSessionRoot 
   state.setConfig({ operatorId: '900', guildId: '100', secretFile: path.join(dir, 'secret') });
   fs.writeFileSync(path.join(dir, 'secret'), token);
   const sourceSessionRoot = customSessionRoot ? path.join(dir, 'codex-sessions') : null;
-  const sourceBinding = state.bind({ ...requester, workspace: dir, sessionRoot: sourceSessionRoot,
+  const sourceBinding = state.bind({ ...requester, provider: sourceProvider, workspace: dir, sessionRoot: sourceSessionRoot,
+    ...(sourceProvider === 'claude' ? { endpoint: path.join(dir, 'requester.sock') } : {}),
     conductorId: 'withdraw-source', repoKey: 'repo:withdraw-source' });
   const targetBinding = state.bind({ ...recipient, workspace: dir, endpoint: '/tmp/agent-withdraw-target.sock',
     conductorId: 'withdraw-target', repoKey: 'repo:withdraw-target' });
@@ -36,7 +37,7 @@ function setup(t, { acknowledge = true, kind = KINDS.REQUEST, customSessionRoot 
   state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture child ready', null, null, sourceBinding);
   state.enrollThread({ threadId: '104', parentChannelId: recipient.channelId, guildId: '100' }, targetBinding);
   state.markThreadBoundary('104', THREAD_STATES.READY, 'fixture child ready', null, null, targetBinding);
-  const source = { ...requester, channelId: '103', generation: sourceBinding.generation };
+  const source = { ...requester, provider: sourceProvider, channelId: '103', generation: sourceBinding.generation };
   const target = { ...recipient, channelId: '104', generation: targetBinding.generation };
   const packet = { id: 'withdraw-me', kind, source, target,
     replyTo: kind === KINDS.RESULT ? 'earlier-request' : null, text: 'Old request.' };
@@ -183,6 +184,50 @@ test('public withdrawal requires the current requester caller', async t => {
       threadId: fixture.source.nativeId }) });
   assert.equal(result.withdrawn, true);
   assert.equal(fixture.state.getMessage(fixture.messageId).state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
+});
+
+test('public withdrawal accepts Claude caller without threadId but rejects a mismatched one', async t => {
+  const fixture = setup(t, { sourceProvider: 'claude' });
+  const args = { 'state-dir': fixture.dir, db: fixture.state.dbPath,
+    'message-id': fixture.messageId, 'packet-id': fixture.packet.id,
+    provider: fixture.source.provider, 'native-id': fixture.source.nativeId,
+    generation: String(fixture.source.generation) };
+  const dependencies = { print: () => {}, gatewayProcessStatus: () => ({ state: 'stopped', pid: null }) };
+  await assert.rejects(agentWithdraw(args, { ...dependencies,
+    resolveClaudeCaller: () => ({ harness: 'claude-code', sessionId: fixture.source.nativeId,
+      threadId: '33333333-3333-3333-3333-333333333333' }) }), /current Claude caller/);
+  assert.equal(fixture.state.getMessage(fixture.messageId).state, MESSAGE_STATES.SUBMITTED);
+  const result = await agentWithdraw(args, { ...dependencies,
+    resolveClaudeCaller: () => ({ harness: 'claude-code', sessionId: fixture.source.nativeId }) });
+  assert.equal(result.withdrawn, true);
+});
+
+test('running Gateway must advertise withdrawal-aware intake before custody changes', async t => {
+  const fixture = setup(t);
+  const args = { 'state-dir': fixture.dir, db: fixture.state.dbPath,
+    'message-id': fixture.messageId, 'packet-id': fixture.packet.id,
+    provider: fixture.source.provider, 'native-id': fixture.source.nativeId,
+    generation: String(fixture.source.generation) };
+  let wakeCapability;
+  const dependencies = {
+    print: () => {},
+    resolveInvocationIdentity: () => ({ sessionId: fixture.source.nativeId, threadId: fixture.source.nativeId }),
+    validateCodexSessionIdentity: async nativeId => ({ sessionId: nativeId }),
+    requestGatewayRecovery: (_paths, options) => {
+      wakeCapability = options.requiredCapability;
+      return { requested: true };
+    }
+  };
+  await assert.rejects(agentWithdraw(args, { ...dependencies,
+    gatewayProcessStatus: () => ({ state: 'running', pid: 7301,
+      capabilities: [GATEWAY_CAPABILITIES.agentHandledWithoutPost] }) }), /does not support agent withdrawal/);
+  assert.equal(fixture.state.getMessage(fixture.messageId).state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(fixture.state.listReceipts().some(row => row.kind === 'agent-request-withdrawn'), false);
+  const result = await agentWithdraw(args, { ...dependencies,
+    gatewayProcessStatus: () => ({ state: 'running', pid: 7301,
+      capabilities: [GATEWAY_CAPABILITIES.agentRequestWithdrawal] }) });
+  assert.equal(result.withdrawn, true);
+  assert.equal(wakeCapability, GATEWAY_CAPABILITIES.agentRequestWithdrawal);
 });
 
 test('public withdrawal validates Codex against the request source session root', async t => {
