@@ -2165,6 +2165,7 @@ class DiscordGateway {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (Date.now() >= deadline) {
         const watermark = this.state.getIntakeWatermark(binding.channelId);
+        if (classifyReadiness(binding, watermark) === READINESS.READY) continue;
         if (isRetryableRecoveryBoundary(watermark) ||
             [READINESS.PENDING, READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark?.state)) {
           failure ||= { ready: false, state: watermark?.state || 'unavailable' };

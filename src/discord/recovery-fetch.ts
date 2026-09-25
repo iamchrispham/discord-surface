@@ -1,7 +1,7 @@
 import { THREAD_STATES, type ThreadEnrollment } from '../state/thread-enrollment';
 
 const RETRYABLE_FETCH_PREFIX = 'Discord HTTP 503 during recovery: ';
-const LEGACY_DEADLINE_DETAIL = 'ordinary-bind recovery exceeded 30000ms';
+const LEGACY_DEADLINE_DETAIL_SUFFIX = ' recovery exceeded 30000ms';
 
 export const RECOVERY_DEADLINE_MARKER_PREFIX = 'Discord recovery deadline: ';
 export const RECOVERY_RETRY_PENDING_PREFIX = 'Discord recovery retry pending: ';
@@ -43,10 +43,15 @@ export function isRetryableHttp503Boundary(state: string, detail: string | null 
   return state === 'unavailable' && detail?.startsWith(RETRYABLE_FETCH_PREFIX) === true;
 }
 
+function isLegacyDeadlineDetail(detail: string | null | undefined): boolean {
+  return typeof detail === 'string' && detail.length > LEGACY_DEADLINE_DETAIL_SUFFIX.length &&
+    detail.endsWith(LEGACY_DEADLINE_DETAIL_SUFFIX);
+}
+
 export function isRetryableIntakeBoundary(boundary: IntakeBoundaryLike | null | undefined): boolean {
   if (!boundary) return false;
   if (isRetryableFetchBoundary(boundary.state || '', boundary.detail)) return true;
-  return boundary.state === 'gap' && boundary.detail === LEGACY_DEADLINE_DETAIL &&
+  return boundary.state === 'gap' && isLegacyDeadlineDetail(boundary.detail) &&
     boundary.gap_from == null && boundary.gap_to == null &&
     typeof boundary.recovered_through_id === 'string' && boundary.recovered_through_id.length > 0;
 }
@@ -54,7 +59,7 @@ export function isRetryableIntakeBoundary(boundary: IntakeBoundaryLike | null | 
 export function retryPendingBoundaryDetail(reason: string, boundary: RetryBoundaryLike): string {
   if (typeof boundary.detail === 'string' && boundary.detail.startsWith(RECOVERY_RETRY_PENDING_PREFIX)) return boundary.detail;
   let source = 'HTTP 503';
-  if (boundary.state === 'gap' && boundary.detail === LEGACY_DEADLINE_DETAIL) source = 'legacy recovery timeout';
+  if (boundary.state === 'gap' && isLegacyDeadlineDetail(boundary.detail)) source = 'legacy recovery timeout';
   else if (boundary.detail?.startsWith(RECOVERY_DEADLINE_MARKER_PREFIX)) source = 'recovery deadline';
   return `${RECOVERY_RETRY_PENDING_PREFIX}${reason} after ${source}`;
 }
