@@ -318,3 +318,13 @@ test('every main dispatch case has a flag policy entry', () => {
     assert.throws(() => parseArgs([command, '--frobnicate', 'x']), new RegExp(`unknown --frobnicate for ${command}`));
   }
 });
+
+test('parseArgs rejects a single-dash token that looks like a long flag', { todo: 'F1 pending parser fix' }, () => {
+  assert.throws(() => parseArgs(['claude-post', '--attachment-file', 'a.png', '-attachment-file', 'b.png']));
+  assert.throws(() => parseArgs(['stop', '-h']));
+});
+
+test('parseArgs rejects a value-bearing boolean flag', { todo: 'F2 pending parser fix' }, () => {
+  assert.throws(() => parseArgs(['claude-post', '--resume', '/tmp/a.png']));
+  assert.throws(() => parseArgs(['claude-post', '--resume=TRUE']));
+});
