@@ -223,46 +223,57 @@ test('unsupported wake keeps conductor attach alive without revoking readiness',
   assert.match(output.join(''), /gateway-wake-unsupported/);
 });
 
-for (const command of ['claude-channel', 'claude-monitor']) {
-  test(`${command} CLI entrypoint wakes Gateway and delivers held conductor intake`, async t => {
-    const messageId = command === 'claude-channel' ? '101' : '102';
-    const content = `deliver through ${command}`;
-    const f = conductorFixture(t);
-    spawnGateway(t, f, { messageId, content });
-    await expectWithin(() => fs.existsSync(path.join(f.dir, 'runtime.pid')), `${command} Gateway runtime pid`);
-    const recovered = new SurfaceState(f.db);
-    try {
-      await expectWithin(() => recovered.getBinding(f.binding.channelId)?.readiness === READINESS.READY &&
-        recovered.getIntakeWatermark(f.binding.channelId)?.state === READINESS.READY,
-      `${command} initial Gateway recovery`);
-    } finally {
-      recovered.close();
-    }
-    const acceptedState = new SurfaceState(f.db);
-    const accepted = acceptedState.acceptDiscordMessage({
-      id: messageId, guildId: 'guild', channelId: f.binding.channelId,
-      authorId: 'operator', isBot: false, content, attachments: []
-    }, { ready: false });
-    assert.equal(accepted.accepted, true);
-    assert.equal(acceptedState.claimDispatch(messageId).reason, 'binding-not-ready');
-    assert.equal(acceptedState.getMessage(messageId)?.state, MESSAGE_STATES.ACCEPTED);
-    acceptedState.close();
-    const listener = spawnListener(t, f, command);
+async function runConductorCliScenario(t, command) {
+  const messageId = command === 'claude-channel' ? '101' : '102';
+  const content = `deliver through ${command}`;
+  const f = conductorFixture(t);
+  spawnGateway(t, f, { messageId, content });
+  await expectWithin(() => fs.existsSync(path.join(f.dir, 'runtime.pid')), `${command} Gateway runtime pid`);
+  const recovered = new SurfaceState(f.db);
+  try {
+    await expectWithin(() => recovered.getBinding(f.binding.channelId)?.readiness === READINESS.READY &&
+      recovered.getIntakeWatermark(f.binding.channelId)?.state === READINESS.READY,
+    `${command} initial Gateway recovery`);
+  } finally {
+    recovered.close();
+  }
+  const acceptedState = new SurfaceState(f.db);
+  const accepted = acceptedState.acceptDiscordMessage({
+    id: messageId, guildId: 'guild', channelId: f.binding.channelId,
+    authorId: 'operator', isBot: false, content, attachments: []
+  }, { ready: false });
+  assert.equal(accepted.accepted, true);
+  assert.equal(acceptedState.claimDispatch(messageId).reason, 'binding-not-ready');
+  assert.equal(acceptedState.getMessage(messageId)?.state, MESSAGE_STATES.ACCEPTED);
+  acceptedState.close();
+  const listener = spawnListener(t, f, command);
+  try {
     await expectWithin(() => fs.existsSync(f.socketPath), `${command} listener socket`);
-    await expectWithin(() => listener.stdout().includes(messageId), `held message delivery through ${command}`);
-    const observed = new SurfaceState(f.db);
-    t.after(() => { try { observed.close(); } catch {} });
-    await expectWithin(() => observed.getMessage(messageId)?.state === MESSAGE_STATES.SUBMITTED,
-      `${command} submitted held message`);
-    if (command === 'claude-monitor') {
-      const pointer = listener.stdout().trim().split('\n').map(line => {
-        try { return JSON.parse(line); } catch { return null; }
-      }).find(value => value?.meta?.messageId === messageId);
-      assert.ok(pointer?.payloadPath, 'Claude Monitor must expose the delivered payload');
-      assert.equal(JSON.parse(fs.readFileSync(pointer.payloadPath, 'utf8')).content, content);
-    } else {
-      assert.match(listener.stdout(), new RegExp(content));
-    }
-    await listener.terminate();
-  });
+  } catch (error) {
+    error.message += `\n${listener.stderr()}`;
+    throw error;
+  }
+  await expectWithin(() => listener.stdout().includes(messageId), `held message delivery through ${command}`);
+  const observed = new SurfaceState(f.db);
+  t.after(() => { try { observed.close(); } catch {} });
+  await expectWithin(() => observed.getMessage(messageId)?.state === MESSAGE_STATES.SUBMITTED,
+    `${command} submitted held message`);
+  if (command === 'claude-monitor') {
+    const pointer = listener.stdout().trim().split('\n').map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).find(value => value?.meta?.messageId === messageId);
+    assert.ok(pointer?.payloadPath, 'Claude Monitor must expose the delivered payload');
+    assert.equal(JSON.parse(fs.readFileSync(pointer.payloadPath, 'utf8')).content, content);
+  } else {
+    assert.match(listener.stdout(), new RegExp(content));
+  }
+  await listener.terminate();
 }
+
+test('claude-channel CLI entrypoint wakes Gateway and delivers held conductor intake', async t => {
+  await runConductorCliScenario(t, 'claude-channel');
+});
+
+test('claude-monitor CLI entrypoint wakes Gateway and delivers held conductor intake', async t => {
+  await runConductorCliScenario(t, 'claude-monitor');
+});
