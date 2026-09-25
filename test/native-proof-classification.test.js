@@ -28,6 +28,18 @@ for (const [label, validate] of [['sync', validateCodexSessionIdentity], ['async
     f.write(`second-${ID}.jsonl`);
     await check(f.dir, K.AMBIGUOUS);
   });
+
+  test(`${label} proof classifies conflicting transcript identity`, async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, `${ID}-conflict.jsonl`), JSON.stringify({
+      type: 'session_meta', payload: {
+        id: ID,
+        session_id: '99999999-9999-4999-8999-999999999999',
+        cwd: f.dir
+      }
+    }) + '\n');
+    await assert.rejects(async () => validate(ID, f.dir, f.root), error => error.recoveryKind === K.IDENTITY_MISMATCH);
+  });
 }
 
 test('async proof preserves deadline and cancellation kinds through unavailable wrapper', async t => {

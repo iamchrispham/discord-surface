@@ -9,7 +9,7 @@ const { SurfaceState } = require(path.join(installed, 'src/state'));
 const { DiscordGateway } = require(path.join(installed, 'src/discord'));
 const { validateCodexSessionIdentityAsync } = require(path.join(installed, 'src/native'));
 
-for (const phase of ['preflight', 'before-binding', 'existing-gap', 'reopen', 'pending-reopen', 'missing', 'concurrent', 'workspace-mismatch', 'ambiguous', 'permission', 'cancelled']) {
+for (const phase of ['preflight', 'before-binding', 'existing-gap', 'reopen', 'pending-reopen', 'missing', 'concurrent', 'workspace-mismatch', 'ambiguous', 'permission', 'identity-mismatch', 'cancelled', 'startup']) {
 test(`native deadline recovery preserves custody: ${phase}`, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-deadline-'));
   const root = path.join(dir, 'sessions');
@@ -20,6 +20,7 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
   }) + '\n');
   let state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   let gateway;
+  let blockedTranscriptDirectory = null;
   try {
     state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
     const binding = state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
@@ -32,12 +33,19 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
     let preflights = 0;
     let dispatches = 0;
     let historyReads = 0;
+    let cancelNextPreflight = false;
     const replies = [];
     const channel = { id: '1000', guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }),
       messages: { async fetch() { return { async react() {} }; } },
       async send(body) { replies.push(body); return { id: 'reply-101' }; } };
     const gatewayOptions = {
-      client: { user: { id: 'bot' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
+      client: {
+        user: { id: 'bot' },
+        channels: { fetch: async () => channel },
+        application: { commands: { async fetch() { return []; }, async create() {} } },
+        async login() {},
+        on() {}, off() {}, async destroy() {}
+      },
       fetchHistory: async (_channel, options) => {
         historyReads++;
         return BigInt(options.after || '0') < 101n
@@ -55,24 +63,60 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
         },
         async observe() { return { text: 'recovered answer' }; }
       } },
-      recoveryOptions: { ordinaryNativePreflight: async (current, options) => {
+      recoveryOptions: {
+        ...(phase === 'existing-gap' ? { maxPages: 1, pageLimit: 1 } : {}),
+        ordinaryNativePreflight: async (current, options) => {
         preflights++;
-        if (!expire && phase === 'permission') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
-        if (!expire && phase === 'cancelled') options = { ...options, signal: AbortSignal.abort() };
+        if (!expire && phase === 'cancelled' && cancelNextPreflight) {
+          cancelNextPreflight = false;
+          options = { ...options, signal: AbortSignal.abort() };
+        }
+        if (expire && phase === 'preflight') {
+          const originalOpen = fs.promises.open;
+          fs.promises.open = async (...args) => {
+            await new Promise(resolve => setTimeout(resolve, 10));
+            return originalOpen(...args);
+          };
+          try {
+            return await validateCodexSessionIdentityAsync(current.nativeId, current.workspace, root,
+              { ...options, deadline: Date.now() + 1 });
+          } finally {
+            fs.promises.open = originalOpen;
+          }
+        }
         return validateCodexSessionIdentityAsync(current.nativeId, current.workspace, root,
           { ...options, deadline: expire ? Date.now() - 1 : options.deadline });
       } }
     };
     gateway = new DiscordGateway({ ...gatewayOptions, state });
-    if (phase === 'existing-gap') state.markIntakeBoundary('1000', 'gap', 'genuine missing Discord history');
+    if (phase === 'startup') {
+      const secretFile = path.join(dir, 'discord.env');
+      fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+      await gateway.start(secretFile);
+      assert.equal(gateway.started, true);
+      assert.equal(gateway.ready, true);
+      assert.equal(state.getMessage('101').state, 'accepted');
+      expire = false;
+      const recovery = await gateway.beginReconnectRecovery('resume');
+      assert.equal(recovery.ready, true);
+      assert.equal(state.getIntakeWatermark('1000').state, 'ready');
+      await gateway.consumer.waitForNativeWork();
+      assert.equal(dispatches, 1);
+      assert.equal(state.getMessage('101').state, 'replied');
+      assert.equal(replies.filter(row => row.content === 'recovered answer').length, 1);
+      return;
+    }
     const first = !['before-binding', 'existing-gap'].includes(phase)
       ? await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch)
       : await gateway.recoverInbound(new AbortController().signal, 'reconnect', gateway.lifecycleEpoch, null, Date.now() - 1);
     if (phase === 'existing-gap') {
-      assert.equal(state.getIntakeWatermark('1000').detail, 'genuine missing Discord history');
       expire = false;
-      assert.equal((await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch)).ready, false);
-      assert.equal(preflights, 0);
+      const retry = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+      assert.equal(retry.ready, false);
+      assert.equal(state.getIntakeWatermark('1000').state, 'gap');
+      assert.match(state.getIntakeWatermark('1000').detail, /history page bound/);
+      assert.equal(preflights, 1);
+      assert.ok(historyReads > 0);
       assert.equal(dispatches, 0);
       assert.equal(state.getMessage('101').state, 'accepted');
       return;
@@ -98,14 +142,45 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
       fs.writeFileSync(path.join(root, `${nativeId}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: nativeId, cwd: '/wrong-workspace' } }) + '\n');
     }
     if (phase === 'ambiguous') fs.copyFileSync(path.join(root, `${nativeId}.jsonl`), path.join(root, `second-${nativeId}.jsonl`));
+    if (phase === 'identity-mismatch') {
+      fs.writeFileSync(path.join(root, `${nativeId}.jsonl`), JSON.stringify({ type: 'session_meta', payload: {
+        id: nativeId, session_id: '88888888-8888-4888-8888-888888888888', cwd: dir
+      } }) + '\n');
+    }
+    if (phase === 'permission') {
+      blockedTranscriptDirectory = path.join(root, 'blocked');
+      fs.mkdirSync(blockedTranscriptDirectory);
+      fs.renameSync(path.join(root, `${nativeId}.jsonl`), path.join(blockedTranscriptDirectory, `${nativeId}.jsonl`));
+      fs.chmodSync(blockedTranscriptDirectory, 0o000);
+    }
+    if (phase === 'cancelled') cancelNextPreflight = true;
     const second = phase === 'concurrent'
       ? (await Promise.all([gateway.recoverTransport('reconnect', gateway.lifecycleEpoch), gateway.recoverTransport('reconnect', gateway.lifecycleEpoch)]))[0]
       : await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
-    if (['missing', 'workspace-mismatch', 'ambiguous', 'permission', 'cancelled'].includes(phase)) {
+    if (['missing', 'workspace-mismatch', 'ambiguous', 'permission', 'identity-mismatch', 'cancelled'].includes(phase)) {
       assert.equal(second.ready, false);
       assert.equal(dispatches, 0);
       assert.equal(state.getMessage('101').state, 'accepted');
       assert.equal(state.getBinding('1000').generation, binding.generation);
+      if (['missing', 'workspace-mismatch', 'ambiguous', 'permission', 'identity-mismatch'].includes(phase)) {
+        await gateway.stop();
+        state.close();
+        state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+        gateway = new DiscordGateway({ ...gatewayOptions, state });
+        const reopened = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+        assert.equal(reopened.ready, false);
+        assert.equal(state.getMessage('101').state, 'accepted');
+        assert.equal(state.getIntakeWatermark('1000').state, 'unavailable');
+        assert.equal(state.getBinding('1000').generation, binding.generation);
+      } else {
+        await gateway.stop();
+        state.close();
+        state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+        gateway = new DiscordGateway({ ...gatewayOptions, state });
+        const reopened = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+        assert.equal(reopened.ready, true);
+        assert.equal(state.getIntakeWatermark('1000').state, 'ready');
+      }
       return;
     }
     assert.equal(second.ready, true);
@@ -124,6 +199,7 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
     assert.equal(state.getMessage('101').state, 'replied');
     assert.equal(replies.filter(row => row.content === 'recovered answer').length, 1);
   } finally {
+    if (blockedTranscriptDirectory) fs.chmodSync(blockedTranscriptDirectory, 0o700);
     if (gateway) await gateway.stop();
     state.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -206,4 +282,194 @@ async function runSharedBudget(slowFirst) {
 test('shared deadline does not permanently hold an unattempted binding', async () => {
   await runSharedBudget(false);
   await runSharedBudget(true);
+});
+
+test('stopping native retry during preflight preserves custody across restart', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-interrupted-retry-'));
+  const root = path.join(dir, 'sessions');
+  const db = path.join(dir, 'surface.sqlite');
+  const secret = path.join(dir, 'discord.env');
+  const nativeId = '33333333-3333-4333-8333-333333333333';
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, `${nativeId}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: nativeId, cwd: dir } }) + '\n');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  let state = new SurfaceState(db);
+  let gateway;
+  let preflightStarted;
+  let releasePreflight;
+  const started = new Promise(resolve => { preflightStarted = resolve; });
+  const gate = new Promise(resolve => { releasePreflight = resolve; });
+  let block = false;
+  let dispatches = 0;
+  const replies = [];
+  const channel = { id: '1000', guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }),
+    messages: { async fetch() { return { async react() {} }; } },
+    async send(body) { replies.push(body); return { id: 'reply-101' }; } };
+  const makeGateway = () => new DiscordGateway({ state,
+    client: {
+      user: { id: 'bot' }, channels: { fetch: async () => channel },
+      application: { commands: { async fetch() { return []; }, async create() {} } },
+      async login() {}, on() {}, off() {}, async destroy() {}
+    },
+    fetchHistory: async (_channel, options) => BigInt(options.after || '0') < 101n
+      ? [{ id: '101', channelId: '1000', guildId: 'guild', content: 'retained instruction', author: { id: 'operator', bot: false }, channel }]
+      : [],
+    providers: { codex: {
+      async dispatch(message) {
+        dispatches++;
+        recordNativeAcknowledgment(state, { messageId: message.id, provider: 'codex', nativeId, generation: message.generation });
+        return { status: 'submitted' };
+      },
+      async observe() { return { text: 'recovered answer' }; }
+    } },
+    recoveryOptions: { ordinaryNativePreflight: async (binding, options) => {
+      if (block) {
+        preflightStarted();
+        await Promise.race([gate, new Promise(resolve => options.signal?.addEventListener('abort', resolve, { once: true }))]);
+      }
+      return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
+    } }
+  });
+  try {
+    state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: secret });
+    const binding = state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
+      { sessionId: nativeId, threadId: nativeId });
+    state.setIntakeBaseline('1000', '100', 'fixture baseline');
+    assert.equal(state.acceptDiscordMessage({ id: '101', channelId: '1000', guildId: 'guild', authorId: 'operator', isBot: false,
+      content: 'retained instruction' }, { ready: false }).accepted, true);
+    gateway = makeGateway();
+    await gateway.recoverInbound(new AbortController().signal, 'reconnect', gateway.lifecycleEpoch, null, Date.now() - 1);
+    assert.match(state.getIntakeWatermark('1000').detail, /Native proof recovery v1:/);
+    block = true;
+    const retry = gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+    await started;
+    await gateway.stop();
+    await retry;
+    assert.equal(state.getMessage('101').state, 'accepted');
+    assert.match(state.getIntakeWatermark('1000').detail, /Native proof recovery v1:/);
+
+    state.close();
+    state = new SurfaceState(db);
+    block = false;
+    gateway = makeGateway();
+    await gateway.start(secret);
+    await gateway.reconcilePending();
+    await gateway.consumer.waitForNativeWork();
+    assert.equal(state.getIntakeWatermark('1000').state, 'ready');
+    assert.equal(state.getMessage('101').state, 'replied');
+    assert.equal(dispatches, 1);
+    assert.equal(replies.filter(row => row.content === 'recovered answer').length, 1);
+    assert.equal(state.getBinding('1000').generation, binding.generation);
+  } finally {
+    releasePreflight?.();
+    if (gateway) await gateway.stop();
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('concurrent recovery abandons a stale owner after an ordinary handoff', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-concurrent-handoff-'));
+  const root = path.join(dir, 'sessions');
+  const oldId = '44444444-4444-4444-8444-444444444444';
+  const newId = '55555555-5555-4555-8555-555555555555';
+  fs.mkdirSync(root);
+  for (const id of [oldId, newId]) fs.writeFileSync(path.join(root, `${id}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id, cwd: dir } }) + '\n');
+  let state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  let gateway;
+  let releaseOld;
+  const oldGate = new Promise(resolve => { releaseOld = resolve; });
+  let oldPreflightStarted;
+  const oldStarted = new Promise(resolve => { oldPreflightStarted = resolve; });
+  const preflights = [];
+  const channel = { id: '1000', guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }), messages: { async fetch() {} } };
+  const makeGateway = () => new DiscordGateway({ state,
+    client: { user: { id: 'bot' }, channels: { fetch: async () => channel }, on() {}, off() {}, async destroy() {} },
+    fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { throw new Error('no custody should dispatch'); } } },
+    recoveryOptions: { ordinaryNativePreflight: async (binding, options) => {
+      preflights.push(binding.nativeId);
+      if (binding.nativeId === oldId) {
+        oldPreflightStarted();
+        await oldGate;
+      }
+      return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
+    } }
+  });
+  try {
+    state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
+    const original = state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId: oldId, workspace: dir },
+      { sessionId: oldId, threadId: oldId });
+    state.setIntakeBaseline('1000', '100', 'fixture baseline');
+    gateway = makeGateway();
+    await gateway.recoverInbound(new AbortController().signal, 'reconnect', gateway.lifecycleEpoch, null, Date.now() - 1);
+    const retry = gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+    await oldStarted;
+    const replacementProof = { file: path.join(root, `${newId}.jsonl`), sessionId: newId, threadId: newId, workspace: dir, sessionRoot: null };
+    const successor = state.handoffOrdinary({ channelId: '1000', provider: 'codex', fromNativeId: oldId, fromGeneration: original.generation,
+      nativeId: newId, workspace: dir, handoffId: 'handoff-during-recovery', identity: { sessionId: newId, threadId: newId }, nativeProof: replacementProof });
+    assert.equal(successor.generation, original.generation + 1);
+    releaseOld();
+    const result = await retry;
+    assert.equal(result.ready, false);
+    assert.equal(result.state, 'unavailable');
+    assert.equal(state.getIntakeWatermark('1000').state, 'pending');
+    const followup = await gateway.recoverTransport('reconnect follow-up', gateway.lifecycleEpoch, ['1000']);
+    assert.equal(followup.ready, true);
+    assert.equal(state.getBinding('1000').nativeId, newId);
+    assert.equal(state.getBinding('1000').generation, original.generation + 1);
+    assert.equal(state.getIntakeWatermark('1000').state, 'ready');
+    assert.deepEqual(preflights, [oldId, newId]);
+  } finally {
+    releaseOld?.();
+    if (gateway) await gateway.stop();
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('shared deadline keeps a conductor binding in a terminal gap', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-shared-conductor-'));
+  const root = path.join(dir, 'sessions');
+  const slowId = '66666666-6666-4666-8666-666666666666';
+  const conductorId = '77777777-7777-4777-8777-777777777777';
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, `${slowId}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: slowId, cwd: dir } }) + '\n');
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  let gateway;
+  const timers = new Set();
+  try {
+    state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
+    state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId: slowId, workspace: dir },
+      { sessionId: slowId, threadId: slowId });
+    state.bind({ channelId: '2000', guildId: 'guild', provider: 'codex', nativeId: conductorId, workspace: dir,
+      conductorId: 'conductor-2000', repoKey: 'repo:2000' });
+    state.setIntakeBaseline('1000', '100', 'fixture baseline');
+    state.setIntakeBaseline('2000', '100', 'fixture baseline');
+    const preflights = [];
+    gateway = new DiscordGateway({ state,
+      client: { user: { id: 'bot' }, channels: { fetch: async id => ({ id, guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) }) }, on() {}, off() {}, async destroy() {} },
+      fetchHistory: async () => [],
+      providers: { codex: { async dispatch() { throw new Error('conductor binding must not dispatch'); } } },
+      recoveryOptions: { timeoutMs: 1000, ordinaryNativePreflight: async (binding, options) => {
+        preflights.push(binding.channelId);
+        if (binding.channelId === '1000') await new Promise(resolve => {
+          const timer = setTimeout(() => { timers.delete(timer); resolve(); }, 1100);
+          timers.add(timer);
+        });
+        return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
+      } }
+    });
+    const result = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+    assert.equal(result.ready, false);
+    assert.deepEqual(preflights, ['1000']);
+    assert.equal(state.getBinding('2000').conductorId, 'conductor-2000');
+    assert.equal(state.getIntakeWatermark('2000').state, 'gap');
+    assert.doesNotMatch(state.getIntakeWatermark('2000').detail, /Native proof recovery v1:/);
+  } finally {
+    if (gateway) await gateway.stop();
+    for (const timer of timers) clearTimeout(timer);
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -229,6 +229,7 @@ export async function readCodexSessionIdentityAsync(
     ? { ...supplied, deadline: Date.now() + CODEX_SESSION_DISCOVERY_TIMEOUT_MS }
     : supplied;
   const matches: CodexSessionIdentity[] = [];
+  const mismatches: CodexSessionIdentity[] = [];
   let fileFailures = 0;
   for await (const file of walkAsync(root, 0, options)) {
     assertValidationActive(options);
@@ -250,8 +251,17 @@ export async function readCodexSessionIdentityAsync(
         : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
-      if (sessionId && threadId && sessionId !== threadId) continue;
-      if ((sessionId || threadId) !== nativeId) continue;
+      if (sessionId && threadId && sessionId !== threadId) {
+        mismatches.push({ file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        continue;
+      }
+      if ((sessionId || threadId) !== nativeId) {
+        if (sessionId || threadId) {
+          const mismatch = (sessionId || threadId) as string;
+          mismatches.push({ file, sessionId: mismatch, threadId: mismatch, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        }
+        continue;
+      }
       matches.push({
         file, sessionId: nativeId, threadId: nativeId,
         workspace: typeof payload?.cwd === 'string' ? payload.cwd : null
@@ -266,6 +276,7 @@ export async function readCodexSessionIdentityAsync(
   }
   assertValidationActive(options);
   if (fileFailures > 0) return null;
+  if (matches.length === 0 && mismatches.length > 0) return mismatches[0];
   if (matches.length === 0) return null;
   return matches[0];
 }
@@ -324,6 +335,7 @@ export function findCodexSessionFile(nativeId: string, root = sessionRoot()): st
 export function readCodexSessionIdentity(nativeId: string, root = sessionRoot()): DiscoveredCodexSessionIdentity | null {
   validateNativeId(nativeId);
   const matches: CodexSessionIdentity[] = [];
+  const mismatches: CodexSessionIdentity[] = [];
   for (const file of walk(root)) {
     if (!file.includes(nativeId)) continue;
     try {
@@ -333,14 +345,24 @@ export function readCodexSessionIdentity(nativeId: string, root = sessionRoot())
         : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
-      if (sessionId && threadId && sessionId !== threadId) continue;
-      if ((sessionId || threadId) !== nativeId) continue;
+      if (sessionId && threadId && sessionId !== threadId) {
+        mismatches.push({ file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        continue;
+      }
+      if ((sessionId || threadId) !== nativeId) {
+        if (sessionId || threadId) {
+          const mismatch = (sessionId || threadId) as string;
+          mismatches.push({ file, sessionId: mismatch, threadId: mismatch, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        }
+        continue;
+      }
       matches.push({
         file, sessionId: nativeId, threadId: nativeId,
         workspace: typeof payload?.cwd === 'string' ? payload.cwd : null
       });
     } catch {}
   }
+  if (matches.length === 0 && mismatches.length > 0) return mismatches[0];
   if (matches.length === 0) return null;
   if (matches.length > 1) return { ambiguous: true, files: matches.map(match => match.file) };
   return matches[0];
