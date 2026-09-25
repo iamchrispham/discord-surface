@@ -7,8 +7,42 @@ const { resolvePeerCaller } = require('./caller');
 const { resolvePeerBinding, requireReadyPeer } = require('../../dist/peer/resolution');
 const { resolveAgentAddress, runDirectPost } = require('../direct-post');
 const { postByRole } = require('./post');
-const { inspectPeerResult } = require('./result');
+const { inspectPeerResult, validPeerId } = require('./result');
 const { issueAgentAddress } = require('../agent-message');
+const { READINESS } = require('../state');
+const { THREAD_STATES } = require('../state/thread-enrollment');
+
+function canonicalNativeId(value) {
+  return typeof value === 'string' ? value.toLowerCase() : value;
+}
+
+function samePeerBinding(left, right) {
+  return left.active && left.guildId === right.guildId && left.channelId === right.channelId &&
+    left.provider === right.provider && canonicalNativeId(left.nativeId) === canonicalNativeId(right.nativeId) &&
+    left.generation === right.generation && (left.conductorId ?? null) === (right.conductorId ?? null) &&
+    (left.repoKey ?? null) === (right.repoKey ?? null);
+}
+
+function currentPeerDestination(state, target, expectedBinding = null, expectedChildId = null) {
+  if (!target || typeof target !== 'object') return false;
+  const { guildId } = state.requireConfig();
+  const candidates = state.listBindings().filter(binding =>
+    binding.active && binding.guildId === guildId && binding.guildId === target.guildId &&
+    binding.provider === target.provider && canonicalNativeId(binding.nativeId) === canonicalNativeId(target.nativeId) &&
+    binding.generation === target.generation && (!expectedBinding || samePeerBinding(binding, expectedBinding))
+  );
+  const routes = candidates.filter(binding => {
+    const children = state.listThreadEnrollments(binding.channelId).filter(child =>
+      child.active && child.parentChannelId === binding.channelId && child.guildId === binding.guildId
+    );
+    const watermark = state.getIntakeWatermark(binding.channelId);
+    return children.length === 1 && binding.readiness === READINESS.READY &&
+      (!watermark || watermark.state === READINESS.READY) && children[0].state === THREAD_STATES.READY &&
+      children[0].threadId === target.channelId &&
+      (expectedChildId === null || expectedChildId === target.channelId);
+  });
+  return routes.length === 1;
+}
 
 function createPeerService(context) {
   const { state, provider, token, stateDir, loadChannels, callerDependencies, fetchImpl } = context;
@@ -17,9 +51,10 @@ function createPeerService(context) {
     async post(input, signal) { return postByRole(context, input, signal, service.send); },
     async result(correlationId) { return inspectPeerResult(state, await caller(), correlationId); },
     async list() {
-      await caller();
+      const current = await caller();
       const { guildId } = state.requireConfig();
-      return state.listBindings().filter(binding => binding.active && binding.guildId === guildId).map(binding => {
+      return state.listBindings().filter(binding => binding.active && binding.guildId === guildId &&
+        !(binding.provider === current.provider && canonicalNativeId(binding.nativeId) === canonicalNativeId(current.nativeId))).map(binding => {
         let childId = null;
         let reason = null;
         try { childId = requireReadyPeer(state, binding).childId; }
@@ -37,8 +72,8 @@ function createPeerService(context) {
       }
       if ((input.text === undefined) === (input.text_file === undefined)) throw new Error('provide exactly one of text or text_file');
       if ((input.peer === undefined) === (input.reply_to === undefined)) throw new Error('provide exactly one of peer or reply_to');
-      if (typeof input.dedupe_key !== 'string' || !input.dedupe_key.trim() || input.dedupe_key.length > 256) throw new Error('dedupe_key is required');
-      if (input.reply_to !== undefined && (typeof input.reply_to !== 'string' || !input.reply_to.trim())) throw new Error('reply_to must be non-empty');
+      if (!validPeerId(input.dedupe_key)) throw new Error('dedupe_key must be a valid packet id');
+      if (input.reply_to !== undefined && !validPeerId(input.reply_to)) throw new Error('reply_to must be a valid packet id');
       if (input.text !== undefined && (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > 10000)) throw new Error('text must be non-empty and at most 10000 bytes');
       if (input.text_file !== undefined && (typeof input.text_file !== 'string' || !input.text_file.trim())) throw new Error('text_file must be non-empty');
       const channels = input.peer?.channelName ? await loadChannels(signal) : [];
@@ -49,8 +84,9 @@ function createPeerService(context) {
       const sourceRoute = requireReadyPeer(state, source);
       resolveAgentAddress(state, source, sourceRoute.childId);
       let agentTarget = null;
+      let destination = null;
       if (input.peer !== undefined) {
-        const destination = requireReadyPeer(state, resolvePeerBinding(state, input.peer, channels));
+        destination = requireReadyPeer(state, resolvePeerBinding(state, input.peer, channels));
         agentTarget = issueAgentAddress(resolveAgentAddress(state, destination.binding, destination.childId), token);
       }
       let directory;
@@ -67,6 +103,7 @@ function createPeerService(context) {
           ordinary: state.isOrdinaryBindingRecord(source), agentMode: true,
           agentThreadId: sourceRoute.childId, agentTarget, agentKind: input.reply_to === undefined ? 'request' : 'result',
           agentReplyTo: input.reply_to ?? null, agentPresentation: 'attachment-v1',
+          agentDestinationCurrent: target => currentPeerDestination(state, target, destination?.binding || null, destination?.childId || null),
           textFile, dedupeKey: input.dedupe_key, signal, fetchImpl });
         return { correlationId: input.dedupe_key, ...result };
       } finally {

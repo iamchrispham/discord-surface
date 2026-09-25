@@ -6,7 +6,7 @@ const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
 const { fixture } = require('./fixtures/peer-fixture');
 
-test('public MCP stdio lists current peers and refuses an unready send', { timeout: 15000 }, async t => {
+test('public MCP stdio omits the caller and refuses an unready send', { timeout: 15000 }, async t => {
   const f = fixture(t);
   f.state.db.prepare("UPDATE bindings SET provider='codex'").run();
   const config = f.state.requireConfig();
@@ -23,8 +23,7 @@ test('public MCP stdio lists current peers and refuses an unready send', { timeo
     assert.deepEqual((await client.listTools()).tools.map(tool => tool.name), ['post', 'peer_result', 'peer_list', 'peer_send']);
     const listed = await client.callTool({ name: 'peer_list', arguments: {} });
     const peers = JSON.parse(listed.content[0].text);
-    assert.equal(peers[0].channelId, '101');
-    assert.equal(peers[0].reachable, false);
+    assert.deepEqual(peers, []);
     const before = f.state.listReceipts().length;
     const refused = await client.callTool({ name: 'peer_send', arguments: {
       peer: { conductorId: 'test-conductor' }, text: 'hello', dedupe_key: 'public-fixture'

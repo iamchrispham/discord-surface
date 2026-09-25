@@ -1,17 +1,19 @@
 import type { DirectPostBinding } from '../direct-post/contracts';
+import { THREAD_STATES, type ThreadState } from '../state/thread-enrollment';
+import { READINESS, type Readiness } from '../topic';
 
-export type PeerBinding = DirectPostBinding & { readiness: string };
+export type PeerBinding = DirectPostBinding & { readiness: Readiness };
 
 export type PeerSelector = { repoKey: string; provider: 'codex' | 'claude' } |
   { conductorId: string } | { channelName: string };
 export interface PeerChannel { id: string; guildId: string; name: string }
-interface Enrollment { threadId: string; parentChannelId: string; guildId: string; active: boolean; state: string; detail?: string | null }
+interface Enrollment { threadId: string; parentChannelId: string; guildId: string; active: boolean; state: ThreadState; detail?: string | null }
 interface PeerState {
   db: { prepare(sql: string): { get(...parameters: string[]): unknown } };
   requireConfig(): { guildId: string };
   listBindings(): PeerBinding[];
   listThreadEnrollments(parentChannelId: string): Enrollment[];
-  getIntakeWatermark(channelId: string): { state: string; detail?: string | null } | null;
+  getIntakeWatermark(channelId: string): { state: Readiness; detail?: string | null } | null;
 }
 
 function selectorValues(selector: PeerSelector): [string, string][] {
@@ -46,10 +48,10 @@ export function resolvePeerBinding(state: PeerState, selector: PeerSelector, cha
 
 export function requireReadyBinding(state: PeerState, binding: PeerBinding): void {
   const watermark = state.getIntakeWatermark(binding.channelId);
-  if (watermark && watermark.state !== 'ready') {
+  if (watermark && watermark.state !== READINESS.READY) {
     throw new Error(`peer is not ready: ${watermark.detail || watermark.state}`);
   }
-  if (binding.readiness !== 'ready') {
+  if (binding.readiness !== READINESS.READY) {
     const row = state.db.prepare(`SELECT detail FROM receipts WHERE kind='binding-readiness'
       AND json_extract(detail, '$.channelId')=? ORDER BY id DESC LIMIT 1`).get(binding.channelId) as { detail: string } | undefined;
     const receipt = row ? JSON.parse(row.detail) : null;
@@ -65,6 +67,6 @@ export function requireReadyPeer(state: PeerState, binding: PeerBinding): { bind
   const children = state.listThreadEnrollments(binding.channelId).filter(child =>
     child.active && child.parentChannelId === binding.channelId && child.guildId === binding.guildId);
   if (children.length !== 1) throw new Error(children.length ? 'peer child route is ambiguous' : 'peer has no enrolled child route');
-  if (children[0].state !== 'ready') throw new Error(`peer child is not ready: ${children[0].detail || children[0].state}`);
+  if (children[0].state !== THREAD_STATES.READY) throw new Error(`peer child is not ready: ${children[0].detail || children[0].state}`);
   return { binding, childId: children[0].threadId };
 }

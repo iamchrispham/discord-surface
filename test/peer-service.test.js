@@ -27,13 +27,13 @@ test('missing caller refuses listing and sends before network or custody', async
   assert.equal(f.state.listReceipts().length, before);
 });
 
-test('peer list reports missing child and a gap without claiming reachability', async t => {
+test('peer list omits the caller even when its child is ready', async t => {
   const f = fixture(t); const peer = service(f);
-  assert.equal((await peer.list())[0].reachable, false);
+  assert.deepEqual(await peer.list(), []);
   f.enroll('102');
-  assert.equal((await peer.list())[0].reachable, true);
+  assert.deepEqual(await peer.list(), []);
   f.state.setBindingReadiness('101', READINESS.GAP, 'fixture', f.state.getBinding('101'));
-  assert.equal((await peer.list())[0].reachable, false);
+  assert.deepEqual(await peer.list(), []);
   const before = f.state.listReceipts().length;
   await assert.rejects(peer.send(request), /not ready/);
   assert.equal(f.state.listReceipts().length, before);
@@ -56,6 +56,25 @@ test('tool arguments cannot override the native caller or combine destinations',
   await assert.rejects(peer.send({ ...request, reply_to: 'other' }), /exactly one of peer/);
   await assert.rejects(peer.send({ ...request, text_file: '/ignored' }), /exactly one of text/);
   assert.equal(f.state.listReceipts().length, before);
+});
+
+test('peer packet IDs refuse invalid lengths and characters before custody', async t => {
+  const f = fixture(t); const peer = service(f); const before = f.state.listReceipts().length;
+  await assert.rejects(peer.send({ ...request, dedupe_key: 'a'.repeat(129) }), /valid packet id/);
+  await assert.rejects(peer.send({ ...request, dedupe_key: 'job:123' }), /valid packet id/);
+  await assert.rejects(peer.send({ peer: request.peer, text: 'hello', dedupe_key: 'ok', reply_to: 'job:123' }), /exactly one of peer/);
+  await assert.rejects(peer.send({ reply_to: 'job:123', text: 'hello', dedupe_key: 'ok' }), /valid packet id/);
+  assert.equal(f.state.listReceipts().length, before);
+});
+
+test('peer packet IDs accept the exact 128-character limit', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  const result = await peer.send({ peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'a'.repeat(128) });
+  assert.equal(result.status, 'sent');
 });
 
 test('successful agent send targets the enrolled child and retry keeps one post', async t => {
@@ -171,4 +190,46 @@ test('target generation is resolved after asynchronous peer name lookup', async 
     return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
   } });
   assert.equal((await peer.send({ ...request, peer: { channelName: 'recipient' } })).status, 'sent');
+});
+
+test('peer send refuses publication after destination handoff during channel verification', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f); let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      f.state.db.prepare("UPDATE bindings SET generation=generation+1 WHERE channel_id='201'").run();
+      return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    }
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  const result = await peer.send({ ...request, peer: { conductorId: 'recipient' } });
+  assert.equal(result.status, 'stale');
+  assert.equal(posts, 0);
+  assert.equal(f.state.directPostRows(request.dedupe_key).filter(row => row.kind === 'direct-post-attempt').length, 0);
+});
+
+test('peer result refuses publication after correlated destination handoff', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addRecipient(f); let requestWire; let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    requestWire = await options.body.get('files[0]').text();
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  assert.equal((await peer.send({ ...request, peer: { conductorId: 'recipient' } })).status, 'sent');
+  assert.equal(f.state.acceptDiscordMessage({ id: '10001', guildId: '100', channelId: '202', authorId: '901', isBot: true,
+    content: requestWire }, { agentToken: 'fixture' }).accepted, true);
+  const recipient = createPeerService({ state: f.state, provider: 'codex', token: 'fixture',
+    callerDependencies: { environment: { CODEX_THREAD_ID: target.nativeId } },
+    fetchImpl: async (url, options) => {
+      if (options.method === 'GET') {
+        f.state.db.prepare("UPDATE bindings SET generation=generation+1 WHERE channel_id='101'").run();
+        return { ok: true, status: 200, json: async () => ({ id: '102', guild_id: '100' }) };
+      }
+      posts += 1;
+      return { ok: true, status: 200, json: async () => ({ id: '10002' }) };
+    } });
+  const result = await recipient.send({ reply_to: request.dedupe_key, text: 'result', dedupe_key: 'result-race' });
+  assert.equal(result.status, 'stale');
+  assert.equal(posts, 0);
+  assert.equal(f.state.directPostRows('result-race').filter(row => row.kind === 'direct-post-attempt').length, 0);
 });

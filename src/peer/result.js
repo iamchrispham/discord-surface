@@ -2,6 +2,11 @@
 
 const { KINDS, sameAddress, validateAgentMessage } = require('../agent-message');
 const { DIRECT_POST_OUTCOME, AGENT_COMPLETION_RECEIPTS, MESSAGE_STATES } = require('../state');
+const PACKET_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
+
+function validPeerId(value) {
+  return typeof value === 'string' && PACKET_ID_PATTERN.test(value);
+}
 
 function packetMatches(left, right) {
   return left.id === right.id && left.kind === right.kind && left.replyTo === right.replyTo &&
@@ -27,7 +32,7 @@ function deliveryEvidence(state, messageId, packet) {
 }
 
 function inspectPeerResult(state, source, correlationId) {
-  if (typeof correlationId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(correlationId)) throw new Error('invalid correlation_id');
+  if (!validPeerId(correlationId)) throw new Error('invalid correlation_id');
   const rows = state.directPostRows(correlationId, source.channelId).filter(row => {
     const d = row.detail;
     return d.nativeId === source.nativeId && d.provider === source.provider && d.generation === source.generation && d.guildId === source.guildId;
@@ -60,4 +65,4 @@ function inspectPeerResult(state, source, correlationId) {
     deliveries, results };
 }
 
-module.exports = { inspectPeerResult };
+module.exports = { inspectPeerResult, validPeerId };

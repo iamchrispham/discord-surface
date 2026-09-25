@@ -118,7 +118,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     agentThreadId = null, agentMode = false,
     dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
     agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
-    agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null } =
+    agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null,
+    agentDestinationCurrent = null } =
     input as DirectPostInput & { agentThreadId?: string | null };
   const binding = watcherNotice
     ? watcherNotice.binding
@@ -306,6 +307,11 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       return false;
     }
   };
+  const currentDestination = () => {
+    if (deliveryTarget === null || typeof agentDestinationCurrent !== 'function') return true;
+    try { return agentDestinationCurrent(deliveryTarget); }
+    catch { return false; }
+  };
   for (let partIndex = 0; partIndex < source.parts.length; partIndex += 1) {
     if (signal?.aborted) {
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
@@ -331,7 +337,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       try {
         await verifyAgentDestination({ token, agentTarget: deliveryTarget, fetchImpl, signal, timeoutMs });
       } catch (error) {
-        if (!currentBinding()) {
+        if (!currentBinding() || !currentDestination()) {
           const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
           parts.push({ index: partIndex, status: stale.outcome, messageId: null });
           break;
@@ -342,7 +348,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         parts.push({ index: partIndex, status: preflight.outcome, messageId: null });
         break;
       }
-      if (!currentBinding()) {
+      if (!currentBinding() || !currentDestination()) {
         const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
         parts.push({ index: partIndex, status: stale.outcome, messageId: null });
         break;
@@ -371,13 +377,13 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       continue;
     }
     claimedAny = true;
-    if (!currentBinding()) {
+    if (!currentBinding() || !currentDestination()) {
       const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before network' });
       parts.push({ index: partIndex, status: stale.outcome });
       break;
     }
     try {
-      if (!currentBinding()) {
+      if (!currentBinding() || !currentDestination()) {
         const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before send' });
         parts.push({ index: partIndex, status: stale.outcome });
         break;

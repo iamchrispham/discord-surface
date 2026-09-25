@@ -16,6 +16,15 @@ test('Codex peer caller requires matching native invocation identifiers', async 
   await assert.rejects(resolvePeerCaller(f.state, 'codex', { environment: { CODEX_THREAD_ID: other } }), /no active binding/);
 });
 
+test('Codex peer caller matches UUIDs without changing stored spelling', async () => {
+  const f = fixture();
+  f.rows[0].nativeId = '9CAA5D21-2169-429D-918B-5F08651B5DBD';
+  const caller = await resolvePeerCaller(f.state, 'codex', {
+    environment: { CODEX_THREAD_ID: '9caa5d21-2169-429d-918b-5f08651b5dbd' }
+  });
+  assert.equal(caller.nativeId, f.rows[0].nativeId);
+});
+
 test('Claude peer caller rechecks the native resolver and binding on every call', async () => {
   const f = fixture('claude'); let current = id;
   const dependencies = { resolveClaudeCaller: async () => ({ harness: 'claude-code', sessionId: current }) };

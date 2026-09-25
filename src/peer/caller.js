@@ -2,6 +2,10 @@
 
 const { resolveInvocationIdentity } = require('../ordinary-codex');
 
+function canonicalNativeId(value) {
+  return typeof value === 'string' ? value.toLowerCase() : value;
+}
+
 async function resolvePeerCaller(state, provider, dependencies = {}) {
   let nativeId;
   if (provider === 'codex') {
@@ -18,8 +22,9 @@ async function resolvePeerCaller(state, provider, dependencies = {}) {
     throw new Error('peer caller provider must be codex or claude');
   }
   const { guildId } = state.requireConfig();
+  const canonicalId = canonicalNativeId(nativeId);
   const bindings = state.listBindings().filter(binding => binding.active && binding.guildId === guildId &&
-    binding.provider === provider && binding.nativeId === nativeId);
+    binding.provider === provider && canonicalNativeId(binding.nativeId) === canonicalId);
   if (bindings.length !== 1) {
     throw new Error(bindings.length ? 'peer caller binding is ambiguous' : 'peer caller has no active binding');
   }

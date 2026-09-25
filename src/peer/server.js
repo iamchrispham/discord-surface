@@ -6,6 +6,8 @@ const { ListToolsRequestSchema, CallToolRequestSchema } = require('@modelcontext
 const { readSecret } = require('../discord');
 const { createPeerService } = require('./service');
 
+const packetId = { type: 'string', minLength: 1, maxLength: 128, pattern: '^[a-zA-Z0-9_-]{1,128}$' };
+
 const selector = { oneOf: [
   { type: 'object', properties: { repoKey: { type: 'string' }, provider: { enum: ['codex', 'claude'] } }, required: ['repoKey', 'provider'], additionalProperties: false },
   { type: 'object', properties: { conductorId: { type: 'string' } }, required: ['conductorId'], additionalProperties: false },
@@ -16,11 +18,11 @@ const tools = [
     inputSchema: { type: 'object', properties: { role: { enum: ['announce', 'board', 'child'] }, text_file: { type: 'string' },
       dedupe_key: { type: 'string' }, message_id: { type: 'string' }, peer: selector, reply_to: { type: 'string' } }, required: ['role', 'text_file', 'dedupe_key'], additionalProperties: false } },
   { name: 'peer_result', description: 'Inspect caller-scoped send, native pickup and completion evidence without changing custody.',
-    inputSchema: { type: 'object', properties: { correlation_id: { type: 'string' } }, required: ['correlation_id'], additionalProperties: false } },
+    inputSchema: { type: 'object', properties: { correlation_id: packetId }, required: ['correlation_id'], additionalProperties: false } },
   { name: 'peer_list', description: 'List current bindings and whether each has one ready enrolled child.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'peer_send', description: 'Send an authenticated agent request to a current peer, or a result using reply_to. Reuse dedupe_key on retry. Sent is not native pickup or completion.',
-    inputSchema: { type: 'object', properties: { peer: selector, reply_to: { type: 'string' }, text: { type: 'string' }, text_file: { type: 'string' }, dedupe_key: { type: 'string' } },
+    inputSchema: { type: 'object', properties: { peer: selector, reply_to: packetId, text: { type: 'string' }, text_file: { type: 'string' }, dedupe_key: packetId },
       required: ['dedupe_key'], additionalProperties: false } }
 ];
 
