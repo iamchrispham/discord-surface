@@ -18,6 +18,7 @@ import type {
   DirectPostMatchEvent,
   DirectPostOutcomeRecord,
   DirectPostHandlers,
+  DirectPostCustodyKey,
   RawOutcomeRow,
   DirectPostErrorConstructor,
   DirectPostDependencies
@@ -65,19 +66,52 @@ function identityValueMatches(left: unknown, right: unknown): boolean {
   try { return JSON.stringify(left) === JSON.stringify(right); } catch { return false; }
 }
 
-function assertImmutableDetail(expected: DirectPostPartMeta, detail: Record<string, unknown>, BindingError: DirectPostErrorConstructor): void {
-  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) throw new BindingError('direct post outcome detail is invalid');
-  const keys: readonly string[] = [...identityKeys, 'legacyAgentPacket', 'attemptId', 'ownerPid', 'ownerStartTime', 'ownerCommand', 'journal'];
-  for (const key of keys) {
+const immutableDetailKeys: Record<DirectPostCustodyKey, true> = {
+  requestId: true,
+  inReplyTo: true,
+  attemptId: true,
+  sourcePath: true,
+  textHash: true,
+  operatorId: true,
+  partHash: true,
+  channelId: true,
+  guildId: true,
+  provider: true,
+  nativeId: true,
+  generation: true,
+  conductorId: true,
+  repoKey: true,
+  partIndex: true,
+  partCount: true,
+  nonce: true,
+  binding: true,
+  deliveryChannelId: true,
+  agentPacket: true,
+  legacyAgentPacket: true,
+  agentRequestTarget: true,
+  routingVersion: true,
+  presentation: true,
+  watcherNotice: true,
+  caption: true,
+  fileManifest: true,
+  ownerPid: true,
+  ownerStartTime: true,
+  ownerCommand: true,
+  journal: true,
+};
+
+function validatedOutcomeDetail(expected: DirectPostPartMeta, input: Record<string, unknown>, BindingError: DirectPostErrorConstructor): Record<string, unknown> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new BindingError('direct post outcome detail is invalid');
+  const detail = { ...input };
+  for (const key of Object.keys(immutableDetailKeys)) {
     if (!Object.hasOwn(detail, key)) continue;
     const expectedValue = key === 'journal' ? 'direct-post-v1' : (expected as unknown as Record<string, unknown>)[key];
-    const missingAgentPacket = key === 'agentPacket' && expectedValue !== undefined && expectedValue !== null &&
-      (detail[key] === undefined || detail[key] === null);
-    if (missingAgentPacket || !identityKeyValueMatches(key, detail[key], expectedValue)) {
+    if (!identityValueMatches(detail[key], expectedValue)) {
       throw new BindingError(`direct post outcome cannot override immutable ${key}`);
     }
   }
   if (Object.hasOwn(detail, 'outcome')) throw new BindingError('direct post outcome cannot override immutable outcome');
+  return detail;
 }
 
 function assertFileSeed(seed: DirectPostFilePreparationSeed, BindingError: DirectPostErrorConstructor, assertText: DirectPostDependencies['assertText']): void {
@@ -283,7 +317,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     recordDirectPostPreflight(state, meta, outcome, detail = {}) {
       validateMeta(meta, BindingError, assertText);
       if (!DIRECT_POST_OUTCOMES.includes(outcome)) throw new BindingError('invalid direct post outcome');
-      assertImmutableDetail(meta, detail, BindingError);
+      detail = validatedOutcomeDetail(meta, detail, BindingError);
       return state.transaction(() => {
         const rows = state.directPostRows(meta.requestId);
         assertRequestIdentity(rows, meta);
@@ -316,7 +350,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
         const rows = state.directPostRows(requestId);
         const attempt = rows.find(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.attemptId === attemptId);
         if (!attempt) throw new BindingError('direct post attempt is unknown');
-        assertImmutableDetail(attempt.detail as unknown as DirectPostPartMeta, detail, BindingError);
+        detail = validatedOutcomeDetail(attempt.detail as unknown as DirectPostPartMeta, detail, BindingError);
         const existing = rows.find(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId === attemptId);
         if (existing) return existing.detail as DirectPostOutcomeRecord;
         const next = { ...attempt.detail, ...detail, outcome };
