@@ -416,13 +416,13 @@ test('scheduled native proof deadline requeues until proof succeeds', { timeout:
   await gateway.start(secret);
   failPreflights = true;
   preflights = 0;
-  state.markIntakeBoundary('1000', 'unavailable',
-    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now() - 1), null, null, state.getBinding('1000'));
   gateway.deferredHandoffRecoveryDelayMs = 0;
-  gateway.scheduleDeferredHandoffRecovery('1000');
+  const first = await gateway.recoverTransport('ordinary-bind', gateway.lifecycleEpoch, ['1000']);
+  assert.equal(first.ready, false);
+  assert.equal(state.getIntakeWatermark('1000').state, 'unavailable');
   const waitDeadline = Date.now() + 3000;
   while (state.getIntakeWatermark('1000').state !== 'ready') {
-    if (Date.now() >= waitDeadline) throw new Error('deferred native proof retry did not recover');
+    if (Date.now() >= waitDeadline) throw new Error('ordinary-bind native proof retry did not recover');
     await new Promise(resolve => setTimeout(resolve, 25));
   }
   assert.equal(preflights, 3);
