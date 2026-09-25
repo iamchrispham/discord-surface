@@ -312,6 +312,26 @@ test('deadline policy inventory has no direct deadline-to-gap decision outside i
   assert.deepEqual(offenders, [], 'new deadline decisions must use the shared recovery classifier');
 });
 
+test('pre-adoption retry classifier sites stay in the audited owners', () => {
+  const sourceRoot = path.join(__dirname, '../src');
+  const collect = directory => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) return collect(absolute);
+    return /\.(?:js|ts)$/.test(entry.name) ? [absolute] : [];
+  });
+  const sites = new Map();
+  for (const file of collect(sourceRoot)) {
+    const source = fs.readFileSync(file, 'utf8');
+    const count = source.match(/\bisPreAdoptionRetryableThread\b/g)?.length || 0;
+    if (count) sites.set(path.relative(sourceRoot, file).split(path.sep).join('/'), count);
+  }
+  assert.deepEqual(Object.fromEntries([...sites].sort(([left], [right]) => left.localeCompare(right))), {
+    'discord.js': 10,
+    'discord/recovery-fetch.ts': 1,
+    'discord/thread-enrollment.ts': 3
+  }, 'new retryability consumers must join the class inventory before using this policy');
+});
+
 test('G2: page-bound exhaustion still records a gap', CASES, async t => {
   const f = fixture(t);
   f.gateway.historyMaxPages = 1;
