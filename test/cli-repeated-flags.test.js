@@ -137,6 +137,10 @@ test('handoff modes refuse options consumed only by another mode', () => {
     });
   }
   for (const command of [
+    ['handoff', '--ordinary=false'],
+    ['handoff', '--from-lock=false'],
+    ['handoff-run', '--ordinary=false'],
+    ['handoff-run', '--from-lock=false'],
     ['handoff', '--ordinary', '--session-root', '/tmp/root'],
     ['handoff', '--from-lock', '--session-file', '/tmp/session'],
     ['handoff', '--endpoint', '/tmp/socket'],

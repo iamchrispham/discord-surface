@@ -5,7 +5,7 @@
 // it at parse time, ahead of the courier-guard startup path and main dispatch.
 
 const COMMON_FLAGS = Object.freeze(['state-dir', 'db', 'help']);
-const DIRECT_HANDOFF_FLAGS = Object.freeze(['provider', 'conductor-id', 'repo-key', 'from-native-id', 'native-id',
+const DIRECT_HANDOFF_FLAGS = Object.freeze(['ordinary', 'from-lock', 'provider', 'conductor-id', 'repo-key', 'from-native-id', 'native-id',
   'from-generation', 'endpoint', 'workspace', 'channel-id', 'handoff-id', 'category-id']);
 const ORDINARY_HANDOFF_FLAGS = Object.freeze(['ordinary', 'provider', 'from-native-id', 'native-id',
   'from-generation', 'workspace', 'channel-id', 'handoff-id', 'session-root']);
