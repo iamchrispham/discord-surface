@@ -183,7 +183,7 @@ function spawnListener(t, f, command) {
   } };
 }
 
-test('conductor attach wakes once without ordinary readiness changes', () => {
+test('attachOrdinaryListener wakes once without ordinary readiness changes', () => {
   for (const label of ['Claude channel', 'Claude Monitor']) {
     const f = fixture();
     assert.deepEqual(attachOrdinaryListener({ ...f.args, label }), { requested: true });
@@ -221,7 +221,7 @@ test('unsupported wake refuses attach without revoking conductor readiness', () 
 });
 
 for (const command of ['claude-channel', 'claude-monitor']) {
-  test(`${command} wakes Gateway and delivers held conductor intake`, async t => {
+  test(`${command} CLI entrypoint wakes Gateway and delivers held conductor intake`, async t => {
     const messageId = command === 'claude-channel' ? '101' : '102';
     const content = `deliver through ${command}`;
     const f = conductorFixture(t);
@@ -242,6 +242,7 @@ for (const command of ['claude-channel', 'claude-monitor']) {
     }, { ready: false });
     assert.equal(accepted.accepted, true);
     assert.equal(acceptedState.claimDispatch(messageId).reason, 'binding-not-ready');
+    assert.equal(acceptedState.getMessage(messageId)?.state, MESSAGE_STATES.ACCEPTED);
     acceptedState.close();
     const listener = spawnListener(t, f, command);
     await expectWithin(() => fs.existsSync(f.socketPath), `${command} listener socket`);
