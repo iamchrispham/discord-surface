@@ -18,6 +18,7 @@ import type {
   DirectPostMatchEvent,
   DirectPostOutcomeRecord,
   DirectPostHandlers,
+  DirectPostCustodyKey,
   RawOutcomeRow,
   DirectPostErrorConstructor,
   DirectPostDependencies
@@ -65,19 +66,86 @@ function identityValueMatches(left: unknown, right: unknown): boolean {
   try { return JSON.stringify(left) === JSON.stringify(right); } catch { return false; }
 }
 
-function assertImmutableDetail(expected: DirectPostPartMeta, detail: Record<string, unknown>, BindingError: DirectPostErrorConstructor): void {
-  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) throw new BindingError('direct post outcome detail is invalid');
-  const keys: readonly string[] = [...identityKeys, 'legacyAgentPacket', 'attemptId', 'ownerPid', 'ownerStartTime', 'ownerCommand', 'journal'];
-  for (const key of keys) {
+const immutableDetailKeys: Record<DirectPostCustodyKey, true> = {
+  requestId: true,
+  inReplyTo: true,
+  attemptId: true,
+  sourcePath: true,
+  textHash: true,
+  operatorId: true,
+  partHash: true,
+  channelId: true,
+  guildId: true,
+  provider: true,
+  nativeId: true,
+  generation: true,
+  conductorId: true,
+  repoKey: true,
+  partIndex: true,
+  partCount: true,
+  nonce: true,
+  binding: true,
+  deliveryChannelId: true,
+  agentPacket: true,
+  legacyAgentPacket: true,
+  agentRequestTarget: true,
+  routingVersion: true,
+  presentation: true,
+  watcherNotice: true,
+  caption: true,
+  fileManifest: true,
+  ownerPid: true,
+  ownerStartTime: true,
+  ownerCommand: true,
+  journal: true,
+};
+
+function validatedOutcomeDetail(expected: DirectPostPartMeta, input: Record<string, unknown>, BindingError: DirectPostErrorConstructor, snapshots = new WeakMap<object, unknown>()): Record<string, unknown> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new BindingError('direct post outcome detail is invalid');
+  const expectedSnapshot = snapshotCustodyFields(expected, snapshots);
+  const detail = snapshotCustodyFields(input, snapshots);
+  if (Object.hasOwn(detail, 'toJSON')) throw new BindingError('direct post outcome detail cannot define toJSON');
+  const serializedDetail = assertSerializableOutcomeDetail(detail, BindingError);
+  for (const key of Object.keys(immutableDetailKeys)) {
     if (!Object.hasOwn(detail, key)) continue;
-    const expectedValue = key === 'journal' ? 'direct-post-v1' : (expected as unknown as Record<string, unknown>)[key];
-    const missingAgentPacket = key === 'agentPacket' && expectedValue !== undefined && expectedValue !== null &&
-      (detail[key] === undefined || detail[key] === null);
-    if (missingAgentPacket || !identityKeyValueMatches(key, detail[key], expectedValue)) {
+    const expectedValue = key === 'journal' ? 'direct-post-v1' : (expectedSnapshot as unknown as Record<string, unknown>)[key];
+    const hasSerializedValue = Object.hasOwn(serializedDetail, key);
+    if ((!hasSerializedValue && (detail[key] !== undefined || expectedValue !== undefined))
+      || (hasSerializedValue && !identityValueMatches(serializedDetail[key], expectedValue))) {
       throw new BindingError(`direct post outcome cannot override immutable ${key}`);
     }
   }
   if (Object.hasOwn(detail, 'outcome')) throw new BindingError('direct post outcome cannot override immutable outcome');
+  return serializedDetail;
+}
+
+function snapshotCustodyValue(value: unknown, snapshots: WeakMap<object, unknown>): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  if (snapshots.has(value)) return snapshots.get(value);
+  const serialized = JSON.stringify(value);
+  const snapshot = serialized === undefined ? undefined : JSON.parse(serialized);
+  snapshots.set(value, snapshot);
+  return snapshot;
+}
+
+function snapshotCustodyFields<T>(input: T, snapshots = new WeakMap<object, unknown>()): T {
+  const snapshot = { ...(input as object) } as Record<string, unknown>;
+  for (const key of Object.keys(immutableDetailKeys)) {
+    if (Object.hasOwn(snapshot, key)) snapshot[key] = snapshotCustodyValue(snapshot[key], snapshots);
+  }
+  return snapshot as T;
+}
+
+function assertSerializableOutcomeDetail(detail: Record<string, unknown>, BindingError: DirectPostErrorConstructor): Record<string, unknown> {
+  try {
+    const serialized = JSON.stringify(detail);
+    if (serialized === undefined) throw new Error('detail serialization returned no value');
+    const snapshot = JSON.parse(serialized) as unknown;
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) throw new Error('detail serialization returned a non-object');
+    return snapshot as Record<string, unknown>;
+  } catch {
+    throw new BindingError('direct post outcome detail is unserializable');
+  }
 }
 
 function assertFileSeed(seed: DirectPostFilePreparationSeed, BindingError: DirectPostErrorConstructor, assertText: DirectPostDependencies['assertText']): void {
@@ -283,11 +351,13 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     recordDirectPostPreflight(state, meta, outcome, detail = {}) {
       validateMeta(meta, BindingError, assertText);
       if (!DIRECT_POST_OUTCOMES.includes(outcome)) throw new BindingError('invalid direct post outcome');
-      assertImmutableDetail(meta, detail, BindingError);
+      const snapshots = new WeakMap<object, unknown>();
+      const canonicalMeta = snapshotCustodyFields(meta, snapshots);
+      detail = validatedOutcomeDetail(canonicalMeta, detail, BindingError, snapshots);
       return state.transaction(() => {
-        const rows = state.directPostRows(meta.requestId);
-        assertRequestIdentity(rows, meta);
-        const { attemptId: _attemptId, ...preflightMeta } = meta;
+        const rows = state.directPostRows(canonicalMeta.requestId);
+        assertRequestIdentity(rows, canonicalMeta);
+        const { attemptId: _attemptId, ...preflightMeta } = canonicalMeta;
         const next = { journal: 'direct-post-v1', ...preflightMeta, ...detail, phase: 'preflight', outcome };
         state.receipt(null, DIRECT_POST_OUTCOME, next);
         return next;
@@ -316,7 +386,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
         const rows = state.directPostRows(requestId);
         const attempt = rows.find(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.attemptId === attemptId);
         if (!attempt) throw new BindingError('direct post attempt is unknown');
-        assertImmutableDetail(attempt.detail as unknown as DirectPostPartMeta, detail, BindingError);
+        detail = validatedOutcomeDetail(attempt.detail as unknown as DirectPostPartMeta, detail, BindingError);
         const existing = rows.find(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId === attemptId);
         if (existing) return existing.detail as DirectPostOutcomeRecord;
         const next = { ...attempt.detail, ...detail, outcome };
