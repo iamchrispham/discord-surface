@@ -2,13 +2,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const net = require('node:net');
-const os = require('node:os');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { prepareSocket, prepareSocketAsync, ClaudeChannel } = require('../src/claude-channel');
-const { acquireSocketLock, assertSocketDirectory } = require('../src/claude/socket-ownership');
+const socketOwnership = require('../src/claude/socket-ownership');
+const { acquireSocketLock, assertSocketDirectory } = socketOwnership;
 const { fixture, CLAUDE_ID } = require('./surface-fixtures');
 
 function removeSocketDirectory(socket) {
@@ -23,10 +23,17 @@ function socketPath(t, { cleanup = true } = {}) {
   return socket;
 }
 
-function socketLockNamespace() {
-  const temporaryRoot = fs.realpathSync(process.platform === 'win32' ? os.tmpdir() : '/tmp');
-  const owner = process.getuid?.();
-  return path.join(temporaryRoot, `.discord-surface-locks-${owner === undefined ? 'shared' : owner}`);
+function acquireSocketLockWithPath(t, socket) {
+  let lockPath;
+  const originalRename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (path.basename(source).startsWith('.staging-')) lockPath = destination;
+    return originalRename(source, destination);
+  });
+  const release = acquireSocketLock(socket);
+  assert.ok(lockPath);
+  assert.equal(fs.existsSync(path.join(lockPath, 'owner')), true);
+  return { release, lockPath };
 }
 
 function isCaseInsensitiveDirectory(directory) {
@@ -73,13 +80,9 @@ test('abrupt listener expiry can re-arm the same Claude binding', { timeout: 800
 test('owner records include a boot-unique process identity on Linux', t => {
   const socket = socketPath(t);
   assertSocketDirectory(socket);
-  const namespace = socketLockNamespace();
-  const before = new Set(fs.readdirSync(namespace));
-  const release = acquireSocketLock(socket);
+  const { release, lockPath } = acquireSocketLockWithPath(t, socket);
   try {
-    const lockName = fs.readdirSync(namespace).find(entry => !before.has(entry));
-    assert.ok(lockName);
-    const owner = JSON.parse(fs.readFileSync(path.join(namespace, lockName, 'owner'), 'utf8'));
+    const owner = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner'), 'utf8'));
     assert.equal(owner.pid, process.pid);
     if (process.platform === 'linux') {
       assert.equal(typeof owner.identity, 'string');
@@ -98,8 +101,20 @@ test('coordination artifacts stay outside a valid endpoint namespace', t => {
   t.after(() => removeSocketDirectory(socket));
   assertSocketDirectory(socket);
   assert.equal(fs.existsSync(socket), false);
-  const release = acquireSocketLock(socket);
-  try { assert.equal(fs.existsSync(socket), false); } finally { release(); }
+  const local = acquireSocketLockWithPath(t, socket);
+  assert.equal(fs.existsSync(socket), false);
+  local.release();
+
+  const nestedEndpoint = local.lockPath;
+  assert.equal(fs.existsSync(nestedEndpoint), false);
+  assertSocketDirectory(nestedEndpoint);
+  const second = acquireSocketLockWithPath(t, nestedEndpoint);
+  try {
+    assert.notEqual(second.lockPath, nestedEndpoint);
+    assert.equal(fs.existsSync(nestedEndpoint), false);
+  } finally {
+    second.release();
+  }
 });
 
 test('preparation refuses a live socket without deleting it', async t => {
@@ -196,18 +211,36 @@ test('stop during orphan probe prevents subsequent listener startup', { timeout:
 test('ownerless preparation locks are reclaimed without deleting a replacement owner', t => {
   const socket = socketPath(t);
   assertSocketDirectory(socket);
-  const namespace = socketLockNamespace();
-  const before = new Set(fs.readdirSync(namespace));
-  const firstRelease = acquireSocketLock(socket);
-  const lockName = fs.readdirSync(namespace).find(entry => !before.has(entry));
-  assert.ok(lockName);
-  const lockPath = path.join(namespace, lockName);
+  const first = acquireSocketLockWithPath(t, socket);
+  const firstRelease = first.release;
+  const lockPath = first.lockPath;
   fs.unlinkSync(path.join(lockPath, 'owner'));
-  const secondRelease = acquireSocketLock(socket);
+  const secondRelease = acquireSocketLockWithPath(t, socket).release;
   assert.throws(firstRelease, /lock owner changed before release/);
   assert.equal(fs.existsSync(path.join(lockPath, 'owner')), true);
   assert.throws(() => acquireSocketLock(socket), /already in progress/);
   assert.doesNotThrow(secondRelease);
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
+test('socket-lock release remains retryable after owner removal fails', t => {
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const { release, lockPath } = acquireSocketLockWithPath(t, socket);
+  const originalRename = fs.renameSync;
+  let failOwnerMove = true;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (failOwnerMove && path.basename(source) === 'owner' && path.basename(path.dirname(destination)).startsWith('.transition-')) {
+      failOwnerMove = false;
+      const error = new Error('owner move failed');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return originalRename(source, destination);
+  });
+  assert.throws(release, /owner move failed/);
+  assert.equal(fs.existsSync(path.join(lockPath, 'owner')), true);
+  assert.doesNotThrow(release);
   assert.equal(fs.existsSync(lockPath), false);
 });
 
@@ -232,8 +265,11 @@ test('endpoint names ending in .lock do not collide with coordination artifacts'
   const socket = socketPath(t);
   const sibling = `${socket}.lock`;
   assertSocketDirectory(socket);
-  const firstRelease = acquireSocketLock(socket);
-  const secondRelease = acquireSocketLock(sibling);
+  const first = acquireSocketLockWithPath(t, socket);
+  const second = acquireSocketLockWithPath(t, sibling);
+  assert.notEqual(first.lockPath, second.lockPath);
+  const firstRelease = first.release;
+  const secondRelease = second.release;
   assert.doesNotThrow(firstRelease);
   assert.doesNotThrow(secondRelease);
 });
@@ -244,13 +280,15 @@ test('socket basename aliases share one lock only on case-insensitive parents', 
   const caseInsensitive = isCaseInsensitiveDirectory(path.dirname(socket));
   assertSocketDirectory(socket);
   assertSocketDirectory(alias);
-  const firstRelease = acquireSocketLock(socket);
+  const first = acquireSocketLockWithPath(t, socket);
+  const firstRelease = first.release;
   try {
     if (caseInsensitive) {
       assert.throws(() => acquireSocketLock(alias), /already in progress/);
     } else {
-      const secondRelease = acquireSocketLock(alias);
-      secondRelease();
+      const second = acquireSocketLockWithPath(t, alias);
+      assert.notEqual(first.lockPath, second.lockPath);
+      second.release();
     }
   } finally {
     firstRelease();
@@ -323,6 +361,38 @@ test('stop retains the socket lock until MCP teardown completes', { timeout: 800
   releaseClose();
   await stopping;
   assert.equal(fs.existsSync(socket), false);
+});
+
+test('stop retries a failed socket-lock release', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  const originalAcquire = socketOwnership.acquireSocketLock;
+  let releaseCalls = 0;
+  t.mock.method(socketOwnership, 'acquireSocketLock', endpoint => {
+    const release = originalAcquire(endpoint);
+    return () => {
+      releaseCalls += 1;
+      if (releaseCalls === 1) throw new Error('release failed');
+      release();
+    };
+  });
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  t.after(async () => {
+    try { await channel.stop(); } finally { removeSocketDirectory(socket); }
+  });
+  await channel.start();
+  await assert.rejects(channel.stop(), error => {
+    assert.equal(error.message, 'Claude channel stop failed');
+    assert.match(error.errors[0].message, /release failed/);
+    return true;
+  });
+  await channel.stop();
+  assert.equal(releaseCalls, 2);
+  await channel.start();
+  assert.equal(channel.ready, true);
+  await channel.stop();
 });
 
 test('start calls during stop share one post-stop startup', { timeout: 8000 }, async t => {

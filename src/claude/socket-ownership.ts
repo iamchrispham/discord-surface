@@ -19,6 +19,7 @@ export type SocketLockRelease = () => void;
 
 const LOCK_NAMESPACE = '.discord-surface-locks';
 const caseSensitivityByDirectory = new Map<string, boolean>();
+const normalizationSensitivityByDirectory = new Map<string, boolean>();
 const linuxBootId = readLinuxBootId();
 const ownerIdentity = processIdentity(process.pid);
 
@@ -61,6 +62,19 @@ function processIdentity(pid: number): string | undefined {
       stdio: ['ignore', 'pipe', 'ignore']
     }).trim();
     if (startTime) return `${linuxBootId ? `ps:${linuxBootId}:` : 'ps:'}${startTime}`;
+  } catch {}
+  return undefined;
+}
+
+function processState(pid: number): string | undefined {
+  const procStat = readProcStat(pid);
+  if (procStat) return procStat.state;
+  try {
+    const state = execFileSync('ps', ['-p', String(pid), '-o', 'state='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim();
+    return state.charAt(0) || undefined;
   } catch {}
   return undefined;
 }
@@ -112,6 +126,39 @@ function isCaseInsensitiveDirectory(directoryPath: string): boolean {
   return insensitive;
 }
 
+function isNormalizationInsensitiveDirectory(directoryPath: string): boolean {
+  const cached = normalizationSensitivityByDirectory.get(directoryPath);
+  if (cached !== undefined) return cached;
+  const probeName = `.discord-surface-normalization-${randomUUID()}`;
+  const composedPath = path.join(directoryPath, `${probeName}-é`);
+  const decomposedPath = path.join(directoryPath, `${probeName}-e\u0301`);
+  let descriptor: number | undefined;
+  let insensitive = false;
+  try {
+    descriptor = fs.openSync(composedPath, 'wx', 0o600);
+    try {
+      insensitive = sameFile(fileIdentity(composedPath), fileIdentity(decomposedPath));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return false;
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+    try { fs.unlinkSync(composedPath); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    try { fs.unlinkSync(decomposedPath); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  normalizationSensitivityByDirectory.set(directoryPath, insensitive);
+  return insensitive;
+}
+
 function canonicalSocketPath(socketPath: string): string {
   const parentPath = path.dirname(socketPath);
   let canonicalParentPath = parentPath;
@@ -121,30 +168,58 @@ function canonicalSocketPath(socketPath: string): string {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
   const basename = path.basename(socketPath);
-  if (!isCaseInsensitiveDirectory(canonicalParentPath)) return path.join(canonicalParentPath, basename);
+  const caseInsensitive = isCaseInsensitiveDirectory(canonicalParentPath);
+  const normalizationInsensitive = isNormalizationInsensitiveDirectory(canonicalParentPath);
+  const normalizedBasename = normalizationInsensitive ? basename.normalize('NFC') : basename;
+  if (!caseInsensitive && !normalizationInsensitive) return path.join(canonicalParentPath, basename);
   let entries: string[];
   try {
     entries = fs.readdirSync(canonicalParentPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return path.join(canonicalParentPath, basename.toLowerCase());
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return path.join(canonicalParentPath, caseInsensitive ? normalizedBasename.toLowerCase() : normalizedBasename);
+    }
     throw error;
   }
-  const foldedBasename = basename.toLowerCase();
-  const existing = entries.find(entry => entry.toLowerCase() === foldedBasename);
-  return path.join(canonicalParentPath, existing || foldedBasename);
+  const comparableBasename = caseInsensitive ? normalizedBasename.toLowerCase() : normalizedBasename;
+  const existing = entries.find(entry => {
+    const comparableEntry = normalizationInsensitive ? entry.normalize('NFC') : entry;
+    return (caseInsensitive ? comparableEntry.toLowerCase() : comparableEntry) === comparableBasename;
+  });
+  return path.join(canonicalParentPath, existing || comparableBasename);
 }
 
-function lockNamespacePath(): string {
+function pathIsWithin(parentPath: string, childPath: string): boolean {
+  const relativePath = path.relative(parentPath, childPath);
+  return relativePath === '' || (relativePath !== '..' && !relativePath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePath));
+}
+
+function pathsOverlap(leftPath: string, rightPath: string): boolean {
+  return pathIsWithin(leftPath, rightPath) || pathIsWithin(rightPath, leftPath);
+}
+
+function lockNamespacePath(socketPath: string, key: string): string {
   let temporaryRoot = process.platform === 'win32' ? os.tmpdir() : '/tmp';
   try { temporaryRoot = fs.realpathSync(temporaryRoot); } catch {}
   const owner = process.getuid?.();
-  return path.join(temporaryRoot, `${LOCK_NAMESPACE}-${owner === undefined ? 'shared' : owner}`);
+  const ownerName = owner === undefined ? 'shared' : String(owner);
+  const baseNamespace = path.join(temporaryRoot, `${LOCK_NAMESPACE}-${ownerName}`);
+  const candidates = [
+    baseNamespace,
+    path.join(temporaryRoot, `.dss-locks-${ownerName}-${key.slice(0, 16)}`),
+    path.join(os.homedir(), `.dss-locks-${ownerName}-${key}`),
+    path.join(temporaryRoot, `${LOCK_NAMESPACE}-fallback-${ownerName}-${key}`)
+  ];
+  for (const candidate of candidates) {
+    if (!pathsOverlap(socketPath, candidate)) return candidate;
+  }
+  throw new Error('Claude channel socket lock namespace conflicts with socket path');
 }
 
 function lockPathForSocket(socketPath: string): string {
   const identityPath = canonicalSocketPath(socketPath);
   const key = createHash('sha256').update(identityPath).digest('hex').slice(0, 32);
-  return path.join(lockNamespacePath(), `${key}.lock`);
+  return path.join(lockNamespacePath(identityPath, key), `${key}.lock`);
 }
 
 function ownerPathForLock(lockPath: string): string {
@@ -206,7 +281,7 @@ function isSocketLockOwnerAlive(owner: OwnerRecord): boolean {
     if ((probeError as NodeJS.ErrnoException).code === 'ESRCH') return false;
     if ((probeError as NodeJS.ErrnoException).code !== 'EPERM') throw probeError;
   }
-  if (readProcStat(owner.pid)?.state === 'Z') return false;
+  if (processState(owner.pid)?.startsWith('Z')) return false;
   if (!owner.identity) return true;
   const currentIdentity = processIdentity(owner.pid);
   if (!currentIdentity) return true;
@@ -248,10 +323,12 @@ function isTransitionAlive(transitionPath: string): boolean {
   if (owner) return isSocketLockOwnerAlive(owner);
   const match = path.basename(transitionPath).match(/^\.transition-(\d+)-([A-Za-z0-9_-]+)$/);
   if (!match) return true;
-  if (match[2] === 'unknown') return true;
+  const pid = Number(match[1]);
+  if (!Number.isSafeInteger(pid) || pid < 1) return true;
+  if (match[2] === 'unknown') return isSocketLockOwnerAlive({ pid });
   let identity: string;
   try { identity = Buffer.from(match[2], 'base64url').toString('utf8'); } catch { return true; }
-  return isSocketLockOwnerAlive({ pid: Number(match[1]), identity });
+  return isSocketLockOwnerAlive({ pid, identity });
 }
 
 function removeLockDirectory(directoryPath: string): void {
@@ -443,8 +520,8 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
       let released = false;
       return () => {
         if (released) return;
-        released = true;
         releaseSocketLock(lockPath, owner.ownerPath, owner.identity);
+        released = true;
       };
     } catch (error) {
       removeLockDirectory(stagingPath);

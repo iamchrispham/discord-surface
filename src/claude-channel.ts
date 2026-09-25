@@ -175,7 +175,13 @@ type ClaudeRuntimeMcp = ClaudeChannelMcpBase & {
   transportFactory?: () => unknown;
 };
 
-type ClaudeStartupPhase = 'socket preparation' | 'MCP connection' | 'listener startup';
+export const CLAUDE_STARTUP_PHASES = {
+  SOCKET_PREPARATION: 'socket preparation',
+  MCP_CONNECTION: 'MCP connection',
+  LISTENER_STARTUP: 'listener startup'
+} as const;
+
+export type ClaudeStartupPhase = typeof CLAUDE_STARTUP_PHASES[keyof typeof CLAUDE_STARTUP_PHASES];
 
 interface ClaudeChannelOptionsBase {
   nativeId: string;
@@ -450,7 +456,7 @@ export class ClaudeChannel<
     socketOwnership.assertSocketDirectory(this.socketPath);
     let rejectStartup: ((error: Error) => void) | null = null;
     let startupCancelled = false;
-    let startupPhase: ClaudeStartupPhase = 'socket preparation';
+    let startupPhase: ClaudeStartupPhase = CLAUDE_STARTUP_PHASES.SOCKET_PREPARATION;
     const startupController = new AbortController();
     this.startupPhase = startupPhase;
     const startupCancellation = new Promise<never>((_, reject) => {
@@ -491,7 +497,7 @@ export class ClaudeChannel<
       await socketOwnership.prepareSocket(this.socketPath, startupController.signal);
       if (this.transportClosed) throw new Error('Claude channel stopped during socket preparation');
       if (typeof (this.mcp as unknown as ClaudeRuntimeMcp).connect === 'function') {
-        startupPhase = 'MCP connection';
+        startupPhase = CLAUDE_STARTUP_PHASES.MCP_CONNECTION;
         this.startupPhase = startupPhase;
         await Promise.race([
           (this.mcp as unknown as ClaudeRuntimeMcp).connect!((this.mcp as unknown as ClaudeRuntimeMcp).transportFactory!()),
@@ -499,7 +505,7 @@ export class ClaudeChannel<
         ]);
         if (this.transportClosed) throw new Error('Claude channel stopped during MCP connection');
       }
-      startupPhase = 'listener startup';
+      startupPhase = CLAUDE_STARTUP_PHASES.LISTENER_STARTUP;
       this.startupPhase = startupPhase;
       this.server = http.createServer(async (request, response) => {
         if (request.method === 'GET' && request.url === '/identity') {
@@ -594,8 +600,10 @@ export class ClaudeChannel<
       if (this.startupPhase === startupPhase) this.startupPhase = null;
       if (!this.started) {
         const release = this.socketLockRelease;
-        this.socketLockRelease = null;
-        release?.();
+        if (release) {
+          release();
+          if (this.socketLockRelease === release) this.socketLockRelease = null;
+        }
       }
     }
   }
@@ -628,10 +636,12 @@ export class ClaudeChannel<
         this.ownsSocket = false;
       }
       const release = this.socketLockRelease;
-      this.socketLockRelease = null;
       this.started = false;
       this.stopping = false;
-      try { release?.(); } catch (error) { errors.push(error); }
+      try {
+        release?.();
+        if (release && this.socketLockRelease === release) this.socketLockRelease = null;
+      } catch (error) { errors.push(error); }
       if (errors.length) throw new AggregateError(errors, 'Claude channel stop failed');
     })();
     try { await this.stopPromise; } finally { this.stopPromise = null; }

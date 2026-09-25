@@ -78,6 +78,7 @@
     "test/watcher-notice-types.ts",
     "test/acknowledgment-types.ts",
     "test/claude-channel-types.ts",
+    "test/types/socket-ownership.ts",
     "test/handoff-fence-types.ts",
     "test/cs-interaction-types.ts",
     "test/board-refresh-types.ts",
