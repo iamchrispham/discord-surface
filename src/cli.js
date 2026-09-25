@@ -81,7 +81,8 @@ function parseArgs(argv) {
     if (repeated === null && Object.hasOwn(args, key)) repeated = key;
     let parsedValue;
     if (inline !== undefined) parsedValue = inline;
-    else if (argv[i + 1] && !argv[i + 1].startsWith('--')) parsedValue = argv[++i];
+    // Keep single-dash tokens visible to the positional-option guard; use --flag=-value when a dash-prefixed value is intentional.
+    else if (argv[i + 1] && !argv[i + 1].startsWith('--') && !/^-[^-]/.test(argv[i + 1])) parsedValue = argv[++i];
     else parsedValue = true;
     // Keep --__proto__ enumerable so the command policy can reject it.
     Object.defineProperty(args, key, { value: parsedValue, enumerable: true, configurable: true, writable: true });

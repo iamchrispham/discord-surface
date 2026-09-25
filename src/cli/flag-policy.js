@@ -134,19 +134,24 @@ function suggestionFor(unknown, allowed) {
   return winner;
 }
 
-const BOOLEAN_FLAGS = new Set(['resume']);
+const BOOLEAN_FLAGS = new Set([
+  'resume',
+  'migrate-legacy-topic',
+  'board-no-hidden-retry',
+  'board-single-attempt',
+  'board-sole-writer',
+  'ordinary',
+  'from-lock',
+  'reuse'
+]);
 const BOOLEAN_VALUES = new Set([true, false, 'true', 'false']);
+const REQUIRED_VALUE_FLAGS = new Set(['part-index']);
 
 // Validates the parsed args for one selected command. `help` and `--help` are
 // read-only and bypass unknown-flag validation; callers run that check after the
 // duplicate-flag check. Throws an Error with .command set so the courier-guard
 // startup path can keep its existing deny JSON and exit code 2.
 function validateFlags({ command, subcommand, args } = {}) {
-  for (const flag of BOOLEAN_FLAGS) {
-    if (Object.hasOwn(args || {}, flag) && !BOOLEAN_VALUES.has(args[flag])) {
-      throw Object.assign(new Error(`--${flag} takes only true or false`), { command });
-    }
-  }
   if (command === 'help' || args?.help === true) return;
   const allowed = allowedFlags(command, subcommand, args);
   const unknown = Object.keys(args || {}).find(key => {
@@ -154,6 +159,15 @@ function validateFlags({ command, subcommand, args } = {}) {
     return !COMMON_FLAGS.includes(key) && !allowed.includes(key);
   });
   if (unknown === undefined) {
+    for (const flag of BOOLEAN_FLAGS) {
+      if (Object.hasOwn(args || {}, flag) && !BOOLEAN_VALUES.has(args[flag])) {
+        throw Object.assign(new Error(`--${flag} takes only true or false`), { command });
+      }
+    }
+    const missingValue = [...REQUIRED_VALUE_FLAGS].find(flag => Object.hasOwn(args || {}, flag) && args[flag] === true);
+    if (missingValue !== undefined) {
+      throw Object.assign(new Error(`--${missingValue} requires a value`), { command });
+    }
     if (Object.hasOwn(args || {}, 'help') && args.help !== true) {
       throw Object.assign(new Error('--help takes no value'), { command });
     }
