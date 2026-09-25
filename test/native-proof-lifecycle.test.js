@@ -154,9 +154,30 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
       fs.chmodSync(blockedTranscriptDirectory, 0o000);
     }
     if (phase === 'cancelled') cancelNextPreflight = true;
+    const recover = phase === 'permission'
+      ? async (operation) => {
+        const originalReaddirSync = fs.readdirSync;
+        const deniedRoot = path.resolve(root);
+        fs.readdirSync = (...args) => {
+          const candidate = args[0];
+          const resolvedCandidate = typeof candidate === 'string' ? path.resolve(candidate) : null;
+          if (resolvedCandidate === deniedRoot || resolvedCandidate?.startsWith(`${deniedRoot}${path.sep}`)) {
+            const error = new Error(`EACCES: permission denied, scandir '${candidate}'`);
+            error.code = 'EACCES';
+            throw error;
+          }
+          return originalReaddirSync(...args);
+        };
+        try {
+          return await operation();
+        } finally {
+          fs.readdirSync = originalReaddirSync;
+        }
+      }
+      : async operation => operation();
     const second = phase === 'concurrent'
       ? (await Promise.all([gateway.recoverTransport('reconnect', gateway.lifecycleEpoch), gateway.recoverTransport('reconnect', gateway.lifecycleEpoch)]))[0]
-      : await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+      : await recover(() => gateway.recoverTransport('reconnect', gateway.lifecycleEpoch));
     if (['missing', 'workspace-mismatch', 'ambiguous', 'permission', 'identity-mismatch', 'cancelled'].includes(phase)) {
       assert.equal(second.ready, false);
       assert.equal(dispatches, 0);
@@ -167,7 +188,7 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
         state.close();
         state = new SurfaceState(path.join(dir, 'surface.sqlite'));
         gateway = new DiscordGateway({ ...gatewayOptions, state });
-        const reopened = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
+        const reopened = await recover(() => gateway.recoverTransport('reconnect', gateway.lifecycleEpoch));
         assert.equal(reopened.ready, false);
         assert.equal(state.getMessage('101').state, 'accepted');
         assert.equal(state.getIntakeWatermark('1000').state, 'unavailable');
