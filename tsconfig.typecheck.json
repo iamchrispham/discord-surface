@@ -87,6 +87,7 @@
     "test/decision-types.ts",
     "test/discord-decision-types.ts",
     "src/discord/recovery-fetch.ts",
-    "src/state/agent-routing.ts"
+    "src/state/agent-routing.ts",
+    "src/peer/resolution.ts"
   ]
 }

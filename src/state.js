@@ -979,7 +979,9 @@ class SurfaceState {
       }
       if (readiness === READINESS.READY) this.assertLegacyMigrationSafe(channelId);
       this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
-      this.receipt(null, 'binding-readiness', { channelId, conductorId: binding.conductorId, readiness, detail: detail || undefined });
+      this.receipt(null, 'binding-readiness', { channelId, conductorId: binding.conductorId,
+        guildId: binding.guildId, provider: binding.provider, nativeId: binding.nativeId,
+        generation: binding.generation, readiness, detail: detail || undefined });
       return this.getBinding(channelId);
     });
   }

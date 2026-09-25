@@ -129,7 +129,7 @@ function print(value) {
 
 const GENERAL_USAGE = `Usage: discord-surface <command> [options]
 
-Commands: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind,
+Commands: mcp, configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind,
 status, recover, board-refresh, thread-enroll, provision, handoff, start, stop,
 claude-channel, claude-monitor, native-ack, native-reply, claude-reply, agent-address,
 agent-send, agent-complete, watcher-arm, watcher-send, watcher-consume, post, ordinary-post, ordinary-claude-post, claude-post,
@@ -180,6 +180,7 @@ Consumes an acknowledged watcher notice without posting a Discord reply.
 
 function printUsage(command) {
   let usage = GENERAL_USAGE;
+  if (command === 'mcp') usage = 'Usage: discord-surface mcp --provider codex|claude [--state-dir DIR] [--db FILE]\n\nRuns authenticated peer tools over stdio. Native caller identity must be available.\n';
   if (command === 'agent-send') usage = AGENT_SEND_USAGE;
   if (command === 'agent-complete') usage = AGENT_COMPLETE_USAGE;
   if (command === 'watcher-arm') usage = WATCHER_ARM_USAGE;
@@ -2048,6 +2049,7 @@ async function main() {
   if (command === 'help' || args.help) return printUsage(command === 'help' ? subcommand : command);
   switch (command) {
     case 'courier-guard': return require('./courier-guard').courierGuard(args, pathsFor);
+    case 'mcp': return require('./peer/server').startPeerMcp(args);
     case 'configure': return configure(args);
     case 'bind': return bind(args);
     case 'ordinary-bind':

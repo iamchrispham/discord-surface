@@ -1172,7 +1172,8 @@ test('ordinary Claude channel startup reopens an endpoint-unavailable watermark,
   await listener.terminate();
   assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
   assert.deepEqual(readinessReceipts(observed, f.binding.channelId).at(-1), {
-    channelId: f.binding.channelId, conductorId: null, readiness: READINESS.UNAVAILABLE, detail: 'Claude channel unavailable'
+    channelId: f.binding.channelId, conductorId: null, readiness: READINESS.UNAVAILABLE, detail: 'Claude channel unavailable',
+    guildId: f.binding.guildId, provider: f.binding.provider, nativeId: f.binding.nativeId, generation: f.binding.generation
   });
 });
 
