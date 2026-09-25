@@ -38,7 +38,7 @@ const tools = [
   { name: 'peer_list', description: 'List current bindings and whether each has one ready enrolled child.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'peer_send', description: 'Send an authenticated agent request to a current peer, or a result using reply_to. Reuse dedupe_key on retry. Sent is not native pickup or completion.',
-    inputSchema: { type: 'object', properties: { peer: selector, reply_to: packetId, text: { type: 'string', minLength: 1 }, text_file: { type: 'string', minLength: 1 }, dedupe_key: packetId },
+    inputSchema: { type: 'object', properties: { peer: selector, reply_to: packetId, text: nonBlankString, text_file: nonBlankString, dedupe_key: packetId },
       required: ['dedupe_key'], additionalProperties: false, allOf: [
         { oneOf: [
           { required: ['text'], not: { required: ['text_file'] } },
