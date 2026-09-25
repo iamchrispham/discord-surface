@@ -1472,6 +1472,9 @@ class DiscordGateway {
         this.transportReady = true;
         if (result.ready) await this.reconcilePending();
         else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true });
+        for (const binding of this.state.listBindings().filter(binding => binding.active)) {
+          if (this.isRetryableNativeProofBoundary(binding)) this.scheduleDeferredHandoffRecovery(binding.channelId);
+        }
         if (!this.stopping && connectionEpoch === this.connectionEpoch) this.onReady?.();
       }
       return result;
