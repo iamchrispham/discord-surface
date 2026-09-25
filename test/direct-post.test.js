@@ -696,6 +696,66 @@ test('CLI --db and claude-post use the bound channel without native work', async
   assert.equal(recorder.calls.length, 1);
 });
 
+test('claude-post rejects unknown attachment flag with nearest valid flag', { todo: 'issue #110: unknown flags are not rejected yet' }, async t => {
+  const f = fixture(t, 'claude');
+  const imageFile = path.join(f.dir, 'frame.png');
+  fs.writeFileSync(f.textFile, 'milestone');
+  fs.writeFileSync(imageFile, Buffer.from('frame'));
+  const recorder = fetchRecorder();
+  const originalFetch = globalThis.fetch;
+  const originalArgv = process.argv;
+  globalThis.fetch = recorder.fetchImpl;
+  process.argv = ['node', 'src/cli.js', 'claude-post', '--db', path.join(f.dir, 'surface.sqlite'), '--native-id', f.nativeId, '--generation', '1', '--text-file', f.textFile,
+    '--dedupe-key', 'unknown-flag-error', '--attachment', imageFile];
+  try {
+    await assert.rejects(main(), /--attachment\b[\s\S]*--attachment-file/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.argv = originalArgv;
+  }
+});
+
+test('claude-post unknown attachment flag cannot reach Discord', { todo: 'issue #110: unknown flags are not rejected yet' }, async t => {
+  const f = fixture(t, 'claude');
+  const imageFile = path.join(f.dir, 'frame.png');
+  fs.writeFileSync(f.textFile, 'milestone');
+  fs.writeFileSync(imageFile, Buffer.from('frame'));
+  const recorder = fetchRecorder();
+  const originalFetch = globalThis.fetch;
+  const originalArgv = process.argv;
+  globalThis.fetch = recorder.fetchImpl;
+  process.argv = ['node', 'src/cli.js', 'claude-post', '--db', path.join(f.dir, 'surface.sqlite'), '--native-id', f.nativeId, '--generation', '1', '--text-file', f.textFile,
+    '--dedupe-key', 'unknown-flag-network', '--attachment', imageFile];
+  try {
+    await main().catch(() => {});
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.argv = originalArgv;
+  }
+  assert.equal(recorder.calls.length, 0);
+});
+
+test('claude-post unknown attachment flag leaves receipts unchanged', { todo: 'issue #110: unknown flags are not rejected yet' }, async t => {
+  const f = fixture(t, 'claude');
+  const imageFile = path.join(f.dir, 'frame.png');
+  fs.writeFileSync(f.textFile, 'milestone');
+  fs.writeFileSync(imageFile, Buffer.from('frame'));
+  const recorder = fetchRecorder();
+  const originalFetch = globalThis.fetch;
+  const originalArgv = process.argv;
+  globalThis.fetch = recorder.fetchImpl;
+  process.argv = ['node', 'src/cli.js', 'claude-post', '--db', path.join(f.dir, 'surface.sqlite'), '--native-id', f.nativeId, '--generation', '1', '--text-file', f.textFile,
+    '--dedupe-key', 'unknown-flag-receipt', '--attachment', imageFile];
+  const before = f.state.listReceipts();
+  try {
+    await main().catch(() => {});
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.argv = originalArgv;
+  }
+  assert.deepEqual(f.state.listReceipts(), before);
+});
+
 test('CLI requires one dedupe key and rejects conflicting aliases before network', async t => {
   const f = fixture(t, 'claude');
   fs.writeFileSync(f.textFile, 'CLI key validation');
