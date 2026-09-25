@@ -3,7 +3,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { validateCodexSessionIdentity, validateCodexSessionIdentityAsync, CODEX_VALIDATION_KINDS: K } = require('../src/native');
+const {
+  readCodexSessionIdentity,
+  readCodexSessionIdentityAsync,
+  validateCodexSessionIdentity,
+  validateCodexSessionIdentityAsync,
+  CODEX_VALIDATION_KINDS: K
+} = require('../src/native');
 const ID = '11111111-1111-4111-8111-111111111111';
 
 function fixture(t) {
@@ -41,6 +47,21 @@ for (const [label, validate] of [['sync', validateCodexSessionIdentity], ['async
     await assert.rejects(async () => validate(ID, f.dir, f.root), error => error.recoveryKind === K.IDENTITY_MISMATCH);
   });
 }
+
+test('identity readers mark mismatched candidates instead of returning them as matches', async t => {
+  const f = fixture(t);
+  const mismatch = '99999999-9999-4999-8999-999999999999';
+  fs.writeFileSync(path.join(f.root, `${ID}-conflict.jsonl`), JSON.stringify({
+    type: 'session_meta', payload: { id: ID, session_id: mismatch, cwd: f.dir }
+  }) + '\n');
+  const sync = readCodexSessionIdentity(ID, f.root);
+  const asyncIdentity = await readCodexSessionIdentityAsync(ID, f.root);
+  for (const identity of [sync, asyncIdentity]) {
+    assert.equal(identity?.mismatch, true);
+    assert.equal(identity?.sessionId, mismatch);
+    assert.equal(identity?.threadId, ID);
+  }
+});
 
 test('async proof preserves deadline and cancellation kinds through unavailable wrapper', async t => {
   const f = fixture(t);

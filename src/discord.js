@@ -1527,6 +1527,11 @@ class DiscordGateway {
       this.started = true;
       this.resolveInteractionRecovery(true);
       this.schedulePendingHandoffRecoveryPoll();
+      if (hasEndpointUnavailableBinding) {
+        for (const binding of unresolvedBindings) {
+          if (this.isRetryableNativeProofBoundary(binding)) this.scheduleDeferredHandoffRecovery(binding.channelId);
+        }
+      }
       this.acknowledgments = watchAcknowledgments({
         state: this.state,
         send: (message, reaction) => this.sendAcknowledgment(message, reaction),
@@ -1762,6 +1767,12 @@ class DiscordGateway {
     return isPreAdoptionRetryableThread(this.state.getThreadEnrollment?.(channelId));
   }
 
+  isRetryableNativeProofBoundary(binding) {
+    if (!binding?.active || !this.state.isOrdinaryBinding?.(binding)) return false;
+    const watermark = this.state.getIntakeWatermark(binding.channelId);
+    return isNativeProofRetryBoundary(watermark?.state, watermark?.detail);
+  }
+
   noteLiveIntake(message) {
     const channelId = typeof message?.channelId === 'string' ? message.channelId : null;
     if (!channelId || this.stopping || !this.state.getMessageRoute(channelId)?.binding.active) return;
@@ -1836,7 +1847,8 @@ class DiscordGateway {
           } else if (recovery && binding?.active) {
             recoverableChannels.add(channelId);
           } else if (binding?.active && this.state.isOrdinaryBinding?.(binding) &&
-            [READINESS.PENDING, READINESS.RECOVERING].includes(binding.readiness)) {
+            ([READINESS.PENDING, READINESS.RECOVERING].includes(binding.readiness) ||
+              this.isRetryableNativeProofBoundary(binding))) {
             recoverableChannels.add(channelId);
           } else if (binding?.active && binding.readiness === READINESS.READY) {
             reconcileOnlyChannels.add(channelId);

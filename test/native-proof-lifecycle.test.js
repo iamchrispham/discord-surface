@@ -313,6 +313,63 @@ async function runSharedBudget(slowFirst) {
   }
 }
 
+test('startup schedules a retry for a native proof deadline marker', { timeout: 5000 }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-startup-retry-'));
+  const root = path.join(dir, 'sessions');
+  const db = path.join(dir, 'surface.sqlite');
+  const secret = path.join(dir, 'discord.env');
+  const nativeId = '22222222-2222-4222-8222-222222222222';
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, `${nativeId}.jsonl`), JSON.stringify({
+    type: 'session_meta', payload: { id: nativeId, cwd: dir }
+  }) + '\n');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  const state = new SurfaceState(db);
+  state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: secret });
+  state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
+    { sessionId: nativeId, threadId: nativeId });
+  state.setIntakeBaseline('1000', '100', 'fixture baseline');
+  let preflights = 0;
+  const channel = {
+    id: '1000', guildId: 'guild', topic: null,
+    permissionsFor: () => ({ has: () => true })
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client: {
+      user: { id: 'bot' },
+      channels: { fetch: async () => channel },
+      application: { commands: { async fetch() { return []; }, async create() {} } },
+      async login() {}, on() {}, off() {}, async destroy() {}
+    },
+    fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { throw new Error('startup retry fixture must not dispatch'); } } },
+    recoveryOptions: {
+      codexSessionRoot: root,
+      ordinaryNativePreflight: async (binding, options) => {
+        preflights += 1;
+        const deadline = preflights === 1 ? Date.now() - 1 : Date.now() + 1000;
+        return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, { ...options, deadline });
+      }
+    }
+  });
+  t.after(async () => {
+    await gateway.stop();
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await gateway.start(secret);
+  assert.equal(gateway.started, true);
+  assert.equal(state.getIntakeWatermark('1000').state, 'unavailable');
+  const waitDeadline = Date.now() + 3000;
+  while (state.getIntakeWatermark('1000').state !== 'ready') {
+    if (Date.now() >= waitDeadline) throw new Error('startup native proof retry did not recover');
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.equal(preflights, 2);
+});
+
 test('shared deadline does not permanently hold an unattempted binding', async () => {
   await runSharedBudget(false);
   await runSharedBudget(true);
