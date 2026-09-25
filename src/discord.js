@@ -2194,6 +2194,7 @@ class DiscordGateway {
             failure ||= { ready: false, state: currentState || 'unavailable' };
           }
         } else if (watermark && ['gap', 'unavailable'].includes(watermark.state)) {
+          this.state.setBindingReadiness(binding.channelId, watermark.state, watermark.detail, binding);
           failure ||= { ready: false, state: watermark.state };
         } else if (binding.provider === 'codex' && this.state.isOrdinaryBinding(binding)) {
           await this.recordBoundary(binding, null, READINESS.UNAVAILABLE,
