@@ -3,11 +3,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const { SurfaceState, BOARD_OUTCOMES } = require('../src/state');
 
 function seededRecovery(t, withOutcome = true) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-board-time-'));
-  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  const dbPath = path.join(dir, 'surface.sqlite');
+  const state = new SurfaceState(dbPath);
   t.after(() => {
     state.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -30,7 +32,7 @@ function seededRecovery(t, withOutcome = true) {
       operationEndedAt: '2026-01-01T00:00:00.000Z'
     });
   }
-  return { state, target, attemptId };
+  return { state, target, attemptId, dbPath };
 }
 
 function evidence(observedAt) {
@@ -79,6 +81,39 @@ test('direct board outcomes return the same persisted time on first and duplicat
   const receipt = after.at(-1);
   assert.equal(fresh.recordedAt, receipt.created_at);
   const duplicate = state.recordBoardRefreshOutcome(target, attemptId, BOARD_OUTCOMES.UNKNOWN, detail);
+  assert.equal(duplicate.recordedAt, receipt.created_at);
+  assert.deepEqual(state.listReceipts(), after);
+});
+
+test('CLI recovery prints the normalized readback and durable receipt time', t => {
+  const { state, target, attemptId, dbPath } = seededRecovery(t);
+  const args = [
+    path.join(__dirname, '../src/cli.js'), 'recover', '--db', dbPath,
+    '--board-guild-id', target.guildId,
+    '--board-channel-id', target.channelId,
+    '--board-message-id', target.messageId,
+    '--board-attempt-id', attemptId,
+    '--board-resolution', BOARD_OUTCOMES.APPLIED,
+    '--board-evidence-scope', 'fixture readback',
+    '--board-readback-at', '2026-01-01T01:00:01+01:00',
+    '--board-readback', 'new board',
+    '--board-sole-writer', 'true',
+    '--board-single-attempt', 'true',
+    '--board-no-hidden-retry', 'true'
+  ];
+  const recover = () => {
+    const child = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(child.status, 0, child.stderr);
+    return JSON.parse(child.stdout);
+  };
+  const fresh = recover();
+  const after = state.listReceipts();
+  const receipt = after.at(-1);
+  assert.equal(fresh.readbackAt, '2026-01-01T00:00:01.000Z');
+  assert.equal(JSON.parse(receipt.detail).readbackAt, fresh.readbackAt);
+  assert.equal(fresh.recordedAt, receipt.created_at);
+  const duplicate = recover();
+  assert.equal(duplicate.historical, true);
   assert.equal(duplicate.recordedAt, receipt.created_at);
   assert.deepEqual(state.listReceipts(), after);
 });
