@@ -1,5 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { fixture } = require('./fixtures/peer-fixture');
 const { createPeerService } = require('../src/peer/service');
 const { READINESS } = require('../src/state');
@@ -75,6 +78,25 @@ test('peer packet IDs accept the exact 128-character limit', async t => {
   } });
   const result = await peer.send({ peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'a'.repeat(128) });
   assert.equal(result.status, 'sent');
+});
+
+test('peer send rejects text that exceeds the signed packet budget before custody', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  const textFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'peer-text-')), 'message.txt');
+  fs.writeFileSync(textFile, 'a'.repeat(1500));
+  t.after(() => fs.rmSync(path.dirname(textFile), { recursive: true, force: true }));
+  let posts = 0;
+  const peer = service(f, { fetchImpl: async () => { posts += 1; assert.fail('oversized peer text reached network'); } });
+  const before = f.state.listReceipts().length;
+  for (const [key, input] of [
+    ['inline', { text: 'a'.repeat(1500) }],
+    ['file', { text_file: textFile }]
+  ]) {
+    await assert.rejects(peer.send({ peer: { conductorId: 'recipient' }, dedupe_key: `oversized-${key}`, ...input }),
+      /peer text exceeds signed packet limit/);
+  }
+  assert.equal(posts, 0);
+  assert.equal(f.state.listReceipts().length, before);
 });
 
 test('successful agent send targets the enrolled child and retry keeps one post', async t => {

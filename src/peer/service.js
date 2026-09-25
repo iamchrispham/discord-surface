@@ -5,10 +5,11 @@ const os = require('node:os');
 const path = require('node:path');
 const { resolvePeerCaller } = require('./caller');
 const { resolvePeerBinding, requireReadyPeer } = require('../../dist/peer/resolution');
-const { resolveAgentAddress, runDirectPost } = require('../direct-post');
+const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest } = require('../../dist/state/agent-routing');
+const { readTextFile, resolveAgentAddress, runDirectPost } = require('../direct-post');
 const { postByRole } = require('./post');
 const { inspectPeerResult, validPeerId } = require('./result');
-const { issueAgentAddress } = require('../agent-message');
+const { encodeAgentMessage, issueAgentAddress, KINDS } = require('../agent-message');
 const { READINESS } = require('../state');
 const { THREAD_STATES } = require('../state/thread-enrollment');
 
@@ -44,6 +45,33 @@ function currentPeerDestination(state, target, expectedBinding = null, expectedC
       (!watermark || watermark.state === READINESS.READY) && (parentRoute || childRoute);
   });
   return routes.length === 1;
+}
+
+function assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token }) {
+  const kind = input.reply_to === undefined ? KINDS.REQUEST : KINDS.RESULT;
+  const target = destination === null
+    ? resolveAgentReplyRequest(state, input.reply_to, sourceAddress, null, {
+      guildId: source.guildId, channelId: source.channelId, provider: source.provider,
+      nativeId: source.nativeId, generation: source.generation
+    }, Error).source
+    : resolveAgentAddress(state, destination.binding, destination.childId);
+  try {
+    encodeAgentMessage({
+      id: input.dedupe_key,
+      kind,
+      source: sourceAddress,
+      target,
+      replyTo: input.reply_to ?? null,
+      routingVersion: AGENT_ROUTING_VERSION,
+      ...(kind === KINDS.RESULT ? { sourceParentChannelId: source.channelId } : {}),
+      text
+    }, token);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('agent message exceeds Discord message limit:')) {
+      throw new Error(`peer text exceeds signed packet limit: ${error.message}`, { cause: error });
+    }
+    throw error;
+  }
 }
 
 function createPeerService(context) {
@@ -85,13 +113,15 @@ function createPeerService(context) {
       }
       const sourceRoute = requireReadyPeer(state, source);
       const sourceReadiness = source.readiness;
-      resolveAgentAddress(state, source, sourceRoute.childId);
+      const sourceAddress = resolveAgentAddress(state, source, sourceRoute.childId);
       let agentTarget = null;
       let destination = null;
       if (input.peer !== undefined) {
         destination = requireReadyPeer(state, resolvePeerBinding(state, input.peer, channels));
         agentTarget = issueAgentAddress(resolveAgentAddress(state, destination.binding, destination.childId), token);
       }
+      const text = input.text_file === undefined ? input.text : readTextFile(input.text_file).text;
+      assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token });
       let directory;
       try {
         let textFile = input.text_file;
