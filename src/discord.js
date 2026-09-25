@@ -2860,8 +2860,10 @@ class DiscordGateway {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const selectedChannels = channelIds ? new Set(channelIds) : null;
     this.consumer?.releaseHandledWithoutPost?.();
+    const isHeldDurable = message => message.state === 'submitted' || message.state === 'reply_ready';
     const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
-      (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready);
+      (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready ||
+        isHeldDurable(message));
     this.startDecisionRecovery(signal, selectedChannels);
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -2913,7 +2915,8 @@ class DiscordGateway {
         author: { id: message.authorId, bot: false },
         channel
       };
-      if (!this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready) {
+      if (!this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready &&
+          !isHeldDurable(message)) {
         blockedOwners.add(key);
         continue;
       }

@@ -284,6 +284,12 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
         if (!retryableHold) {
           const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery pending before first fetch', null);
           if (!pending) return false;
+        } else if (gateway.recoverTransport) {
+          void gateway.recoverTransport(
+            'thread history recovery deadline retry',
+            epoch,
+            new Set([enrollment.threadId])
+          ).catch(() => {});
         }
         return false;
       }

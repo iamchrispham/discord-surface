@@ -5,7 +5,10 @@ const LEGACY_DEADLINE_DETAIL_SUFFIX = ' recovery exceeded 30000ms';
 const LEGACY_DEADLINE_DETAILS = {
   THREAD: 'Discord recovery deadline exceeded',
   HISTORY_ADMISSION: 'Discord recovery deadline exceeded while admitting history',
-  HISTORY_BOUND: 'history recovery deadline 30000ms reached'
+  HISTORY_BOUND: 'history recovery deadline 30000ms reached',
+  CODEX_TRANSCRIPT: 'Codex transcript proof unavailable before event write: Discord recovery deadline exceeded',
+  CLAUDE_ENDPOINT: 'Claude endpoint unavailable before event write: Discord recovery deadline exceeded',
+  CODEX_NATIVE_PREFLIGHT: 'Codex native preflight deadline exceeded'
 } as const;
 
 export const RECOVERY_DEADLINE_MARKER_PREFIX = 'Discord recovery deadline: ';

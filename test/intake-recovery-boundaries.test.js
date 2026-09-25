@@ -7,6 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { fixture } = require('./helpers/intake-recovery-fixture');
+const { MESSAGE_STATES } = require('../src/state');
 const { recoverThread } = require('../src/discord/thread-enrollment');
 const { waitForRecoveryOperation } = require('../src/discord');
 const { CASES, operatorMessage } = require('./helpers/intake-recovery-scenarios');
@@ -139,6 +140,31 @@ test('R6: child deadline before first fetch keeps the existing pending boundary'
   assert.equal(f.calls.length, callsBefore);
 });
 
+test('R6b: retryable child deadline before first fetch queues a fresh scoped recovery', CASES, async t => {
+  const f = fixture(t);
+  const owner = f.state.getBinding('1000');
+  f.state.markThreadBoundary('2000', 'unavailable', 'Discord recovery deadline: prior pass expired', null, null, owner);
+  const recoveries = [];
+  const originalRecoverTransport = f.gateway.recoverTransport;
+  f.gateway.recoverTransport = async (...args) => {
+    recoveries.push(args);
+    return { ready: false, state: 'unavailable' };
+  };
+  try {
+    const result = await recoverThread(f.gateway, f.boundary('2000'), new AbortController().signal,
+      f.gateway.lifecycleEpoch, waitForRecoveryOperation, false, Date.now() - 1);
+    assert.equal(result, false);
+  } finally {
+    f.gateway.recoverTransport = originalRecoverTransport;
+  }
+
+  assert.equal(recoveries.length, 1);
+  assert.equal(recoveries[0][0], 'thread history recovery deadline retry');
+  assert.equal(recoveries[0][1], f.gateway.lifecycleEpoch);
+  assert.deepEqual([...recoveries[0][2]], ['2000']);
+  assert.equal(recoveries[0].length, 3, 'retry must receive a fresh deadline');
+});
+
 test('R7: old timeout gap with a confirmed cursor retries after database reopen', CASES, async t => {
   const f = fixture(t);
   const owner = f.state.getBinding('1000');
@@ -203,10 +229,41 @@ test('R7c: legacy child timeout gap retries after database reopen', CASES, async
   assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
 });
 
+test('R7e: degraded reconciliation drains submitted and reply-ready custody on a held route', CASES, async t => {
+  const f = fixture(t);
+  const owner = f.state.getBinding('1000');
+  for (const id of ['101', '102']) {
+    assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, id, '1000')).accepted, true);
+    assert.equal(f.state.claimDispatch(id).claimed, true);
+    assert.equal(f.state.markSubmitted(id).state, MESSAGE_STATES.SUBMITTED);
+  }
+  const replyReady = f.state.getMessage('102');
+  f.state.recordNativeReply({
+    provider: replyReady.provider,
+    messageId: replyReady.id,
+    nativeId: replyReady.nativeId,
+    generation: replyReady.generation,
+    text: 'already observed'
+  });
+  assert.equal(f.state.getMessage('102').state, MESSAGE_STATES.REPLY_READY);
+  f.state.markIntakeBoundary('1000', 'gap', 'Discord recovery deadline: held route', null, null, owner);
+  f.enableDelivery();
+
+  await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+  await f.gateway.consumer.waitForNativeWork();
+
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
+  assert.equal(f.state.getMessage('102').state, MESSAGE_STATES.REPLIED);
+  assert.equal(f.replies.length, 2);
+});
+
 for (const legacy of [
   { name: 'child admission', detail: LEGACY_THREAD_TIMEOUT_DETAIL, thread: true },
   { name: 'parent admission', detail: 'Discord recovery deadline exceeded while admitting history', thread: false },
-  { name: 'parent history bound', detail: 'history recovery deadline 30000ms reached', thread: false }
+  { name: 'parent history bound', detail: 'history recovery deadline 30000ms reached', thread: false },
+  { name: 'Codex transcript preflight', detail: 'Codex transcript proof unavailable before event write: Discord recovery deadline exceeded', thread: false },
+  { name: 'Claude endpoint preflight', detail: 'Claude endpoint unavailable before event write: Discord recovery deadline exceeded', thread: false },
+  { name: 'Codex native preflight', detail: 'Codex native preflight deadline exceeded', thread: false }
 ]) {
   test(`R7d: bounded legacy ${legacy.name} timeout retries after database reopen`, CASES, async t => {
     const f = fixture(t);
@@ -233,7 +290,8 @@ const LEGACY_NEGATIVE_CONTROLS = [
   { name: 'page-bound detail', detail: 'history page bound 100 reached', gapFrom: '100', gapTo: '101' },
   { name: 'near-match timeout detail', detail: 'ordinary-bind recovery exceeded 30001ms', gapFrom: null, gapTo: null },
   { name: 'legacy detail with coverage bounds', detail: LEGACY_TIMEOUT_DETAIL, gapFrom: '100', gapTo: '101' },
-  { name: 'legacy detail without a confirmed cursor', detail: LEGACY_TIMEOUT_DETAIL, gapFrom: null, gapTo: null, clearCursor: true }
+  { name: 'legacy detail without a confirmed cursor', detail: LEGACY_TIMEOUT_DETAIL, gapFrom: null, gapTo: null, clearCursor: true },
+  { name: 'native preflight detail without a confirmed cursor', detail: 'Codex native preflight deadline exceeded', gapFrom: null, gapTo: null, clearCursor: true }
 ];
 
 for (const control of LEGACY_NEGATIVE_CONTROLS) {
