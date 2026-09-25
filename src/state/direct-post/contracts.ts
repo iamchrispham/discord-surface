@@ -75,6 +75,7 @@ export interface DirectPostReceiptRow {
 
 export interface DirectPostState {
   db: DirectPostDatabase;
+  isAgentResultForWithdrawnRequest(packet: AgentMessage): boolean;
   activeFilePreparationCount?(): number;
   transaction<T>(operation: () => T): T;
   directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
@@ -232,4 +233,3 @@ export interface DirectPostDependencies {
   now(): string;
   DIRECT_POST_OUTCOMES?: typeof DIRECT_POST_OUTCOMES;
 }
-

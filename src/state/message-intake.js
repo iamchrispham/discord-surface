@@ -128,6 +128,14 @@ function createMessageIntakeHandlers({
       }
       const committed = this.getMessage(event.id);
       if (committed) return { accepted: false, duplicate: true, reason: 'duplicate-message', message: committed };
+      if (agent && this.isAgentResultForWithdrawnRequest(agent)) {
+        this.receipt(null, 'intake-rejected', {
+          discordId: event.id, channelId: authorityChannelId,
+          ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
+          reason: 'agent-request-withdrawn', ready
+        });
+        return this.reject('agent-request-withdrawn');
+      }
       const cutoffReason = intakeCutoffDecision(event.id, intakeCutoff, compareDiscordIds);
       if (cutoffReason) {
         this.receipt(null, 'intake-rejected', {

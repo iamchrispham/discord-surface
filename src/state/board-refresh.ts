@@ -13,6 +13,7 @@ import {
 } from './board-refresh/receipt-projection';
 import * as crypto from 'node:crypto';
 import { boardTextEquivalent } from '../board-text';
+import { qualifiedReadbackInstant } from './readback-instant';
 import {
   BOARD_RECEIPT_KINDS,
   BOARD_OUTCOMES,
@@ -342,6 +343,13 @@ function beginBoardRefresh(state: BoardState, metaInput: BoardRefreshMeta, captu
   });
 }
 
+function persistBoardOutcome(state: BoardState, attemptId: string, detail: Record<string, unknown>): BoardRefreshRecord {
+  state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, detail);
+  const persisted = latestOutcome(readReceipts(state, [BOARD_RECEIPT_KINDS.OUTCOME]), attemptId);
+  if (!persisted) throw new Error('board refresh outcome receipt was not persisted');
+  return { ...(detail as unknown as BoardRefreshRecord), recordedAt: persisted.createdAt };
+}
+
 function recordBoardRefreshOutcome(state: BoardState, targetInput: BoardTarget, attemptIdInput: string, outcomeInput: unknown, detail: Record<string, unknown> = {}): BoardRefreshRecord {
   const target = assertTarget(targetInput);
   const attemptId = text(attemptIdInput, 'attemptId', 128);
@@ -362,8 +370,7 @@ function recordBoardRefreshOutcome(state: BoardState, targetInput: BoardTarget, 
       status: outcome,
       operationEndedAt: ended
     };
-    state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, next);
-    return { ...(next as unknown as BoardRefreshRecord), recordedAt: ended };
+    return persistBoardOutcome(state, attemptId, next);
   });
 }
 
@@ -372,8 +379,7 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
   const attemptId = text(attemptIdInput, 'attemptId', 128);
   if (resolution !== BOARD_OUTCOMES.APPLIED) throw new Error('board refresh reconciliation only accepts applied evidence');
   const scope = text(evidence?.evidenceScope, 'evidenceScope', 2000);
-  const observedAt = text(evidence?.observedAt, 'observedAt', 64);
-  if (!Number.isFinite(Date.parse(observedAt))) throw new Error('observedAt must be an ISO timestamp');
+  const observedAt = qualifiedReadbackInstant(evidence?.observedAt);
   const readbackContent = boardContent(evidence?.readbackContent, 'readbackContent');
   if (!evidence.soleWriter || !evidence.singleAttempt || !evidence.noHiddenRetry) {
     throw new Error('positive board readback requires sole-writer, single-attempt, and no-hidden-retry evidence');
@@ -409,8 +415,7 @@ function reconcileBoardRefresh(state: BoardState, targetInput: BoardTarget, atte
       noHiddenRetry: true,
       operationEndedAt: endedAt
     };
-    state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, next);
-    return { ...(next as unknown as BoardRefreshRecord), recordedAt: observedAt };
+    return persistBoardOutcome(state, attemptId, next);
   });
 }
 
