@@ -258,7 +258,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
       const firstPayloadText = fs.readFileSync(firstPointer.payloadPath, 'utf8');
       const firstPayload = JSON.parse(firstPayloadText);
       assert.notEqual(firstPointer.payloadPath, oldPayloadPath);
-      assert.equal(firstPayload.version, 4);
+      assert.equal(firstPayload.version, 5);
       assert.equal(firstPayload.content, messageRequest(state.getMessage(agentId)));
       assert.match(firstPayload.content, /Agent result result-1 from codex/);
       assert.match(firstPayload.content, /Correlates to agent message work-1/);
