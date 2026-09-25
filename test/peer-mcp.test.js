@@ -20,7 +20,17 @@ test('public MCP stdio omits the caller and refuses an unready send', { timeout:
   const deadline = setTimeout(() => { void transport.close(); }, 10000);
   try {
     await client.connect(transport);
-    assert.deepEqual((await client.listTools()).tools.map(tool => tool.name), ['post', 'peer_result', 'peer_list', 'peer_send']);
+    const tools = (await client.listTools()).tools;
+    assert.deepEqual(tools.map(tool => tool.name), ['post', 'peer_result', 'peer_list', 'peer_send']);
+    const postSchema = tools.find(tool => tool.name === 'post').inputSchema;
+    const peerSendSchema = tools.find(tool => tool.name === 'peer_send').inputSchema;
+    const childSchema = postSchema.oneOf.find(branch => branch.properties.role.enum[0] === 'child');
+    const nonChildSchema = postSchema.oneOf.find(branch => branch.properties.role.enum.includes('announce'));
+    assert.deepEqual(childSchema.properties.dedupe_key, peerSendSchema.properties.dedupe_key);
+    assert.deepEqual(childSchema.properties.reply_to, peerSendSchema.properties.reply_to);
+    assert.deepEqual(nonChildSchema.properties.role.enum, ['announce', 'board']);
+    assert.equal(postSchema.properties.dedupe_key.type, 'string');
+    assert.equal(postSchema.properties.reply_to.type, 'string');
     const listed = await client.callTool({ name: 'peer_list', arguments: {} });
     const peers = JSON.parse(listed.content[0].text);
     assert.deepEqual(peers, []);

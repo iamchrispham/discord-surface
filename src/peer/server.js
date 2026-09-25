@@ -15,10 +15,15 @@ const selector = { oneOf: [
   { type: 'object', properties: { channelId: { type: 'string' } }, required: ['channelId'], additionalProperties: false },
   { type: 'object', properties: { channelName: { type: 'string' } }, required: ['channelName'], additionalProperties: false }
 ] };
+const postInputSchema = { type: 'object', properties: { role: { enum: ['announce', 'board', 'child'] }, text_file: { type: 'string' },
+  dedupe_key: { type: 'string' }, message_id: { type: 'string' }, peer: selector, reply_to: { type: 'string' } },
+  required: ['role', 'text_file', 'dedupe_key'], additionalProperties: false, oneOf: [
+    { properties: { role: { enum: ['child'] }, dedupe_key: packetId, reply_to: packetId }, required: ['role'] },
+    { properties: { role: { enum: ['announce', 'board'] } }, required: ['role'] }
+  ] };
 const tools = [
   { name: 'post', description: 'Post an announcement to the caller parent, update a known board message, or send an authenticated child packet. Board requires message_id. Child requires peer or reply_to.',
-    inputSchema: { type: 'object', properties: { role: { enum: ['announce', 'board', 'child'] }, text_file: { type: 'string' },
-      dedupe_key: { type: 'string' }, message_id: { type: 'string' }, peer: selector, reply_to: { type: 'string' } }, required: ['role', 'text_file', 'dedupe_key'], additionalProperties: false } },
+    inputSchema: postInputSchema },
   { name: 'peer_result', description: 'Inspect caller-scoped send, native pickup and completion evidence without changing custody.',
     inputSchema: { type: 'object', properties: { correlation_id: packetId }, required: ['correlation_id'], additionalProperties: false } },
   { name: 'peer_list', description: 'List current bindings and whether each has one ready enrolled child.',
