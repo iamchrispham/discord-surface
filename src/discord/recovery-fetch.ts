@@ -67,7 +67,7 @@ export function isInterruptedRetryBoundary(boundary: RetryBoundaryLike | null | 
 export function isPreAdoptionRetryableThread(enrollment: ThreadEnrollment | null | undefined): boolean {
   return Boolean(enrollment?.active && !enrollment.adoptedAt &&
     (enrollment.state === THREAD_STATES.PENDING || enrollment.state === THREAD_STATES.UNAVAILABLE) &&
-    isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, enrollment.detail));
+    (isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, enrollment.detail) || isInterruptedRetryBoundary(enrollment)));
 }
 
 export async function recoveryFetch<T>(fetch: () => Promise<T>): Promise<T> {

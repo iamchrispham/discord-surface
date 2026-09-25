@@ -4,6 +4,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { fixture } = require('./helpers/intake-recovery-fixture');
+const {
+  RECOVERY_DEADLINE_MARKER_PREFIX,
+  RECOVERY_RETRY_PENDING_PREFIX
+} = require('../src/discord/recovery-fetch');
 
 for (const kind of ['channel', 'history']) {
   test(`pre-adoption thread ${kind} 503 stays pending and preserves observed custody`, async t => {
@@ -222,6 +226,43 @@ test('pre-adoption 503 waits for later recovery instead of scheduling itself aga
   assert.equal(f.calls.filter(c => c.kind === 'channel' && c.id === '2000').length, 1,
     'one recovery invocation caused repeated child fetches');
   assert.equal(f.dispatched.length, 0);
+});
+
+test('pre-adoption retry remains held from live checkpoints while its retry boundary is pending', { timeout: 3000 }, async t => {
+  const f = fixture(t, { adoptThread: false });
+  const binding = f.state.getBinding('1000');
+  f.state.markThreadBoundary('2000', 'unavailable', `${RECOVERY_DEADLINE_MARKER_PREFIX}timeout`, null, null, binding);
+  const controller = new AbortController();
+  const fetchChannel = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+  f.gateway.client.channels.fetch = async id => {
+    const channel = await fetchChannel(id);
+    const boundary = f.boundary('2000');
+    if (id === '2000' && boundary.state === 'pending' && boundary.detail?.startsWith(RECOVERY_RETRY_PENDING_PREFIX)) {
+      controller.abort();
+    }
+    return channel;
+  };
+  const scheduled = [];
+  f.gateway.liveCheckpointThreshold = 1;
+  f.gateway.beginLiveCheckpoint = counts => scheduled.push([...counts.entries()]);
+
+  await f.gateway.recoverInbound(controller.signal, 'fixture retry', f.gateway.lifecycleEpoch,
+    new Set(['2000']), Date.now() + 1000);
+
+  const retry = f.boundary('2000');
+  assert.equal(retry.state, 'pending');
+  assert.ok(retry.detail.startsWith(RECOVERY_RETRY_PENDING_PREFIX));
+  assert.equal(f.gateway.liveIntakeCounts.get('2000') || 0, 0,
+    'interrupted retry must not be reclassified as ordinary pending checkpoint work');
+  f.gateway.scheduleHeldLiveCheckpoints();
+  assert.deepEqual(scheduled, [], 'retry-pending pre-adoption thread must not schedule a live checkpoint');
+
+  const pending = f.state.markThreadBoundary('2000', 'pending', 'Thread history recovery in progress', null, null,
+    binding, undefined, undefined, retry);
+  assert.ok(pending);
+  f.gateway.liveIntakeCounts.set('2000', 1);
+  f.gateway.scheduleHeldLiveCheckpoints();
+  assert.deepEqual(scheduled, [[['2000', 1]]], 'ordinary pending thread remains checkpoint eligible');
 });
 
 for (const expired of [true, false]) {
