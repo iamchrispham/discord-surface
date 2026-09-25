@@ -49,7 +49,7 @@ function evidence(observedAt) {
 test('board recovery refuses unqualified or invalid instants without a receipt', t => {
   const { state, target, attemptId } = seededRecovery(t);
   const before = state.listReceipts();
-  for (const observedAt of ['2026-01-01T00:00:01', '2026-02-30T00:00:01Z', '2026-01-01T00:00:01-00:00', '2026-01-01T00:00:01-0000']) {
+  for (const observedAt of ['2026-01-01T00:00:01', '2026-02-30T00:00:01Z', '2026-02-30T00:01Z', '2026-01-01T00:00:01-00:00', '2026-01-01T00:00:01-0000']) {
     assert.throws(
       () => state.reconcileBoardRefresh(target, attemptId, BOARD_OUTCOMES.APPLIED, evidence(observedAt)),
       /observedAt must be a timezone-qualified ISO timestamp/
@@ -71,6 +71,15 @@ test('board recovery normalizes readback time and returns persisted receipt time
   assert.equal(duplicate.historical, true);
   assert.equal(duplicate.recordedAt, receipt.created_at);
   assert.deepEqual(state.listReceipts(), after);
+});
+
+test('board recovery accepts timezone-qualified minute precision', t => {
+  for (const observedAt of ['2026-01-01T00:01Z', '2026-01-01T01:01+01:00', '2026-01-01T01:01+0100']) {
+    const { state, target, attemptId } = seededRecovery(t);
+    const result = state.reconcileBoardRefresh(target, attemptId, BOARD_OUTCOMES.APPLIED, evidence(observedAt));
+    assert.equal(result.readbackAt, '2026-01-01T00:01:00.000Z');
+    assert.equal(JSON.parse(state.listReceipts().at(-1).detail).readbackAt, result.readbackAt);
+  }
 });
 
 test('direct board outcomes return the same persisted time on first and duplicate calls', t => {
@@ -95,7 +104,7 @@ test('CLI recovery prints the normalized readback and durable receipt time', t =
     '--board-attempt-id', attemptId,
     '--board-resolution', BOARD_OUTCOMES.APPLIED,
     '--board-evidence-scope', 'fixture readback',
-    '--board-readback-at', '2026-01-01T01:00:01+0100',
+    '--board-readback-at', '2026-01-01T01:01+0100',
     '--board-readback', 'new board',
     '--board-sole-writer', 'true',
     '--board-single-attempt', 'true',
@@ -109,7 +118,7 @@ test('CLI recovery prints the normalized readback and durable receipt time', t =
   const fresh = recover();
   const after = state.listReceipts();
   const receipt = after.at(-1);
-  assert.equal(fresh.readbackAt, '2026-01-01T00:00:01.000Z');
+  assert.equal(fresh.readbackAt, '2026-01-01T00:01:00.000Z');
   assert.equal(JSON.parse(receipt.detail).readbackAt, fresh.readbackAt);
   assert.equal(fresh.recordedAt, receipt.created_at);
   const duplicate = recover();
