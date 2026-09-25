@@ -9,6 +9,8 @@ import type {
 import type { Attachment } from './attachments';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import type { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { CLAUDE_PICKUP_ACKNOWLEDGMENT } from './acknowledgment/pickup';
+export { CLAUDE_PICKUP_ACKNOWLEDGMENT } from './acknowledgment/pickup';
 
 const { recordNativeAcknowledgment } = require('./acknowledgment') as typeof import('./acknowledgment');
 
@@ -264,7 +266,9 @@ export function createDefaultMcp({ nativeId, state }: { nativeId: string; state:
     { name: 'discord-surface-claude-channel', version: '0.1.0' },
     {
       capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
-      instructions: 'This channel is explicitly opted in by the native Claude session. For each event, call acknowledge at pickup, then answer the user and call reply with the exact messageId and generation from the event. Do not attach, resume, or start another session.'
+      instructions: 'This channel is explicitly opted in by the native Claude session. For each event, call acknowledge at pickup. ' +
+        `${CLAUDE_PICKUP_ACKNOWLEDGMENT} ` +
+        'Then answer the user and call reply with the exact messageId and generation from the event. Do not attach, resume, or start another session.'
     }
   );
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
