@@ -1861,6 +1861,12 @@ class DiscordGateway {
           const recovery = await this.recoverTransport('ordinary-handoff', this.lifecycleEpoch, recoverableChannels);
           if (recovery.ready) await this.reconcilePending(undefined, { channelIds: recoverableChannels });
           else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true, channelIds: recoverableChannels });
+          for (const channelId of recoverableChannels) {
+            const binding = this.state.getBinding(channelId);
+            if (binding?.active && this.isRetryableNativeProofBoundary(binding)) {
+              this.deferredHandoffRecoveryChannels.add(channelId);
+            }
+          }
         }
         if (reconcileOnlyChannels.size) {
           await this.reconcilePending(undefined, {

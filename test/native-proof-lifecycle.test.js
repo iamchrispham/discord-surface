@@ -8,6 +8,7 @@ const { recordNativeAcknowledgment } = require(path.join(installed, 'src/acknowl
 const { SurfaceState } = require(path.join(installed, 'src/state'));
 const { DiscordGateway } = require(path.join(installed, 'src/discord'));
 const { validateCodexSessionIdentityAsync } = require(path.join(installed, 'src/native'));
+const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail } = require(path.join(installed, 'src/discord/native-proof-recovery'));
 
 for (const phase of ['preflight', 'before-binding', 'existing-gap', 'reopen', 'pending-reopen', 'missing', 'concurrent', 'workspace-mismatch', 'ambiguous', 'permission', 'identity-mismatch', 'cancelled', 'startup']) {
 test(`native deadline recovery preserves custody: ${phase}`, async () => {
@@ -368,6 +369,67 @@ test('startup schedules a retry for a native proof deadline marker', { timeout: 
     await new Promise(resolve => setTimeout(resolve, 25));
   }
   assert.equal(preflights, 2);
+});
+
+test('scheduled native proof deadline requeues until proof succeeds', { timeout: 5000 }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-deferred-retry-'));
+  const root = path.join(dir, 'sessions');
+  const db = path.join(dir, 'surface.sqlite');
+  const secret = path.join(dir, 'discord.env');
+  const nativeId = '33333333-3333-4333-8333-333333333333';
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, `${nativeId}.jsonl`), JSON.stringify({
+    type: 'session_meta', payload: { id: nativeId, cwd: dir }
+  }) + '\n');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  const state = new SurfaceState(db);
+  state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: secret });
+  const binding = state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
+    { sessionId: nativeId, threadId: nativeId });
+  state.setIntakeBaseline('1000', '100', 'fixture baseline');
+  state.markIntakeBoundary('1000', 'unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now() - 1), null, null, binding);
+  let preflights = 0;
+  const channel = { id: '1000', guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) };
+  const gateway = new DiscordGateway({
+    state,
+    client: {
+      user: { id: 'bot' },
+      channels: { fetch: async () => channel },
+      application: { commands: { async fetch() { return []; }, async create() {} } },
+      async login() {}, on() {}, off() {}, async destroy() {}
+    },
+    fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { throw new Error('deferred retry fixture must not dispatch'); } } },
+    recoveryOptions: {
+      codexSessionRoot: root,
+      ordinaryNativePreflight: async (current, options) => {
+        preflights += 1;
+        const deadline = failPreflights && preflights < 3 ? Date.now() - 1 : Date.now() + 1000;
+        return validateCodexSessionIdentityAsync(current.nativeId, current.workspace, root, { ...options, deadline });
+      }
+    }
+  });
+  let failPreflights = false;
+  t.after(async () => {
+    await gateway.stop();
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await gateway.start(secret);
+  failPreflights = true;
+  preflights = 0;
+  state.markIntakeBoundary('1000', 'unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now() - 1), null, null, state.getBinding('1000'));
+  gateway.deferredHandoffRecoveryDelayMs = 0;
+  gateway.scheduleDeferredHandoffRecovery('1000');
+  const waitDeadline = Date.now() + 3000;
+  while (state.getIntakeWatermark('1000').state !== 'ready') {
+    if (Date.now() >= waitDeadline) throw new Error('deferred native proof retry did not recover');
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.equal(preflights, 3);
 });
 
 test('shared deadline does not permanently hold an unattempted binding', async () => {
