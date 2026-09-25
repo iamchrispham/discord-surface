@@ -110,6 +110,9 @@ function parseArgs(argv) {
         if (unknown !== undefined) {
           throw Object.assign(new Error(`unknown --${unknown} for courier-guard`), { command: 'courier-guard' });
         }
+        if (Object.hasOwn(args, 'help') && args.help !== true) {
+          throw Object.assign(new Error('--help takes no value'), { command: 'courier-guard' });
+        }
       }
     };
   }

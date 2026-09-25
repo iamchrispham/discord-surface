@@ -292,10 +292,15 @@ test('degraded courier-guard fallback matches its allowed flags and denies extra
     return load.call(this, request, parent, isMain);
   };
   try {
-    for (const key of [...COMMON_FLAGS, ...allowedFlags('courier-guard')]) {
+    for (const key of [...COMMON_FLAGS, ...allowedFlags('courier-guard')].filter(key => key !== 'help')) {
       assert.doesNotThrow(() => parseArgs(['courier-guard', `--${key}`, 'x']), `fallback rejected --${key}`);
     }
+    assert.doesNotThrow(() => parseArgs(['courier-guard', '--help']));
+    for (const value of ['', 'true', 'false']) {
+      assert.throws(() => parseArgs(['courier-guard', `--help=${value}`]), /--help takes no value/);
+    }
     assert.throws(() => parseArgs(['courier-guard', '--message-id', 'x']), /unknown --message-id for courier-guard/);
+    assert.throws(() => parseArgs(['courier-guard', '--message-id', 'x', '--help=false']), /unknown --message-id for courier-guard/);
     assert.throws(() => parseArgs(['courier-guard', '--__proto__', 'x']), /unknown --__proto__ for courier-guard/);
   } finally {
     Module._load = load;
