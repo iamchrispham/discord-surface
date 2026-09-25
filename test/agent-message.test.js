@@ -212,7 +212,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
     const trustedCompletion = agentCompletionCommand({ ...state.getMessage(agentId), channelId: destination.channelId }, db, path.resolve(path.join(__dirname, '../src/cli.js')), dir);
 
     const oldPayloadPath = path.join(dir, '.cm-e', `${crypto.createHash('sha256')
-      .update(`2\0${path.resolve(db)}\0${agentId}\0${destination.nativeId}\0${destination.generation}`)
+      .update(`4\0${path.resolve(db)}\0${agentId}\0${destination.nativeId}\0${destination.generation}`)
       .digest('hex').slice(0, 32)}.json`);
     const oldPayload = monitorEvent({
       content: agentEvent.content,
@@ -224,7 +224,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
       cliPath: path.resolve(path.join(__dirname, '../src/cli.js')),
       textFile: path.join(dir, 'old-reply.txt')
     });
-    oldPayload.version = 2;
+    oldPayload.version = 4;
     const oldPayloadText = JSON.stringify(oldPayload);
     fs.mkdirSync(path.dirname(oldPayloadPath), { recursive: true, mode: 0o700 });
     fs.chmodSync(path.dirname(oldPayloadPath), 0o700);
