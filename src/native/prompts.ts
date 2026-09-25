@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import type { Attachment } from '../attachments';
 import { watcherNoticePrompt, type WatcherNotice } from '../watcher-notice';
+import { CLAUDE_PICKUP_ACKNOWLEDGMENT } from '../acknowledgment/pickup';
 import { ENVELOPE_TYPE, PROMPT_PREFIX } from '../state/courier-route/constants';
 import type { CourierDispatchEnvelope, NativeMessage } from '../native';
 
@@ -192,6 +193,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     isDecision
       ? `Saved canonical decision continuation ${message.id} for native Claude session ${message.nativeId}.`
       : `Inbound Discord message ${message.id} for native Claude session ${message.nativeId}.`,
+    `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once and follow its result before any work: ${CLAUDE_PICKUP_ACKNOWLEDGMENT}`,
     replyInstruction,
     ...(completionInstruction ? [completionInstruction] : []),
     isDecision ? 'Preserve the exact canonical identity and answer from the decision JSON. Preserve this session. Do not start or resume another session.' : 'Do not start or resume another session.',
