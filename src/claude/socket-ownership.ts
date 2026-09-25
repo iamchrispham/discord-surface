@@ -15,6 +15,8 @@ type FileIdentity = {
   ino: bigint;
 };
 
+export type SocketPathIdentity = FileIdentity;
+
 export type SocketLockRelease = () => void;
 
 const LOCK_NAMESPACE = '.discord-surface-locks';
@@ -61,7 +63,9 @@ function processIdentity(pid: number): string | undefined {
   try {
     const startTime = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
       encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore']
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1000,
+      env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' }
     }).trim();
     if (startTime) return `${linuxBootId ? `ps:${linuxBootId}:` : 'ps:'}${startTime}`;
   } catch {}
@@ -74,7 +78,9 @@ function processState(pid: number): string | undefined {
   try {
     const state = execFileSync('ps', ['-p', String(pid), '-o', 'state='], {
       encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore']
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1000,
+      env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' }
     }).trim();
     return state.charAt(0) || undefined;
   } catch {}
@@ -88,6 +94,26 @@ function sameFile(left: FileIdentity, right: FileIdentity): boolean {
 function fileIdentity(filePath: string): FileIdentity {
   const stats = fs.lstatSync(filePath, { bigint: true });
   return { dev: stats.dev, ino: stats.ino };
+}
+
+export function socketPathIdentity(socketPath: string): SocketPathIdentity | undefined {
+  try { return fileIdentity(socketPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+export function unlinkSocketIfOwned(socketPath: string, expected: SocketPathIdentity | null | undefined): void {
+  if (!expected) return;
+  let observed: FileIdentity;
+  try { observed = fileIdentity(socketPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (!sameFile(observed, expected)) return;
+  try { fs.unlinkSync(socketPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
 }
 
 function alternateCase(value: string): string {
@@ -213,16 +239,14 @@ function lockNamespacePath(socketPath: string, key: string): string {
   const owner = process.getuid?.();
   const ownerName = owner === undefined ? 'shared' : String(owner);
   const candidates = [
-    lockNamespaceCandidate(temporaryRoot, `${LOCK_NAMESPACE}-${ownerName}`),
-    lockNamespaceCandidate(temporaryRoot, `.dss-locks-${ownerName}-${key.slice(0, 16)}`),
     lockNamespaceCandidate(os.homedir(), `.dss-locks-${ownerName}-${key}`),
+    lockNamespaceCandidate(os.homedir(), `${LOCK_NAMESPACE}-${ownerName}`),
+    lockNamespaceCandidate(temporaryRoot, `.dss-locks-${ownerName}-${key.slice(0, 16)}`),
     lockNamespaceCandidate(temporaryRoot, `${LOCK_NAMESPACE}-fallback-${ownerName}-${key}`)
   ];
   for (const candidate of candidates) {
     if (pathsOverlap(socketPath, candidate)) continue;
-    if (!ensureUsableLockNamespaceCandidate(candidate)) {
-      throw new Error('Claude channel socket lock namespace conflicts with socket path');
-    }
+    if (!ensureUsableLockNamespaceCandidate(candidate)) continue;
     return candidate;
   }
   throw new Error('Claude channel socket lock namespace conflicts with socket path');
@@ -299,8 +323,8 @@ function readSocketLockOwnerSnapshot(ownerPath: string): { owner: OwnerRecord; i
     const stats = fs.fstatSync(descriptor, { bigint: true });
     ownerValue = fs.readFileSync(descriptor, 'utf8').trim();
     identity = { dev: stats.dev, ino: stats.ino };
-  } catch {
-    throw new Error('Claude channel socket preparation is already in progress');
+  } catch (error) {
+    throw error;
   } finally {
     if (descriptor !== undefined) {
       try { fs.closeSync(descriptor); } catch {}
@@ -570,9 +594,9 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
       if (lockStats.isDirectory()) {
         let ownerSnapshot: { owner: OwnerRecord; identity: FileIdentity };
         try { ownerSnapshot = readSocketLockOwnerSnapshot(ownerPath); } catch (ownerError) {
-          if (errorMessage(ownerError) !== 'Claude channel socket preparation is already in progress') throw ownerError;
+          if ((ownerError as NodeJS.ErrnoException).code !== 'ENOENT') throw ownerError;
           if (reclaimOwnerlessLock(lockPath, ownerPath)) continue;
-          throw ownerError;
+          throw new Error('Claude channel socket preparation is already in progress');
         }
         const owner = ownerSnapshot.owner;
         if (isSocketLockOwnerAlive(owner)) {
@@ -584,12 +608,16 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
         continue;
       }
       if (!lockStats.isFile()) throw new Error('Claude channel socket preparation lock is invalid');
-      const owner = readSocketLockOwner(lockPath);
-      const lockIdentity = fileIdentity(lockPath);
+      let ownerSnapshot: { owner: OwnerRecord; identity: FileIdentity };
+      try { ownerSnapshot = readSocketLockOwnerSnapshot(lockPath); } catch (ownerError) {
+        if ((ownerError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw ownerError;
+      }
+      const owner = ownerSnapshot.owner;
       if (isSocketLockOwnerAlive(owner)) {
         throw new Error('Claude channel socket preparation is already in progress');
       }
-      if (!reclaimLegacyLockFile(lockPath, lockIdentity)) {
+      if (!reclaimLegacyLockFile(lockPath, ownerSnapshot.identity)) {
         throw new Error('Claude channel socket preparation is already in progress');
       }
     }

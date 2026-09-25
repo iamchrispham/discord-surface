@@ -345,6 +345,7 @@ export class ClaudeChannel<
   declare mcp: ClaudeResolvedMcp<TProvidedMcp>;
   declare server: http.Server | null;
   declare ownsSocket: boolean;
+  declare socketIdentity: socketOwnership.SocketPathIdentity | null;
   declare started: boolean;
   declare stopping: boolean;
   declare stopPromise: Promise<void> | null;
@@ -381,6 +382,7 @@ export class ClaudeChannel<
     this.mcp = (mcp || createDefaultMcp({ nativeId, state: state as ClaudeDefaultMcpState })) as unknown as ClaudeResolvedMcp<TProvidedMcp>;
     this.server = null;
     this.ownsSocket = false;
+    this.socketIdentity = null;
     this.started = false;
     this.stopping = false;
     this.stopPromise = null;
@@ -573,13 +575,25 @@ export class ClaudeChannel<
         server.once('error', reject);
         server.listen(this.socketPath, () => {
           server.off('error', reject);
+          let socketIdentity: socketOwnership.SocketPathIdentity | undefined;
+          try { socketIdentity = socketOwnership.socketPathIdentity(this.socketPath); } catch (error) {
+            try { server.close(); } catch {}
+            reject(error);
+            return;
+          }
+          if (!socketIdentity) {
+            try { server.close(); } catch {}
+            reject(new Error('Claude channel listener socket disappeared during startup'));
+            return;
+          }
           if (this.transportClosed) {
             try { server.close(); } catch {}
-            try { fs.unlinkSync(this.socketPath); } catch {}
+            try { socketOwnership.unlinkSocketIfOwned(this.socketPath, socketIdentity); } catch {}
             reject(new Error('Claude channel stopped during listener startup'));
             return;
           }
           try { fs.chmodSync(this.socketPath, 0o600); } catch {}
+          this.socketIdentity = socketIdentity;
           this.ownsSocket = true;
           resolve();
         });
@@ -595,8 +609,9 @@ export class ClaudeChannel<
       try { this.server?.close(); } catch {}
       this.server = null;
       if (this.ownsSocket) {
-        try { fs.unlinkSync(this.socketPath); } catch {}
+        try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch {}
         this.ownsSocket = false;
+        this.socketIdentity = null;
       }
       throw error;
     } finally {
@@ -634,10 +649,11 @@ export class ClaudeChannel<
       } catch (error) { errors.push(error); }
       this.server = null;
       if (this.ownsSocket) {
-        try { fs.unlinkSync(this.socketPath); } catch (error) {
+        try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch (error) {
           if ((error as { code?: unknown }).code !== 'ENOENT') errors.push(error);
         }
         this.ownsSocket = false;
+        this.socketIdentity = null;
       }
       const release = this.socketLockRelease;
       this.started = false;

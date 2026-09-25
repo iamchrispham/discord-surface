@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { prepareSocket, prepareSocketAsync, ClaudeChannel } = require('../src/claude-channel');
 const socketOwnership = require('../src/claude/socket-ownership');
@@ -90,6 +90,68 @@ test('owner records include a boot-unique process identity on Linux', t => {
       assert.match(owner.identity, new RegExp(`^proc:${bootId}:`));
     }
   } finally {
+    release();
+  }
+});
+
+test('live socket locks survive contenders with different timezones', { timeout: 8000 }, async t => {
+  const socket = socketPath(t);
+  const modulePath = path.resolve(__dirname, '../src/claude/socket-ownership');
+  const holder = spawn(process.execPath, ['-e', `
+    const { acquireSocketLock } = require(process.argv[1]);
+    const release = acquireSocketLock(process.argv[2]);
+    process.stdout.write('ready');
+    process.stdin.resume();
+    process.stdin.on('end', () => {
+      try { release(); process.exit(0); } catch (error) { process.stderr.write(String(error)); process.exit(1); }
+    });
+  `, modulePath, socket], {
+    env: { ...process.env, TZ: 'UTC' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  t.after(() => holder.kill('SIGKILL'));
+  await once(holder.stdout, 'data');
+  const contender = spawnSync(process.execPath, ['-e', `
+    const { acquireSocketLock } = require(process.argv[1]);
+    try { const release = acquireSocketLock(process.argv[2]); release(); process.stdout.write('acquired'); }
+    catch (error) { process.stdout.write(String(error)); }
+  `, modulePath, socket], {
+    env: { ...process.env, TZ: 'America/Los_Angeles' },
+    encoding: 'utf8',
+    timeout: 5000
+  });
+  assert.equal(contender.status, 0, contender.stderr);
+  assert.match(contender.stdout, /already in progress/);
+  holder.stdin.end();
+  await once(holder, 'exit');
+});
+
+test('unreadable live owner markers preserve the preparation lock', { timeout: 8000 }, t => {
+  if (process.getuid?.() === 0) return t.skip('requires non-root permissions');
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const { release, lockPath } = acquireSocketLockWithPath(t, socket);
+  const ownerPath = path.join(lockPath, 'owner');
+  t.after(() => {
+    try { fs.chmodSync(ownerPath, 0o600); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  });
+  try {
+    fs.chmodSync(ownerPath, 0);
+    const contender = spawnSync(process.execPath, ['-e', `
+      const { acquireSocketLock } = require(process.argv[1]);
+      try { acquireSocketLock(process.argv[2]); process.stdout.write('acquired'); }
+      catch (error) { process.stdout.write(String(error.code || error)); }
+    `, path.resolve(__dirname, '../src/claude/socket-ownership'), socket], {
+      encoding: 'utf8',
+      timeout: 5000
+    });
+    assert.equal(contender.status, 0, contender.stderr);
+    assert.match(contender.stdout, /EACCES/);
+    assert.equal(fs.existsSync(ownerPath), true);
+  } finally {
+    fs.chmodSync(ownerPath, 0o600);
     release();
   }
 });
@@ -233,6 +295,40 @@ test('ownerless preparation locks are reclaimed without deleting a replacement o
   assert.equal(fs.existsSync(lockPath), false);
 });
 
+test('legacy lock reclamation preserves a replacement owner', t => {
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const first = acquireSocketLockWithPath(t, socket);
+  const lockPath = first.lockPath;
+  first.release();
+  t.after(() => fs.rmSync(lockPath, { recursive: true, force: true }));
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999999 }));
+
+  const originalOpen = fs.openSync;
+  const originalRead = fs.readFileSync;
+  const ownerDescriptors = new Set();
+  let replaced = false;
+  t.mock.method(fs, 'openSync', (file, ...args) => {
+    const descriptor = originalOpen(file, ...args);
+    if (file === lockPath) ownerDescriptors.add(descriptor);
+    return descriptor;
+  });
+  t.mock.method(fs, 'readFileSync', (file, ...args) => {
+    const value = originalRead(file, ...args);
+    if (!replaced && typeof file === 'number' && ownerDescriptors.has(file)) {
+      replaced = true;
+      fs.unlinkSync(lockPath);
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, 'owner'), JSON.stringify({ pid: process.pid }));
+    }
+    return value;
+  });
+
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  assert.equal(fs.lstatSync(lockPath).isDirectory(), true);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(lockPath, 'owner'), 'utf8')).pid, process.pid);
+});
+
 test('socket-lock release remains retryable after owner removal fails', t => {
   const socket = socketPath(t);
   assertSocketDirectory(socket);
@@ -371,6 +467,43 @@ test('stop retains the socket lock until MCP teardown completes', { timeout: 800
   releaseClose();
   await stopping;
   assert.equal(fs.existsSync(socket), false);
+});
+
+test('late stop cleanup preserves a replacement listener', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  await channel.start();
+  const server = channel.server;
+  assert.ok(server);
+  const originalClose = server.close.bind(server);
+  let finishClose;
+  let notifyClose;
+  const closeCalled = new Promise(resolve => { notifyClose = resolve; });
+  t.mock.method(server, 'close', callback => {
+    originalClose(error => {
+      finishClose = () => callback(error);
+      notifyClose();
+    });
+  });
+  const stopping = channel.stop();
+  await closeCalled;
+  assert.equal(fs.existsSync(socket), false);
+  const replacement = net.createServer(connection => connection.destroy());
+  t.after(async () => {
+    if (replacement.listening) await new Promise(resolve => replacement.close(resolve));
+    removeSocketDirectory(socket);
+  });
+  await new Promise((resolve, reject) => {
+    replacement.once('error', reject);
+    replacement.listen(socket, resolve);
+  });
+  finishClose();
+  await stopping;
+  assert.equal(fs.lstatSync(socket).isSocket(), true);
+  await new Promise(resolve => replacement.close(resolve));
 });
 
 test('stop retries a failed socket-lock release', { timeout: 8000 }, async t => {
