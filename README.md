@@ -296,7 +296,7 @@ node /absolute/path/to/discord-surface/src/cli.js claude-channel \
 
 It carries the same ordinary-binding lifecycle as the Monitor, against the same identity checks on native UUID, workspace, endpoint, and generation: on startup it reconciles an intake left unavailable by a Claude endpoint failure and requests a Gateway wake, and when it stops it marks ordinary binding readiness unavailable, with the reason `Claude channel unavailable`. If the binding changed between construction and start, it refuses instead of writing. Neither listener revokes readiness for a binding that is no longer the one it attached to, so a successor generation keeps its own readiness.
 
-Run one listener at a time. Both own the same socket, and the second to start fails on the socket the first already holds. A binding whose listener is a conductor rather than an ordinary session is unaffected by any of this: the lifecycle runs only for ordinary bindings.
+Run one listener at a time. Both own the same socket, and the second to start fails on the socket the first already holds. A conductor listener is excluded from ordinary readiness reconciliation and stop-time readiness revocation, but attaching either Claude listener still requests the Gateway recovery wake for the matching binding. Conductor attach and stop do not change readiness.
 
 For an explicit milestone from the same ordinary Claude session, write the text to an owner-controlled file and run:
 

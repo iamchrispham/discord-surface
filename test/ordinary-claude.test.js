@@ -1236,7 +1236,7 @@ test('Claude channel leaves a conductor binding untouched on start and stop', as
   await expectWithin(() => fs.existsSync(f.socketPath), 'Claude channel socket');
   await sleep(50);
   assert.equal(observed.getBinding(conductor.channelId).readiness, READINESS.READY);
-  assert.equal(listener.stderr().includes('wake Gateway'), false);
+  assert.equal(listener.stderr().includes('could not wake Gateway (gateway-not-running)'), true);
   assert.equal(observed.getIntakeWatermark(conductor.channelId), null);
 
   await listener.terminate();

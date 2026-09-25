@@ -1502,26 +1502,28 @@ function start(args, dependencies = {}) {
   process.exitCode = result.status ?? 1;
 }
 
-// One owner for the ordinary-binding lifecycle every Claude listener shares. A listener
-// that serves an ordinary binding owns that binding's attach and detach; the Gateway holds
-// intake until something reopens the watermark and wakes it, so a listener that skips this
-// leaves its session attached and silent.
-function servedOrdinaryBinding(state, identity) {
+// A listener may wake intake only for the binding whose socket it opened.
+function servedClaudeBinding(state, identity) {
   const binding = identity ? state.getBinding(identity.channelId) : null;
-  return binding?.active && state.isOrdinaryBinding(binding) &&
+  return binding?.active && binding.provider === PROVIDERS.CLAUDE &&
     binding.channelId === identity.channelId && binding.guildId === identity.guildId &&
     binding.provider === identity.provider && binding.nativeId === identity.nativeId &&
     binding.workspace === identity.workspace && binding.endpoint === identity.endpoint &&
     binding.generation === identity.generation ? binding : null;
 }
 
-// Readiness `ready` is written only by the Gateway once it has probed the listener. A wake
-// the Gateway cannot honour leaves a started listener nobody will ever deliver to, so that
-// case fails the attach instead of logging past it.
+function servedOrdinaryBinding(state, identity) {
+  const binding = servedClaudeBinding(state, identity);
+  return binding && state.isOrdinaryBinding(binding) ? binding : null;
+}
+
+// Both binding kinds need an attach wake. Only ordinary listeners own readiness revocation.
 function attachOrdinaryListener({ state, paths, startupBinding, identity, label, requestRecovery = requestGatewayRecovery, stderr = process.stderr }) {
-  if (!startupBinding) return null;
-  if (!servedOrdinaryBinding(state, identity)) throw new Error(`${label} binding changed during startup`);
-  const watermark = state.getIntakeWatermark(startupBinding.channelId);
+  const binding = servedClaudeBinding(state, identity);
+  if (!binding || (startupBinding && !servedOrdinaryBinding(state, identity))) {
+    throw new Error(`${label} binding changed during startup`);
+  }
+  const watermark = startupBinding ? state.getIntakeWatermark(startupBinding.channelId) : null;
   const endpointUnavailable = watermark?.state === READINESS.UNAVAILABLE &&
     typeof watermark.detail === 'string' &&
     watermark.detail.startsWith(CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX);
@@ -1534,7 +1536,7 @@ function attachOrdinaryListener({ state, paths, startupBinding, identity, label,
   const gatewayWake = requestRecovery(paths);
   if (!gatewayWake.requested) {
     stderr.write(`discord-surface: ${label} startup could not wake Gateway (${gatewayWake.reason})\n`);
-    if (gatewayWake.reason === 'gateway-wake-unsupported') {
+    if (startupBinding && gatewayWake.reason === 'gateway-wake-unsupported') {
       // The reconcile above already moved the binding to pending. Nothing will ever
       // resolve that, so the owner puts readiness back before the caller unwinds.
       detachOrdinaryListener({ state, startupBinding, reason: `${label} unavailable` });
@@ -1612,7 +1614,8 @@ async function claudeChannel(args) {
     });
     ordinaryStartupBinding = servedOrdinaryBinding(state, channel.bindingIdentity);
     await channel.start();
-    ordinaryListenerAttached = attachOrdinaryListener({ state, paths, startupBinding: ordinaryStartupBinding, identity: channel.bindingIdentity, label: 'Claude channel' }) !== null;
+    attachOrdinaryListener({ state, paths, startupBinding: ordinaryStartupBinding, identity: channel.bindingIdentity, label: 'Claude channel' });
+    ordinaryListenerAttached = Boolean(ordinaryStartupBinding);
   }
   catch (error) { await stop(); throw error; }
 }
