@@ -235,6 +235,23 @@ test('peer send refuses publication after destination handoff during channel ver
   assert.equal(f.state.directPostRows(request.dedupe_key).filter(row => row.kind === 'direct-post-attempt').length, 0);
 });
 
+test('peer send refuses publication after source intake gap during channel verification', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f); let posts = 0;
+  f.state.upsertIntakeWatermark({ channelId: '101', guildId: '100', id: '1' }, true);
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      f.state.db.prepare("UPDATE intake_watermarks SET state='gap' WHERE channel_id='101'").run();
+      return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    }
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  const result = await peer.send({ ...request, peer: { conductorId: 'recipient' } });
+  assert.equal(result.status, 'stale');
+  assert.equal(posts, 0);
+  assert.equal(f.state.directPostRows(request.dedupe_key).filter(row => row.kind === 'direct-post-attempt').length, 0);
+});
+
 test('peer result refuses publication after correlated destination handoff', async t => {
   const f = fixture(t); f.enroll('102'); const target = addRecipient(f); let requestWire; let posts = 0;
   const peer = service(f, { fetchImpl: async (url, options) => {

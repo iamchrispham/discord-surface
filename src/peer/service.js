@@ -84,6 +84,7 @@ function createPeerService(context) {
         throw new Error('peer caller changed during resolution');
       }
       const sourceRoute = requireReadyPeer(state, source);
+      const sourceReadiness = source.readiness;
       resolveAgentAddress(state, source, sourceRoute.childId);
       let agentTarget = null;
       let destination = null;
@@ -105,7 +106,12 @@ function createPeerService(context) {
           ordinary: state.isOrdinaryBindingRecord(source), agentMode: true,
           agentThreadId: sourceRoute.childId, agentTarget, agentKind: input.reply_to === undefined ? 'request' : 'result',
           agentReplyTo: input.reply_to ?? null, agentPresentation: 'attachment-v1',
-          agentDestinationCurrent: target => currentPeerDestination(state, target, destination?.binding || null, destination?.childId || null),
+          agentDestinationCurrent: target => {
+            const currentSource = state.getBinding(source.channelId);
+            if (!currentSource || currentSource.readiness !== sourceReadiness) return false;
+            requireReadyPeer(state, currentSource);
+            return currentPeerDestination(state, target, destination?.binding || null, destination?.childId || null);
+          },
           textFile, dedupeKey: input.dedupe_key, signal, fetchImpl });
         return { correlationId: input.dedupe_key, ...result };
       } finally {
