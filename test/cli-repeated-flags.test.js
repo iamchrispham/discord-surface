@@ -11,6 +11,7 @@ const {
 const os = require('node:os');
 const Module = require('node:module');
 const { main, parseArgs } = require('../src/cli');
+const { runDirectPost } = require('../src/direct-post');
 const { allowedFlags, COMMON_FLAGS } = require('../src/cli/flag-policy');
 
 const CLI = path.join(__dirname, '..', 'src', 'cli.js');
@@ -91,6 +92,11 @@ test('claude-post rejects an unrecognized flag without inventing a suggestion', 
   });
 });
 
+test('help is read-only only when bare', () => {
+  assert.doesNotThrow(() => parseArgs(['claude-post', '--help']));
+  assert.throws(() => parseArgs(['claude-post', '--help=false']), /--help takes no value/);
+});
+
 test('prototype-named flags are rejected rather than lost while parsing', () => {
   for (const flag of ['--__proto__', '--__proto__=x']) {
     const argv = flag.includes('=') ? ['claude-post', flag] : ['claude-post', flag, 'x'];
@@ -136,6 +142,26 @@ test('handoff modes refuse options consumed only by another mode', () => {
     ['handoff', '--endpoint', '/tmp/socket'],
     ['handoff-local', '--intake-cutoff', '100']
   ]) assert.doesNotThrow(() => parseArgs(command));
+});
+
+test('recover refuses flags consumed only by another recovery mode', () => {
+  const invalid = [
+    [['--board-attempt-id', 'A'], ['--direct-post-request-id', 'R']],
+    [['--topic-channel-id', 'C'], ['--board-resolution', 'applied']],
+    [['--intake-channel-id', 'C'], ['--topic-readback', 'old']],
+    [['--message-id', 'M', '--resolution', 'reply_sent'], ['--direct-post-request-id', 'R']],
+    [['--direct-post-request-id', 'R'], ['--message-id', 'M']],
+    [[], ['--part-index', '1']]
+  ];
+  for (const [mode, extra] of invalid) {
+    assert.throws(() => parseArgs(['recover', ...mode, ...extra]), /unknown --.+ for recover/);
+  }
+  for (const mode of [
+    ['--board-attempt-id', 'A'], ['--topic-channel-id', 'C'], ['--intake-channel-id', 'C'],
+    ['--message-id', 'M', '--resolution', 'reply_sent', '--part-index', '1'],
+    ['--direct-post-request-id', 'R', '--direct-post-attempt-id', 'A'],
+    ['--message-id', 'M', '--resolution', 'submitted']
+  ]) assert.doesNotThrow(() => parseArgs(['recover', ...mode]));
 });
 
 test('ordinary handoff rejects an ignored endpoint before creating state', t => {
@@ -184,7 +210,7 @@ test('misspelled attachment refuses before claude-post touches state or network'
   assert.equal(fs.existsSync(path.join(dir, 'surface.sqlite')), false);
 });
 
-test('empty help cannot bypass an unknown attachment on a configured post', async t => {
+test('valued help cannot bypass an unknown attachment on a configured post', async t => {
   const f = fixture(t, 'claude');
   const caption = path.join(f.dir, 'caption.txt');
   const image = path.join(f.dir, 'frame.png');
@@ -198,27 +224,49 @@ test('empty help cannot bypass an unknown attachment on a configured post', asyn
     fetches += 1;
     return { ok: true, status: 200, body: { cancel() {} }, json: async () => ({ id: 'posted' }) };
   };
-  process.argv = ['node', CLI, 'claude-post', '--db', path.join(f.dir, 'surface.sqlite'),
-    '--native-id', f.nativeId, '--generation', '1', '--text-file', caption, '--dedupe-key', 'empty-help',
-    '--attachment', image, '--help='];
-  let error;
   try {
-    await main();
-  } catch (caught) {
-    error = caught;
+    for (const help of ['--help=', '--help=false']) {
+      process.argv = ['node', CLI, 'claude-post', '--db', path.join(f.dir, 'surface.sqlite'),
+        '--native-id', f.nativeId, '--generation', '1', '--text-file', caption, '--dedupe-key', 'valued-help',
+        '--attachment', image, help];
+      await assert.rejects(main(), /unknown --attachment for claude-post; did you mean --attachment-file\?/);
+    }
   } finally {
     globalThis.fetch = oldFetch;
     process.argv = oldArgv;
   }
   assert.equal(fetches, 0);
-  assert.match(error?.message || '', /unknown --attachment for claude-post; did you mean --attachment-file\?/);
+  assert.deepEqual(f.state.listReceipts(), before);
+});
+
+test('explicit false resume cannot send an admitted snapshot', async t => {
+  const f = fixture(t);
+  const caption = path.join(f.dir, 'caption.txt');
+  const attachment = path.join(f.dir, 'source.bin');
+  fs.writeFileSync(caption, 'held caption');
+  fs.writeFileSync(attachment, 'held file');
+  const stopped = new AbortController();
+  stopped.abort();
+  await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1,
+    textFile: caption, attachmentFile: attachment, dedupeKey: 'false-resume', signal: stopped.signal,
+    fetchImpl: async () => { throw new Error('network reached'); } });
+  const before = f.state.listReceipts();
+  const oldArgv = process.argv;
+  const oldFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async () => { fetches += 1; throw new Error('network reached'); };
+  process.argv = ['node', CLI, 'post', '--state-dir', f.dir, '--native-id', f.nativeId,
+    '--generation', '1', '--dedupe-key', 'false-resume', '--resume=false'];
+  try { await assert.rejects(main(), /text-file must be a non-empty string/); }
+  finally { process.argv = oldArgv; globalThis.fetch = oldFetch; }
+  assert.equal(fetches, 0);
   assert.deepEqual(f.state.listReceipts(), before);
 });
 
 test('courier-guard rejects an unknown flag with the deny hook JSON before state exists', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-unknown-flag-'));
   try {
-    for (const help of [[], ['--help=']]) {
+    for (const help of [[], ['--help='], ['--help=false']]) {
       const result = spawnSync(process.execPath, [CLI, 'courier-guard', '--state-dir', dir,
         '--courier-route-id', 'guard-route', '--surprise', 'y', ...help], { encoding: 'utf8', timeout: 10000 });
       assert.equal(result.status, 2, result.stderr);

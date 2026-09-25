@@ -13,6 +13,27 @@ const LOCK_HANDOFF_FLAGS = Object.freeze(['from-lock', 'repo', 'provider', 'cond
   'native-id', 'endpoint', 'workspace', 'session-file', 'worker-file', 'category-id']);
 const LOCAL_HANDOFF_FLAGS = Object.freeze(['provider', 'conductor-id', 'repo-key', 'from-native-id', 'native-id',
   'from-generation', 'endpoint', 'workspace', 'channel-id', 'handoff-id', 'enrollment-proof', 'intake-cutoff', 'reuse']);
+const RECOVER_FLAGS = Object.freeze({
+  board: ['board-attempt-id', 'board-channel-id', 'board-evidence-scope', 'board-guild-id', 'board-message-id',
+    'board-no-hidden-retry', 'board-readback', 'board-readback-at', 'board-resolution', 'board-single-attempt', 'board-sole-writer'],
+  topic: ['topic-channel-id', 'topic-request-id', 'resolution', 'evidence-scope', 'topic-readback', 'topic-readback-at'],
+  intake: ['intake-channel-id'],
+  reply: ['message-id', 'resolution', 'part-index', 'reply-message-id'],
+  directPost: ['direct-post-request-id', 'direct-post-attempt-id', 'direct-post-message-id', 'direct-post-nonce',
+    'resolution', 'evidence-scope'],
+  message: ['message-id', 'resolution'],
+  restart: []
+});
+
+function recoverMode(args = {}) {
+  if (Object.keys(args).some(key => key.startsWith('board-') && args[key] !== undefined)) return 'board';
+  if (args['topic-channel-id']) return 'topic';
+  if (args['intake-channel-id']) return 'intake';
+  if (args['message-id'] && ['reply_sent', 'reply_not_sent'].includes(args.resolution)) return 'reply';
+  if (args['direct-post-request-id']) return 'directPost';
+  if (args['message-id'] && args.resolution) return 'message';
+  return 'restart';
+}
 
 // FIXED inventory from the issue-110 build brief. Group identical families; the
 // policy is per selected command, never one global set. A missing entry fails
@@ -27,10 +48,7 @@ const COMMAND_FLAGS = Object.freeze({
   'ordinary-claude-bind-run': ['channel', 'channel-id', 'endpoint', 'socket', 'transcript', 'workspace', 'native-id'],
   unbind: ['channel-id'],
   status: [],
-  recover: ['board-attempt-id', 'board-channel-id', 'board-evidence-scope', 'board-guild-id', 'board-message-id', 'board-no-hidden-retry',
-    'board-readback', 'board-readback-at', 'board-resolution', 'board-single-attempt', 'board-sole-writer', 'direct-post-attempt-id',
-    'direct-post-message-id', 'direct-post-nonce', 'direct-post-request-id', 'evidence-scope', 'intake-channel-id', 'message-id',
-    'part-index', 'reply-message-id', 'resolution', 'topic-channel-id', 'topic-readback', 'topic-readback-at', 'topic-request-id'],
+  recover: RECOVER_FLAGS.restart,
   'board-refresh': ['channel-id', 'dedupe-key', 'generation', 'message-id', 'native-id', 'request-id', 'text-file'],
   provision: ['provider', 'native-id', 'conductor-id', 'repo-key', 'channel-id', 'task-name', 'workspace', 'endpoint', 'category-id', 'migrate-legacy-topic'],
   'provision-run': ['provider', 'native-id', 'conductor-id', 'repo-key', 'channel-id', 'task-name', 'workspace', 'endpoint', 'category-id', 'migrate-legacy-topic'],
@@ -73,6 +91,7 @@ const SUBCOMMAND_FLAGS = Object.freeze({
 
 function allowedFlags(command, subcommand, args) {
   if (command === 'liaison' && subcommand === 'draft') return SUBCOMMAND_FLAGS['liaison draft'];
+  if (command === 'recover') return RECOVER_FLAGS[recoverMode(args)];
   if (command === 'handoff' || command === 'handoff-run') {
     if (args?.ordinary === true || args?.ordinary === 'true') return ORDINARY_HANDOFF_FLAGS;
     if (args?.['from-lock'] === true || args?.['from-lock'] === 'true') return LOCK_HANDOFF_FLAGS;
@@ -120,13 +139,18 @@ function suggestionFor(unknown, allowed) {
 // duplicate-flag check. Throws an Error with .command set so the courier-guard
 // startup path can keep its existing deny JSON and exit code 2.
 function validateFlags({ command, subcommand, args } = {}) {
-  if (command === 'help' || Boolean(args?.help)) return;
+  if (command === 'help' || args?.help === true) return;
   const allowed = allowedFlags(command, subcommand, args);
   const unknown = Object.keys(args || {}).find(key => {
     if (allowed === null) return true;
     return !COMMON_FLAGS.includes(key) && !allowed.includes(key);
   });
-  if (unknown === undefined) return;
+  if (unknown === undefined) {
+    if (Object.hasOwn(args || {}, 'help') && args.help !== true) {
+      throw Object.assign(new Error('--help takes no value'), { command });
+    }
+    return;
+  }
   // Common flags are options for this command too, so they are candidate suggestions.
   const candidates = allowed === null ? null : [...allowed, ...COMMON_FLAGS];
   const suggestion = candidates === null ? null : suggestionFor(unknown, candidates);
@@ -135,4 +159,4 @@ function validateFlags({ command, subcommand, args } = {}) {
   throw Object.assign(new Error(message), { command });
 }
 
-module.exports = { allowedFlags, COMMAND_FLAGS, COMMON_FLAGS, levenshtein, suggestionFor, validateFlags };
+module.exports = { allowedFlags, COMMAND_FLAGS, COMMON_FLAGS, levenshtein, recoverMode, suggestionFor, validateFlags };

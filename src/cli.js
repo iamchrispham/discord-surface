@@ -7,7 +7,7 @@ const path = require('node:path');
 let startup;
 try { startup = parseArgs(process.argv.slice(2)); }
 catch (error) { startup = { command: error.command, args: {}, error }; }
-if (require.main === module && startup.command === 'courier-guard' && !startup.args.help) {
+if (require.main === module && startup.command === 'courier-guard' && startup.args.help !== true) {
   try {
     require('./courier-guard').courierGuard(startup.args, pathsFor, startup.error);
   } catch (error) {
@@ -731,8 +731,8 @@ async function liaisonDraft(args) {
 function recover(args) {
   const { paths, state } = openState(args);
   try {
-    const boardRequested = Object.keys(args).some(key => key.startsWith('board-') && args[key] !== undefined);
-    if (boardRequested) {
+    const mode = require('./cli/flag-policy').recoverMode(args);
+    if (mode === 'board') {
       const boardTarget = {
         guildId: required(args, 'board-guild-id'),
         channelId: required(args, 'board-channel-id'),
@@ -753,7 +753,7 @@ function recover(args) {
           noHiddenRetry: args['board-no-hidden-retry'] === true || args['board-no-hidden-retry'] === 'true'
         }
       ));
-    } else if (args['topic-channel-id']) {
+    } else if (mode === 'topic') {
       const resolution = required(args, 'resolution');
       if (!['published', 'not_published'].includes(resolution)) throw new Error('--resolution must be published or not_published for topic reconciliation');
       print(state.reconcileTopicPublication(
@@ -763,7 +763,7 @@ function recover(args) {
         required(args, 'evidence-scope'),
         { topic: required(args, 'topic-readback'), observedAt: required(args, 'topic-readback-at') }
       ));
-    } else if (args['intake-channel-id']) {
+    } else if (mode === 'intake') {
       const channelId = required(args, 'intake-channel-id');
       const thread = state.getThreadEnrollment(channelId);
       const activeThread = thread?.active ? thread : null;
@@ -775,12 +775,12 @@ function recover(args) {
           requiredCapability: GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake
         })
       } : recovered);
-    } else if (args['message-id'] && ['reply_sent', 'reply_not_sent'].includes(args.resolution)) {
+    } else if (mode === 'reply') {
       print(state.reconcileReplyDelivery(required(args, 'message-id'), args.resolution === 'reply_sent' ? 'sent' : 'not_sent', {
         partIndex: args['part-index'] === undefined ? null : Number(args['part-index']),
         replyMessageId: args['reply-message-id']
       }));
-    } else if (args['direct-post-request-id']) {
+    } else if (mode === 'directPost') {
       const resolution = required(args, 'resolution');
       if (!['sent', 'not_sent'].includes(resolution)) throw new Error('--resolution must be sent or not_sent for direct-post reconciliation');
       print(state.reconcileDirectPostOutcome(
@@ -793,7 +793,7 @@ function recover(args) {
           nonce: args['direct-post-nonce']
         }
       ));
-    } else if (args['message-id'] && args.resolution) print(state.reconcileUncertain(required(args, 'message-id'), args.resolution));
+    } else if (mode === 'message') print(state.reconcileUncertain(required(args, 'message-id'), args.resolution));
     else print(state.recoverAfterRestart());
   }
   finally { state.close(); }
@@ -1835,7 +1835,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
     const config = state.requireConfig();
     const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: !dependencies.exportAddress });
     const hasAgentReplyTo = Object.hasOwn(args, 'agent-reply-to');
-    const resume = Boolean(args.resume);
+    const resume = args.resume === true || args.resume === 'true';
     if (hasAgentReplyTo && !args['agent-reply-to']) throw new Error('agent reply correlation must not be empty');
     const nativeId = required(args, 'native-id');
     const generation = required(args, 'generation');
@@ -2130,7 +2130,7 @@ function stop(args) {
 
 async function main() {
   const { command, subcommand, args } = parseArgs(process.argv.slice(2));
-  if (command === 'help' || args.help) return printUsage(command === 'help' ? subcommand : command);
+  if (command === 'help' || args.help === true) return printUsage(command === 'help' ? subcommand : command);
   switch (command) {
     case 'courier-guard': return require('./courier-guard').courierGuard(args, pathsFor);
     case 'configure': return configure(args);
