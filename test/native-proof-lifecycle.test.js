@@ -156,22 +156,22 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
     if (phase === 'cancelled') cancelNextPreflight = true;
     const recover = phase === 'permission'
       ? async (operation) => {
-        const originalReaddirSync = fs.readdirSync;
+        const originalOpendir = fs.promises.opendir;
         const deniedRoot = path.resolve(root);
-        fs.readdirSync = (...args) => {
+        fs.promises.opendir = async (...args) => {
           const candidate = args[0];
           const resolvedCandidate = typeof candidate === 'string' ? path.resolve(candidate) : null;
           if (resolvedCandidate === deniedRoot || resolvedCandidate?.startsWith(`${deniedRoot}${path.sep}`)) {
-            const error = new Error(`EACCES: permission denied, scandir '${candidate}'`);
+            const error = new Error(`EACCES: permission denied, opendir '${candidate}'`);
             error.code = 'EACCES';
             throw error;
           }
-          return originalReaddirSync(...args);
+          return originalOpendir.apply(fs.promises, args);
         };
         try {
           return await operation();
         } finally {
-          fs.readdirSync = originalReaddirSync;
+          fs.promises.opendir = originalOpendir;
         }
       }
       : async operation => operation();
