@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as net from 'node:net';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -17,22 +18,49 @@ type FileIdentity = {
 export type SocketLockRelease = () => void;
 
 const LOCK_NAMESPACE = '.discord-surface-locks';
+const caseSensitivityByDirectory = new Map<string, boolean>();
+const linuxBootId = readLinuxBootId();
 const ownerIdentity = processIdentity(process.pid);
 
-function processIdentity(pid: number): string | undefined {
+type ProcStat = {
+  state: string;
+  startTime: string;
+};
+
+function readLinuxBootId(): string | undefined {
+  if (process.platform !== 'linux') return undefined;
+  try {
+    const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return bootId || undefined;
+  } catch {}
+  return undefined;
+}
+
+function readProcStat(pid: number): ProcStat | undefined {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const endOfCommand = stat.lastIndexOf(')');
+    if (endOfCommand < 0) return undefined;
     const fields = stat.slice(endOfCommand + 2).trim().split(/\s+/);
+    const state = fields[0];
     const startTime = fields[19];
-    if (startTime) return `proc:${startTime}`;
+    if (state && startTime) return { state, startTime };
   } catch {}
+  return undefined;
+}
+
+function processIdentity(pid: number): string | undefined {
+  const procStat = readProcStat(pid);
+  if (procStat) {
+    if (linuxBootId) return `proc:${linuxBootId}:${procStat.startTime}`;
+    return `proc:${procStat.startTime}`;
+  }
   try {
     const startTime = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore']
     }).trim();
-    if (startTime) return `ps:${startTime}`;
+    if (startTime) return `${linuxBootId ? `ps:${linuxBootId}:` : 'ps:'}${startTime}`;
   } catch {}
   return undefined;
 }
@@ -46,6 +74,44 @@ function fileIdentity(filePath: string): FileIdentity {
   return { dev: stats.dev, ino: stats.ino };
 }
 
+function alternateCase(value: string): string {
+  const index = value.search(/[A-Za-z]/);
+  if (index < 0) return value;
+  const character = value[index];
+  const replacement = character === character.toLowerCase() ? character.toUpperCase() : character.toLowerCase();
+  return `${value.slice(0, index)}${replacement}${value.slice(index + 1)}`;
+}
+
+function isCaseInsensitiveDirectory(directoryPath: string): boolean {
+  const cached = caseSensitivityByDirectory.get(directoryPath);
+  if (cached !== undefined) return cached;
+  const probeName = `.discord-surface-case-${randomUUID()}`;
+  const probePath = path.join(directoryPath, probeName);
+  const alternatePath = path.join(directoryPath, alternateCase(probeName));
+  let descriptor: number | undefined;
+  let insensitive = false;
+  try {
+    descriptor = fs.openSync(probePath, 'wx', 0o600);
+    try {
+      insensitive = sameFile(fileIdentity(probePath), fileIdentity(alternatePath));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return false;
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+    try { fs.unlinkSync(probePath); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  caseSensitivityByDirectory.set(directoryPath, insensitive);
+  return insensitive;
+}
+
 function canonicalSocketPath(socketPath: string): string {
   const parentPath = path.dirname(socketPath);
   let canonicalParentPath = parentPath;
@@ -54,13 +120,31 @@ function canonicalSocketPath(socketPath: string): string {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  return path.join(canonicalParentPath, path.basename(socketPath));
+  const basename = path.basename(socketPath);
+  if (!isCaseInsensitiveDirectory(canonicalParentPath)) return path.join(canonicalParentPath, basename);
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(canonicalParentPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return path.join(canonicalParentPath, basename.toLowerCase());
+    throw error;
+  }
+  const foldedBasename = basename.toLowerCase();
+  const existing = entries.find(entry => entry.toLowerCase() === foldedBasename);
+  return path.join(canonicalParentPath, existing || foldedBasename);
+}
+
+function lockNamespacePath(): string {
+  let temporaryRoot = process.platform === 'win32' ? os.tmpdir() : '/tmp';
+  try { temporaryRoot = fs.realpathSync(temporaryRoot); } catch {}
+  const owner = process.getuid?.();
+  return path.join(temporaryRoot, `${LOCK_NAMESPACE}-${owner === undefined ? 'shared' : owner}`);
 }
 
 function lockPathForSocket(socketPath: string): string {
   const identityPath = canonicalSocketPath(socketPath);
   const key = createHash('sha256').update(identityPath).digest('hex').slice(0, 32);
-  return path.join(path.dirname(identityPath), LOCK_NAMESPACE, `${key}.lock`);
+  return path.join(lockNamespacePath(), `${key}.lock`);
 }
 
 function ownerPathForLock(lockPath: string): string {
@@ -68,7 +152,8 @@ function ownerPathForLock(lockPath: string): string {
 }
 
 function transitionPathForLock(lockPath: string): string {
-  return path.join(lockPath, `.transition-${process.pid}`);
+  const identity = ownerIdentity ? Buffer.from(ownerIdentity).toString('base64url') : 'unknown';
+  return path.join(lockPath, `.transition-${process.pid}-${identity}`);
 }
 
 function stagingPathForNamespace(namespacePath: string): string {
@@ -121,6 +206,7 @@ function isSocketLockOwnerAlive(owner: OwnerRecord): boolean {
     if ((probeError as NodeJS.ErrnoException).code === 'ESRCH') return false;
     if ((probeError as NodeJS.ErrnoException).code !== 'EPERM') throw probeError;
   }
+  if (readProcStat(owner.pid)?.state === 'Z') return false;
   if (!owner.identity) return true;
   const currentIdentity = processIdentity(owner.pid);
   if (!currentIdentity) return true;
@@ -160,9 +246,12 @@ function transitionOwner(transitionPath: string): OwnerRecord | null {
 function isTransitionAlive(transitionPath: string): boolean {
   const owner = transitionOwner(transitionPath);
   if (owner) return isSocketLockOwnerAlive(owner);
-  const match = path.basename(transitionPath).match(/^\.transition-(\d+)$/);
+  const match = path.basename(transitionPath).match(/^\.transition-(\d+)-([A-Za-z0-9_-]+)$/);
   if (!match) return true;
-  return isSocketLockOwnerAlive({ pid: Number(match[1]) });
+  if (match[2] === 'unknown') return true;
+  let identity: string;
+  try { identity = Buffer.from(match[2], 'base64url').toString('utf8'); } catch { return true; }
+  return isSocketLockOwnerAlive({ pid: Number(match[1]), identity });
 }
 
 function removeLockDirectory(directoryPath: string): void {

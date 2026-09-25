@@ -629,9 +629,9 @@ export class ClaudeChannel<
       }
       const release = this.socketLockRelease;
       this.socketLockRelease = null;
-      try { release?.(); } catch (error) { errors.push(error); }
       this.started = false;
       this.stopping = false;
+      try { release?.(); } catch (error) { errors.push(error); }
       if (errors.length) throw new AggregateError(errors, 'Claude channel stop failed');
     })();
     try { await this.stopPromise; } finally { this.stopPromise = null; }

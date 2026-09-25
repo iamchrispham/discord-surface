@@ -2,7 +2,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const net = require('node:net');
+const os = require('node:os');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { prepareSocket, prepareSocketAsync, ClaudeChannel } = require('../src/claude-channel');
@@ -19,6 +21,20 @@ function socketPath(t, { cleanup = true } = {}) {
   const socket = path.join(dir, 'listener.sock');
   if (cleanup) t.after(() => removeSocketDirectory(socket));
   return socket;
+}
+
+function socketLockNamespace() {
+  const temporaryRoot = fs.realpathSync(process.platform === 'win32' ? os.tmpdir() : '/tmp');
+  const owner = process.getuid?.();
+  return path.join(temporaryRoot, `.discord-surface-locks-${owner === undefined ? 'shared' : owner}`);
+}
+
+function isCaseInsensitiveDirectory(directory) {
+  const probe = `.case-probe-${randomUUID()}`;
+  const probePath = path.join(directory, probe);
+  const alternatePath = path.join(directory, probe.toUpperCase());
+  fs.writeFileSync(probePath, 'probe');
+  try { return fs.existsSync(alternatePath); } finally { fs.unlinkSync(probePath); }
 }
 
 async function orphan(socket) {
@@ -52,6 +68,38 @@ test('abrupt listener expiry can re-arm the same Claude binding', { timeout: 800
   assert.equal(channel.ready, true);
   assert.equal(state.getBinding('claude').nativeId, CLAUDE_ID);
   assert.equal(state.getBinding('claude').generation, 1);
+});
+
+test('owner records include a boot-unique process identity on Linux', t => {
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const namespace = socketLockNamespace();
+  const before = new Set(fs.readdirSync(namespace));
+  const release = acquireSocketLock(socket);
+  try {
+    const lockName = fs.readdirSync(namespace).find(entry => !before.has(entry));
+    assert.ok(lockName);
+    const owner = JSON.parse(fs.readFileSync(path.join(namespace, lockName, 'owner'), 'utf8'));
+    assert.equal(owner.pid, process.pid);
+    if (process.platform === 'linux') {
+      assert.equal(typeof owner.identity, 'string');
+      const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      assert.match(owner.identity, new RegExp(`^proc:${bootId}:`));
+    }
+  } finally {
+    release();
+  }
+});
+
+test('coordination artifacts stay outside a valid endpoint namespace', t => {
+  const dir = fs.mkdtempSync('/tmp/dss-');
+  fs.chmodSync(dir, 0o700);
+  const socket = path.join(dir, '.discord-surface-locks');
+  t.after(() => removeSocketDirectory(socket));
+  assertSocketDirectory(socket);
+  assert.equal(fs.existsSync(socket), false);
+  const release = acquireSocketLock(socket);
+  try { assert.equal(fs.existsSync(socket), false); } finally { release(); }
 });
 
 test('preparation refuses a live socket without deleting it', async t => {
@@ -148,9 +196,12 @@ test('stop during orphan probe prevents subsequent listener startup', { timeout:
 test('ownerless preparation locks are reclaimed without deleting a replacement owner', t => {
   const socket = socketPath(t);
   assertSocketDirectory(socket);
+  const namespace = socketLockNamespace();
+  const before = new Set(fs.readdirSync(namespace));
   const firstRelease = acquireSocketLock(socket);
-  const namespace = path.join(path.dirname(socket), '.discord-surface-locks');
-  const lockPath = path.join(namespace, fs.readdirSync(namespace)[0]);
+  const lockName = fs.readdirSync(namespace).find(entry => !before.has(entry));
+  assert.ok(lockName);
+  const lockPath = path.join(namespace, lockName);
   fs.unlinkSync(path.join(lockPath, 'owner'));
   const secondRelease = acquireSocketLock(socket);
   assert.throws(firstRelease, /lock owner changed before release/);
@@ -187,6 +238,25 @@ test('endpoint names ending in .lock do not collide with coordination artifacts'
   assert.doesNotThrow(secondRelease);
 });
 
+test('socket basename aliases share one lock only on case-insensitive parents', t => {
+  const socket = socketPath(t);
+  const alias = path.join(path.dirname(socket), 'LISTENER.SOCK');
+  const caseInsensitive = isCaseInsensitiveDirectory(path.dirname(socket));
+  assertSocketDirectory(socket);
+  assertSocketDirectory(alias);
+  const firstRelease = acquireSocketLock(socket);
+  try {
+    if (caseInsensitive) {
+      assert.throws(() => acquireSocketLock(alias), /already in progress/);
+    } else {
+      const secondRelease = acquireSocketLock(alias);
+      secondRelease();
+    }
+  } finally {
+    firstRelease();
+  }
+});
+
 test('stop aborts a pending MCP connection and releases startup', { timeout: 8000 }, async t => {
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
@@ -219,6 +289,40 @@ test('stop aborts a pending MCP connection and releases startup', { timeout: 800
   assert.equal(channel.ready, false);
   assert.equal(fs.existsSync(socket), false);
   assert.equal(closeCalls, 1);
+});
+
+test('stop retains the socket lock until MCP teardown completes', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  let releaseClose;
+  const closeGate = new Promise(resolve => { releaseClose = resolve; });
+  let enterClose;
+  const entered = new Promise(resolve => { enterClose = resolve; });
+  const channel = new ClaudeChannel({
+    state,
+    nativeId: CLAUDE_ID,
+    socketPath: socket,
+    mcp: {
+      notification: async () => {},
+      close: async () => {
+        enterClose();
+        await closeGate;
+      }
+    }
+  });
+  t.after(async () => {
+    releaseClose?.();
+    try { await channel.stop(); } finally { removeSocketDirectory(socket); }
+  });
+  await channel.start();
+  const stopping = channel.stop();
+  await entered;
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  releaseClose();
+  await stopping;
+  assert.equal(fs.existsSync(socket), false);
 });
 
 test('start calls during stop share one post-stop startup', { timeout: 8000 }, async t => {
