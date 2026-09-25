@@ -85,7 +85,7 @@ test('simulated: login-time input is durably held and backfill closes before dis
   state.close();
 });
 
-test('simulated: bounded intake recovery records a visible gap and requires explicit reconciliation', async () => {
+test('simulated: page-bound recovery connects degraded and requires explicit reconciliation', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
   const secret = path.join(dir, 'discord.env');
@@ -102,7 +102,10 @@ test('simulated: bounded intake recovery records a visible gap and requires expl
         { id: '102', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'two' }
       ]
   });
-  await assert.rejects(() => gateway.start(secret), /intake recovery is gap/);
+  await gateway.start(secret);
+  assert.equal(gateway.started, true);
+  assert.equal(gateway.transportReady, true);
+  assert.equal(gateway.ready, false);
   assert.equal(state.getBinding('channel-codex').readiness, READINESS.GAP);
   assert.equal(state.getReadiness().limits.connectionBackfill, 'unrecoverable-gap');
   assert.equal(state.getIntakeWatermark('channel-codex').state, 'gap');
@@ -233,12 +236,14 @@ test('simulated: noncooperative history fetch is fenced by the recovery deadline
   await assert.doesNotReject(async () => {
     const result = await recovery;
     assert.equal(result.ready, false);
-    assert.equal(result.state, 'gap');
+    assert.equal(result.state, 'unavailable');
   });
   const elapsed = performance.now() - started;
   await gateway.stop();
   release([]);
   assert.ok(elapsed < 1500, `recovery exceeded bounded wait: ${elapsed}ms`);
-  assert.equal(state.getIntakeWatermark('channel-codex').state, 'gap');
+  const deadlineBoundary = state.getIntakeWatermark('channel-codex');
+  assert.equal(deadlineBoundary.state, 'unavailable');
+  assert.match(deadlineBoundary.detail, /^Discord recovery deadline: /);
   state.close();
 });

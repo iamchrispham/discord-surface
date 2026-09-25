@@ -1,6 +1,13 @@
 const discord = () => require('discord.js') as typeof import('discord.js');
 import { CODEX_VALIDATION_KINDS } from '../native-transcript';
-import { isPreAdoptionRetryableThread, isRetryableFetchBoundary, recoveryFetch } from './recovery-fetch';
+import {
+  classifyRecoveryFailure,
+  isPreAdoptionRetryableThread,
+  isRetryableFetchBoundary,
+  isRetryableHttp503Boundary,
+  recoveryFetch,
+  retryPendingBoundaryDetail
+} from './recovery-fetch';
 import { THREAD_STATES, type ThreadBinding, type ThreadEnrollment, type ThreadRoute, type ThreadState } from '../state/thread-enrollment';
 
 export interface ThreadChannel {
@@ -101,8 +108,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   const parent = gateway.state.getMessageRoute(enrollment.parentChannelId);
   if (!parent?.ready) return false;
   const binding = parent.binding;
-  const retryableBoundary = enrollment.adoptedAt != null &&
-    isRetryableFetchBoundary(enrollment.state, enrollment.detail);
+  const retryableBoundary = isRetryableFetchBoundary(enrollment.state, enrollment.detail);
   const preAdoptionRetryBoundary = isPreAdoptionRetryableThread(enrollment);
   const retryableHold = retryableBoundary || preAdoptionRetryBoundary;
   if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state) &&
@@ -140,7 +146,10 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   try {
     const channel = await wait(() => {
       if (!checkpointOnly) {
-        const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery in progress', null);
+        const detail = retryableHold
+          ? retryPendingBoundaryDetail('thread history recovery', enrollment)
+          : 'Thread history recovery in progress';
+        const pending = boundary(THREAD_STATES.PENDING, detail, null);
         if (!pending) throw stale();
       }
       recoveryAttempted = true;
@@ -282,17 +291,17 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
         }
         return false;
       }
-      const detail = error instanceof Error ? error.message : String(error);
+      const classified = classifyRecoveryFailure(error);
+      const detail = classified.detail;
       const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
       if (!currentEnrollment?.active || currentEnrollment.state === THREAD_STATES.GAP || currentEnrollment.state === THREAD_STATES.UNAVAILABLE || currentEnrollment.state === THREAD_STATES.READY) {
         return false;
       }
       ownedEnrollment = currentEnrollment;
       const preAdoptionRetry = !currentEnrollment.adoptedAt &&
-        isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
-      let nextState: ThreadState = THREAD_STATES.UNAVAILABLE;
-      if (deadlineReached) nextState = THREAD_STATES.GAP;
-      else if (preAdoptionRetry) nextState = THREAD_STATES.PENDING;
+        isRetryableHttp503Boundary(THREAD_STATES.UNAVAILABLE, detail);
+      let nextState: ThreadState = classified.state;
+      if (preAdoptionRetry) nextState = THREAD_STATES.PENDING;
       boundary(nextState, detail, after);
     }
     return false;

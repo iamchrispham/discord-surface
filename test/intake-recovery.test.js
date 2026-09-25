@@ -140,8 +140,12 @@ for (const id of ['1000', '2000']) {
     assert.equal(f.state.getMessage('101').state, 'accepted');
     f.history.set(id, [message]);
     f.fail({ id, kind: 'channel', status: 503 });
-    if (id === '1000') await assert.rejects(f.gateway.start(f.secret), /intake recovery is unavailable/);
-    else await f.gateway.start(f.secret);
+    await f.gateway.start(f.secret);
+    if (id === '1000') {
+      assert.equal(f.gateway.started, true);
+      assert.equal(f.gateway.transportReady, true);
+      assert.equal(f.gateway.ready, false);
+    }
     assert.equal(f.boundary(id).state, 'unavailable');
     await f.reopen(); f.fail(null); f.enableDelivery();
     await f.gateway.start(f.secret);

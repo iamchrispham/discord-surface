@@ -24,7 +24,10 @@ test('simulated: empty Discord history requires known effective read permission'
       on() {}, off() {}, async login() {}, channels: { fetch: async () => channel }, async destroy() {}
     };
     const gateway = new DiscordGateway({ state, client, fetchHistory: async () => { throw new Error('history must not be fetched'); } });
-    await assert.rejects(() => gateway.start(secret), /intake recovery is unavailable/);
+    await gateway.start(secret);
+    assert.equal(gateway.started, true);
+    assert.equal(gateway.transportReady, true);
+    assert.equal(gateway.ready, false);
     const watermark = state.getIntakeWatermark('channel-codex');
     assert.equal(watermark.recovered_through_id, '100');
     assert.equal(watermark.state, 'unavailable');
