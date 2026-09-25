@@ -6,6 +6,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { prepareSocket, prepareSocketAsync, ClaudeChannel } = require('../src/claude-channel');
+const { acquireSocketLock, assertSocketDirectory } = require('../src/claude/socket-ownership');
 const { fixture, CLAUDE_ID } = require('./surface-fixtures');
 
 function socketPath(t) {
@@ -123,4 +124,90 @@ test('stop during orphan probe prevents subsequent listener startup', { timeout:
   await rejected;
   assert.equal(channel.ready, false);
   assert.equal(fs.existsSync(socket), false);
+});
+
+test('ownerless preparation locks are reclaimed without deleting a replacement owner', t => {
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const firstRelease = acquireSocketLock(socket);
+  const namespace = path.join(path.dirname(socket), '.discord-surface-locks');
+  const lockPath = path.join(namespace, fs.readdirSync(namespace)[0]);
+  fs.unlinkSync(path.join(lockPath, 'owner'));
+  const secondRelease = acquireSocketLock(socket);
+  assert.doesNotThrow(secondRelease);
+  assert.doesNotThrow(firstRelease);
+});
+
+test('endpoint names ending in .lock do not collide with coordination artifacts', t => {
+  const socket = socketPath(t);
+  const sibling = `${socket}.lock`;
+  assertSocketDirectory(socket);
+  const firstRelease = acquireSocketLock(socket);
+  const secondRelease = acquireSocketLock(sibling);
+  assert.doesNotThrow(firstRelease);
+  assert.doesNotThrow(secondRelease);
+});
+
+test('stop aborts a pending MCP connection and releases startup', { timeout: 8000 }, async t => {
+  const socket = socketPath(t);
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  let connectStarted;
+  const connected = new Promise(resolve => { connectStarted = resolve; });
+  let closeCalls = 0;
+  const channel = new ClaudeChannel({
+    state,
+    nativeId: CLAUDE_ID,
+    socketPath: socket,
+    mcp: {
+      notification: async () => {},
+      transportFactory: () => ({}),
+      connect: async () => {
+        connectStarted();
+        return new Promise(() => {});
+      },
+      close: async () => { closeCalls += 1; }
+    }
+  });
+  t.after(() => channel.stop());
+  const starting = channel.start();
+  await connected;
+  await channel.stop();
+  await assert.rejects(starting, /stopped during MCP connection/);
+  assert.equal(channel.ready, false);
+  assert.equal(fs.existsSync(socket), false);
+  assert.equal(closeCalls, 1);
+});
+
+test('start calls during stop share one post-stop startup', { timeout: 8000 }, async t => {
+  const socket = socketPath(t);
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  let releaseClose;
+  const closeGate = new Promise(resolve => { releaseClose = resolve; });
+  let closeCalls = 0;
+  const channel = new ClaudeChannel({
+    state,
+    nativeId: CLAUDE_ID,
+    socketPath: socket,
+    mcp: {
+      notification: async () => {},
+      close: async () => {
+        closeCalls += 1;
+        if (closeCalls === 1) await closeGate;
+      }
+    }
+  });
+  t.after(() => channel.stop());
+  await channel.start();
+  const stopping = channel.stop();
+  const first = channel.start();
+  const second = channel.start();
+  releaseClose();
+  await stopping;
+  await Promise.all([first, second]);
+  assert.equal(channel.ready, true);
+  assert.equal(closeCalls, 1);
 });
