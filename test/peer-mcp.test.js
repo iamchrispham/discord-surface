@@ -45,6 +45,10 @@ test('public MCP stdio omits the caller and refuses an unready send', { timeout:
       assert.equal(pattern.test(' '), false);
       assert.equal(pattern.test('payload'), true);
     }
+    assert.equal(peerSendSchema.properties.text.not, undefined);
+    const textPattern = new RegExp(peerSendSchema.properties.text.pattern);
+    assert.equal(textPattern.test('first line\nsecond line'), true);
+    assert.equal(textPattern.test('\t\n'), false);
     const listed = await client.callTool({ name: 'peer_list', arguments: {} });
     const peers = JSON.parse(listed.content[0].text);
     assert.deepEqual(peers, []);

@@ -10,6 +10,7 @@ const { PEER_PACKET_ID_SCHEMA } = require('./result');
 const packetId = PEER_PACKET_ID_SCHEMA;
 const nonBlankString = { type: 'string', minLength: 1,
   pattern: '[^\\s\\u0000-\\u001F\\u007F-\\u009F]', not: { pattern: '[\\u0000-\\u001F\\u007F-\\u009F]' } };
+const payloadText = { type: 'string', minLength: 1, pattern: '[^\\s]' };
 
 const selector = { oneOf: [
   { type: 'object', properties: { repoKey: nonBlankString, provider: { enum: ['codex', 'claude'] } }, required: ['repoKey', 'provider'], additionalProperties: false },
@@ -38,7 +39,7 @@ const tools = [
   { name: 'peer_list', description: 'List current bindings and whether each has one ready enrolled child.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'peer_send', description: 'Send an authenticated agent request to a current peer, or a result using reply_to. Reuse dedupe_key on retry. Sent is not native pickup or completion.',
-    inputSchema: { type: 'object', properties: { peer: selector, reply_to: packetId, text: nonBlankString, text_file: nonBlankString, dedupe_key: packetId },
+    inputSchema: { type: 'object', properties: { peer: selector, reply_to: packetId, text: payloadText, text_file: nonBlankString, dedupe_key: packetId },
       required: ['dedupe_key'], additionalProperties: false, allOf: [
         { oneOf: [
           { required: ['text'], not: { required: ['text_file'] } },
