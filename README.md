@@ -654,6 +654,15 @@ keeps its original custody and records the selected child as the new wire
 source. Sent and unknown outcomes remain non-sending on retry.
 Existing native acknowledgment and reply delivery remain separate from intake.
 
+The current requester can withdraw an acknowledged request that has no reply or
+result custody with `agent-withdraw --provider PROVIDER --message-id DISCORD_ID
+--packet-id PACKET_ID --native-id NATIVE_UUID --generation GENERATION`. This
+records a distinct withdrawal receipt and releases the recipient's handoff
+fence; it does not claim the request was completed. A late result is refused.
+Withdrawal requires the shared state database that holds the accepted request
+and both bindings. It does not transmit cancellation between installations;
+an unknown request in another installation is refused without changing custody.
+
 Receiving installations pin the exact destination generation and deduplicate the
 packet identity. Reconnecting the same native owner preserves accepted custody.
 Changing owners still requires the existing explicit binding handoff. Drain

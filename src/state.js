@@ -22,6 +22,7 @@ const {
   createNativeReplyFileHandlers
 } = require('./state/native-reply-file');
 const { createAgentCompletionHandlers } = require('./state/agent-completion');
+const { createAgentRequestWithdrawalHandlers, AGENT_WITHDRAWAL_RECEIPTS } = require('./state/agent-request-withdrawal');
 const {
   createWatcherNoticeHandlers,
   WATCHER_NOTICE_AUTHORITY,
@@ -185,6 +186,19 @@ const agentCompletionHandlers = createAgentCompletionHandlers({
   DIRECT_POST_ATTEMPT,
   DIRECT_POST_OUTCOME,
   NATIVE_REPLY_FILE_PHASES,
+  assertText,
+  assertProvider,
+  assertUuid,
+  parseJson,
+  now,
+  AuthorizationError,
+  BindingError,
+  StaleGenerationError,
+  StateCorruptError
+});
+
+const agentRequestWithdrawalHandlers = createAgentRequestWithdrawalHandlers({
+  MESSAGE_STATES,
   assertText,
   assertProvider,
   assertUuid,
@@ -1883,6 +1897,22 @@ class SurfaceState {
     return agentCompletionHandlers.completeAgentHandledWithoutPost(this, args);
   }
 
+  withdrawAgentRequest(args) {
+    return agentRequestWithdrawalHandlers.withdrawAgentRequest(this, args);
+  }
+
+  agentWithdrawalRequesterSessionRoot(messageId, packetId) {
+    return agentRequestWithdrawalHandlers.requesterSessionRoot(this, messageId, packetId);
+  }
+
+  isAgentResultForWithdrawnRequest(packet) {
+    return agentRequestWithdrawalHandlers.isAgentResultForWithdrawnRequest(this, packet);
+  }
+
+  isAgentRequestWithdrawn(packet) {
+    return agentRequestWithdrawalHandlers.isAgentRequestWithdrawn(this, packet);
+  }
+
   armWatcherNotice(input) {
     return watcherNoticeHandlers.armWatcherNotice(this, input);
   }
@@ -2143,6 +2173,7 @@ function validateNativeId(value) {
 module.exports = {
   ACTIVE_STATES,
   AGENT_COMPLETION_RECEIPTS,
+  AGENT_WITHDRAWAL_RECEIPTS,
   AuthorizationError,
   BindingError,
   DecisionError,
