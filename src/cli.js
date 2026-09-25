@@ -132,7 +132,7 @@ const GENERAL_USAGE = `Usage: discord-surface <command> [options]
 Commands: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind,
 status, recover, board-refresh, thread-enroll, provision, handoff, start, stop,
 claude-channel, claude-monitor, native-ack, native-reply, claude-reply, agent-address,
-agent-send, agent-complete, watcher-arm, watcher-send, watcher-consume, post, ordinary-post, ordinary-claude-post, claude-post,
+agent-send, agent-complete, agent-withdraw, watcher-arm, watcher-send, watcher-consume, post, ordinary-post, ordinary-claude-post, claude-post,
 post-file-cleanup,
 native-reply-file-cleanup,
 decision-present, courier-guard, liaison draft
@@ -160,6 +160,12 @@ const AGENT_COMPLETE_USAGE = `Usage: discord-surface agent-complete --provider P
 Consumes one authenticated agent request or result without posting a reply. A live Gateway must advertise the completion wake capability.
 `;
 
+const AGENT_WITHDRAW_USAGE = `Usage: discord-surface agent-withdraw --provider PROVIDER --message-id MESSAGE_ID \\
+  --packet-id PACKET_ID --native-id NATIVE_UUID --generation GENERATION
+
+Withdraws one acknowledged outstanding agent request from its current requester session. Preserves the signed request and acknowledgment, and records a distinct withdrawal receipt.
+`;
+
 const WATCHER_ARM_USAGE = `Usage: discord-surface watcher-arm --arm-key ARM_KEY --provider claude --channel-id PARENT_CHANNEL_ID \\
   --agent-thread-id CHILD_CHANNEL_ID --native-id NATIVE_UUID --generation GENERATION
 
@@ -182,6 +188,7 @@ function printUsage(command) {
   let usage = GENERAL_USAGE;
   if (command === 'agent-send') usage = AGENT_SEND_USAGE;
   if (command === 'agent-complete') usage = AGENT_COMPLETE_USAGE;
+  if (command === 'agent-withdraw') usage = AGENT_WITHDRAW_USAGE;
   if (command === 'watcher-arm') usage = WATCHER_ARM_USAGE;
   if (command === 'watcher-send') usage = WATCHER_SEND_USAGE;
   if (command === 'watcher-consume') usage = WATCHER_CONSUME_USAGE;
@@ -1289,6 +1296,7 @@ function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
       GATEWAY_CAPABILITIES.runtimeBindLock,
       GATEWAY_CAPABILITIES.ordinaryClaudeBind,
       GATEWAY_CAPABILITIES.agentHandledWithoutPost,
+      GATEWAY_CAPABILITIES.agentRequestWithdrawal,
       GATEWAY_CAPABILITIES.watcherNoticeIngress
     ]
   }), { mode: 0o600 });
@@ -1896,6 +1904,54 @@ function agentComplete(args, dependencies = {}) {
   }
 }
 
+async function agentWithdraw(args, dependencies = {}) {
+  const provider = required(args, 'provider');
+  const nativeId = required(args, 'native-id');
+  if (provider === PROVIDERS.CLAUDE) {
+    const caller = await (dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies)))();
+    if (caller?.harness !== 'claude-code' || caller.sessionId !== nativeId ||
+        (caller.threadId != null && caller.threadId !== nativeId)) {
+      throw new Error('agent withdrawal requires the current Claude caller');
+    }
+  } else if (provider === PROVIDERS.CODEX) {
+    const caller = (dependencies.resolveInvocationIdentity || resolveInvocationIdentity)(dependencies.environment || process.env);
+    if (caller.sessionId !== nativeId || caller.threadId !== nativeId) {
+      throw new Error('agent withdrawal requires the current Codex caller');
+    }
+  } else {
+    throw new Error('invalid agent provider');
+  }
+  const { paths, state } = openState(args);
+  try {
+    if (provider === PROVIDERS.CODEX) {
+      const sessionRoot = state.agentWithdrawalRequesterSessionRoot(required(args, 'message-id'), required(args, 'packet-id'));
+      await (dependencies.validateCodexSessionIdentity || validateCodexSessionIdentityAsync)(nativeId, undefined, sessionRoot);
+    }
+    const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
+    const runtime = gatewayStatus(paths);
+    const requiredCapability = GATEWAY_CAPABILITIES.agentRequestWithdrawal;
+    if (!runtime || !['running', 'stopped', 'stale'].includes(runtime.state) ||
+        (runtime.state === 'running' && (!Number.isSafeInteger(Number(runtime.pid)) || Number(runtime.pid) <= 0))) {
+      throw new Error('Gateway status is unknown; stop or restart it before agent withdrawal');
+    }
+    const live = runtime.state === 'running';
+    if (live && !runtime.capabilities?.includes(requiredCapability)) {
+      throw new Error('running Gateway does not support agent withdrawal; stop or restart it before withdrawal');
+    }
+    const result = state.withdrawAgentRequest({
+      messageId: required(args, 'message-id'), packetId: required(args, 'packet-id'),
+      provider, nativeId, generation: Number(required(args, 'generation'))
+    });
+    const gatewayWake = (dependencies.requestGatewayRecovery || requestGatewayRecovery)(paths, {
+      status: gatewayStatus, kill: dependencies.killProcess || process.kill,
+      ...(live ? { expectedPid: runtime.pid } : {}), requiredCapability
+    });
+    const response = { ...result, gatewayWake };
+    (dependencies.print || print)(response);
+    return response;
+  } finally { state.close(); }
+}
+
 async function watcherArm(args, dependencies = {}) {
   const { state } = openState(args);
   const output = dependencies.print || print;
@@ -2111,6 +2167,7 @@ async function main() {
     }
     case 'agent-send': return agentSend(args);
     case 'agent-complete': return agentComplete(args);
+    case 'agent-withdraw': return agentWithdraw(args);
     case 'watcher-arm': return watcherArm(args);
     case 'watcher-send': return watcherSend(args);
     case 'watcher-consume': return watcherConsume(args);
@@ -2132,11 +2189,11 @@ async function main() {
     case 'liaison':
       if (subcommand !== 'draft') throw new Error('usage: liaison draft --receipt-id RECEIPT_ID');
       return liaisonDraft(args);
-    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, native-reply, claude-reply, agent-address, agent-send, agent-complete, post, ordinary-post, ordinary-claude-post, claude-post, native-reply-file-cleanup, decision-present, liaison draft');
+    default: throw new Error('usage: configure, bind, ordinary-bind, ordinary-claude-bind, rebind, unbind, status, recover, board-refresh, thread-enroll, provision, handoff, start, stop, claude-channel, claude-monitor, native-ack, native-reply, claude-reply, agent-address, agent-send, agent-complete, agent-withdraw, post, ordinary-post, ordinary-claude-post, claude-post, native-reply-file-cleanup, decision-present, liaison draft');
   }
 }
 
-module.exports = { agentComplete, agentSend, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
+module.exports = { agentComplete, agentSend, agentWithdraw, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
 
 if (require.main === module) {
   main().catch(error => {
