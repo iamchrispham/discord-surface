@@ -49,7 +49,7 @@ function evidence(observedAt) {
 test('board recovery refuses unqualified or invalid instants without a receipt', t => {
   const { state, target, attemptId } = seededRecovery(t);
   const before = state.listReceipts();
-  for (const observedAt of ['2026-01-01T00:00:01', '2026-02-30T00:00:01Z']) {
+  for (const observedAt of ['2026-01-01T00:00:01', '2026-02-30T00:00:01Z', '2026-01-01T00:00:01-00:00']) {
     assert.throws(
       () => state.reconcileBoardRefresh(target, attemptId, BOARD_OUTCOMES.APPLIED, evidence(observedAt)),
       /observedAt must be a timezone-qualified ISO timestamp/
