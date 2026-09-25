@@ -203,6 +203,32 @@ test('R7c: legacy child timeout gap retries after database reopen', CASES, async
   assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
 });
 
+for (const legacy of [
+  { name: 'child admission', detail: LEGACY_THREAD_TIMEOUT_DETAIL, thread: true },
+  { name: 'parent admission', detail: 'Discord recovery deadline exceeded while admitting history', thread: false },
+  { name: 'parent history bound', detail: 'history recovery deadline 30000ms reached', thread: false }
+]) {
+  test(`R7d: bounded legacy ${legacy.name} timeout retries after database reopen`, CASES, async t => {
+    const f = fixture(t);
+    const owner = f.state.getBinding('1000');
+    const channelId = legacy.thread ? '2000' : '1000';
+    assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, '101', channelId), { ready: false }).accepted, true);
+    if (legacy.thread) f.state.markThreadBoundary(channelId, 'gap', legacy.detail, '100', '101', owner);
+    else f.state.markIntakeBoundary(channelId, 'gap', legacy.detail, '100', '101', owner);
+    f.history.set(channelId, [f.message('101', channelId)]);
+    await f.reopen();
+
+    f.enableDelivery();
+    const result = await f.recover();
+    assert.equal(result.ready, true, JSON.stringify(result));
+    assert.equal(f.boundary(channelId).state, 'ready');
+    await f.gateway.reconcilePending(undefined, { readyOnly: true });
+    await f.gateway.consumer.waitForNativeWork();
+    assert.equal(f.state.getMessage('101').state, 'replied');
+    assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
+  });
+}
+
 const LEGACY_NEGATIVE_CONTROLS = [
   { name: 'page-bound detail', detail: 'history page bound 100 reached', gapFrom: '100', gapTo: '101' },
   { name: 'near-match timeout detail', detail: 'ordinary-bind recovery exceeded 30001ms', gapFrom: null, gapTo: null },

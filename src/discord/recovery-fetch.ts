@@ -2,7 +2,11 @@ import { THREAD_STATES, type ThreadEnrollment } from '../state/thread-enrollment
 
 const RETRYABLE_FETCH_PREFIX = 'Discord HTTP 503 during recovery: ';
 const LEGACY_DEADLINE_DETAIL_SUFFIX = ' recovery exceeded 30000ms';
-const LEGACY_THREAD_DEADLINE_DETAIL = 'Discord recovery deadline exceeded';
+const LEGACY_DEADLINE_DETAILS = {
+  THREAD: 'Discord recovery deadline exceeded',
+  HISTORY_ADMISSION: 'Discord recovery deadline exceeded while admitting history',
+  HISTORY_BOUND: 'history recovery deadline 30000ms reached'
+} as const;
 
 export const RECOVERY_DEADLINE_MARKER_PREFIX = 'Discord recovery deadline: ';
 export const RECOVERY_RETRY_PENDING_PREFIX = 'Discord recovery retry pending: ';
@@ -45,17 +49,30 @@ export function isRetryableHttp503Boundary(state: string, detail: string | null 
 }
 
 function isLegacyDeadlineDetail(detail: string | null | undefined): boolean {
-  return detail === LEGACY_THREAD_DEADLINE_DETAIL ||
+  return Object.values(LEGACY_DEADLINE_DETAILS).includes(detail as typeof LEGACY_DEADLINE_DETAILS[keyof typeof LEGACY_DEADLINE_DETAILS]) ||
     (typeof detail === 'string' && detail.length > LEGACY_DEADLINE_DETAIL_SUFFIX.length &&
       detail.endsWith(LEGACY_DEADLINE_DETAIL_SUFFIX));
+}
+
+function isBoundedLegacyDeadlineDetail(detail: string | null | undefined): boolean {
+  return Object.values(LEGACY_DEADLINE_DETAILS).includes(detail as typeof LEGACY_DEADLINE_DETAILS[keyof typeof LEGACY_DEADLINE_DETAILS]);
+}
+
+function hasConfirmedLegacyCursor(boundary: IntakeBoundaryLike): boolean {
+  return typeof boundary.recovered_through_id === 'string' && boundary.recovered_through_id.length > 0;
+}
+
+function hasLegacyCursorBounds(boundary: IntakeBoundaryLike): boolean {
+  return typeof boundary.gap_from === 'string' && boundary.gap_from === boundary.recovered_through_id &&
+    typeof boundary.gap_to === 'string' && boundary.gap_to.length > 0;
 }
 
 export function isRetryableIntakeBoundary(boundary: IntakeBoundaryLike | null | undefined): boolean {
   if (!boundary) return false;
   if (isRetryableFetchBoundary(boundary.state || '', boundary.detail)) return true;
-  return boundary.state === 'gap' && isLegacyDeadlineDetail(boundary.detail) &&
-    boundary.gap_from == null && boundary.gap_to == null &&
-    typeof boundary.recovered_through_id === 'string' && boundary.recovered_through_id.length > 0;
+  return boundary.state === 'gap' && isLegacyDeadlineDetail(boundary.detail) && hasConfirmedLegacyCursor(boundary) &&
+    ((boundary.gap_from == null && boundary.gap_to == null) ||
+      (isBoundedLegacyDeadlineDetail(boundary.detail) && hasLegacyCursorBounds(boundary)));
 }
 
 export function retryPendingBoundaryDetail(reason: string, boundary: RetryBoundaryLike): string {

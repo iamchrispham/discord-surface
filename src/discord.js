@@ -2165,14 +2165,29 @@ class DiscordGateway {
     };
     const isRetryableRecoveryBoundary = boundary => boundary &&
       (isRetryableIntakeBoundary(boundary) || isInterruptedRetryBoundary(boundary));
+    const scheduleRecoveryRetry = (channelId, retryDeadline) => {
+      if (this.stopping || this.recoveryRetryScheduledChannels.has(channelId)) return;
+      this.recoveryRetryScheduledChannels.add(channelId);
+      queueMicrotask(() => {
+        this.recoveryRetryScheduledChannels.delete(channelId);
+        if (this.stopping || !this.isCurrentLifecycle(lifecycleEpoch)) return;
+        this.recoverTransport(reason, lifecycleEpoch, [channelId], retryDeadline).catch(error => {
+          this.logger(`Discord intake boundary retry failed: ${error.message}`);
+        });
+      });
+    };
     let failure = null;
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (Date.now() >= deadline) {
         const watermark = this.state.getIntakeWatermark(binding.channelId);
-        if (classifyReadiness(binding, watermark) === READINESS.READY) continue;
+        const currentState = classifyReadiness(binding, watermark);
+        if (currentState === READINESS.READY) continue;
         if (isRetryableRecoveryBoundary(watermark) ||
             [READINESS.PENDING, READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark?.state)) {
+          if (currentState === READINESS.PENDING || isRetryableRecoveryBoundary(watermark)) {
+            scheduleRecoveryRetry(binding.channelId, Date.now() + this.recoveryTimeoutMs);
+          }
           failure ||= { ready: false, state: watermark?.state || 'unavailable' };
         } else {
           const classified = classifyRecoveryFailure(recoveryError(CODEX_VALIDATION_KINDS.DEADLINE,
@@ -2239,15 +2254,7 @@ class DiscordGateway {
         if (this.stopping) return;
         const current = classifyCurrentReadiness();
         if (current?.state !== READINESS.PENDING) return;
-        if (this.recoveryRetryScheduledChannels.has(binding.channelId)) return;
-        this.recoveryRetryScheduledChannels.add(binding.channelId);
-        queueMicrotask(() => {
-          this.recoveryRetryScheduledChannels.delete(binding.channelId);
-          if (this.stopping || !this.isCurrentLifecycle(lifecycleEpoch)) return;
-          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], deadline).catch(error => {
-            this.logger(`Discord intake boundary retry failed: ${error.message}`);
-          });
-        });
+        scheduleRecoveryRetry(binding.channelId, deadline);
       };
       const recordOwnedBoundary = async (owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary) => {
         if (nextState === READINESS.GAP || nextState === READINESS.UNAVAILABLE) {
