@@ -260,7 +260,14 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     }
   }
 
+  function assertResultRequestActive(state: DirectPostState, meta: DirectPostPartMeta): void {
+    if (meta.agentPacket && state.isAgentResultForWithdrawnRequest(meta.agentPacket)) {
+      throw new BindingError('agent request was withdrawn');
+    }
+  }
+
   function inspectPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null {
+    assertResultRequestActive(state, meta);
     const rows = state.directPostRows(meta.requestId);
     assertRequestIdentity(rows, meta);
     const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
@@ -355,6 +362,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       const canonicalMeta = snapshotCustodyFields(meta, snapshots);
       detail = validatedOutcomeDetail(canonicalMeta, detail, BindingError, snapshots);
       return state.transaction(() => {
+        assertResultRequestActive(state, canonicalMeta);
         const rows = state.directPostRows(canonicalMeta.requestId);
         assertRequestIdentity(rows, canonicalMeta);
         const { attemptId: _attemptId, ...preflightMeta } = canonicalMeta;

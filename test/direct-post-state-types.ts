@@ -41,6 +41,7 @@ const meta: DirectPostPartMeta = {
 };
 
 const state: DirectPostState = {
+  isAgentResultForWithdrawnRequest: () => false,
   db: {
     prepare: () => ({
       all: <T extends Record<string, unknown>>(..._parameters: unknown[]) => [] as T[]
