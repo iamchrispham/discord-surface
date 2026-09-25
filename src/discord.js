@@ -947,6 +947,7 @@ class DiscordGateway {
     this.liveCheckpointRetryDelayMs = LIVE_CHECKPOINT_RETRY_INITIAL_DELAY_MS;
     this.reconnectPromise = null;
     this.deferredHandoffRecoveryTimer = null;
+    this.deferredHandoffRecoveryTimerDeadline = null;
     this.pendingHandoffRecoveryPollTimer = null;
     this.deferredHandoffRecoveryChannels = new Set();
     this.pendingHandoffRecoveryChannels = new Set();
@@ -1786,8 +1787,17 @@ class DiscordGateway {
     if (!binding?.active || !this.state.isOrdinaryBinding?.(binding) ||
         !isNativeProofRetryBoundary(watermark?.state, watermark?.detail)) return null;
     const existing = this.deferredHandoffRecoveryDeadlines.get(channelId);
-    if (existing && existing.deadline > Date.now() && existing.generation === binding.generation &&
-        existing.nativeId === binding.nativeId) return existing;
+    if (existing && existing.generation === binding.generation && existing.nativeId === binding.nativeId) {
+      if (existing.deadline > Date.now() && existing.detail === watermark.detail) return existing;
+      const retry = {
+        detail: watermark.detail,
+        deadline: existing.deadline,
+        generation: binding.generation,
+        nativeId: binding.nativeId
+      };
+      this.deferredHandoffRecoveryDeadlines.set(channelId, retry);
+      return retry;
+    }
     const retry = {
       detail: watermark.detail,
       deadline: Date.now() + this.recoveryTimeoutMs,
@@ -1851,14 +1861,22 @@ class DiscordGateway {
     if (!pendingGeneration) this.ensureDeferredNativeProofRecovery(channelId);
     const channels = pendingGeneration ? this.pendingHandoffRecoveryChannels : this.deferredHandoffRecoveryChannels;
     channels.add(channelId);
-    if (this.deferredHandoffRecoveryTimer) return;
     const retry = this.deferredHandoffRecoveryDeadlines.get(channelId);
     const delay = retry
       ? Math.min(this.deferredHandoffRecoveryDelayMs, Math.max(0, retry.deadline - Date.now()))
       : this.deferredHandoffRecoveryDelayMs;
+    const timerDeadline = Date.now() + delay;
+    if (this.deferredHandoffRecoveryTimer) {
+      const currentDeadline = this.deferredHandoffRecoveryTimerDeadline ?? Number.POSITIVE_INFINITY;
+      if (timerDeadline >= currentDeadline) return;
+      clearTimeout(this.deferredHandoffRecoveryTimer);
+      this.deferredHandoffRecoveryTimer = null;
+    }
     this.deferredHandoffRecoveryDelayMs = Math.min(delay * 2, DEFERRED_HANDOFF_RECOVERY_MAX_DELAY_MS);
     const timer = setTimeout(() => {
-      if (this.deferredHandoffRecoveryTimer === timer) this.deferredHandoffRecoveryTimer = null;
+      if (this.deferredHandoffRecoveryTimer !== timer) return;
+      this.deferredHandoffRecoveryTimer = null;
+      this.deferredHandoffRecoveryTimerDeadline = null;
       if (this.stopping || (!this.deferredHandoffRecoveryChannels.size && !this.pendingHandoffRecoveryChannels.size)) return;
       const deferredChannels = [...this.deferredHandoffRecoveryChannels]
         .filter(deferredChannelId => !this.expireDeferredNativeProofRecovery(deferredChannelId));
@@ -1939,6 +1957,7 @@ class DiscordGateway {
     }, delay);
     timer.unref?.();
     this.deferredHandoffRecoveryTimer = timer;
+    this.deferredHandoffRecoveryTimerDeadline = timerDeadline;
   }
 
   schedulePendingHandoffRecoveryPoll() {
@@ -2399,7 +2418,9 @@ class DiscordGateway {
           failure ||= { ready: false, state: current?.state || 'unavailable', error };
           continue;
         }
-        const nativeProofRetry = typeof nativeProofRetryDetail === 'string';
+        const transientChannelLookup = isRetryableFetchBoundary(READINESS.UNAVAILABLE, error?.message);
+        const nativeProofRetry = typeof nativeProofRetryDetail === 'string' &&
+          (!recoveryAttempted || transientChannelLookup);
         const retryState = nativeProofRetry ? READINESS.UNAVAILABLE
           : kind === CODEX_VALIDATION_KINDS.DEADLINE ? READINESS.GAP : READINESS.UNAVAILABLE;
         const retryDetail = nativeProofRetry ? nativeProofRetryDetail : error.message;
@@ -3055,6 +3076,7 @@ class DiscordGateway {
     this.attachmentIntakeRetryInFlight.clear();
     if (this.deferredHandoffRecoveryTimer) clearTimeout(this.deferredHandoffRecoveryTimer);
     this.deferredHandoffRecoveryTimer = null;
+    this.deferredHandoffRecoveryTimerDeadline = null;
     if (this.pendingHandoffRecoveryPollTimer) clearTimeout(this.pendingHandoffRecoveryPollTimer);
     this.pendingHandoffRecoveryPollTimer = null;
     this.deferredHandoffRecoveryChannels.clear();
