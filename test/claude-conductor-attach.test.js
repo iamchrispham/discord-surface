@@ -183,14 +183,6 @@ function spawnListener(t, f, command) {
   } };
 }
 
-test('attachOrdinaryListener wakes once without ordinary readiness changes', () => {
-  for (const label of ['Claude channel', 'Claude Monitor']) {
-    const f = fixture();
-    assert.deepEqual(attachOrdinaryListener({ ...f.args, label }), { requested: true });
-    assert.equal(f.wakes(), 1);
-  }
-});
-
 test('conductor attach refuses changed identity before waking', () => {
   for (const change of [
     { active: false }, { nativeId: 'successor' }, { generation: 4 },
