@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { qualifiedReadbackInstant } = require('./readback-instant');
 const TOPIC_DEFINITE_NOT_PUBLISHED = new Set(['rate_limited', 'rejected', 'stopped', 'not_published']);
 
 function rowTopicPublication(row) {
@@ -167,7 +168,12 @@ function createTopicPublicationHandlers({ assertText, BindingError, UnresolvedWo
     if (!readback || typeof readback !== 'object') throw new BindingError('fresh topic readback is required');
     assertText(readback.topic, 'readback.topic', 2048);
     assertText(readback.observedAt, 'readback.observedAt', 64);
-    if (!Number.isFinite(Date.parse(readback.observedAt))) throw new BindingError('readback.observedAt must be an ISO timestamp');
+    let observedAt;
+    try {
+      observedAt = qualifiedReadbackInstant(readback.observedAt, 'readback.observedAt');
+    } catch (error) {
+      throw new BindingError(error.message);
+    }
     return this.transaction(() => {
       const custody = this.getTopicPublication(requestId);
       if (!custody || custody.channelId !== channelId) throw new BindingError('topic publication custody is unknown');
@@ -175,7 +181,7 @@ function createTopicPublicationHandlers({ assertText, BindingError, UnresolvedWo
         throw new BindingError('topic publication custody is already settled');
       }
       if (!custody.operationEndedAt) throw new UnresolvedWorkError('topic publication operation has not terminated');
-      if (Date.parse(readback.observedAt) < Date.parse(custody.operationEndedAt)) throw new BindingError('topic readback predates operation termination');
+      if (Date.parse(observedAt) < Date.parse(custody.operationEndedAt)) throw new BindingError('topic readback predates operation termination');
       if (resolution === 'published' && readback.topic !== custody.desiredTopic) throw new BindingError('topic readback does not confirm the desired publication');
       if (resolution === 'not_published' && readback.topic === custody.desiredTopic) throw new BindingError('topic readback confirms the desired publication');
       const binding = this.getBinding(channelId);
@@ -183,12 +189,12 @@ function createTopicPublicationHandlers({ assertText, BindingError, UnresolvedWo
       const status = resolution === 'published' ? TOPIC_PUBLICATION_STATES.PUBLISHED : TOPIC_PUBLICATION_STATES.NOT_PUBLISHED;
       const outcome = resolution === 'published' ? 'reconciled_published' : 'reconciled_not_published';
       this.db.prepare('UPDATE topic_publications SET status=?, outcome=?, evidence_scope=?, error=NULL, readback_at=?, readback_topic=?, updated_at=? WHERE request_id=? AND status IN (?, ?)')
-        .run(status, outcome, evidenceScope, readback.observedAt, readback.topic, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN);
+        .run(status, outcome, evidenceScope, observedAt, readback.topic, now(), requestId, TOPIC_PUBLICATION_STATES.IN_FLIGHT, TOPIC_PUBLICATION_STATES.UNKNOWN);
       this.receipt(null, 'topic-publication-reconciled', {
         requestId, channelId, provider: custody.provider, nativeId: custody.nativeId,
         conductorId: custody.conductorId, repoKey: custody.repoKey, generation: custody.generation,
         desiredReadiness: custody.desiredReadiness, resolution, evidenceScope, custodyStatus: status,
-        operationEndedAt: custody.operationEndedAt, readbackAt: readback.observedAt, readbackTopic: readback.topic
+        operationEndedAt: custody.operationEndedAt, readbackAt: observedAt, readbackTopic: readback.topic
       });
       return this.getBinding(channelId);
     });
