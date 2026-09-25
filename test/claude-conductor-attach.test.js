@@ -213,11 +213,15 @@ test('missing Gateway is reported without promoting conductor readiness', () => 
   assert.match(output.join(''), /gateway-not-running/);
 });
 
-test('unsupported wake refuses attach without revoking conductor readiness', () => {
+test('unsupported wake keeps conductor attach alive without revoking readiness', () => {
   const f = fixture();
-  assert.throws(() => attachOrdinaryListener({ ...f.args,
-    requestRecovery: () => ({ requested: false, reason: 'gateway-wake-unsupported' })
-  }), /gateway-wake-unsupported/);
+  const output = [];
+  const result = attachOrdinaryListener({ ...f.args,
+    requestRecovery: () => ({ requested: false, reason: 'gateway-wake-unsupported' }),
+    stderr: { write: text => output.push(text) }
+  });
+  assert.deepEqual(result, { requested: false, reason: 'gateway-wake-unsupported' });
+  assert.match(output.join(''), /gateway-wake-unsupported/);
 });
 
 for (const command of ['claude-channel', 'claude-monitor']) {
