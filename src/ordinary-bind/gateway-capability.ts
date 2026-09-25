@@ -2,6 +2,7 @@ const { GATEWAY_CAPABILITIES } = require('../../src/ordinary-bind/constants') as
   GATEWAY_CAPABILITIES: {
     ordinaryBindWake: string;
     agentHandledWithoutPost: string;
+    agentRequestWithdrawal: string;
     watcherNoticeIngress: string;
   };
 };
