@@ -272,6 +272,37 @@ test('reply_to can select a colliding legacy parent request through its peer', a
   assert.equal(posts, 1);
 });
 
+test('reply_to refuses a same-peer parent and child collision', async t => {
+  const f = fixture(t); f.enroll('102');
+  const target = addRecipient(f);
+  const caller = f.state.getBinding('101');
+  const callerAddress = { guildId: caller.guildId, channelId: '102', provider: caller.provider,
+    nativeId: caller.nativeId, generation: caller.generation };
+  const requestPacket = channelId => ({
+    id: 'same-peer-collision', kind: 'request',
+    source: { guildId: target.guildId, channelId, provider: target.provider,
+      nativeId: target.nativeId, generation: target.generation },
+    target: callerAddress, replyTo: null, routingVersion: 2, text: 'hello'
+  });
+  f.state.receipt(null, 'agent-message', { packet: requestPacket('202') });
+  f.state.receipt(null, 'agent-message', { packet: requestPacket('201') });
+  let posts = 0;
+  const peer = service(f, { fetchImpl: async () => { posts += 1; assert.fail('ambiguous reply reached network'); } });
+  await assert.rejects(peer.send({ peer: { conductorId: 'recipient' }, reply_to: 'same-peer-collision',
+    text: 'reply', dedupe_key: 'same-peer-collision-result' }), /ambiguous across parent and child routes/);
+  assert.equal(posts, 0);
+});
+
+test('peer send rejects inline text that cannot round-trip through UTF-8 staging', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  let posts = 0;
+  const peer = service(f, { fetchImpl: async () => { posts += 1; assert.fail('invalid UTF-8 text reached network'); } });
+  await assert.rejects(peer.send({ peer: { conductorId: 'recipient' }, text: '\ud800', dedupe_key: 'invalid-inline-text' }),
+    /round-trip losslessly through UTF-8/);
+  assert.equal(posts, 0);
+  assert.equal(f.state.directPostRows('invalid-inline-text').length, 0);
+});
+
 test('peer result preserves current and rejects stale legacy parent destinations', async t => {
   const f = fixture(t); const target = addRecipient(f);
   const sourceBinding = f.state.getBinding('101');

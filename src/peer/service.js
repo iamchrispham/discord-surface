@@ -65,10 +65,10 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
           generation: destination.binding.generation }
       ];
     let lastError;
+    const matches = [];
     for (const selector of selectors) {
       try {
-        target = resolveAgentReplyRequest(state, input.reply_to, sourceAddress, selector, callerAddress, Error).source;
-        break;
+        matches.push(resolveAgentReplyRequest(state, input.reply_to, sourceAddress, selector, callerAddress, Error).source);
       } catch (error) {
         if (!(error instanceof Error) || error.message !== 'agent reply target is unknown or does not match the active request') {
           throw error;
@@ -76,7 +76,9 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
         lastError = error;
       }
     }
-    if (target === undefined) throw lastError;
+    if (matches.length > 1) throw new Error('agent reply target is ambiguous across parent and child routes');
+    if (matches.length === 1) target = matches[0];
+    else throw lastError;
   } else {
     target = resolveAgentAddress(state, destination.binding, destination.childId);
   }
@@ -130,6 +132,7 @@ function createPeerService(context) {
       if (!validPeerId(input.dedupe_key)) throw new Error('dedupe_key must be a valid packet id');
       if (input.reply_to !== undefined && !validPeerId(input.reply_to)) throw new Error('reply_to must be a valid packet id');
       if (input.text !== undefined && (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > 10000)) throw new Error('text must be non-empty and at most 10000 bytes');
+      if (input.text !== undefined && Buffer.from(input.text, 'utf8').toString('utf8') !== input.text) throw new Error('text must round-trip losslessly through UTF-8');
       if (input.text_file !== undefined && (typeof input.text_file !== 'string' || !input.text_file.trim())) throw new Error('text_file must be non-empty');
       const initial = await caller(signal);
       const channels = input.peer?.channelName ? await loadChannels(signal) : [];
