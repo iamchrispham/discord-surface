@@ -225,7 +225,7 @@ export async function* walkAsync(dir: string, depth = 0, rawOptions: RawValidati
 }
 
 function transcriptFilenameMatchesNativeId(file: string, nativeId: string): boolean {
-  return path.basename(file).includes(nativeId);
+  return path.basename(file).endsWith(`${nativeId}.jsonl`);
 }
 
 const CODEX_SESSION_DISCOVERY_TIMEOUT_MS = 5000;
@@ -246,6 +246,7 @@ export async function readCodexSessionIdentityAsync(
   for await (const file of walkAsync(root, 0, options)) {
     assertValidationActive(options);
     if (!file.includes(nativeId)) continue;
+    if (!transcriptFilenameMatchesNativeId(file, nativeId)) continue;
     const filenameMatchesNativeId = transcriptFilenameMatchesNativeId(file, nativeId);
     const controller = new AbortController();
     const relayAbort = () => controller.abort();
@@ -333,6 +334,7 @@ function readSessionHeader(file: string): string {
 export function findCodexSessionFile(nativeId: string, root = sessionRoot()): string | null {
   for (const file of walk(root)) {
     if (!file.includes(nativeId)) continue;
+    if (!transcriptFilenameMatchesNativeId(file, nativeId)) continue;
     try {
       const row = JSON.parse(readSessionHeader(file)) as { type?: unknown; payload?: unknown };
       if (row.type !== 'session_meta') continue;
@@ -352,6 +354,7 @@ export function readCodexSessionIdentity(nativeId: string, root = sessionRoot())
   const mismatches: MismatchedCodexSessionIdentity[] = [];
   for (const file of walk(root)) {
     if (!file.includes(nativeId)) continue;
+    if (!transcriptFilenameMatchesNativeId(file, nativeId)) continue;
     const filenameMatchesNativeId = transcriptFilenameMatchesNativeId(file, nativeId);
     try {
       const row = JSON.parse(readSessionHeader(file)) as { type?: unknown; payload?: unknown };

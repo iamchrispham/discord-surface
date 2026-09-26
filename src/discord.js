@@ -1515,7 +1515,11 @@ class DiscordGateway {
       const unresolvedThreadEnrollments = this.state.listThreadEnrollments().filter(enrollment =>
         enrollment.active && enrollment.state !== THREAD_STATES.READY
       );
-      const hasEndpointUnavailableBinding = !recovery.ready && ['gap', 'unavailable'].includes(recovery.state) &&
+      const aggregateRecoveryReady = recovery.ready && unresolvedThreadEnrollments.length === 0;
+      const aggregateRecoveryState = aggregateRecoveryReady
+        ? recovery.state
+        : unresolvedThreadEnrollments[0]?.state || recovery.state;
+      const hasEndpointUnavailableBinding = !aggregateRecoveryReady && ['gap', 'unavailable'].includes(recovery.state) &&
         unresolvedBindings.length > 0 && unresolvedBindings.every(binding => {
           const watermark = this.state.getIntakeWatermark(binding.channelId);
           return watermark?.state === READINESS.UNAVAILABLE &&
@@ -1525,7 +1529,7 @@ class DiscordGateway {
               watermark.detail.startsWith('Codex transcript proof unavailable before event write:')
             );
         }) && unresolvedThreadEnrollments.every(enrollment => this.isPreAdoptionRetryableThread(enrollment.threadId));
-      if (!recovery.ready && !hasEndpointUnavailableBinding) throw new Error(`Discord intake recovery is ${recovery.state}`);
+      if (!aggregateRecoveryReady && !hasEndpointUnavailableBinding) throw new Error(`Discord intake recovery is ${aggregateRecoveryState}`);
       if (hasEndpointUnavailableBinding) this.ready = true;
       this.transportReady = true;
       this.started = true;
@@ -1547,9 +1551,15 @@ class DiscordGateway {
     })();
     this.startPromise = startPromise;
     try { return await startPromise; }
+    catch (error) {
+      this.started = false;
+      throw error;
+    }
     finally {
       if (this.startPromise === startPromise) this.startPromise = null;
       this.starting = false;
+      if (!this.started) this.ready = false;
+      if (!this.started) this.transportReady = false;
       if (!this.started) this.resolveInteractionRecovery(false);
       if (!this.started) this.discordToken = null;
     }

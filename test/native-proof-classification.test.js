@@ -37,7 +37,7 @@ for (const [label, validate] of [['sync', validateCodexSessionIdentity], ['async
 
   test(`${label} proof classifies conflicting transcript identity`, async t => {
     const f = fixture(t);
-    fs.writeFileSync(path.join(f.root, `${ID}-conflict.jsonl`), JSON.stringify({
+    fs.writeFileSync(path.join(f.root, `conflict-${ID}.jsonl`), JSON.stringify({
       type: 'session_meta', payload: {
         id: ID,
         session_id: '99999999-9999-4999-8999-999999999999',
@@ -51,7 +51,7 @@ for (const [label, validate] of [['sync', validateCodexSessionIdentity], ['async
 test('identity readers mark mismatched candidates instead of returning them as matches', async t => {
   const f = fixture(t);
   const mismatch = '99999999-9999-4999-8999-999999999999';
-  fs.writeFileSync(path.join(f.root, `${ID}-conflict.jsonl`), JSON.stringify({
+  fs.writeFileSync(path.join(f.root, `conflict-${ID}.jsonl`), JSON.stringify({
     type: 'session_meta', payload: { id: ID, session_id: mismatch, cwd: f.dir }
   }) + '\n');
   const sync = readCodexSessionIdentity(ID, f.root);

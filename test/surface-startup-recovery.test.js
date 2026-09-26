@@ -112,6 +112,30 @@ test('simulated: bounded intake recovery records a visible gap and requires expl
   state.close();
 });
 
+test('simulated: startup rejects a ready aggregate with a terminal active child', async () => {
+  const { dir, state } = fixture();
+  const binding = state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.enrollThread({ threadId: 'thread-terminal', parentChannelId: binding.channelId, guildId: 'guild-1' }, binding);
+  state.markThreadBoundary('thread-terminal', 'gap', 'terminal child gap', '100', '101', binding);
+  const secret = path.join(dir, 'discord.env');
+  fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
+  const client = {
+    user: { id: 'bot-1' },
+    on() {},
+    off() {},
+    async login() {},
+    channels: { fetch: async () => ({ id: binding.channelId, permissionsFor: () => historyPermissions() }) },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [] });
+  gateway.recoverTransport = async () => ({ ready: true, state: 'ready' });
+
+  await assert.rejects(() => gateway.start(secret), /intake recovery is gap/);
+  assert.equal(gateway.ready, false);
+  await gateway.stop();
+  state.close();
+});
+
 test('simulated: stop fences a client login that resolves after state close', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });

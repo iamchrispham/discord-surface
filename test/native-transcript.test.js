@@ -3,7 +3,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { findCodexSessionFile, observeCodexReply, readInitialCursor, validateCodexSessionIdentityAsync } = require('../src/native');
+const {
+  findCodexSessionFile,
+  observeCodexReply,
+  readInitialCursor,
+  validateCodexSessionIdentityAsync,
+  CODEX_VALIDATION_KINDS
+} = require('../src/native');
 const { SurfaceState, MESSAGE_STATES, REPLY_COMPLETED_WITHOUT_POST } = require('../src/state');
 const { createSurfaceConsumer } = require('../src/discord');
 
@@ -75,6 +81,17 @@ test('async identity validation returns verified session identity', async t => {
   const { root, workspace, file } = identityFixture(t);
   const result = await validateCodexSessionIdentityAsync(ID, workspace, root);
   assert.deepEqual(result, { file, sessionId: ID, threadId: ID, workspace });
+});
+
+test('async identity validation ignores a native id in a noncanonical backup suffix', async t => {
+  const { root, workspace, file } = identityFixture(t);
+  const backup = path.join(root, `${ID}-backup.jsonl`);
+  fs.renameSync(file, backup);
+
+  await assert.rejects(
+    () => validateCodexSessionIdentityAsync(ID, workspace, root),
+    error => error.recoveryKind === CODEX_VALIDATION_KINDS.UNAVAILABLE
+  );
 });
 
 test('async identity validation stops before scanning when already aborted', async t => {
