@@ -398,6 +398,9 @@ test('Gateway claims callback before HTTP, preserves accepted work on visibility
     processed += 1;
     return { message };
   };
+  gateway.started = true;
+  gateway.transportReady = true;
+  gateway.ready = true;
   try {
     const first = await gateway.handleInteraction(interaction('gateway-1'), new AbortController().signal);
     const duplicate = await gateway.handleInteraction(interaction('gateway-1'), new AbortController().signal);
@@ -434,6 +437,9 @@ test('Gateway admission persists the callback claim with accepted custody', asyn
     }
   });
   gateway.consumer.processAccepted = async message => ({ message });
+  gateway.started = true;
+  gateway.transportReady = true;
+  gateway.ready = true;
   try {
     const result = await gateway.handleInteraction(interaction('atomic-claim'), new AbortController().signal);
     assert.equal(result.message.id, 'atomic-claim');
@@ -502,6 +508,9 @@ test('callback deadline records unknown and still processes accepted custody', a
     processed += 1;
     return { message };
   };
+  gateway.started = true;
+  gateway.transportReady = true;
+  gateway.ready = true;
   try {
     const startedAt = Date.now();
     const result = await gateway.handleInteraction(interaction('deadline-callback'), new AbortController().signal);
@@ -601,6 +610,9 @@ test('expired callback token settles once and native custody continues without t
     processed += 1;
     return { message };
   };
+  gateway.started = true;
+  gateway.transportReady = true;
+  gateway.ready = true;
   try {
     const first = await gateway.handleInteraction(interaction('expired-token'), new AbortController().signal);
     const duplicate = await gateway.handleInteraction(interaction('expired-token'), new AbortController().signal);
@@ -739,6 +751,59 @@ test('missing or deleted callback target becomes terminal local visibility failu
   } finally {
     await deletedGateway.stop();
     closeFixture(deleted);
+  }
+});
+
+test('successful Gateway start dispatches one interactionCreate through native exactly once', { timeout: 8000 }, async t => {
+  const fixtureState = fixture();
+  const { state, dir } = fixtureState;
+  const secretFile = path.join(dir, 'discord.secret');
+  fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  state.setBindingReadiness('channel', 'ready');
+  const listeners = new Map();
+  let callbacks = 0;
+  let dispatchCount = 0;
+  const client = {
+    application: { id: 'application', commands: null },
+    user: { id: 'bot-1' },
+    on(name, listener) { listeners.set(name, listener); },
+    off(name, listener) { if (listeners.get(name) === listener) listeners.delete(name); },
+    async login() {},
+    channels: { fetch: async () => ({ id: 'channel', messages: { fetch: async () => ({ react: async () => {} }) }, send: async () => ({ id: 'reply-1' }) }) },
+    async destroy() {}
+  };
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    providers: {
+      codex: {
+        async dispatch() { dispatchCount += 1; return { status: 'submitted' }; },
+        async observe() { return { text: 'status board' }; }
+      }
+    },
+    interactionFetch: async () => {
+      callbacks += 1;
+      return { ok: true, status: 200, async json() { return { interaction: { response_message_id: 'response-1' } }; } };
+    }
+  });
+  gateway.recoverTransport = async () => {
+    gateway.ready = true;
+    return { ready: true, state: 'ready' };
+  };
+  try {
+    await gateway.start(secretFile);
+    assert.equal(gateway.started, true);
+    assert.equal(typeof listeners.get('interactionCreate'), 'function');
+
+    listeners.get('interactionCreate')(interaction('successful-start'));
+    await Promise.all([...gateway.inFlight]);
+
+    assert.equal(callbacks, 1);
+    assert.equal(dispatchCount, 1);
+    assert.equal(state.getMessage('successful-start').state, MESSAGE_STATES.REPLIED);
+  } finally {
+    await gateway.stop();
+    closeFixture(fixtureState);
   }
 });
 

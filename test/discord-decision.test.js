@@ -132,6 +132,9 @@ async function waitForCondition(predicate, message, timeoutMs = 3000) {
 
 test('Gateway settles competing component clicks once and imports the canonical winner', { timeout: 30000 }, async t => {
   const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
   const first = await f.gateway.handleInteraction(component(f.presentation, 'component-approve', 0), new AbortController().signal);
   const second = await f.gateway.handleInteraction(component(f.presentation, 'component-hold', 1), new AbortController().signal);
 
@@ -196,8 +199,43 @@ test('bound component ingress keeps callback custody before readiness and gates 
   assert.ok(aborted.state.listDecisionPendingWork().some(click => click.interactionId === 'aborted-barrier-component'));
 });
 
+test('decision native return is held before startup and proceeds once after a healthy start', { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  const listener = f.listeners.get('interactionCreate');
+  assert.equal(typeof listener, 'function');
+  assert.equal(f.gateway.started, false);
+
+  listener(component(f.presentation, 'held-before-start', 0));
+  await waitForCondition(() => f.callbacks.length === 1, 'held decision callback was not attempted');
+  await Promise.all([...f.gateway.inFlight]);
+
+  const held = f.state.getDecisionClick('held-before-start');
+  assert.equal(held.callbackOutcome, 'sent');
+  assert.equal(held.nativeReturn, null);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.edits.length, 0);
+  assert.equal(decisionMessages(f.state).length, 0);
+
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  listener(component(f.presentation, 'native-after-start', 0));
+  await waitForCondition(() => f.callbacks.length === 2, 'started decision callback was not attempted');
+  await Promise.all([...f.gateway.inFlight]);
+
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.edits.length, 1);
+  assert.deepEqual(f.edits.map(item => item.content), ['approve']);
+  assert.equal(decisionMessages(f.state).length, 1);
+  assert.equal(f.state.getDecisionClick('native-after-start').nativeReturn.outcome, 'submitted');
+  assert.equal(f.state.getDecisionClick('held-before-start').nativeReturn, null);
+});
+
 test('losing projection refuses binding and config drift during question fetch', { timeout: 30000 }, async t => {
   const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
   await f.gateway.handleInteraction(component(f.presentation, 'projection-owner', 0), new AbortController().signal);
   const admitted = f.state.admitDecisionClickAndBeginCallback({
     interactionId: 'projection-loser',
@@ -271,6 +309,9 @@ test('callback uncertainty does not cancel canonical settlement or native custod
   const f = await fixture(t, {
     callback: async () => { throw new Error('Discord callback connection lost'); }
   });
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
   const result = await f.gateway.handleInteraction(component(f.presentation, 'callback-unknown', 0), new AbortController().signal);
   const click = f.state.getDecisionClick('callback-unknown');
 

@@ -1233,7 +1233,7 @@ class DiscordGateway {
     const pending = [this.startPromise, this.reconnectPromise, this.recoveryPromise].filter(Boolean);
     if (pending.length) await Promise.all(pending.map(promise => Promise.resolve(promise).catch(() => null)));
     if (signal?.aborted || this.stopping) return false;
-    if (!this.started) return true;
+    if (!this.started) return false;
     if (!this.transportReady || !this.ready) return false;
     return this.state.getBinding(message.channelId)?.readiness === READINESS.READY;
   }

@@ -30,7 +30,13 @@ function setupGateway() {
   };
   const calls = { codex: 0, claude: 0 };
   let dispatchCount = 0;
-  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [], providers: providers({ calls }) });
+  const gateway = new DiscordGateway({
+    state,
+    client,
+    fetchHistory: async () => [],
+    providers: providers({ calls }),
+    interactionFetch: async () => ({ ok: true, status: 200, async json() { return { interaction: { response_message_id: 'fixture-response' } }; } })
+  });
   gateway.providers.codex.dispatch = async () => { dispatchCount += 1; return { status: 'submitted' }; };
   return { dir, state, secret, listeners, channel, gateway, dispatchCount: () => dispatchCount };
 }
@@ -41,6 +47,20 @@ function cleanup(t, { dir, state, gateway }) {
     state.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
+}
+
+function csInteraction(id) {
+  return {
+    type: 2,
+    id,
+    applicationId: 'application',
+    guildId: 'guild-1',
+    channelId: 'channel-codex',
+    commandName: 'cs',
+    token: `token-${id}`,
+    user: { id: 'operator-1' },
+    options: { data: [] }
+  };
 }
 
 test('simulated: rejected gateway start must fence later live native dispatch', { timeout: 8000 }, async t => {
@@ -76,6 +96,28 @@ test('simulated: rejected gateway start must fence later live native dispatch', 
   await t.test('failed start leaves the transport not ready', async () => {
     assert.equal(gateway.transportReady, false);
   });
+});
+
+test('simulated: never-started gateway holds interaction custody with zero native dispatch', { timeout: 8000 }, async t => {
+  const env = setupGateway();
+  cleanup(t, env);
+  const { state, listeners, gateway } = env;
+  assert.equal(gateway.started, false);
+  assert.equal(typeof listeners.get('interactionCreate'), 'function');
+
+  listeners.get('interactionCreate')(csInteraction('interaction-never-started'));
+  await Promise.all([...gateway.inFlight]);
+
+  const message = state.getMessage('interaction-never-started');
+  assert.equal(message.state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(env.dispatchCount(), 0);
+  assert.equal(state.hasNativeAcknowledgment(message), false);
+
+  const direct = await gateway.handleInteraction(csInteraction('interaction-never-started-direct'), new AbortController().signal);
+  assert.equal(direct.accepted, true);
+  assert.equal(direct.deferred, true);
+  assert.equal(state.getMessage('interaction-never-started-direct').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(env.dispatchCount(), 0);
 });
 
 test('simulated: successful gateway start dispatches live native input to completion', { timeout: 8000 }, async t => {
