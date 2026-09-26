@@ -37,6 +37,10 @@ const normalizationSensitivityByDirectory = new Map<string, boolean>();
 const linuxBootId = readLinuxBootId();
 const ownerIdentity = processIdentity(process.pid);
 
+function effectiveUserId(): number | undefined {
+  return process.geteuid?.() ?? process.getuid?.();
+}
+
 type ProcStat = {
   state: string;
   startTime: string;
@@ -269,8 +273,7 @@ function assertLockNamespaceIsUsable(namespacePath: string, owner: number | unde
 }
 
 function ownerControlledNamespaceRoot(): string {
-  const owner = process.getuid?.();
-  const ownerName = owner === undefined ? 'shared' : String(owner);
+  const owner = effectiveUserId();
   const candidates: string[] = [];
   try {
     // The passwd-backed home directory is stable across invocations when it
@@ -279,8 +282,14 @@ function ownerControlledNamespaceRoot(): string {
   } catch {
     // Try the runtime and temporary roots below.
   }
-  try { candidates.push(fs.realpathSync('/tmp')); } catch {
-    // No stable system temporary root is available.
+  const runtimeRoot = process.env.XDG_RUNTIME_DIR;
+  if (runtimeRoot) {
+    try { candidates.push(fs.realpathSync(runtimeRoot)); } catch {
+      // No stable runtime root is available.
+    }
+  }
+  try { candidates.push(fs.realpathSync(os.tmpdir())); } catch {
+    // No stable temporary root is available.
   }
 
   for (const root of candidates) {
@@ -297,33 +306,13 @@ function ownerControlledNamespaceRoot(): string {
         // Try the next candidate.
       }
     }
-
-    // A sticky shared temporary root can safely contain a stable owner-only
-    // child. A group-writable home or runtime root without the sticky bit is
-    // not a safe fallback because another UID could replace that child.
-    const stickySharedRoot = (directory.mode & 0o1000) !== 0 && (directory.mode & 0o002) !== 0;
-    if (!stickySharedRoot) continue;
-    const privateRoot = path.join(root, `.claude-channel-${ownerName}`);
-    try {
-      fs.mkdirSync(privateRoot, { recursive: true, mode: 0o700 });
-      const privateDirectory = fs.statSync(privateRoot);
-      const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
-      const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
-      if (privateDirectory.isDirectory() && privateOwnerControlled && privateOwnerWritable &&
-        (privateDirectory.mode & 0o077) === 0) {
-        fs.accessSync(privateRoot, fs.constants.W_OK | fs.constants.X_OK);
-        return privateRoot;
-      }
-    } catch {
-      // Try the next candidate.
-    }
   }
   throw new Error('Claude channel socket lock namespace root is unusable');
 }
 
 function lockNamespacePath(socketPath: string): string {
   const root = ownerControlledNamespaceRoot();
-  const owner = process.getuid?.();
+  const owner = effectiveUserId();
   const ownerName = owner === undefined ? 'shared' : String(owner);
   const namespacePath = lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`);
   if (pathsOverlap(socketPath, namespacePath)) {
@@ -360,7 +349,7 @@ function stagingPathForNamespace(namespacePath: string): string {
 function ensureDirectoryOwnerOnly(directoryPath: string): void {
   fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
   const directory = fs.statSync(directoryPath);
-  if ((directory.mode & 0o077) || directory.uid !== process.getuid?.()) {
+  if ((directory.mode & 0o077) || directory.uid !== effectiveUserId()) {
     throw new Error('Claude channel socket directory must be owner-only');
   }
 }
@@ -551,7 +540,7 @@ function clearOrphanOwnerTemps(lockPath: string): boolean {
 
 function clearOrphanStagingDirs(namespacePath: string): void {
   try {
-    assertLockNamespaceIsUsable(namespacePath, process.getuid?.());
+    assertLockNamespaceIsUsable(namespacePath, effectiveUserId());
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
@@ -583,7 +572,7 @@ function createStagingLock(namespacePath: string): string {
         try { fs.mkdirSync(namespacePath, { mode: 0o700 }); } catch (recreateError) {
           if ((recreateError as NodeJS.ErrnoException).code !== 'EEXIST') throw recreateError;
         }
-        assertLockNamespaceIsUsable(namespacePath, process.getuid?.());
+        assertLockNamespaceIsUsable(namespacePath, effectiveUserId());
         continue;
       }
       if (code !== 'EEXIST') throw error;
@@ -773,7 +762,7 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
     throw error;
   }
   if (!original.isSocket()) throw new Error('Claude channel path exists and is not a socket');
-  if (original.uid !== process.getuid?.()) throw new Error('Claude channel socket belongs to another owner');
+  if (original.uid !== effectiveUserId()) throw new Error('Claude channel socket belongs to another owner');
   if (signal?.aborted) throw new Error('Claude channel stopped during socket preparation');
   await new Promise<void>((resolve, reject) => {
     if (signal?.aborted) {

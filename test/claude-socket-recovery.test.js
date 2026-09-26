@@ -177,6 +177,14 @@ test('owner records include a boot-unique process identity on Linux', t => {
   }
 });
 
+test('socket ownership follows the effective UID when real and effective IDs differ', t => {
+  if (process.getuid === undefined || process.geteuid === undefined) return;
+  const realUid = process.getuid();
+  t.mock.method(process, 'getuid', () => realUid + 1);
+  const socket = socketPath(t);
+  assert.doesNotThrow(() => assertSocketDirectory(socket));
+});
+
 test('live socket locks survive contenders with different timezones', { timeout: 8000 }, async t => {
   const socket = socketPath(t);
   const modulePath = path.resolve(__dirname, '../src/claude/socket-ownership');
@@ -309,7 +317,7 @@ for (const [label, mode] of [
   ['not-searchable', 0o600],
   ['missing', null],
 ]) {
-  test(`an ${label} passwd home falls back to the stable system temporary root`, t => {
+  test(`an ${label} passwd home falls back to the owner-controlled runtime root`, t => {
     const root = path.join('/tmp', `dss-root-${randomUUID()}`);
     if (mode !== null) {
       fs.mkdirSync(root, { mode: 0o700 });
@@ -346,11 +354,8 @@ for (const [label, mode] of [
     const socket = socketPath(t);
     const { release, lockPath } = acquireSocketLockWithPath(t, socket);
     try {
-      const owner = process.getuid?.();
-      const stableRoot = path.join(fs.realpathSync('/tmp'),
-        `.claude-channel-${owner === undefined ? 'shared' : String(owner)}`);
-      assert.equal(path.dirname(path.dirname(lockPath)), stableRoot,
-        'an unsafe passwd home must not own the lock namespace');
+      assert.equal(path.dirname(path.dirname(lockPath)), fs.realpathSync(runtimeRoot),
+        'an unsafe passwd home must use the owner-controlled runtime root');
       if (mode !== null) assert.deepEqual(fs.readdirSync(root), [], 'the unsafe home must remain untouched');
     } finally {
       release();
