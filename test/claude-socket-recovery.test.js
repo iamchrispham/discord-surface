@@ -323,6 +323,34 @@ test('ownerless preparation locks are reclaimed without deleting a replacement o
   assert.equal(fs.existsSync(lockPath), false);
 });
 
+test('ownerless lock replacement is not reclaimed by a stale contender', t => {
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const first = acquireSocketLockWithPath(t, socket);
+  const lockPath = first.lockPath;
+  const ownerPath = path.join(lockPath, 'owner');
+
+  const originalOpen = fs.openSync;
+  let replacementRelease;
+  let replaced = false;
+  t.mock.method(fs, 'openSync', (file, ...args) => {
+    if (!replaced && file === ownerPath) {
+      replaced = true;
+      fs.rmSync(lockPath, { recursive: true, force: true });
+      replacementRelease = acquireSocketLockWithPath(t, socket).release;
+      throw Object.assign(new Error('owner marker missing'), { code: 'ENOENT' });
+    }
+    return originalOpen(file, ...args);
+  });
+
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  assert.equal(replaced, true);
+  assert.equal(fs.existsSync(ownerPath), true);
+  assert.ok(replacementRelease);
+  assert.doesNotThrow(replacementRelease);
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
 test('legacy lock reclamation preserves a replacement owner', t => {
   const socket = socketPath(t);
   assertSocketDirectory(socket);

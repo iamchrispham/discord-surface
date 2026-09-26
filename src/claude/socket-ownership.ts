@@ -15,6 +15,8 @@ type FileIdentity = {
   ino: bigint;
 };
 
+type FileGeneration = FileIdentity & { ctimeNs: bigint };
+
 type SocketIdentity = FileIdentity & { ctimeNs: bigint };
 
 export type SocketPathIdentity = SocketIdentity;
@@ -93,6 +95,10 @@ function sameFile(left: FileIdentity, right: FileIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+function sameGeneration(left: FileGeneration, right: FileGeneration): boolean {
+  return sameFile(left, right) && left.ctimeNs === right.ctimeNs;
+}
+
 function sameSocket(left: SocketIdentity, right: SocketIdentity): boolean {
   return sameFile(left, right) && left.ctimeNs === right.ctimeNs;
 }
@@ -100,6 +106,11 @@ function sameSocket(left: SocketIdentity, right: SocketIdentity): boolean {
 function fileIdentity(filePath: string): FileIdentity {
   const stats = fs.lstatSync(filePath, { bigint: true });
   return { dev: stats.dev, ino: stats.ino };
+}
+
+function fileGeneration(filePath: string): FileGeneration {
+  const stats = fs.lstatSync(filePath, { bigint: true });
+  return { dev: stats.dev, ino: stats.ino, ctimeNs: stats.ctimeNs };
 }
 
 function socketIdentity(filePath: string): SocketIdentity {
@@ -514,16 +525,38 @@ function claimTransition(lockPath: string): string | null {
   }
 }
 
-function reclaimOwnerFile(lockPath: string, ownerPath: string, expected?: FileIdentity): boolean {
+function reclaimOwnerFile(
+  lockPath: string,
+  ownerPath: string,
+  expected?: FileIdentity,
+  expectedLockGeneration?: FileGeneration
+): boolean {
+  if (expectedLockGeneration) {
+    let observedLock: FileGeneration;
+    try { observedLock = fileGeneration(lockPath); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+    if (!sameGeneration(observedLock, expectedLockGeneration)) return false;
+  }
   const transitionPath = claimTransition(lockPath);
   if (!transitionPath) return false;
   const tombstonePath = path.join(transitionPath, 'owner');
   try {
+    if (expectedLockGeneration) {
+      let observedLock: FileIdentity;
+      try { observedLock = fileIdentity(lockPath); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
+      }
+      if (!sameFile(observedLock, expectedLockGeneration)) return false;
+    }
     let observed: FileIdentity | undefined;
     try { observed = fileIdentity(ownerPath); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return clearOrphanOwnerTemps(lockPath);
       throw error;
     }
+    if (expectedLockGeneration && observed) return false;
     if (expected && !sameFile(observed, expected)) return false;
     try { fs.renameSync(ownerPath, tombstonePath); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return clearOrphanOwnerTemps(lockPath);
@@ -541,8 +574,13 @@ function reclaimOwnerFile(lockPath: string, ownerPath: string, expected?: FileId
   }
 }
 
-function reclaimOwnerlessLock(lockPath: string, ownerPath: string, expected?: FileIdentity): boolean {
-  if (!reclaimOwnerFile(lockPath, ownerPath, expected)) return false;
+function reclaimOwnerlessLock(
+  lockPath: string,
+  ownerPath: string,
+  expectedOwner?: FileIdentity,
+  expectedLockGeneration?: FileGeneration
+): boolean {
+  if (!reclaimOwnerFile(lockPath, ownerPath, expectedOwner, expectedLockGeneration)) return false;
   if (!clearOrphanOwnerTemps(lockPath)) return false;
   try { fs.rmdirSync(lockPath); } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -620,16 +658,17 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
       removeLockDirectory(stagingPath);
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST' && code !== 'ENOTEMPTY' && code !== 'ENOTDIR') throw error;
-      let lockStats: fs.Stats;
-      try { lockStats = fs.lstatSync(lockPath); } catch (statError) {
+      let lockStats: fs.BigIntStats;
+      try { lockStats = fs.lstatSync(lockPath, { bigint: true }); } catch (statError) {
         if ((statError as NodeJS.ErrnoException).code === 'ENOENT') continue;
         throw statError;
       }
       if (lockStats.isDirectory()) {
+        const lockGeneration: FileGeneration = { dev: lockStats.dev, ino: lockStats.ino, ctimeNs: lockStats.ctimeNs };
         let ownerSnapshot: { owner: OwnerRecord; identity: FileIdentity };
         try { ownerSnapshot = readSocketLockOwnerSnapshot(ownerPath); } catch (ownerError) {
           if ((ownerError as NodeJS.ErrnoException).code !== 'ENOENT') throw ownerError;
-          if (reclaimOwnerlessLock(lockPath, ownerPath)) continue;
+          if (reclaimOwnerlessLock(lockPath, ownerPath, undefined, lockGeneration)) continue;
           throw new Error('Claude channel socket preparation is already in progress');
         }
         const owner = ownerSnapshot.owner;
