@@ -326,6 +326,8 @@ test('every main dispatch case has a flag policy entry', () => {
 test('parseArgs rejects a single-dash token that looks like a long flag', () => {
   assert.throws(() => parseArgs(['claude-post', '--attachment-file', 'a.png', '-attachment-file', 'b.png']));
   assert.throws(() => parseArgs(['stop', '-h']));
+  assert.throws(() => parseArgs(['claude-post', '--text-file', '-attachment-file', 'frame.png']), /unknown option -attachment-file/);
+  assert.strictEqual(parseArgs(['claude-post', '--text-file=-attachment-file']).args['text-file'], '-attachment-file');
 });
 
 test('parseArgs rejects a value-bearing boolean flag', () => {
