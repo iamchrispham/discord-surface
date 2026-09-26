@@ -71,9 +71,12 @@ function inspectPeerResult(state, source, correlationId) {
     attemptKind: DIRECT_POST_ATTEMPT,
     outcomeKind: DIRECT_POST_OUTCOME
   });
-  const sendOutcome = projection.attempt
-    ? (projection.outcome ? projection.outcome.detail.outcome ?? null : 'in_flight')
-    : projection.latestPreflight?.detail.outcome ?? null;
+  const preflightIsCurrent = Boolean(projection.latestPreflight &&
+    (!projection.attempt || projection.latestPreflight.id > projection.attempt.id) &&
+    (!projection.outcome || projection.latestPreflight.id > projection.outcome.id));
+  let sendOutcome = null;
+  if (preflightIsCurrent) sendOutcome = projection.latestPreflight.detail.outcome ?? null;
+  else if (projection.attempt) sendOutcome = projection.outcome ? projection.outcome.detail.outcome ?? null : 'in_flight';
   return { correlationId, sendOutcome, deliveries, results };
 }
 

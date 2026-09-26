@@ -139,6 +139,21 @@ function inspectBoardRequest(state: BoardState, requestId: string, rawTarget: Bo
   return duplicateRecord(readReceipts(state), requestId, target);
 }
 
+function hasUnresolvedBindingPost(state: BoardState, channelId: string): boolean {
+  const rows = readReceipts(state, [BOARD_RECEIPT_KINDS.ATTEMPT, BOARD_RECEIPT_KINDS.OUTCOME]);
+  for (const attempt of rows.filter(row => row.kind === BOARD_RECEIPT_KINDS.ATTEMPT && row.detail.channelId === channelId)) {
+    const attemptId = typeof attempt.detail.attemptId === 'string' ? attempt.detail.attemptId : '';
+    if (!attemptId) return true;
+    const outcome = latestOutcome(rows, attemptId);
+    if (!outcome) return true;
+    const value = OUTCOME_VALUES.has(String(outcome.detail.outcome))
+      ? String(outcome.detail.outcome) as BoardOutcome
+      : BOARD_OUTCOMES.UNKNOWN;
+    if (UNRESOLVED_OUTCOMES.has(value)) return true;
+  }
+  return false;
+}
+
 function boardMessageProvenance(state: BoardState, rawTarget: BoardTarget): BoardProvenance[] {
   const target = assertTarget(rawTarget);
   const direct = state.db.prepare(`SELECT detail, created_at FROM receipts
@@ -423,6 +438,7 @@ export function createBoardRefreshHandlers() {
   return {
     captureBoardRevision,
     inspectBoardRequest,
+    hasUnresolvedBindingPost,
     boardMessageProvenance,
     recoverBoardRefreshReceipts,
     recoverBoardRefreshAttempt,

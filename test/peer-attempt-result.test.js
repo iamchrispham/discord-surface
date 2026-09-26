@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { fixture, service, addRecipient } = require('./fixtures/peer-fixture');
+const { inspectPeerResult } = require('../src/peer/result');
 
 const request = { peer: { conductorId: 'recipient' }, text: 'retry after rate limit', dedupe_key: 'held-retry' };
 
@@ -48,4 +49,25 @@ test('peer result reports in_flight while a retry is unresolved after a rate_lim
   const rows = f.state.directPostRows(request.dedupe_key);
   assert.equal(rows.filter(row => row.kind === 'direct-post-attempt').length, 2);
   assert.equal(rows.filter(row => row.kind === 'direct-post-outcome').length, 2);
+});
+
+test('peer result surfaces a newer rejected preflight after a rate-limited attempt', async t => {
+  const f = fixture(t);
+  f.enroll('102');
+  addRecipient(f);
+  const peer = service(f, { fetchImpl: async (_url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    return { ok: false, status: 429, json: async () => ({ retry_after: 1 }) };
+  } });
+
+  assert.equal((await peer.send(request)).status, 'rate_limited');
+  const attempt = f.state.directPostRows(request.dedupe_key)
+    .find(row => row.kind === 'direct-post-attempt');
+  assert.ok(attempt);
+  f.state.recordDirectPostPreflight(attempt.detail, 'rejected', { reason: 'destination readiness changed' });
+
+  assert.equal((await peer.result(request.dedupe_key)).sendOutcome, 'rejected');
+  assert.equal(inspectPeerResult(f.state,
+    { channelId: '101', guildId: '100', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 },
+    request.dedupe_key).sendOutcome, 'rejected');
 });

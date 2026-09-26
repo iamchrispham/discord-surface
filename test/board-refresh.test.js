@@ -764,6 +764,37 @@ test('preflight signal stop exits with signal status and sends no PATCH', async 
   assert.equal(f.state.listReceipts().some(row => row.kind === 'board-refresh-attempt'), false);
 });
 
+test('unresolved board PATCH fences binding retirement until its outcome is recorded', async t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  const patchStarted = deferred();
+  const releasePatch = deferred();
+  const board = { content: 'initial board' };
+  fs.writeFileSync(f.textFile, 'pending board');
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/users/@me')) return response({ id: 'bot-1' });
+    if (init.method === 'GET' && url.endsWith('/channels/channel-1')) return boardChannelResponse();
+    if (init.method === 'GET') return boardMessageResponse(board.content);
+    if (init.method === 'PATCH') {
+      patchStarted.resolve();
+      await releasePatch.promise;
+      board.content = JSON.parse(init.body).content;
+      return boardMessageResponse(board.content);
+    }
+    throw new Error(`unexpected board request ${init.method} ${url}`);
+  };
+
+  const running = refresh(f, 'pending board', 'refresh-fence', fetchImpl);
+  await waitFor(patchStarted, 'board PATCH admission');
+  assert.equal(f.state.hasUnresolvedBindingPost('channel-1'), true);
+  assert.throws(() => f.state.unbind('channel-1', { expectedBinding: f.binding }), /cannot unbind while work is unresolved/);
+
+  releasePatch.resolve();
+  assert.equal((await running).status, BOARD_OUTCOMES.APPLIED);
+  assert.equal(f.state.hasUnresolvedBindingPost('channel-1'), false);
+  assert.doesNotThrow(() => f.state.unbind('channel-1', { expectedBinding: f.binding }));
+});
+
 test('late PATCH stays fenced across handoff, ordinary readiness, and successor refresh', async t => {
   const f = fixture();
   t.after(() => f.state.close());

@@ -1119,7 +1119,8 @@ class SurfaceState {
   }
 
   hasUnresolvedBindingPost(channelId) {
-    return directPostHandlers.hasUnresolvedBindingPost(this, channelId);
+    return directPostHandlers.hasUnresolvedBindingPost(this, channelId) ||
+      boardRefreshHandlers.hasUnresolvedBindingPost(this, channelId);
   }
 
   hasUnresolvedOrdinaryPost(channelId) {

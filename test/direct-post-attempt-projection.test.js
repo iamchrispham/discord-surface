@@ -157,14 +157,14 @@ function seedPeer(state, kind, extra) {
     partIndex: 0, partCount: 1, agentPacket: PACKET, ...extra });
 }
 
-test('passive peer readback reports in_flight and a later preflight does not replace it', t => {
+test('passive peer readback surfaces a newer preflight after the prior outcome', t => {
   const { state } = fixture(t);
   seedPeer(state, 'direct-post-attempt', { attemptId: 'a1', nonce: 'n1' });
   seedPeer(state, 'direct-post-outcome', { attemptId: 'a1', nonce: 'n1', outcome: 'rate_limited' });
   seedPeer(state, 'direct-post-attempt', { attemptId: 'a2', nonce: 'n2' });
-  seedPeer(state, 'direct-post-outcome', { phase: 'preflight', outcome: 'not_sent' });
+  seedPeer(state, 'direct-post-outcome', { phase: 'preflight', outcome: 'rejected' });
   const before = state.listReceipts().length;
-  assert.equal(inspectPeerResult(state, SOURCE, 'peer-corr').sendOutcome, 'in_flight');
+  assert.equal(inspectPeerResult(state, SOURCE, 'peer-corr').sendOutcome, 'rejected');
   assert.equal(state.listReceipts().length, before, 'passive inspection adds no custody');
 });
 
