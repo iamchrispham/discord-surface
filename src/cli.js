@@ -7,7 +7,7 @@ const path = require('node:path');
 let startup;
 try { startup = parseArgs(process.argv.slice(2)); }
 catch (error) { startup = { command: error.command, args: {}, error }; }
-if (require.main === module && startup.command === 'courier-guard' && !startup.args.help) {
+if (require.main === module && startup.command === 'courier-guard' && startup.args.help !== true) {
   try {
     require('./courier-guard').courierGuard(startup.args, pathsFor, startup.error);
   } catch (error) {
@@ -79,16 +79,51 @@ function parseArgs(argv) {
     const key = equalsIndex === -1 ? raw : raw.slice(0, equalsIndex);
     const inline = equalsIndex === -1 ? undefined : raw.slice(equalsIndex + 1);
     if (repeated === null && Object.hasOwn(args, key)) repeated = key;
-    if (inline !== undefined) args[key] = inline;
-    else if (argv[i + 1] && !argv[i + 1].startsWith('--')) args[key] = argv[++i];
-    else args[key] = true;
+    let parsedValue;
+    if (inline !== undefined) parsedValue = inline;
+    // Keep single-dash tokens visible to the positional-option guard; use --flag=-value when a dash-prefixed value is intentional.
+    else if (argv[i + 1] && !argv[i + 1].startsWith('--') && !/^-[^-]/.test(argv[i + 1])) parsedValue = argv[++i];
+    else parsedValue = true;
+    // Keep --__proto__ enumerable so the command policy can reject it.
+    Object.defineProperty(args, key, { value: parsedValue, enumerable: true, configurable: true, writable: true });
   }
   // Every flag is single-valued, so a repeat is refused rather than letting the last one win.
   // The scan finishes first so the refusal still names the command, wherever the repeat sits.
   if (repeated !== null) {
     throw Object.assign(new Error(`--${repeated} was given more than once; each flag takes one value`), { command: positional[0] });
   }
-  return { command: positional[0], subcommand: positional[1], args };
+  const command = positional[0];
+  const optionLikePositional = positional.find(token => /^-[^-]/.test(token));
+  if (optionLikePositional !== undefined) {
+    throw Object.assign(new Error(`unknown option ${optionLikePositional} for ${command}`), { command });
+  }
+
+  // Reject flags the selected command does not consume here, before state, custody,
+  // or network work. `help`/`--help` is read-only and bypasses this after the repeat
+  // check. The error carries .command so the courier-guard startup path keeps its
+  // existing deny JSON and exit code 2. The policy module is loaded lazily so the hook
+  // entrypoint can still emit its own startup denial from a degraded checkout that is
+  // missing build companions; if the policy module itself is absent there, the hook
+  // still fails closed by only accepting its own flags.
+  let policy;
+  try {
+    policy = require('./cli/flag-policy');
+  } catch (error) {
+    if (command !== 'courier-guard') throw error;
+    policy = {
+      validateFlags: ({ args }) => {
+        const unknown = Object.keys(args).find(key => !['courier-route-id', 'state-dir', 'db', 'help'].includes(key));
+        if (unknown !== undefined) {
+          throw Object.assign(new Error(`unknown --${unknown} for courier-guard`), { command: 'courier-guard' });
+        }
+        if (Object.hasOwn(args, 'help') && args.help !== true) {
+          throw Object.assign(new Error('--help takes no value'), { command: 'courier-guard' });
+        }
+      }
+    };
+  }
+  if (policy) policy.validateFlags({ command, subcommand: positional[1], args });
+  return { command, subcommand: positional[1], args };
 }
 
 function pathsFor(args) {
@@ -705,8 +740,8 @@ async function liaisonDraft(args) {
 function recover(args) {
   const { paths, state } = openState(args);
   try {
-    const boardRequested = Object.keys(args).some(key => key.startsWith('board-') && args[key] !== undefined);
-    if (boardRequested) {
+    const mode = require('./cli/flag-policy').recoverMode(args);
+    if (mode === 'board') {
       const boardTarget = {
         guildId: required(args, 'board-guild-id'),
         channelId: required(args, 'board-channel-id'),
@@ -727,7 +762,7 @@ function recover(args) {
           noHiddenRetry: args['board-no-hidden-retry'] === true || args['board-no-hidden-retry'] === 'true'
         }
       ));
-    } else if (args['topic-channel-id']) {
+    } else if (mode === 'topic') {
       const resolution = required(args, 'resolution');
       if (!['published', 'not_published'].includes(resolution)) throw new Error('--resolution must be published or not_published for topic reconciliation');
       print(state.reconcileTopicPublication(
@@ -737,7 +772,7 @@ function recover(args) {
         required(args, 'evidence-scope'),
         { topic: required(args, 'topic-readback'), observedAt: required(args, 'topic-readback-at') }
       ));
-    } else if (args['intake-channel-id']) {
+    } else if (mode === 'intake') {
       const channelId = required(args, 'intake-channel-id');
       const thread = state.getThreadEnrollment(channelId);
       const activeThread = thread?.active ? thread : null;
@@ -749,12 +784,12 @@ function recover(args) {
           requiredCapability: GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake
         })
       } : recovered);
-    } else if (args['message-id'] && ['reply_sent', 'reply_not_sent'].includes(args.resolution)) {
+    } else if (mode === 'reply') {
       print(state.reconcileReplyDelivery(required(args, 'message-id'), args.resolution === 'reply_sent' ? 'sent' : 'not_sent', {
         partIndex: args['part-index'] === undefined ? null : Number(args['part-index']),
         replyMessageId: args['reply-message-id']
       }));
-    } else if (args['direct-post-request-id']) {
+    } else if (mode === 'directPost') {
       const resolution = required(args, 'resolution');
       if (!['sent', 'not_sent'].includes(resolution)) throw new Error('--resolution must be sent or not_sent for direct-post reconciliation');
       print(state.reconcileDirectPostOutcome(
@@ -767,7 +802,7 @@ function recover(args) {
           nonce: args['direct-post-nonce']
         }
       ));
-    } else if (args['message-id'] && args.resolution) print(state.reconcileUncertain(required(args, 'message-id'), args.resolution));
+    } else if (mode === 'message') print(state.reconcileUncertain(required(args, 'message-id'), args.resolution));
     else print(state.recoverAfterRestart());
   }
   finally { state.close(); }
@@ -1809,7 +1844,7 @@ async function directPost(args, provider = null, ordinary = false, dependencies 
     const config = state.requireConfig();
     const dedupeKey = resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: !dependencies.exportAddress });
     const hasAgentReplyTo = Object.hasOwn(args, 'agent-reply-to');
-    const resume = Boolean(args.resume);
+    const resume = args.resume === true || args.resume === 'true';
     if (hasAgentReplyTo && !args['agent-reply-to']) throw new Error('agent reply correlation must not be empty');
     const nativeId = required(args, 'native-id');
     const generation = required(args, 'generation');
@@ -2104,7 +2139,7 @@ function stop(args) {
 
 async function main() {
   const { command, subcommand, args } = parseArgs(process.argv.slice(2));
-  if (command === 'help' || args.help) return printUsage(command === 'help' ? subcommand : command);
+  if (command === 'help' || args.help === true) return printUsage(command === 'help' ? subcommand : command);
   switch (command) {
     case 'courier-guard': return require('./courier-guard').courierGuard(args, pathsFor);
     case 'configure': return configure(args);
