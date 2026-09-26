@@ -279,13 +279,8 @@ function ownerControlledNamespaceRoot(): string {
   } catch {
     // Try the runtime and temporary roots below.
   }
-  if (process.env.XDG_RUNTIME_DIR) {
-    try { candidates.push(fs.realpathSync(process.env.XDG_RUNTIME_DIR)); } catch {
-      // Try the temporary root below.
-    }
-  }
-  try { candidates.push(fs.realpathSync(os.tmpdir())); } catch {
-    // No temporary root is available.
+  try { candidates.push(fs.realpathSync('/tmp')); } catch {
+    // No stable system temporary root is available.
   }
 
   for (const root of candidates) {
@@ -541,8 +536,14 @@ function clearOrphanOwnerTemps(lockPath: string): boolean {
     }
     if (!marker || typeof marker !== 'object') continue;
     const markerRecord = marker as { pid?: unknown; identity?: unknown };
-    if (markerRecord.pid !== pid || typeof markerRecord.identity !== 'string') continue;
-    if (isSocketLockOwnerAlive({ pid, identity: markerRecord.identity })) return false;
+    if (markerRecord.pid !== pid) continue;
+    if (typeof markerRecord.identity === 'string') {
+      if (isSocketLockOwnerAlive({ pid, identity: markerRecord.identity })) return false;
+    } else if (markerRecord.identity === undefined) {
+      if (isSocketLockOwnerAlive({ pid })) return false;
+    } else {
+      continue;
+    }
     unlinkIfPresent(ownerPath);
   }
   return true;

@@ -304,7 +304,7 @@ test('socket locks use one fixed namespace and retain it across release', t => {
 });
 
 for (const [label, mode] of [['group-writable', 0o777], ['read-only', 0o555], ['missing', null]]) {
-  test(`an ${label} passwd home falls back to an owner-controlled runtime root`, t => {
+  test(`an ${label} passwd home falls back to the stable system temporary root`, t => {
     const root = path.join('/tmp', `dss-root-${randomUUID()}`);
     if (mode !== null) {
       fs.mkdirSync(root, { mode: 0o700 });
@@ -312,22 +312,28 @@ for (const [label, mode] of [['group-writable', 0o777], ['read-only', 0o555], ['
     }
     const fallbackRoot = fs.mkdtempSync('/tmp/dss-fallback-root-');
     fs.chmodSync(fallbackRoot, 0o700);
+    const runtimeRoot = fs.mkdtempSync('/tmp/dss-runtime-root-');
+    fs.chmodSync(runtimeRoot, 0o700);
     const userInfo = os.userInfo();
     t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
     t.mock.method(os, 'tmpdir', () => fallbackRoot);
-    const runtimeRoot = process.env.XDG_RUNTIME_DIR;
-    delete process.env.XDG_RUNTIME_DIR;
+    const previousRuntimeRoot = process.env.XDG_RUNTIME_DIR;
+    process.env.XDG_RUNTIME_DIR = runtimeRoot;
     t.after(() => {
-      if (runtimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
-      else process.env.XDG_RUNTIME_DIR = runtimeRoot;
+      if (previousRuntimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = previousRuntimeRoot;
       fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(fallbackRoot, { recursive: true, force: true });
+      fs.rmSync(runtimeRoot, { recursive: true, force: true });
     });
 
     const socket = socketPath(t);
     const { release, lockPath } = acquireSocketLockWithPath(t, socket);
     try {
-      assert.equal(path.dirname(path.dirname(lockPath)), fs.realpathSync(fallbackRoot),
+      const owner = process.getuid?.();
+      const stableRoot = path.join(fs.realpathSync('/tmp'),
+        `.claude-channel-${owner === undefined ? 'shared' : String(owner)}`);
+      assert.equal(path.dirname(path.dirname(lockPath)), stableRoot,
         'an unsafe passwd home must not own the lock namespace');
       if (mode !== null) assert.deepEqual(fs.readdirSync(root), [], 'the unsafe home must remain untouched');
     } finally {
