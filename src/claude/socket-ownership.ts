@@ -145,6 +145,21 @@ export function socketPathIdentity(socketPath: string): SocketPathIdentity | und
   }
 }
 
+function restoreQuarantinedSocket(quarantinedPath: string, socketPath: string): void {
+  try {
+    fs.linkSync(quarantinedPath, socketPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') {
+      fs.unlinkSync(quarantinedPath);
+      return;
+    }
+    if (code === 'EPERM' || code === 'EOPNOTSUPP' || code === 'EXDEV') return;
+    throw error;
+  }
+  fs.unlinkSync(quarantinedPath);
+}
+
 export function unlinkSocketIfOwned(socketPath: string, expected: SocketPathIdentity | null | undefined): void {
   if (!expected) return;
   let observed: SocketIdentity;
@@ -160,7 +175,7 @@ export function unlinkSocketIfOwned(socketPath: string, expected: SocketPathIden
     fs.renameSync(socketPath, quarantinedPath);
     const quarantined = socketIdentity(quarantinedPath);
     if (quarantined.dev !== expected.dev || quarantined.ino !== expected.ino) {
-      fs.renameSync(quarantinedPath, socketPath);
+      restoreQuarantinedSocket(quarantinedPath, socketPath);
       fs.rmdirSync(quarantineDirectory);
       return;
     }
@@ -336,17 +351,30 @@ function ownerControlledNamespaceRoot(): string {
       }
     }
 
-    // A sticky shared temporary root can safely contain a stable owner-only
-    // child. A group-writable home without the sticky bit is not a safe
-    // fallback because another UID could replace that child.
+    // A sticky shared temporary root can safely contain a randomly named,
+    // owner-only child. A group-writable home without the sticky bit is not a
+    // safe fallback because another UID could replace that child.
     const stickySharedRoot = (directory.mode & 0o1000) !== 0 && (directory.mode & 0o002) !== 0;
     if (!stickySharedRoot) continue;
-    const privateRoot = path.join(root, `.claude-channel-${ownerName}`);
+    const privateRootPrefix = `.claude-channel-${ownerName}-`;
     try {
-      try {
-        fs.mkdirSync(privateRoot, { mode: 0o700 });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const privateRoots = fs.readdirSync(root)
+        .filter(entry => entry.startsWith(privateRootPrefix))
+        .map(entry => path.join(root, entry))
+        .filter(candidate => {
+          try {
+            const privateDirectory = fs.lstatSync(candidate);
+            const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
+            const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
+            return privateDirectory.isDirectory() && !privateDirectory.isSymbolicLink() && privateOwnerControlled &&
+              privateOwnerWritable && (privateDirectory.mode & 0o077) === 0;
+          } catch {
+            return false;
+          }
+        });
+      let privateRoot = privateRoots.sort()[0];
+      if (!privateRoot) {
+        privateRoot = fs.mkdtempSync(path.join(root, privateRootPrefix));
       }
       const privateDirectory = fs.lstatSync(privateRoot);
       const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
@@ -867,7 +895,7 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
         const quarantined = fs.lstatSync(quarantinedPath);
         if (!quarantined.isSocket() || quarantined.uid !== original.uid ||
           quarantined.dev !== original.dev || quarantined.ino !== original.ino) {
-          fs.renameSync(quarantinedPath, socketPath);
+          restoreQuarantinedSocket(quarantinedPath, socketPath);
           fs.rmdirSync(quarantineDirectory);
           quarantineDirectory = undefined;
           reject(new Error('Claude channel socket changed during stale probe'));

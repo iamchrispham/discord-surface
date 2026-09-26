@@ -352,10 +352,17 @@ for (const [label, mode] of [
     const { release, lockPath } = acquireSocketLockWithPath(t, socket);
     try {
       const owner = process.geteuid?.() ?? process.getuid?.();
-      const stableRoot = path.join(fs.realpathSync('/tmp'),
-        `.claude-channel-${owner === undefined ? 'shared' : String(owner)}`);
-      assert.equal(path.dirname(path.dirname(lockPath)), stableRoot,
-        'an unsafe passwd home must use the stable owner-controlled system temporary root');
+      const stableRoot = fs.realpathSync('/tmp');
+      const privateRoot = path.dirname(path.dirname(lockPath));
+      const ownerName = owner === undefined ? 'shared' : String(owner);
+      assert.equal(path.dirname(privateRoot), stableRoot,
+        'an unsafe passwd home must use the system temporary root');
+      assert.match(path.basename(privateRoot), new RegExp(`^\\.claude-channel-${ownerName}-[A-Za-z0-9]+$`),
+        'the fallback root must use an unpredictable name');
+      if (owner !== undefined) {
+        assert.equal(fs.lstatSync(privateRoot).uid, owner,
+          'the fallback root must remain owner-controlled');
+      }
       if (mode !== null) assert.deepEqual(fs.readdirSync(root), [], 'the unsafe home must remain untouched');
     } finally {
       release();
@@ -391,14 +398,25 @@ test('fallback lock roots ignore per-process runtime directories', t => {
   }
 });
 
-test('missing home and runtime roots bootstrap an owner-only child under shared temp', t => {
+test('missing home and runtime roots bootstrap an unpredictable owner-only child under shared temp', t => {
   const missingHome = path.join('/tmp', `dss-missing-home-${randomUUID()}`);
   const userInfo = os.userInfo();
   t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: missingHome }));
   const previousRuntimeRoot = process.env.XDG_RUNTIME_DIR;
   delete process.env.XDG_RUNTIME_DIR;
 
-  const stableTempRoot = fs.realpathSync('/tmp');
+  const sharedTempRoot = fs.mkdtempSync('/tmp/dss-shared-temp-');
+  fs.chmodSync(sharedTempRoot, 0o1777);
+  const originalRealpath = fs.realpathSync;
+  t.mock.method(fs, 'realpathSync', (target, ...args) => {
+    if (String(target) === '/tmp') return sharedTempRoot;
+    return originalRealpath(target, ...args);
+  });
+  const stableTempRoot = sharedTempRoot;
+  const owner = process.geteuid?.() ?? process.getuid?.();
+  const ownerName = owner === undefined ? 'shared' : String(owner);
+  const decoy = path.join(stableTempRoot, `.claude-channel-${ownerName}`);
+  fs.mkdirSync(decoy, { mode: 0o700, recursive: true });
   const originalStat = fs.statSync;
   t.mock.method(fs, 'statSync', (target, ...args) => {
     const stats = originalStat(target, ...args);
@@ -414,15 +432,16 @@ test('missing home and runtime roots bootstrap an owner-only child under shared 
   t.after(() => {
     if (previousRuntimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
     else process.env.XDG_RUNTIME_DIR = previousRuntimeRoot;
+    fs.rmSync(sharedTempRoot, { recursive: true, force: true });
   });
 
   const socket = socketPath(t);
   const { release, lockPath } = acquireSocketLockWithPath(t, socket);
   try {
-    const owner = process.geteuid?.() ?? process.getuid?.();
-    const privateRoot = path.join(stableTempRoot,
-      `.claude-channel-${owner === undefined ? 'shared' : String(owner)}`);
-    assert.equal(path.dirname(path.dirname(lockPath)), privateRoot);
+    const privateRoot = path.dirname(path.dirname(lockPath));
+    assert.equal(path.dirname(privateRoot), stableTempRoot);
+    assert.notEqual(privateRoot, decoy);
+    assert.match(path.basename(privateRoot), new RegExp(`^\\.claude-channel-${ownerName}-[A-Za-z0-9]+$`));
     const privateStats = fs.lstatSync(privateRoot);
     assert.equal(privateStats.isDirectory(), true);
     assert.equal(privateStats.isSymbolicLink(), false);
