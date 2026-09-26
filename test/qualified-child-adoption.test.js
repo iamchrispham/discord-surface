@@ -4,12 +4,6 @@ const assert = require('node:assert/strict');
 const { fixture } = require('./helpers/intake-recovery-fixture');
 const { enrollPublicThread } = require('../src/discord/thread-enrollment');
 
-// Cold public child custody. A brand-new public thread must acquire qualified history
-// through the real enrollPublicThread before it is activated, so accepted live custody
-// and offline history are admitted exactly once on the lifecycle retry. These two
-// TODO fixtures pin the unfixed behavior; the covered control shows the intended
-// sequence once a baseline boundary exists.
-
 function coldChild(f, { failReads = false } = {}) {
   let reads = 0;
   const child = {
@@ -30,7 +24,7 @@ function coldChild(f, { failReads = false } = {}) {
 }
 
 test('cold public child refuses activation when qualified history acquisition fails',
-  { todo: 'known defect: public enrollment activates before qualified history acquisition' }, async t => {
+  { todo: 'known defect: public enrollment activates before qualified history acquisition', timeout: 8000 }, async t => {
     const f = fixture(t);
     const reads = coldChild(f, { failReads: true });
     const before = f.state.getBinding('1000');
@@ -80,10 +74,10 @@ async function coldChildSequence(f, covered) {
 }
 
 test('cold public child delivers accepted A and offline B exactly once after history retry',
-  { todo: 'known defect: cold child accepted custody stays held after history failure' }, async t => {
+  { todo: 'known defect: cold child accepted custody stays held after history failure', timeout: 8000 }, async t => {
     await coldChildSequence(fixture(t), false);
   });
 
-test('completed covered child delivers accepted A and offline B after the same failure', async t => {
+test('completed covered child delivers accepted A and offline B after the same failure', { timeout: 8000 }, async t => {
   await coldChildSequence(fixture(t), true);
 });
