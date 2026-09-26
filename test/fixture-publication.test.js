@@ -1,9 +1,9 @@
 'use strict';
 
-// Issue 119 fixture-publication rung. These two cases are deliberately red until
-// test/fixture-publication.js exists and publishes atomically. They run the raw
-// writeFileSync fallback, whose write window is still observable, so the negative
-// assertion fails with a real AssertionError instead of a timeout.
+// Issue 119 fixture-publication rung. These two cases stay deliberately red until
+// test/fixture-publication.js exists and publishes atomically. Node 22 string
+// writeFileSync bypasses the exported fs.openSync, so the worker-local shim below
+// exists only to open the raw fallback's publication window for observation.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -83,7 +83,7 @@ try {
 `;
 }
 
-async function race(tempDir, kind) {
+async function race(tempDir, kind, signal) {
   const finalPath = path.join(tempDir, kind === 'pid' ? 'runtime.pid' : 'runtime.json');
   const releaseBuffer = new SharedArrayBuffer(4);
   const cell = new Int32Array(releaseBuffer);
@@ -100,13 +100,24 @@ async function race(tempDir, kind) {
     }
   };
 
+  if (signal && signal.aborted) {
+    throw signal.reason || new Error('aborted before worker admission');
+  }
+
+  let onAbort;
+  const aborted = new Promise((resolve, reject) => {
+    onAbort = () => reject(signal && signal.reason ? signal.reason : new Error('aborted'));
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+  aborted.catch(() => {});
+
   try {
     worker = new Worker(buildWorkerSource(), {
       eval: true,
       workerData: { tempDir, finalPath, payloadKind: kind, releaseBuffer, ownerModule: OWNER_MODULE },
     });
 
-    await new Promise((resolve, reject) => {
+    const terminal = new Promise((resolve, reject) => {
       const onMessage = (msg) => {
         if (msg && msg.type === 'partial-write') {
           if (workerPid === undefined) workerPid = msg.pid;
@@ -127,7 +138,11 @@ async function race(tempDir, kind) {
       worker.on('error', onError);
       worker.on('exit', onExit);
     });
+
+    await Promise.race([terminal, aborted]);
   } finally {
+    release();
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
     if (worker) {
       worker.removeAllListeners('message');
       worker.removeAllListeners('error');
@@ -142,9 +157,11 @@ async function race(tempDir, kind) {
 test('atomic fixture PID publication hides its pathname until complete', { todo: 'issue119 atomic fixture publication is not implemented', timeout: 8000 }, async (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fixture-pub-pid-'));
   try {
-    const result = await race(tempDir, 'pid');
+    const result = await race(tempDir, 'pid', t.signal);
     assert.equal(result.observedDuringWindow, false);
-    const parsed = Number.parseInt(fs.readFileSync(result.finalPath, 'utf8'), 10);
+    const text = fs.readFileSync(result.finalPath, 'utf8');
+    assert.equal(text, String(result.workerPid));
+    const parsed = Number.parseInt(text, 10);
     assert.ok(Number.isInteger(parsed) && parsed > 0);
     assert.equal(parsed, result.workerPid);
   } finally {
@@ -155,9 +172,11 @@ test('atomic fixture PID publication hides its pathname until complete', { todo:
 test('atomic fixture JSON publication hides its pathname until complete', { todo: 'issue119 atomic fixture publication is not implemented', timeout: 8000 }, async (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fixture-pub-json-'));
   try {
-    const result = await race(tempDir, 'json');
+    const result = await race(tempDir, 'json', t.signal);
     assert.equal(result.observedDuringWindow, false);
-    const parsed = JSON.parse(fs.readFileSync(result.finalPath, 'utf8'));
+    const text = fs.readFileSync(result.finalPath, 'utf8');
+    assert.equal(text, JSON.stringify({ ready: true, pid: result.workerPid }));
+    const parsed = JSON.parse(text);
     assert.deepEqual(parsed, { ready: true, pid: result.workerPid });
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
