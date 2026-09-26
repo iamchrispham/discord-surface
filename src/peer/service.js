@@ -81,10 +81,9 @@ function createPeerService(context) {
     async post(input, signal) { return postByRole(context, input, signal, service.send); },
     async result(correlationId, signal) { return inspectPeerResult(state, await caller(signal), correlationId); },
     async list(signal) {
-      const current = await caller(signal);
+      await caller(signal);
       const { guildId } = state.requireConfig();
-      return state.listBindings().filter(binding => binding.active && binding.guildId === guildId &&
-        !(binding.provider === current.provider && canonicalNativeId(binding.nativeId) === canonicalNativeId(current.nativeId))).map(binding => {
+      return state.listBindings().filter(binding => binding.active && binding.guildId === guildId).map(binding => {
         let childId = null;
         let reason = null;
         try { childId = requireReadyPeer(state, binding).childId; }

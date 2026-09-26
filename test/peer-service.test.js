@@ -43,16 +43,32 @@ test('peer caller lookup tolerates native UUID casing from CLI bindings', async 
   const f = fixture(t);
   f.state.db.prepare("UPDATE bindings SET native_id=upper(native_id) WHERE channel_id='101'").run();
   f.enroll('102');
-  assert.deepEqual(await service(f).list(), []);
+  const listed = await service(f).list();
+  const caller = listed.find(entry => entry.channelId === '101');
+  assert.ok(caller, 'uppercase native UUID still lists its caller');
+  assert.equal(caller.reachable, true);
+  assert.equal(caller.childId, '102');
 });
 
-test('peer list omits the caller even when its child is ready', async t => {
+test('peer list includes the caller and classifies its readiness independently', async t => {
   const f = fixture(t); const peer = service(f);
-  assert.deepEqual(await peer.list(), []);
+  const generation = f.state.getBinding('101').generation;
+  const callerRow = (readiness, childId, reachable, reason) => ({
+    repoKey: 'github.com/test/repo',
+    provider: 'claude',
+    conductorId: 'test-conductor',
+    channelId: '101',
+    generation,
+    readiness,
+    childId,
+    reachable,
+    reason
+  });
+  assert.deepEqual(await peer.list(), [callerRow(READINESS.READY, null, false, 'peer has no enrolled child route')]);
   f.enroll('102');
-  assert.deepEqual(await peer.list(), []);
+  assert.deepEqual(await peer.list(), [callerRow(READINESS.READY, '102', true, null)]);
   f.state.setBindingReadiness('101', READINESS.GAP, 'fixture', f.state.getBinding('101'));
-  assert.deepEqual(await peer.list(), []);
+  assert.deepEqual(await peer.list(), [callerRow(READINESS.GAP, null, false, 'peer is not ready: fixture')]);
   const before = f.state.listReceipts().length;
   await assert.rejects(peer.send(request), /not ready/);
   assert.equal(f.state.listReceipts().length, before);
@@ -389,6 +405,91 @@ test('ready caller refuses send to unready destination child before network or c
   assert.equal(calls, 0);
   assert.deepEqual(f.state.listReceipts(), receipts);
   assert.deepEqual(f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all(), messages);
+});
+
+test('inventory destination binding gap is diagnostic and read-only', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  assert.equal(f.state.getBinding('101').readiness, READINESS.READY);
+  assert.equal(f.state.getThreadEnrollment('102').state, THREAD_STATES.READY);
+  f.state.setBindingReadiness('201', READINESS.GAP, 'fixture destination gap', f.state.getBinding('201'));
+  let calls = 0;
+  const peer = service(f, { fetchImpl: async () => { calls += 1; assert.fail('inventory listing reached network'); } });
+  const receipts = f.state.listReceipts();
+  const messages = f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all();
+  const listed = await peer.list();
+  const caller = listed.find(entry => entry.channelId === '101');
+  const target = listed.find(entry => entry.channelId === '201');
+  assert.ok(caller, 'caller row is present');
+  assert.equal(caller.reachable, true);
+  assert.equal(caller.childId, '102');
+  assert.ok(target, 'target row is present');
+  assert.equal(target.reachable, false);
+  assert.equal(target.reason, 'peer is not ready: fixture destination gap');
+  assert.equal(calls, 0);
+  assert.deepEqual(f.state.listReceipts(), receipts);
+  assert.deepEqual(f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all(), messages);
+});
+
+test('inventory destination binding unavailable is diagnostic and read-only', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  assert.equal(f.state.getBinding('101').readiness, READINESS.READY);
+  assert.equal(f.state.getThreadEnrollment('102').state, THREAD_STATES.READY);
+  f.state.setBindingReadiness('201', READINESS.UNAVAILABLE, 'fixture destination unavailable', f.state.getBinding('201'));
+  let calls = 0;
+  const peer = service(f, { fetchImpl: async () => { calls += 1; assert.fail('inventory listing reached network'); } });
+  const receipts = f.state.listReceipts();
+  const messages = f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all();
+  const listed = await peer.list();
+  const caller = listed.find(entry => entry.channelId === '101');
+  const target = listed.find(entry => entry.channelId === '201');
+  assert.ok(caller, 'caller row is present');
+  assert.equal(caller.reachable, true);
+  assert.equal(caller.childId, '102');
+  assert.ok(target, 'target row is present');
+  assert.equal(target.reachable, false);
+  assert.equal(target.reason, 'peer is not ready: fixture destination unavailable');
+  assert.equal(calls, 0);
+  assert.deepEqual(f.state.listReceipts(), receipts);
+  assert.deepEqual(f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all(), messages);
+});
+
+test('inventory destination child gap is diagnostic and read-only', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
+  assert.equal(f.state.getBinding('101').readiness, READINESS.READY);
+  assert.equal(f.state.getThreadEnrollment('102').state, THREAD_STATES.READY);
+  assert.equal(f.state.getBinding('201').readiness, READINESS.READY);
+  f.state.markThreadBoundary('202', THREAD_STATES.GAP, 'fixture destination child gap', null, null, target);
+  let calls = 0;
+  const peer = service(f, { fetchImpl: async () => { calls += 1; assert.fail('inventory listing reached network'); } });
+  const receipts = f.state.listReceipts();
+  const messages = f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all();
+  const listed = await peer.list();
+  const caller = listed.find(entry => entry.channelId === '101');
+  const destination = listed.find(entry => entry.channelId === '201');
+  assert.ok(caller, 'caller row is present');
+  assert.equal(caller.reachable, true);
+  assert.equal(caller.childId, '102');
+  assert.ok(destination, 'target row is present');
+  assert.equal(destination.reachable, false);
+  assert.equal(destination.reason, 'peer child is not ready: fixture destination child gap');
+  assert.equal(calls, 0);
+  assert.deepEqual(f.state.listReceipts(), receipts);
+  assert.deepEqual(f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all(), messages);
+});
+
+test('inventory excludes inactive and foreign guild bindings', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f); addOrdinaryRecipient(f);
+  f.state.unbind('301');
+  assert.equal(f.state.getBinding('301').active, false);
+  const row = f.state.db.prepare("SELECT * FROM bindings WHERE channel_id='201'").get();
+  f.state.db.prepare(`INSERT INTO bindings(channel_id, guild_id, provider, native_id, workspace, session_root, endpoint,
+    category_id, conductor_id, repo_key, readiness, generation, active, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run('401', '999', row.provider, '44444444-4444-4444-4444-444444444444',
+    row.workspace, row.session_root, row.endpoint, row.category_id, null, row.repo_key, row.readiness,
+    row.generation, row.active, row.updated_at);
+  assert.equal(f.state.getBinding('401').guildId, '999');
+  const listed = await service(f).list();
+  assert.deepEqual(listed.map(entry => entry.channelId).sort(), ['101', '201']);
 });
 
 test('peer result refuses publication after correlated destination handoff', async t => {
