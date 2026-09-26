@@ -673,3 +673,52 @@ This slice is under local validation. No cross-OS or live agent delivery claim i
 made by these examples.
 
 Legacy known-unsent request retries require a freshly exported v2 child destination proof matching the recorded target. A v1 destination does not establish that it is a child and is refused before sending. Terminal sent/unknown recovery still accepts its original recorded identity without resending. Legacy result compatibility uses the latest outcome per attempt, excludes preflight receipts, and matches the exact original child or its signed parent.
+
+### Authenticated peer MCP
+
+`discord-surface mcp --provider codex|claude [--state-dir DIR] [--db FILE]`
+serves tools over stdio using the same binding database and outbound receipts as
+CLI sends. Register it with the native harness as a stdio MCP server. Use the
+installed Node and CLI paths for that release. Do not supply a bot token in tool
+arguments or copy a destination address file.
+
+The server derives the caller from the native Codex invocation identifiers or the
+existing Claude caller resolver on every call. The caller must have exactly one
+active binding in the configured guild. A generic process without that identity
+cannot send by supplying someone else's UUID. This command does not bind, enroll,
+repair, resume or replace a session.
+
+- `peer_list()` returns every active binding in the configured guild, including
+  the caller. Each row reports binding readiness, child route and a reachability
+  reason. Inactive and other-guild bindings are excluded. Listing does not send
+  network requests or change custody. A ready binding without one ready child
+  is not reachable.
+- `peer_send({peer, text|text_file, dedupe_key})` resolves an exact
+  `{repoKey, provider}`, `{conductorId}` or `{channelName}` at call time.
+  Channel names come from the configured guild. Unknown or ambiguous peers and
+  multiple active children refuse rather than select an arbitrary destination.
+  Requests use signed agent packets and the existing `attachment-v1` delivery.
+- For a result, call `peer_send({reply_to, text|text_file, dedupe_key})` without
+  `peer`. The existing immutable request determines the return address. The
+  recommended `reply_to` is the request packet ID.
+- `peer_result({correlation_id})` inspects this caller's outbound correlation.
+  Transport outcome, native delivery, acknowledgment and terminal completion are
+  separate fields. Received result text does not imply native consumption.
+  Reading this tool never acknowledges or completes custody.
+- `post({role, text_file, dedupe_key, ...})` selects an existing operation.
+  `announce` posts to the caller's bound parent. `board` additionally requires
+  `message_id` and uses the existing board-update provenance checks, including a
+  conductor binding. `child` additionally requires `peer` or `reply_to` and uses
+  the same authenticated agent path as `peer_send`. Raw human text is never a
+  fallback for a child packet.
+
+`text_file` on `peer_send` file input and on `post` file input exports local
+UTF-8 file contents to Discord. Relative paths resolve from the MCP process
+working directory. Native host tool approval governs invocation. For a child
+agent send, the published message carries the validated text snapshot even if
+the source file later changes.
+
+Keep the same dedupe key and content after an uncertain outcome. A changed owner
+or generation is not permission to replay. These tools do not establish CLI
+active-turn steering or repair native pickup. Installation, current-source tests,
+and an actual native correlated round trip remain separate qualification steps.

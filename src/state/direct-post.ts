@@ -1,5 +1,5 @@
-import { queryFilePreparationRows, latestFilePreparation } from './direct-post/receipt-queries';
-export { queryDirectPostRows, querySentAgentResultRows } from './direct-post/receipt-queries';
+import { queryFilePreparationRows, latestFilePreparation, projectNewestDirectPostAttempt } from './direct-post/receipt-queries';
+export { queryDirectPostRows, querySentAgentResultRows, projectNewestDirectPostAttempt } from './direct-post/receipt-queries';
 import { DIRECT_POST_OUTCOMES } from './direct-post/contracts';
 import type {
   DirectPostOutcome,
@@ -270,15 +270,20 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     assertResultRequestActive(state, meta);
     const rows = state.directPostRows(meta.requestId);
     assertRequestIdentity(rows, meta);
-    const attempts = rows.filter(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.partIndex === meta.partIndex).sort((a, b) => a.id - b.id);
-    const preflights = rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.partIndex === meta.partIndex &&
-      row.detail.phase === 'preflight').sort((a, b) => a.id - b.id);
-    const outcomes = new Map<unknown, DirectPostReceiptRow>(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail.attemptId)
-      .map(row => [row.detail.attemptId, row]));
-    const latest = attempts.at(-1);
-    const latestAttemptOutcome = latest ? outcomes.get(latest.detail.attemptId) : undefined;
-    const latestConfirmedOutcome = Array.from(outcomes.values()).filter(row => row.detail.partIndex === meta.partIndex && row.detail.phase !== 'preflight' &&
-      ['sent', 'unknown'].includes(row.detail.outcome as string)).sort((a, b) => a.id - b.id).at(-1);
+    const partRows = rows.filter(row => row.detail.partIndex === meta.partIndex);
+    const { attempt: latest, outcome, latestPreflight } = projectNewestDirectPostAttempt(partRows, {
+      attemptKind: DIRECT_POST_ATTEMPT,
+      outcomeKind: DIRECT_POST_OUTCOME
+    });
+    const latestAttemptOutcome = outcome;
+    const finalOutcomeByAttempt = new Map<unknown, DirectPostReceiptRow>();
+    for (const row of partRows) {
+      if (row.kind !== DIRECT_POST_OUTCOME || !row.detail.attemptId || row.detail.phase === 'preflight') continue;
+      finalOutcomeByAttempt.set(row.detail.attemptId, row);
+    }
+    const latestConfirmedOutcome = Array.from(finalOutcomeByAttempt.values())
+      .filter(row => ['sent', 'unknown'].includes(row.detail.outcome as string))
+      .sort((a, b) => a.id - b.id).at(-1);
     const assertParentCurrent = (): void => {
       if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
     };
@@ -287,7 +292,6 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
         throw new StaleGenerationError('direct post binding is stale');
       }
     };
-    const latestPreflight = preflights.at(-1);
     if (latestPreflight && !latestConfirmedOutcome && (!latest || (latestPreflight.id > latest.id &&
       (!latestAttemptOutcome || latestPreflight.id > latestAttemptOutcome.id)))) {
       const status = latestPreflight.detail.outcome as string;
@@ -302,7 +306,6 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       assertRouteCurrent();
       return null;
     }
-    const outcome = outcomes.get(latest.detail.attemptId);
     assertParentCurrent();
     if (!outcome) return { claimed: false, status: 'in_flight', attemptId: latest.detail.attemptId as string, nonce: latest.detail.nonce as string };
     const status = outcome.detail.outcome as string;
@@ -317,37 +320,57 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
   }
 
   const handlers: DirectPostHandlers = {
-    hasUnresolvedOrdinaryPost(state, channelId) {
+    hasUnresolvedBindingPost(state, channelId) {
       const rows = state.directPostRows(null, channelId);
-      const outcomes = new Map<unknown, DirectPostReceiptRow>(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail?.attemptId)
-        .map(row => [row.detail.attemptId, row]));
-      const requests = new Map<unknown, { partCount: number; parts: Map<number, DirectPostReceiptRow> }>();
+      const requests = new Map<unknown, { partCount: number; parts: Map<number, { attempts: DirectPostReceiptRow[]; outcomes: DirectPostReceiptRow[] }> }>();
+      const attemptPart = new Map<unknown, number>();
       for (const row of rows) {
-        if (row.kind !== DIRECT_POST_ATTEMPT || row.detail.channelId !== channelId ||
-          row.detail.provider !== 'codex' || row.detail.conductorId || row.detail.repoKey) continue;
-        const partCount = Number(row.detail.partCount || 1);
-        const partIndex = Number.isInteger(row.detail.partIndex) ? row.detail.partIndex as number : 0;
+        if (row.kind !== DIRECT_POST_ATTEMPT || row.detail.channelId !== channelId) continue;
+        const partCount = Object.hasOwn(row.detail, 'partCount') ? row.detail.partCount as number : 1;
+        const partIndex = Object.hasOwn(row.detail, 'partIndex') ? row.detail.partIndex as number : 0;
         if (!Number.isSafeInteger(partCount) || partCount < 1 || !Number.isSafeInteger(partIndex) || partIndex < 0 || partIndex >= partCount) return true;
-        const request = requests.get(row.detail.requestId) || { partCount, parts: new Map<number, DirectPostReceiptRow>() };
+        const request = requests.get(row.detail.requestId) || { partCount, parts: new Map<number, { attempts: DirectPostReceiptRow[]; outcomes: DirectPostReceiptRow[] }>() };
         if (request.partCount !== partCount) return true;
-        request.parts.set(partIndex, row);
+        const part = request.parts.get(partIndex) || { attempts: [], outcomes: [] };
+        part.attempts.push(row);
+        request.parts.set(partIndex, part);
         requests.set(row.detail.requestId, request);
+        if (typeof row.detail.attemptId === 'string' && row.detail.attemptId) attemptPart.set(`${row.detail.requestId}\u0000${row.detail.attemptId}`, partIndex);
+      }
+      for (const row of rows) {
+        if (row.kind !== DIRECT_POST_OUTCOME || typeof row.detail?.attemptId !== 'string' || !row.detail.attemptId) continue;
+        const request = requests.get(row.detail.requestId);
+        const partIndex = attemptPart.get(`${row.detail.requestId}\u0000${row.detail.attemptId}`);
+        if (!request || partIndex === undefined) continue;
+        const part = request.parts.get(partIndex);
+        if (part) part.outcomes.push(row);
       }
       for (const request of requests.values()) {
+        const projections = new Map<number, ReturnType<typeof projectNewestDirectPostAttempt>>();
+        for (const [partIndex, part] of request.parts) {
+          projections.set(partIndex, projectNewestDirectPostAttempt([...part.attempts, ...part.outcomes], {
+            attemptKind: DIRECT_POST_ATTEMPT,
+            outcomeKind: DIRECT_POST_OUTCOME
+          }));
+        }
         let definitiveFailure = false;
-        for (const row of request.parts.values()) {
-          const outcome = outcomes.get(row.detail.attemptId);
-          if (!outcome || outcome.detail.outcome === 'unknown') return true;
-          if (outcome.detail.outcome !== 'sent') definitiveFailure = true;
+        for (const projection of projections.values()) {
+          const value = projection.outcome?.detail?.outcome as string | undefined;
+          if (!projection.attempt || !value || value === 'unknown' || !(DIRECT_POST_OUTCOMES as readonly string[]).includes(value)) return true;
+          if (value !== 'sent') definitiveFailure = true;
         }
         if (definitiveFailure) continue;
         for (let partIndex = 0; partIndex < request.partCount; partIndex += 1) {
-          const row = request.parts.get(partIndex);
-          const outcome = row && outcomes.get(row.detail.attemptId);
-          if (!outcome || outcome.detail.outcome === 'unknown') return true;
+          const projection = projections.get(partIndex);
+          const value = projection?.outcome?.detail?.outcome as string | undefined;
+          if (!projection || !projection.attempt || !value || value === 'unknown' || !(DIRECT_POST_OUTCOMES as readonly string[]).includes(value)) return true;
         }
       }
       return false;
+    },
+
+    hasUnresolvedOrdinaryPost(state, channelId) {
+      return handlers.hasUnresolvedBindingPost(state, channelId);
     },
 
     inspectDirectPostPart(state, meta) {

@@ -134,7 +134,8 @@ export async function runBoardRefresh({
   signal,
   fetchImpl = globalThis.fetch as unknown as BoardFetch,
   timeoutMs = 30000,
-  resolveBinding
+  resolveBinding,
+  bindingCurrent = null
 }: {
   state: BoardStateRuntime;
   token: string;
@@ -148,6 +149,7 @@ export async function runBoardRefresh({
   fetchImpl?: BoardFetch;
   timeoutMs?: number;
   resolveBinding: BoardBindingResolver;
+  bindingCurrent?: (() => boolean) | null;
 }): Promise<BoardRefreshResult> {
   const nativeId = text(rawNativeId, 'nativeId', 128);
   const ownerGeneration = generation(rawGeneration);
@@ -168,6 +170,11 @@ export async function runBoardRefresh({
   if (existing && (existing.historical || existing.duplicate)) return resultFromAdmission(existing);
 
   const binding = resolveBinding(state, { nativeId, generation: ownerGeneration, channelId });
+  const isBindingCurrent = () => {
+    if (typeof bindingCurrent !== 'function') return true;
+    try { return bindingCurrent(); }
+    catch { return false; }
+  };
 
   // Capture before the asynchronous preflight GETs. Admission compares this value inside BEGIN IMMEDIATE.
   const prepared = state.captureBoardRevision(target);
@@ -179,6 +186,18 @@ export async function runBoardRefresh({
   targetAuthorMatches(remoteTarget, installation.id);
   const provenance = state.boardMessageProvenance(target);
   if (provenance.length === 0) throw new Error('board target has no sent-message provenance in this installation');
+  if (!isBindingCurrent()) {
+    return {
+      requestId,
+      targetMessageId: messageId,
+      channelId,
+      nativeId,
+      generation: ownerGeneration,
+      status: BOARD_OUTCOMES.STALE,
+      outcome: BOARD_OUTCOMES.STALE,
+      reason: 'binding readiness changed before board refresh admission'
+    };
+  }
   const meta: BoardRefreshMeta = {
     requestId,
     target,
@@ -194,6 +213,17 @@ export async function runBoardRefresh({
   const admission = state.beginBoardRefresh(meta, prepared.revision);
   if (admission.status !== 'admitted') return resultFromAdmission(admission, binding);
   if (!admission.attemptId) throw new Error('board refresh admission lacks an attempt ID');
+  if (!isBindingCurrent()) {
+    const stale = state.recordBoardRefreshOutcome(target, admission.attemptId, BOARD_OUTCOMES.STALE, {
+      reason: 'binding readiness changed before board update'
+    });
+    return {
+      ...resultFromAdmission(admission, binding),
+      status: stale.outcome,
+      outcome: stale.outcome,
+      reason: 'binding readiness changed before board update'
+    };
+  }
   try {
     const patched = await patchBoardMessage({ token, channelId, messageId, content, signal, timeoutMs, fetchImpl });
     targetMatches(patched, target);

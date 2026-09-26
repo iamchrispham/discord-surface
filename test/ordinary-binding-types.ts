@@ -71,6 +71,7 @@ const state: OrdinaryBindingState = {
   isOrdinaryBinding: (_value): _value is OrdinaryBindingRecord => true,
   transaction: operation => operation(),
   hasUnresolved: () => false,
+  hasUnresolvedBindingPost: () => false,
   hasUnresolvedOrdinaryPost: () => false,
   listThreadEnrollments: () => [],
   bindingInput: value => value,

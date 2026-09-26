@@ -166,6 +166,12 @@ test('ordinary post uses explicit binding custody and suppresses duplicate and u
   assert.equal(sent.status, 'sent');
   assert.equal(duplicate.duplicate, true);
   assert.equal(calls, 2);
+  const beforeRebind = f.state.getBinding(binding.channelId);
+  assert.throws(() => f.state.rebind({ channelId: binding.channelId, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX, workspace: f.dir, ordinaryIdentity: { sessionId: CODEX, threadId: CODEX } }), /publication is unresolved/, 'an unknown outcome still holds binding retirement');
+  const afterRebind = f.state.getBinding(binding.channelId);
+  assert.deepEqual(afterRebind, beforeRebind, 'refused rebind must leave binding state untouched');
+  const heldAttempt = f.state.directPostRows('ordinary-unknown').find(row => row.kind === 'direct-post-attempt');
+  f.state.reconcileDirectPostOutcome('ordinary-unknown', heldAttempt.detail.attemptId, 'not_sent', { reason: 'fixture reconciliation' });
   f.state.rebind({ channelId: binding.channelId, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: f.dir, ordinaryIdentity: { sessionId: CODEX, threadId: CODEX } });
   await assert.rejects(() => runDirectPost({ state: f.state, token: 'fixture', nativeId: CODEX, generation: binding.generation,
