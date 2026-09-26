@@ -274,22 +274,17 @@ function assertLockNamespaceIsUsable(namespacePath: string, owner: number | unde
 
 function ownerControlledNamespaceRoot(): string {
   const owner = effectiveUserId();
+  const ownerName = owner === undefined ? 'shared' : String(owner);
   const candidates: string[] = [];
   try {
     // The passwd-backed home directory is stable across invocations when it
     // is usable, but service accounts may not have one.
     candidates.push(fs.realpathSync(os.userInfo().homedir));
   } catch {
-    // Try the runtime and temporary roots below.
+    // Try the stable system temporary root below.
   }
-  const runtimeRoot = process.env.XDG_RUNTIME_DIR;
-  if (runtimeRoot) {
-    try { candidates.push(fs.realpathSync(runtimeRoot)); } catch {
-      // No stable runtime root is available.
-    }
-  }
-  try { candidates.push(fs.realpathSync(os.tmpdir())); } catch {
-    // No stable temporary root is available.
+  try { candidates.push(fs.realpathSync('/tmp')); } catch {
+    // No stable system temporary root is available.
   }
 
   for (const root of candidates) {
@@ -305,6 +300,30 @@ function ownerControlledNamespaceRoot(): string {
       } catch {
         // Try the next candidate.
       }
+    }
+
+    // A sticky shared temporary root can safely contain a stable owner-only
+    // child. A group-writable home without the sticky bit is not a safe
+    // fallback because another UID could replace that child.
+    const stickySharedRoot = (directory.mode & 0o1000) !== 0 && (directory.mode & 0o002) !== 0;
+    if (!stickySharedRoot) continue;
+    const privateRoot = path.join(root, `.claude-channel-${ownerName}`);
+    try {
+      try {
+        fs.mkdirSync(privateRoot, { mode: 0o700 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      const privateDirectory = fs.lstatSync(privateRoot);
+      const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
+      const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
+      if (privateDirectory.isDirectory() && !privateDirectory.isSymbolicLink() && privateOwnerControlled &&
+        privateOwnerWritable && (privateDirectory.mode & 0o077) === 0) {
+        fs.accessSync(privateRoot, fs.constants.W_OK | fs.constants.X_OK);
+        return privateRoot;
+      }
+    } catch {
+      // Try the next candidate.
     }
   }
   throw new Error('Claude channel socket lock namespace root is unusable');

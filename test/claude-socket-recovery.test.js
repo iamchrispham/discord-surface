@@ -317,19 +317,16 @@ for (const [label, mode] of [
   ['not-searchable', 0o600],
   ['missing', null],
 ]) {
-  test(`an ${label} passwd home falls back to the owner-controlled runtime root`, t => {
+  test(`an ${label} passwd home falls back to the stable owner-controlled system temporary root`, t => {
     const root = path.join('/tmp', `dss-root-${randomUUID()}`);
     if (mode !== null) {
       fs.mkdirSync(root, { mode: 0o700 });
       fs.chmodSync(root, mode);
     }
-    const fallbackRoot = fs.mkdtempSync('/tmp/dss-fallback-root-');
-    fs.chmodSync(fallbackRoot, 0o700);
     const runtimeRoot = fs.mkdtempSync('/tmp/dss-runtime-root-');
     fs.chmodSync(runtimeRoot, 0o700);
     const userInfo = os.userInfo();
     t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
-    t.mock.method(os, 'tmpdir', () => fallbackRoot);
     const previousRuntimeRoot = process.env.XDG_RUNTIME_DIR;
     process.env.XDG_RUNTIME_DIR = runtimeRoot;
     if (label === 'not-searchable') {
@@ -347,21 +344,93 @@ for (const [label, mode] of [
       if (previousRuntimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
       else process.env.XDG_RUNTIME_DIR = previousRuntimeRoot;
       fs.rmSync(root, { recursive: true, force: true });
-      fs.rmSync(fallbackRoot, { recursive: true, force: true });
       fs.rmSync(runtimeRoot, { recursive: true, force: true });
     });
 
     const socket = socketPath(t);
     const { release, lockPath } = acquireSocketLockWithPath(t, socket);
     try {
-      assert.equal(path.dirname(path.dirname(lockPath)), fs.realpathSync(runtimeRoot),
-        'an unsafe passwd home must use the owner-controlled runtime root');
+      const owner = process.geteuid?.() ?? process.getuid?.();
+      const stableRoot = path.join(fs.realpathSync('/tmp'),
+        `.claude-channel-${owner === undefined ? 'shared' : String(owner)}`);
+      assert.equal(path.dirname(path.dirname(lockPath)), stableRoot,
+        'an unsafe passwd home must use the stable owner-controlled system temporary root');
       if (mode !== null) assert.deepEqual(fs.readdirSync(root), [], 'the unsafe home must remain untouched');
     } finally {
       release();
     }
   });
 }
+
+test('fallback lock roots ignore per-process runtime directories', t => {
+  const root = path.join('/tmp', `dss-root-${randomUUID()}`);
+  const runtimeA = fs.mkdtempSync('/tmp/dss-runtime-a-');
+  const runtimeB = fs.mkdtempSync('/tmp/dss-runtime-b-');
+  fs.chmodSync(runtimeA, 0o700);
+  fs.chmodSync(runtimeB, 0o700);
+  const userInfo = os.userInfo();
+  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
+  const previousRuntimeRoot = process.env.XDG_RUNTIME_DIR;
+  process.env.XDG_RUNTIME_DIR = runtimeA;
+  t.after(() => {
+    if (previousRuntimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = previousRuntimeRoot;
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(runtimeA, { recursive: true, force: true });
+    fs.rmSync(runtimeB, { recursive: true, force: true });
+  });
+
+  const socket = socketPath(t);
+  const first = acquireSocketLockWithPath(t, socket);
+  try {
+    process.env.XDG_RUNTIME_DIR = runtimeB;
+    assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  } finally {
+    first.release();
+  }
+});
+
+test('missing home and runtime roots bootstrap an owner-only child under shared temp', t => {
+  const missingHome = path.join('/tmp', `dss-missing-home-${randomUUID()}`);
+  const userInfo = os.userInfo();
+  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: missingHome }));
+  const previousRuntimeRoot = process.env.XDG_RUNTIME_DIR;
+  delete process.env.XDG_RUNTIME_DIR;
+
+  const stableTempRoot = fs.realpathSync('/tmp');
+  const originalStat = fs.statSync;
+  t.mock.method(fs, 'statSync', (target, ...args) => {
+    const stats = originalStat(target, ...args);
+    if (String(target) !== stableTempRoot || (args.length > 0 && args[0] && args[0].bigint)) return stats;
+    return {
+      ...stats,
+      uid: 0,
+      mode: (stats.mode & ~0o1777) | 0o1777,
+      isDirectory: () => stats.isDirectory(),
+      isSymbolicLink: () => stats.isSymbolicLink()
+    };
+  });
+  t.after(() => {
+    if (previousRuntimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = previousRuntimeRoot;
+  });
+
+  const socket = socketPath(t);
+  const { release, lockPath } = acquireSocketLockWithPath(t, socket);
+  try {
+    const owner = process.geteuid?.() ?? process.getuid?.();
+    const privateRoot = path.join(stableTempRoot,
+      `.claude-channel-${owner === undefined ? 'shared' : String(owner)}`);
+    assert.equal(path.dirname(path.dirname(lockPath)), privateRoot);
+    const privateStats = fs.lstatSync(privateRoot);
+    assert.equal(privateStats.isDirectory(), true);
+    assert.equal(privateStats.isSymbolicLink(), false);
+    if (owner !== undefined) assert.equal(privateStats.uid, owner);
+    assert.equal(privateStats.mode & 0o077, 0);
+  } finally {
+    release();
+  }
+});
 
 test('a foreign shared-temp namespace cannot preempt the owner-controlled root', t => {
   const ownerRoot = isolatedNamespaceRoot(t);
