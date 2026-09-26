@@ -16,6 +16,15 @@ function addOrdinaryRecipient(f) {
   f.state.markThreadBoundary('302', 'ready', 'fixture', null, null, target);
   return target;
 }
+
+function addSecondRecipient(f) {
+  f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: '33333333-3333-3333-3333-333333333333',
+    workspace: '/tmp', conductorId: 'second-recipient', repoKey: 'github.com/test/second-recipient' });
+  const target = f.state.setBindingReadiness('301', READINESS.READY, 'fixture', f.state.getBinding('301'));
+  f.state.enrollThread({ threadId: '302', parentChannelId: '301', guildId: '100' }, target);
+  f.state.markThreadBoundary('302', THREAD_STATES.READY, 'fixture', null, null, target);
+  return target;
+}
 const request = { peer: { conductorId: 'test-conductor' }, text: 'hello', dedupe_key: 'fixture-request' };
 
 test('missing caller refuses listing and sends before network or custody', async t => {
@@ -33,7 +42,8 @@ test('peer caller lookup tolerates native UUID casing from CLI bindings', async 
   const listed = await service(f).list();
   const caller = listed.find(entry => entry.channelId === '101');
   assert.ok(caller, 'uppercase native UUID still lists its caller');
-  assert.equal(caller.reachable, true);
+  assert.equal(caller.reachable, false);
+  assert.equal(caller.reason, 'caller cannot target itself');
   assert.equal(caller.childId, '102');
 });
 
@@ -53,7 +63,7 @@ test('peer list includes the caller and classifies its readiness independently',
   });
   assert.deepEqual(await peer.list(), [callerRow(READINESS.READY, null, false, 'peer has no enrolled child route')]);
   f.enroll('102');
-  assert.deepEqual(await peer.list(), [callerRow(READINESS.READY, '102', true, null)]);
+  assert.deepEqual(await peer.list(), [callerRow(READINESS.READY, '102', false, 'caller cannot target itself')]);
   f.state.setBindingReadiness('101', READINESS.GAP, 'fixture', f.state.getBinding('101'));
   assert.deepEqual(await peer.list(), [callerRow(READINESS.GAP, null, false, 'peer is not ready: fixture')]);
   const before = f.state.listReceipts().length;
@@ -96,7 +106,7 @@ test('handoff during name lookup refuses before network send or custody', async 
 test('tool arguments cannot override the native caller or combine destinations', async t => {
   const f = fixture(t); const peer = service(f); const before = f.state.listReceipts().length;
   await assert.rejects(peer.send({ ...request, nativeId: id }), /invalid peer send/);
-  await assert.rejects(peer.send({ ...request, reply_to: 'other' }), /exactly one of peer/);
+  await assert.rejects(peer.send({ text: 'hello', dedupe_key: 'ok' }), /provide peer or reply_to/);
   await assert.rejects(peer.send({ ...request, text_file: '/ignored' }), /exactly one of text/);
   assert.equal(f.state.listReceipts().length, before);
 });
@@ -105,7 +115,7 @@ test('peer packet IDs refuse invalid lengths and characters before custody', asy
   const f = fixture(t); const peer = service(f); const before = f.state.listReceipts().length;
   await assert.rejects(peer.send({ ...request, dedupe_key: 'a'.repeat(129) }), /valid packet id/);
   await assert.rejects(peer.send({ ...request, dedupe_key: 'job:123' }), /valid packet id/);
-  await assert.rejects(peer.send({ peer: request.peer, text: 'hello', dedupe_key: 'ok', reply_to: 'job:123' }), /exactly one of peer/);
+  await assert.rejects(peer.send({ peer: request.peer, text: 'hello', dedupe_key: 'ok', reply_to: 'job:123' }), /valid packet id/);
   await assert.rejects(peer.send({ reply_to: 'job:123', text: 'hello', dedupe_key: 'ok' }), /valid packet id/);
   assert.equal(f.state.listReceipts().length, before);
 });
@@ -190,6 +200,34 @@ test('successful agent send targets the enrolled child and retry keeps one post'
   });
   f.state.completeAgentHandledWithoutPost({ provider: 'claude', nativeId: id, generation: 1, messageId: message.id });
   assert.equal((await peer.result(request.dedupe_key)).results[0].completed, true);
+});
+
+test('reply_to can select the request source when packet IDs collide', async t => {
+  const f = fixture(t); f.enroll('102');
+  const first = addRecipient(f);
+  const second = addSecondRecipient(f);
+  const caller = f.state.getBinding('101');
+  const callerAddress = { guildId: caller.guildId, channelId: '102', provider: caller.provider,
+    nativeId: caller.nativeId, generation: caller.generation };
+  const requestPacket = (binding, channelId) => ({
+    id: 'duplicate-request', kind: 'request',
+    source: { guildId: binding.guildId, channelId, provider: binding.provider, nativeId: binding.nativeId, generation: binding.generation },
+    target: callerAddress, replyTo: null, routingVersion: 2, text: 'hello'
+  });
+  f.state.receipt(null, 'agent-message', { packet: requestPacket(first, '202') });
+  f.state.receipt(null, 'agent-message', { packet: requestPacket(second, '302') });
+  let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  await assert.rejects(peer.send({ reply_to: 'duplicate-request', text: 'reply', dedupe_key: 'ambiguous-reply' }),
+    /agent reply target is unknown or does not match/);
+  const result = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: 'duplicate-request',
+    text: 'reply', dedupe_key: 'selected-reply' });
+  assert.equal(result.status, 'sent');
+  assert.equal(posts, 1);
 });
 
 test('peer result preserves current and rejects stale legacy parent destinations', async t => {

@@ -237,7 +237,7 @@ test('inspectDirectPostPart follows the projected attempt instead of raw rows', 
 });
 
 function ordinaryState(rows) {
-  return { directPostRows: () => rows.map(row => ({ ...row, detail: { ...row.detail } })) };
+  return { directPostRows: () => rows.map(row => ({ ...row, detail: { ...row.detail } })), listThreadEnrollments: () => [] };
 }
 
 test('hasUnresolvedBindingPost follows the projected outcome instead of raw rows', () => {

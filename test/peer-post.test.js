@@ -83,7 +83,7 @@ test('child role cannot fall through to an unaddressed human post', async t => {
   const peer = createPeerService({ state: f.state, provider: 'claude', token: 'fixture', callerDependencies: identity,
     fetchImpl: async () => { assert.fail('invalid role reached transport'); } });
   const before = f.state.listReceipts().length;
-  await assert.rejects(peer.post({ role: 'child', text_file: '/unused', dedupe_key: 'child-fixture' }), /exactly one of peer/);
+  await assert.rejects(peer.post({ role: 'child', text_file: '/unused', dedupe_key: 'child-fixture' }), /provide peer or reply_to/);
   await assert.rejects(peer.post({ role: 'board', text_file: '/unused', dedupe_key: 'board-fixture' }), /invalid board/);
   await assert.rejects(peer.post({ role: 'announce', text_file: '/unused', dedupe_key: 'announce-fixture', channel_id: 'other' }), /invalid announce/);
   assert.equal(f.state.listReceipts().length, before);

@@ -96,6 +96,34 @@ test('conductor retirement retains custody of an admitted in-flight publication'
     'enrolled child is deactivated');
 });
 
+test('destination retirement retains custody of an admitted peer publication', {
+  timeout: 5000
+}, async t => {
+  const f = setup(t);
+  let release;
+  let entered;
+  const held = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const deadline = setTimeout(release, 3000);
+  t.after(() => { clearTimeout(deadline); release(); });
+
+  const peer = createPeer(f, async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    entered();
+    await held;
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  });
+  const destination = f.state.getBinding('201');
+  const pending = peer.send(SEND_INPUT);
+
+  await started;
+  assert.throws(() => f.state.unbind('201', { expectedBinding: destination }), /work is unresolved/,
+    'destination retirement must fence an admitted publication targeting its enrolled child');
+  release();
+  assert.equal((await pending).status, 'sent');
+  assert.equal(f.state.unbind('201', { expectedBinding: destination }), true);
+});
+
 test('focused control: an admitted publication completes before retirement', { timeout: 5000 }, async t => {
   const f = setup(t);
   const peer = createPeer(f, async (url, options) => options.method === 'GET'

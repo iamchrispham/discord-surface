@@ -1711,7 +1711,7 @@ class SurfaceState {
     });
   }
 
-  directPostRows(requestId = null, channelId = null) {
+  directPostRows(requestId = null, channelId = null, relatedChannelIds = []) {
     return queryDirectPostRows({
       db: this.db,
       assertText,
@@ -1719,7 +1719,7 @@ class SurfaceState {
       StateCorruptError,
       attemptKind: DIRECT_POST_ATTEMPT,
       outcomeKind: DIRECT_POST_OUTCOME
-    }, requestId, channelId);
+    }, requestId, channelId, relatedChannelIds);
   }
 
   getBindingReadinessReceipt(channelId) {

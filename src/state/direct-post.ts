@@ -210,6 +210,25 @@ function validateMeta(meta: DirectPostPartMeta | null | undefined, BindingError:
   }
 }
 
+function packetTargetChannelId(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const target = (value as Record<string, unknown>).target;
+  if (!target || typeof target !== 'object' || Array.isArray(target)) return null;
+  const channelId = (target as Record<string, unknown>).channelId;
+  return typeof channelId === 'string' ? channelId : null;
+}
+
+function bindingTargetChannels(state: DirectPostState, channelId: string): Set<string> {
+  return new Set([channelId, ...state.listThreadEnrollments(channelId).map(enrollment => enrollment.threadId)]);
+}
+
+function targetsBinding(detail: DirectPostReceiptDetail, channelId: string, targetChannels: Set<string>): boolean {
+  if (detail.channelId === channelId) return true;
+  if (typeof detail.deliveryChannelId === 'string' && targetChannels.has(detail.deliveryChannelId)) return true;
+  const targetChannelId = packetTargetChannelId(detail.agentPacket);
+  return targetChannelId !== null && targetChannels.has(targetChannelId);
+}
+
 export function createDirectPostHandlers(dependencies: DirectPostDependencies): DirectPostHandlers {
   const {
     BindingError,
@@ -321,11 +340,14 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
 
   const handlers: DirectPostHandlers = {
     hasUnresolvedBindingPost(state, channelId) {
-      const rows = state.directPostRows(null, channelId);
+      const targetChannels = bindingTargetChannels(state, channelId);
+      const rows = state.directPostRows(null, null, [...targetChannels]);
       const requests = new Map<unknown, { partCount: number; parts: Map<number, { attempts: DirectPostReceiptRow[]; outcomes: DirectPostReceiptRow[] }> }>();
       const attemptPart = new Map<unknown, number>();
+      const relevantRequests = new Set<unknown>();
       for (const row of rows) {
-        if (row.kind !== DIRECT_POST_ATTEMPT || row.detail.channelId !== channelId) continue;
+        if (row.kind !== DIRECT_POST_ATTEMPT || !targetsBinding(row.detail, channelId, targetChannels)) continue;
+        relevantRequests.add(row.detail.requestId);
         const partCount = Object.hasOwn(row.detail, 'partCount') ? row.detail.partCount as number : 1;
         const partIndex = Object.hasOwn(row.detail, 'partIndex') ? row.detail.partIndex as number : 0;
         if (!Number.isSafeInteger(partCount) || partCount < 1 || !Number.isSafeInteger(partIndex) || partIndex < 0 || partIndex >= partCount) return true;
@@ -339,6 +361,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       }
       for (const row of rows) {
         if (row.kind !== DIRECT_POST_OUTCOME || typeof row.detail?.attemptId !== 'string' || !row.detail.attemptId) continue;
+        if (!relevantRequests.has(row.detail.requestId)) continue;
         const request = requests.get(row.detail.requestId);
         const partIndex = attemptPart.get(`${row.detail.requestId}\u0000${row.detail.attemptId}`);
         if (!request || partIndex === undefined) continue;

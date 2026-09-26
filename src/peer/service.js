@@ -49,11 +49,12 @@ function currentPeerDestination(state, target, expectedBinding = null, expectedC
 
 function assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token }) {
   const kind = input.reply_to === undefined ? KINDS.REQUEST : KINDS.RESULT;
-  const target = destination === null
-    ? resolveAgentReplyRequest(state, input.reply_to, sourceAddress, null, {
-      guildId: source.guildId, channelId: source.channelId, provider: source.provider,
-      nativeId: source.nativeId, generation: source.generation
-    }, Error).source
+  const target = kind === KINDS.RESULT
+    ? resolveAgentReplyRequest(state, input.reply_to, sourceAddress,
+      destination === null ? null : resolveAgentAddress(state, destination.binding, destination.childId), {
+        guildId: source.guildId, channelId: source.channelId, provider: source.provider,
+        nativeId: source.nativeId, generation: source.generation
+      }, Error).source
     : resolveAgentAddress(state, destination.binding, destination.childId);
   try {
     encodeAgentMessage({
@@ -81,30 +82,31 @@ function createPeerService(context) {
     async post(input, signal) { return postByRole(context, input, signal, service.send); },
     async result(correlationId, signal) { return inspectPeerResult(state, await caller(signal), correlationId); },
     async list(signal) {
-      await caller(signal);
+      const callerBinding = await caller(signal);
       const { guildId } = state.requireConfig();
       return state.listBindings().filter(binding => binding.active && binding.guildId === guildId).map(binding => {
         let childId = null;
         let reason = null;
         try { childId = requireReadyPeer(state, binding).childId; }
         catch (error) { reason = error.message; }
+        if (binding.channelId === callerBinding.channelId && reason === null) reason = 'caller cannot target itself';
         return { repoKey: binding.repoKey, provider: binding.provider, conductorId: binding.conductorId,
           channelId: binding.channelId, generation: binding.generation, readiness: binding.readiness,
-          childId, reachable: reason === null, reason };
+          childId, reachable: reason === null && binding.channelId !== callerBinding.channelId, reason };
       });
     },
     async send(input, signal) {
-      const initial = await caller(signal);
       if (!input || typeof input !== 'object' || Array.isArray(input) ||
           Object.keys(input).some(key => !['peer', 'text', 'text_file', 'dedupe_key', 'reply_to'].includes(key))) {
         throw new Error('invalid peer send arguments');
       }
       if ((input.text === undefined) === (input.text_file === undefined)) throw new Error('provide exactly one of text or text_file');
-      if ((input.peer === undefined) === (input.reply_to === undefined)) throw new Error('provide exactly one of peer or reply_to');
+      if (input.peer === undefined && input.reply_to === undefined) throw new Error('provide peer or reply_to');
       if (!validPeerId(input.dedupe_key)) throw new Error('dedupe_key must be a valid packet id');
       if (input.reply_to !== undefined && !validPeerId(input.reply_to)) throw new Error('reply_to must be a valid packet id');
       if (input.text !== undefined && (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > 10000)) throw new Error('text must be non-empty and at most 10000 bytes');
       if (input.text_file !== undefined && (typeof input.text_file !== 'string' || !input.text_file.trim())) throw new Error('text_file must be non-empty');
+      const initial = await caller(signal);
       const channels = input.peer?.channelName ? await loadChannels(signal) : [];
       const source = await caller(signal);
       if (source.channelId !== initial.channelId || canonicalNativeId(source.nativeId) !== canonicalNativeId(initial.nativeId) || source.generation !== initial.generation) {

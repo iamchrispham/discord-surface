@@ -17,7 +17,8 @@ test('inventory destination binding gap is diagnostic and read-only', async t =>
   const caller = listed.find(entry => entry.channelId === '101');
   const target = listed.find(entry => entry.channelId === '201');
   assert.ok(caller, 'caller row is present');
-  assert.equal(caller.reachable, true);
+  assert.equal(caller.reachable, false);
+  assert.equal(caller.reason, 'caller cannot target itself');
   assert.equal(caller.childId, '102');
   assert.ok(target, 'target row is present');
   assert.equal(target.reachable, false);
@@ -40,7 +41,8 @@ test('inventory destination binding unavailable is diagnostic and read-only', as
   const caller = listed.find(entry => entry.channelId === '101');
   const target = listed.find(entry => entry.channelId === '201');
   assert.ok(caller, 'caller row is present');
-  assert.equal(caller.reachable, true);
+  assert.equal(caller.reachable, false);
+  assert.equal(caller.reason, 'caller cannot target itself');
   assert.equal(caller.childId, '102');
   assert.ok(target, 'target row is present');
   assert.equal(target.reachable, false);
@@ -64,7 +66,8 @@ test('inventory destination child gap is diagnostic and read-only', async t => {
   const caller = listed.find(entry => entry.channelId === '101');
   const destination = listed.find(entry => entry.channelId === '201');
   assert.ok(caller, 'caller row is present');
-  assert.equal(caller.reachable, true);
+  assert.equal(caller.reachable, false);
+  assert.equal(caller.reason, 'caller cannot target itself');
   assert.equal(caller.childId, '102');
   assert.ok(destination, 'target row is present');
   assert.equal(destination.reachable, false);

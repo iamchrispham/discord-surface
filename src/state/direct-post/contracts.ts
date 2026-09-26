@@ -78,7 +78,8 @@ export interface DirectPostState {
   isAgentResultForWithdrawnRequest(packet: AgentMessage): boolean;
   activeFilePreparationCount?(): number;
   transaction<T>(operation: () => T): T;
-  directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
+  directPostRows(requestId?: string | null, channelId?: string | null, relatedChannelIds?: readonly string[]): DirectPostReceiptRow[];
+  listThreadEnrollments(parentChannelId?: string | null): Array<{ threadId: string; parentChannelId: string; active: boolean }>;
   directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null, deliveryChannelId?: string | null): boolean;
   directPostOwnerIdentity(pid: number): DirectPostOwnerIdentity | null;
   directPostOwnerAlive(pid: number, expectedIdentity: DirectPostOwnerIdentity): boolean;

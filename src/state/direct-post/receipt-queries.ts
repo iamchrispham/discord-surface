@@ -30,7 +30,8 @@ export function latestFilePreparation(state: DirectPostState, kind: string, pars
 export function queryDirectPostRows(
   { db, assertText, parseJson, StateCorruptError, attemptKind, outcomeKind }: DirectPostQueryDependencies,
   requestId: string | null = null,
-  channelId: string | null = null
+  channelId: string | null = null,
+  relatedChannelIds: readonly string[] = []
 ): DirectPostReceiptRow[] {
   if (requestId !== null) assertText(requestId, 'requestId', 256);
   if (channelId !== null) assertText(channelId, 'channelId', 128);
@@ -43,6 +44,15 @@ export function queryDirectPostRows(
   if (channelId !== null) {
     clauses.push("json_extract(detail, '$.channelId')=?");
     parameters.push(channelId);
+  }
+  const relatedChannels = [...new Set(relatedChannelIds)];
+  relatedChannels.forEach(value => assertText(value, 'relatedChannelId', 128));
+  if (relatedChannels.length > 0) {
+    const placeholders = relatedChannels.map(() => '?').join(', ');
+    clauses.push(`(json_extract(detail, '$.channelId') IN (${placeholders}) OR
+      json_extract(detail, '$.deliveryChannelId') IN (${placeholders}) OR
+      json_extract(detail, '$.agentPacket.target.channelId') IN (${placeholders}))`);
+    parameters.push(...relatedChannels, ...relatedChannels, ...relatedChannels);
   }
   const rows = db.prepare(`SELECT id, kind, detail, created_at FROM receipts
     WHERE ${clauses.join(' AND ')} ORDER BY id`).all<RawReceiptRow>(...parameters);

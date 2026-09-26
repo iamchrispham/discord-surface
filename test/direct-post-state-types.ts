@@ -49,6 +49,7 @@ const state: DirectPostState = {
   },
   transaction: operation => operation(),
   directPostRows: () => [],
+  listThreadEnrollments: () => [],
   directPostBindingCurrent: () => true,
   directPostOwnerIdentity: () => ({ ownerPid: 1, ownerStartTime: null, ownerCommand: null }),
   directPostOwnerAlive: () => false,
