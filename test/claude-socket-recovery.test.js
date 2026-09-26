@@ -62,15 +62,6 @@ function acquireProbeLock(t) {
   return { root, namespacePath };
 }
 
-// Structural race trigger for the clearOrphanStagingDirs window. clearOrphanStagingDirs
-// calls assertLockNamespaceIsUsable, whose namespace lstat originates from that frame.
-// Detect the call origin from the stack instead of counting namespace lstats, so an
-// unrelated extra lstat of the namespace cannot consume the trigger and mask a lost
-// revalidation.
-function isNamespaceLstatFromOrphanScan() {
-  return (new Error().stack || '').includes('clearOrphanStagingDirs');
-}
-
 function releaseQuietly(release) {
   if (!release) return;
   try { release(); } catch {}
@@ -416,15 +407,19 @@ test('a namespace absent during the orphan scan recovers and acquires', t => {
   const { namespacePath } = acquireProbeLock(t);
   const socket = socketPath(t);
 
-  // The namespace validates, then vanishes at the clearOrphanStagingDirs call.
-  // That window must stay ENOENT-tolerant so createStagingLock can recreate it.
+  // The namespace validates, then vanishes immediately after that first
+  // validation snapshot. That window must stay ENOENT-tolerant so
+  // createStagingLock can recreate it.
   const originalLstat = fs.lstatSync;
   let triggered = false;
   t.mock.method(fs, 'lstatSync', (target, ...args) => {
-    if (target === namespacePath && !(args.length > 0 && args[0] && args[0].bigint) &&
-      isNamespaceLstatFromOrphanScan()) {
+    if (!triggered && target === namespacePath && !(args.length > 0 && args[0] && args[0].bigint)) {
       triggered = true;
+      // Capture the real valid snapshot on the first namespace lstat, then mutate
+      // and return that snapshot for this one call only.
+      const snapshot = originalLstat(target, ...args);
       fs.rmSync(namespacePath, { recursive: true, force: true });
+      return snapshot;
     }
     return originalLstat(target, ...args);
   });
@@ -450,17 +445,21 @@ test('a permissive replacement during the orphan scan is refused and preserved',
   const orphanName = `.staging-999999999-${randomUUID()}`;
 
   // The namespace validates, then a foreign permissive directory with a plausible
-  // orphan staging dir occupies the fixed path at the clearOrphanStagingDirs call.
+  // orphan staging dir occupies the fixed path immediately after that first
+  // validation snapshot.
   const originalLstat = fs.lstatSync;
   let triggered = false;
   t.mock.method(fs, 'lstatSync', (target, ...args) => {
-    if (target === namespacePath && !(args.length > 0 && args[0] && args[0].bigint) &&
-      isNamespaceLstatFromOrphanScan()) {
+    if (!triggered && target === namespacePath && !(args.length > 0 && args[0] && args[0].bigint)) {
       triggered = true;
+      // Capture the real valid snapshot on the first namespace lstat, then mutate
+      // and return that snapshot for this one call only.
+      const snapshot = originalLstat(target, ...args);
       fs.rmSync(namespacePath, { recursive: true, force: true });
       fs.mkdirSync(namespacePath, { mode: 0o777 });
       fs.chmodSync(namespacePath, 0o777);
       fs.mkdirSync(path.join(namespacePath, orphanName), { mode: 0o700 });
+      return snapshot;
     }
     return originalLstat(target, ...args);
   });
