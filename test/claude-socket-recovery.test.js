@@ -303,7 +303,12 @@ test('socket locks use one fixed namespace and retain it across release', t => {
   assert.equal(rmdirs.includes(namespacePath), false, 'release must never rmdir the shared namespace root');
 });
 
-for (const [label, mode] of [['group-writable', 0o777], ['read-only', 0o555], ['missing', null]]) {
+for (const [label, mode] of [
+  ['group-writable', 0o777],
+  ['read-only', 0o555],
+  ['not-searchable', 0o600],
+  ['missing', null],
+]) {
   test(`an ${label} passwd home falls back to the stable system temporary root`, t => {
     const root = path.join('/tmp', `dss-root-${randomUUID()}`);
     if (mode !== null) {
@@ -319,6 +324,17 @@ for (const [label, mode] of [['group-writable', 0o777], ['read-only', 0o555], ['
     t.mock.method(os, 'tmpdir', () => fallbackRoot);
     const previousRuntimeRoot = process.env.XDG_RUNTIME_DIR;
     process.env.XDG_RUNTIME_DIR = runtimeRoot;
+    if (label === 'not-searchable') {
+      const originalAccessSync = fs.accessSync;
+      t.mock.method(fs, 'accessSync', (target, accessMode, ...args) => {
+        if (String(target) === root && (accessMode & fs.constants.X_OK) !== 0) {
+          const error = new Error('search access denied');
+          error.code = 'EACCES';
+          throw error;
+        }
+        return originalAccessSync(target, accessMode, ...args);
+      });
+    }
     t.after(() => {
       if (previousRuntimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
       else process.env.XDG_RUNTIME_DIR = previousRuntimeRoot;

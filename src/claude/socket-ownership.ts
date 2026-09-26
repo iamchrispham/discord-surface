@@ -291,7 +291,7 @@ function ownerControlledNamespaceRoot(): string {
     const ownerWritableRoot = owner === undefined || (directory.mode & 0o200) !== 0;
     if (ownerControlledRoot && ownerWritableRoot && (directory.mode & 0o022) === 0) {
       try {
-        fs.accessSync(root, fs.constants.W_OK);
+        fs.accessSync(root, fs.constants.W_OK | fs.constants.X_OK);
         return root;
       } catch {
         // Try the next candidate.
@@ -311,7 +311,7 @@ function ownerControlledNamespaceRoot(): string {
       const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
       if (privateDirectory.isDirectory() && privateOwnerControlled && privateOwnerWritable &&
         (privateDirectory.mode & 0o077) === 0) {
-        fs.accessSync(privateRoot, fs.constants.W_OK);
+        fs.accessSync(privateRoot, fs.constants.W_OK | fs.constants.X_OK);
         return privateRoot;
       }
     } catch {
