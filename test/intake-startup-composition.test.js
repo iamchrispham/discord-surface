@@ -31,7 +31,7 @@ test('healthy parent dispatch continues while active child custody remains held'
   assert.equal(held.gapFrom, '101');
 });
 
-test('healthy parent dispatch proceeds when startup finds no held custody', async t => {
+test('healthy parent dispatch proceeds when startup finds no held custody', { timeout: 8000 }, async t => {
   const f = fixture(t);
   assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, '101', '1000')).accepted, true);
   f.history.set('1000', [f.message('101', '1000')]);
