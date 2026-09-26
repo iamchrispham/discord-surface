@@ -38,19 +38,15 @@ function acquireSocketLockWithPath(t, socket) {
   return { release, lockPath };
 }
 
-// Per-test isolated lock namespace: redirect the fixed realpathSync('/tmp') root
-// to a fresh temporary directory so tests never mutate the real shared per-UID
-// coordination namespace.
+// Per-test isolated lock namespace: redirect the owner-controlled os.tmpdir()
+// root to a fresh temporary directory so tests never mutate the real shared
+// per-UID coordination namespace.
 function isolatedNamespaceRoot(t) {
   const root = fs.mkdtempSync('/tmp/dss-root-');
   fs.chmodSync(root, 0o700);
-  const originalRealpath = fs.realpathSync;
-  t.mock.method(fs, 'realpathSync', (target, ...args) => {
-    if (String(target) === '/tmp') return root;
-    return originalRealpath(target, ...args);
-  });
+  t.mock.method(os, 'tmpdir', () => root);
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  return root;
+  return fs.realpathSync(root);
 }
 
 function acquireProbeLock(t) {
@@ -278,17 +274,17 @@ test('socket paths overlapping the reserved coordination namespace are refused',
 });
 
 test('socket locks use one fixed namespace and retain it across release', t => {
+  const root = isolatedNamespaceRoot(t);
   const socket = socketPath(t);
   assertSocketDirectory(socket);
   const { release, lockPath } = acquireSocketLockWithPath(t, socket);
   const namespacePath = path.dirname(lockPath);
-  assert.equal(path.dirname(namespacePath), fs.realpathSync('/tmp'));
+  assert.equal(path.dirname(namespacePath), root);
   assert.match(path.basename(namespacePath), new RegExp(`^\\.discord-surface-locks-${process.getuid()}-coordination`));
 
-  // Changed HOME/TMPDIR must not move the lock: the contender still sees the same one.
-  const bogus = path.join(fs.realpathSync('/tmp'), `dss-bogus-${randomUUID()}`);
+  // Changed HOME must not move the lock: the contender still sees the same one.
+  const bogus = path.join(root, `dss-bogus-${randomUUID()}`);
   t.mock.method(os, 'homedir', () => bogus);
-  t.mock.method(os, 'tmpdir', () => bogus);
   assert.throws(() => acquireSocketLock(socket), /already in progress/);
 
   // Environment-independent retention: the shared namespace must never be an
@@ -305,6 +301,17 @@ test('socket locks use one fixed namespace and retain it across release', t => {
   assert.equal(fs.existsSync(namespacePath), true, 'namespace directory must be retained after release');
   assert.equal(fs.lstatSync(namespacePath).isDirectory(), true, 'namespace path must remain a directory');
   assert.equal(rmdirs.includes(namespacePath), false, 'release must never rmdir the shared namespace root');
+});
+
+test('an unsafe temporary root refuses before bootstrapping the namespace', t => {
+  const root = fs.mkdtempSync('/tmp/dss-root-');
+  fs.chmodSync(root, 0o777);
+  t.mock.method(os, 'tmpdir', () => root);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const socket = socketPath(t);
+  assert.throws(() => assertSocketDirectory(socket), /namespace root is unusable/);
+  assert.deepEqual(fs.readdirSync(root), [], 'an unsafe root must not receive a fixed namespace');
 });
 
 test('an unusable fixed namespace root refuses with no fallback', t => {

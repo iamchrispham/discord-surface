@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as net from 'node:net';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -267,13 +268,29 @@ function assertLockNamespaceIsUsable(namespacePath: string, owner: number | unde
   }
 }
 
-function lockNamespacePath(socketPath: string): string {
+function ownerControlledNamespaceRoot(): string {
   let root: string;
   try {
-    root = fs.realpathSync('/tmp');
+    root = fs.realpathSync(os.tmpdir());
   } catch {
     throw new Error('Claude channel socket lock namespace root is unavailable');
   }
+  let directory: fs.Stats;
+  try {
+    directory = fs.statSync(root);
+  } catch {
+    throw new Error('Claude channel socket lock namespace root is unavailable');
+  }
+  const owner = process.getuid?.();
+  if (!directory.isDirectory() || (owner !== undefined && directory.uid !== owner) ||
+    (directory.mode & 0o022) !== 0) {
+    throw new Error('Claude channel socket lock namespace root is unusable');
+  }
+  return root;
+}
+
+function lockNamespacePath(socketPath: string): string {
+  const root = ownerControlledNamespaceRoot();
   const owner = process.getuid?.();
   const ownerName = owner === undefined ? 'shared' : String(owner);
   const namespacePath = lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`);
