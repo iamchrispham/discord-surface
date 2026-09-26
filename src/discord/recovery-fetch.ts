@@ -98,6 +98,61 @@ export function isPreAdoptionRetryableThread(enrollment: ThreadEnrollment | null
     (isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, enrollment.detail) || isInterruptedRetryBoundary(enrollment)));
 }
 
+export interface BaselineRefusalInput {
+  /**
+   * True when the owner snapshot proves an earlier adoption/recovery attempt
+   * already failed for this route: a retryable HTTP503/deadline fetch, a typed
+   * recovery deadline, or an interrupted retry-pending marker. Callers derive
+   * this from existing owner predicates, never from the newest fetched message.
+   */
+  failedAttempt: boolean;
+  /**
+   * True when the owner snapshot proves adoption already completed, e.g. a child
+   * enrollment with `adoptedAt` set, or a parent ready all-null boundary. A
+   * known-empty completed adoption must not be refused.
+   */
+  adoptionCompleted?: boolean;
+  /**
+   * Historical starting bound proved by the owner snapshot (`recovered_through_id`
+   * for parents, `recoveredThroughId` for children). `last_seen_id` alone is NOT
+   * coverage and must never be passed here.
+   */
+  coveredCursor?: string | null;
+  /**
+   * True only when every message the candidate cutoff would exclude already has
+   * retained accepted custody proof (for children, each fetched baseline row has
+   * intake evidence). This is an admission fact, not `last_seen_id` or
+   * `lastAcceptedId` watermark substitution: an admitted higher row does not cover
+   * a lower unadmitted history row.
+   */
+  newestAlreadyRetained?: boolean;
+}
+
+/**
+ * Pure F15 decision: refuse installing a new latest-message exclusion cutoff
+ * after a failed adoption/recovery attempt when the owner snapshot carries no
+ * qualified historical starting bound and the candidate cutoff is not proven to
+ * exclude only already-admitted custody.
+ *
+ * Returns true only when all of the following hold:
+ * - `failedAttempt` is true (a retry after an HTTP503, typed deadline, or
+ *   interrupted-retry-pending attempt);
+ * - adoption is not already proven complete (`adoptionCompleted` false);
+ * - `coveredCursor` is not a non-empty string;
+ * - `newestAlreadyRetained` is not true.
+ *
+ * A genuine first adoption (`failedAttempt` false), a covered-cursor retry, a
+ * known-empty completed adoption (`adoptionCompleted` true), and a retry whose
+ * candidate cutoff only excludes already-admitted rows are all allowed. This
+ * gates the baseline COMMIT, not just retry eligibility.
+ */
+export function refusesUnqualifiedBaseline(input: BaselineRefusalInput): boolean {
+  if (!input.failedAttempt) return false;
+  if (input.adoptionCompleted) return false;
+  if (input.newestAlreadyRetained) return false;
+  return !(typeof input.coveredCursor === 'string' && input.coveredCursor.length > 0);
+}
+
 export async function recoveryFetch<T>(fetch: () => Promise<T>): Promise<T> {
   try {
     return await fetch();

@@ -155,14 +155,22 @@ for (const adopted of [true, false]) {
 
     const recovered = await f.gateway.recoverTransport('restart');
     assert.equal(recovered.ready, true, JSON.stringify(recovered));
-    assert.equal(f.boundary('2000').state, 'ready');
     if (adopted) {
+      assert.equal(f.boundary('2000').state, 'ready');
       f.enableDelivery();
       await f.gateway.reconcilePending(undefined, { readyOnly: true });
       await f.gateway.consumer.waitForNativeWork();
       assert.equal(f.state.getMessage('101').state, 'replied');
       assert.equal(f.dispatched.filter(item => item.id === '101').length, 1);
     } else {
+      // F15 rule (lead ruling on F-005): an unqualified pre-adoption retry after a
+      // typed deadline must stay visibly held; the old 'ready' expectation encoded
+      // the F15 defect. See findings F-005 / decision F-007.
+      const heldRetry = f.boundary('2000');
+      assert.equal(heldRetry.state, 'pending');
+      assert.equal(heldRetry.adoptedAt, null);
+      assert.equal(heldRetry.adoptedThroughId, null);
+      assert.equal(heldRetry.recoveredThroughId, null);
       assert.equal(f.dispatched.length, 0);
     }
   });

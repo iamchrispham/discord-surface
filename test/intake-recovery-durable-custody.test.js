@@ -1,17 +1,13 @@
 'use strict';
 
-// PR113 durable custody fixtures: TODO-wrapped findings F11-F14 plus passing controls C11-C14.
+// PR113 durable custody fixtures: F11-F14 causal findings (unwrapped, real assertions)
+// plus passing controls C11-C15 and the F13 same-generation readiness fence.
 // Recipe (adapted to relative imports): ~/.agents/work-control/discord-pr113-current-findings-20260926/recovery-findings.test.cjs
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fixture } = require('./helpers/intake-recovery-fixture');
 const { CASES, operatorMessage } = require('./helpers/intake-recovery-scenarios');
-
-const F11_REASON = 'DEFECT(F11): a channel fetch that fails once leaves the recovered submitted message at reply_ready instead of attaching the already-running native observation and reaching replied';
-const F12_REASON = 'DEFECT(F12): a reply saved on a held message is delivered into a channel from another guild; it must send zero replies, stay reply_ready, and preserve native identity/generation';
-const F13_REASON = 'DEFECT(F13): a terminal gap watermark on an unvisited route leaves the paused binding readiness at recovering instead of restoring gap';
-const F14_REASON = 'DEFECT(F14): a slow first channel fetch consumes the recovery deadline and starves the later submitted observation, which is never admitted at all';
 
 function submitted(f, id, channel = '1000') {
   assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, id, channel)).accepted, true);
@@ -27,7 +23,7 @@ function identity(binding) {
   return [binding.provider, binding.nativeId, binding.generation];
 }
 
-test('F11 recovered channel must attach to an existing native observation', { ...CASES, todo: F11_REASON }, async t => {
+test('F11 recovered channel must attach to an existing native observation', CASES, async t => {
   const f = fixture(t); submitted(f, '101'); hold(f); f.enableDelivery();
   let release;
   const answer = new Promise(resolve => { release = resolve; });
@@ -54,7 +50,7 @@ test('F11 recovered channel must attach to an existing native observation', { ..
   assert.equal(f.dispatched.length, 0);
 });
 
-test('F12 held parent reply must refuse a channel in another guild', { ...CASES, todo: F12_REASON }, async t => {
+test('F12 held parent reply must refuse a channel in another guild', CASES, async t => {
   const f = fixture(t); submitted(f, '101');
   const m = f.state.getMessage('101');
   const owner = f.state.getBinding('1000');
@@ -70,7 +66,35 @@ test('F12 held parent reply must refuse a channel in another guild', { ...CASES,
   assert.equal(f.dispatched.length, 0);
 });
 
-test('F13 unvisited terminal watermark must restore paused binding readiness', { ...CASES, todo: F13_REASON }, async t => {
+test('F12 fetched wrong-guild parent channel must not publish the saved reply', CASES, async t => {
+  const f = fixture(t); submitted(f, '101');
+  const m = f.state.getMessage('101');
+  f.state.recordNativeReply({ provider: m.provider, messageId: m.id, nativeId: m.nativeId, generation: m.generation, text: 'saved reply' });
+  hold(f); f.enableDelivery();
+  const foreign = { ...f.channels.get('1000'), guildId: 'foreign-guild' };
+  f.gateway.client.channels.fetch = async id => id === '1000' ? foreign : f.channels.get(id);
+  await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+  assert.equal(f.replies.length, 0, 'fetched wrong-guild parent must receive no saved reply');
+  assert.equal(f.state.getMessage('101').state, 'reply_ready');
+  assert.equal(f.dispatched.length, 0);
+});
+
+test('F12 attached wrong-guild parent channel is refused before send', CASES, async t => {
+  const f = fixture(t); submitted(f, '101');
+  const m = f.state.getMessage('101');
+  f.state.recordNativeReply({ provider: m.provider, messageId: m.id, nativeId: m.nativeId, generation: m.generation, text: 'saved reply' });
+  const ready = f.state.getMessage('101');
+  const wrong = { ...f.channels.get('1000'), guildId: 'foreign-guild' };
+  await assert.rejects(
+    f.gateway.sendReply({ ...ready, channel: wrong }, ready),
+    error => error.outcome === 'not_sent'
+  );
+  assert.equal(f.replies.length, 0, 'attached wrong-guild parent must receive no saved reply');
+  assert.equal(f.state.getMessage('101').state, 'reply_ready');
+  assert.equal(f.dispatched.length, 0);
+});
+
+test('F13 unvisited terminal watermark must restore paused binding readiness', CASES, async t => {
   const f = fixture(t); const base = f.state.getBinding('1000');
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
   f.state.setIntakeBaseline('3000', '100', 'fixture');
@@ -91,7 +115,7 @@ test('F13 unvisited terminal watermark must restore paused binding readiness', {
 });
 
 // F14: the diagnostic counter became an explicit admitted-event race with a bounded timer.
-test('F14 slow first fetch must not starve a later submitted observation', { ...CASES, todo: F14_REASON }, async t => {
+test('F14 slow first fetch must not starve a later submitted observation', CASES, async t => {
   const f = fixture(t); submitted(f, '101');
   const base = f.state.getBinding('1000');
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
@@ -162,6 +186,46 @@ test('C13 visited terminal watermark without a deadline advance restores gap rea
   assert.equal(f.dispatched.length, 0);
 });
 
+// F13 control: a same-generation newer READY/PENDING outcome committed while the
+// expired deadline pass is running must not be overwritten by the terminal restore.
+for (const newer of ['ready', 'pending']) {
+  test(`F13 same-generation newer ${newer} is not overwritten by the terminal restore`, CASES, async t => {
+    const f = fixture(t); const base = f.state.getBinding('1000');
+    f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
+    f.state.setIntakeBaseline('3000', '100', 'fixture');
+    f.state.markIntakeBoundary('3000', 'gap', 'explicit uncovered history', '101', '102');
+    f.history.set('1000', [f.message('101', '1000')]);
+    const owner = f.state.getBinding('3000');
+    const now = Date.now, intake = f.gateway.consumer.intakeMessage;
+    let advanced = false;
+    f.gateway.consumer.intakeMessage = async function (...args) {
+      const result = await intake.apply(f.gateway.consumer, args);
+      if (!advanced && args[0]?.id === '101') { advanced = true; Date.now = () => now() + 120000; }
+      return result;
+    };
+    // A same-generation concurrent recovery commits a newer outcome for the other
+    // route at the moment the terminal restore is about to write.
+    let injected = false;
+    const recordBoundary = f.gateway.recordBoundary.bind(f.gateway);
+    f.gateway.recordBoundary = async function (binding, channel, boundaryState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary, expectedReadiness) {
+      if (!injected && binding?.channelId === '3000' && ['gap', 'unavailable'].includes(boundaryState)) {
+        injected = true;
+        const committed = f.state.markIntakeBoundary('3000', newer, `concurrent ${newer}`, null, null, f.state.getBinding('3000'));
+        assert.equal(committed?.state, newer);
+      }
+      return recordBoundary(binding, channel, boundaryState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary, expectedReadiness);
+    };
+    try { f.gateway.pauseConnection('reconnect'); await f.recover(); }
+    finally { Date.now = now; f.gateway.consumer.intakeMessage = intake; }
+    assert.equal(advanced, true);
+    assert.equal(injected, true);
+    assert.equal(f.state.getIntakeWatermark('3000').state, newer, `newer same-generation ${newer} watermark must not be overwritten`);
+    assert.equal(f.state.getBinding('3000').readiness, newer, `newer same-generation ${newer} readiness must not be overwritten`);
+    assert.equal(identity(f.state.getBinding('3000')).join('|'), identity(owner).join('|'));
+    assert.equal(f.dispatched.length, 0);
+  });
+}
+
 test('C14 unexhausted reconcile observes both owners exactly once', CASES, async t => {
   const f = fixture(t); submitted(f, '101');
   const base = f.state.getBinding('1000');
@@ -184,5 +248,72 @@ test('C14 unexhausted reconcile observes both owners exactly once', CASES, async
   assert.equal(f.replies.length, 2);
   assert.equal(identity(f.state.getBinding('1000')).join('|'), identity(owners[0]).join('|'));
   assert.equal(identity(f.state.getBinding('3000')).join('|'), identity(owners[1]).join('|'));
+  assert.equal(f.dispatched.length, 0);
+});
+
+test('C15 history message landing on page two is admitted with the cursor advanced', CASES, async t => {
+  const f = fixture(t); // fixture pageLimit is 1, so 102 is only reachable on page two.
+  f.history.set('1000', [f.message('101', '1000'), f.message('102', '1000')]);
+  const owner = f.state.getBinding('1000');
+  f.gateway.pauseConnection('reconnect');
+  await f.recover();
+  assert.equal(f.state.getMessage('101').state, 'accepted');
+  assert.equal(f.state.getMessage('102').state, 'accepted');
+  assert.equal(f.cursor('1000'), '102');
+  assert.equal(f.state.getIntakeWatermark('1000').state, 'ready');
+  assert.equal(identity(f.state.getBinding('1000')).join('|'), identity(owner).join('|'));
+  assert.equal(f.dispatched.length, 0);
+});
+
+test('C16 deadline exhaustion mid-recovery keeps the partial cursor and does not dispatch', CASES, async t => {
+  const f = fixture(t);
+  f.history.set('1000', [f.message('101', '1000'), f.message('102', '1000')]);
+  const now = Date.now, intake = f.gateway.consumer.intakeMessage;
+  let advanced = false;
+  f.gateway.consumer.intakeMessage = async function (...args) {
+    const result = await intake.apply(f.gateway.consumer, args);
+    // Exhaust the bounded recovery deadline after the first page is admitted.
+    if (!advanced && args[0]?.id === '101') { advanced = true; Date.now = () => now() + 120000; }
+    return result;
+  };
+  try { f.gateway.pauseConnection('reconnect'); await f.recover(); }
+  finally { Date.now = now; f.gateway.consumer.intakeMessage = intake; }
+  assert.equal(advanced, true);
+  const watermark = f.state.getIntakeWatermark('1000');
+  assert.equal(watermark.state, 'unavailable');
+  assert.match(watermark.detail, /^Discord recovery deadline: /);
+  assert.equal(watermark.recovered_through_id, '101');
+  assert.equal(f.state.getMessage('101').state, 'accepted');
+  assert.equal(f.state.getMessage('102'), null, 'page two must not be admitted past the exhausted deadline');
+  assert.equal(f.state.getBinding('1000').readiness, 'unavailable');
+  assert.equal(f.dispatched.length, 0);
+});
+
+test('C17 owner change during recovery await is not overwritten', CASES, async t => {
+  const f = fixture(t);
+  const base = f.state.getBinding('1000');
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
+  f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
+  f.state.setIntakeBaseline('3000', '100', 'fixture'); f.state.markIntakeBoundary('3000', 'ready');
+  f.history.set('3000', [f.message('101', '3000')]);
+  const intake = f.gateway.consumer.intakeMessage;
+  let advanced = false, rebound = null;
+  f.gateway.consumer.intakeMessage = async function (...args) {
+    // A cutover to a new native owner completes while the recovery pass is awaiting.
+    if (!advanced && args[0]?.id === '101') {
+      advanced = true;
+      rebound = f.state.rebind({ channelId: '3000', guildId: 'guild', provider: 'codex',
+        nativeId: '44444444-4444-4444-8444-444444444444', workspace: base.workspace }, { resetIntake: true });
+    }
+    return intake.apply(f.gateway.consumer, args);
+  };
+  try { f.gateway.pauseConnection('reconnect'); await f.recover(); }
+  finally { f.gateway.consumer.intakeMessage = intake; }
+  assert.equal(advanced, true);
+  assert.equal(rebound?.nativeId, '44444444-4444-4444-8444-444444444444');
+  const owner = f.state.getBinding('3000');
+  assert.equal(owner.nativeId, '44444444-4444-4444-8444-444444444444', 'cutover owner must survive the stale recovery pass');
+  assert.equal(owner.generation, rebound.generation);
+  assert.equal(owner.readiness, 'pending', 'cutover owner must not be marked ready by the stale pass');
   assert.equal(f.dispatched.length, 0);
 });

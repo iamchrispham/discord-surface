@@ -6,6 +6,7 @@ import {
   isRetryableIntakeBoundary,
   isRetryableHttp503Boundary,
   recoveryFetch,
+  refusesUnqualifiedBaseline,
   retryPendingBoundaryDetail
 } from './recovery-fetch';
 import { THREAD_STATES, type ThreadBinding, type ThreadEnrollment, type ThreadRoute, type ThreadState } from '../state/thread-enrollment';
@@ -118,6 +119,16 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   const retryableBoundary = isRetryableThreadBoundary(enrollment);
   const preAdoptionRetryBoundary = isPreAdoptionRetryableThread(enrollment);
   const retryableHold = retryableBoundary || preAdoptionRetryBoundary;
+  // Qualify the INCOMING owner snapshot before the pending-boundary write below can
+  // replace its detail. A failed prior adoption/recovery attempt (retryable HTTP503,
+  // typed deadline, or interrupted-retry-pending marker) must not later install a
+  // newest fetched message as a fresh exclusion cutoff. The decision itself runs at
+  // the baseline COMMIT, once the candidate newest message is known.
+  const baselineRefusalInput = {
+    failedAttempt: retryableHold,
+    adoptionCompleted: Boolean(enrollment.adoptedAt),
+    coveredCursor: enrollment.recoveredThroughId
+  };
   if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state) &&
       !retryableHold) return false;
   let ownedEnrollment = enrollment;
@@ -184,6 +195,21 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       const liveLastSeenId = gateway.state.getThreadEnrollment(enrollment.threadId)?.lastSeenId || null;
       let newest = fetchedNewest || liveLastSeenId;
       if (fetchedNewest && liveLastSeenId && compareIds(liveLastSeenId, fetchedNewest) > 0) newest = liveLastSeenId;
+      if (newest && refusesUnqualifiedBaseline({
+        ...baselineRefusalInput,
+        // Per-row admission proof, not a watermark comparison: an admitted higher row
+        // does not cover a lower unadmitted history row that the cutoff would exclude.
+        newestAlreadyRetained: baseline.length > 0 &&
+          baseline.every(message => gateway.state.hasIntakeEvidence(message.id))
+      })) {
+        // Gate the baseline COMMIT, not just retry eligibility: the failed attempt
+        // left no covered historical cursor and the candidate cutoff would exclude
+        // unadmitted history, so keep the route visibly held pending instead of
+        // adopting a fresh history-only message as the newest exclusion cutoff.
+        boundary(THREAD_STATES.PENDING,
+          retryPendingBoundaryDetail('thread baseline refused without historical coverage', ownedEnrollment), null);
+        return false;
+      }
       const baselineEnrollment = gateway.state.setThreadBaseline(enrollment.threadId, newest, binding, ownedEnrollment);
       if (!baselineEnrollment) return false;
       ownedEnrollment = baselineEnrollment;
