@@ -463,6 +463,7 @@ export class ClaudeChannel<
     let rejectStartup: ((error: Error) => void) | null = null;
     let startupCancelled = false;
     let startupPhase: ClaudeStartupPhase = CLAUDE_STARTUP_PHASES.SOCKET_PREPARATION;
+    let listenerStartup: Promise<void> | null = null;
     const startupController = new AbortController();
     this.startupPhase = startupPhase;
     const startupCancellation = new Promise<never>((_, reject) => {
@@ -571,7 +572,7 @@ export class ClaudeChannel<
       });
       const server = this.server;
       if (!server) throw new Error('Claude channel server failed to initialize');
-      await Promise.race([new Promise<void>((resolve, reject) => {
+      listenerStartup = new Promise<void>((resolve, reject) => {
         server.once('error', reject);
         server.listen(this.socketPath, () => {
           server.off('error', reject);
@@ -597,12 +598,18 @@ export class ClaudeChannel<
           this.ownsSocket = true;
           resolve();
         });
-      }), startupCancellation]);
+      });
+      await Promise.race([listenerStartup, startupCancellation]);
+      listenerStartup = null;
       if (this.transportClosed) throw new Error('Claude channel transport closed during startup');
       this.ready = true;
       this.started = true;
     } catch (error) {
       this.ready = false;
+      if (listenerStartup) {
+        try { await listenerStartup; } catch {}
+        listenerStartup = null;
+      }
       if (!this.stopping) {
         try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
       }

@@ -630,3 +630,35 @@ test('start calls during stop share one post-stop startup', { timeout: 8000 }, a
   assert.equal(channel.ready, true);
   assert.equal(closeCalls, 1);
 });
+
+test('stop joins a pending listener startup before releasing the socket lock', { timeout: 8000 }, async t => {
+  const socket = socketPath(t);
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  let signalListenCalled;
+  const listenCalled = new Promise(resolve => { signalListenCalled = resolve; });
+  let resumeListen;
+  const listenGate = new Promise(resolve => { resumeListen = resolve; });
+  const originalListen = net.Server.prototype.listen;
+  t.mock.method(net.Server.prototype, 'listen', function (...args) {
+    signalListenCalled();
+    void listenGate.then(() => Reflect.apply(originalListen, this, args));
+    return this;
+  });
+  t.after(() => resumeListen());
+
+  const start = channel.start();
+  await listenCalled;
+  const stop = channel.stop();
+  let stopped = false;
+  void stop.then(() => { stopped = true; }, () => { stopped = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stopped, false);
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+
+  resumeListen();
+  await assert.rejects(start, /Claude channel stopped during listener startup/);
+  await stop;
+});

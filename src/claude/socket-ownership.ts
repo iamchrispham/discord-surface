@@ -244,6 +244,10 @@ function lockNamespaceCandidate(parentPath: string, prefix: string): string {
   return path.join(parentPath, component);
 }
 
+function canonicalNamespaceRoot(directoryPath: string): string | undefined {
+  try { return fs.realpathSync(directoryPath); } catch { return undefined; }
+}
+
 function ensureUsableLockNamespaceCandidate(directoryPath: string): boolean {
   try {
     fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
@@ -256,15 +260,19 @@ function ensureUsableLockNamespaceCandidate(directoryPath: string): boolean {
 }
 
 function lockNamespacePath(socketPath: string, key: string): string {
-  let temporaryRoot = process.platform === 'win32' ? os.tmpdir() : '/tmp';
-  try { temporaryRoot = fs.realpathSync(temporaryRoot); } catch {}
+  const homeRoot = canonicalNamespaceRoot(os.homedir());
+  const temporaryRoot = canonicalNamespaceRoot(process.platform === 'win32' ? os.tmpdir() : '/tmp');
   const owner = process.getuid?.();
   const ownerName = owner === undefined ? 'shared' : String(owner);
   const candidates = [
-    lockNamespaceCandidate(os.homedir(), `.dss-locks-${ownerName}-${key}`),
-    lockNamespaceCandidate(os.homedir(), `${LOCK_NAMESPACE}-${ownerName}`),
-    lockNamespaceCandidate(temporaryRoot, `.dss-locks-${ownerName}-${key.slice(0, 16)}`),
-    lockNamespaceCandidate(temporaryRoot, `${LOCK_NAMESPACE}-fallback-${ownerName}-${key}`)
+    ...(homeRoot ? [
+      lockNamespaceCandidate(homeRoot, `.dss-locks-${ownerName}-${key}`),
+      lockNamespaceCandidate(homeRoot, `${LOCK_NAMESPACE}-${ownerName}`)
+    ] : []),
+    ...(temporaryRoot ? [
+      lockNamespaceCandidate(temporaryRoot, `.dss-locks-${ownerName}-${key.slice(0, 16)}`),
+      lockNamespaceCandidate(temporaryRoot, `${LOCK_NAMESPACE}-fallback-${ownerName}-${key}`)
+    ] : [])
   ];
   for (const candidate of candidates) {
     if (pathsOverlap(socketPath, candidate)) continue;
