@@ -154,7 +154,7 @@ async function race(tempDir, kind, signal) {
   return { finalPath, observedDuringWindow, workerPid };
 }
 
-test('atomic fixture PID publication hides its pathname until complete', { todo: 'issue119 atomic fixture publication is not implemented', timeout: 8000 }, async (t) => {
+test('atomic fixture PID publication hides its pathname until complete', { timeout: 8000 }, async (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fixture-pub-pid-'));
   try {
     const result = await race(tempDir, 'pid', t.signal);
@@ -169,7 +169,7 @@ test('atomic fixture PID publication hides its pathname until complete', { todo:
   }
 });
 
-test('atomic fixture JSON publication hides its pathname until complete', { todo: 'issue119 atomic fixture publication is not implemented', timeout: 8000 }, async (t) => {
+test('atomic fixture JSON publication hides its pathname until complete', { timeout: 8000 }, async (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fixture-pub-json-'));
   try {
     const result = await race(tempDir, 'json', t.signal);
