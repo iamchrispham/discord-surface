@@ -37,6 +37,40 @@ function acquireSocketLockWithPath(t, socket) {
   return { release, lockPath };
 }
 
+// Per-test isolated lock namespace: redirect the fixed realpathSync('/tmp') root
+// to a fresh temporary directory so tests never mutate the real shared per-UID
+// coordination namespace.
+function isolatedNamespaceRoot(t) {
+  const root = fs.mkdtempSync('/tmp/dss-root-');
+  fs.chmodSync(root, 0o700);
+  const originalRealpath = fs.realpathSync;
+  t.mock.method(fs, 'realpathSync', (target, ...args) => {
+    if (String(target) === '/tmp') return root;
+    return originalRealpath(target, ...args);
+  });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return root;
+}
+
+function acquireProbeLock(t) {
+  const root = isolatedNamespaceRoot(t);
+  const probeSocket = socketPath(t);
+  const probe = acquireSocketLockWithPath(t, probeSocket);
+  const namespacePath = path.dirname(probe.lockPath);
+  assert.equal(path.dirname(namespacePath), root, 'namespace must live under the isolated root');
+  probe.release();
+  return { root, namespacePath };
+}
+
+// Structural race trigger for the clearOrphanStagingDirs window. clearOrphanStagingDirs
+// calls assertLockNamespaceIsUsable, whose namespace lstat originates from that frame.
+// Detect the call origin from the stack instead of counting namespace lstats, so an
+// unrelated extra lstat of the namespace cannot consume the trigger and mask a lost
+// revalidation.
+function isNamespaceLstatFromOrphanScan() {
+  return (new Error().stack || '').includes('clearOrphanStagingDirs');
+}
+
 function releaseQuietly(release) {
   if (!release) return;
   try { release(); } catch {}
@@ -299,6 +333,148 @@ for (const [label, corrupt] of unusableNamespaceFacets()) {
     assert.equal(fs.existsSync(namespacePath), true, 'refusal must not delete the shared namespace root');
   });
 }
+
+test('staging ENOENT recovery revalidates a replaced fixed namespace', t => {
+  const owner = process.getuid?.();
+  const { namespacePath } = acquireProbeLock(t);
+
+  function restoreNamespace() {
+    fs.rmSync(namespacePath, { recursive: true, force: true });
+    fs.mkdirSync(namespacePath, { mode: 0o700 });
+    fs.chmodSync(namespacePath, 0o700);
+  }
+  restoreNamespace();
+
+  const socket = socketPath(t);
+
+  // Simulate the exact race: the namespace passes lockNamespacePath's validation,
+  // then the first staging mkdir observes it gone (ENOENT). The recovery branch
+  // must revalidate before retrying, because a foreign directory now occupies the
+  // fixed path.
+  let phase = 'replaced';
+  const originalMkdir = fs.mkdirSync;
+  t.mock.method(fs, 'mkdirSync', (target, ...args) => {
+    const basename = path.basename(String(target));
+    if (basename.startsWith('.staging-')) {
+      if (phase === 'replaced') {
+        phase = 'control';
+        fs.rmSync(namespacePath, { recursive: true, force: true });
+        originalMkdir(namespacePath, { mode: 0o777 });
+        fs.chmodSync(namespacePath, 0o777);
+        throw Object.assign(new Error('simulated vanished namespace'), { code: 'ENOENT' });
+      }
+      if (phase === 'control') {
+        phase = 'done';
+        fs.rmSync(namespacePath, { recursive: true, force: true });
+        throw Object.assign(new Error('simulated vanished namespace'), { code: 'ENOENT' });
+      }
+    }
+    return originalMkdir(target, ...args);
+  });
+
+  assert.throws(() => acquireSocketLock(socket), /namespace is unusable/);
+
+  // The foreign replacement must be refused, not repaired or deleted.
+  const replacement = fs.lstatSync(namespacePath);
+  assert.equal(replacement.isDirectory(), true, 'replacement directory must be preserved');
+  assert.equal(replacement.mode & 0o077, 0o077, 'replacement must not be chmod-repaired');
+  if (owner !== undefined) assert.equal(replacement.uid, owner);
+
+  const artifacts = [];
+  const walk = directory => {
+    for (const entry of fs.readdirSync(directory)) {
+      const fullPath = path.join(directory, entry);
+      artifacts.push({ relative: path.relative(namespacePath, fullPath), name: entry });
+      if (fs.lstatSync(fullPath).isDirectory()) walk(fullPath);
+    }
+  };
+  walk(namespacePath);
+  assert.deepEqual(artifacts.filter(entry => entry.name.startsWith('.staging-')), [],
+    'refusal must not create a staging directory');
+  assert.deepEqual(artifacts.filter(entry => entry.name.endsWith('.lock')), [],
+    'refusal must not create a lock directory');
+  assert.deepEqual(artifacts.filter(entry => entry.name === 'owner'), [],
+    'refusal must not create an owner marker');
+
+  // Control: the namespace simply vanishes and the real owner recreates it mode
+  // 0700 in the recovery branch, so acquisition still succeeds and release works.
+  restoreNamespace();
+  const release = acquireSocketLock(socket);
+  try {
+    const recreated = fs.lstatSync(namespacePath);
+    assert.equal(recreated.isDirectory(), true);
+    assert.equal(recreated.mode & 0o077, 0);
+    if (owner !== undefined) assert.equal(recreated.uid, owner);
+  } finally {
+    release();
+  }
+  assert.equal(fs.existsSync(namespacePath), true, 'namespace root must survive release');
+});
+
+test('a namespace absent during the orphan scan recovers and acquires', t => {
+  const owner = process.getuid?.();
+  const { namespacePath } = acquireProbeLock(t);
+  const socket = socketPath(t);
+
+  // The namespace validates, then vanishes at the clearOrphanStagingDirs call.
+  // That window must stay ENOENT-tolerant so createStagingLock can recreate it.
+  const originalLstat = fs.lstatSync;
+  let triggered = false;
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    if (target === namespacePath && !(args.length > 0 && args[0] && args[0].bigint) &&
+      isNamespaceLstatFromOrphanScan()) {
+      triggered = true;
+      fs.rmSync(namespacePath, { recursive: true, force: true });
+    }
+    return originalLstat(target, ...args);
+  });
+
+  let release;
+  assert.doesNotThrow(() => { release = acquireSocketLock(socket); });
+  assert.equal(triggered, true, 'race hook must fire');
+  try {
+    const recreated = fs.lstatSync(namespacePath);
+    assert.equal(recreated.isDirectory(), true, 'namespace must be recreated as a directory');
+    assert.equal(recreated.mode & 0o077, 0, 'recreated namespace must be owner-only');
+    if (owner !== undefined) assert.equal(recreated.uid, owner);
+  } finally {
+    release();
+  }
+  assert.equal(fs.existsSync(namespacePath), true, 'namespace root must survive release');
+});
+
+test('a permissive replacement during the orphan scan is refused and preserved', t => {
+  const owner = process.getuid?.();
+  const { namespacePath } = acquireProbeLock(t);
+  const socket = socketPath(t);
+  const orphanName = `.staging-999999999-${randomUUID()}`;
+
+  // The namespace validates, then a foreign permissive directory with a plausible
+  // orphan staging dir occupies the fixed path at the clearOrphanStagingDirs call.
+  const originalLstat = fs.lstatSync;
+  let triggered = false;
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    if (target === namespacePath && !(args.length > 0 && args[0] && args[0].bigint) &&
+      isNamespaceLstatFromOrphanScan()) {
+      triggered = true;
+      fs.rmSync(namespacePath, { recursive: true, force: true });
+      fs.mkdirSync(namespacePath, { mode: 0o777 });
+      fs.chmodSync(namespacePath, 0o777);
+      fs.mkdirSync(path.join(namespacePath, orphanName), { mode: 0o700 });
+    }
+    return originalLstat(target, ...args);
+  });
+
+  assert.throws(() => acquireSocketLock(socket), /namespace is unusable/);
+  assert.equal(triggered, true, 'race hook must fire');
+
+  const replacement = fs.lstatSync(namespacePath);
+  assert.equal(replacement.isDirectory(), true, 'replacement directory must be preserved');
+  assert.equal(replacement.mode & 0o077, 0o077, 'replacement must not be chmod-repaired');
+  if (owner !== undefined) assert.equal(replacement.uid, owner);
+  assert.equal(fs.existsSync(path.join(namespacePath, orphanName)), true,
+    'seeded orphan staging dir must not be deleted by refusal');
+});
 
 test('coordination lock paths are rejected by the endpoint contract', t => {
   const socket = socketPath(t);

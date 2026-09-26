@@ -259,6 +259,14 @@ function lockNamespaceCandidate(parentPath: string, prefix: string): string {
   return path.join(parentPath, component);
 }
 
+function assertLockNamespaceIsUsable(namespacePath: string, owner: number | undefined): void {
+  const directory = fs.lstatSync(namespacePath);
+  if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0 ||
+    (owner !== undefined && directory.uid !== owner)) {
+    throw new Error('Claude channel socket lock namespace is unusable');
+  }
+}
+
 function lockNamespacePath(socketPath: string): string {
   let root: string;
   try {
@@ -277,11 +285,7 @@ function lockNamespacePath(socketPath: string): string {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
-  const directory = fs.lstatSync(namespacePath);
-  if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0 ||
-    (owner !== undefined && directory.uid !== owner)) {
-    throw new Error('Claude channel socket lock namespace is unusable');
-  }
+  assertLockNamespaceIsUsable(namespacePath, owner);
   return namespacePath;
 }
 
@@ -480,6 +484,12 @@ function clearOrphanOwnerTemps(lockPath: string): boolean {
 }
 
 function clearOrphanStagingDirs(namespacePath: string): void {
+  try {
+    assertLockNamespaceIsUsable(namespacePath, process.getuid?.());
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
   let entries: string[];
   try { entries = fs.readdirSync(namespacePath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
@@ -507,6 +517,7 @@ function createStagingLock(namespacePath: string): string {
         try { fs.mkdirSync(namespacePath, { mode: 0o700 }); } catch (recreateError) {
           if ((recreateError as NodeJS.ErrnoException).code !== 'EEXIST') throw recreateError;
         }
+        assertLockNamespaceIsUsable(namespacePath, process.getuid?.());
         continue;
       }
       if (code !== 'EEXIST') throw error;
