@@ -1,7 +1,8 @@
 'use strict';
 
 const { KINDS, sameAddress, validateAgentMessage } = require('../agent-message');
-const { DIRECT_POST_OUTCOME, AGENT_COMPLETION_RECEIPTS, MESSAGE_STATES } = require('../state');
+const { DIRECT_POST_ATTEMPT, DIRECT_POST_OUTCOME, AGENT_COMPLETION_RECEIPTS, MESSAGE_STATES } = require('../state');
+const { projectNewestDirectPostAttempt } = require('../../dist/state/direct-post.js');
 const PACKET_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
 const PEER_PACKET_ID_SCHEMA = Object.freeze({
   type: 'string',
@@ -66,8 +67,14 @@ function inspectPeerResult(state, source, correlationId) {
       results.push({ ...evidence, packetId: candidate.id, text: candidate.text });
     }
   }
-  return { correlationId, sendOutcome: rows.filter(row => row.kind === DIRECT_POST_OUTCOME).at(-1)?.detail.outcome ?? null,
-    deliveries, results };
+  const projection = projectNewestDirectPostAttempt(rows, {
+    attemptKind: DIRECT_POST_ATTEMPT,
+    outcomeKind: DIRECT_POST_OUTCOME
+  });
+  const sendOutcome = projection.attempt
+    ? (projection.outcome ? projection.outcome.detail.outcome ?? null : 'in_flight')
+    : projection.latestPreflight?.detail.outcome ?? null;
+  return { correlationId, sendOutcome, deliveries, results };
 }
 
 module.exports = { inspectPeerResult, validPeerId, PEER_PACKET_ID_SCHEMA };

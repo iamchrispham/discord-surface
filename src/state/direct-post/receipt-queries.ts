@@ -54,6 +54,34 @@ export function queryDirectPostRows(
   });
 }
 
+export function projectNewestDirectPostAttempt(
+  rows: readonly DirectPostReceiptRow[],
+  kinds: Pick<DirectPostQueryDependencies, 'attemptKind' | 'outcomeKind'>
+): {
+  attempt: DirectPostReceiptRow | null;
+  outcome: DirectPostReceiptRow | null;
+  latestPreflight: DirectPostReceiptRow | null;
+} {
+  let attempt: DirectPostReceiptRow | null = null;
+  for (const row of rows) {
+    if (row.kind === kinds.attemptKind && (!attempt || row.id > attempt.id)) attempt = row;
+  }
+  const attemptId = attempt && typeof attempt.detail.attemptId === 'string' && attempt.detail.attemptId
+    ? attempt.detail.attemptId
+    : null;
+  let outcome: DirectPostReceiptRow | null = null;
+  let latestPreflight: DirectPostReceiptRow | null = null;
+  for (const row of rows) {
+    if (row.kind !== kinds.outcomeKind) continue;
+    if (row.detail.phase === 'preflight') {
+      if (!latestPreflight || row.id > latestPreflight.id) latestPreflight = row;
+      continue;
+    }
+    if (attemptId && row.detail.attemptId === attemptId && (!outcome || row.id > outcome.id)) outcome = row;
+  }
+  return { attempt, outcome, latestPreflight };
+}
+
 export function querySentAgentResultRows(
   { db, parseJson, attemptKind, outcomeKind }: DirectPostQueryDependencies,
   request: AgentMessage,
