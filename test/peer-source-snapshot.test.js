@@ -8,7 +8,6 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const Ajv = require('ajv');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
 const { SurfaceState, READINESS } = require('../src/state');
@@ -314,22 +313,23 @@ test('11 preparedTextSource with resume input is rejected before recovery and fi
 
 test('12 external preparedTextSource-shaped field is refused by the peer allowlist and the MCP schema', async t => {
   const f = makeFixture(t);
-  const before = f.state.listReceipts();
-  let network = 0;
-  const peer = callerService(f, { fetchImpl: async () => { network += 1; assert.fail('allowlist refusal reached network'); } });
   const external = { sourcePath: '/tmp/external.txt', text: 'external', textHash: 'external-hash', parts: ['external'] };
-  await assert.rejects(peer.send({ peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'snapshot-external',
-    preparedTextSource: external }), /invalid peer send arguments/);
-  assert.equal(network, 0);
-  assert.deepEqual(f.state.listReceipts(), before);
-
-  const server = createPeerMcp({ list: async () => [], send: async () => { throw new Error('unused'); },
-    result: async () => ({}), post: async () => ({}) });
+  const transport = peerTransport();
+  let httpCalls = 0;
+  const peer = callerService(f, { fetchImpl: async (url, options) => { httpCalls += 1; return transport.fetchImpl(url, options); } });
+  const server = createPeerMcp(peer);
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: 'snapshot-schema', version: '1' });
-  await server.connect(serverTransport);
-  await client.connect(clientTransport);
+  const client = new Client({ name: 'snapshot-wire', version: '1' });
   try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    await assert.rejects(peer.send({ peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'snapshot-external',
+      preparedTextSource: external }), /invalid peer send arguments/);
+    assert.equal(httpCalls, 0);
+
+    const before = f.state.listReceipts();
+    const baselineCalls = httpCalls;
+
     const tools = (await client.listTools()).tools;
     const peerSend = tools.find(tool => tool.name === 'peer_send').inputSchema;
     const post = tools.find(tool => tool.name === 'post').inputSchema;
@@ -337,14 +337,37 @@ test('12 external preparedTextSource-shaped field is refused by the peer allowli
     assert.equal(post.additionalProperties, false);
     assert.equal(Object.hasOwn(peerSend.properties, 'preparedTextSource'), false);
     assert.equal(Object.hasOwn(post.properties, 'preparedTextSource'), false);
-    const baselines = [
-      [peerSend, { peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'snapshot-external' }],
-      [post, { role: 'child', peer: { conductorId: 'recipient' }, text_file: '/tmp/request.txt', dedupe_key: 'snapshot-external' }]
-    ];
-    for (const [schema, valid] of baselines) {
-      const validate = new Ajv({ strict: false }).compile(schema);
-      assert.equal(validate(valid), true, 'baseline arguments validate');
-      assert.equal(validate({ ...valid, preparedTextSource: external }), false, 'external field is refused');
+
+    const refusedPeerSend = await client.callTool({ name: 'peer_send', arguments: {
+      peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'snapshot-wire-peer-send-refused', preparedTextSource: external } });
+    assert.equal(refusedPeerSend.isError, true);
+    assert.equal(refusedPeerSend.content[0].text.includes('invalid peer send arguments'), true);
+    assert.equal(httpCalls, baselineCalls);
+    assert.deepEqual(f.state.listReceipts(), before);
+
+    const refusedPost = await client.callTool({ name: 'post', arguments: {
+      role: 'child', peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'snapshot-wire-post-refused', preparedTextSource: external } });
+    assert.equal(refusedPost.isError, true);
+    assert.equal(refusedPost.content[0].text.includes('invalid peer send arguments'), true);
+    assert.equal(httpCalls, baselineCalls);
+    assert.deepEqual(f.state.listReceipts(), before);
+
+    const sentPeerSend = await client.callTool({ name: 'peer_send', arguments: {
+      peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'snapshot-wire-peer-send-valid' } });
+    assert.notEqual(sentPeerSend.isError, true);
+    const sentPost = await client.callTool({ name: 'post', arguments: {
+      role: 'child', peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'snapshot-wire-post-valid' } });
+    assert.notEqual(sentPost.isError, true);
+
+    assert.equal(transport.posts.length, 2);
+    assert.equal(httpCalls, baselineCalls + 4);
+    for (const published of transport.posts) {
+      const packet = decodeAgentMessage(published.wire, 'fixture', childAddress(f, '202'));
+      assert.notEqual(packet, null);
+      assert.equal(packet.text, 'hello');
+      assert.deepEqual(packet.source, sourceChildAddress(f));
+      assert.deepEqual(packet.target, childAddress(f, '202'));
+      assert.equal(packet.kind, 'request');
     }
   } finally {
     await client.close();
