@@ -373,6 +373,45 @@ test('legacy receipts that never persisted part metadata release the binding', t
     'absent fields keep legacy one-part semantics');
 });
 
+// Audit F1: every malformed-metadata case above pairs the malformed field with a
+// 'sent' outcome, so a sent-only matrix cannot distinguish a hold charged to the
+// malformed value from a hold charged merely to the outcome not being 'sent'. A
+// 'not_sent' outcome is itself definitive for a complete valid part set, so these
+// cases pair the same raw malformed values with 'not_sent', and the legacy-absent
+// control proves 'not_sent' alone releases absent one-part metadata.
+test('present malformed partCount holds binding retirement on a definitive not_sent outcome', t => {
+  const f = createFixture(t);
+  const detail = plainAttempt({
+    channelId: '308', requestId: 'bad-count-not-sent', attemptId: 'a1', partIndex: 0, partCount: 0
+  });
+  seedAttempt(f.state, detail);
+  seedOutcome(f.state, detail, 'not_sent');
+  assert.equal(f.state.hasUnresolvedBindingPost('308'), true,
+    'explicit malformed partCount must not default like a legacy one-part record even on a definitive not_sent outcome');
+});
+
+test('present malformed partIndex holds binding retirement on a definitive not_sent outcome', t => {
+  const f = createFixture(t);
+  const detail = plainAttempt({
+    channelId: '309', requestId: 'bad-index-not-sent', attemptId: 'a1', partCount: 1, partIndex: null
+  });
+  seedAttempt(f.state, detail);
+  seedOutcome(f.state, detail, 'not_sent');
+  assert.equal(f.state.hasUnresolvedBindingPost('309'), true,
+    'explicit malformed partIndex must not default like a legacy first part even on a definitive not_sent outcome');
+});
+
+test('legacy-absent metadata with a definitive not_sent outcome releases the binding', t => {
+  const f = createFixture(t);
+  const detail = legacyAttempt({ channelId: '310', requestId: 'legacy-not-sent', attemptId: 'a1' });
+  assert.equal(Object.hasOwn(detail, 'partCount'), false, 'legacy detail omits partCount');
+  assert.equal(Object.hasOwn(detail, 'partIndex'), false, 'legacy detail omits partIndex');
+  seedAttempt(f.state, detail);
+  seedOutcome(f.state, detail, 'not_sent');
+  assert.equal(f.state.hasUnresolvedBindingPost('310'), false,
+    'absent multipart fields keep legacy one-part semantics, so not_sent alone releases and cannot explain the malformed holds');
+});
+
 test('valid one-part and complete multipart sent receipts still release the binding', t => {
   const f = createFixture(t);
   seedAttempt(f.state, plainAttempt({ channelId: '305', requestId: 'one', attemptId: 'a1', partCount: 1, partIndex: 0 }));
