@@ -120,7 +120,8 @@ function createPeerService(context) {
         destination = requireReadyPeer(state, resolvePeerBinding(state, input.peer, channels));
         agentTarget = issueAgentAddress(resolveAgentAddress(state, destination.binding, destination.childId), token);
       }
-      const text = input.text_file === undefined ? input.text : readTextFile(input.text_file).text;
+      const fileSource = input.text_file === undefined ? null : readTextFile(input.text_file);
+      const text = fileSource === null ? input.text : fileSource.text;
       assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token });
       let directory;
       try {
@@ -143,7 +144,8 @@ function createPeerService(context) {
             requireReadyPeer(state, currentSource);
             return currentPeerDestination(state, target, destination?.binding || null, destination?.childId || null);
           },
-          textFile, dedupeKey: input.dedupe_key, signal, fetchImpl });
+          textFile, dedupeKey: input.dedupe_key, signal, fetchImpl,
+          ...(fileSource === null ? {} : { preparedTextSource: fileSource }) });
         return { correlationId: input.dedupe_key, ...result };
       } finally {
         if (directory) fs.rmSync(directory, { recursive: true, force: true });

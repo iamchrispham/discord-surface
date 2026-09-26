@@ -42,6 +42,10 @@ const READINESS_OWNERS = new Map([
 
 const WRITE_PATTERN = /\b(?:UPDATE|INSERT(?:\s+OR\s+REPLACE)?|DELETE\s+FROM)\b/i;
 const OTHER_TABLES = /\b(?:intake_watermarks|topic_publications|messages|reply_parts|provision_intents|thread_enrollments|native_reply_files|config|receipts)\b/i;
+// A db.exec batch counts when it contains a DML statement against `bindings`.
+// Matching the statement itself keeps ALTER/CREATE INDEX/COMMIT/ROLLBACK batches
+// and reference-only mentions out, even when they name the table.
+const EXEC_BINDINGS_WRITE = /\b(?:UPDATE\s+bindings\b|INSERT\s+(?:OR\s+(?:REPLACE|IGNORE)\s+)?INTO\s+bindings\b|DELETE\s+FROM\s+bindings\b)/i;
 
 function sourceFiles(root) {
   const found = [];
@@ -80,18 +84,36 @@ function isBindingsWrite(sql) {
   return WRITE_PATTERN.test(sql) && /\bbindings\b/i.test(sql) && !OTHER_TABLES.test(sql);
 }
 
+// A literal db.exec batch counts when it contains a bindings DML statement, even
+// alongside another table's statements. A batch that only names bindings in an
+// ALTER/CREATE/INDEX/reference statement is not a writer.
+function isBindingsExecBatch(sql) {
+  return EXEC_BINDINGS_WRITE.test(sql);
+}
+
+// `this.db.exec(...)` / `state.db.exec(...)` / `db.exec(...)` only; never RegExp.exec.
+function isDbExecCall(node) {
+  const expression = node.expression;
+  if (!ts.isPropertyAccessExpression(expression) || expression.name.text !== 'exec') return false;
+  const receiver = expression.expression;
+  if (ts.isIdentifier(receiver)) return receiver.text === 'db';
+  return ts.isPropertyAccessExpression(receiver) && receiver.name.text === 'db';
+}
+
 function parseWriters(fileName, text) {
   const kind = fileName.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS;
   const sourceFile = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, kind);
   const writers = [];
   const visit = node => {
     if (ts.isCallExpression(node)) {
-      const expression = node.expression;
-      if (ts.isPropertyAccessExpression(expression) && expression.name.text === 'prepare') {
-        const argument = node.arguments[0];
-        if (argument && ts.isStringLiteralLike(argument)) {
-          const sql = argument.text.replace(/\s+/g, ' ').trim();
-          if (isBindingsWrite(sql)) writers.push({ file: fileName, owner: enclosingOwner(node), sql });
+      const argument = node.arguments[0];
+      if (argument && ts.isStringLiteralLike(argument)) {
+        const sql = argument.text.replace(/\s+/g, ' ').trim();
+        const expression = node.expression;
+        const isPrepare = ts.isPropertyAccessExpression(expression) && expression.name.text === 'prepare';
+        const isExec = isDbExecCall(node);
+        if ((isPrepare && isBindingsWrite(sql)) || (isExec && isBindingsExecBatch(sql))) {
+          writers.push({ file: fileName, owner: enclosingOwner(node), sql });
         }
       }
     }
@@ -154,4 +176,51 @@ test('writer inventory rejects an unclassified added writer and ignores other ta
   assert.throws(() => classifyWriters([{ file: 'state.js', owner: 'rebindV2', sql: 'UPDATE bindings SET active=0' }]),
     /unclassified bindings writer/, 'a renamed or moved owner is rejected');
   assert.doesNotThrow(() => classifyWriters(enumerateWriters(SRC_ROOT)), 'the real tree stays fully classified');
+});
+
+test('exec inventory counts a bindings UPDATE batched with another table and refuses its unknown owner', () => {
+  const synthetic = [
+    'function addedExecWriter(db: any): void {',
+    '  db.exec("UPDATE bindings SET active=0 WHERE channel_id=?; UPDATE messages SET state=\'x\' WHERE discord_id=?");',
+    '}'
+  ].join('\n');
+  const writers = parseWriters('state/new-exec-owner.ts', synthetic);
+  assert.equal(writers.length, 1, 'the mixed batch is enumerated for its bindings UPDATE');
+  assert.equal(writers[0].owner, 'addedExecWriter');
+  assert.throws(() => classifyWriters(writers), /unclassified bindings writer: state\/new-exec-owner\.ts:addedExecWriter/);
+  const schemaOnly = [
+    'function schemaOnly(db: any): void {',
+    '  db.exec("ALTER TABLE bindings ADD COLUMN session_root TEXT");',
+    '  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS bindings_native_id_unique ON bindings(provider, native_id) WHERE active=1;");',
+    '  db.exec("BEGIN IMMEDIATE");',
+    '  db.exec("CREATE TABLE messages (channel_id TEXT REFERENCES bindings(channel_id))");',
+    '  db.exec("SELECT count(*) FROM bindings");',
+    '}'
+  ].join('\n');
+  assert.deepEqual(parseWriters('state/schema-only.ts', schemaOnly), [],
+    'schema, transaction and reference-only batches do not create writers');
+});
+
+test('exec inventory counts an INSERT INTO bindings batch and refuses its unknown owner', () => {
+  const synthetic = [
+    'function addedExecInsert(db: any): void {',
+    '  db.exec("insert or ignore into bindings(channel_id, guild_id) values (?, ?)");',
+    '}'
+  ].join('\n');
+  const writers = parseWriters('state/new-exec-insert.ts', synthetic);
+  assert.equal(writers.length, 1, 'the case-insensitive INSERT batch is enumerated');
+  assert.equal(writers[0].owner, 'addedExecInsert');
+  assert.throws(() => classifyWriters(writers), /unclassified bindings writer: state\/new-exec-insert\.ts:addedExecInsert/);
+});
+
+test('exec inventory counts a DELETE FROM bindings batch and refuses its unknown owner', () => {
+  const synthetic = [
+    'function addedExecDelete(db: any): void {',
+    '  db.exec("DELETE FROM bindings WHERE channel_id=?");',
+    '}'
+  ].join('\n');
+  const writers = parseWriters('state/new-exec-delete.ts', synthetic);
+  assert.equal(writers.length, 1, 'the DELETE batch is enumerated');
+  assert.equal(writers[0].owner, 'addedExecDelete');
+  assert.throws(() => classifyWriters(writers), /unclassified bindings writer: state\/new-exec-delete\.ts:addedExecDelete/);
 });

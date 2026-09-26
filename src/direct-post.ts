@@ -119,7 +119,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
     agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
     agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null,
-    agentDestinationCurrent = null, bindingCurrent = null } =
+    preparedTextSource, agentDestinationCurrent = null, bindingCurrent = null } =
     input as DirectPostInput & { agentThreadId?: string | null };
   const binding = watcherNotice
     ? watcherNotice.binding
@@ -152,6 +152,9 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     throw new BindingError('watcher notice dedupe key must match its frozen identity');
   }
   if (fileRequested && explicitRequestId === undefined) throw new BindingError('file posts require an explicit dedupe-key');
+  if (fileRequested && preparedTextSource !== undefined) {
+    throw new BindingError('prepared text source cannot be combined with file or resume input');
+  }
   let legacy: LegacyParentSourcedReceipt | null = null;
   if (!watcherNotice && isAgentMessage && explicitRequestId !== undefined) {
     state.recoverDirectPostReceipts();
@@ -165,7 +168,14 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     source = fileRequested
       ? prepareFileSource({ state, requestId: explicitRequestId as string, textFile, attachmentFile, resume, stateDir,
         binding, operatorId, inReplyTo })
-      : readTextFile(textFile);
+      : preparedTextSource !== undefined
+        ? {
+          sourcePath: preparedTextSource.sourcePath,
+          text: preparedTextSource.text,
+          textHash: preparedTextSource.textHash,
+          parts: [...preparedTextSource.parts]
+        }
+        : readTextFile(textFile);
   } catch (error) {
     const legacySourcePath = legacy?.attempt.sourcePath;
     const requestedSourcePath = typeof textFile === 'string' ? path.resolve(textFile) : null;

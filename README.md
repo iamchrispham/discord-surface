@@ -712,6 +712,12 @@ repair, resume or replace a session.
   the same authenticated agent path as `peer_send`. Raw human text is never a
   fallback for a child packet.
 
+`text_file` on `peer_send` file input and on `post` file input exports local
+UTF-8 file contents to Discord. Relative paths resolve from the MCP process
+working directory. Native host tool approval governs invocation. For a child
+agent send, the published message carries the validated text snapshot even if
+the source file later changes.
+
 Keep the same dedupe key and content after an uncertain outcome. A changed owner
 or generation is not permission to replay. These tools do not establish CLI
 active-turn steering or repair native pickup. Installation, current-source tests,

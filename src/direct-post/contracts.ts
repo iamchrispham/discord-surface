@@ -204,6 +204,8 @@ export interface DirectPostInputBase {
   textFile?: unknown;
   attachmentFile?: unknown;
   resume?: boolean;
+  // Internal handoff for already-read text sources. Never a public tool argument or CLI flag.
+  preparedTextSource?: Pick<DirectPostSource, 'sourcePath' | 'text' | 'textHash' | 'parts'>;
   stateDir?: string;
   dedupeKey?: unknown;
   requestId?: unknown;
