@@ -260,7 +260,8 @@ export function prepareSocket(socketPath: string): void {
     throw error;
   }
   if (!original.isSocket()) throw new Error('Claude channel path exists and is not a socket');
-  if (original.uid !== process.getuid?.()) throw new Error('Claude channel socket belongs to another owner');
+  const effectiveUid = process.geteuid?.() ?? process.getuid?.();
+  if (original.uid !== effectiveUid) throw new Error('Claude channel socket belongs to another owner');
   throw new Error('Claude channel socket already exists; stop its owner first');
 }
 

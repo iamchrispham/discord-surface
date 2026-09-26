@@ -357,6 +357,28 @@ function ownerControlledNamespaceRoot(): string {
     const stickySharedRoot = (directory.mode & 0o1000) !== 0 && (directory.mode & 0o002) !== 0;
     if (!stickySharedRoot) continue;
     const privateRootPrefix = `.claude-channel-${ownerName}-`;
+    const rendezvousDirectory = lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`);
+    const rendezvousPath = path.join(rendezvousDirectory, 'fallback-root');
+    const readRendezvousRoot = (): string | undefined => {
+      let marker: fs.Stats;
+      try {
+        marker = fs.lstatSync(rendezvousPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw error;
+      }
+      const markerOwnerControlled = owner === undefined || marker.uid === owner;
+      const markerOwnerWritable = owner === undefined || (marker.mode & 0o200) !== 0;
+      if (!marker.isFile() || marker.isSymbolicLink() || !markerOwnerControlled || !markerOwnerWritable ||
+        (marker.mode & 0o077) !== 0) {
+        throw new Error('Claude channel fallback-root rendezvous is unusable');
+      }
+      const target = fs.readFileSync(rendezvousPath, 'utf8').trim();
+      if (!target || path.basename(target) !== target || !target.startsWith(privateRootPrefix)) {
+        throw new Error('Claude channel fallback-root rendezvous is invalid');
+      }
+      return path.join(root, target);
+    };
     try {
       const privateRoots = fs.readdirSync(root)
         .filter(entry => entry.startsWith(privateRootPrefix))
@@ -372,9 +394,51 @@ function ownerControlledNamespaceRoot(): string {
             return false;
           }
         });
-      let privateRoot = privateRoots.sort()[0];
+      let privateRoot = readRendezvousRoot();
+      let createdPrivateRoot = false;
+      if (!privateRoot) {
+        try {
+          fs.mkdirSync(rendezvousDirectory, { mode: 0o700 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        const rendezvousStats = fs.lstatSync(rendezvousDirectory);
+        const rendezvousOwnerControlled = owner === undefined || rendezvousStats.uid === owner;
+        const rendezvousOwnerWritable = owner === undefined || (rendezvousStats.mode & 0o200) !== 0;
+        if (!rendezvousStats.isDirectory() || rendezvousStats.isSymbolicLink() || !rendezvousOwnerControlled ||
+          !rendezvousOwnerWritable || (rendezvousStats.mode & 0o077) !== 0) {
+          throw new Error('Claude channel fallback-root rendezvous directory is unusable');
+        }
+        privateRoot = privateRoots.sort()[0];
+      }
       if (!privateRoot) {
         privateRoot = fs.mkdtempSync(path.join(root, privateRootPrefix));
+        createdPrivateRoot = true;
+      }
+      const rendezvousRoot = readRendezvousRoot();
+      if (rendezvousRoot) {
+        if (createdPrivateRoot && rendezvousRoot !== privateRoot) {
+          try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
+        }
+        privateRoot = rendezvousRoot;
+      } else {
+        const markerTemp = path.join(rendezvousDirectory, `.fallback-root-${process.pid}-${randomUUID()}`);
+        fs.writeFileSync(markerTemp, path.basename(privateRoot), { mode: 0o600, flag: 'wx' });
+        try {
+          try {
+            fs.linkSync(markerTemp, rendezvousPath);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+            const winnerRoot = readRendezvousRoot();
+            if (!winnerRoot) throw new Error('Claude channel fallback-root rendezvous is missing');
+            if (createdPrivateRoot && winnerRoot !== privateRoot) {
+              try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
+            }
+            privateRoot = winnerRoot;
+          }
+        } finally {
+          try { fs.unlinkSync(markerTemp); } catch { /* marker link owns the content */ }
+        }
       }
       const privateDirectory = fs.lstatSync(privateRoot);
       const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
