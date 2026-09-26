@@ -282,8 +282,10 @@ function ownerControlledNamespaceRoot(): string {
     throw new Error('Claude channel socket lock namespace root is unavailable');
   }
   const owner = process.getuid?.();
-  if (!directory.isDirectory() || (owner !== undefined && directory.uid !== owner) ||
-    (directory.mode & 0o022) !== 0) {
+  const ownerControlledRoot = owner === undefined || directory.uid === owner;
+  const standardSharedRoot = directory.uid === 0 && (directory.mode & 0o1777) === 0o1777;
+  if (!directory.isDirectory() ||
+    ((!ownerControlledRoot || (directory.mode & 0o022) !== 0) && !standardSharedRoot)) {
     throw new Error('Claude channel socket lock namespace root is unusable');
   }
   return root;
