@@ -26,6 +26,14 @@ function claudeSocket(dir) {
   return path.join(dir, `${CLAUDE_ID}.sock`);
 }
 
+function isolatedNamespaceRoot(t) {
+  const root = fs.mkdtempSync('/tmp/dss-lock-root-');
+  fs.chmodSync(root, 0o700);
+  const userInfo = os.userInfo();
+  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
+  return fs.realpathSync(root);
+}
+
 function acquireSocketLockWithPath(t, socket) {
   let lockPath;
   const originalRename = fs.renameSync;
@@ -88,17 +96,19 @@ function seedDeadTransition(lockPath) {
 }
 
 test('the fixed UID namespace keeps one lock across HOME and TMPDIR changes', t => {
+  const root = isolatedNamespaceRoot(t);
   const socket = claudeSocket(privateSocketDir(t));
   const first = acquireSocketLockWithPath(t, socket);
   const lockPath = first.lockPath;
   const namespacePath = path.dirname(lockPath);
   guardSharedNamespace(t, lockPath);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
-  assert.equal(path.dirname(namespacePath), fs.realpathSync('/tmp'));
+  assert.equal(path.dirname(namespacePath), root);
   assert.match(path.basename(namespacePath), new RegExp(`^\\.discord-surface-locks-${process.getuid()}-coordination`));
 
   // Changed HOME/TMPDIR must not select a different lock: the contender still sees this one.
-  const bogus = path.join(fs.realpathSync('/tmp'), `dss-bogus-${randomUUID()}`);
+  const bogus = path.join(root, `dss-bogus-${randomUUID()}`);
   t.mock.method(os, 'homedir', () => bogus);
   t.mock.method(os, 'tmpdir', () => bogus);
   let refusal = null;

@@ -271,7 +271,10 @@ function assertLockNamespaceIsUsable(namespacePath: string, owner: number | unde
 function ownerControlledNamespaceRoot(): string {
   let root: string;
   try {
-    root = fs.realpathSync(os.tmpdir());
+    // `TMPDIR` is process-local and can point two contenders at different
+    // lock namespaces. The passwd-backed home directory is stable across
+    // invocations and is not writable by another UID.
+    root = fs.realpathSync(os.userInfo().homedir);
   } catch {
     throw new Error('Claude channel socket lock namespace root is unavailable');
   }
@@ -283,9 +286,7 @@ function ownerControlledNamespaceRoot(): string {
   }
   const owner = process.getuid?.();
   const ownerControlledRoot = owner === undefined || directory.uid === owner;
-  const standardSharedRoot = directory.uid === 0 && (directory.mode & 0o1777) === 0o1777;
-  if (!directory.isDirectory() ||
-    ((!ownerControlledRoot || (directory.mode & 0o022) !== 0) && !standardSharedRoot)) {
+  if (!directory.isDirectory() || !ownerControlledRoot || (directory.mode & 0o022) !== 0) {
     throw new Error('Claude channel socket lock namespace root is unusable');
   }
   return root;

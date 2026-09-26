@@ -38,13 +38,13 @@ function acquireSocketLockWithPath(t, socket) {
   return { release, lockPath };
 }
 
-// Per-test isolated lock namespace: redirect the owner-controlled os.tmpdir()
-// root to a fresh temporary directory so tests never mutate the real shared
-// per-UID coordination namespace.
+// Per-test isolated lock namespace: redirect the passwd-backed home root to a
+// fresh temporary directory so tests never mutate the real coordination namespace.
 function isolatedNamespaceRoot(t) {
   const root = fs.mkdtempSync('/tmp/dss-root-');
   fs.chmodSync(root, 0o700);
-  t.mock.method(os, 'tmpdir', () => root);
+  const userInfo = os.userInfo();
+  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return fs.realpathSync(root);
 }
@@ -303,15 +303,61 @@ test('socket locks use one fixed namespace and retain it across release', t => {
   assert.equal(rmdirs.includes(namespacePath), false, 'release must never rmdir the shared namespace root');
 });
 
-test('an unsafe temporary root refuses before bootstrapping the namespace', t => {
+test('an unsafe namespace root refuses before bootstrapping the namespace', t => {
   const root = fs.mkdtempSync('/tmp/dss-root-');
   fs.chmodSync(root, 0o777);
-  t.mock.method(os, 'tmpdir', () => root);
+  const userInfo = os.userInfo();
+  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
   const socket = socketPath(t);
   assert.throws(() => assertSocketDirectory(socket), /namespace root is unusable/);
   assert.deepEqual(fs.readdirSync(root), [], 'an unsafe root must not receive a fixed namespace');
+});
+
+test('a foreign shared-temp namespace cannot preempt the owner-controlled root', t => {
+  const ownerRoot = isolatedNamespaceRoot(t);
+  const socket = socketPath(t);
+  const probe = acquireSocketLockWithPath(t, socket);
+  const namespaceName = path.basename(path.dirname(probe.lockPath));
+  probe.release();
+
+  const sharedRoot = fs.mkdtempSync('/tmp/dss-shared-root-');
+  fs.chmodSync(sharedRoot, 0o1777);
+  t.after(() => fs.rmSync(sharedRoot, { recursive: true, force: true }));
+  const decoy = path.join(sharedRoot, namespaceName);
+  fs.mkdirSync(decoy, { mode: 0o700 });
+
+  const originalStat = fs.statSync;
+  t.mock.method(fs, 'statSync', (target, ...args) => {
+    const stats = originalStat(target, ...args);
+    if (String(target) !== sharedRoot) return stats;
+    return {
+      ...stats,
+      uid: 0,
+      mode: (stats.mode & ~0o1777) | 0o1777,
+      isDirectory: () => stats.isDirectory(),
+      isSymbolicLink: () => stats.isSymbolicLink()
+    };
+  });
+  const originalLstat = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    const stats = originalLstat(target, ...args);
+    if (String(target) !== decoy || (args.length > 0 && args[0] && args[0].bigint)) return stats;
+    return {
+      ...stats,
+      uid: (process.getuid?.() ?? 0) + 1,
+      isDirectory: () => stats.isDirectory(),
+      isSymbolicLink: () => stats.isSymbolicLink()
+    };
+  });
+  t.mock.method(os, 'tmpdir', () => sharedRoot);
+
+  const release = acquireSocketLock(socket);
+  release();
+  assert.equal(fs.existsSync(decoy), true, 'the foreign shared-temp decoy must remain untouched');
+  assert.equal(path.dirname(path.dirname(probe.lockPath)), ownerRoot,
+    'the lock must stay under the owner-controlled root');
 });
 
 test('an unusable fixed namespace root refuses with no fallback', t => {
