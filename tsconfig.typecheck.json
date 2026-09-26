@@ -26,6 +26,8 @@
     "src/acknowledgment/contracts.ts",
     "src/acknowledgment/pickup.ts",
     "src/claude-channel.ts",
+    "src/claude/socket-ownership.ts",
+    "test/types/socket-ownership.ts",
     "src/discord/handoff-fence.ts",
     "src/discord/decision.ts",
     "src/discord-interaction.ts",
