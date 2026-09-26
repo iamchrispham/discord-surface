@@ -20,7 +20,7 @@ const READER_CALLEES = new Set(['directPostRows', 'queryDirectPostRows']);
 const ADOPTING_OWNERS = new Map([
   ['peer/result.js\u0000inspectPeerResult', 1],
   ['state/direct-post.ts\u0000inspectPart', 1],
-  ['state/direct-post.ts\u0000hasUnresolvedOrdinaryPost', 1]
+  ['state/direct-post.ts\u0000hasUnresolvedBindingPost', 1]
 ]);
 const EXCLUDED_OWNERS = new Map([
   ['state/agent-routing.ts\u0000legacyParentSourcedReceipt', 1],
@@ -240,7 +240,7 @@ function ordinaryState(rows) {
   return { directPostRows: () => rows.map(row => ({ ...row, detail: { ...row.detail } })) };
 }
 
-test('hasUnresolvedOrdinaryPost follows the projected outcome instead of raw rows', () => {
+test('hasUnresolvedBindingPost follows the projected outcome instead of raw rows', () => {
   const attempt = {
     requestId: 'ordinary-request', attemptId: 'ordinary-attempt', channelId: 'ordinary-channel',
     provider: 'codex', conductorId: null, repoKey: null, partIndex: 0, partCount: 1, nonce: 'ordinary-nonce'
@@ -256,7 +256,7 @@ test('hasUnresolvedOrdinaryPost follows the projected outcome instead of raw row
   };
   const unresolved = withMockedProjection(() => projection, () => {
     const { createDirectPostHandlers } = require(BARREL_PATH);
-    return createDirectPostHandlers(handlerDependencies()).hasUnresolvedOrdinaryPost(ordinaryState(rows), 'ordinary-channel');
+    return createDirectPostHandlers(handlerDependencies()).hasUnresolvedBindingPost(ordinaryState(rows), 'ordinary-channel');
   });
   // Raw rows hold an unknown outcome for the represented part, so a raw re-selection would fence retirement.
   assert.equal(unresolved, false);

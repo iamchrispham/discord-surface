@@ -756,8 +756,7 @@ class SurfaceState {
     sessionRootOverride = undefined,
     intakeCutoff = null,
     enrollmentProof = null,
-    beforeMutation = undefined,
-    rejectUnresolvedOrdinaryPost = false
+    beforeMutation = undefined
   } = {}) {
     if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     const channelId = assertText(binding.channelId, 'channelId', 128);
@@ -800,11 +799,9 @@ class SurfaceState {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('rebind source identity is stale');
       if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot rebind while work drains');
+      if (this.hasUnresolvedBindingPost(channelId)) throw new UnresolvedWorkError('cannot rebind while a publication is unresolved');
       if (this._hasActiveThreadEnrollments(channelId) && intakeCutoff === null) {
         throw new BindingError('active thread enrollments require an observed intake cutoff');
-      }
-      if (rejectUnresolvedOrdinaryPost && ordinary && this.hasUnresolvedOrdinaryPost(channelId)) {
-        throw new UnresolvedWorkError('cannot rebind while an ordinary post is unresolved');
       }
       this.assertLegacyMigrationSafe(channelId);
       this.assertNativeOwnerFree(input.provider, input.nativeId, channelId);
@@ -844,19 +841,19 @@ class SurfaceState {
     if (expectedBinding !== undefined && !bindingMatchesExpected(binding, expectedBinding)) {
       throw new StaleGenerationError('unbind source identity is stale');
     }
-    if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
+    if (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId)) {
       throw new UnresolvedWorkError('cannot unbind while work is unresolved');
     }
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       const expected = expectedBinding === undefined ? binding : expectedBinding;
       if (!bindingMatchesExpected(current, expected)) throw new StaleGenerationError('unbind source identity is stale');
+      if (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId)) {
+        throw new UnresolvedWorkError('cannot unbind while work is unresolved');
+      }
       if (!current.active) {
         threadEnrollmentHandlers.deactivateThreadEnrollments(this, channelId, current);
         return true;
-      }
-      if (this.hasUnresolved(channelId) || this.hasUnresolvedOrdinaryPost(channelId)) {
-        throw new UnresolvedWorkError('cannot unbind while work is unresolved');
       }
       this.assertLegacyMigrationSafe(channelId);
       if (intakeCutoff !== null) {
@@ -1060,12 +1057,12 @@ class SurfaceState {
       throw new BindingError('active thread enrollments require an observed intake cutoff');
     }
     if (nativeId === fromNativeId) throw new BindingError('successor handoff requires a different native session UUID');
-    if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+    if (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
     this.assertNativeOwnerFree(provider, nativeId, channelId);
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('handoff source identity is stale');
-      if (this.hasUnresolved(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+      if (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       if (this._hasActiveThreadEnrollments(channelId) && intakeCutoff === null) {
         throw new BindingError('active thread enrollments require an observed intake cutoff');
       }
@@ -1121,8 +1118,12 @@ class SurfaceState {
       .get(channelId, MESSAGE_STATES.UNCERTAIN));
   }
 
+  hasUnresolvedBindingPost(channelId) {
+    return directPostHandlers.hasUnresolvedBindingPost(this, channelId);
+  }
+
   hasUnresolvedOrdinaryPost(channelId) {
-    return directPostHandlers.hasUnresolvedOrdinaryPost(this, channelId);
+    return this.hasUnresolvedBindingPost(channelId);
   }
 
   reject(reason) {

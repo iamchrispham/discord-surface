@@ -151,7 +151,7 @@ export function createOrdinaryBindingHandlers(
         throw new BindingError('ordinary binding tombstone is unavailable for reuse');
       }
       if (existing.active && !sessionRootMatches &&
-        (state.hasUnresolved(binding.channelId) || state.hasUnresolvedOrdinaryPost(binding.channelId))) {
+        (state.hasUnresolved(binding.channelId) || state.hasUnresolvedBindingPost(binding.channelId))) {
         const input = state.bindingInput({
           ...binding,
           channelId: binding.channelId,
@@ -170,7 +170,7 @@ export function createOrdinaryBindingHandlers(
           if (dispatching) {
             throw new BindingError('ordinary binding root relocation is unavailable while dispatch is in flight');
           }
-          if (state.hasUnresolvedOrdinaryPost(binding.channelId)) {
+          if (state.hasUnresolvedBindingPost(binding.channelId)) {
             throw new BindingError('ordinary binding root relocation has unresolved post custody');
           }
           state.assertLegacyMigrationSafe(binding.channelId);
@@ -296,7 +296,7 @@ export function createOrdinaryBindingHandlers(
       if (!existing.active && !state.hasUnboundReceipt(channelId, fromGeneration)) {
         throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
       }
-      if (state.hasUnresolved(channelId) || state.hasUnresolvedOrdinaryPost(channelId)) {
+      if (state.hasUnresolved(channelId) || state.hasUnresolvedBindingPost(channelId)) {
         throw new UnresolvedWorkError('cannot handoff while work is unresolved');
       }
       state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);
@@ -315,7 +315,7 @@ export function createOrdinaryBindingHandlers(
           if (!current.active && !state.hasUnboundReceipt(channelId, fromGeneration)) {
             throw new BindingError('ordinary handoff tombstone has no matching unbind receipt');
           }
-          if (state.hasUnresolved(channelId) || state.hasUnresolvedOrdinaryPost(channelId)) {
+          if (state.hasUnresolved(channelId) || state.hasUnresolvedBindingPost(channelId)) {
             throw new UnresolvedWorkError('cannot handoff while work is unresolved');
           }
           state.assertNativeOwnerFree(PROVIDERS.CODEX, nativeId, channelId);

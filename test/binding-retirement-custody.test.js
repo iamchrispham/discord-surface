@@ -4,11 +4,9 @@
 // admitted into POST must not silently drop custody of that in-flight post.
 //
 // T1 is the defect proof: src/state.js unbind() consults hasUnresolved (messages table)
-// and hasUnresolvedOrdinaryPost (src/state/direct-post.ts), and the latter skips
-// conductor-identified direct-post-attempt rows, so an admitted conductor-to-conductor
-// POST is invisible and retirement is allowed. T1 is registered with `todo` (never
-// `skip`) so the real assertion stays live and the suite reports the defect without
-// going red.
+// and hasUnresolvedBindingPost (src/state/direct-post.ts). Before the repair the latter
+// skipped conductor-identified direct-post-attempt rows, so an admitted
+// conductor-to-conductor POST was invisible and retirement was allowed.
 //
 // T2 is a plain always-green control proving the happy path (POST completes, then
 // retirement deactivates the source binding and its enrolled child) still works.
@@ -44,8 +42,7 @@ function rowKinds(rows, kind) {
 }
 
 test('conductor retirement retains custody of an admitted in-flight publication', {
-  timeout: 5000,
-  todo: 'F4: conductor retirement must retain admitted publication custody'
+  timeout: 5000
 }, async t => {
   const f = setup(t);
   let release;

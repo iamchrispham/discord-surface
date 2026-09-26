@@ -320,13 +320,12 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
   }
 
   const handlers: DirectPostHandlers = {
-    hasUnresolvedOrdinaryPost(state, channelId) {
+    hasUnresolvedBindingPost(state, channelId) {
       const rows = state.directPostRows(null, channelId);
       const requests = new Map<unknown, { partCount: number; parts: Map<number, { attempts: DirectPostReceiptRow[]; outcomes: DirectPostReceiptRow[] }> }>();
       const attemptPart = new Map<unknown, number>();
       for (const row of rows) {
-        if (row.kind !== DIRECT_POST_ATTEMPT || row.detail.channelId !== channelId ||
-          row.detail.provider !== 'codex' || row.detail.conductorId || row.detail.repoKey) continue;
+        if (row.kind !== DIRECT_POST_ATTEMPT || row.detail.channelId !== channelId) continue;
         const partCount = Number(row.detail.partCount || 1);
         const partIndex = Number.isInteger(row.detail.partIndex) ? row.detail.partIndex as number : 0;
         if (!Number.isSafeInteger(partCount) || partCount < 1 || !Number.isSafeInteger(partIndex) || partIndex < 0 || partIndex >= partCount) return true;
@@ -356,16 +355,22 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
         }
         let definitiveFailure = false;
         for (const projection of projections.values()) {
-          if (!projection.attempt || !projection.outcome || projection.outcome.detail.outcome === 'unknown') return true;
-          if (projection.outcome.detail.outcome !== 'sent') definitiveFailure = true;
+          const value = projection.outcome?.detail?.outcome as string | undefined;
+          if (!projection.attempt || !value || value === 'unknown' || !(DIRECT_POST_OUTCOMES as readonly string[]).includes(value)) return true;
+          if (value !== 'sent') definitiveFailure = true;
         }
         if (definitiveFailure) continue;
         for (let partIndex = 0; partIndex < request.partCount; partIndex += 1) {
           const projection = projections.get(partIndex);
-          if (!projection || !projection.attempt || !projection.outcome || projection.outcome.detail.outcome === 'unknown') return true;
+          const value = projection?.outcome?.detail?.outcome as string | undefined;
+          if (!projection || !projection.attempt || !value || value === 'unknown' || !(DIRECT_POST_OUTCOMES as readonly string[]).includes(value)) return true;
         }
       }
       return false;
+    },
+
+    hasUnresolvedOrdinaryPost(state, channelId) {
+      return handlers.hasUnresolvedBindingPost(state, channelId);
     },
 
     inspectDirectPostPart(state, meta) {

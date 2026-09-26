@@ -163,6 +163,7 @@ export interface DirectPostOutcomeRecord extends DirectPostReceiptDetail {
 }
 
 export interface DirectPostHandlers {
+  hasUnresolvedBindingPost(state: DirectPostState, channelId: string): boolean;
   hasUnresolvedOrdinaryPost(state: DirectPostState, channelId: string): boolean;
   inspectDirectPostPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null;
   recordDirectPostPreflight(state: DirectPostState, meta: DirectPostPartMeta, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostOutcomeRecord;
