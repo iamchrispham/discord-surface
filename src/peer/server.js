@@ -37,7 +37,7 @@ const tools = [
     inputSchema: postInputSchema },
   { name: 'peer_result', description: 'Inspect caller-scoped send, native pickup and completion evidence without changing custody.',
     inputSchema: { type: 'object', properties: { correlation_id: packetId }, required: ['correlation_id'], additionalProperties: false } },
-  { name: 'peer_list', description: 'List current bindings and whether each has one ready enrolled child.',
+  { name: 'peer_list', description: 'List every active binding in the configured guild, including the caller, with child-route readiness and a reachability reason. Inactive and other-guild bindings are excluded. Listing does not send network requests or change custody.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'peer_send', description: 'Send an authenticated agent request to a current peer, or a result using reply_to. Reuse dedupe_key on retry. Sent is not native pickup or completion.',
     inputSchema: { type: 'object', properties: { peer: selector, reply_to: packetId, text: payloadText, text_file: textFile, dedupe_key: packetId },

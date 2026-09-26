@@ -5,6 +5,19 @@ const path = require('node:path');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
 const { fixture } = require('./fixtures/peer-fixture');
+const { parseArgs } = require('../src/cli');
+
+test('mcp accepts provider and state flags, rejects unknown and repeated flags', () => {
+  for (const provider of ['codex', 'claude']) {
+    assert.deepEqual(parseArgs(['mcp', '--provider', provider, '--state-dir', '/fixture', '--db', '/fixture/surface.sqlite']), {
+      command: 'mcp',
+      subcommand: undefined,
+      args: { provider, 'state-dir': '/fixture', db: '/fixture/surface.sqlite' }
+    });
+  }
+  assert.throws(() => parseArgs(['mcp', '--channel-id', '123']), /unknown --channel-id for mcp/);
+  assert.throws(() => parseArgs(['mcp', '--provider', 'codex', '--provider', 'claude']), /--provider was given more than once/);
+});
 
 test('public MCP stdio lists the caller and refuses an unready send', { timeout: 15000 }, async t => {
   const f = fixture(t);
