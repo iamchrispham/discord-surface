@@ -161,6 +161,7 @@ test('abrupt listener expiry can re-arm the same Claude binding', { timeout: 800
 });
 
 test('owner records include a boot-unique process identity on Linux', t => {
+  isolatedNamespaceRoot(t);
   const socket = socketPath(t);
   assertSocketDirectory(socket);
   const { release, lockPath } = acquireSocketLockWithPath(t, socket);
