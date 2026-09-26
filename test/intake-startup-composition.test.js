@@ -1,0 +1,50 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { fixture } = require('./helpers/intake-recovery-fixture');
+const { operatorMessage } = require('./helpers/intake-recovery-scenarios');
+const { THREAD_STATES } = require('../src/state/thread-enrollment');
+
+test('healthy parent dispatch continues while active child custody remains held', { timeout: 8000, todo: 'PR106/PR113 integration must preserve held-child aggregate readiness' }, async t => {
+  const f = fixture(t);
+  assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, '102', '2000'), { ready: false }).accepted, true);
+  f.state.markThreadBoundary('2000', THREAD_STATES.GAP, 'explicit uncovered child history', '101', '102');
+  assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, '101', '1000')).accepted, true);
+  f.history.set('1000', [f.message('101', '1000')]);
+  f.enableDelivery();
+  let startupRecovery;
+  const recover = f.gateway.recoverTransport.bind(f.gateway);
+  f.gateway.recoverTransport = async (...args) => { const result = await recover(...args); startupRecovery = result; return result; };
+  await f.gateway.start(f.secret);
+  assert.equal(startupRecovery.ready, false, 'active child gap must keep aggregate recovery not ready');
+  assert.equal(f.gateway.started, true);
+  assert.equal(f.gateway.transportReady, true);
+  await f.gateway.reconcilePending(undefined, { readyOnly: true });
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getMessage('101').state, 'replied');
+  assert.equal(f.dispatched.filter(m => m.id === '101').length, 1);
+  assert.equal(f.dispatched.length, 1, 'held child must never dispatch');
+  assert.equal(f.state.getMessage('102').state, 'accepted');
+  const held = f.state.getThreadEnrollment('2000');
+  assert.equal(held.state, THREAD_STATES.GAP);
+  assert.equal(held.gapTo, '102');
+  assert.equal(held.gapFrom, '101');
+});
+
+test('healthy parent dispatch proceeds when startup finds no held custody', async t => {
+  const f = fixture(t);
+  assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, '101', '1000')).accepted, true);
+  f.history.set('1000', [f.message('101', '1000')]);
+  f.enableDelivery();
+  let startupRecovery;
+  const recover = f.gateway.recoverTransport.bind(f.gateway);
+  f.gateway.recoverTransport = async (...args) => { const result = await recover(...args); startupRecovery = result; return result; };
+  await f.gateway.start(f.secret);
+  assert.equal(startupRecovery.ready, true);
+  assert.equal(f.gateway.started, true);
+  await f.gateway.reconcilePending(undefined, { readyOnly: true });
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getMessage('101').state, 'replied');
+  assert.equal(f.dispatched.filter(m => m.id === '101').length, 1);
+  assert.equal(f.dispatched.length, 1);
+});
