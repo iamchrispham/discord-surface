@@ -8,6 +8,7 @@ import { createHash, randomUUID } from 'node:crypto';
 type OwnerRecord = {
   pid: number;
   identity?: string;
+  generation?: string;
 };
 
 type FileIdentity = {
@@ -18,6 +19,11 @@ type FileIdentity = {
 type FileGeneration = FileIdentity & { ctimeNs: bigint };
 
 type SocketIdentity = FileIdentity & { ctimeNs: bigint };
+
+type OwnerMarkerSnapshot = {
+  owner: OwnerRecord;
+  identity: FileGeneration;
+};
 
 export type SocketPathIdentity = SocketIdentity;
 
@@ -101,6 +107,16 @@ function sameGeneration(left: FileGeneration, right: FileGeneration): boolean {
 
 function sameSocket(left: SocketIdentity, right: SocketIdentity): boolean {
   return sameFile(left, right) && left.ctimeNs === right.ctimeNs;
+}
+
+function sameOwnerRecord(left: OwnerRecord, right: OwnerRecord): boolean {
+  return left.pid === right.pid && left.identity === right.identity && left.generation === right.generation;
+}
+
+function sameOwnerMarker(left: OwnerMarkerSnapshot, right: OwnerMarkerSnapshot): boolean {
+  if (!sameFile(left.identity, right.identity) || !sameOwnerRecord(left.owner, right.owner)) return false;
+  return left.owner.generation !== undefined || right.owner.generation !== undefined ||
+    left.identity.ctimeNs === right.identity.ctimeNs;
 }
 
 function fileIdentity(filePath: string): FileIdentity {
@@ -325,8 +341,10 @@ function parseSocketLockOwner(ownerValue: string): OwnerRecord {
   try {
     const owner = JSON.parse(ownerValue) as Partial<OwnerRecord>;
     const pid = owner.pid;
-    if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && (owner.identity === undefined || typeof owner.identity === 'string')) {
-      return { pid, identity: owner.identity };
+    if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0 &&
+      (owner.identity === undefined || typeof owner.identity === 'string') &&
+      (owner.generation === undefined || typeof owner.generation === 'string')) {
+      return { pid, identity: owner.identity, generation: owner.generation };
     }
   } catch {}
   const ownerPid = Number(ownerValue);
@@ -344,15 +362,15 @@ function readSocketLockOwner(ownerPath: string): OwnerRecord {
   return parseSocketLockOwner(ownerValue);
 }
 
-function readSocketLockOwnerSnapshot(ownerPath: string): { owner: OwnerRecord; identity: FileIdentity } {
+function readSocketLockOwnerSnapshot(ownerPath: string): OwnerMarkerSnapshot {
   let descriptor: number | undefined;
   let ownerValue: string;
-  let identity: FileIdentity;
+  let identity: FileGeneration;
   try {
     descriptor = fs.openSync(ownerPath, 'r');
     const stats = fs.fstatSync(descriptor, { bigint: true });
     ownerValue = fs.readFileSync(descriptor, 'utf8').trim();
-    identity = { dev: stats.dev, ino: stats.ino };
+    identity = { dev: stats.dev, ino: stats.ino, ctimeNs: stats.ctimeNs };
   } catch (error) {
     throw error;
   } finally {
@@ -383,12 +401,13 @@ function unlinkIfPresent(filePath: string): void {
   }
 }
 
-function writeOwnerMarker(ownerPath: string): void {
+function writeOwnerMarker(ownerPath: string): OwnerRecord {
+  const owner = { pid: process.pid, identity: ownerIdentity, generation: randomUUID() };
   const temporaryPath = path.join(path.dirname(ownerPath), `.owner-${process.pid}-${randomUUID()}`);
   let descriptor: number | undefined;
   try {
     descriptor = fs.openSync(temporaryPath, 'wx', 0o600);
-    fs.writeFileSync(descriptor, JSON.stringify({ pid: process.pid, identity: ownerIdentity }));
+    fs.writeFileSync(descriptor, JSON.stringify(owner));
     fs.closeSync(descriptor);
     descriptor = undefined;
     fs.renameSync(temporaryPath, ownerPath);
@@ -399,6 +418,7 @@ function writeOwnerMarker(ownerPath: string): void {
     try { fs.unlinkSync(temporaryPath); } catch {}
     throw error;
   }
+  return owner;
 }
 
 function transitionOwner(transitionPath: string): OwnerRecord | null {
@@ -495,7 +515,14 @@ function createStagingLock(namespacePath: string): string {
       fs.mkdirSync(stagingPath, { mode: 0o700 });
       return stagingPath;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        try { fs.mkdirSync(namespacePath, { mode: 0o700 }); } catch (recreateError) {
+          if ((recreateError as NodeJS.ErrnoException).code !== 'EEXIST') throw recreateError;
+        }
+        continue;
+      }
+      if (code !== 'EEXIST') throw error;
     }
   }
 }
@@ -536,7 +563,7 @@ function claimTransition(lockPath: string): string | null {
 function reclaimOwnerFile(
   lockPath: string,
   ownerPath: string,
-  expected?: FileIdentity,
+  expected?: OwnerMarkerSnapshot,
   expectedLockGeneration?: FileGeneration
 ): boolean {
   if (expectedLockGeneration) {
@@ -552,26 +579,26 @@ function reclaimOwnerFile(
   const tombstonePath = path.join(transitionPath, 'owner');
   try {
     if (expectedLockGeneration) {
-      let observedLock: FileIdentity;
-      try { observedLock = fileIdentity(lockPath); } catch (error) {
+      let observedLock: FileGeneration;
+      try { observedLock = fileGeneration(lockPath); } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
         throw error;
       }
-      if (!sameFile(observedLock, expectedLockGeneration)) return false;
+      if (!sameGeneration(observedLock, expectedLockGeneration)) return false;
     }
-    let observed: FileIdentity | undefined;
-    try { observed = fileIdentity(ownerPath); } catch (error) {
+    let observed: OwnerMarkerSnapshot | undefined;
+    try { observed = readSocketLockOwnerSnapshot(ownerPath); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return clearOrphanOwnerTemps(lockPath);
       throw error;
     }
     if (expectedLockGeneration && observed) return false;
-    if (expected && !sameFile(observed, expected)) return false;
+    if (expected && !sameOwnerMarker(observed, expected)) return false;
     try { fs.renameSync(ownerPath, tombstonePath); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return clearOrphanOwnerTemps(lockPath);
       throw error;
     }
-    const moved = fileIdentity(tombstonePath);
-    if (!sameFile(moved, observed)) {
+    const moved = readSocketLockOwnerSnapshot(tombstonePath);
+    if (!sameFile(moved.identity, observed.identity) || !sameOwnerRecord(moved.owner, observed.owner)) {
       fs.renameSync(tombstonePath, ownerPath);
       return false;
     }
@@ -585,7 +612,7 @@ function reclaimOwnerFile(
 function reclaimOwnerlessLock(
   lockPath: string,
   ownerPath: string,
-  expectedOwner?: FileIdentity,
+  expectedOwner?: OwnerMarkerSnapshot,
   expectedLockGeneration?: FileGeneration
 ): boolean {
   if (!reclaimOwnerFile(lockPath, ownerPath, expectedOwner, expectedLockGeneration)) return false;
@@ -599,14 +626,14 @@ function reclaimOwnerlessLock(
   return true;
 }
 
-function publishOwner(lockPath: string): { ownerPath: string; identity: FileIdentity } {
+function publishOwner(lockPath: string): { ownerPath: string; marker: OwnerMarkerSnapshot } {
   const ownerPath = ownerPathForLock(lockPath);
-  writeOwnerMarker(ownerPath);
-  return { ownerPath, identity: fileIdentity(ownerPath) };
+  const owner = writeOwnerMarker(ownerPath);
+  return { ownerPath, marker: { owner, identity: fileGeneration(ownerPath) } };
 }
 
-function releaseSocketLock(lockPath: string, ownerPath: string, identity: FileIdentity): void {
-  if (!reclaimOwnerFile(lockPath, ownerPath, identity)) {
+function releaseSocketLock(lockPath: string, ownerPath: string, marker: OwnerMarkerSnapshot): void {
+  if (!reclaimOwnerFile(lockPath, ownerPath, marker)) {
     throw new Error('Claude channel socket preparation lock owner changed before release');
   }
   removeEmptyDirectory(lockPath);
@@ -655,11 +682,11 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
     try {
       const stagedOwner = publishOwner(stagingPath);
       fs.renameSync(stagingPath, lockPath);
-      const owner = { ownerPath, identity: stagedOwner.identity };
+      const owner = { ownerPath, marker: stagedOwner.marker };
       let released = false;
       return () => {
         if (released) return;
-        releaseSocketLock(lockPath, owner.ownerPath, owner.identity);
+        releaseSocketLock(lockPath, owner.ownerPath, owner.marker);
         released = true;
       };
     } catch (error) {
@@ -673,7 +700,7 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
       }
       if (lockStats.isDirectory()) {
         const lockGeneration: FileGeneration = { dev: lockStats.dev, ino: lockStats.ino, ctimeNs: lockStats.ctimeNs };
-        let ownerSnapshot: { owner: OwnerRecord; identity: FileIdentity };
+        let ownerSnapshot: OwnerMarkerSnapshot;
         try { ownerSnapshot = readSocketLockOwnerSnapshot(ownerPath); } catch (ownerError) {
           if ((ownerError as NodeJS.ErrnoException).code !== 'ENOENT') throw ownerError;
           if (reclaimOwnerlessLock(lockPath, ownerPath, undefined, lockGeneration)) continue;
@@ -683,13 +710,13 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
         if (isSocketLockOwnerAlive(owner)) {
           throw new Error('Claude channel socket preparation is already in progress');
         }
-        if (!reclaimOwnerlessLock(lockPath, ownerPath, ownerSnapshot.identity)) {
+        if (!reclaimOwnerlessLock(lockPath, ownerPath, ownerSnapshot)) {
           throw new Error('Claude channel socket preparation is already in progress');
         }
         continue;
       }
       if (!lockStats.isFile()) throw new Error('Claude channel socket preparation lock is invalid');
-      let ownerSnapshot: { owner: OwnerRecord; identity: FileIdentity };
+      let ownerSnapshot: OwnerMarkerSnapshot;
       try { ownerSnapshot = readSocketLockOwnerSnapshot(lockPath); } catch (ownerError) {
         if ((ownerError as NodeJS.ErrnoException).code === 'ENOENT') continue;
         throw ownerError;
