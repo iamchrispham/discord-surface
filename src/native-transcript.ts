@@ -9,7 +9,11 @@ const { validateNativeId } = require('../src/state') as {
 export const CODEX_VALIDATION_KINDS = Object.freeze({
   UNSUPPORTED_ROOT: 'unsupported-root',
   STOPPED: 'stopped',
-  DEADLINE: 'deadline'
+  DEADLINE: 'deadline',
+  UNAVAILABLE: 'identity-unavailable',
+  AMBIGUOUS: 'identity-ambiguous',
+  IDENTITY_MISMATCH: 'identity-mismatch',
+  WORKSPACE_MISMATCH: 'workspace-mismatch'
 } as const);
 
 export const TRANSCRIPT_BLOCK_BYTES = 64 * 1024;
@@ -37,7 +41,15 @@ export interface AmbiguousCodexSessionIdentity {
   files: string[];
 }
 
-type DiscoveredCodexSessionIdentity = CodexSessionIdentity | AmbiguousCodexSessionIdentity;
+export interface MismatchedCodexSessionIdentity {
+  mismatch: true;
+  file: string;
+  sessionId: string | null;
+  threadId: string | null;
+  workspace: string | null;
+}
+
+type DiscoveredCodexSessionIdentity = CodexSessionIdentity | AmbiguousCodexSessionIdentity | MismatchedCodexSessionIdentity;
 
 function sessionRoot(environment: NodeJS.ProcessEnv = process.env): string {
   const home = os.homedir();
@@ -212,6 +224,10 @@ export async function* walkAsync(dir: string, depth = 0, rawOptions: RawValidati
   }
 }
 
+function transcriptFilenameMatchesNativeId(file: string, nativeId: string): boolean {
+  return path.basename(file).includes(nativeId);
+}
+
 const CODEX_SESSION_DISCOVERY_TIMEOUT_MS = 5000;
 
 export async function readCodexSessionIdentityAsync(
@@ -225,10 +241,12 @@ export async function readCodexSessionIdentityAsync(
     ? { ...supplied, deadline: Date.now() + CODEX_SESSION_DISCOVERY_TIMEOUT_MS }
     : supplied;
   const matches: CodexSessionIdentity[] = [];
+  const mismatches: MismatchedCodexSessionIdentity[] = [];
   let fileFailures = 0;
   for await (const file of walkAsync(root, 0, options)) {
     assertValidationActive(options);
     if (!file.includes(nativeId)) continue;
+    const filenameMatchesNativeId = transcriptFilenameMatchesNativeId(file, nativeId);
     const controller = new AbortController();
     const relayAbort = () => controller.abort();
     options.signal?.addEventListener('abort', relayAbort, { once: true });
@@ -246,8 +264,18 @@ export async function readCodexSessionIdentityAsync(
         : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
-      if (sessionId && threadId && sessionId !== threadId) continue;
-      if ((sessionId || threadId) !== nativeId) continue;
+      if (sessionId && threadId && sessionId !== threadId) {
+        if (filenameMatchesNativeId) {
+          mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        }
+        continue;
+      }
+      if ((sessionId || threadId) !== nativeId) {
+        if ((sessionId || threadId) && filenameMatchesNativeId) {
+          mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        }
+        continue;
+      }
       matches.push({
         file, sessionId: nativeId, threadId: nativeId,
         workspace: typeof payload?.cwd === 'string' ? payload.cwd : null
@@ -262,6 +290,7 @@ export async function readCodexSessionIdentityAsync(
   }
   assertValidationActive(options);
   if (fileFailures > 0) return null;
+  if (matches.length === 0 && mismatches.length > 0) return mismatches[0];
   if (matches.length === 0) return null;
   return matches[0];
 }
@@ -320,8 +349,10 @@ export function findCodexSessionFile(nativeId: string, root = sessionRoot()): st
 export function readCodexSessionIdentity(nativeId: string, root = sessionRoot()): DiscoveredCodexSessionIdentity | null {
   validateNativeId(nativeId);
   const matches: CodexSessionIdentity[] = [];
+  const mismatches: MismatchedCodexSessionIdentity[] = [];
   for (const file of walk(root)) {
     if (!file.includes(nativeId)) continue;
+    const filenameMatchesNativeId = transcriptFilenameMatchesNativeId(file, nativeId);
     try {
       const row = JSON.parse(readSessionHeader(file)) as { type?: unknown; payload?: unknown };
       const payload = row?.type === 'session_meta' && row.payload && typeof row.payload === 'object'
@@ -329,14 +360,25 @@ export function readCodexSessionIdentity(nativeId: string, root = sessionRoot())
         : null;
       const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
       const threadId = typeof payload?.id === 'string' ? payload.id : null;
-      if (sessionId && threadId && sessionId !== threadId) continue;
-      if ((sessionId || threadId) !== nativeId) continue;
+      if (sessionId && threadId && sessionId !== threadId) {
+        if (filenameMatchesNativeId) {
+          mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        }
+        continue;
+      }
+      if ((sessionId || threadId) !== nativeId) {
+        if ((sessionId || threadId) && filenameMatchesNativeId) {
+          mismatches.push({ mismatch: true, file, sessionId, threadId, workspace: typeof payload?.cwd === 'string' ? payload.cwd : null });
+        }
+        continue;
+      }
       matches.push({
         file, sessionId: nativeId, threadId: nativeId,
         workspace: typeof payload?.cwd === 'string' ? payload.cwd : null
       });
     } catch {}
   }
+  if (matches.length === 0 && mismatches.length > 0) return mismatches[0];
   if (matches.length === 0) return null;
   if (matches.length > 1) return { ambiguous: true, files: matches.map(match => match.file) };
   return matches[0];
@@ -355,10 +397,10 @@ function normalizeCodexSessionIdentity(identity: CodexSessionIdentity, nativeId:
   const sessionId = identity.sessionId ?? null;
   const threadId = identity.threadId ?? null;
   if (sessionId !== null && threadId !== null && sessionId !== threadId) {
-    throw new Error('Codex transcript identity does not match the supplied native UUID');
+    throw validationError(CODEX_VALIDATION_KINDS.IDENTITY_MISMATCH, 'Codex transcript identity does not match the supplied native UUID');
   }
   if ((sessionId ?? threadId) !== nativeId) {
-    throw new Error('Codex transcript identity does not match the supplied native UUID');
+    throw validationError(CODEX_VALIDATION_KINDS.IDENTITY_MISMATCH, 'Codex transcript identity does not match the supplied native UUID');
   }
   return {
     ...identity,
@@ -367,16 +409,23 @@ function normalizeCodexSessionIdentity(identity: CodexSessionIdentity, nativeId:
   };
 }
 
+function validateDiscoveredIdentity(identity: DiscoveredCodexSessionIdentity | null, nativeId: string, workspace: string | undefined): CodexSessionIdentity {
+  if (!identity) throw validationError(CODEX_VALIDATION_KINDS.UNAVAILABLE, 'Codex transcript identity is unavailable');
+  if ('ambiguous' in identity) throw validationError(CODEX_VALIDATION_KINDS.AMBIGUOUS, 'Codex transcript identity is ambiguous');
+  if ('mismatch' in identity) throw validationError(CODEX_VALIDATION_KINDS.IDENTITY_MISMATCH, 'Codex transcript identity does not match the supplied native UUID');
+  const normalizedIdentity = normalizeCodexSessionIdentity(identity, nativeId);
+  if (workspace !== undefined && normalizedIdentity.workspace !== workspace) {
+    throw validationError(CODEX_VALIDATION_KINDS.WORKSPACE_MISMATCH, 'Codex transcript workspace does not match the supplied workspace');
+  }
+  return normalizedIdentity;
+}
+
 export function validateCodexSessionIdentity(nativeId: string, workspace: string | undefined, root = sessionRoot()): CodexSessionIdentity {
   validateNativeId(nativeId);
   if (workspace !== undefined && (typeof workspace !== 'string' || !path.isAbsolute(workspace))) throw new Error('Codex workspace must be absolute');
   codexHomeForSessionRoot(root);
   const identity = readCodexSessionIdentity(nativeId, root);
-  if (!identity) throw new Error('Codex transcript identity is unavailable');
-  if ('ambiguous' in identity) throw new Error('Codex transcript identity is ambiguous');
-  const normalizedIdentity = normalizeCodexSessionIdentity(identity, nativeId);
-  if (workspace !== undefined && normalizedIdentity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
-  return normalizedIdentity;
+  return validateDiscoveredIdentity(identity, nativeId, workspace);
 }
 
 export async function validateCodexSessionIdentityAsync(
@@ -400,11 +449,7 @@ export async function validateCodexSessionIdentityAsync(
     }
     throw error;
   }
-  if (!identity) throw new Error('Codex transcript identity is unavailable');
-  if ('ambiguous' in identity) throw new Error('Codex transcript identity is ambiguous');
-  const normalizedIdentity = normalizeCodexSessionIdentity(identity, nativeId);
-  if (workspace !== undefined && normalizedIdentity.workspace !== workspace) throw new Error('Codex transcript workspace does not match the supplied workspace');
-  return normalizedIdentity;
+  return validateDiscoveredIdentity(identity, nativeId, workspace);
 }
 
 export { sessionRoot, walk };
