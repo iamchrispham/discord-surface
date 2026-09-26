@@ -6,8 +6,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
-const { once } = require('node:events');
+const { once, EventEmitter } = require('node:events');
 const { prepareSocket, prepareSocketAsync, ClaudeChannel } = require('../src/claude-channel');
+const { SurfaceState } = require('../src/state');
 const socketOwnership = require('../src/claude/socket-ownership');
 const { acquireSocketLock, assertSocketDirectory, assertSocketPath } = socketOwnership;
 const { fixture, CLAUDE_ID } = require('./surface-fixtures');
@@ -75,22 +76,34 @@ function isCaseInsensitiveDirectory(directory) {
   try { return fs.existsSync(alternatePath); } finally { fs.unlinkSync(probePath); }
 }
 
-async function orphan(socket) {
+async function orphan(socket, { db, workspace } = {}) {
   const channelModule = path.resolve(__dirname, '../src/claude-channel');
   const fixturesModule = path.resolve(__dirname, './surface-fixtures');
+  const stateModule = path.resolve(__dirname, '../src/state');
   const child = spawn(process.execPath, ['-e', `
+    const deadline = setTimeout(() => process.exit(2), 3000);
+    deadline.unref();
     const { ClaudeChannel } = require(process.argv[1]);
-    const { fixture, CLAUDE_ID } = require(process.argv[2]);
+    const { CLAUDE_ID } = require(process.argv[2]);
     const socket = process.argv[3];
-    const { dir, state } = fixture();
-    state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+    const dbPath = process.argv[4];
+    const workspace = process.argv[5];
+    let state;
+    if (dbPath) {
+      const { SurfaceState } = require(process.argv[6]);
+      state = new SurfaceState(dbPath);
+    } else {
+      const { fixture } = require(process.argv[2]);
+      const created = fixture();
+      state = created.state;
+      state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: workspace || created.dir, endpoint: socket });
+    }
     const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
-    setTimeout(() => process.exit(2), 3000);
     channel.start().then(() => process.stdout.write('ready')).catch(error => {
       process.stderr.write(String(error));
       process.exit(1);
     });
-  `, channelModule, fixturesModule, socket], { stdio: ['ignore', 'pipe', 'pipe'] });
+  `, channelModule, fixturesModule, socket, db || '', workspace || '', stateModule], { stdio: ['ignore', 'pipe', 'pipe'] });
   const deadline = setTimeout(() => child.kill('SIGKILL'), 4000);
   try {
     await once(child.stdout, 'data');
@@ -104,18 +117,51 @@ async function orphan(socket) {
 
 test('abrupt listener expiry can re-arm the same Claude binding', { timeout: 8000 }, async t => {
   const socket = socketPath(t, { cleanup: false });
-  await orphan(socket);
-  const { dir, state } = fixture();
-  t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
-  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  const { dir, db, state } = fixture();
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket, generation: 7 });
+  const messageId = 'abrupt-custody-message';
+  state.acceptDiscordMessage({
+    id: messageId, guildId: 'guild-1', channelId: 'claude', authorId: 'operator-1', isBot: false,
+    content: 'retain this accepted custody across abrupt listener death'
+  }, { ready: false });
+
+  const beforeBinding = state.getBinding('claude');
+  assert.equal(beforeBinding.channelId, 'claude');
+  assert.equal(beforeBinding.generation, 7);
+  const beforeCustody = state.listMessages().map(message => state.getMessage(message.id));
+  assert.equal(beforeCustody.length, 1);
+  assert.equal(beforeCustody[0].id, messageId);
+  // The killed child opens this exact persisted database and the existing binding.
+  state.close();
+
+  await orphan(socket, { db, workspace: dir });
+
+  const recoveredState = new SurfaceState(db);
+  const channel = new ClaudeChannel({ state: recoveredState, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   t.after(async () => {
-    try { await channel.stop(); } finally { removeSocketDirectory(socket); }
+    try {
+      await channel.stop();
+    } finally {
+      try { recoveredState.close(); } finally {
+        removeSocketDirectory(socket);
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
   });
   await channel.start();
-  assert.equal(channel.ready, true);
-  assert.equal(state.getBinding('claude').nativeId, CLAUDE_ID);
-  assert.equal(state.getBinding('claude').generation, 1);
+  assert.equal(channel.ready, true, 'public start must re-arm a real listener');
+  const socketStats = fs.lstatSync(socket);
+  assert.equal(socketStats.isSocket(), true, 're-armed path must be a real unix socket');
+
+  const afterBinding = recoveredState.getBinding('claude');
+  assert.equal(afterBinding.nativeId, beforeBinding.nativeId, 'native UUID must survive recovery');
+  assert.equal(afterBinding.generation, 7, 'binding generation must not reset');
+  assert.equal(afterBinding.workspace, beforeBinding.workspace, 'workspace must survive recovery');
+  assert.equal(afterBinding.endpoint, beforeBinding.endpoint, 'endpoint must survive recovery');
+  assert.equal(recoveredState.listBindings().length, 1, 'recovery must not create a replacement binding');
+
+  const afterCustody = recoveredState.listMessages().map(message => recoveredState.getMessage(message.id));
+  assert.deepEqual(afterCustody, beforeCustody, 'accepted message custody must be unchanged');
 });
 
 test('owner records include a boot-unique process identity on Linux', t => {
@@ -139,6 +185,8 @@ test('live socket locks survive contenders with different timezones', { timeout:
   const socket = socketPath(t);
   const modulePath = path.resolve(__dirname, '../src/claude/socket-ownership');
   const holder = spawn(process.execPath, ['-e', `
+    const deadline = setTimeout(() => process.exit(2), 7000);
+    deadline.unref();
     const { acquireSocketLock } = require(process.argv[1]);
     const release = acquireSocketLock(process.argv[2]);
     process.stdout.write('ready');
@@ -153,6 +201,8 @@ test('live socket locks survive contenders with different timezones', { timeout:
   t.after(() => holder.kill('SIGKILL'));
   await once(holder.stdout, 'data');
   const contender = spawnSync(process.execPath, ['-e', `
+    const deadline = setTimeout(() => process.exit(2), 4000);
+    deadline.unref();
     const { acquireSocketLock } = require(process.argv[1]);
     try { const release = acquireSocketLock(process.argv[2]); release(); process.stdout.write('acquired'); }
     catch (error) { process.stdout.write(String(error)); }
@@ -181,6 +231,8 @@ test('unreadable live owner markers preserve the preparation lock', { timeout: 8
   try {
     fs.chmodSync(ownerPath, 0);
     const contender = spawnSync(process.execPath, ['-e', `
+      const deadline = setTimeout(() => process.exit(2), 4000);
+      deadline.unref();
       const { acquireSocketLock } = require(process.argv[1]);
       try { acquireSocketLock(process.argv[2]); process.stdout.write('acquired'); }
       catch (error) { process.stdout.write(String(error.code || error)); }
@@ -545,6 +597,182 @@ test('socket replaced during refusal probe is preserved', { timeout: 8000 }, asy
   });
   await assert.rejects(prepareSocketAsync(socket), /changed during stale probe/);
   assert.equal(fs.readFileSync(socket, 'utf8'), 'replacement');
+});
+
+test('replacement socket during refusal probe is preserved', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  await orphan(socket);
+
+  // Keep the original probe from reusing the moved-aside inode: the old path is
+  // renamed away so the allocator cannot hand its inode back to the replacement.
+  const originalLstat = fs.lstatSync;
+  const realCreateConnection = net.createConnection;
+  let signalProbe;
+  const probeReady = new Promise(resolve => { signalProbe = resolve; });
+  let pendingProbe;
+  t.mock.method(net, 'createConnection', () => {
+    pendingProbe = new EventEmitter();
+    pendingProbe.destroy = () => {};
+    signalProbe();
+    return pendingProbe;
+  });
+
+  const preparing = prepareSocketAsync(socket);
+  await probeReady;
+
+  fs.renameSync(socket, `${socket}.stale`);
+  const replacement = net.createServer(connection => connection.destroy());
+  t.after(async () => {
+    if (replacement.listening) await new Promise(resolve => replacement.close(resolve));
+    removeSocketDirectory(socket);
+  });
+  await new Promise((resolve, reject) => {
+    replacement.once('error', reject);
+    replacement.listen(socket, resolve);
+  });
+  const replacementIdentity = socketOwnership.socketPathIdentity(socket);
+  assert.equal(originalLstat(socket).isSocket(), true);
+  assert.ok(replacementIdentity && typeof replacementIdentity.ctimeNs === 'bigint');
+
+  // The old probe's refusal arrives after the replacement listener is live.
+  pendingProbe.emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
+  await assert.rejects(preparing, /changed during stale probe/);
+
+  const after = socketOwnership.socketPathIdentity(socket);
+  assert.equal(after.dev, replacementIdentity.dev, 'replacement socket device must be preserved');
+  assert.equal(after.ino, replacementIdentity.ino, 'replacement socket inode must be preserved');
+  assert.equal(after.ctimeNs, replacementIdentity.ctimeNs, 'replacement socket generation must be preserved');
+  assert.equal(originalLstat(socket).isSocket(), true, 'replacement path must remain a socket');
+
+  await new Promise((resolve, reject) => {
+    const client = realCreateConnection.call(net, socket);
+    client.once('connect', () => { client.destroy(); resolve(); });
+    client.once('error', reject);
+  });
+});
+
+test('foreign socket owner is refused before probing', { timeout: 8000 }, async t => {
+  const socket = socketPath(t);
+  await orphan(socket);
+  const originalLstat = fs.lstatSync;
+  const before = originalLstat(socket, { bigint: true });
+  assert.equal(before.isSocket(), true);
+
+  const originalUnlink = fs.unlinkSync;
+  const unlinked = [];
+  t.mock.method(fs, 'unlinkSync', (target, ...args) => {
+    unlinked.push(String(target));
+    return originalUnlink(target, ...args);
+  });
+  let probes = 0;
+  t.mock.method(net, 'createConnection', () => {
+    probes += 1;
+    const probe = new EventEmitter();
+    probe.destroy = () => {};
+    return probe;
+  });
+
+  // Narrow fixture: only the preparation socket's own stat is rewritten to a
+  // foreign owner; every other filesystem observation stays real.
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    if (target === socket) {
+      const stats = originalLstat(target, ...args);
+      return {
+        dev: stats.dev,
+        ino: stats.ino,
+        ctimeMs: stats.ctimeMs,
+        ctimeNs: stats.ctimeNs,
+        uid: stats.uid + 1,
+        isSocket: () => true
+      };
+    }
+    return originalLstat(target, ...args);
+  });
+
+  await assert.rejects(prepareSocketAsync(socket), /belongs to another owner/);
+  assert.equal(probes, 0, 'foreign ownership must be refused before any probe');
+  assert.equal(unlinked.includes(socket), false, 'foreign socket must not be unlinked');
+
+  const after = originalLstat(socket, { bigint: true });
+  assert.equal(after.dev, before.dev, 'foreign refusal must preserve socket device');
+  assert.equal(after.ino, before.ino, 'foreign refusal must preserve socket inode');
+  assert.equal(after.ctimeNs, before.ctimeNs, 'foreign refusal must preserve socket generation');
+  assert.equal(after.isSocket(), true, 'foreign refusal must preserve the socket path');
+});
+
+test('inconclusive socket probe error preserves custody', { timeout: 8000 }, async t => {
+  const socket = socketPath(t);
+  await orphan(socket);
+  const originalLstat = fs.lstatSync;
+  const before = originalLstat(socket, { bigint: true });
+
+  t.mock.method(net, 'createConnection', () => {
+    const probe = new EventEmitter();
+    probe.destroy = () => {};
+    queueMicrotask(() => {
+      probe.emit('error', Object.assign(new Error('permission denied'), { code: 'EACCES' }));
+    });
+    return probe;
+  });
+
+  await assert.rejects(prepareSocketAsync(socket), /permission denied/);
+  const afterRefusal = originalLstat(socket, { bigint: true });
+  assert.equal(afterRefusal.dev, before.dev, 'inconclusive probe must preserve socket device');
+  assert.equal(afterRefusal.ino, before.ino, 'inconclusive probe must preserve socket inode');
+  assert.equal(afterRefusal.ctimeNs, before.ctimeNs, 'inconclusive probe must preserve socket generation');
+  assert.equal(fs.existsSync(socket), true, 'inconclusive probe must preserve the socket path');
+
+  // Real preparation custody must be available again: the failed attempt retained no lock.
+  t.mock.restoreAll();
+  const release = acquireSocketLock(socket);
+  assert.doesNotThrow(() => release());
+  assert.equal(fs.existsSync(socket), true, 'released custody must still preserve the stale socket');
+
+  // A real bounded preparation attempt is permitted now that the probe hook is gone.
+  await assert.doesNotReject(prepareSocketAsync(socket));
+  assert.equal(fs.existsSync(socket), false, 'the conclusive refusal may remove the owned stale socket');
+});
+
+test('socket probe timeout preserves custody after late refusal', { timeout: 8000 }, async t => {
+  const socket = socketPath(t);
+  await orphan(socket);
+  const originalLstat = fs.lstatSync;
+  const before = originalLstat(socket, { bigint: true });
+
+  let probes = 0;
+  let destroyCalls = 0;
+  let pendingProbe;
+  t.mock.method(net, 'createConnection', () => {
+    probes += 1;
+    pendingProbe = new EventEmitter();
+    pendingProbe.destroy = () => { destroyCalls += 1; };
+    pendingProbe.on('error', () => {});
+    return pendingProbe;
+  });
+
+  // The real 1000 ms probe deadline expires with neither connect nor error.
+  await assert.rejects(prepareSocketAsync(socket), /probe timed out/);
+  assert.equal(probes, 1, 'timeout must be decided by the single probe');
+  assert.equal(destroyCalls, 1, 'timeout must destroy the abandoned probe');
+
+  const afterTimeout = originalLstat(socket, { bigint: true });
+  assert.equal(afterTimeout.dev, before.dev, 'timeout must preserve socket device');
+  assert.equal(afterTimeout.ino, before.ino, 'timeout must preserve socket inode');
+  assert.equal(afterTimeout.ctimeNs, before.ctimeNs, 'timeout must preserve socket generation');
+  assert.equal(fs.existsSync(socket), true, 'timeout must preserve the socket path');
+
+  // A late refusal on the already-settled probe must not authorize an unlink.
+  pendingProbe.emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
+  const afterLateRefusal = originalLstat(socket, { bigint: true });
+  assert.equal(afterLateRefusal.dev, before.dev, 'late refusal must preserve socket device');
+  assert.equal(afterLateRefusal.ino, before.ino, 'late refusal must preserve socket inode');
+  assert.equal(afterLateRefusal.ctimeNs, before.ctimeNs, 'late refusal must preserve socket generation');
+  assert.equal(fs.existsSync(socket), true, 'late refusal must preserve the socket path');
+
+  // Preparation custody was released by the failed attempt.
+  t.mock.restoreAll();
+  const release = acquireSocketLock(socket);
+  assert.doesNotThrow(() => release());
 });
 
 test('stop during orphan probe prevents subsequent listener startup', { timeout: 8000 }, async t => {
