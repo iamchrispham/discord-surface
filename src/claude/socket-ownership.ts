@@ -269,27 +269,61 @@ function assertLockNamespaceIsUsable(namespacePath: string, owner: number | unde
 }
 
 function ownerControlledNamespaceRoot(): string {
-  let root: string;
-  try {
-    // `TMPDIR` is process-local and can point two contenders at different
-    // lock namespaces. The passwd-backed home directory is stable across
-    // invocations and is not writable by another UID.
-    root = fs.realpathSync(os.userInfo().homedir);
-  } catch {
-    throw new Error('Claude channel socket lock namespace root is unavailable');
-  }
-  let directory: fs.Stats;
-  try {
-    directory = fs.statSync(root);
-  } catch {
-    throw new Error('Claude channel socket lock namespace root is unavailable');
-  }
   const owner = process.getuid?.();
-  const ownerControlledRoot = owner === undefined || directory.uid === owner;
-  if (!directory.isDirectory() || !ownerControlledRoot || (directory.mode & 0o022) !== 0) {
-    throw new Error('Claude channel socket lock namespace root is unusable');
+  const ownerName = owner === undefined ? 'shared' : String(owner);
+  const candidates: string[] = [];
+  try {
+    // The passwd-backed home directory is stable across invocations when it
+    // is usable, but service accounts may not have one.
+    candidates.push(fs.realpathSync(os.userInfo().homedir));
+  } catch {
+    // Try the runtime and temporary roots below.
   }
-  return root;
+  if (process.env.XDG_RUNTIME_DIR) {
+    try { candidates.push(fs.realpathSync(process.env.XDG_RUNTIME_DIR)); } catch {
+      // Try the temporary root below.
+    }
+  }
+  try { candidates.push(fs.realpathSync(os.tmpdir())); } catch {
+    // No temporary root is available.
+  }
+
+  for (const root of candidates) {
+    let directory: fs.Stats;
+    try { directory = fs.statSync(root); } catch { continue; }
+    if (!directory.isDirectory()) continue;
+    const ownerControlledRoot = owner === undefined || directory.uid === owner;
+    const ownerWritableRoot = owner === undefined || (directory.mode & 0o200) !== 0;
+    if (ownerControlledRoot && ownerWritableRoot && (directory.mode & 0o022) === 0) {
+      try {
+        fs.accessSync(root, fs.constants.W_OK);
+        return root;
+      } catch {
+        // Try the next candidate.
+      }
+    }
+
+    // A sticky shared temporary root can safely contain a stable owner-only
+    // child. A group-writable home or runtime root without the sticky bit is
+    // not a safe fallback because another UID could replace that child.
+    const stickySharedRoot = (directory.mode & 0o1000) !== 0 && (directory.mode & 0o002) !== 0;
+    if (!stickySharedRoot) continue;
+    const privateRoot = path.join(root, `.claude-channel-${ownerName}`);
+    try {
+      fs.mkdirSync(privateRoot, { recursive: true, mode: 0o700 });
+      const privateDirectory = fs.statSync(privateRoot);
+      const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
+      const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
+      if (privateDirectory.isDirectory() && privateOwnerControlled && privateOwnerWritable &&
+        (privateDirectory.mode & 0o077) === 0) {
+        fs.accessSync(privateRoot, fs.constants.W_OK);
+        return privateRoot;
+      }
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  throw new Error('Claude channel socket lock namespace root is unusable');
 }
 
 function lockNamespacePath(socketPath: string): string {
@@ -455,7 +489,11 @@ function removeLockDirectory(directoryPath: string): void {
   try {
     for (const entry of fs.readdirSync(directoryPath)) {
       const entryPath = path.join(directoryPath, entry);
-      if (fs.lstatSync(entryPath).isFile()) unlinkIfPresent(entryPath);
+      try {
+        if (fs.lstatSync(entryPath).isFile()) unlinkIfPresent(entryPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;

@@ -303,17 +303,38 @@ test('socket locks use one fixed namespace and retain it across release', t => {
   assert.equal(rmdirs.includes(namespacePath), false, 'release must never rmdir the shared namespace root');
 });
 
-test('an unsafe namespace root refuses before bootstrapping the namespace', t => {
-  const root = fs.mkdtempSync('/tmp/dss-root-');
-  fs.chmodSync(root, 0o777);
-  const userInfo = os.userInfo();
-  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+for (const [label, mode] of [['group-writable', 0o777], ['read-only', 0o555], ['missing', null]]) {
+  test(`an ${label} passwd home falls back to an owner-controlled runtime root`, t => {
+    const root = path.join('/tmp', `dss-root-${randomUUID()}`);
+    if (mode !== null) {
+      fs.mkdirSync(root, { mode: 0o700 });
+      fs.chmodSync(root, mode);
+    }
+    const fallbackRoot = fs.mkdtempSync('/tmp/dss-fallback-root-');
+    fs.chmodSync(fallbackRoot, 0o700);
+    const userInfo = os.userInfo();
+    t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
+    t.mock.method(os, 'tmpdir', () => fallbackRoot);
+    const runtimeRoot = process.env.XDG_RUNTIME_DIR;
+    delete process.env.XDG_RUNTIME_DIR;
+    t.after(() => {
+      if (runtimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = runtimeRoot;
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(fallbackRoot, { recursive: true, force: true });
+    });
 
-  const socket = socketPath(t);
-  assert.throws(() => assertSocketDirectory(socket), /namespace root is unusable/);
-  assert.deepEqual(fs.readdirSync(root), [], 'an unsafe root must not receive a fixed namespace');
-});
+    const socket = socketPath(t);
+    const { release, lockPath } = acquireSocketLockWithPath(t, socket);
+    try {
+      assert.equal(path.dirname(path.dirname(lockPath)), fs.realpathSync(fallbackRoot),
+        'an unsafe passwd home must not own the lock namespace');
+      if (mode !== null) assert.deepEqual(fs.readdirSync(root), [], 'the unsafe home must remain untouched');
+    } finally {
+      release();
+    }
+  });
+}
 
 test('a foreign shared-temp namespace cannot preempt the owner-controlled root', t => {
   const ownerRoot = isolatedNamespaceRoot(t);
@@ -541,6 +562,36 @@ test('a namespace absent during the orphan scan recovers and acquires', t => {
     release();
   }
   assert.equal(fs.existsSync(namespacePath), true, 'namespace root must survive release');
+});
+
+test('orphan cleanup tolerates a staging entry removed by a contender', t => {
+  const { namespacePath } = acquireProbeLock(t);
+  const orphanName = `.staging-999999999-${randomUUID()}`;
+  const orphanPath = path.join(namespacePath, orphanName);
+  const orphanEntry = path.join(orphanPath, 'marker');
+  fs.mkdirSync(orphanPath, { mode: 0o700 });
+  fs.writeFileSync(orphanEntry, 'marker', { mode: 0o600 });
+  const socket = socketPath(t);
+  const originalKill = process.kill;
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (pid === 999999999) throw Object.assign(new Error('simulated dead contender'), { code: 'ESRCH' });
+    return originalKill(pid, signal);
+  });
+  const originalLstat = fs.lstatSync;
+  let raced = false;
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    if (!raced && target === orphanEntry && !(args.length > 0 && args[0] && args[0].bigint)) {
+      raced = true;
+      fs.unlinkSync(orphanEntry);
+      throw Object.assign(new Error('simulated contender cleanup'), { code: 'ENOENT' });
+    }
+    return originalLstat(target, ...args);
+  });
+
+  let release;
+  assert.doesNotThrow(() => { release = acquireSocketLock(socket); });
+  assert.equal(raced, true, 'the per-entry removal race must be exercised');
+  release();
 });
 
 test('a permissive replacement during the orphan scan is refused and preserved', t => {
