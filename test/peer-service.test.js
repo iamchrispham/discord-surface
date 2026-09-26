@@ -230,6 +230,48 @@ test('reply_to can select the request source when packet IDs collide', async t =
   assert.equal(posts, 1);
 });
 
+test('reply_to can select a colliding legacy parent request through its peer', async t => {
+  const f = fixture(t); f.enroll('102');
+  const first = addRecipient(f);
+  const second = addSecondRecipient(f);
+  const caller = f.state.getBinding('101');
+  const callerAddress = { guildId: caller.guildId, channelId: '102', provider: caller.provider,
+    nativeId: caller.nativeId, generation: caller.generation };
+  const requestPacket = binding => ({
+    id: 'duplicate-legacy-request', kind: 'request',
+    source: { guildId: binding.guildId, channelId: binding.channelId, provider: binding.provider,
+      nativeId: binding.nativeId, generation: binding.generation },
+    target: callerAddress, replyTo: null, routingVersion: 2, text: 'hello'
+  });
+  f.state.receipt(null, 'agent-message', { packet: requestPacket(first) });
+  f.state.receipt(null, 'agent-message', { packet: requestPacket(second) });
+  let postUrl;
+  let posts = 0;
+  let staleNext = false;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      if (staleNext) {
+        f.state.db.prepare("UPDATE bindings SET generation=generation+1 WHERE channel_id='201'").run();
+        staleNext = false;
+      }
+      return { ok: true, status: 200, json: async () => ({ id: '201', guild_id: '100' }) };
+    }
+    posts += 1;
+    postUrl = url;
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  const result = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: 'duplicate-legacy-request',
+    text: 'reply', dedupe_key: 'selected-legacy-reply' });
+  assert.equal(result.status, 'sent');
+  assert.match(postUrl, /channels\/201\/messages$/);
+  assert.equal(posts, 1);
+  staleNext = true;
+  const stale = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: 'duplicate-legacy-request',
+    text: 'stale reply', dedupe_key: 'selected-legacy-stale' });
+  assert.equal(stale.status, 'stale');
+  assert.equal(posts, 1);
+});
+
 test('peer result preserves current and rejects stale legacy parent destinations', async t => {
   const f = fixture(t); const target = addRecipient(f);
   const sourceBinding = f.state.getBinding('101');

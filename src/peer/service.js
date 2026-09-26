@@ -37,7 +37,8 @@ function currentPeerDestination(state, target, expectedBinding = null, expectedC
       child.active && child.parentChannelId === binding.channelId && child.guildId === binding.guildId
     );
     const watermark = state.getIntakeWatermark(binding.channelId);
-    const parentRoute = expectedBinding === null && expectedChildId === null && binding.channelId === target.channelId;
+    const parentRoute = binding.channelId === target.channelId &&
+      (!expectedBinding || samePeerBinding(binding, expectedBinding));
     const childRoute = children.length === 1 && children[0].state === THREAD_STATES.READY &&
       children[0].threadId === target.channelId &&
       (expectedChildId === null || expectedChildId === target.channelId);
@@ -49,13 +50,36 @@ function currentPeerDestination(state, target, expectedBinding = null, expectedC
 
 function assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token }) {
   const kind = input.reply_to === undefined ? KINDS.REQUEST : KINDS.RESULT;
-  const target = kind === KINDS.RESULT
-    ? resolveAgentReplyRequest(state, input.reply_to, sourceAddress,
-      destination === null ? null : resolveAgentAddress(state, destination.binding, destination.childId), {
-        guildId: source.guildId, channelId: source.channelId, provider: source.provider,
-        nativeId: source.nativeId, generation: source.generation
-      }, Error).source
-    : resolveAgentAddress(state, destination.binding, destination.childId);
+  const callerAddress = {
+    guildId: source.guildId, channelId: source.channelId, provider: source.provider,
+    nativeId: source.nativeId, generation: source.generation
+  };
+  let target;
+  if (kind === KINDS.RESULT) {
+    const selectors = destination === null
+      ? [null]
+      : [
+        resolveAgentAddress(state, destination.binding, destination.childId),
+        { guildId: destination.binding.guildId, channelId: destination.binding.channelId,
+          provider: destination.binding.provider, nativeId: destination.binding.nativeId,
+          generation: destination.binding.generation }
+      ];
+    let lastError;
+    for (const selector of selectors) {
+      try {
+        target = resolveAgentReplyRequest(state, input.reply_to, sourceAddress, selector, callerAddress, Error).source;
+        break;
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== 'agent reply target is unknown or does not match the active request') {
+          throw error;
+        }
+        lastError = error;
+      }
+    }
+    if (target === undefined) throw lastError;
+  } else {
+    target = resolveAgentAddress(state, destination.binding, destination.childId);
+  }
   try {
     encodeAgentMessage({
       id: input.dedupe_key,
@@ -73,6 +97,7 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
     }
     throw error;
   }
+  return target;
 }
 
 function createPeerService(context) {
@@ -124,7 +149,10 @@ function createPeerService(context) {
       }
       const fileSource = input.text_file === undefined ? null : readTextFile(input.text_file);
       const text = fileSource === null ? input.text : fileSource.text;
-      assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token });
+      const packetTarget = assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token });
+      if (input.reply_to !== undefined && destination !== null) {
+        agentTarget = issueAgentAddress(packetTarget, token);
+      }
       let directory;
       try {
         let textFile = input.text_file;
