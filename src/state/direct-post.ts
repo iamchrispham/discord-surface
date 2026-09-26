@@ -326,8 +326,8 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       const attemptPart = new Map<unknown, number>();
       for (const row of rows) {
         if (row.kind !== DIRECT_POST_ATTEMPT || row.detail.channelId !== channelId) continue;
-        const partCount = Number(row.detail.partCount || 1);
-        const partIndex = Number.isInteger(row.detail.partIndex) ? row.detail.partIndex as number : 0;
+        const partCount = Object.hasOwn(row.detail, 'partCount') ? row.detail.partCount as number : 1;
+        const partIndex = Object.hasOwn(row.detail, 'partIndex') ? row.detail.partIndex as number : 0;
         if (!Number.isSafeInteger(partCount) || partCount < 1 || !Number.isSafeInteger(partIndex) || partIndex < 0 || partIndex >= partCount) return true;
         const request = requests.get(row.detail.requestId) || { partCount, parts: new Map<number, { attempts: DirectPostReceiptRow[]; outcomes: DirectPostReceiptRow[] }>() };
         if (request.partCount !== partCount) return true;

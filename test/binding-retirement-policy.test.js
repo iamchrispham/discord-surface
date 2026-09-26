@@ -310,6 +310,100 @@ test('D3 evidence matrix classifies each receipt history semantically', t => {
   assert.equal(has('some-other-channel'), false, 'a different source channel does not block');
 });
 
+// PR118: silently defaulting *explicitly persisted* malformed multipart metadata
+// to legacy-absent semantics (partCount || 1, Number.isInteger(partIndex) ? ...)
+// can let a receipt look like a complete one-part send and retire a binding after
+// message suffix custody was lost. Only property absence may default; any present
+// raw value must reach the existing Number.isSafeInteger/bounds checks uncoerced.
+const MALFORMED_PART_COUNTS = [0, null, '', '1', true, 1.5, -1, Number.MAX_SAFE_INTEGER + 1];
+const MALFORMED_PART_INDEXES = [null, '', '1', true, 1.5, -1, Number.MAX_SAFE_INTEGER + 1];
+
+// Build a legacy receipt detail that literally omits both part fields, the way a
+// record written before multipart metadata existed would.
+function legacyAttempt(detail) {
+  const { partCount: _partCount, partIndex: _partIndex, ...rest } = plainAttempt(detail);
+  return rest;
+}
+
+for (const value of MALFORMED_PART_COUNTS) {
+  test(`present malformed partCount ${JSON.stringify(value)} holds binding retirement`, t => {
+    const f = createFixture(t);
+    const detail = plainAttempt({
+      channelId: '301', requestId: `bad-count-${JSON.stringify(value)}`, attemptId: 'a1',
+      partIndex: 0, partCount: value
+    });
+    seedAttempt(f.state, detail);
+    seedOutcome(f.state, detail, 'sent');
+    assert.equal(f.state.hasUnresolvedBindingPost('301'), true,
+      'explicit malformed partCount must not default like a legacy one-part record');
+  });
+}
+
+for (const value of MALFORMED_PART_INDEXES) {
+  test(`present malformed partIndex ${JSON.stringify(value)} holds binding retirement`, t => {
+    const f = createFixture(t);
+    const detail = plainAttempt({
+      channelId: '302', requestId: `bad-index-${JSON.stringify(value)}`, attemptId: 'a1',
+      partCount: 1, partIndex: value
+    });
+    seedAttempt(f.state, detail);
+    seedOutcome(f.state, detail, 'sent');
+    assert.equal(f.state.hasUnresolvedBindingPost('302'), true,
+      'explicit malformed partIndex must not default like a legacy first part');
+  });
+}
+
+test('present out-of-range partIndex holds binding retirement despite a sent outcome', t => {
+  const f = createFixture(t);
+  const detail = plainAttempt({ channelId: '303', requestId: 'range', attemptId: 'a1', partCount: 1, partIndex: 2 });
+  seedAttempt(f.state, detail);
+  seedOutcome(f.state, detail, 'sent');
+  assert.equal(f.state.hasUnresolvedBindingPost('303'), true,
+    'an index beyond the declared part count is not a complete publication');
+});
+
+test('legacy receipts that never persisted part metadata release the binding', t => {
+  const f = createFixture(t);
+  const detail = legacyAttempt({ channelId: '304', requestId: 'legacy', attemptId: 'a1' });
+  assert.equal(Object.hasOwn(detail, 'partCount'), false, 'legacy detail omits partCount');
+  assert.equal(Object.hasOwn(detail, 'partIndex'), false, 'legacy detail omits partIndex');
+  seedAttempt(f.state, detail);
+  seedOutcome(f.state, detail, 'sent');
+  assert.equal(f.state.hasUnresolvedBindingPost('304'), false,
+    'absent fields keep legacy one-part semantics');
+});
+
+test('valid one-part and complete multipart sent receipts still release the binding', t => {
+  const f = createFixture(t);
+  seedAttempt(f.state, plainAttempt({ channelId: '305', requestId: 'one', attemptId: 'a1', partCount: 1, partIndex: 0 }));
+  seedOutcome(f.state, plainAttempt({ channelId: '305', requestId: 'one', attemptId: 'a1', partCount: 1, partIndex: 0 }), 'sent');
+  assert.equal(f.state.hasUnresolvedBindingPost('305'), false, 'a valid one-part send releases');
+
+  for (const partIndex of [0, 1]) {
+    const detail = plainAttempt({
+      channelId: '306', requestId: 'two', attemptId: `a${partIndex}`, partCount: 2, partIndex
+    });
+    seedAttempt(f.state, detail);
+    seedOutcome(f.state, detail, 'sent');
+  }
+  assert.equal(f.state.hasUnresolvedBindingPost('306'), false, 'every present part sent releases');
+});
+
+test('public unbind refuses a binding whose sent receipt persisted malformed partCount', t => {
+  const f = createFixture(t);
+  const binding = bindConductor(f, '307', CODEX_A, 'codex');
+  const detail = plainAttempt({
+    channelId: '307', requestId: 'owner-bad-count', attemptId: 'a1',
+    partIndex: 0, partCount: 0, conductorId: binding.conductorId, repoKey: binding.repoKey
+  });
+  seedAttempt(f.state, detail);
+  seedOutcome(f.state, detail, 'sent');
+  assert.equal(f.state.hasUnresolvedBindingPost('307'), true, 'malformed multipart custody holds');
+  const before = captureCustody(f.state, '307');
+  assert.throws(() => f.state.unbind('307', { expectedBinding: binding }), /cannot unbind while work is unresolved/);
+  assertCustodyUnchanged(f.state, '307', before);
+});
+
 test('stale expected-binding refusal and enrollment/intake proof checks are preserved', t => {
   const f = createFixture(t);
   const binding = bindConductor(f, '101', CODEX_A, 'codex');
