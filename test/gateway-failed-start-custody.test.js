@@ -98,6 +98,28 @@ test('simulated: rejected gateway start must fence later live native dispatch', 
   });
 });
 
+test('simulated: rejected gateway start must fence later live slash-command dispatch', { timeout: 8000 }, async t => {
+  const env = setupGateway();
+  cleanup(t, env);
+  const { state, secret, listeners, gateway } = env;
+  const bindingBefore = state.getBinding('channel-codex');
+  gateway.recoverTransport = async () => {
+    gateway.ready = true;
+    throw new Error('fixture startup recovery refused');
+  };
+  await assert.rejects(gateway.start(secret), /fixture startup recovery refused/);
+
+  listeners.get('interactionCreate')(csInteraction('interaction-after-failed-start'));
+  await Promise.all([...gateway.inFlight]);
+
+  const message = state.getMessage('interaction-after-failed-start');
+  assert.equal(message.state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(env.dispatchCount(), 0);
+  assert.equal(state.hasNativeAcknowledgment(message), false);
+  assert.equal(gateway.transportReady, false);
+  assert.deepEqual(state.getBinding('channel-codex'), bindingBefore);
+});
+
 test('simulated: never-started gateway holds interaction custody with zero native dispatch', { timeout: 8000 }, async t => {
   const env = setupGateway();
   cleanup(t, env);

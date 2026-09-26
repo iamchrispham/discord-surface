@@ -231,6 +231,36 @@ test('decision native return is held before startup and proceeds once after a he
   assert.equal(f.state.getDecisionClick('held-before-start').nativeReturn, null);
 });
 
+test('original held click resumes through startDecisionRecovery without a second click', { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  const listener = f.listeners.get('interactionCreate');
+  assert.equal(typeof listener, 'function');
+
+  listener(component(f.presentation, 'held-original', 0));
+  await waitForCondition(() => f.callbacks.length === 1, 'held original decision callback was not attempted');
+  await Promise.all([...f.gateway.inFlight]);
+
+  assert.equal(f.state.getDecisionClick('held-original').nativeReturn, null);
+  assert.equal(f.dispatches.length, 0);
+
+  f.gateway.ready = true;
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  await f.gateway.startDecisionRecovery(new AbortController().signal);
+
+  const recovered = f.state.getDecisionClick('held-original');
+  assert.equal(recovered.nativeReturn.outcome, 'submitted');
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.edits.length, 1);
+  assert.equal(decisionMessages(f.state).length, 1);
+
+  await f.gateway.startDecisionRecovery(new AbortController().signal);
+  assert.equal(f.state.getDecisionClick('held-original').nativeReturn.outcome, 'submitted');
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.edits.length, 1);
+  assert.equal(decisionMessages(f.state).length, 1);
+});
+
 test('losing projection refuses binding and config drift during question fetch', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.started = true;
