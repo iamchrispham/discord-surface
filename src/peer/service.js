@@ -48,6 +48,19 @@ function currentPeerDestination(state, target, expectedBinding = null, expectedC
   return routes.length === 1;
 }
 
+function requireReadyReplyPeer(state, binding) {
+  try {
+    return requireReadyPeer(state, binding);
+  } catch (error) {
+    const watermark = state.getIntakeWatermark(binding.channelId);
+    if (binding.active && binding.readiness === READINESS.READY &&
+        (!watermark || watermark.state === READINESS.READY)) {
+      return { binding, childId: null };
+    }
+    throw error;
+  }
+}
+
 function assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token }) {
   const kind = input.reply_to === undefined ? KINDS.REQUEST : KINDS.RESULT;
   const callerAddress = {
@@ -56,14 +69,14 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
   };
   let target;
   if (kind === KINDS.RESULT) {
-    const selectors = destination === null
-      ? [null]
-      : [
-        resolveAgentAddress(state, destination.binding, destination.childId),
-        { guildId: destination.binding.guildId, channelId: destination.binding.channelId,
-          provider: destination.binding.provider, nativeId: destination.binding.nativeId,
-          generation: destination.binding.generation }
-      ];
+    const parentSelector = destination === null ? null : {
+      guildId: destination.binding.guildId, channelId: destination.binding.channelId,
+      provider: destination.binding.provider, nativeId: destination.binding.nativeId,
+      generation: destination.binding.generation
+    };
+    const selectors = destination === null ? [null] : destination.childId === null
+      ? [parentSelector]
+      : [resolveAgentAddress(state, destination.binding, destination.childId), parentSelector];
     let lastError;
     const matches = [];
     for (const selector of selectors) {
@@ -147,8 +160,13 @@ function createPeerService(context) {
       let agentTarget = null;
       let destination = null;
       if (input.peer !== undefined) {
-        destination = requireReadyPeer(state, resolvePeerBinding(state, input.peer, channels));
-        agentTarget = issueAgentAddress(resolveAgentAddress(state, destination.binding, destination.childId), token);
+        const destinationBinding = resolvePeerBinding(state, input.peer, channels);
+        destination = input.reply_to === undefined
+          ? requireReadyPeer(state, destinationBinding)
+          : requireReadyReplyPeer(state, destinationBinding);
+        if (input.reply_to === undefined) {
+          agentTarget = issueAgentAddress(resolveAgentAddress(state, destination.binding, destination.childId), token);
+        }
       }
       const fileSource = input.text_file === undefined ? null : readTextFile(input.text_file);
       const text = fileSource === null ? input.text : fileSource.text;

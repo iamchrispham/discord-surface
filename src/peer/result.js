@@ -20,6 +20,22 @@ function packetMatches(left, right) {
     left.text === right.text && sameAddress(left.source, right.source) && sameAddress(left.target, right.target);
 }
 
+function packetVariants(packet, legacyAgentPacket) {
+  return [packet, legacyAgentPacket].filter(Boolean);
+}
+
+function packetRecordsMatch(left, right) {
+  return packetMatches(left.packet, right.packet) ||
+    (left.legacyAgentPacket && packetMatches(left.legacyAgentPacket, right.packet)) ||
+    (right.legacyAgentPacket && packetMatches(left.packet, right.legacyAgentPacket)) ||
+    (left.legacyAgentPacket && right.legacyAgentPacket && packetMatches(left.legacyAgentPacket, right.legacyAgentPacket));
+}
+
+function packetMatchesRecordedIdentity(candidate, records) {
+  return records.some(record => packetVariants(record.packet, record.legacyAgentPacket)
+    .some(variant => packetMatches(candidate, variant)));
+}
+
 function deliveryEvidence(state, messageId, packet) {
   const message = state.getMessage(messageId);
   if (!message || message.nativeId !== packet.target.nativeId || message.provider !== packet.target.provider ||
@@ -44,11 +60,19 @@ function inspectPeerResult(state, source, correlationId) {
     const d = row.detail;
     return d.nativeId === source.nativeId && d.provider === source.provider && d.generation === source.generation && d.guildId === source.guildId;
   });
-  const packets = rows.map(row => row.detail.agentPacket).filter(Boolean);
-  for (const packet of packets) validateAgentMessage(packet);
+  const records = rows.map(row => ({
+    packet: row.detail.agentPacket,
+    legacyAgentPacket: row.detail.legacyAgentPacket
+  })).filter(record => record.packet);
+  const packets = records.map(record => record.packet);
+  for (const record of records) {
+    validateAgentMessage(record.packet);
+    if (record.legacyAgentPacket) validateAgentMessage(record.legacyAgentPacket);
+  }
   const packet = packets[0];
   if (!packet) throw new Error('correlation is unknown for this caller');
-  if (packets.some(candidate => !packetMatches(candidate, packet))) throw new Error('correlation has conflicting custody');
+  const canonicalRecord = records[0];
+  if (records.some(candidate => !packetRecordsMatch(candidate, canonicalRecord))) throw new Error('correlation has conflicting custody');
   const receipts = state.listAgentMessageReceiptIds(packet.id);
   const deliveries = [];
   const results = [];
@@ -61,7 +85,7 @@ function inspectPeerResult(state, source, correlationId) {
     validateAgentMessage(candidate);
     const evidence = deliveryEvidence(state, discordId, candidate);
     if (!evidence) continue;
-    if (packetMatches(candidate, packet)) deliveries.push(evidence);
+    if (packetMatchesRecordedIdentity(candidate, records)) deliveries.push(evidence);
     else if (packet.kind === KINDS.REQUEST && candidate.kind === KINDS.RESULT && candidate.replyTo === packet.id &&
       sameAddress(candidate.source, packet.target) && sameAddress(candidate.target, packet.source)) {
       results.push({ ...evidence, packetId: candidate.id, text: candidate.text });
