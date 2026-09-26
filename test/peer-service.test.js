@@ -6,6 +6,7 @@ const path = require('node:path');
 const { fixture } = require('./fixtures/peer-fixture');
 const { createPeerService } = require('../src/peer/service');
 const { READINESS } = require('../src/state');
+const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const id = '11111111-1111-1111-1111-111111111111';
 function service(f, extras = {}) {
   return createPeerService({ state: f.state, provider: 'claude', token: 'fixture',
@@ -340,6 +341,54 @@ test('peer send refuses publication after destination child loses readiness duri
   assert.equal(result.status, 'stale');
   assert.equal(posts, 0);
   assert.equal(f.state.directPostRows(request.dedupe_key).filter(row => row.kind === 'direct-post-attempt').length, 0);
+});
+
+test('ready caller refuses send to unready destination binding gap before network or custody', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  assert.equal(f.state.getBinding('101').readiness, READINESS.READY);
+  assert.equal(f.state.getThreadEnrollment('102').state, THREAD_STATES.READY);
+  f.state.setBindingReadiness('201', READINESS.GAP, 'fixture destination gap', f.state.getBinding('201'));
+  let calls = 0;
+  const peer = service(f, { fetchImpl: async () => { calls += 1; assert.fail('unready destination reached network'); } });
+  const receipts = f.state.listReceipts();
+  const messages = f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all();
+  await assert.rejects(peer.send({ peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'unready-destination-binding-gap' }),
+    error => error instanceof Error && error.message === 'peer is not ready: fixture destination gap');
+  assert.equal(calls, 0);
+  assert.deepEqual(f.state.listReceipts(), receipts);
+  assert.deepEqual(f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all(), messages);
+});
+
+test('ready caller refuses send to unready destination binding unavailable before network or custody', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  assert.equal(f.state.getBinding('101').readiness, READINESS.READY);
+  assert.equal(f.state.getThreadEnrollment('102').state, THREAD_STATES.READY);
+  f.state.setBindingReadiness('201', READINESS.UNAVAILABLE, 'fixture destination unavailable', f.state.getBinding('201'));
+  let calls = 0;
+  const peer = service(f, { fetchImpl: async () => { calls += 1; assert.fail('unready destination reached network'); } });
+  const receipts = f.state.listReceipts();
+  const messages = f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all();
+  await assert.rejects(peer.send({ peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'unready-destination-binding-unavailable' }),
+    error => error instanceof Error && error.message === 'peer is not ready: fixture destination unavailable');
+  assert.equal(calls, 0);
+  assert.deepEqual(f.state.listReceipts(), receipts);
+  assert.deepEqual(f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all(), messages);
+});
+
+test('ready caller refuses send to unready destination child before network or custody', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
+  assert.equal(f.state.getBinding('101').readiness, READINESS.READY);
+  assert.equal(f.state.getThreadEnrollment('102').state, THREAD_STATES.READY);
+  f.state.markThreadBoundary('202', THREAD_STATES.GAP, 'fixture destination child gap', null, null, target);
+  let calls = 0;
+  const peer = service(f, { fetchImpl: async () => { calls += 1; assert.fail('unready destination reached network'); } });
+  const receipts = f.state.listReceipts();
+  const messages = f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all();
+  await assert.rejects(peer.send({ peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'unready-destination-child-gap' }),
+    error => error instanceof Error && error.message === 'peer child is not ready: fixture destination child gap');
+  assert.equal(calls, 0);
+  assert.deepEqual(f.state.listReceipts(), receipts);
+  assert.deepEqual(f.state.db.prepare('SELECT * FROM messages ORDER BY rowid').all(), messages);
 });
 
 test('peer result refuses publication after correlated destination handoff', async t => {
