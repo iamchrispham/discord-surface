@@ -198,7 +198,7 @@ test('unavailable child does not demote parent or send accepted work to it', asy
   f.child.locked = true;
   const controller = new AbortController();
   const result = await f.gateway.recoverInbound(controller.signal, 'fixture');
-  assert.equal(result.ready, true);
+  assert.equal(result.ready, false);
   assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
   await f.gateway._reconcilePending(null, controller.signal, true);

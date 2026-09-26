@@ -2609,7 +2609,9 @@ class DiscordGateway {
       const recovered = await recoverThread(this, enrollment, signal, lifecycleEpoch, waitForRecoveryOperation, false, deadline);
       const currentEnrollment = this.state.getThreadEnrollment(enrollment.threadId);
       if (!recovered) {
-        if (currentEnrollment?.active && currentEnrollment.state === THREAD_STATES.PENDING && !this.isPreAdoptionRetryableThread(enrollment.threadId)) {
+        if (currentEnrollment?.active && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(currentEnrollment.state)) {
+          failure ||= { ready: false, state: currentEnrollment.state };
+        } else if (currentEnrollment?.active && currentEnrollment.state === THREAD_STATES.PENDING && !this.isPreAdoptionRetryableThread(enrollment.threadId)) {
           const currentCount = this.liveIntakeCounts.get(enrollment.threadId) || 0;
           this.liveIntakeCounts.set(enrollment.threadId, Math.max(currentCount, this.liveCheckpointThreshold));
         }
@@ -2631,6 +2633,7 @@ class DiscordGateway {
       }
       return expanded;
     };
+    const allActiveEnrollmentsReady = () => this.state.listThreadEnrollments().every(enrollment => !enrollment.active || enrollment.state === THREAD_STATES.READY);
     const scopeIsReady = scope => {
       const expanded = expandScope(scope);
       const scopedChannels = expanded === null
@@ -2644,11 +2647,7 @@ class DiscordGateway {
         if (enrollment?.active && enrollment.state === THREAD_STATES.READY) continue;
         return false;
       }
-      if (expanded === null) {
-        for (const enrollment of this.state.listThreadEnrollments()) {
-          if (enrollment.active && enrollment.state !== THREAD_STATES.READY) return false;
-        }
-      }
+      if (expanded === null && !allActiveEnrollmentsReady()) return false;
       return true;
     };
     const scopesIntersect = (left, right) => {
@@ -2660,7 +2659,7 @@ class DiscordGateway {
     const makeResult = (waiter, fallback = null) => {
       if (waiter.stopped || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (scopeIsReady(waiter.scope)) return { ready: true, state: 'ready' };
-      if (waiter.scope === null && waiter.childCount === 0 && waiter.ownResult?.ready === true) return waiter.ownResult;
+      if (waiter.scope === null && waiter.childCount === 0 && waiter.ownResult?.ready === true && allActiveEnrollmentsReady()) return waiter.ownResult;
       const result = fallback || waiter.lastResult || waiter.ownResult || { ready: false, state: 'unavailable' };
       return result?.ready === true ? { ready: false, state: 'unavailable', error: result.error } : result;
     };
