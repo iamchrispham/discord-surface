@@ -923,6 +923,23 @@ test('ownerless preparation locks are reclaimed without deleting a replacement o
   assert.equal(fs.existsSync(lockPath), false);
 });
 
+test('malformed owner temporaries from dead processes are reclaimed', t => {
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const first = acquireSocketLockWithPath(t, socket);
+  const lockPath = first.lockPath;
+  const ownerPath = path.join(lockPath, 'owner');
+  const temporaryPath = path.join(lockPath, '.owner-999999999-crashed');
+  t.after(() => fs.rmSync(lockPath, { recursive: true, force: true }));
+
+  fs.unlinkSync(ownerPath);
+  fs.writeFileSync(temporaryPath, '', { mode: 0o600 });
+
+  const secondRelease = acquireSocketLock(socket);
+  assert.equal(fs.existsSync(temporaryPath), false);
+  assert.doesNotThrow(secondRelease);
+});
+
 test('ownerless lock replacement is not reclaimed by a stale contender', t => {
   const socket = socketPath(t);
   assertSocketDirectory(socket);

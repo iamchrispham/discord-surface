@@ -526,10 +526,17 @@ function clearOrphanOwnerTemps(lockPath: string): boolean {
     if (!match) continue;
     const pid = Number(match[1]);
     const ownerPath = path.join(lockPath, entry);
-    let marker: unknown;
+    let contents: string;
     try {
-      marker = JSON.parse(fs.readFileSync(ownerPath, 'utf8'));
-    } catch {
+      contents = fs.readFileSync(ownerPath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    let marker: unknown;
+    try { marker = JSON.parse(contents); } catch {
+      if (!Number.isSafeInteger(pid) || pid < 1 || isSocketLockOwnerAlive({ pid })) return false;
+      unlinkIfPresent(ownerPath);
       continue;
     }
     if (!marker || typeof marker !== 'object') continue;
