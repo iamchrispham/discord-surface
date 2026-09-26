@@ -153,8 +153,26 @@ export function unlinkSocketIfOwned(socketPath: string, expected: SocketPathIden
     throw error;
   }
   if (!sameSocket(observed, expected)) return;
-  try { fs.unlinkSync(socketPath); } catch (error) {
+  let quarantineDirectory: string | undefined;
+  try {
+    quarantineDirectory = fs.mkdtempSync(path.join(path.dirname(socketPath), '.stale-'));
+    const quarantinedPath = path.join(quarantineDirectory, 'socket');
+    fs.renameSync(socketPath, quarantinedPath);
+    const quarantined = socketIdentity(quarantinedPath);
+    if (quarantined.dev !== expected.dev || quarantined.ino !== expected.ino) {
+      fs.renameSync(quarantinedPath, socketPath);
+      fs.rmdirSync(quarantineDirectory);
+      return;
+    }
+    fs.unlinkSync(quarantinedPath);
+    fs.rmdirSync(quarantineDirectory);
+    quarantineDirectory = undefined;
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  } finally {
+    if (quarantineDirectory !== undefined) {
+      try { fs.rmdirSync(quarantineDirectory); } catch {}
+    }
   }
 }
 
@@ -242,7 +260,7 @@ function canonicalSocketPath(socketPath: string): string {
   const normalizationInsensitive = isNormalizationInsensitiveDirectory(canonicalParentPath);
   const normalizedBasename = normalizationInsensitive ? basename.normalize('NFC') : basename;
   if (!caseInsensitive && !normalizationInsensitive) return path.join(canonicalParentPath, basename);
-  const comparableBasename = caseInsensitive ? normalizedBasename.toLowerCase() : normalizedBasename;
+  const comparableBasename = caseInsensitive ? filesystemCaseFold(normalizedBasename) : normalizedBasename;
   return path.join(canonicalParentPath, comparableBasename);
 }
 
@@ -253,6 +271,22 @@ function pathIsWithin(parentPath: string, childPath: string): boolean {
 
 function pathsOverlap(leftPath: string, rightPath: string): boolean {
   return pathIsWithin(leftPath, rightPath) || pathIsWithin(rightPath, leftPath);
+}
+
+function filesystemCaseFold(value: string): string {
+  // Per-code-point folding keeps final sigma and the Unicode special cases stable.
+  return Array.from(value, character => {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint === 0x1e9e) return 'ss';
+    if (codePoint === 0x0131 || (codePoint >= 0x13a0 && codePoint <= 0x13f5)) return character;
+    if (codePoint >= 0x13f8 && codePoint <= 0x13fd) {
+      return String.fromCodePoint(codePoint - 8);
+    }
+    if (codePoint >= 0xab70 && codePoint <= 0xabbf) {
+      return String.fromCodePoint(codePoint - 0x97d0);
+    }
+    return character.toUpperCase().toLowerCase();
+  }).join('');
 }
 
 function lockNamespaceCandidate(parentPath: string, prefix: string): string {
@@ -557,6 +591,16 @@ function clearOrphanOwnerTemps(lockPath: string): boolean {
   return true;
 }
 
+function stagingPathForCurrentCreator(namespacePath: string): string {
+  const stagingPath = stagingPathForNamespace(namespacePath);
+  const identity = processIdentity(process.pid);
+  const identityToken = identity === undefined
+    ? 'u'
+    : Buffer.from(identity, 'utf8').toString('hex') || 'u';
+  const name = path.basename(stagingPath);
+  return path.join(namespacePath, name.replace(/^(\.staging-\d+-)/, `$1i${identityToken}-`));
+}
+
 function clearOrphanStagingDirs(namespacePath: string): void {
   try {
     assertLockNamespaceIsUsable(namespacePath, effectiveUserId());
@@ -570,10 +614,13 @@ function clearOrphanStagingDirs(namespacePath: string): void {
     throw error;
   }
   for (const entry of entries) {
-    const match = entry.match(/^\.staging-(\d+)-/);
-    if (!match) continue;
-    const pid = Number(match[1]);
-    const identity = processIdentity(pid);
+    const legacyMatch = entry.match(/^\.staging-(\d+)-/);
+    if (!legacyMatch) continue;
+    const identityMatch = entry.match(/^\.staging-(\d+)-i([0-9a-f]+|u)-/);
+    const pid = Number(legacyMatch[1]);
+    const identity = identityMatch && identityMatch[2] !== 'u'
+      ? Buffer.from(identityMatch[2], 'hex').toString('utf8')
+      : processIdentity(pid);
     if (isSocketLockOwnerAlive({ pid, identity })) continue;
     removeLockDirectory(path.join(namespacePath, entry));
   }
@@ -581,7 +628,7 @@ function clearOrphanStagingDirs(namespacePath: string): void {
 
 function createStagingLock(namespacePath: string): string {
   for (;;) {
-    const stagingPath = stagingPathForNamespace(namespacePath);
+    const stagingPath = stagingPathForCurrentCreator(namespacePath);
     try {
       fs.mkdirSync(stagingPath, { mode: 0o700 });
       return stagingPath;
@@ -812,11 +859,29 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
         reject(new Error('Claude channel socket changed during stale probe'));
         return;
       }
+      let quarantineDirectory: string | undefined;
       try {
-        fs.unlinkSync(socketPath);
+        quarantineDirectory = fs.mkdtempSync(path.join(path.dirname(socketPath), '.stale-'));
+        const quarantinedPath = path.join(quarantineDirectory, 'socket');
+        fs.renameSync(socketPath, quarantinedPath);
+        const quarantined = fs.lstatSync(quarantinedPath);
+        if (!quarantined.isSocket() || quarantined.uid !== original.uid ||
+          quarantined.dev !== original.dev || quarantined.ino !== original.ino) {
+          fs.renameSync(quarantinedPath, socketPath);
+          fs.rmdirSync(quarantineDirectory);
+          quarantineDirectory = undefined;
+          reject(new Error('Claude channel socket changed during stale probe'));
+          return;
+        }
+        fs.unlinkSync(quarantinedPath);
+        fs.rmdirSync(quarantineDirectory);
+        quarantineDirectory = undefined;
         resolve();
-      } catch (unlinkError) {
-        reject(unlinkError);
+      } catch (cleanupError) {
+        if (quarantineDirectory !== undefined) {
+          try { fs.rmdirSync(quarantineDirectory); } catch {}
+        }
+        reject(cleanupError);
       }
     }
     signal?.addEventListener('abort', onAbort, { once: true });
