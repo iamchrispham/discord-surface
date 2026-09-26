@@ -37,6 +37,11 @@ function acquireSocketLockWithPath(t, socket) {
   return { release, lockPath };
 }
 
+function releaseQuietly(release) {
+  if (!release) return;
+  try { release(); } catch {}
+}
+
 function isCaseInsensitiveDirectory(directory) {
   const probe = `.case-probe-${randomUUID()}`;
   const probePath = path.join(directory, probe);
@@ -167,45 +172,133 @@ test('unreadable live owner markers preserve the preparation lock', { timeout: 8
   }
 });
 
-test('coordination artifacts stay outside a valid endpoint namespace', t => {
-  const dir = fs.mkdtempSync('/tmp/dss-');
-  fs.chmodSync(dir, 0o700);
-  const socket = path.join(dir, '.discord-surface-locks');
-  t.after(() => removeSocketDirectory(socket));
+test('socket paths overlapping the reserved coordination namespace are refused', t => {
+  const socket = socketPath(t);
   assertSocketDirectory(socket);
-  assert.equal(fs.existsSync(socket), false);
   const local = acquireSocketLockWithPath(t, socket);
-  assert.equal(fs.existsSync(socket), false);
-  local.release();
+  const namespacePath = path.dirname(local.lockPath);
 
-  const nestedEndpoint = local.lockPath;
-  assert.equal(fs.existsSync(nestedEndpoint), false);
-  assertSocketDirectory(nestedEndpoint);
-  const second = acquireSocketLockWithPath(t, nestedEndpoint);
-  try {
-    assert.notEqual(second.lockPath, nestedEndpoint);
-    assert.equal(fs.existsSync(nestedEndpoint), false);
-  } finally {
-    second.release();
-  }
+  // A normal endpoint whose parent merely starts with the namespace name still works.
+  const nearNamespace = fs.mkdtempSync('/tmp/.discord-surface-locks-private-');
+  fs.chmodSync(nearNamespace, 0o700);
+  t.after(() => fs.rmSync(nearNamespace, { recursive: true, force: true }));
+  const nearSocket = path.join(nearNamespace, 'listener.sock');
+  assertSocketDirectory(nearSocket);
+  const near = acquireSocketLockWithPath(t, nearSocket);
+  t.after(() => releaseQuietly(near.release));
+  assert.equal(path.dirname(near.lockPath), namespacePath);
+
+  // A short symlink-parent alias into the reserved namespace must be refused.
+  const alias = `${namespacePath}-alias-${randomUUID()}`;
+  fs.symlinkSync(namespacePath, alias, 'dir');
+  t.after(() => fs.unlinkSync(alias));
+
+  assert.throws(() => acquireSocketLock(path.join(namespacePath, 'direct.sock')), /conflicts with socket path/);
+  assert.throws(() => acquireSocketLock(path.join(alias, 'aliased.sock')), /conflicts with socket path/);
+  assert.throws(() => acquireSocketLock(local.lockPath), /conflicts with socket path/);
+
+  local.release();
 });
 
-test('socket locks fall back from an unusable home and remove empty namespaces', t => {
-  const root = fs.mkdtempSync('/tmp/dss-home-');
-  const homeFile = path.join(root, 'home');
-  fs.writeFileSync(homeFile, 'not a directory');
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  t.mock.method(os, 'homedir', () => homeFile);
-
+test('socket locks use one fixed namespace and retain it across release', t => {
   const socket = socketPath(t);
   assertSocketDirectory(socket);
   const { release, lockPath } = acquireSocketLockWithPath(t, socket);
   const namespacePath = path.dirname(lockPath);
-  const expectedRoot = process.platform === 'win32' ? fs.realpathSync(os.tmpdir()) : fs.realpathSync('/tmp');
-  assert.equal(path.dirname(namespacePath), expectedRoot);
+  assert.equal(path.dirname(namespacePath), fs.realpathSync('/tmp'));
+  assert.match(path.basename(namespacePath), new RegExp(`^\\.discord-surface-locks-${process.getuid()}-coordination`));
+
+  // Changed HOME/TMPDIR must not move the lock: the contender still sees the same one.
+  const bogus = path.join(fs.realpathSync('/tmp'), `dss-bogus-${randomUUID()}`);
+  t.mock.method(os, 'homedir', () => bogus);
+  t.mock.method(os, 'tmpdir', () => bogus);
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+
+  // Environment-independent retention: the shared namespace must never be an
+  // rmdir target (a non-empty namespace would otherwise mask the bug as ENOTEMPTY).
+  const rmdirs = [];
+  const originalRmdir = fs.rmdirSync;
+  t.mock.method(fs, 'rmdirSync', (target, ...args) => {
+    rmdirs.push(String(target));
+    return originalRmdir(target, ...args);
+  });
   release();
-  assert.equal(fs.existsSync(namespacePath), false);
+  assert.equal(fs.existsSync(lockPath), false, 'release must remove only the lock object');
+  // Plain retention assertion: the shared namespace directory must survive release.
+  assert.equal(fs.existsSync(namespacePath), true, 'namespace directory must be retained after release');
+  assert.equal(fs.lstatSync(namespacePath).isDirectory(), true, 'namespace path must remain a directory');
+  assert.equal(rmdirs.includes(namespacePath), false, 'release must never rmdir the shared namespace root');
 });
+
+test('an unusable fixed namespace root refuses with no fallback', t => {
+  const probe = socketPath(t);
+  assertSocketDirectory(probe);
+  const seed = acquireSocketLockWithPath(t, probe);
+  const namespacePath = path.dirname(seed.lockPath);
+  seed.release();
+
+  const socket = socketPath(t);
+  const originalLstat = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    if (target === namespacePath && !(args.length > 0 && args[0] && args[0].bigint)) {
+      const stats = originalLstat(target, ...args);
+      return {
+        dev: stats.dev,
+        ino: stats.ino,
+        mode: stats.mode & ~0o077,
+        uid: stats.uid,
+        isDirectory: () => false,
+        isSymbolicLink: () => false
+      };
+    }
+    return originalLstat(target, ...args);
+  });
+
+  assert.throws(() => acquireSocketLock(socket), /namespace is unusable/);
+  assert.equal(fs.existsSync(socket), false, 'refusal must not mutate the socket path');
+  assert.equal(fs.existsSync(namespacePath), true, 'refusal must not delete the shared namespace root');
+});
+
+// Each facet makes exactly one namespace usability term false, so removing that
+// term from lockNamespacePath makes only that facet test fail.
+function unusableNamespaceFacets() {
+  const healthy = stats => ({
+    dev: stats.dev,
+    ino: stats.ino,
+    mode: stats.mode,
+    uid: stats.uid,
+    isDirectory: () => true,
+    isSymbolicLink: () => false
+  });
+  return [
+    ['not a directory', stats => ({ ...healthy(stats), isDirectory: () => false })],
+    ['a symlink', stats => ({ ...healthy(stats), isSymbolicLink: () => true })],
+    ['group or other accessible', stats => ({ ...healthy(stats), mode: stats.mode | 0o077 })],
+    ['owned by another uid', stats => ({ ...healthy(stats), uid: stats.uid + 1 })]
+  ];
+}
+
+for (const [label, corrupt] of unusableNamespaceFacets()) {
+  test(`an unusable fixed namespace root (${label}) refuses with no fallback`, t => {
+    const probe = socketPath(t);
+    assertSocketDirectory(probe);
+    const seed = acquireSocketLockWithPath(t, probe);
+    const namespacePath = path.dirname(seed.lockPath);
+    seed.release();
+
+    const socket = socketPath(t);
+    const originalLstat = fs.lstatSync;
+    t.mock.method(fs, 'lstatSync', (target, ...args) => {
+      const stats = originalLstat(target, ...args);
+      if (target === namespacePath && !(args.length > 0 && args[0] && args[0].bigint)) return corrupt(stats);
+      return stats;
+    });
+
+    assert.throws(() => acquireSocketLock(socket), /namespace is unusable/);
+    assert.equal(fs.existsSync(socket), false, 'refusal must not mutate the socket path');
+    assert.equal(fs.existsSync(namespacePath), true, 'refusal must not delete the shared namespace root');
+  });
+}
 
 test('coordination lock paths are rejected by the endpoint contract', t => {
   const socket = socketPath(t);
@@ -351,39 +444,54 @@ test('ownerless lock replacement is not reclaimed by a stale contender', t => {
   assert.equal(fs.existsSync(lockPath), false);
 });
 
-test('legacy lock reclamation preserves a replacement owner', t => {
+test('a regular file at the canonical lock path is refused untouched', t => {
   const socket = socketPath(t);
   assertSocketDirectory(socket);
   const first = acquireSocketLockWithPath(t, socket);
   const lockPath = first.lockPath;
   first.release();
   t.after(() => fs.rmSync(lockPath, { recursive: true, force: true }));
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999999 }));
+  const ownerBytes = JSON.stringify({ pid: 999999999 });
+  fs.writeFileSync(lockPath, ownerBytes, { mode: 0o600 });
+  const before = fs.lstatSync(lockPath, { bigint: true });
 
-  const originalOpen = fs.openSync;
-  const originalRead = fs.readFileSync;
-  const ownerDescriptors = new Set();
-  let replaced = false;
-  t.mock.method(fs, 'openSync', (file, ...args) => {
-    const descriptor = originalOpen(file, ...args);
-    if (file === lockPath) ownerDescriptors.add(descriptor);
-    return descriptor;
-  });
-  t.mock.method(fs, 'readFileSync', (file, ...args) => {
-    const value = originalRead(file, ...args);
-    if (!replaced && typeof file === 'number' && ownerDescriptors.has(file)) {
-      replaced = true;
-      fs.unlinkSync(lockPath);
-      fs.mkdirSync(lockPath, { mode: 0o700 });
-      fs.writeFileSync(path.join(lockPath, 'owner'), JSON.stringify({ pid: process.pid }));
-    }
-    return value;
+  const originalRename = fs.renameSync;
+  const renamed = [];
+  t.mock.method(fs, 'renameSync', (source, ...rest) => {
+    if (String(source) === lockPath) renamed.push(String(rest[0]));
+    return originalRename(source, ...rest);
   });
 
   assert.throws(() => acquireSocketLock(socket), /already in progress/);
-  assert.equal(fs.lstatSync(lockPath).isDirectory(), true);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(lockPath, 'owner'), 'utf8')).pid, process.pid);
+  const after = fs.lstatSync(lockPath, { bigint: true });
+  assert.equal(after.isFile(), true, 'regular file must be preserved');
+  assert.equal(after.ino, before.ino, 'regular file identity must be preserved');
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), ownerBytes, 'regular file bytes must be preserved');
+  assert.deepEqual(renamed, [], 'regular file must not be renamed');
+
+  // A replacement object appearing at the path afterward is also refused and preserved.
+  fs.writeFileSync(lockPath, 'replacement-object');
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), 'replacement-object');
+});
+
+test('a symlink at the canonical lock path is refused untouched', t => {
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const first = acquireSocketLockWithPath(t, socket);
+  const lockPath = first.lockPath;
+  first.release();
+  t.after(() => fs.rmSync(lockPath, { recursive: true, force: true }));
+  const target = `${lockPath}.target`;
+  fs.symlinkSync(target, lockPath);
+  const before = fs.lstatSync(lockPath, { bigint: true });
+  assert.equal(before.isSymbolicLink(), true);
+
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  const after = fs.lstatSync(lockPath, { bigint: true });
+  assert.equal(after.isSymbolicLink(), true, 'symlink must be preserved');
+  assert.equal(after.ino, before.ino, 'symlink identity must be preserved');
+  assert.equal(fs.readlinkSync(lockPath), target, 'symlink target must be preserved');
 });
 
 test('socket-lock release remains retryable after owner removal fails', t => {

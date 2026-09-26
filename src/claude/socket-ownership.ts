@@ -1,7 +1,6 @@
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as net from 'node:net';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -260,48 +259,36 @@ function lockNamespaceCandidate(parentPath: string, prefix: string): string {
   return path.join(parentPath, component);
 }
 
-function canonicalNamespaceRoot(directoryPath: string): string | undefined {
-  try { return fs.realpathSync(directoryPath); } catch { return undefined; }
-}
-
-function ensureUsableLockNamespaceCandidate(directoryPath: string): boolean {
+function lockNamespacePath(socketPath: string): string {
+  let root: string;
   try {
-    fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
-    const directory = fs.lstatSync(directoryPath);
-    const owner = process.getuid?.();
-    return directory.isDirectory() && (directory.mode & 0o077) === 0 && (owner === undefined || directory.uid === owner);
+    root = fs.realpathSync('/tmp');
   } catch {
-    return false;
+    throw new Error('Claude channel socket lock namespace root is unavailable');
   }
-}
-
-function lockNamespacePath(socketPath: string, key: string): string {
-  const homeRoot = canonicalNamespaceRoot(os.homedir());
-  const temporaryRoot = canonicalNamespaceRoot(process.platform === 'win32' ? os.tmpdir() : '/tmp');
   const owner = process.getuid?.();
   const ownerName = owner === undefined ? 'shared' : String(owner);
-  const candidates = [
-    ...(homeRoot ? [
-      lockNamespaceCandidate(homeRoot, `.dss-locks-${ownerName}-${key}`),
-      lockNamespaceCandidate(homeRoot, `${LOCK_NAMESPACE}-${ownerName}`)
-    ] : []),
-    ...(temporaryRoot ? [
-      lockNamespaceCandidate(temporaryRoot, `.dss-locks-${ownerName}-${key.slice(0, 16)}`),
-      lockNamespaceCandidate(temporaryRoot, `${LOCK_NAMESPACE}-fallback-${ownerName}-${key}`)
-    ] : [])
-  ];
-  for (const candidate of candidates) {
-    if (pathsOverlap(socketPath, candidate)) continue;
-    if (!ensureUsableLockNamespaceCandidate(candidate)) continue;
-    return candidate;
+  const namespacePath = lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`);
+  if (pathsOverlap(socketPath, namespacePath)) {
+    throw new Error('Claude channel socket lock namespace conflicts with socket path');
   }
-  throw new Error('Claude channel socket lock namespace conflicts with socket path');
+  try {
+    fs.mkdirSync(namespacePath, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  const directory = fs.lstatSync(namespacePath);
+  if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0 ||
+    (owner !== undefined && directory.uid !== owner)) {
+    throw new Error('Claude channel socket lock namespace is unusable');
+  }
+  return namespacePath;
 }
 
 function lockPathForSocket(socketPath: string): string {
   const identityPath = canonicalSocketPath(socketPath);
   const key = createHash('sha256').update(identityPath).digest('hex').slice(0, 32);
-  return path.join(lockNamespacePath(identityPath, key), `${key}.lock`);
+  return path.join(lockNamespacePath(identityPath), `${key}.lock`);
 }
 
 function ownerPathForLock(lockPath: string): string {
@@ -579,12 +566,12 @@ function reclaimOwnerFile(
   const tombstonePath = path.join(transitionPath, 'owner');
   try {
     if (expectedLockGeneration) {
-      let observedLock: FileGeneration;
-      try { observedLock = fileGeneration(lockPath); } catch (error) {
+      let observedLock: FileIdentity;
+      try { observedLock = fileIdentity(lockPath); } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
         throw error;
       }
-      if (!sameGeneration(observedLock, expectedLockGeneration)) return false;
+      if (!sameFile(observedLock, expectedLockGeneration)) return false;
     }
     let observed: OwnerMarkerSnapshot | undefined;
     try { observed = readSocketLockOwnerSnapshot(ownerPath); } catch (error) {
@@ -637,39 +624,6 @@ function releaseSocketLock(lockPath: string, ownerPath: string, marker: OwnerMar
     throw new Error('Claude channel socket preparation lock owner changed before release');
   }
   removeEmptyDirectory(lockPath);
-  removeEmptyDirectory(path.dirname(lockPath));
-}
-
-function reclaimLegacyLockFile(lockPath: string, expected: FileIdentity): boolean {
-  let current: FileIdentity;
-  try {
-    current = fileIdentity(lockPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
-    throw error;
-  }
-  if (!sameFile(current, expected)) return false;
-
-  const tombstonePath = `${lockPath}.reclaim-${process.pid}-${randomUUID()}`;
-  try {
-    fs.renameSync(lockPath, tombstonePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
-    if ((error as NodeJS.ErrnoException).code === 'EISDIR') return false;
-    throw error;
-  }
-  try {
-    const moved = fileIdentity(tombstonePath);
-    if (!sameFile(moved, expected)) {
-      fs.renameSync(tombstonePath, lockPath);
-      return false;
-    }
-    fs.unlinkSync(tombstonePath);
-    return true;
-  } catch (error) {
-    try { fs.renameSync(tombstonePath, lockPath); } catch {}
-    throw error;
-  }
 }
 
 export function acquireSocketLock(socketPath: string): SocketLockRelease {
@@ -715,19 +669,7 @@ export function acquireSocketLock(socketPath: string): SocketLockRelease {
         }
         continue;
       }
-      if (!lockStats.isFile()) throw new Error('Claude channel socket preparation lock is invalid');
-      let ownerSnapshot: OwnerMarkerSnapshot;
-      try { ownerSnapshot = readSocketLockOwnerSnapshot(lockPath); } catch (ownerError) {
-        if ((ownerError as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        throw ownerError;
-      }
-      const owner = ownerSnapshot.owner;
-      if (isSocketLockOwnerAlive(owner)) {
-        throw new Error('Claude channel socket preparation is already in progress');
-      }
-      if (!reclaimLegacyLockFile(lockPath, ownerSnapshot.identity)) {
-        throw new Error('Claude channel socket preparation is already in progress');
-      }
+      throw new Error('Claude channel socket preparation is already in progress');
     }
   }
 }
