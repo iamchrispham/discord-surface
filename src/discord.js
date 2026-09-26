@@ -17,7 +17,16 @@ const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { readDirectPostFileSnapshot } = require('./direct-post-file');
 const { assertPublicThread, historyPermission, recoverThread } = require('./discord/thread-enrollment');
-const { isPreAdoptionRetryableThread, isRetryableFetchBoundary, recoveryFetch } = require('./discord/recovery-fetch');
+const {
+  classifyRecoveryFailure,
+  isInterruptedRetryBoundary,
+  isPreAdoptionRetryableThread,
+  isRetryableFetchBoundary,
+  isRetryableIntakeBoundary,
+  refusesUnqualifiedBaseline,
+  recoveryFetch,
+  retryPendingBoundaryDetail
+} = require('./discord/recovery-fetch');
 const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail, isNativeProofRetryBoundary } = require('./discord/native-proof-recovery');
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
@@ -127,6 +136,18 @@ function bindingIdentityMatches(expected, current) {
   return Boolean(current?.active) && current.channelId === expected.channelId && current.guildId === expected.guildId &&
     current.provider === expected.provider && current.nativeId === expected.nativeId &&
     current.generation === expected.generation && current.conductorId === expected.conductorId && current.repoKey === expected.repoKey;
+}
+
+// F12: a resolved channel is only usable when its guild/channel identity agrees with
+// the stored message destination tuple. Absent stored metadata stays compatible.
+function storedChannelMatches(channel, stored) {
+  if (!stored) return true;
+  const expectedChannelId = stored.deliveryChannelId || stored.channelId;
+  if (typeof expectedChannelId === 'string' && expectedChannelId &&
+      typeof channel?.id === 'string' && channel.id !== expectedChannelId) return false;
+  if (typeof stored.guildId === 'string' && stored.guildId &&
+      typeof channel?.guildId === 'string' && channel.guildId !== stored.guildId) return false;
+  return true;
 }
 
 function readSecret(secretFile) {
@@ -528,9 +549,12 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return returnWhenQueued ? Promise.resolve({ status: 'observing', message: state.getMessage(message.id) }) : promise;
   }
 
-  function trackNativeWork(messageId, work, onSettled = null) {
+  function trackNativeWork(message, work, onSettled = null) {
     const tracked = Promise.resolve(work);
-    nativeWork.set(messageId, { promise: tracked, controller: null });
+    const messageId = message.id;
+    // F11: retain the ORIGINAL message reference so a later verified channel fetch can
+    // refresh only this entry's delivery channel without replacing the promise/observer.
+    nativeWork.set(messageId, { message, promise: tracked, controller: null });
     tracked.finally(() => {
       if (nativeWork.get(messageId)?.promise !== tracked) return;
       nativeWork.delete(messageId);
@@ -539,7 +563,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return tracked;
   }
 
-  function startNativeWork(messageId, signal, workFactory, onSettled = null) {
+  function startNativeWork(message, signal, workFactory, onSettled = null) {
     const controller = new AbortController();
     const onAbort = () => controller.abort();
     if (signal?.aborted) controller.abort();
@@ -548,11 +572,25 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       if (controller.signal.aborted) return { status: 'stopped', message: null };
       return workFactory(controller.signal);
     });
-    const tracked = trackNativeWork(messageId, work, onSettled);
-    const entry = nativeWork.get(messageId);
+    const tracked = trackNativeWork(message, work, onSettled);
+    const entry = nativeWork.get(message.id);
     if (entry?.promise === tracked) entry.controller = controller;
     tracked.finally(() => signal?.removeEventListener('abort', onAbort)).catch(() => {});
     return tracked;
+  }
+
+  // F11: a later verified channel fetch refreshes ONLY the existing entry's delivery
+  // channel. A channel-less input never clears usable channel context, and the object,
+  // promise and observer remain the same.
+  function refreshNativeWorkChannel(message) {
+    const channel = message?.channel;
+    if (!channel) return false;
+    let refreshed = false;
+    const active = nativeWork.get(message.id);
+    if (active?.message) { active.message.channel = channel; refreshed = true; }
+    const queued = queuedNativeWork.get(message.id);
+    if (queued?.message) { queued.message.channel = channel; refreshed = true; }
+    return refreshed;
   }
 
   function abortNativeWork() {
@@ -746,7 +784,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       if (ownerEntry.dispatchBlocked) settleNative();
       const work = ownerEntry.dispatchBlocked
         ? Promise.resolve({ status: COURIER_OUTCOMES.NOT_SUBMITTED, message: state.getMessage(message.id) })
-        : startNativeWork(message.id, signal, async taskSignal => {
+        : startNativeWork(message, signal, async taskSignal => {
         let result;
         try {
           if (courierCustodyRequiresOwnerHold(message.id)) {
@@ -863,7 +901,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return processAccepted(message, signal, { continueUntilFinal, awaitExisting: false, handoff, awaitDispatchOutcome });
   }
 
-  function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false } = {}) {
+  function resumeSubmitted(message, signal, { awaitExisting = false, continueUntilFinal = false, deferReply = false } = {}) {
     if (!state.isInteractionMessage?.(message.id)) launchTransportReceipt(message);
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) {
@@ -881,7 +919,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
         refreshDispatchBlock();
         onNativeSettled();
       };
-      const work = startNativeWork(message.id, signal, async taskSignal => {
+      const work = startNativeWork(message, signal, async taskSignal => {
         const provider = providers[message.provider];
         let result;
         try {
@@ -889,7 +927,8 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
         } finally {
           settleNative();
         }
-        return deliverReply(message, result, taskSignal);
+        const holdReply = typeof deferReply === 'function' ? deferReply() : deferReply;
+        return holdReply ? result : deliverReply(message, result, taskSignal);
       }, settleNative);
       if (continueUntilFinal) return Promise.resolve({ status: 'observing', message: state.getMessage(message.id) });
       return work;
@@ -899,7 +938,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
   }
 
   return { abortNativeWork, deliverReply, handleMessage, handleStoredMessage, intakeMessage, issueTransportReceipt, processAccepted,
-    releaseAcknowledged, releaseHandledWithoutPost, releaseIntake, resumeSubmitted, waitForNativeWork, waitForReceipts };
+    refreshNativeWorkChannel, releaseAcknowledged, releaseHandledWithoutPost, releaseIntake, resumeSubmitted, waitForNativeWork, waitForReceipts };
 }
 
 class DiscordGateway {
@@ -1254,12 +1293,15 @@ class DiscordGateway {
     if (!bindingIdentityMatches(stored, binding)) return;
     const enrollment = this.state.getThreadEnrollment(stored.deliveryChannelId);
     if (!enrollment) return;
+    const detail = recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE
+      ? classifyRecoveryFailure(error).detail
+      : error.message;
     const retryableBoundary = isRetryableFetchBoundary(enrollment.state, enrollment.detail);
-    const retryableFetch = isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, error.message);
+    const retryableFetch = isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
     if (['gap', 'unavailable'].includes(enrollment.state) && !retryableBoundary) return;
     const nextState = !enrollment.adoptedAt && retryableFetch ? THREAD_STATES.PENDING : THREAD_STATES.UNAVAILABLE;
     this.state.markThreadBoundary(stored.deliveryChannelId, nextState,
-      error.message, null, null, binding, undefined, undefined, enrollment);
+      detail, null, null, binding, undefined, undefined, enrollment);
   }
 
   async threadDeliveryMessage(message) {
@@ -1292,6 +1334,12 @@ class DiscordGateway {
     if (typeof reply.replyNonce !== 'string' || reply.replyNonce.length > 25) throw new Error('Discord reply nonce must be at most 25 characters');
     const channel = message.channel || await this.client.channels?.fetch?.(message.deliveryChannelId || message.channelId);
     if (!channel?.send) throw new Error('Discord reply channel is unavailable');
+    // F12: an explicit guild/channel mismatch on the resolved destination is a
+    // definitive not-sent outcome. Nothing is sent and the saved reply keeps its
+    // stored tuple. Missing stored metadata stays compatible.
+    if (!storedChannelMatches(channel, stored)) {
+      throw Object.assign(new Error('Discord reply channel does not match the stored message destination'), { outcome: 'not_sent' });
+    }
     this.state.assertMessageCurrent(reply.id, 'reply-send');
     const fileManifest = reply.replyPart?.fileManifest || null;
     const files = fileManifest
@@ -1472,7 +1520,7 @@ class DiscordGateway {
       if (this.isCurrentLifecycle(lifecycleEpoch) && !this.stopping && connectionEpoch === this.connectionEpoch && result.state !== 'stopped') {
         this.transportReady = true;
         if (result.ready) await this.reconcilePending();
-        else if (this.ready) await this.reconcilePending(undefined, { readyOnly: true });
+        else await this.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
         if (!this.stopping && connectionEpoch === this.connectionEpoch) this.onReady?.();
       }
       return result;
@@ -1529,7 +1577,18 @@ class DiscordGateway {
               watermark.detail.startsWith('Codex transcript proof unavailable before event write:')
             );
         }) && unresolvedThreadEnrollments.every(enrollment => this.isPreAdoptionRetryableThread(enrollment.threadId));
-      if (!aggregateRecoveryReady && !hasEndpointUnavailableBinding) throw new Error(`Discord intake recovery is ${aggregateRecoveryState}`);
+      const hasPersistedRecoveryHolds = !aggregateRecoveryReady && recovery.state !== 'stopped' &&
+        (unresolvedBindings.length > 0 || unresolvedThreadEnrollments.length > 0) &&
+        unresolvedBindings.every(binding => {
+          const watermark = this.state.getIntakeWatermark(binding.channelId);
+          return watermark && [READINESS.PENDING, READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark.state) &&
+            binding.readiness === watermark.state;
+        }) &&
+        unresolvedThreadEnrollments.every(enrollment =>
+          [THREAD_STATES.PENDING, THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(enrollment.state));
+      if (!aggregateRecoveryReady && !hasEndpointUnavailableBinding && !hasPersistedRecoveryHolds) {
+        throw new Error(`Discord intake recovery is ${aggregateRecoveryState}`);
+      }
       if (hasEndpointUnavailableBinding) this.ready = true;
       this.transportReady = true;
       this.started = true;
@@ -2168,57 +2227,114 @@ class DiscordGateway {
     const selectedChannels = channelIds ? new Set(channelIds) : null;
     const bindings = this.state.listBindings().filter(binding => binding.active &&
       (!selectedChannels || selectedChannels.has(binding.channelId)));
+    const hasCoveredReadyWatermark = currentBoundary => currentBoundary?.state === READINESS.READY &&
+      ((currentBoundary.last_seen_id === null && currentBoundary.recovered_through_id === null) ||
+        (typeof currentBoundary.last_seen_id === 'string' && currentBoundary.last_seen_id.length > 0 &&
+          typeof currentBoundary.recovered_through_id === 'string' && currentBoundary.recovered_through_id.length > 0 &&
+          compareDiscordIds(currentBoundary.recovered_through_id, currentBoundary.last_seen_id) >= 0));
     const classifyReadiness = (currentBinding, currentBoundary) => {
-      if (currentBinding?.readiness === READINESS.READY && currentBoundary?.state === READINESS.READY) return READINESS.READY;
-      if (currentBinding?.readiness === READINESS.GAP || currentBoundary?.state === READINESS.GAP) return READINESS.GAP;
+      if (currentBoundary?.state === READINESS.READY &&
+          (currentBinding?.readiness === READINESS.READY ||
+            (currentBinding?.readiness === READINESS.RECOVERING && hasCoveredReadyWatermark(currentBoundary)))) return READINESS.READY;
+      const retryableBoundary = isRetryableIntakeBoundary(currentBoundary) || isInterruptedRetryBoundary(currentBoundary);
+      if (currentBinding?.readiness === READINESS.GAP) return READINESS.GAP;
       if (currentBinding?.readiness === READINESS.UNAVAILABLE) return READINESS.UNAVAILABLE;
+      if (!retryableBoundary && currentBoundary?.state === READINESS.GAP) return READINESS.GAP;
       if (currentBoundary?.state === READINESS.UNAVAILABLE &&
-          !isRetryableFetchBoundary(currentBoundary.state, currentBoundary.detail)) return READINESS.UNAVAILABLE;
-      if (currentBinding?.readiness === READINESS.PENDING || currentBoundary?.state === READINESS.PENDING) return READINESS.PENDING;
+          !retryableBoundary) return READINESS.UNAVAILABLE;
+      if (currentBinding?.readiness === READINESS.PENDING || currentBoundary?.state === READINESS.PENDING || retryableBoundary) return READINESS.PENDING;
       if (currentBinding?.readiness === READINESS.RECOVERING && currentBoundary?.state === READINESS.READY &&
           currentBoundary.last_seen_id && (!currentBoundary.recovered_through_id ||
             compareDiscordIds(currentBoundary.last_seen_id, currentBoundary.recovered_through_id) > 0)) return READINESS.PENDING;
-      if (isRetryableFetchBoundary(currentBoundary?.state, currentBoundary?.detail)) return READINESS.PENDING;
       if (currentBoundary?.state === READINESS.UNAVAILABLE) return READINESS.UNAVAILABLE;
       return null;
     };
-    const isInterruptedRetryBoundary = boundary => boundary?.state === READINESS.PENDING &&
-      typeof boundary.detail === 'string' &&
-      boundary.detail.endsWith('retry after Discord HTTP 503');
     const isRetryableRecoveryBoundary = boundary => boundary &&
-      (isRetryableFetchBoundary(boundary.state, boundary.detail) || isInterruptedRetryBoundary(boundary) ||
+      (isRetryableIntakeBoundary(boundary) || isInterruptedRetryBoundary(boundary) ||
         isNativeProofRetryBoundary(boundary.state, boundary.detail));
+    const scheduleRecoveryRetry = (channelId, retryDeadline) => {
+      const nativeProofHeld = () => {
+        const boundary = this.state.getIntakeWatermark(channelId);
+        return isNativeProofRetryBoundary(boundary?.state, boundary?.detail);
+      };
+      if (this.stopping || this.recoveryRetryScheduledChannels.has(channelId) || nativeProofHeld()) return;
+      this.recoveryRetryScheduledChannels.add(channelId);
+      queueMicrotask(() => {
+        this.recoveryRetryScheduledChannels.delete(channelId);
+        if (this.stopping || !this.isCurrentLifecycle(lifecycleEpoch) || nativeProofHeld()) return;
+        this.recoverTransport(reason, lifecycleEpoch, [channelId], retryDeadline).catch(error => {
+          this.logger(`Discord intake boundary retry failed: ${error.message}`);
+        });
+      });
+    };
     let failure = null;
     for (const binding of bindings) {
       if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
       if (Date.now() >= deadline) {
         const watermark = this.state.getIntakeWatermark(binding.channelId);
-        if (isRetryableRecoveryBoundary(watermark)) {
-          if (isInterruptedRetryBoundary(watermark)) {
-            failure ||= { ready: false, state: 'unavailable' };
-            continue;
+        const nativeProofHeld = isNativeProofRetryBoundary(watermark?.state, watermark?.detail);
+        const genericRetry = isRetryableIntakeBoundary(watermark) || isInterruptedRetryBoundary(watermark);
+        const beforeNativeProof = binding.provider === 'codex' && this.state.isOrdinaryBinding(binding) &&
+          !genericRetry && ![READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark?.state);
+        if (nativeProofHeld || beforeNativeProof) {
+          const detail = nativeProofHeld ? watermark.detail
+            : nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, deadline);
+          const recorded = await this.recordBoundary(binding, null, READINESS.UNAVAILABLE, detail,
+            watermark?.gap_from ?? watermark?.recovered_through_id, watermark?.gap_to ?? null,
+            signal, deadline, watermark, binding.readiness);
+          if (recorded?.watermark) failure ||= { ready: false, state: READINESS.UNAVAILABLE };
+          else {
+            const currentBinding = this.state.getBinding(binding.channelId);
+            const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+            const currentState = classifyReadiness(currentBinding, currentBoundary);
+            failure ||= { ready: false, state: currentState || READINESS.UNAVAILABLE };
           }
-          const expired = this.state.markIntakeBoundary(binding.channelId, READINESS.UNAVAILABLE,
-            watermark.detail || `${reason} intake unavailable`, watermark.gap_from, watermark.gap_to,
-            binding, null, watermark, binding.readiness);
-          if (expired) failure ||= { ready: false, state: 'unavailable' };
+          continue;
+        }
+        const currentState = classifyReadiness(binding, watermark);
+        if (currentState === READINESS.READY) {
+          if (binding.readiness === READINESS.RECOVERING) {
+            scheduleRecoveryRetry(binding.channelId, Date.now() + this.recoveryTimeoutMs);
+          }
+          continue;
+        }
+        if (isRetryableRecoveryBoundary(watermark) ||
+            [READINESS.PENDING, READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark?.state)) {
+          if (currentState === READINESS.PENDING || isRetryableRecoveryBoundary(watermark)) {
+            scheduleRecoveryRetry(binding.channelId, Date.now() + this.recoveryTimeoutMs);
+            failure ||= { ready: false, state: watermark?.state || 'unavailable' };
+          } else if (watermark && [READINESS.GAP, READINESS.UNAVAILABLE].includes(watermark.state)) {
+            // F13: an expired deadline on an already-terminal watermark must restore
+            // the RECOVERING binding's durable readiness through the existing
+            // expected-boundary/readiness guard, preserving cursor/gap bounds and
+            // detail. A newer READY/PENDING or changed binding must not be overwritten.
+            const recorded = await this.recordBoundary(binding, null, watermark.state,
+              watermark.detail || `${reason} intake ${watermark.state}`, watermark.gap_from, watermark.gap_to,
+              signal, deadline, watermark, binding.readiness);
+            if (recorded?.watermark) failure ||= { ready: false, state: watermark.state };
+            else {
+              const currentBinding = this.state.getBinding(binding.channelId);
+              const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
+              const restoredState = classifyReadiness(currentBinding, currentBoundary);
+              failure ||= { ready: false, state: restoredState || 'unavailable' };
+            }
+          } else {
+            failure ||= { ready: false, state: watermark?.state || 'unavailable' };
+          }
+        } else {
+          const classified = binding.provider === 'codex' && this.state.isOrdinaryBinding(binding)
+            ? { state: READINESS.UNAVAILABLE, detail: nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, deadline) }
+            : classifyRecoveryFailure(recoveryError(CODEX_VALIDATION_KINDS.DEADLINE,
+              `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`));
+          const recorded = await this.recordBoundary(binding, null, classified.state, classified.detail,
+            watermark?.recovered_through_id, null, signal, deadline, watermark, binding.readiness);
+          if (recorded?.watermark) failure ||= { ready: false, state: classified.state };
           else {
             const currentBinding = this.state.getBinding(binding.channelId);
             const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
             const currentState = classifyReadiness(currentBinding, currentBoundary);
             failure ||= { ready: false, state: currentState || 'unavailable' };
           }
-        } else if (watermark && ['gap', 'unavailable'].includes(watermark.state)) {
-          this.state.setBindingReadiness(binding.channelId, watermark.state, watermark.detail, binding);
-          failure ||= { ready: false, state: watermark.state };
-        } else if (binding.provider === 'codex' && this.state.isOrdinaryBinding(binding)) {
-          await this.recordBoundary(binding, null, READINESS.UNAVAILABLE,
-            nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, deadline),
-            watermark?.recovered_through_id, null, signal, deadline, watermark);
-          failure ||= { ready: false, state: READINESS.UNAVAILABLE };
-        } else {
-          await this.recordBoundary(binding, null, 'gap', `${reason} recovery exceeded ${this.recoveryTimeoutMs}ms`, null, null, signal, deadline, watermark);
-          failure ||= { ready: false, state: 'gap' };
         }
         continue;
       }
@@ -2244,6 +2360,13 @@ class DiscordGateway {
       let watermark = this.state.getIntakeWatermark(binding.channelId);
       let ownedBoundary = watermark;
       let ownedReadiness = recovering.readiness;
+      // F15: capture the ORIGINAL owner provenance before the channel fetch can
+      // replace `watermark` with a pending retry boundary. A later parent baseline
+      // commit must know whether this pass retried a failed adoption/recovery.
+      const baselineFailedAttempt = Boolean(watermark &&
+        (isRetryableIntakeBoundary(watermark) || isInterruptedRetryBoundary(watermark)));
+      const baselineAdoptionCompleted = Boolean(watermark?.state === READINESS.READY &&
+        watermark.last_seen_id === null && watermark.recovered_through_id === null);
       // A pass that starts from the closing-custody marker under the attempt that queued it is the one retry: it records
       // gap if custody is still ahead. A pass under another lifecycle or deadline gets its own retry.
       const closingCustodyAttempt = this.closingCustodyRetries.get(binding.channelId);
@@ -2272,15 +2395,7 @@ class DiscordGateway {
         if (this.stopping) return;
         const current = classifyCurrentReadiness();
         if (current?.state !== READINESS.PENDING) return;
-        if (this.recoveryRetryScheduledChannels.has(binding.channelId)) return;
-        this.recoveryRetryScheduledChannels.add(binding.channelId);
-        queueMicrotask(() => {
-          this.recoveryRetryScheduledChannels.delete(binding.channelId);
-          if (this.stopping || !this.isCurrentLifecycle(lifecycleEpoch)) return;
-          this.recoverTransport(reason, lifecycleEpoch, [binding.channelId], deadline).catch(error => {
-            this.logger(`Discord intake boundary retry failed: ${error.message}`);
-          });
-        });
+        scheduleRecoveryRetry(binding.channelId, deadline);
       };
       const recordOwnedBoundary = async (owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary) => {
         if (nextState === READINESS.GAP || nextState === READINESS.UNAVAILABLE) {
@@ -2291,7 +2406,23 @@ class DiscordGateway {
             return null;
           }
           const currentBoundary = this.state.getIntakeWatermark(binding.channelId);
-          if (currentBoundary?.state === READINESS.GAP || currentBoundary?.state === READINESS.UNAVAILABLE) return null;
+          if (currentBoundary?.state === READINESS.GAP || currentBoundary?.state === READINESS.UNAVAILABLE) {
+            // F13: a terminal watermark already owns the route. Route the refusal
+            // through the existing guarded boundary writer with the ORIGINAL watermark
+            // and expected RECOVERING readiness so the binding is restored to the
+            // durable terminal state, not left RECOVERING. The newer watermark and a
+            // changed binding/readiness are fenced by markIntakeBoundary.
+            const restored = await this.recordBoundary(owner, channel, currentBoundary.state,
+              currentBoundary.detail || detail, currentBoundary.gap_from, currentBoundary.gap_to,
+              signal, deadline, currentBoundary, ownedReadiness);
+            if (restored?.watermark) ownedReadiness = restored.watermark.state;
+            if (!restored) {
+              const current = adoptCurrentReadiness();
+              if (current?.state === READINESS.READY) return { watermark: current.watermark, concurrentReady: true };
+              if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
+            }
+            return restored;
+          }
           if (currentBoundary) {
             expectedBoundary = currentBoundary;
             gapFrom = currentBoundary.recovered_through_id;
@@ -2314,9 +2445,19 @@ class DiscordGateway {
       let nativeProofRetryDetail = retryBoundary && isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)
         ? retryBoundary.detail : null;
       if (watermark && ['gap', 'unavailable'].includes(watermark.state) && !retryBoundary) {
-        const terminalReadiness = watermark.state === READINESS.GAP ? READINESS.GAP : READINESS.UNAVAILABLE;
-        this.state.setBindingReadiness(binding.channelId, terminalReadiness,
-          watermark.detail || `${reason} intake ${watermark.state}`, binding);
+        // F13: route the pre-fetch terminal refusal through recordBoundary with the
+        // original watermark and expected RECOVERING readiness so the binding is
+        // restored to the durable terminal state without a raw readiness write. A
+        // newer READY/PENDING or changed binding/lifecycle/generation is not overwritten.
+        const recorded = await this.recordBoundary(binding, null, watermark.state,
+          watermark.detail || `${reason} intake ${watermark.state}`, watermark.gap_from, watermark.gap_to,
+          signal, deadline, watermark, ownedReadiness);
+        if (recorded?.watermark) ownedBoundary = recorded.watermark;
+        else {
+          const current = adoptCurrentReadiness();
+          if (current?.state === READINESS.READY) continue;
+          if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
+        }
         failure ||= { ready: false, state: watermark.state };
         continue;
       }
@@ -2326,7 +2467,7 @@ class DiscordGateway {
         channel = await waitForRecoveryOperation(() => {
           if (retryBoundary) {
             const retryDetail = isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)
-              ? retryBoundary.detail : `${reason} retry after Discord HTTP 503`;
+              ? retryBoundary.detail : retryPendingBoundaryDetail(reason, retryBoundary);
             if (isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)) nativeProofRetryDetail = retryDetail;
             const retrying = this.state.markIntakeBoundary(binding.channelId, 'pending', retryDetail,
               retryBoundary.gap_from, retryBoundary.gap_to, binding, null, retryBoundary, ownedReadiness);
@@ -2368,9 +2509,9 @@ class DiscordGateway {
         const transientChannelLookup = isRetryableFetchBoundary(READINESS.UNAVAILABLE, error?.message);
         const nativeProofRetry = typeof nativeProofRetryDetail === 'string' &&
           (!recoveryAttempted || transientChannelLookup);
-        const retryState = nativeProofRetry ? READINESS.UNAVAILABLE
-          : kind === CODEX_VALIDATION_KINDS.DEADLINE ? READINESS.GAP : READINESS.UNAVAILABLE;
-        const retryDetail = nativeProofRetry ? nativeProofRetryDetail : error.message;
+        const classified = classifyRecoveryFailure(error);
+        const retryState = nativeProofRetry ? READINESS.UNAVAILABLE : classified.state;
+        const retryDetail = nativeProofRetry ? nativeProofRetryDetail : classified.detail;
         const recorded = await recordOwnedBoundary(binding, null, retryState, retryDetail,
           ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
         if (recorded?.watermark) ownedBoundary = recorded.watermark;
@@ -2414,15 +2555,16 @@ class DiscordGateway {
             continue;
           }
           const preflightReason = ['Claude endpoint unavailable', 'ordinary-bind', 'reconnect', 'startup'].includes(baseReason);
-          let detail = error.message;
-          if (preflightReason && binding.provider === 'claude') {
+          const classified = classifyRecoveryFailure(error);
+          let detail = classified.detail;
+          if (kind !== CODEX_VALIDATION_KINDS.DEADLINE && preflightReason && binding.provider === 'claude') {
             detail = `${CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX} ${error.message}`;
-          } else if (preflightReason && binding.provider === 'codex') {
+          } else if (kind !== CODEX_VALIDATION_KINDS.DEADLINE && preflightReason && binding.provider === 'codex') {
             detail = `Codex transcript proof unavailable before event write: ${error.message}`;
           }
           const nativeDeadline = binding.provider === 'codex' && kind === CODEX_VALIDATION_KINDS.DEADLINE;
           if (nativeDeadline) detail = nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, deadline);
-          const heldState = kind === CODEX_VALIDATION_KINDS.DEADLINE && !nativeDeadline ? READINESS.GAP : READINESS.UNAVAILABLE;
+          const heldState = nativeDeadline ? READINESS.UNAVAILABLE : classified.state;
           const recorded = await recordOwnedBoundary(binding, channel, heldState, detail, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
           if (recorded?.watermark) ownedBoundary = recorded.watermark;
           if (!recorded?.concurrentReady) failure ||= { ready: false, state: heldState, error };
@@ -2463,9 +2605,10 @@ class DiscordGateway {
         catch (error) {
           const kind = recoveryKind(error);
           if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
-          const recorded = await recordOwnedBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+          const classified = classifyRecoveryFailure(error);
+          const recorded = await recordOwnedBoundary(binding, channel, classified.state, classified.detail, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
           if (recorded?.watermark) ownedBoundary = recorded.watermark;
-          if (!recorded?.concurrentReady) failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
+          if (!recorded?.concurrentReady) failure ||= { ready: false, state: classified.state, error };
           continue;
         }
         if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
@@ -2493,6 +2636,23 @@ class DiscordGateway {
         }
         const newest = baseline.sort((a, b) => compareDiscordIds(b.id, a.id))[0];
         if (newest?.id) {
+          // F15: an unqualified retry after a failed adoption/recovery attempt must
+          // not install the newest history message as a fresh exclusion cutoff. The
+          // candidate cutoff excludes only already-admitted custody when its row has
+          // per-row intake evidence (never inferred from last_seen_id/recovered cursor).
+          if (refusesUnqualifiedBaseline({
+            failedAttempt: baselineFailedAttempt,
+            adoptionCompleted: baselineAdoptionCompleted,
+            coveredCursor: watermark?.recovered_through_id,
+            newestAlreadyRetained: this.state.hasIntakeEvidence(newest.id)
+          })) {
+            const refused = await recordOwnedBoundary(binding, channel, READINESS.PENDING,
+              retryPendingBoundaryDetail(`${reason} baseline refused without historical coverage`, watermark),
+              ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+            if (refused?.watermark) ownedBoundary = refused.watermark;
+            if (!refused?.concurrentReady) failure ||= { ready: false, state: READINESS.PENDING };
+            continue;
+          }
           const baselineWatermark = this.state.setIntakeBaseline(binding.channelId, newest.id, `${reason} cutoff excludes pre-adoption backlog`, binding, ownedBoundary, ownedReadiness);
           if (!baselineWatermark) {
             const current = adoptCurrentReadiness();
@@ -2579,16 +2739,24 @@ class DiscordGateway {
           failure ||= { ready: false, state: current?.state || 'unavailable', error };
           continue;
         }
-        const recorded = await recordOwnedBoundary(binding, channel, kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error.message, ownedBoundary?.recovered_through_id, attemptedId || after, signal, deadline, ownedBoundary);
+        const classified = classifyRecoveryFailure(error);
+        const recorded = await recordOwnedBoundary(binding, channel, classified.state, classified.detail, ownedBoundary?.recovered_through_id, attemptedId || after, signal, deadline, ownedBoundary);
         if (recorded?.watermark) ownedBoundary = recorded.watermark;
-        if (!recorded?.concurrentReady) failure ||= { ready: false, state: kind === CODEX_VALIDATION_KINDS.DEADLINE ? 'gap' : 'unavailable', error };
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: classified.state, error };
         continue;
       }
       if (!complete) {
-        const detail = pages >= this.historyMaxPages ? `history page bound ${this.historyMaxPages} reached` : total >= this.historyMaxMessages ? `history message bound ${this.historyMaxMessages} reached` : `history recovery deadline ${this.recoveryTimeoutMs}ms reached`;
-        const recorded = await recordOwnedBoundary(binding, channel, 'gap', detail, ownedBoundary?.recovered_through_id, after, signal, deadline, ownedBoundary);
+        const pageBoundReached = pages >= this.historyMaxPages;
+        const messageBoundReached = total >= this.historyMaxMessages;
+        const classified = pageBoundReached || messageBoundReached
+          ? { state: READINESS.GAP, detail: pageBoundReached
+            ? `history page bound ${this.historyMaxPages} reached`
+            : `history message bound ${this.historyMaxMessages} reached` }
+          : classifyRecoveryFailure(recoveryError(CODEX_VALIDATION_KINDS.DEADLINE,
+            `history recovery deadline ${this.recoveryTimeoutMs}ms reached`));
+        const recorded = await recordOwnedBoundary(binding, channel, classified.state, classified.detail, ownedBoundary?.recovered_through_id, after, signal, deadline, ownedBoundary);
         if (recorded?.watermark) ownedBoundary = recorded.watermark;
-        if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'gap' };
+        if (!recorded?.concurrentReady) failure ||= { ready: false, state: classified.state };
         continue;
       }
       const boundary = await recordOwnedBoundary(binding, channel, 'ready', `${reason} watermark backfill complete`, null, null, signal, deadline, ownedBoundary);
@@ -2889,16 +3057,60 @@ class DiscordGateway {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const selectedChannels = channelIds ? new Set(channelIds) : null;
     this.consumer?.releaseHandledWithoutPost?.();
+    const isHeldDurable = message => message.state === 'submitted' || message.state === 'reply_ready';
     const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
-      (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready);
+      (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready ||
+        isHeldDurable(message));
     this.startDecisionRecovery(signal, selectedChannels);
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const blockedOwners = new Set();
+    const storedMessages = new Map();
+    const storedMessageFor = message => {
+      let storedMessage = storedMessages.get(message.id);
+      if (!storedMessage) {
+        storedMessage = {
+          ...message,
+          id: message.id,
+          guildId: message.guildId,
+          channelId: message.deliveryChannelId || message.channelId,
+          content: message.content,
+          author: { id: message.authorId, bot: false }
+        };
+        storedMessages.set(message.id, storedMessage);
+      }
+      return storedMessage;
+    };
+    // F14 phase 1: admit every eligible submitted native observation up front through
+    // the existing per-owner queue ordering/deduplication/cancellation, WITHOUT
+    // spending the network deadline and WITHOUT waiting for native completion.
+    // Admission never dispatches or replies; a later native completion still needs
+    // its own reconciliation pass to reach reply.
+    for (const message of ordered) {
+      if (signal?.aborted) break;
+      if (message.state !== 'submitted') continue;
+      const storedMessage = storedMessageFor(message);
+      try {
+        const admitted = this.consumer.resumeSubmitted(storedMessage, signal, {
+          continueUntilFinal: true,
+          deferReply: () => !storedMessage.channel
+        });
+        // Admission observes existing submitted work; its settlement is handled by the
+        // owning observer/queue, so a rejected admission must not become an unhandled
+        // rejection in the recovery pass.
+        if (admitted && typeof admitted.catch === 'function') admitted.catch(() => {});
+      } catch (error) {
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) break;
+        this.state.markObservationUnavailable(message.id, error);
+      }
+    }
+    // F14 phase 2: the existing bounded channel fetch / reply reconciliation.
     for (const message of ordered) {
       if (signal?.aborted) return this.state.recoveryCandidates(before).filter(allowed);
       const key = `${message.provider}:${message.nativeId}`;
       if (blockedOwners.has(key)) continue;
+      const storedMessage = storedMessageFor(message);
+      let result;
       let channel;
       let channelFetchStarted = false;
       try {
@@ -2932,21 +3144,22 @@ class DiscordGateway {
           blockedOwners.add(key);
           continue;
         }
-      }
-      const storedMessage = {
-        ...message,
-        id: message.id,
-        guildId: message.guildId,
-        channelId: message.deliveryChannelId || message.channelId,
-        content: message.content,
-        author: { id: message.authorId, bot: false },
-        channel
-      };
-      if (!this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready) {
+      } else if (!storedChannelMatches(channel, message)) {
+        // F12: never attach refreshed parent context from a channel that disagrees
+        // with the stored message's guild/channel destination.
         blockedOwners.add(key);
         continue;
       }
-      let result;
+      storedMessage.channel = channel;
+      // F11: attach the verified channel to the ORIGINAL observation entry without
+      // replacing its promise/observer, so a deferred reply on the existing work can
+      // still deliver after the recovery fetch that failed once finally succeeds.
+      this.consumer?.refreshNativeWorkChannel?.(storedMessage);
+      if (!this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready &&
+          !isHeldDurable(message)) {
+        blockedOwners.add(key);
+        continue;
+      }
       try {
         if (message.state === 'accepted') {
           for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -2960,11 +3173,11 @@ class DiscordGateway {
             if (!stillAccepted || !this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready) break;
           }
         } else if (message.state === 'submitted') {
-          result = await waitForRecoveryOperation(
-            () => this.consumer.resumeSubmitted(storedMessage, signal, { continueUntilFinal: true }),
-            signal,
-            deadline
-          );
+          const current = this.state.getMessage(message.id);
+          if (current?.state === 'reply_ready') {
+            this.state.recoverNativeReplyAcknowledgment(message.id);
+            result = await this.consumer.deliverReply(storedMessage, { status: current.state, message: current }, signal);
+          }
         } else {
           this.state.recoverNativeReplyAcknowledgment(message.id);
           result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);

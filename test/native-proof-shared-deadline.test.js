@@ -95,7 +95,7 @@ test('shared deadline does not permanently hold an unattempted binding', async (
   await runSharedBudget(false);
   await runSharedBudget(true);
 });
-test('shared deadline keeps a conductor binding in a terminal gap', async () => {
+test('shared deadline keeps an unattempted conductor binding retryable', { timeout: 8000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-shared-conductor-'));
   const root = path.join(dir, 'sessions');
   const slowId = '66666666-6666-4666-8666-666666666666';
@@ -114,10 +114,12 @@ test('shared deadline keeps a conductor binding in a terminal gap', async () => 
     state.setIntakeBaseline('1000', '100', 'fixture baseline');
     state.setIntakeBaseline('2000', '100', 'fixture baseline');
     const preflights = [];
+    let dispatches = 0;
     gateway = new DiscordGateway({ state,
-      client: { user: { id: 'bot' }, channels: { fetch: async id => ({ id, guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) }) }, on() {}, off() {}, async destroy() {} },
+      client: { user: { id: 'bot' }, channels: { fetch: async id => id === '2000' ? new Promise(() => {})
+        : ({ id, guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) }) }, on() {}, off() {}, async destroy() {} },
       fetchHistory: async () => [],
-      providers: { codex: { async dispatch() { throw new Error('conductor binding must not dispatch'); } } },
+      providers: { codex: { async dispatch() { dispatches += 1; throw new Error('conductor binding must not dispatch'); } } },
       recoveryOptions: { timeoutMs: 1000, ordinaryNativePreflight: async (binding, options) => {
         preflights.push(binding.channelId);
         if (binding.channelId === '1000') await new Promise(resolve => {
@@ -129,9 +131,13 @@ test('shared deadline keeps a conductor binding in a terminal gap', async () => 
     });
     const result = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
     assert.equal(result.ready, false);
+    await gateway.recoveryFollowupPromise;
     assert.deepEqual(preflights, ['1000']);
     assert.equal(state.getBinding('2000').conductorId, 'conductor-2000');
-    assert.equal(state.getIntakeWatermark('2000').state, 'gap');
+    assert.equal(state.getIntakeWatermark('2000').state, 'unavailable');
+    assert.equal(state.getIntakeWatermark('2000').recovered_through_id, '100');
+    assert.equal(dispatches, 0);
+    assert.match(state.getIntakeWatermark('2000').detail, /^Discord recovery deadline: /);
     assert.doesNotMatch(state.getIntakeWatermark('2000').detail, /Native proof recovery v1:/);
   } finally {
     if (gateway) await gateway.stop();

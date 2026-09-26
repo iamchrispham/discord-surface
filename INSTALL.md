@@ -64,6 +64,8 @@ Claude uses `ordinary-claude-bind` with the exact current transcript and a short
 
 After the Gateway owner authorizes this host to consume the intended guild, use the public `start --state-dir <state>` entrypoint and inspect `status --state-dir <state>`. Do not start a second consumer as a workaround. Keep all Gateway-aware CLI paths on the same installed release.
 
+Before a planned release cutover boots out the Gateway, inspect the active state with the same release's `status --state-dir <state>` entrypoint. Check `readiness.intakeWatermarks` and `readiness.threadEnrollments` for `state: gap`, and record each affected channel or thread ID with its gap bounds. A gap remains held and non-dispatchable after startup; do not clear it to make the cutover appear ready.
+
 ## Essential live check and return receipt
 
 1. Send one real instruction to the bound channel. Record its Discord ID, actual native pickup and acknowledgment.

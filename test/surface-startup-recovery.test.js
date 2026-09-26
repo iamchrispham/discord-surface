@@ -85,7 +85,7 @@ test('simulated: login-time input is durably held and backfill closes before dis
   state.close();
 });
 
-test('simulated: bounded intake recovery records a visible gap and requires explicit reconciliation', async () => {
+test('simulated: page-bound recovery connects degraded and requires explicit reconciliation', async () => {
   const { dir, state } = fixture();
   state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
   const secret = path.join(dir, 'discord.env');
@@ -102,7 +102,10 @@ test('simulated: bounded intake recovery records a visible gap and requires expl
         { id: '102', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'two' }
       ]
   });
-  await assert.rejects(() => gateway.start(secret), /intake recovery is gap/);
+  await gateway.start(secret);
+  assert.equal(gateway.started, true);
+  assert.equal(gateway.transportReady, true);
+  assert.equal(gateway.ready, false);
   assert.equal(state.getBinding('channel-codex').readiness, READINESS.GAP);
   assert.equal(state.getReadiness().limits.connectionBackfill, 'unrecoverable-gap');
   assert.equal(state.getIntakeWatermark('channel-codex').state, 'gap');
@@ -112,11 +115,18 @@ test('simulated: bounded intake recovery records a visible gap and requires expl
   state.close();
 });
 
-test('simulated: startup rejects a ready aggregate with a terminal active child', { timeout: 8000 }, async t => {
+test('simulated: startup serves a healthy parent while terminal child custody stays held', { timeout: 8000 }, async t => {
   const { dir, state } = fixture();
   const binding = state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
   state.enrollThread({ threadId: 'thread-terminal', parentChannelId: binding.channelId, guildId: 'guild-1' }, binding);
+  state.setThreadBaseline('thread-terminal', '100', binding);
+  state.markThreadBoundary('thread-terminal', 'ready', 'fixture adopted child', null, null, binding);
+  state.setIntakeBaseline(binding.channelId, '100', 'fixture baseline');
+  state.setBindingReadiness(binding.channelId, READINESS.READY, 'fixture healthy parent', binding);
+  const childMessage = discordMessage({ id: '101', channelId: 'thread-terminal' });
+  assert.equal(state.acceptDiscordMessage({ ...childMessage, authorId: 'operator-1', isBot: false }, { ready: false }).accepted, true);
   state.markThreadBoundary('thread-terminal', 'gap', 'terminal child gap', '100', '101', binding);
+  let dispatches = 0;
   const secret = path.join(dir, 'discord.env');
   fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
   const client = {
@@ -127,7 +137,8 @@ test('simulated: startup rejects a ready aggregate with a terminal active child'
     channels: { fetch: async () => ({ id: binding.channelId, permissionsFor: () => historyPermissions() }) },
     async destroy() {}
   };
-  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [] });
+  const gateway = new DiscordGateway({ state, client, fetchHistory: async () => [],
+    providers: { codex: { async dispatch() { dispatches += 1; } } } });
   t.after(async () => {
     try { await gateway?.stop(); } catch {}
     try { state.close(); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -137,8 +148,17 @@ test('simulated: startup rejects a ready aggregate with a terminal active child'
     return { ready: true, state: 'ready' };
   };
 
-  await assert.rejects(() => gateway.start(secret), /intake recovery is gap/);
-  assert.equal(gateway.ready, false);
+  await gateway.start(secret);
+  assert.equal(gateway.started, true);
+  assert.equal(gateway.transportReady, true);
+  assert.equal(gateway.ready, true);
+  assert.equal(state.getMessageRoute(binding.channelId).ready, true);
+  await gateway.reconcilePending(undefined, { readyOnly: true });
+  await gateway.consumer.waitForNativeWork();
+  assert.equal(state.getThreadEnrollment('thread-terminal').state, 'gap');
+  assert.equal(state.getMessageRoute('thread-terminal').ready, false);
+  assert.equal(state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(dispatches, 0);
 });
 
 test('simulated: stop fences a client login that resolves after state close', async () => {
@@ -262,12 +282,14 @@ test('simulated: noncooperative history fetch is fenced by the recovery deadline
   await assert.doesNotReject(async () => {
     const result = await recovery;
     assert.equal(result.ready, false);
-    assert.equal(result.state, 'gap');
+    assert.equal(result.state, 'unavailable');
   });
   const elapsed = performance.now() - started;
   await gateway.stop();
   release([]);
   assert.ok(elapsed < 1500, `recovery exceeded bounded wait: ${elapsed}ms`);
-  assert.equal(state.getIntakeWatermark('channel-codex').state, 'gap');
+  const deadlineBoundary = state.getIntakeWatermark('channel-codex');
+  assert.equal(deadlineBoundary.state, 'unavailable');
+  assert.match(deadlineBoundary.detail, /^Discord recovery deadline: /);
   state.close();
 });

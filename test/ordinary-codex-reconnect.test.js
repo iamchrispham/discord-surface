@@ -130,11 +130,13 @@ test('Gateway reconnect notifies binding wakes after partial recovery', async t 
   });
   gateway.started = true;
   gateway.recoverTransport = async () => ({ ready: false, state: READINESS.UNAVAILABLE });
-  gateway.reconcilePending = async () => calls.push('reconcile');
+  let reconciliation;
+  gateway.reconcilePending = async (...args) => { reconciliation = args; calls.push('reconcile'); };
   const result = await gateway.beginReconnectRecovery('shard-ready');
   assert.equal(result.ready, false);
   assert.equal(gateway.transportReady, true);
-  assert.deepEqual(calls, ['ready']);
+  assert.deepEqual(calls, ['reconcile', 'ready']);
+  assert.deepEqual(reconciliation, [undefined, { allowPaused: true, readyOnly: true }]);
   await gateway.stop();
 });
 

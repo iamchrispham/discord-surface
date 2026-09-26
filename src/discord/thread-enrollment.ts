@@ -1,6 +1,14 @@
 const discord = () => require('discord.js') as typeof import('discord.js');
 import { CODEX_VALIDATION_KINDS } from '../native-transcript';
-import { isPreAdoptionRetryableThread, isRetryableFetchBoundary, recoveryFetch } from './recovery-fetch';
+import {
+  classifyRecoveryFailure,
+  isPreAdoptionRetryableThread,
+  isRetryableIntakeBoundary,
+  isRetryableHttp503Boundary,
+  recoveryFetch,
+  refusesUnqualifiedBaseline,
+  retryPendingBoundaryDetail
+} from './recovery-fetch';
 import { THREAD_STATES, type ThreadBinding, type ThreadEnrollment, type ThreadRoute, type ThreadState } from '../state/thread-enrollment';
 
 export interface ThreadChannel {
@@ -74,6 +82,13 @@ interface ThreadGateway {
 
 type WaitOperation = <T>(operation: () => Promise<T>, signal: AbortSignal, deadline: number) => Promise<T>;
 const compareIds = (a: string, b: string) => BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0;
+const isRetryableThreadBoundary = (enrollment: ThreadEnrollment) => isRetryableIntakeBoundary({
+  state: enrollment.state,
+  detail: enrollment.detail,
+  gap_from: enrollment.gapFrom,
+  gap_to: enrollment.gapTo,
+  recovered_through_id: enrollment.recoveredThroughId
+});
 
 export async function enrollPublicThread(state: ThreadStateOwner, client: ThreadGateway['client'], parentId: string, threadId: string, signal?: AbortSignal) {
   if (signal?.aborted) throw new Error('Thread enrollment stopped');
@@ -101,10 +116,19 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   const parent = gateway.state.getMessageRoute(enrollment.parentChannelId);
   if (!parent?.ready) return false;
   const binding = parent.binding;
-  const retryableBoundary = enrollment.adoptedAt != null &&
-    isRetryableFetchBoundary(enrollment.state, enrollment.detail);
+  const retryableBoundary = isRetryableThreadBoundary(enrollment);
   const preAdoptionRetryBoundary = isPreAdoptionRetryableThread(enrollment);
   const retryableHold = retryableBoundary || preAdoptionRetryBoundary;
+  // Qualify the INCOMING owner snapshot before the pending-boundary write below can
+  // replace its detail. A failed prior adoption/recovery attempt (retryable HTTP503,
+  // typed deadline, or interrupted-retry-pending marker) must not later install a
+  // newest fetched message as a fresh exclusion cutoff. The decision itself runs at
+  // the baseline COMMIT, once the candidate newest message is known.
+  const baselineRefusalInput = {
+    failedAttempt: retryableHold,
+    adoptionCompleted: Boolean(enrollment.adoptedAt),
+    coveredCursor: enrollment.recoveredThroughId
+  };
   if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state) &&
       !retryableHold) return false;
   let ownedEnrollment = enrollment;
@@ -140,7 +164,10 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   try {
     const channel = await wait(() => {
       if (!checkpointOnly) {
-        const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery in progress', null);
+        const detail = retryableHold
+          ? retryPendingBoundaryDetail('thread history recovery', enrollment)
+          : 'Thread history recovery in progress';
+        const pending = boundary(THREAD_STATES.PENDING, detail, null);
         if (!pending) throw stale();
       }
       recoveryAttempted = true;
@@ -168,6 +195,21 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       const liveLastSeenId = gateway.state.getThreadEnrollment(enrollment.threadId)?.lastSeenId || null;
       let newest = fetchedNewest || liveLastSeenId;
       if (fetchedNewest && liveLastSeenId && compareIds(liveLastSeenId, fetchedNewest) > 0) newest = liveLastSeenId;
+      if (newest && refusesUnqualifiedBaseline({
+        ...baselineRefusalInput,
+        // Per-row admission proof, not a watermark comparison: an admitted higher row
+        // does not cover a lower unadmitted history row that the cutoff would exclude.
+        newestAlreadyRetained: baseline.length > 0 &&
+          baseline.every(message => gateway.state.hasIntakeEvidence(message.id))
+      })) {
+        // Gate the baseline COMMIT, not just retry eligibility: the failed attempt
+        // left no covered historical cursor and the candidate cutoff would exclude
+        // unadmitted history, so keep the route visibly held pending instead of
+        // adopting a fresh history-only message as the newest exclusion cutoff.
+        boundary(THREAD_STATES.PENDING,
+          retryPendingBoundaryDetail('thread baseline refused without historical coverage', ownedEnrollment), null);
+        return false;
+      }
       const baselineEnrollment = gateway.state.setThreadBaseline(enrollment.threadId, newest, binding, ownedEnrollment);
       if (!baselineEnrollment) return false;
       ownedEnrollment = baselineEnrollment;
@@ -268,13 +310,19 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
         if (!retryableHold) {
           const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery pending before first fetch', null);
           if (!pending) return false;
+        } else if (gateway.recoverTransport) {
+          void gateway.recoverTransport(
+            'thread history recovery deadline retry',
+            epoch,
+            new Set([enrollment.threadId])
+          ).catch(() => {});
         }
         return false;
       }
       if (recoveryKind === 'stale') {
         const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
         const retryable = currentEnrollment?.active && (
-          isRetryableFetchBoundary(currentEnrollment.state, currentEnrollment.detail) ||
+          isRetryableThreadBoundary(currentEnrollment) ||
           isPreAdoptionRetryableThread(currentEnrollment)
         );
         if (retryable && gateway.recoverTransport) {
@@ -282,17 +330,17 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
         }
         return false;
       }
-      const detail = error instanceof Error ? error.message : String(error);
+      const classified = classifyRecoveryFailure(error);
+      const detail = classified.detail;
       const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
       if (!currentEnrollment?.active || currentEnrollment.state === THREAD_STATES.GAP || currentEnrollment.state === THREAD_STATES.UNAVAILABLE || currentEnrollment.state === THREAD_STATES.READY) {
         return false;
       }
       ownedEnrollment = currentEnrollment;
       const preAdoptionRetry = !currentEnrollment.adoptedAt &&
-        isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
-      let nextState: ThreadState = THREAD_STATES.UNAVAILABLE;
-      if (deadlineReached) nextState = THREAD_STATES.GAP;
-      else if (preAdoptionRetry) nextState = THREAD_STATES.PENDING;
+        isRetryableHttp503Boundary(THREAD_STATES.UNAVAILABLE, detail);
+      let nextState: ThreadState = classified.state;
+      if (preAdoptionRetry) nextState = THREAD_STATES.PENDING;
       boundary(nextState, detail, after);
     }
     return false;
