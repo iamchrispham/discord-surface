@@ -32,7 +32,8 @@ function packetRecordsMatch(left, right) {
     (left.legacyAgentPacket && right.legacyAgentPacket && packetMatches(left.legacyAgentPacket, right.legacyAgentPacket));
 }
 
-function isLegacyParentTarget(state, target) {
+function isLegacyParentTarget(state, target, frozenRequest) {
+  if (frozenRequest?.kind === KINDS.REQUEST && sameAddress(frozenRequest.target, target)) return true;
   const route = typeof state.getMessageRoute === 'function' ? state.getMessageRoute(target.channelId) : null;
   return Boolean(route && !route.enrollment && sameAddress(route.binding, target));
 }
@@ -95,7 +96,8 @@ function inspectPeerResult(state, source, correlationId) {
     else if (packet.kind === KINDS.REQUEST && (candidate.kind === KINDS.RESULT && candidate.replyTo === packet.id &&
       sameAddress(candidate.source, packet.target) && sameAddress(candidate.target, packet.source) ||
       ((packet.routingVersion === undefined || canonicalRecord.legacyAgentPacket?.kind === KINDS.REQUEST) &&
-        isLegacyParentTarget(state, packet.target) && isLegacyChildResult(candidate, packet, packet.target, true)))) {
+        isLegacyParentTarget(state, packet.target, canonicalRecord.legacyAgentPacket) &&
+        isLegacyChildResult(candidate, packet, packet.target, true)))) {
       results.push({ ...evidence, packetId: candidate.id, text: candidate.text });
     }
   }

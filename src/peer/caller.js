@@ -32,6 +32,9 @@ async function resolvePeerCaller(state, provider, dependencies = {}, signal) {
     if (identity?.harness !== 'claude-code' || typeof identity.sessionId !== 'string') {
       throw new Error('peer caller identity is unavailable or uses the wrong harness');
     }
+    if (identity.threadId != null && identity.threadId !== identity.sessionId) {
+      throw new Error('peer caller identity has conflicting Claude thread and session');
+    }
     nativeId = identity.sessionId;
   } else {
     throw new Error('peer caller provider must be codex or claude');

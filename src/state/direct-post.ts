@@ -229,6 +229,18 @@ function targetsBinding(detail: DirectPostReceiptDetail, channelId: string, targ
   return targetChannelId !== null && targetChannels.has(targetChannelId);
 }
 
+function directPostCustodyKey(detail: DirectPostReceiptDetail): string {
+  const source = (detail.agentPacket as AgentMessage | undefined)?.source;
+  return [
+    detail.requestId,
+    source?.guildId ?? detail.guildId,
+    source?.channelId ?? detail.channelId,
+    source?.provider ?? detail.provider,
+    source?.nativeId ?? detail.nativeId,
+    source?.generation ?? detail.generation
+  ].map(value => String(value ?? '')).join('\u0000');
+}
+
 export function createDirectPostHandlers(dependencies: DirectPostDependencies): DirectPostHandlers {
   const {
     BindingError,
@@ -347,23 +359,25 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       const relevantRequests = new Set<unknown>();
       for (const row of rows) {
         if (row.kind !== DIRECT_POST_ATTEMPT || !targetsBinding(row.detail, channelId, targetChannels)) continue;
-        relevantRequests.add(row.detail.requestId);
+        const requestKey = directPostCustodyKey(row.detail);
+        relevantRequests.add(requestKey);
         const partCount = Object.hasOwn(row.detail, 'partCount') ? row.detail.partCount as number : 1;
         const partIndex = Object.hasOwn(row.detail, 'partIndex') ? row.detail.partIndex as number : 0;
         if (!Number.isSafeInteger(partCount) || partCount < 1 || !Number.isSafeInteger(partIndex) || partIndex < 0 || partIndex >= partCount) return true;
-        const request = requests.get(row.detail.requestId) || { partCount, parts: new Map<number, { attempts: DirectPostReceiptRow[]; outcomes: DirectPostReceiptRow[] }>() };
+        const request = requests.get(requestKey) || { partCount, parts: new Map<number, { attempts: DirectPostReceiptRow[]; outcomes: DirectPostReceiptRow[] }>() };
         if (request.partCount !== partCount) return true;
         const part = request.parts.get(partIndex) || { attempts: [], outcomes: [] };
         part.attempts.push(row);
         request.parts.set(partIndex, part);
-        requests.set(row.detail.requestId, request);
-        if (typeof row.detail.attemptId === 'string' && row.detail.attemptId) attemptPart.set(`${row.detail.requestId}\u0000${row.detail.attemptId}`, partIndex);
+        requests.set(requestKey, request);
+        if (typeof row.detail.attemptId === 'string' && row.detail.attemptId) attemptPart.set(`${requestKey}\u0000${row.detail.attemptId}`, partIndex);
       }
       for (const row of rows) {
         if (row.kind !== DIRECT_POST_OUTCOME || typeof row.detail?.attemptId !== 'string' || !row.detail.attemptId) continue;
-        if (!relevantRequests.has(row.detail.requestId)) continue;
-        const request = requests.get(row.detail.requestId);
-        const partIndex = attemptPart.get(`${row.detail.requestId}\u0000${row.detail.attemptId}`);
+        const requestKey = directPostCustodyKey(row.detail);
+        if (!relevantRequests.has(requestKey)) continue;
+        const request = requests.get(requestKey);
+        const partIndex = attemptPart.get(`${requestKey}\u0000${row.detail.attemptId}`);
         if (!request || partIndex === undefined) continue;
         const part = request.parts.get(partIndex);
         if (part) part.outcomes.push(row);
