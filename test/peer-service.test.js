@@ -7,6 +7,7 @@ const { fixture, service, addRecipient } = require('./fixtures/peer-fixture');
 const { createPeerService } = require('../src/peer/service');
 const { READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
+const { decodeAgentMessage, encodeAgentMessage } = require('../src/agent-message');
 const id = '11111111-1111-1111-1111-111111111111';
 function addOrdinaryRecipient(f) {
   f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: '33333333-3333-3333-3333-333333333333',
@@ -200,6 +201,53 @@ test('successful agent send targets the enrolled child and retry keeps one post'
   });
   f.state.completeAgentHandledWithoutPost({ provider: 'claude', nativeId: id, generation: 1, messageId: message.id });
   assert.equal((await peer.result(request.dedupe_key)).results[0].completed, true);
+});
+
+test('peer result does not accept a parent result for a child-targeted request', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addRecipient(f); let requestPacket;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    const wire = await options.body.get('files[0]').text();
+    requestPacket = decodeAgentMessage(wire, 'fixture', {
+      guildId: '100', channelId: '202', provider: 'codex', nativeId: target.nativeId, generation: 1
+    });
+    return { ok: true, status: 200, json: async () => ({ id: 'parent-result-request' }) };
+  } });
+  assert.equal((await peer.send({ ...request, peer: { conductorId: 'recipient' } })).status, 'sent');
+  const foreignResult = {
+    id: 'foreign-parent-result', kind: 'result',
+    source: { guildId: '100', channelId: '201', provider: 'codex', nativeId: target.nativeId, generation: 1 },
+    target: requestPacket.source, replyTo: requestPacket.id, text: 'wrong route'
+  };
+  const accepted = f.state.acceptDiscordMessage({ id: 'foreign-parent-result-discord', guildId: '100',
+    channelId: requestPacket.source.channelId, authorId: '901', isBot: true,
+    content: encodeAgentMessage(foreignResult, 'fixture') }, { agentToken: 'fixture' });
+  assert.equal(accepted.accepted, true, JSON.stringify(accepted));
+  assert.deepEqual((await peer.result(requestPacket.id)).results, []);
+});
+
+test('peer custody scopes a reused packet ID to each caller channel', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  const secondNativeId = '33333333-3333-3333-3333-333333333333';
+  f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: secondNativeId,
+    workspace: '/tmp', endpoint: '/tmp/second-caller.sock', conductorId: 'second-caller', repoKey: 'github.com/test/second-caller' });
+  const secondBinding = f.state.setBindingReadiness('301', READINESS.READY, 'fixture', f.state.getBinding('301'));
+  f.state.enrollThread({ threadId: '302', parentChannelId: '301', guildId: '100' }, secondBinding);
+  f.state.markThreadBoundary('302', THREAD_STATES.READY, 'fixture', null, null, secondBinding);
+  let posts = 0;
+  const fetchImpl = async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: `shared-packet-${posts}` }) };
+  };
+  const first = service(f, { fetchImpl });
+  const second = createPeerService({ state: f.state, provider: 'codex', token: 'fixture',
+    callerDependencies: { environment: { CODEX_THREAD_ID: secondNativeId } }, fetchImpl });
+  const firstResult = await first.send({ peer: { conductorId: 'recipient' }, text: 'first', dedupe_key: 'shared-packet-id' });
+  const secondResult = await second.send({ peer: { conductorId: 'recipient' }, text: 'second', dedupe_key: 'shared-packet-id' });
+  assert.equal(firstResult.status, 'sent');
+  assert.equal(secondResult.status, 'sent');
+  assert.equal(posts, 2);
 });
 
 test('reply_to can select the request source when packet IDs collide', async t => {

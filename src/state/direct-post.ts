@@ -287,7 +287,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
 
   function inspectPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null {
     assertResultRequestActive(state, meta);
-    const rows = state.directPostRows(meta.requestId);
+    const rows = state.directPostRows(meta.requestId, meta.agentPacket ? meta.channelId : null);
     assertRequestIdentity(rows, meta);
     const partRows = rows.filter(row => row.detail.partIndex === meta.partIndex);
     const { attempt: latest, outcome, latestPreflight } = projectNewestDirectPostAttempt(partRows, {
@@ -409,7 +409,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       detail = validatedOutcomeDetail(canonicalMeta, detail, BindingError, snapshots);
       return state.transaction(() => {
         assertResultRequestActive(state, canonicalMeta);
-        const rows = state.directPostRows(canonicalMeta.requestId);
+        const rows = state.directPostRows(canonicalMeta.requestId, canonicalMeta.agentPacket ? canonicalMeta.channelId : null);
         assertRequestIdentity(rows, canonicalMeta);
         const { attemptId: _attemptId, ...preflightMeta } = canonicalMeta;
         const next = { journal: 'direct-post-v1', ...preflightMeta, ...detail, phase: 'preflight', outcome };
