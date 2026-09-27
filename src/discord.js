@@ -2965,7 +2965,12 @@ class DiscordGateway {
     return waiter.promise;
   }
 
-  async reconcilePending(before = undefined, { allowPaused = false, readyOnly = false, channelIds = null } = {}) {
+  async reconcilePending(before = undefined, {
+    allowPaused = false,
+    readyOnly = false,
+    channelIds = null,
+    messageIds = null
+  } = {}) {
     const lifecycleEpoch = this.lifecycleEpoch;
     const connectionEpoch = this.connectionEpoch;
     while (this.recoveryPromise || this.recoveryFollowupPromise) {
@@ -2980,7 +2985,13 @@ class DiscordGateway {
     if (!this.ready && !allowPaused && !hasReadyBinding) throw new Error('Discord gateway is not ready for recovery');
     this.recoveryController = new AbortController();
     const controller = this.recoveryController;
-    this.recoveryPromise = this._reconcilePending(cutoff, controller.signal, readyOnly || allowPaused, channelIds);
+    this.recoveryPromise = this._reconcilePending(
+      cutoff,
+      controller.signal,
+      readyOnly || allowPaused,
+      channelIds,
+      messageIds
+    );
     try { return await this.recoveryPromise; }
     finally {
       this.recoveryPromise = null;
@@ -2989,26 +3000,41 @@ class DiscordGateway {
     }
   }
 
-  async _reconcilePending(before, signal, readyOnly = false, channelIds = null) {
+  async _reconcilePending(before, signal, readyOnly = false, channelIds = null, messageIds = null) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const selectedChannels = channelIds ? new Set(channelIds) : null;
+    const selectedMessages = messageIds ? new Set(messageIds) : null;
     this.consumer?.releaseHandledWithoutPost?.();
     const isHeldDurable = message => message.state === 'submitted' || message.state === 'reply_ready';
-    const allowed = message => (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
+    const allowed = message => (!selectedMessages || selectedMessages.has(message.id)) &&
+      (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
       (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready ||
         isHeldDurable(message));
     this.startDecisionRecovery(signal, selectedChannels);
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
-    const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const retryOrder = messageIds ? new Map(messageIds.map((messageId, index) => [messageId, index])) : null;
+    const ordered = candidates.sort((a, b) => {
+      if (retryOrder) return retryOrder.get(a.id) - retryOrder.get(b.id);
+      return a.createdAt.localeCompare(b.createdAt);
+    });
     const blockedOwners = new Set();
     let reconciliationRetryQueued = false;
-    const queueReconciliationRetry = () => {
-      if (reconciliationRetryQueued || this.stopping || signal?.aborted) return;
+    const reconciliationRetryMessageIds = [];
+    const queueReconciliationRetry = messageIdsToRetry => {
+      if (this.stopping || signal?.aborted) return;
+      for (const messageId of messageIdsToRetry || []) {
+        if (!reconciliationRetryMessageIds.includes(messageId)) reconciliationRetryMessageIds.push(messageId);
+      }
+      if (reconciliationRetryQueued || !reconciliationRetryMessageIds.length) return;
       reconciliationRetryQueued = true;
       queueMicrotask(() => {
         if (this.stopping || signal?.aborted) return;
-        this.reconcilePending(before, { allowPaused: true, readyOnly: true, channelIds })
-          .catch(error => this.logger(`Discord reply reconciliation retry failed: ${error.message}`));
+        this.reconcilePending(before, {
+          allowPaused: true,
+          readyOnly: true,
+          channelIds,
+          messageIds: reconciliationRetryMessageIds
+        }).catch(error => this.logger(`Discord reply reconciliation retry failed: ${error.message}`));
       });
     };
     const storedMessages = new Map();
@@ -3041,7 +3067,7 @@ class DiscordGateway {
           continueUntilFinal: true,
           deferReply: () => {
             const deferred = !storedMessage.channel;
-            if (deferred) queueReconciliationRetry();
+            if (deferred) queueReconciliationRetry([message.id]);
             return deferred;
           }
         });
@@ -3055,7 +3081,8 @@ class DiscordGateway {
       }
     }
     // F14 phase 2: the existing bounded channel fetch / reply reconciliation.
-    for (const message of ordered) {
+    for (let candidateIndex = 0; candidateIndex < ordered.length; candidateIndex += 1) {
+      const message = ordered[candidateIndex];
       if (signal?.aborted) return this.state.recoveryCandidates(before).filter(allowed);
       const key = `${message.provider}:${message.nativeId}`;
       if (blockedOwners.has(key)) continue;
@@ -3075,7 +3102,11 @@ class DiscordGateway {
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE) {
-          queueReconciliationRetry();
+          // Rotate the timed-out candidate behind every unvisited candidate so a
+          // fresh deadline can make progress without abandoning its retry.
+          const retryMessageIds = ordered.slice(candidateIndex + 1).map(candidate => candidate.id);
+          retryMessageIds.push(message.id);
+          queueReconciliationRetry(retryMessageIds);
         }
         blockedOwners.add(key);
         if (!channelFetchStarted) continue;
