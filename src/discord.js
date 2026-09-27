@@ -2863,7 +2863,8 @@ class DiscordGateway {
           Math.max(0, waiter.deadline - Date.now()) + RECOVERY_WAITER_DEADLINE_GRACE_MS);
       };
       waiter.extendDeadline = nextDeadline => {
-        if (waiter.settled || !Number.isFinite(nextDeadline) || nextDeadline <= waiter.deadline) return;
+        if (waiter.settled || !Number.isFinite(nextDeadline) ||
+            (Number.isFinite(waiter.deadline) && nextDeadline <= waiter.deadline)) return;
         waiter.deadline = nextDeadline;
         armTimer();
       };
@@ -2977,9 +2978,17 @@ class DiscordGateway {
         }
         const activeWaiters = [request.waiter, ...request.waiter.parents].filter(waiter => !waiter.settled);
         this.recoveryActiveWaiters = new Set(activeWaiters);
+        // Scoped followups are serialized, so their timeout starts when this pass begins.
+        const passDeadline = request.scope === null
+          ? request.deadline
+          : Date.now() + this.recoveryTimeoutMs;
+        if (request.scope !== null) {
+          request.waiter.extendDeadline(passDeadline);
+          for (const parent of request.waiter.parents) parent.extendDeadline(passDeadline);
+        }
         let result;
         try {
-          result = await startRecoveryPass(request.scope, request.deadline, request.reason,
+          result = await startRecoveryPass(request.scope, passDeadline, request.reason,
             request.lifecycleEpoch, activeWaiters);
         } catch (error) {
           result = { ready: false, state: recoveryKind(error) || 'unavailable', error };
@@ -3011,13 +3020,15 @@ class DiscordGateway {
       coordinator.then(finishCoordinator, finishCoordinator).catch(() => {});
     };
 
-    const waiter = makeWaiter(callerScope, overallDeadline);
-    if (this.recoveryPromise || this.recoveryFollowupPromise) {
+    const recoveryAlreadyQueued = this.recoveryPromise || this.recoveryFollowupPromise;
+    const queuedScoped = recoveryAlreadyQueued && callerScope !== null;
+    const waiter = makeWaiter(callerScope, queuedScoped ? null : overallDeadline);
+    if (recoveryAlreadyQueued) {
       if (callerScope === null) this.ready = false;
       attachParents(waiter);
       this.pendingRecoveryRequests.push({
         scope: callerScope === null ? null : new Set(callerScope),
-        deadline: overallDeadline,
+        deadline: queuedScoped ? null : overallDeadline,
         reason,
         lifecycleEpoch,
         waiter
@@ -3237,7 +3248,12 @@ class DiscordGateway {
         blockedOwners.add(key);
         continue;
       }
+      let recoveryOperationStarted = false;
       try {
+        const startRecoveryOperation = operation => {
+          recoveryOperationStarted = true;
+          return operation();
+        };
         const settleReplyDeadline = () => {
           const current = this.state.getMessage(message.id);
           if (current?.state !== 'replying') return current;
@@ -3245,8 +3261,9 @@ class DiscordGateway {
         };
         if (message.state === 'accepted') {
           for (let attempt = 0; attempt < 2; attempt += 1) {
+            recoveryOperationStarted = false;
             result = await waitForRecoveryOperation(
-              () => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true, awaitDispatchOutcome: true }),
+              () => startRecoveryOperation(() => this.consumer.handleStoredMessage(storedMessage, signal, { continueUntilFinal: true, handoff: true, awaitDispatchOutcome: true })),
               signal,
               deadline
             );
@@ -3258,8 +3275,9 @@ class DiscordGateway {
           const current = this.state.getMessage(message.id);
           if (current?.state === 'reply_ready') {
             this.state.recoverNativeReplyAcknowledgment(message.id);
+            recoveryOperationStarted = false;
             result = await waitForRecoveryOperation(
-              () => this.consumer.deliverReply(storedMessage, { status: current.state, message: current }, signal),
+              () => startRecoveryOperation(() => this.consumer.deliverReply(storedMessage, { status: current.state, message: current }, signal)),
               signal,
               deadline,
               settleReplyDeadline
@@ -3267,8 +3285,9 @@ class DiscordGateway {
           }
         } else {
           this.state.recoverNativeReplyAcknowledgment(message.id);
+          recoveryOperationStarted = false;
           result = await waitForRecoveryOperation(
-            () => this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal),
+            () => startRecoveryOperation(() => this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal)),
             signal,
             deadline,
             settleReplyDeadline
@@ -3279,6 +3298,10 @@ class DiscordGateway {
         }
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE && !recoveryOperationStarted) {
+          // The preflight check skipped delivery and its deadline settlement, so retain custody for a fresh pass.
+          queueReconciliationRetry([message.id]);
+        }
         blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
         continue;

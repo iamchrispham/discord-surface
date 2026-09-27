@@ -349,38 +349,51 @@ test('selected recovery remains selected after an arrival followup', { timeout: 
   assert.equal(f.dispatched.length, 0);
 });
 
-for (const settled of [false, true]) {
-  test(`expired queued recovery preserves healthy custody (${settled ? 'settled' : 'unsettled'} caller)`, { timeout: 3000 }, async t => {
-    const f = fixture(t);
-    f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
-      nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
-    f.state.setIntakeBaseline('3000', '100', 'fixture');
-    f.state.markIntakeBoundary('3000', 'ready');
-    const before = f.state.getIntakeWatermark('3000');
-    let entered, release;
-    const started = new Promise(resolve => { entered = resolve; });
-    const held = new Promise(resolve => { release = resolve; });
-    const original = f.gateway.fetchHistory;
-    let paused = false;
-    f.gateway.fetchHistory = async (channel, options) => {
-      if (!paused) { paused = true; entered(); await held; }
-      return original(channel, options);
-    };
-    try {
-      const active = f.gateway.recoverTransport('active', f.gateway.lifecycleEpoch, ['1000']);
-      await started;
-      const queued = f.gateway.recoverTransport('expired', f.gateway.lifecycleEpoch, ['3000'], Date.now() - 1);
-      if (settled) await settleRecovery(queued);
-      release();
-      await settleRecovery(active);
-      await settleRecovery(queued);
-      await f.gateway.recoveryFollowupPromise;
-      assert.deepEqual(f.state.getIntakeWatermark('3000'), before);
-      assert.equal(f.calls.some(call => call.id === '3000'), false);
-      assert.equal(f.dispatched.length, 0);
-    } finally { release(); }
-  });
-}
+test('queued scoped recovery starts with a fresh deadline', { timeout: 3000 }, async t => {
+  const f = fixture(t);
+  for (const [channelId, nativeId] of [
+    ['3000', '33333333-3333-4333-8333-333333333333'],
+    ['4000', '44444444-4444-4444-8444-444444444444']
+  ]) {
+    f.state.bind({ channelId, guildId: 'guild', provider: 'codex',
+      nativeId, workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
+    f.state.setIntakeBaseline(channelId, '100', 'fixture');
+    f.state.markIntakeBoundary(channelId, 'ready');
+    f.channels.set(channelId, { ...f.channels.get('1000'), id: channelId });
+    f.history.set(channelId, []);
+  }
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const held = new Promise(resolve => { release = resolve; });
+  const original = f.gateway.fetchHistory.bind(f.gateway);
+  let paused = false;
+  let slowRoutePending = true;
+  f.gateway.fetchHistory = async (channel, options) => {
+    if (!paused) { paused = true; entered(); await held; }
+    if (channel.id === '3000' && slowRoutePending) {
+      slowRoutePending = false;
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    return original(channel, options);
+  };
+  try {
+    const active = f.gateway.recoverTransport('active', f.gateway.lifecycleEpoch, ['1000'], Date.now() + 1000);
+    await started;
+    f.gateway.recoveryTimeoutMs = 25;
+    const first = f.gateway.recoverTransport('expired-first', f.gateway.lifecycleEpoch, ['3000'], Date.now() - 1);
+    const second = f.gateway.recoverTransport('expired-second', f.gateway.lifecycleEpoch, ['4000'], Date.now() - 1);
+    release();
+    await settleRecovery(active);
+    await settleRecovery(first);
+    await settleRecovery(second);
+    await f.gateway.recoveryFollowupPromise;
+    assert.equal(f.calls.some(call => call.kind === 'channel' && call.id === '3000'), true);
+    assert.equal(f.calls.some(call => call.kind === 'channel' && call.id === '4000'), true);
+    assert.equal(f.state.getIntakeWatermark('4000').state, 'ready');
+    assert.equal(f.state.getBinding('4000').readiness, 'ready');
+    assert.equal(f.dispatched.length, 0);
+  } finally { release(); }
+});
 
 for (let hops = 0; hops <= 8; hops++) {
   test(`reconciliation and followup remain serialized at microtask ${hops}`, { timeout: 3000 }, async t => {
@@ -525,6 +538,56 @@ test('direct reply-ready recovery send settles as unknown at the shared deadline
     releaseSend?.({ id: 'late-reply' });
   }
 });
+
+test('reply-ready recovery retries when delivery misses the preflight deadline', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const message = f.message('101', '1000');
+  assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, 'submitted');
+  const stored = f.state.getMessage('101');
+  f.state.recordNativeReply({
+    provider: stored.provider,
+    messageId: stored.id,
+    nativeId: stored.nativeId,
+    generation: stored.generation,
+    text: 'saved reply'
+  });
+  f.enableDelivery();
+  f.gateway.recoveryTimeoutMs = 25;
+  const originalFetch = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+  let fetchCalls = 0;
+  f.gateway.client.channels.fetch = async id => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) await new Promise(resolve => setTimeout(resolve, 5));
+    return originalFetch(id);
+  };
+  const originalPermission = f.gateway.historyPermission.bind(f.gateway);
+  let permissionCalls = 0;
+  f.gateway.historyPermission = (...args) => {
+    const permission = originalPermission(...args);
+    permissionCalls += 1;
+    if (permissionCalls === 1) {
+      const deadline = Date.now() + 30;
+      while (Date.now() < deadline) {}
+    }
+    return permission;
+  };
+  try {
+    await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline && f.state.getMessage('101').state !== 'replied') {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok(fetchCalls >= 2, 'the preflight timeout must queue another reconciliation pass');
+    assert.equal(f.state.getMessage('101').state, 'replied');
+    assert.equal(f.replies.length, 1);
+  } finally {
+    f.gateway.client.channels.fetch = originalFetch;
+    f.gateway.historyPermission = originalPermission;
+  }
+});
+
 for (const pageLimit of [10, 2]) {
   test(`completed-empty parent retains descending history with page limit ${pageLimit}`, { timeout: 4000 }, async t => {
     const f = fixture(t);
