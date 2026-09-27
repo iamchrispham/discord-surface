@@ -1,9 +1,11 @@
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import * as http from 'node:http';
 import * as net from 'node:net';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { canonicalSocketPath, pathsOverlap } from './socket-ownership/path';
+import { captureBoundSocketIdentity } from './socket-ownership/bound-identity';
 import {
   assertLockNamespaceIsUsable,
   LOCK_NAMESPACE,
@@ -20,6 +22,8 @@ import {
   type QuarantineDependencies
 } from './socket-ownership/quarantine';
 import type { FileGeneration, FileIdentity, OwnerMarkerSnapshot, OwnerRecord, SocketIdentity } from './socket-ownership/types';
+
+export type { SocketIdentity } from './socket-ownership/types';
 
 export type SocketPathIdentity = SocketIdentity;
 
@@ -141,23 +145,7 @@ export function socketPathIdentity(socketPath: string): SocketPathIdentity | und
   }
 }
 
-export function boundSocketIdentity(server: net.Server): SocketPathIdentity | undefined {
-  const handle = (server as net.Server & { _handle?: { fd?: number } })._handle;
-  const fd = handle?.fd;
-  if (fd === undefined || !Number.isInteger(fd) || fd < 0) return undefined;
-  try {
-    const stats = fs.fstatSync(fd, { bigint: true });
-    if (!stats.isSocket()) return undefined;
-    return {
-      dev: stats.dev,
-      ino: stats.ino,
-      ctimeNs: stats.ctimeNs,
-      birthtimeNs: stats.birthtimeNs
-    };
-  } catch {
-    return undefined;
-  }
-}
+export async function boundSocketIdentity(server: http.Server, socketPath: string, signal?: AbortSignal): Promise<SocketPathIdentity> { return captureBoundSocketIdentity(server, socketPath, { owner: effectiveUserId(), sameSocket, signal }); }
 
 function lockNamespacePath(socketPath: string): string {
   const root = ownerControlledNamespaceRoot({

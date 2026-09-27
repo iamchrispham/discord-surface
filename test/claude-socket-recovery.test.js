@@ -65,6 +65,66 @@ function releaseQuietly(release) {
   try { release(); } catch {}
 }
 
+// Test-local helpers for the real-socket qualification scenarios below. They are
+// intentionally small and bounded: every wait has a deadline, and callers own
+// socket-directory teardown so failure branches clean up too.
+function listenOn(server, socket) {
+  return new Promise((resolve, reject) => {
+    const onError = error => { server.off('error', onError); reject(error); };
+    server.once('error', onError);
+    server.listen(socket, () => {
+      server.off('error', onError);
+      resolve(server);
+    });
+  });
+}
+
+function closeListeningServer(server) {
+  if (!server || !server.listening) return Promise.resolve();
+  return new Promise(resolve => {
+    server.close(() => resolve());
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+  });
+}
+
+function requestOverSocket(socket, { method = 'GET', requestPath = '/identity', headers = {}, agent = false } = {}) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const request = http.request({
+      socketPath: socket,
+      path: requestPath,
+      method,
+      agent,
+      headers: agent ? { ...headers } : { connection: 'close', ...headers }
+    }, response => {
+      const clientSocket = request.socket;
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('error', error => { clearTimeout(timer); reject(error); });
+      response.on('end', () => {
+        clearTimeout(timer);
+        resolve({
+          statusCode: response.statusCode,
+          body: Buffer.concat(chunks).toString('utf8'),
+          clientSocket
+        });
+      });
+    });
+    timer = setTimeout(() => request.destroy(new Error('test HTTP request timed out')), 3000);
+    request.on('error', error => { clearTimeout(timer); reject(error); });
+    request.end();
+  });
+}
+
+async function waitForCondition(predicate, message, timeout = 3000) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+
 function isCaseInsensitiveDirectory(directory) {
   const probe = `.case-probe-${randomUUID()}`;
   const probePath = path.join(directory, probe);
@@ -201,18 +261,34 @@ test('owner records preserve a process identity when Linux exposes one', t => {
   }
 });
 
-test('bound socket identity comes from the listener descriptor', t => {
-  const expected = {
-    dev: 11n,
-    ino: 22n,
-    ctimeNs: 33n,
-    birthtimeNs: 44n
-  };
-  t.mock.method(fs, 'fstatSync', fd => {
-    assert.equal(fd, 17);
-    return { ...expected, isSocket: () => true };
+test('bound socket identity uses qualified pathname metadata', { timeout: 6000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const directory = path.dirname(socket);
+  const server = http.createServer((request, response) => {
+    response.writeHead(404);
+    response.end();
   });
-  assert.deepEqual(socketOwnership.boundSocketIdentity({ _handle: { fd: 17 } }), expected);
+  t.after(async () => {
+    try {
+      await closeListeningServer(server);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  await listenOn(server, socket);
+  const baselineRequestListeners = server.listenerCount('request');
+  const identity = await socketOwnership.boundSocketIdentity(server, socket);
+  const stats = fs.lstatSync(socket, { bigint: true });
+  assert.ok(identity, 'capture must publish an identity for an owned bound socket');
+  assert.equal(identity.dev, stats.dev, 'device must match the qualified pathname');
+  assert.equal(identity.ino, stats.ino, 'inode must match the qualified pathname');
+  assert.equal(identity.ctimeNs, stats.ctimeNs, 'ctime must match the qualified pathname');
+  assert.equal(identity.birthtimeNs, stats.birthtimeNs, 'birthtime must match the qualified pathname');
+  assert.equal(
+    server.listenerCount('request'),
+    baselineRequestListeners,
+    'capture must remove its temporary qualification listener'
+  );
 });
 
 test('socket ownership follows the effective UID when real and effective IDs differ', t => {
@@ -1316,7 +1392,9 @@ test('stop during orphan probe prevents subsequent listener startup', { timeout:
   await orphan(socket);
   const { EventEmitter } = require('node:events');
   const probes = [];
-  t.mock.method(net, 'createConnection', () => {
+  const originalCreateConnection = net.createConnection;
+  t.mock.method(net, 'createConnection', (...args) => {
+    if (probes.length >= 2) return originalCreateConnection.apply(net, args);
     const probe = new EventEmitter();
     probe.destroy = () => {};
     probes.push(probe);
@@ -1912,4 +1990,307 @@ test('capture refuses a different real listener at the path', { timeout: 6000 },
   assert.equal(observedIdentity.ctimeNs, bIdentity.ctimeNs, 'public listener ctimeNs must be preserved');
   assert.equal(observedIdentity.birthtimeNs, bIdentity.birthtimeNs, 'public listener birthtimeNs must be preserved');
   assert.equal(captureOutcome.status, 'rejected', 'capture must refuse a different real listener at the path');
+});
+
+test('pending qualification keeps the preparation lock through stop', { timeout: 6000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  let signalObservedResolve;
+  const signalObserved = new Promise(resolve => { signalObservedResolve = resolve; });
+  let suppliedServer;
+  let baselineRequestListeners;
+  t.mock.method(socketOwnership, 'boundSocketIdentity', (server, _socketPath, signal) => {
+    suppliedServer = server;
+    baselineRequestListeners = server.listenerCount('request');
+    signalObservedResolve();
+    return new Promise((resolve, reject) => {
+      const abortError = () => reject(new Error('Claude channel bound socket qualification aborted'));
+      if (signal?.aborted) { abortError(); return; }
+      signal?.addEventListener('abort', abortError, { once: true });
+    });
+  });
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  t.after(async () => {
+    try { await channel.stop(); } catch {}
+    removeSocketDirectory(socket);
+  });
+
+  const starting = channel.start();
+  const startingOutcome = starting.then(() => null, error => error);
+  await signalObserved;
+  assert.equal(channel.ready, false, 'channel must not become ready while qualification is pending');
+  assert.throws(() => acquireSocketLock(socket), /already in progress/, 'preparation lock must survive a pending qualification');
+
+  const stopping = channel.stop();
+  await new Promise(resolve => setImmediate(resolve));
+  const startError = await startingOutcome;
+  assert.match(startError.message, /Claude channel stopped during listener startup/);
+  await stopping;
+
+  const release = acquireSocketLock(socket);
+  release();
+  assert.ok(suppliedServer, 'the channel must supply its bound server to the capture call');
+  assert.equal(
+    suppliedServer.listenerCount('request'),
+    baselineRequestListeners,
+    'no qualification listener may remain after stopped startup'
+  );
+});
+
+test('qualification abort disposes its own proof resources', { timeout: 6000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const directory = path.dirname(socket);
+  const server = http.createServer((request, response) => {
+    request.resume();
+    if (withhold) {
+      held.push({ request, response });
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ provider: 'claude' }));
+  });
+  let withhold = true;
+  const held = [];
+  const observed = [];
+  let observedResolve;
+  const witnessed = new Promise(resolve => { observedResolve = resolve; });
+  server.on('request', () => {
+    observed.push(Date.now());
+    observedResolve();
+  });
+  t.after(async () => {
+    for (const entry of held) {
+      try { entry.response.destroy(); } catch {}
+      try { entry.request.destroy(); } catch {}
+    }
+    try { await closeListeningServer(server); } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  await listenOn(server, socket);
+  const baselineRequestListeners = server.listenerCount('request');
+  const controller = new AbortController();
+  const capture = socketOwnership.boundSocketIdentity(server, socket, controller.signal);
+  await witnessed;
+  const proofSocket = held[0]?.request?.socket;
+  assert.ok(proofSocket, 'the withheld proof request socket must be observable');
+  controller.abort();
+  await assert.rejects(capture, /Claude channel bound socket qualification aborted/);
+  assert.equal(server.listenerCount('request'), baselineRequestListeners, 'temporary qualification listener must be removed');
+  await waitForCondition(() => proofSocket.destroyed === true, 'proof connection must be closed on abort');
+  assert.equal(fs.existsSync(socket), true, 'aborted capture must leave the socket pathname in place');
+
+  withhold = false;
+  const followUp = await requestOverSocket(socket, { method: 'GET' });
+  assert.equal(followUp.statusCode, 200, 'supplied server must keep serving ordinary requests after abort');
+});
+
+test('qualification deadline rejects a late witness', { timeout: 6000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const directory = path.dirname(socket);
+  const held = [];
+  const server = http.createServer((request, response) => {
+    request.resume();
+    held.push({ request, response });
+  });
+  const activeConnections = new Set();
+  server.on('connection', connection => {
+    activeConnections.add(connection);
+    connection.on('close', () => activeConnections.delete(connection));
+  });
+  let observedResolve;
+  const witnessed = new Promise(resolve => { observedResolve = resolve; });
+  server.on('request', () => { observedResolve(); });  t.after(async () => {
+    for (const entry of held) {
+      try { entry.response.destroy(); } catch {}
+      try { entry.request.destroy(); } catch {}
+    }
+    try { await closeListeningServer(server); } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  await listenOn(server, socket);
+  const baselineRequestListeners = server.listenerCount('request');
+  let outcome = 'pending';
+  let rejectedMessage = '';
+  const started = Date.now();
+  const capture = socketOwnership.boundSocketIdentity(server, socket);
+  capture.then(
+    () => { outcome = 'fulfilled'; },
+    error => { outcome = 'rejected'; rejectedMessage = error.message; }
+  );
+  await witnessed;
+  await assert.rejects(capture, /Claude channel bound socket qualification timed out/);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 900, `deadline must not fire prematurely (elapsed ${elapsed}ms)`);
+  assert.ok(elapsed < 4000, `deadline must stay bounded (elapsed ${elapsed}ms)`);
+  assert.match(rejectedMessage, /Claude channel bound socket qualification timed out/);
+  await waitForCondition(() => activeConnections.size === 0, 'proof connection must be closed at deadline');
+
+  for (const entry of held) {
+    try { entry.response.writeHead(200); } catch {}
+    try { entry.response.end(JSON.stringify({ provider: 'claude' })); } catch {}
+  }
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.equal(outcome, 'rejected', 'no late witness may convert a timed-out capture into success');
+  assert.equal(server.listenerCount('request'), baselineRequestListeners, 'temporary qualification listener must be removed');
+  assert.equal(fs.existsSync(socket), true, 'timed-out capture must leave the socket pathname in place');
+});
+
+test('qualification rejects pathname replacement after its witness', { timeout: 6000 }, async t => {
+  const directory = fs.mkdtempSync('/tmp/dss-');
+  fs.chmodSync(directory, 0o700);
+  const publicPath = path.join(directory, 'public.sock');
+  const movedPath = path.join(directory, 'moved.sock');
+  const privatePath = path.join(directory, 'private.sock');
+  const held = [];
+  let observedResolve;
+  const witnessed = new Promise(resolve => { observedResolve = resolve; });
+  const serverA = http.createServer((request, response) => {
+    request.resume();
+    held.push({ request, response });
+    observedResolve();
+  });
+  const serverB = http.createServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ provider: 'claude', id: 'ordinary-logical-id' }));
+  });
+  t.after(async () => {
+    try {
+      if (fs.existsSync(publicPath)) fs.renameSync(publicPath, privatePath);
+      for (const entry of held) {
+        try { entry.response.destroy(); } catch {}
+        try { entry.request.destroy(); } catch {}
+      }
+      await closeListeningServer(serverA);
+      await closeListeningServer(serverB);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  await listenOn(serverA, publicPath);
+  const capture = socketOwnership.boundSocketIdentity(serverA, publicPath);
+  await witnessed;
+  fs.renameSync(publicPath, movedPath);
+  await listenOn(serverB, publicPath);
+  const bIdentity = socketOwnership.socketPathIdentity(publicPath);
+  assert.ok(bIdentity, 'replacement listener path identity must be readable');
+  for (const entry of held) {
+    try { entry.response.end(); } catch {}
+  }
+  await assert.rejects(capture, /Claude channel bound socket qualification refused/);
+
+  const probe = await requestOverSocket(publicPath, { method: 'GET' });
+  assert.equal(probe.statusCode, 200, 'replacement listener must remain reachable');
+  const observedIdentity = socketOwnership.socketPathIdentity(publicPath);
+  assert.ok(observedIdentity, 'replacement identity must remain readable');
+  assert.equal(observedIdentity.dev, bIdentity.dev, 'replacement dev must be preserved');
+  assert.equal(observedIdentity.ino, bIdentity.ino, 'replacement ino must be preserved');
+  assert.equal(observedIdentity.ctimeNs, bIdentity.ctimeNs, 'replacement ctimeNs must be preserved');
+  assert.equal(observedIdentity.birthtimeNs, bIdentity.birthtimeNs, 'replacement birthtimeNs must be preserved');
+});
+
+test('unrelated requests cannot qualify the bound listener', { timeout: 6000 }, async t => {
+  const directory = fs.mkdtempSync('/tmp/dss-');
+  fs.chmodSync(directory, 0o700);
+  const publicPath = path.join(directory, 'public.sock');
+  const movedPath = path.join(directory, 'moved.sock');
+  const privatePath = path.join(directory, 'private.sock');
+  const serverA = http.createServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ provider: 'claude', id: 'server-a' }));
+  });
+  let nonceRequests = 0;
+  const serverB = http.createServer((request, response) => {
+    request.resume();
+    if (request.headers['x-discord-socket-qualification'] !== undefined) nonceRequests += 1;
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ provider: 'claude', id: 'ordinary-logical-id' }));
+  });
+  t.after(async () => {
+    try {
+      if (fs.existsSync(publicPath)) fs.renameSync(publicPath, privatePath);
+      await closeListeningServer(serverA);
+      await closeListeningServer(serverB);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  await listenOn(serverA, publicPath);
+  fs.renameSync(publicPath, movedPath);
+  await listenOn(serverB, publicPath);
+  const bIdentity = socketOwnership.socketPathIdentity(publicPath);
+  assert.ok(bIdentity, 'replacement listener path identity must be readable');
+
+  const unrelated = await requestOverSocket(publicPath, { method: 'GET' });
+  assert.equal(unrelated.statusCode, 200, 'unrelated request must reach the replacement listener');
+  assert.equal(nonceRequests, 0, 'unrelated traffic must not carry the qualification nonce');
+
+  await assert.rejects(
+    socketOwnership.boundSocketIdentity(serverA, publicPath),
+    /Claude channel bound socket qualification refused/,
+    'capture must refuse when the supplied server never witnessed the request'
+  );
+  assert.equal(nonceRequests, 1, 'the qualification request must reach the other real listener');
+  const probe = await requestOverSocket(publicPath, { method: 'GET' });
+  assert.equal(probe.statusCode, 200, 'replacement listener must remain reachable');
+  const observedIdentity = socketOwnership.socketPathIdentity(publicPath);
+  assert.ok(observedIdentity, 'replacement identity must remain readable');
+  assert.equal(observedIdentity.dev, bIdentity.dev, 'replacement dev must be preserved');
+  assert.equal(observedIdentity.ino, bIdentity.ino, 'replacement ino must be preserved');
+  assert.equal(observedIdentity.ctimeNs, bIdentity.ctimeNs, 'replacement ctimeNs must be preserved');
+  assert.equal(observedIdentity.birthtimeNs, bIdentity.birthtimeNs, 'replacement birthtimeNs must be preserved');
+});
+
+test('qualification preserves unrelated accepted connections', { timeout: 6000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const directory = path.dirname(socket);
+  const server = http.createServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ provider: 'claude' }));
+  });
+  const activeConnections = new Set();
+  let firstServerConnection;
+  server.on('connection', connection => {
+    if (!firstServerConnection) firstServerConnection = connection;
+    activeConnections.add(connection);
+    connection.on('close', () => activeConnections.delete(connection));
+  });
+  const keepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  t.after(async () => {
+    try {
+      for (const connection of activeConnections) connection.destroy();
+      keepAliveAgent.destroy();
+      await closeListeningServer(server);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  await listenOn(server, socket);
+  const baselineRequestListeners = server.listenerCount('request');
+  const unrelated = await requestOverSocket(socket, { agent: keepAliveAgent, method: 'GET' });
+  assert.equal(unrelated.statusCode, 200, 'unrelated connection must be served before capture');
+  const unrelatedSocket = unrelated.clientSocket;
+  assert.ok(unrelatedSocket, 'unrelated client socket must be observable');
+  assert.equal(unrelatedSocket.destroyed, false, 'unrelated connection must stay open before capture');
+
+  const identity = await socketOwnership.boundSocketIdentity(server, socket);
+  assert.ok(identity, 'capture must succeed against an ordinary bound server');
+  assert.equal(unrelatedSocket.destroyed, false, 'unrelated accepted connection must survive capture');
+  assert.equal(activeConnections.size, 1, 'only the nonce connection may be closed by capture');
+  assert.equal(activeConnections.has(firstServerConnection), true, 'the unrelated connection must remain accepted');
+  assert.equal(firstServerConnection.destroyed, false, 'the unrelated accepted connection must remain open');
+
+  const reused = await requestOverSocket(socket, { agent: keepAliveAgent, method: 'GET' });
+  assert.equal(reused.statusCode, 200, 'unrelated connection must remain usable after capture');
+  assert.equal(reused.clientSocket, unrelatedSocket, 'follow-up request must reuse the unrelated connection');
+  assert.equal(server.listenerCount('request'), baselineRequestListeners, 'temporary qualification listener must be removed');
+
+  unrelatedSocket.destroy();
+  keepAliveAgent.destroy();
 });

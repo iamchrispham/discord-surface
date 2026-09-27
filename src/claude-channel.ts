@@ -590,23 +590,24 @@ export class ClaudeChannel<
         server.once('error', reject);
         server.listen(this.socketPath, () => {
           server.off('error', reject);
-          try { fs.chmodSync(this.socketPath, 0o600); } catch {}
           let socketIdentity: socketOwnership.SocketPathIdentity | undefined;
-          socketIdentity = socketOwnership.boundSocketIdentity(server);
-          if (!socketIdentity) {
-            try { server.close(); } catch {}
-            reject(new Error('Claude channel listener socket identity is unavailable during startup'));
-            return;
-          }
-          if (this.transportClosed) {
-            try { server.close(); } catch {}
-            try { socketOwnership.unlinkSocketIfOwned(this.socketPath, socketIdentity); } catch {}
-            reject(new Error('Claude channel stopped during listener startup'));
-            return;
-          }
-          this.socketIdentity = socketIdentity;
-          this.ownsSocket = true;
-          resolve();
+          try { fs.chmodSync(this.socketPath, 0o600); } catch {}
+          void socketOwnership.boundSocketIdentity(server, this.socketPath, startupController.signal)
+            .then(identity => {
+              socketIdentity = identity;
+              if (this.transportClosed) {
+                try { server.close(); } catch {}
+                try { socketOwnership.unlinkSocketIfOwned(this.socketPath, identity); } catch {}
+                reject(new Error('Claude channel stopped during listener startup'));
+                return;
+              }
+              this.socketIdentity = identity;
+              this.ownsSocket = true;
+              resolve();
+            }, error => {
+              try { server.close(); } catch {}
+              reject(error);
+            });
         });
       });
       await Promise.race([listenerStartup, startupCancellation]);
