@@ -200,6 +200,20 @@ test('owner records preserve a process identity when Linux exposes one', t => {
   }
 });
 
+test('bound socket identity comes from the listener descriptor', t => {
+  const expected = {
+    dev: 11n,
+    ino: 22n,
+    ctimeNs: 33n,
+    birthtimeNs: 44n
+  };
+  t.mock.method(fs, 'fstatSync', fd => {
+    assert.equal(fd, 17);
+    return { ...expected, isSocket: () => true };
+  });
+  assert.deepEqual(socketOwnership.boundSocketIdentity({ _handle: { fd: 17 } }), expected);
+});
+
 test('socket ownership follows the effective UID when real and effective IDs differ', t => {
   if (process.getuid === undefined || process.geteuid === undefined) return;
   const realUid = process.getuid();
@@ -475,6 +489,41 @@ test('fallback lock root remains stable when home identity is temporarily unavai
     homeAvailable = true;
     assert.throws(() => acquireSocketLock(socket), /already in progress/,
       'home recovery must not move contenders to a second lock namespace');
+  } finally {
+    first.release();
+  }
+});
+
+test('ambiguous fallback roots are refused when the publication marker disappears', t => {
+  const missingHome = path.join('/tmp', `dss-missing-home-${randomUUID()}`);
+  const userInfo = os.userInfo();
+  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: missingHome }));
+  const previousRuntimeRoot = process.env.XDG_RUNTIME_DIR;
+  delete process.env.XDG_RUNTIME_DIR;
+
+  const sharedRoot = fs.mkdtempSync('/tmp/dss-ambiguous-root-');
+  fs.chmodSync(sharedRoot, 0o1777);
+  const originalRealpath = fs.realpathSync;
+  t.mock.method(fs, 'realpathSync', (target, ...args) => {
+    if (String(target) === '/tmp') return sharedRoot;
+    return originalRealpath(target, ...args);
+  });
+  t.after(() => {
+    if (previousRuntimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = previousRuntimeRoot;
+    fs.rmSync(sharedRoot, { recursive: true, force: true });
+  });
+
+  const first = acquireSocketLockWithPath(t, socketPath(t));
+  const rendezvousName = fs.readdirSync(sharedRoot).find(entry => entry.startsWith('.discord-surface-locks-'));
+  assert.ok(rendezvousName);
+  const markerPath = path.join(sharedRoot, rendezvousName, 'fallback-root');
+  fs.unlinkSync(markerPath);
+  const ownerName = process.geteuid?.() ?? process.getuid?.() ?? 'shared';
+  fs.mkdtempSync(path.join(sharedRoot, `.claude-channel-${ownerName}-`));
+
+  try {
+    assert.throws(() => acquireSocketLock(socketPath(t)), /fallback-root rendezvous is ambiguous/);
   } finally {
     first.release();
   }

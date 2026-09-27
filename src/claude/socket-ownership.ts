@@ -141,6 +141,24 @@ export function socketPathIdentity(socketPath: string): SocketPathIdentity | und
   }
 }
 
+export function boundSocketIdentity(server: net.Server): SocketPathIdentity | undefined {
+  const handle = (server as net.Server & { _handle?: { fd?: number } })._handle;
+  const fd = handle?.fd;
+  if (fd === undefined || !Number.isInteger(fd) || fd < 0) return undefined;
+  try {
+    const stats = fs.fstatSync(fd, { bigint: true });
+    if (!stats.isSocket()) return undefined;
+    return {
+      dev: stats.dev,
+      ino: stats.ino,
+      ctimeNs: stats.ctimeNs,
+      birthtimeNs: stats.birthtimeNs
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function lockNamespacePath(socketPath: string): string {
   const root = ownerControlledNamespaceRoot({
     effectiveUserId,

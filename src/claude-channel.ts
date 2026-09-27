@@ -592,14 +592,10 @@ export class ClaudeChannel<
           server.off('error', reject);
           try { fs.chmodSync(this.socketPath, 0o600); } catch {}
           let socketIdentity: socketOwnership.SocketPathIdentity | undefined;
-          try { socketIdentity = socketOwnership.socketPathIdentity(this.socketPath); } catch (error) {
-            try { server.close(); } catch {}
-            reject(error);
-            return;
-          }
+          socketIdentity = socketOwnership.boundSocketIdentity(server);
           if (!socketIdentity) {
             try { server.close(); } catch {}
-            reject(new Error('Claude channel listener socket disappeared during startup'));
+            reject(new Error('Claude channel listener socket identity is unavailable during startup'));
             return;
           }
           if (this.transportClosed) {

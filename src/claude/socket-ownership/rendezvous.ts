@@ -49,6 +49,7 @@ function publishedFallbackRoot(root: string, owner: number | undefined): string 
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
+  let publishedRoot: string | undefined;
   for (const entry of entries.filter(name => name === rendezvousName || name.startsWith(rendezvousPrefix)).sort()) {
     const rendezvousDirectory = path.join(root, entry);
     let rendezvousStats: fs.Stats;
@@ -83,9 +84,45 @@ function publishedFallbackRoot(root: string, owner: number | undefined): string 
     const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
     const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
     if (privateDirectory.isDirectory() && !privateDirectory.isSymbolicLink() && privateOwnerControlled &&
-      privateOwnerWritable && (privateDirectory.mode & 0o077) === 0) return privateRoot;
+      privateOwnerWritable && (privateDirectory.mode & 0o077) === 0) {
+      if (publishedRoot !== undefined && publishedRoot !== privateRoot) {
+        throw new Error('Claude channel fallback-root rendezvous is ambiguous');
+      }
+      publishedRoot = privateRoot;
+    }
   }
-  return undefined;
+  return publishedRoot;
+}
+
+function fallbackRendezvousClaimed(root: string, owner: number | undefined): boolean {
+  let directory: fs.Stats;
+  try { directory = fs.statSync(root); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  const stickySharedRoot = (directory.mode & 0o1000) !== 0 && (directory.mode & 0o002) !== 0;
+  if (!directory.isDirectory() || !stickySharedRoot) return false;
+
+  const ownerName = owner === undefined ? 'shared' : String(owner);
+  const rendezvousName = path.basename(lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`));
+  const rendezvousPrefix = `${rendezvousName}-`;
+  let entries: string[];
+  try { entries = fs.readdirSync(root); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  for (const entry of entries.filter(name => name === rendezvousName || name.startsWith(rendezvousPrefix))) {
+    const rendezvousDirectory = path.join(root, entry);
+    let rendezvousStats: fs.Stats;
+    try { rendezvousStats = fs.lstatSync(rendezvousDirectory); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    const rendezvousOwnerControlled = owner === undefined || rendezvousStats.uid === owner;
+    if (rendezvousStats.isDirectory() && !rendezvousStats.isSymbolicLink() && rendezvousOwnerControlled &&
+      (rendezvousStats.mode & 0o077) === 0) return true;
+  }
+  return false;
 }
 
 export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): string {
@@ -103,6 +140,7 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
     // No stable system temporary root is available.
   }
 
+  const fallbackClaimed = candidates.some(root => fallbackRendezvousClaimed(root, owner));
   for (const root of candidates) {
     const publishedRoot = publishedFallbackRoot(root, owner);
     if (publishedRoot) return publishedRoot;
@@ -114,7 +152,8 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
     if (!directory.isDirectory()) continue;
     const ownerControlledRoot = owner === undefined || directory.uid === owner;
     const ownerWritableRoot = owner === undefined || (directory.mode & 0o200) !== 0;
-    if (ownerControlledRoot && ownerWritableRoot && (directory.mode & 0o022) === 0) {
+    const fallbackClaimedNow = fallbackClaimed || candidates.some(candidate => fallbackRendezvousClaimed(candidate, owner));
+    if (ownerControlledRoot && ownerWritableRoot && (directory.mode & 0o022) === 0 && !fallbackClaimedNow) {
       try {
         fs.accessSync(root, fs.constants.W_OK | fs.constants.X_OK);
         return root;
@@ -229,9 +268,10 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
       let privateRoot = rendezvousState.root;
       let staleMarker = rendezvousState.staleMarker;
       let createdPrivateRoot = false;
-      if (!privateRoot) {
-        privateRoot = privateRoots.sort()[0];
+      if (!privateRoot && privateRoots.length > 1) {
+        throw new Error('Claude channel fallback-root rendezvous is ambiguous');
       }
+      if (!privateRoot) privateRoot = privateRoots[0];
       if (!privateRoot) {
         privateRoot = fs.mkdtempSync(path.join(root, privateRootPrefix));
         createdPrivateRoot = true;
@@ -349,7 +389,10 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
         }
       }
       const publishedRoot = publishedFallbackRoot(root, owner);
-      if (publishedRoot && publishedRoot !== privateRoot) {
+      if (!publishedRoot) {
+        throw new Error('Claude channel fallback-root rendezvous is missing');
+      }
+      if (publishedRoot !== privateRoot) {
         if (createdPrivateRoot) {
           try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
         }
@@ -363,7 +406,8 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
         fs.accessSync(privateRoot, fs.constants.W_OK | fs.constants.X_OK);
         return privateRoot;
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && /ambiguous|rendezvous is missing/.test(error.message)) throw error;
       // Try the next candidate.
     }
   }
