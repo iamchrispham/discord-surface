@@ -2,6 +2,7 @@
 
 const { KINDS, sameAddress, validateAgentMessage } = require('../agent-message');
 const { DIRECT_POST_ATTEMPT, DIRECT_POST_OUTCOME, AGENT_COMPLETION_RECEIPTS, MESSAGE_STATES } = require('../state');
+const { isLegacyChildResult } = require('../../dist/state/agent-routing.js');
 const { projectNewestDirectPostAttempt } = require('../../dist/state/direct-post.js');
 const PACKET_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
 const PEER_PACKET_ID_SCHEMA = Object.freeze({
@@ -86,8 +87,9 @@ function inspectPeerResult(state, source, correlationId) {
     const evidence = deliveryEvidence(state, discordId, candidate);
     if (!evidence) continue;
     if (packetMatchesRecordedIdentity(candidate, records)) deliveries.push(evidence);
-    else if (packet.kind === KINDS.REQUEST && candidate.kind === KINDS.RESULT && candidate.replyTo === packet.id &&
-      sameAddress(candidate.source, packet.target) && sameAddress(candidate.target, packet.source)) {
+    else if (packet.kind === KINDS.REQUEST && (candidate.kind === KINDS.RESULT && candidate.replyTo === packet.id &&
+      sameAddress(candidate.source, packet.target) && sameAddress(candidate.target, packet.source) ||
+      isLegacyChildResult(candidate, packet, packet.target, true))) {
       results.push({ ...evidence, packetId: candidate.id, text: candidate.text });
     }
   }
