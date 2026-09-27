@@ -773,7 +773,8 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
     if (signal?.aborted) onAbort();
     probe.once('connect', () => finish(new Error('Claude channel socket already exists; stop its owner first')));
     probe.once('error', (error: Error) => {
-      if ((error as NodeJS.ErrnoException).code === 'ECONNREFUSED') finish();
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ECONNREFUSED' || code === 'ENOENT') finish();
       else finish(error as Error);
     });
   });
