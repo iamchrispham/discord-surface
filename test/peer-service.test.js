@@ -250,6 +250,25 @@ test('peer custody scopes a reused packet ID to each caller channel', async t =>
   assert.equal(posts, 2);
 });
 
+test('peer custody scopes a reused packet ID to the caller source identity', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  const replacementNativeId = '44444444-4444-4444-4444-444444444444';
+  let posts = 0;
+  const fetchImpl = async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: `generation-packet-${posts}` }) };
+  };
+  const first = service(f, { fetchImpl });
+  const input = { peer: { conductorId: 'recipient' }, text: 'first', dedupe_key: 'generation-packet-id' };
+  assert.equal((await first.send(input)).status, 'sent');
+  f.state.db.prepare("UPDATE bindings SET native_id=?, generation=2 WHERE channel_id='101'").run(replacementNativeId);
+  const second = createPeerService({ state: f.state, provider: 'claude', token: 'fixture',
+    callerDependencies: { resolveClaudeCaller: async () => ({ harness: 'claude-code', sessionId: replacementNativeId }) }, fetchImpl });
+  assert.equal((await second.send({ ...input, text: 'second' })).status, 'sent');
+  assert.equal(posts, 2);
+});
+
 test('reply_to can select the request source when packet IDs collide', async t => {
   const f = fixture(t); f.enroll('102');
   const first = addRecipient(f);

@@ -241,6 +241,14 @@ function directPostCustodyKey(detail: DirectPostReceiptDetail): string {
   ].map(value => String(value ?? '')).join('\u0000');
 }
 
+function scopedAgentRows(state: DirectPostState, meta: DirectPostPartMeta): DirectPostReceiptRow[] {
+  const rows = state.directPostRows(meta.requestId, meta.agentPacket ? meta.channelId : null);
+  if (!meta.agentPacket) return rows;
+  return rows.filter(row => row.detail.guildId === meta.guildId && row.detail.channelId === meta.channelId &&
+    row.detail.provider === meta.provider && row.detail.nativeId === meta.nativeId &&
+    row.detail.generation === meta.generation);
+}
+
 export function createDirectPostHandlers(dependencies: DirectPostDependencies): DirectPostHandlers {
   const {
     BindingError,
@@ -299,7 +307,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
 
   function inspectPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null {
     assertResultRequestActive(state, meta);
-    const rows = state.directPostRows(meta.requestId, meta.agentPacket ? meta.channelId : null);
+    const rows = scopedAgentRows(state, meta);
     assertRequestIdentity(rows, meta);
     const partRows = rows.filter(row => row.detail.partIndex === meta.partIndex);
     const { attempt: latest, outcome, latestPreflight } = projectNewestDirectPostAttempt(partRows, {
@@ -423,7 +431,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       detail = validatedOutcomeDetail(canonicalMeta, detail, BindingError, snapshots);
       return state.transaction(() => {
         assertResultRequestActive(state, canonicalMeta);
-        const rows = state.directPostRows(canonicalMeta.requestId, canonicalMeta.agentPacket ? canonicalMeta.channelId : null);
+        const rows = scopedAgentRows(state, canonicalMeta);
         assertRequestIdentity(rows, canonicalMeta);
         const { attemptId: _attemptId, ...preflightMeta } = canonicalMeta;
         const next = { journal: 'direct-post-v1', ...preflightMeta, ...detail, phase: 'preflight', outcome };
