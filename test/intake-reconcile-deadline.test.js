@@ -28,7 +28,10 @@ for (const adoptThread of [true, false]) {
     assert.equal(f.dispatched.length, 0);
     await f.reopen();
     await f.recover();
-    assert.equal(f.boundary('2000').state, 'ready', 'later recovery must retry the retained boundary');
+    // A never-adopted child has no committed cutoff, so retrying the retained
+    // boundary observes history without qualifying it; only real adoption does.
+    assert.equal(f.boundary('2000').state, adoptThread ? 'ready' : 'pending',
+      'later recovery must retry the retained boundary');
     assert.equal(afterExpiry.state, held.state);
     assert.equal(afterExpiry.detail, held.detail);
     assert.equal(f.state.getMessage('101').state, 'accepted');

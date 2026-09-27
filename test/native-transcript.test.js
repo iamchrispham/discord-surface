@@ -47,7 +47,7 @@ function surfaceFixture(t) {
   fs.writeFileSync(file, META);
   const state = new SurfaceState(path.join(root, 'surface.sqlite'));
   state.setConfig({ operatorId: 'operator-1', guildId: 'guild-1', secretFile: path.join(root, 'discord.secret') });
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: ID, workspace: root, sessionRoot });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: ID, workspace: root, sessionRoot }, { intakeCutoff: '100' });
   t.after(() => {
     try { state.close(); } catch {}
     fs.rmSync(root, { recursive: true, force: true });
@@ -475,7 +475,7 @@ test('Discord directive sanitization rejects backticks in backtick fence info st
 
 test('directive-only final completes custody without an empty Discord send', async t => {
   const { file, sessionRoot, state } = surfaceFixture(t);
-  const messageId = 'directive-only';
+  const messageId = '900501';
   const cursor = cursorAt(file);
   fs.appendFileSync(file, finalRow('::created-thread{threadId="created-child"}', { marker: `[[discord-surface:${messageId}]]` }));
   const accepted = state.acceptDiscordMessage({
@@ -528,7 +528,7 @@ test('directive-only final completes custody without an empty Discord send', asy
 
 test('whitespace-only reply parts complete custody without a Discord send', async t => {
   const { file, sessionRoot, state } = surfaceFixture(t);
-  const messageId = 'whitespace-boundary';
+  const messageId = '900502';
   const marker = `[[discord-surface:${messageId}]]`;
   const cursor = cursorAt(file);
   const reply = `a${' '.repeat(4000)}b`;

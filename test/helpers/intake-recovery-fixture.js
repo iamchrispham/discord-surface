@@ -13,13 +13,22 @@ function fixture(t, { adoptThread = true } = {}) {
   let state = new SurfaceState(db);
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
   state.bind({ channelId: '1000', guildId: 'guild', provider: 'codex',
-    nativeId: '11111111-1111-1111-1111-111111111111', workspace: dir });
+    nativeId: '11111111-1111-1111-1111-111111111111', workspace: dir }, { intakeCutoff: '100' });
   state.setIntakeBaseline('1000', '100', 'fixture');
   state.markIntakeBoundary('1000', 'ready');
-  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: 'guild' }, state.getBinding('1000'));
+  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: 'guild', adoptionCutoff: '100' }, state.getBinding('1000'));
   if (adoptThread) {
     state.setThreadBaseline('2000', '100', state.getBinding('1000'));
     state.markThreadBoundary('2000', 'ready');
+  } else {
+    // Restore the genuinely pre-adoption route shape from before the mandatory-cutoff
+    // migration: enrollThread now always commits a decimal cutoff, so simulate the
+    // legacy never-adopted tuple directly by clearing recovered_through_id along with
+    // the adoption/observation metadata. This is the historical-unknown subject the
+    // caller is testing, not a route with real committed coverage.
+    state.db.prepare(`UPDATE thread_enrollments
+      SET adopted_through_id=NULL, adopted_at=NULL, last_seen_id=NULL, last_accepted_id=NULL, recovered_through_id=NULL
+      WHERE thread_id=?`).run('2000');
   }
   let fault = null;
   let deliveryAllowed = false;

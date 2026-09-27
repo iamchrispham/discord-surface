@@ -17,9 +17,9 @@ for (const explicitDb of [false, true]) {
     const state = new SurfaceState(db);
     const nativeId = '11111111-1111-1111-1111-111111111111';
     state.setConfig({ guildId: '100', operatorId: 'operator', secretFile: path.join(dir, 'unused') });
-    state.bind({ guildId: '100', channelId: '1000', provider: 'codex', nativeId, workspace: dir });
+    state.bind({ guildId: '100', channelId: '1000', provider: 'codex', nativeId, workspace: dir }, { intakeCutoff: '100' });
     const binding = state.getBinding('1000');
-    state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100' }, binding);
+    state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100' , adoptionCutoff: '100'}, binding);
     state.setThreadBaseline('2000', null, binding);
     state.markThreadBoundary('2000', THREAD_STATES.READY, 'fixture', null, null, binding);
     state.registerCourierRoute({ routeId, routeGeneration: 1, guildId: '100', parentChannelId: '1000', deliveryChannelId: '2000',

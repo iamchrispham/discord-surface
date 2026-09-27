@@ -31,7 +31,7 @@ test('explicit ordinary handoff refuses an active remote intake gap', async t =>
   const original = setup.bindOrdinary({
     channelId: '123456789012345678', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir
-  }, { sessionId: CODEX, threadId: CODEX });
+  }, { sessionId: CODEX, threadId: CODEX }, '100');
   setup.recordOrdinaryPreflight(original, {
     file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir
   });
@@ -88,8 +88,8 @@ test('public conductor handoff refuses an enrolled child history gap before owne
   const original = setup.bind({
     channelId: 'conductor-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir, categoryId: 'codex-category', conductorId: 'conductor', repoKey: 'repo'
-  });
-  setup.enrollThread({ threadId: 'child', parentChannelId: original.channelId, guildId: original.guildId }, original);
+  }, { intakeCutoff: '100' });
+  setup.enrollThread({ threadId: 'child', parentChannelId: original.channelId, guildId: original.guildId , adoptionCutoff: '100'}, original);
   setup.setThreadBaseline('child', '100', original);
   setup.markThreadBoundary('child', THREAD_STATES.READY, 'fixture adoption', null, null, original);
   setup.setIntakeCutoff(original.channelId, 'guild', '100', 'fixture parent coverage');
@@ -153,8 +153,8 @@ test('public conductor handoff rejects enrollment added between proof and commit
   const original = setup.bind({
     channelId: 'conductor-race-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir, categoryId: 'codex-category', conductorId: 'conductor', repoKey: 'repo'
-  });
-  setup.enrollThread({ threadId: 'child-a', parentChannelId: original.channelId, guildId: original.guildId }, original);
+  }, { intakeCutoff: '100' });
+  setup.enrollThread({ threadId: 'child-a', parentChannelId: original.channelId, guildId: original.guildId , adoptionCutoff: '100'}, original);
   setup.setThreadBaseline('child-a', '100', original);
   setup.markThreadBoundary('child-a', THREAD_STATES.READY, 'fixture adoption', null, null, original);
   setup.setIntakeCutoff(original.channelId, 'guild', '100', 'fixture parent coverage');
@@ -198,7 +198,7 @@ test('public conductor handoff rejects enrollment added between proof and commit
       const raceState = new SurfaceState(db);
       try {
         const binding = raceState.getBinding(input.channelId);
-        raceState.enrollThread({ threadId: 'child-b', parentChannelId: input.channelId, guildId: 'guild' }, binding);
+        raceState.enrollThread({ threadId: 'child-b', parentChannelId: input.channelId, guildId: 'guild' , adoptionCutoff: '100'}, binding);
       } finally {
         raceState.close();
       }
@@ -219,7 +219,9 @@ test('public conductor handoff rejects enrollment added between proof and commit
     assert.equal(binding.generation, 1);
     assert.equal(recovered.getThreadEnrollment('child-a').recoveredThroughId, '100');
     assert.equal(recovered.getThreadEnrollment('child-b').active, true);
-    assert.equal(recovered.getThreadEnrollment('child-b').recoveredThroughId, null);
+    // Fresh enrollment commits its qualified adoption cutoff as the covered cursor
+    // atomically (D6); it is never null immediately after a successful enrollThread.
+    assert.equal(recovered.getThreadEnrollment('child-b').recoveredThroughId, '100');
   } finally {
     recovered.close();
   }
@@ -236,7 +238,7 @@ test('explicit ordinary handoff fences remote messages through its ownership com
     const original = setup.bindOrdinary({
       channelId: '123456789012345678', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
       workspace: dir
-    }, { sessionId: CODEX, threadId: CODEX });
+    }, { sessionId: CODEX, threadId: CODEX }, '100');
     setup.recordOrdinaryPreflight(original, {
       file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir
     });

@@ -16,7 +16,7 @@ test('simulated: malformed required columns fail closed even with a known schema
 
 test('simulated: v1.3 migration preserves a recorded cutoff and recovers older history after held live custody', async () => {
   const { dir, db, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   state.setIntakeBaseline('channel-codex', '100', 'recorded v1.3 cutoff');
   state.markIntakeBoundary('channel-codex', 'ready');
   state.acceptDiscordMessage({ id: '200', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'held live input' });
@@ -54,13 +54,13 @@ test('simulated: v1.3 migration preserves a recorded cutoff and recovers older h
 
 test('simulated: v1.4 migration adds empty attachment metadata to legacy messages', () => {
   const { dir, db, state } = fixture('legacy-attachments.sqlite');
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'legacy-text', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'legacy text' });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '111', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'legacy text' });
   state.db.exec("ALTER TABLE messages DROP COLUMN attachments; UPDATE meta SET value='1.4' WHERE key='schema';");
   state.close();
 
   const migrated = new SurfaceState(db);
-  assert.deepEqual(migrated.getMessage('legacy-text').attachments, []);
+  assert.deepEqual(migrated.getMessage('111').attachments, []);
   assert.equal(migrated.db.prepare("SELECT value FROM meta WHERE key='schema'").get().value, '1.8');
   migrated.close();
 });

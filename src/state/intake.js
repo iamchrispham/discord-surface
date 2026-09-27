@@ -1,4 +1,21 @@
 const crypto = require('node:crypto');
+const { PERSISTENCE_REFUSAL_DETAILS } = require('../discord/history-access');
+
+function persistenceRefusal(BindingError, detail) {
+  // Guard the refusal constructor: a mis-referenced constant must fail loudly with
+  // a programmer error, never silently construct an empty-message BindingError.
+  if (typeof detail !== 'string' || detail.length === 0) {
+    throw new Error('persistence refusal requires a non-empty detail');
+  }
+  const error = new BindingError(detail);
+  error.detail = detail;
+  return error;
+}
+
+function qualifiedCoverageId(value) {
+  return typeof value === 'string' && value.length <= 128 && /^\d+$/.test(value) ? value : null;
+}
+
 
 function pauseOrdinaryHandoffIntake(state, channelId, expectedBinding, pendingState, detail) {
   const binding = state.getBinding(channelId);
@@ -166,8 +183,7 @@ function intakeBoundaryMatches(existing, expected, binding, expectedReadiness = 
 
 function createIntakeHandlers({ BindingError, READINESS, assertText, bindingMatchesExpected, compareDiscordIds, now }) {
   return {
-    hasIntakeEvidence(state, discordId) {
-      assertText(discordId, 'discordId', 128);
+    hasIntakeEvidence(state, discordId) {      assertText(discordId, 'discordId', 128);
       const row = state.db.prepare(`SELECT 1 FROM messages message WHERE message.discord_id=?
         AND NOT EXISTS (SELECT 1 FROM receipts origin WHERE origin.discord_id=message.discord_id AND origin.kind='interaction-origin')
         UNION ALL SELECT 1 FROM receipts WHERE kind='intake-rejected'
@@ -327,5 +343,7 @@ module.exports = {
   intakeCutoffDecision,
   pauseOrdinaryHandoffIntake,
   restoreOrdinaryHandoffIntake,
-  recoverInterruptedOrdinaryHandoffIntake
+  recoverInterruptedOrdinaryHandoffIntake,
+  persistenceRefusal,
+  qualifiedCoverageId
 };

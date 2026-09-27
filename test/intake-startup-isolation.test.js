@@ -20,7 +20,7 @@ function deferred() {
 function addHeldRoute(f) {
   const base = f.state.getBinding('1000');
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
-    nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
+    nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace }, { intakeCutoff: '100' });
   f.state.setIntakeBaseline('3000', '100', 'fixture');
   f.state.markIntakeBoundary('3000', 'ready');
   f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });

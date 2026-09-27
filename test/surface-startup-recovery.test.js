@@ -8,7 +8,7 @@ const { CODEX_ID, fixture, discordMessage, historyPermissions, waitForCondition,
 
 test('simulated: gateway stop waits for abortable startup recovery before state close', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const secret = path.join(dir, 'discord.env');
   fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
   const listeners = new Map();
@@ -35,7 +35,7 @@ test('simulated: gateway stop waits for abortable startup recovery before state 
 
 test('simulated: login-time input is durably held and backfill closes before dispatch', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const secret = path.join(dir, 'discord.env');
   fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
   const listeners = new Map();
@@ -61,7 +61,8 @@ test('simulated: login-time input is durably held and backfill closes before dis
     client,
     fetchHistory: async (_channel, options) => {
       history.push(options);
-      if (options.limit === 1) return [{ id: '100', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'old', bot: false }, content: 'before adoption' }];
+      // The committed cutoff '100' already qualifies this route, so recovery reads
+      // only strictly after it rather than fetching a newest-history baseline.
       if (options.after === '100') return [{ id: '101', guildId: 'guild-1', channelId: 'channel-codex', author: { id: 'operator-1', bot: false }, content: 'held live input' }];
       if (options.after === '101') return [];
       throw new Error(`unexpected history cursor ${options.after}`);
@@ -80,14 +81,14 @@ test('simulated: login-time input is durably held and backfill closes before dis
   assert.equal(state.getMessage('101').state, MESSAGE_STATES.REPLIED);
   await listeners.get('resume')();
   assert.equal(state.getBinding('channel-codex').readiness, READINESS.READY);
-  assert.equal(history.length, 3);
+  assert.equal(history.length, 2);
   await gateway.stop();
   state.close();
 });
 
 test('simulated: page-bound recovery connects degraded and requires explicit reconciliation', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const secret = path.join(dir, 'discord.env');
   fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
   const client = { user: { id: 'bot-1' }, on() {}, off() {}, async login() {}, channels: { fetch: async () => ({ id: 'channel-codex', permissionsFor: () => historyPermissions() }) }, async destroy() {} };
@@ -117,8 +118,8 @@ test('simulated: page-bound recovery connects degraded and requires explicit rec
 
 test('simulated: startup serves a healthy parent while terminal child custody stays held', { timeout: 8000 }, async t => {
   const { dir, state } = fixture();
-  const binding = state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.enrollThread({ threadId: 'thread-terminal', parentChannelId: binding.channelId, guildId: 'guild-1' }, binding);
+  const binding = state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.enrollThread({ threadId: 'thread-terminal', parentChannelId: binding.channelId, guildId: 'guild-1' , adoptionCutoff: '100'}, binding);
   state.setThreadBaseline('thread-terminal', '100', binding);
   state.markThreadBoundary('thread-terminal', 'ready', 'fixture adopted child', null, null, binding);
   state.setIntakeBaseline(binding.channelId, '100', 'fixture baseline');
@@ -163,7 +164,7 @@ test('simulated: startup serves a healthy parent while terminal child custody st
 
 test('simulated: stop fences a client login that resolves after state close', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const secret = path.join(dir, 'discord.env');
   fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
   const listeners = new Map();
@@ -190,7 +191,7 @@ test('simulated: stop fences a client login that resolves after state close', as
 
 test('simulated: live custody stays ahead of confirmed history coverage without losing older input', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
   state.markIntakeBoundary('channel-codex', 'ready');
   const secret = path.join(dir, 'discord.env');
@@ -231,7 +232,7 @@ test('simulated: live custody stays ahead of confirmed history coverage without 
 
 test('simulated: live custody recovery never patches the static address topic', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
   state.markIntakeBoundary('channel-codex', 'ready');
   const secret = path.join(dir, 'discord.env');
@@ -264,7 +265,7 @@ test('simulated: live custody recovery never patches the static address topic', 
 
 test('simulated: noncooperative history fetch is fenced by the recovery deadline and stop', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
   state.markIntakeBoundary('channel-codex', 'ready');
   let release;

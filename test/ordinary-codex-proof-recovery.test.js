@@ -33,7 +33,7 @@ test('ordinary bind preserves unrelated terminal intake after native proof recov
 
   const channel = {
     id: 'ordinary-recovery-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
-    async send() { return { id: 'adoption-fence-recovery', async delete() {} }; }
+    async send() { return { id: '9100001', async delete() {} }; }
   };
   class FakeClient {
     constructor() {
@@ -114,16 +114,21 @@ test('ordinary bind public entrypoints recover only proof-related intake boundar
       const binding = setup.bindOrdinary({
         channelId: 'ordinary-public-channel', guildId: 'guild', provider: PROVIDERS.CODEX,
         nativeId: CODEX, workspace: dir, sessionRoot: session.root
-      }, { sessionId: CODEX, threadId: CODEX });
+      }, { sessionId: CODEX, threadId: CODEX }, '100');
       setup.recordOrdinaryPreflight(binding, {
         file: session.file, sessionId: CODEX, threadId: CODEX, workspace: dir
       });
-      assert.throws(() => setup.reconcileIntake(binding.channelId, binding), /intake boundary is unknown/);
+      // A fresh bind now always commits its watermark with the binding (D2), so an
+      // unknown boundary can only occur for a channel that was never bound at all.
+      assert.throws(() => setup.reconcileIntake('never-bound-channel'), /intake boundary is unknown/);
+      const watermarkAtBind = setup.getIntakeWatermark(binding.channelId);
       setup.close();
       t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
       const channel = {
-        id: 'ordinary-public-channel', guildId: 'guild', name: 'dev', isTextBased: () => true
+        id: 'ordinary-public-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+        permissionsFor: () => ({ has: () => true }),
+        messages: { fetch: async () => [] }
       };
       class FakeClient {
         constructor() {
@@ -152,7 +157,9 @@ test('ordinary bind public entrypoints recover only proof-related intake boundar
 
       const state = new SurfaceState(db);
       try {
-        assert.equal(state.getIntakeWatermark(binding.channelId), null);
+        // Reusing an already-active binding makes no new history read and does not
+        // rebaseline; the watermark committed at the original bind stays untouched.
+        assert.deepEqual(state.getIntakeWatermark(binding.channelId), watermarkAtBind);
         state.markIntakeBoundary(binding.channelId, READINESS.GAP, 'unrelated history gap');
       } finally { state.close(); }
       const unrelated = await bindResult();
@@ -201,7 +208,7 @@ test('ordinary bind derives workspace from exact transcript metadata across chec
 
   const channel = {
     id: 'workspace-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
-    async send() { return { id: 'adoption-fence-workspace', async delete() {} }; }
+    async send() { return { id: '9200001', async delete() {} }; }
   };
   let logins = 0;
   class FakeClient {

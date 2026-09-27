@@ -8,7 +8,7 @@ const { CODEX_ID, SUCCESSOR_ID, fixture, discordMessage, historyPermissions, pro
 
 function setupGateway() {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const secret = path.join(dir, 'discord.env');
   fs.writeFileSync(secret, 'DISCORD_TOKEN=fake-token\n', { mode: 0o600 });
   const listeners = new Map();
@@ -189,7 +189,7 @@ test('simulated: a throw after a start became ready leaves no live dispatch and 
   delete gateway.schedulePendingHandoffRecoveryPoll;
   await gateway.start(secret);
 
-  state.bind({ channelId: 'channel-successor', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: env.dir });
+  state.bind({ channelId: 'channel-successor', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: env.dir }, { intakeCutoff: '100' });
   const successorChannel = { ...channel, id: 'channel-successor' };
   listeners.get('messageCreate')({ ...discordMessage({ id: '903', channelId: 'channel-successor' }), channel: successorChannel });
   await Promise.all([...gateway.inFlight]);

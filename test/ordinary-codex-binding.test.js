@@ -20,7 +20,11 @@ const {
 
 test('ordinary bind rejects ownership loss while recording native proof', async t => {
   const f = fixture(t);
-  const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
   let printed = false;
   class Client {
     constructor() { this.guilds = { fetch: async () => ({ channels: { fetch: async () => [channel] } }) }; }
@@ -58,7 +62,9 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   const channel = {
     id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
     async send() {
-      const id = `adoption-fence-${fences.length + 1}`;
+      // Discord message IDs are decimal; the adoption cutoff derived from a fence
+      // message must be a decimal string above any committed cutoff (R1).
+      const id = String(9000001 + fences.length);
       const message = { id, async delete() { fences.find(fence => fence.id === id).deleted = true; } };
       fences.push({ id, deleted: false });
       return message;
@@ -119,13 +125,13 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   assert.equal(rebound.binding.readiness, READINESS.PENDING);
   assert.equal(rebound.nativeProof.status, 'verified');
   assert.deepEqual(fences, [
-    { id: 'adoption-fence-1', deleted: true },
-    { id: 'adoption-fence-2', deleted: true }
+    { id: '9000001', deleted: true },
+    { id: '9000002', deleted: true }
   ]);
 
   const stateAfterRebind = new SurfaceState(db);
   try {
-    assert.equal(stateAfterRebind.getIntakeWatermark(channel.id).last_seen_id, 'adoption-fence-2');
+    assert.equal(stateAfterRebind.getIntakeWatermark(channel.id).last_seen_id, '9000002');
   } finally { stateAfterRebind.close(); }
 
   await assert.rejects(() => ordinaryBind({ ...args, channel: '#category' }, dependencies), /message-capable/);
@@ -170,7 +176,11 @@ test('ordinary bind refuses an incompatible running Gateway before mutation', as
 
 test('ordinary bind does not wake a replacement Gateway after commit', async t => {
   const f = fixture(t);
-  const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
   const wakeSignals = [];
   let reads = 0;
   class Client {
@@ -203,7 +213,10 @@ test('ordinary bind does not wake a replacement Gateway after commit', async t =
 
 test('ordinary bind rolls back when Gateway becomes incompatible after history fetch', async t => {
   const f = fixture(t);
-  const channel = { id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'ordinary-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true })
+  };
   let printed = false;
   let historyFetched = false;
   channel.messages = { fetch: async () => { historyFetched = true; return new Map([['100', { id: '100' }]]); } };

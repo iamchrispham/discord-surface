@@ -42,10 +42,10 @@ for (const operation of ['handoff', 'rebind']) test(`simulated: from-lock pickup
 
   const categoryId = 'codex-category';
   state.setConfig({ codexCategoryId: categoryId });
-  state.bind({ channelId: 'from-lock-channel', guildId: 'guild-1', provider: 'codex', nativeId: oldNativeId, workspace: dir, categoryId, conductorId, repoKey });
+  state.bind({ channelId: 'from-lock-channel', guildId: 'guild-1', provider: 'codex', nativeId: oldNativeId, workspace: dir, categoryId, conductorId, repoKey }, { intakeCutoff: '100' });
   const { THREAD_STATES } = require('../src/state/thread-enrollment');
   const predecessor = state.getBinding('from-lock-channel');
-  state.enrollThread({ threadId: 'child', parentChannelId: predecessor.channelId, guildId: predecessor.guildId }, predecessor);
+  state.enrollThread({ threadId: 'child', parentChannelId: predecessor.channelId, guildId: predecessor.guildId , adoptionCutoff: '100'}, predecessor);
   state.setThreadBaseline('child', '100', predecessor);
   state.markThreadBoundary('child', THREAD_STATES.READY, 'fixture adoption', null, null, predecessor);
   state.setIntakeCutoff(predecessor.channelId, predecessor.guildId, '100', 'fixture parent coverage');

@@ -40,7 +40,7 @@ async function createStaleBarrierScenario({ holdBoundary = false, holdRecovery =
     endpoint: '/tmp/agent-stale-barrier.sock',
     conductorId: 'destination-conductor',
     repoKey: 'repo:destination'
-  });
+  }, { intakeCutoff: '100' });
   const binding = state.getBinding(target.channelId);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);

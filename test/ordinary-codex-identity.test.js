@@ -70,7 +70,11 @@ test('ordinary bind validates a session beyond the historical entry cutoff', asy
   assert.ok(orders[0].indexOf(targetName) > 2048);
   assert.deepEqual(opened, [targetFile]);
 
-  const channel = { id: 'large-root-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'large-root-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
   class FakeClient {
     constructor() {
       this.guilds = { fetch: async () => ({ channels: {

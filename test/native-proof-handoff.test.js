@@ -39,7 +39,7 @@ test('concurrent recovery abandons a stale owner after an ordinary handoff', asy
   try {
     state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
     const original = state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId: oldId, workspace: dir },
-      { sessionId: oldId, threadId: oldId });
+      { sessionId: oldId, threadId: oldId }, '100');
     state.setIntakeBaseline('1000', '100', 'fixture baseline');
     gateway = makeGateway();
     await gateway.recoverInbound(new AbortController().signal, 'reconnect', gateway.lifecycleEpoch, null, Date.now() - 1);

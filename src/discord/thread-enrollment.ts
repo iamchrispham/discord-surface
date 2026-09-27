@@ -9,7 +9,15 @@ import {
   refusesUnqualifiedBaseline,
   retryPendingBoundaryDetail
 } from './recovery-fetch';
+import {
+  ADOPTION_REFUSAL_DETAILS,
+  AdoptionRefusalError,
+  historyPermission,
+  readAdoptionCutoff
+} from './history-access';
 import { THREAD_STATES, type ThreadBinding, type ThreadEnrollment, type ThreadRoute, type ThreadState } from '../state/thread-enrollment';
+
+export { ADOPTION_REFUSAL_DETAILS, AdoptionRefusalError, historyPermission, readAdoptionCutoff };
 
 export interface ThreadChannel {
   id: string;
@@ -19,22 +27,7 @@ export interface ThreadChannel {
   locked?: boolean;
   isThread?: () => boolean;
   permissionsFor?: (user: unknown) => { has: (permission: bigint) => boolean } | null;
-  messages?: { fetch: (options: unknown) => Promise<unknown> };
-}
-
-export function historyPermission(channel: ThreadChannel, user: unknown, requireSend = false) {
-  if (!user || typeof channel?.permissionsFor !== 'function') return { known: false, allowed: false };
-  try {
-    const { PermissionFlagsBits } = discord();
-    const permissions = channel.permissionsFor(user);
-    if (!permissions || typeof permissions.has !== 'function') return { known: false, allowed: false };
-    const history = permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory);
-    if (!requireSend) return { known: true, allowed: history };
-    const thread = channel.isThread?.() === true;
-    const send = permissions.has(thread ? PermissionFlagsBits.SendMessagesInThreads : PermissionFlagsBits.SendMessages);
-    const locked = thread && channel.locked === true && !permissions.has(PermissionFlagsBits.ManageThreads) && !permissions.has(PermissionFlagsBits.Administrator);
-    return { known: true, allowed: history && (!requireSend || (send && !locked)) };
-  } catch { return { known: false, allowed: false }; }
+  messages?: { fetch: (options: unknown, cacheOptions?: unknown) => Promise<unknown> };
 }
 
 export function assertPublicThread(channel: ThreadChannel | null, binding: ThreadBinding, threadId: string, user: unknown): asserts channel is ThreadChannel {
@@ -52,7 +45,7 @@ interface ThreadStateOwner {
   getBinding(id: string): ThreadBinding | null;
   getMessageRoute(id: string): ThreadRoute | null;
   getThreadEnrollment(id: string): ThreadEnrollment | null;
-  enrollThread(input: { threadId: string; parentChannelId: string; guildId: string }, binding: ThreadBinding): unknown;
+  enrollThread(input: { threadId: string; parentChannelId: string; guildId: string; adoptionCutoff?: string | null }, binding: ThreadBinding): unknown;
   setThreadBaseline(id: string, latestId: string | null, binding: ThreadBinding, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
   markThreadBoundary(id: string, state: ThreadState, detail: string, from: string | null, to: string | null, binding: ThreadBinding, coverageId?: string | null, lastSeenBaselineId?: string | null, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
   checkpointThread(id: string, coverage: string, binding: ThreadBinding, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
@@ -94,15 +87,29 @@ export async function enrollPublicThread(state: ThreadStateOwner, client: Thread
   if (signal?.aborted) throw new Error('Thread enrollment stopped');
   const binding = state.getBinding(parentId);
   if (!binding?.active) throw new Error('Thread parent requires an active binding');
-  const { ChannelType } = discord();
-  const parent = await client.channels.fetch(parentId);
-  if (parent?.type !== ChannelType.GuildText || parent.guildId !== binding.guildId) {
-    throw new Error('Thread parent must be the bound public text channel');
+  const existing = state.getThreadEnrollment(threadId);
+  // Already-active reuse performs no new history read and no rebaseline. It still
+  // converges on the single authoritative enrollment transaction below so the state
+  // owner revalidates parent/guild identity and the captured binding generation
+  // atomically instead of the public helper short-circuiting those checks.
+  let adoptionCutoff: string | null = null;
+  if (!existing?.active) {
+    const { ChannelType } = discord();
+    const parent = await client.channels.fetch(parentId);
+    if (parent?.type !== ChannelType.GuildText || parent.guildId !== binding.guildId) {
+      throw new Error('Thread parent must be the bound public text channel');
+    }
+    const thread = await client.channels.fetch(threadId);
+    assertPublicThread(thread, binding, threadId, client.user);
+    if (signal?.aborted) throw new Error('Thread enrollment stopped');
+    // The child must acquire its OWN permission-qualified history boundary before the
+    // enrollment transaction can insert an active binding.
+    adoptionCutoff = await readAdoptionCutoff(thread, threadId, client.user, signal);
   }
-  const thread = await client.channels.fetch(threadId);
-  assertPublicThread(thread, binding, threadId, client.user);
-  if (signal?.aborted) throw new Error('Thread enrollment stopped');
-  const enrollment = state.enrollThread({ threadId, parentChannelId: parentId, guildId: binding.guildId }, binding);
+  const enrollment = state.enrollThread(
+    { threadId, parentChannelId: parentId, guildId: binding.guildId, adoptionCutoff },
+    binding
+  );
   if (!enrollment) throw new Error('Thread parent binding changed during enrollment');
   return enrollment;
 }
@@ -119,16 +126,6 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   const retryableBoundary = isRetryableThreadBoundary(enrollment);
   const preAdoptionRetryBoundary = isPreAdoptionRetryableThread(enrollment);
   const retryableHold = retryableBoundary || preAdoptionRetryBoundary;
-  // Qualify the INCOMING owner snapshot before the pending-boundary write below can
-  // replace its detail. A failed prior adoption/recovery attempt (retryable HTTP503,
-  // typed deadline, or interrupted-retry-pending marker) must not later install a
-  // newest fetched message as a fresh exclusion cutoff. The decision itself runs at
-  // the baseline COMMIT, once the candidate newest message is known.
-  const baselineRefusalInput = {
-    failedAttempt: retryableHold,
-    adoptionCompleted: Boolean(enrollment.adoptedAt),
-    coveredCursor: enrollment.recoveredThroughId
-  };
   if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state) &&
       !retryableHold) return false;
   let ownedEnrollment = enrollment;
@@ -195,13 +192,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       const liveLastSeenId = gateway.state.getThreadEnrollment(enrollment.threadId)?.lastSeenId || null;
       let newest = fetchedNewest || liveLastSeenId;
       if (fetchedNewest && liveLastSeenId && compareIds(liveLastSeenId, fetchedNewest) > 0) newest = liveLastSeenId;
-      if (newest && refusesUnqualifiedBaseline({
-        ...baselineRefusalInput,
-        // Per-row admission proof, not a watermark comparison: an admitted higher row
-        // does not cover a lower unadmitted history row that the cutoff would exclude.
-        newestAlreadyRetained: baseline.length > 0 &&
-          baseline.every(message => gateway.state.hasIntakeEvidence(message.id))
-      })) {
+      if (newest && refusesUnqualifiedBaseline({ coveredCursor: enrollment.recoveredThroughId })) {
         // Gate the baseline COMMIT, not just retry eligibility: the failed attempt
         // left no covered historical cursor and the candidate cutoff would exclude
         // unadmitted history, so keep the route visibly held pending instead of

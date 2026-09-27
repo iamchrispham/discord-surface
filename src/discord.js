@@ -2360,13 +2360,10 @@ class DiscordGateway {
       let watermark = this.state.getIntakeWatermark(binding.channelId);
       let ownedBoundary = watermark;
       let ownedReadiness = recovering.readiness;
-      // F15: capture the ORIGINAL owner provenance before the channel fetch can
-      // replace `watermark` with a pending retry boundary. A later parent baseline
-      // commit must know whether this pass retried a failed adoption/recovery.
-      const baselineFailedAttempt = Boolean(watermark &&
-        (isRetryableIntakeBoundary(watermark) || isInterruptedRetryBoundary(watermark)));
-      const baselineAdoptionCompleted = Boolean(watermark?.state === READINESS.READY &&
-        watermark.last_seen_id === null && watermark.recovered_through_id === null);
+      // Capture the qualified coverage input from the owned snapshot before any
+      // reconciliation write in this pass can replace the boundary detail. A cursor
+      // qualifies only when it is a string of decimal digits ("0" included).
+      const ownedCoverageCursor = watermark?.recovered_through_id;
       // A pass that starts from the closing-custody marker under the attempt that queued it is the one retry: it records
       // gap if custody is still ahead. A pass under another lifecycle or deadline gets its own retry.
       const closingCustodyAttempt = this.closingCustodyRetries.get(binding.channelId);
@@ -2599,91 +2596,22 @@ class DiscordGateway {
         if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'unavailable', error };
         continue;
       }
-      if (!watermark?.recovered_through_id) {
-        let baseline;
-        try { baseline = this.historyMessages(await waitForRecoveryOperation(() => recoveryFetch(() => this.fetchHistory(channel, { limit: 1, signal })), signal, deadline)); }
-        catch (error) {
-          const kind = recoveryKind(error);
-          if (kind === CODEX_VALIDATION_KINDS.STOPPED) return { ready: false, state: 'stopped' };
-          const classified = classifyRecoveryFailure(error);
-          const recorded = await recordOwnedBoundary(binding, channel, classified.state, classified.detail, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
-          if (recorded?.watermark) ownedBoundary = recorded.watermark;
-          if (!recorded?.concurrentReady) failure ||= { ready: false, state: classified.state, error };
-          continue;
-        }
-        if (signal.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
-        if (!currentRecovery()) {
-          const current = adoptCurrentReadiness();
-          if (current?.state === READINESS.READY) continue;
-          if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
-          failure ||= { ready: false, state: current?.state || 'unavailable' };
-          continue;
-        }
-        const fetchedBoundary = this.state.getIntakeWatermark(binding.channelId);
-        if (fetchedBoundary?.state === READINESS.GAP || fetchedBoundary?.state === READINESS.UNAVAILABLE) {
-          failure ||= { ready: false, state: fetchedBoundary.state };
-          continue;
-        }
-        if (fetchedBoundary) {
-          ownedBoundary = fetchedBoundary;
-          watermark = fetchedBoundary;
-        }
-        if (baseline.some(message => typeof message?.id !== 'string' || !message.id)) {
-          const error = new Error('Discord history message has no stable ID');
-          const recorded = await recordOwnedBoundary(binding, channel, 'unavailable', error.message, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
-          if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'unavailable', error };
-          continue;
-        }
-        const newest = baseline.sort((a, b) => compareDiscordIds(b.id, a.id))[0];
-        if (newest?.id) {
-          // F15: an unqualified retry after a failed adoption/recovery attempt must
-          // not install the newest history message as a fresh exclusion cutoff. The
-          // candidate cutoff excludes only already-admitted custody when its row has
-          // per-row intake evidence (never inferred from last_seen_id/recovered cursor).
-          if (refusesUnqualifiedBaseline({
-            failedAttempt: baselineFailedAttempt,
-            adoptionCompleted: baselineAdoptionCompleted,
-            coveredCursor: watermark?.recovered_through_id,
-            newestAlreadyRetained: this.state.hasIntakeEvidence(newest.id)
-          })) {
-            const refused = await recordOwnedBoundary(binding, channel, READINESS.PENDING,
-              retryPendingBoundaryDetail(`${reason} baseline refused without historical coverage`, watermark),
-              ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
-            if (refused?.watermark) ownedBoundary = refused.watermark;
-            if (!refused?.concurrentReady) failure ||= { ready: false, state: READINESS.PENDING };
-            continue;
-          }
-          const baselineWatermark = this.state.setIntakeBaseline(binding.channelId, newest.id, `${reason} cutoff excludes pre-adoption backlog`, binding, ownedBoundary, ownedReadiness);
-          if (!baselineWatermark) {
-            const current = adoptCurrentReadiness();
-            if (current?.state === READINESS.READY) continue;
-            queueRecoveryIfPending();
-            failure ||= { ready: false, state: current?.state || 'unavailable' };
-            continue;
-          }
-          ownedBoundary = baselineWatermark;
-        } else {
-          watermark = this.state.getIntakeWatermark(binding.channelId);
-          if (!watermark?.last_seen_id) {
-            const boundary = await recordOwnedBoundary(binding, channel, 'ready', `${reason} empty channel baseline`, null, null, signal, deadline, ownedBoundary);
-            if (boundary?.watermark) ownedBoundary = boundary.watermark;
-            if (!boundary || (!boundary.concurrentReady && (boundary.stale || boundary.blocked))) {
-              failure ||= { ready: false, state: 'unavailable', error: boundary?.error };
-            }
-            continue;
-          }
-          const baselineWatermark = this.state.setIntakeBaseline(binding.channelId, watermark.last_seen_id, `${reason} empty channel baseline after live custody`, binding, ownedBoundary, ownedReadiness);
-          if (!baselineWatermark) {
-            const current = adoptCurrentReadiness();
-            if (current?.state === READINESS.READY) continue;
-            queueRecoveryIfPending();
-            failure ||= { ready: false, state: current?.state || 'unavailable' };
-            continue;
-          }
-          ownedBoundary = baselineWatermark;
-        }
-        watermark = this.state.getIntakeWatermark(binding.channelId);
+      // A genuinely new parent route may only install its history boundary from a
+      // permission-qualified covered cursor on the owned snapshot. A null/unknown
+      // historical parent refuses visibly HERE, before any history request: no
+      // cutoff is ever inferred from newest history, last_seen_id, channel id,
+      // channel creation time, wall clock, or a later retry.
+      if (refusesUnqualifiedBaseline({ coveredCursor: ownedCoverageCursor })) {
+        const refusalDetail = watermark
+          ? retryPendingBoundaryDetail(`${reason} baseline refused without historical coverage`, watermark)
+          : `${reason} history boundary requires qualified historical coverage`;
+        const refused = await recordOwnedBoundary(binding, channel, READINESS.PENDING,
+          refusalDetail, ownedBoundary?.recovered_through_id, null, signal, deadline, ownedBoundary);
+        if (refused?.watermark) ownedBoundary = refused.watermark;
+        if (!refused?.concurrentReady) failure ||= { ready: false, state: READINESS.PENDING };
+        continue;
       }
+      watermark = this.state.getIntakeWatermark(binding.channelId);
       let after = watermark?.recovered_through_id || null;
       let pages = 0;
       let total = 0;

@@ -21,7 +21,7 @@ function fixture(t, provider = 'codex') {
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture\n', { mode: 0o600 });
   state.bind({ channelId: 'channel', guildId: 'guild', provider, nativeId: NATIVE[provider], workspace: dir,
-    endpoint: provider === 'claude' ? '/tmp/claude.sock' : undefined, conductorId: 'conductor', repoKey: 'repo:fixture' });
+    endpoint: provider === 'claude' ? '/tmp/claude.sock' : undefined, conductorId: 'conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
   const binding = state.getBinding('channel');
   state.setBindingReadiness('channel', 'ready', 'fixture ready', binding);
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });

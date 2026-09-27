@@ -49,7 +49,7 @@ test('Gateway preserves recovered readiness while another binding wake fails', a
     fetch: async channelId => {
       if (channelId === second.channelId) {
         client.emit('messageCreate', {
-          id: 'live-A',
+          id: '900801',
           guildId: 'guild',
           channelId: first.channelId,
           content: 'held while the second binding recovers',
@@ -93,9 +93,9 @@ test('Gateway preserves recovered readiness while another binding wake fails', a
   assert.equal(f.state.getBinding(first.channelId).readiness, READINESS.READY);
   assert.equal(f.state.getIntakeWatermark(first.channelId).state, READINESS.READY);
   assert.equal(f.state.getBinding(second.channelId).readiness, READINESS.UNAVAILABLE);
-  assert.deepEqual(dispatches, ['live-A']);
+  assert.deepEqual(dispatches, ['900801']);
   await gateway.consumer.waitForNativeWork();
-  assert.equal(f.state.getMessage('live-A').state, 'replied');
+  assert.equal(f.state.getMessage('900801').state, 'replied');
   await gateway.stop();
 });
 

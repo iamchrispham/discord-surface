@@ -22,7 +22,7 @@ async function fixture(t, { callback = null } = {}) {
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile });
   const binding = state.bindOrdinary({
     channelId: 'channel', guildId: 'guild', provider: 'codex', nativeId: NATIVE_ID, workspace: dir
-  }, { sessionId: NATIVE_ID, threadId: NATIVE_ID });
+  }, { sessionId: NATIVE_ID, threadId: NATIVE_ID }, '100');
   state.recordOrdinaryPreflight(binding, {
     file: path.join(dir, 'fixture.jsonl'), sessionId: NATIVE_ID, threadId: NATIVE_ID, workspace: dir
   });
@@ -443,7 +443,7 @@ test('ordinary recovery is returned while decision recovery remains independentl
     signal.addEventListener('abort', () => resolve([]), { once: true });
   });
   const ordinary = f.state.acceptDiscordMessage({
-    id: 'ordinary-sibling', guildId: 'guild', channelId: 'channel', authorId: 'operator',
+    id: '9000', guildId: 'guild', channelId: 'channel', authorId: 'operator',
     isBot: false, attachments: [], content: 'ordinary sibling'
   });
   assert.equal(ordinary.accepted, true);

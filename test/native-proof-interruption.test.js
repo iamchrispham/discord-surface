@@ -75,7 +75,7 @@ test('stopping before-binding recovery during shared deadline preserves custody 
     state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
     for (let i = 0; i < channels.length; i++) {
       state.bindOrdinary({ channelId: channels[i], guildId: 'guild', provider: 'codex', nativeId: ids[i], workspace: dir },
-        { sessionId: ids[i], threadId: ids[i] });
+        { sessionId: ids[i], threadId: ids[i] }, '100');
       state.setIntakeBaseline(channels[i], '100', 'fixture baseline');
       assert.equal(state.acceptDiscordMessage({ id: String(101 + i), channelId: channels[i], guildId: 'guild',
         authorId: 'operator', isBot: false, content: 'retained instruction' }, { ready: false }).accepted, true);
@@ -179,7 +179,7 @@ test('stopping native preflight deadline marker creation preserves custody acros
   try {
     state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: secret });
     const binding = state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
-      { sessionId: nativeId, threadId: nativeId });
+      { sessionId: nativeId, threadId: nativeId }, '100');
     state.setIntakeBaseline('1000', '100', 'fixture baseline');
     assert.equal(state.acceptDiscordMessage({ id: '101', channelId: '1000', guildId: 'guild', authorId: 'operator', isBot: false,
       content: 'retained instruction' }, { ready: false }).accepted, true);

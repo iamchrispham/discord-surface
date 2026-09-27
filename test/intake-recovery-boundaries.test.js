@@ -62,7 +62,7 @@ test('R4: deadline between full pages stays retryable after one real admission',
 test('R4b: shared deadline preserves an unvisited ready binding', CASES, async t => {
   const f = fixture(t);
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
-    nativeId: '33333333-3333-3333-3333-333333333333', workspace: f.secret });
+    nativeId: '33333333-3333-3333-3333-333333333333', workspace: f.secret }, { intakeCutoff: '100' });
   f.state.setIntakeBaseline('3000', '100', 'fixture');
   f.state.markIntakeBoundary('3000', 'ready');
   f.history.set('1000', [f.message('101', '1000')]);
@@ -94,7 +94,7 @@ for (const [label, empty] of [['R4c', false], ['R4d', true]]) {
 test(`${label}: reconnect deadline preserves ${empty ? 'an empty' : 'a'} ready watermark after pause`, CASES, async t => {
   const f = fixture(t);
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
-    nativeId: '33333333-3333-3333-3333-333333333333', workspace: f.secret });
+    nativeId: '33333333-3333-3333-3333-333333333333', workspace: f.secret }, { intakeCutoff: '100' });
   if (!empty) f.state.setIntakeBaseline('3000', '100', 'fixture');
   f.state.markIntakeBoundary('3000', 'ready');
   const baseChannel = f.channels.get('1000');

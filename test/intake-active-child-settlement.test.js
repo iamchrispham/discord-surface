@@ -90,7 +90,7 @@ test('P4 fresh pending enrollment created during a suspended unscoped pass block
   const pending = f.gateway.recoverTransport('restart', f.gateway.lifecycleEpoch);
   await waitForCondition(() => started, 'unscoped recovery pass did not start');
   const enrolled = f.state.enrollThread(
-    { threadId: '3000', parentChannelId: '1000', guildId: 'guild' },
+    { threadId: '3000', parentChannelId: '1000', guildId: 'guild' , adoptionCutoff: '100'},
     f.state.getBinding('1000')
   );
   assert.equal(enrolled.active, true);

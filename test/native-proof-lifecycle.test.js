@@ -24,7 +24,7 @@ test(`native deadline recovery preserves custody: ${phase}`, async () => {
   try {
     state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
     const binding = state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
-      { sessionId: nativeId, threadId: nativeId });
+      { sessionId: nativeId, threadId: nativeId }, '100');
     state.setIntakeBaseline('1000', '100', 'fixture baseline');
     const accepted = state.acceptDiscordMessage({ id: '101', channelId: '1000', guildId: 'guild',
       authorId: 'operator', isBot: false, content: 'retained instruction' }, { ready: false });

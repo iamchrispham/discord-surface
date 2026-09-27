@@ -7,7 +7,7 @@ const { CODEX_ID, fixture, discordMessage, waitForCondition, providers } = requi
 
 test('simulated: same native owner dispatches its next message while the prior ACK is pending', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   let ackStartedResolve;
   const ackStarted = new Promise(resolve => { ackStartedResolve = resolve; });
   let release;
@@ -26,34 +26,34 @@ test('simulated: same native owner dispatches its next message while the prior A
       }
     },
     prepareReply: messageId => {
-      if (messageId !== 'same-owner-first') return null;
+      if (messageId !== '101') return null;
       ackStartedResolve();
       return priorAck;
     },
     sendTransportReceipt: async () => ({ id: 'receipt' }),
     sendReply: async (_message, reply) => { sends.push(reply.id); return { id: `sent-${reply.id}` }; }
   });
-  const first = consumer.handleMessage(discordMessage({ id: 'same-owner-first', channelId: 'channel-codex' }));
+  const first = consumer.handleMessage(discordMessage({ id: '101', channelId: 'channel-codex' }));
   await ackStarted;
-  const second = consumer.handleMessage(discordMessage({ id: 'same-owner-second', channelId: 'channel-codex' }));
-  await waitForCondition(() => dispatches.includes('same-owner-second'));
+  const second = consumer.handleMessage(discordMessage({ id: '102', channelId: 'channel-codex' }));
+  await waitForCondition(() => dispatches.includes('102'));
   const secondResult = await second;
   assert.equal(secondResult.message.state, MESSAGE_STATES.REPLIED);
-  assert.equal(state.getMessage('same-owner-first').state, MESSAGE_STATES.REPLY_READY);
-  assert.deepEqual(dispatches, ['same-owner-first', 'same-owner-second']);
+  assert.equal(state.getMessage('101').state, MESSAGE_STATES.REPLY_READY);
+  assert.deepEqual(dispatches, ['101', '102']);
   release();
   const firstResult = await first;
   assert.equal(firstResult.message.state, MESSAGE_STATES.REPLIED);
-  assert.deepEqual(sends, ['same-owner-second', 'same-owner-first']);
+  assert.deepEqual(sends, ['102', '101']);
   await consumer.waitForReceipts();
   state.close();
 });
 
 test('simulated: readiness recovery releases a terminal owner blocker before a queued message is replayed', async () => {
   const { dir, state } = fixture();
-  const binding = state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  const firstId = 'readiness-terminal-first';
-  const secondId = 'readiness-terminal-second';
+  const binding = state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  const firstId = '103';
+  const secondId = '104';
   const dispatches = [];
   let releaseFirst;
   const firstReply = new Promise(resolve => { releaseFirst = resolve; });
@@ -98,9 +98,9 @@ test('simulated: readiness recovery releases a terminal owner blocker before a q
 
 test('simulated: current native ACK releases a queued owner before the first reply', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  const firstId = 'ack-queue-first';
-  const secondId = 'ack-queue-second';
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  const firstId = '105';
+  const secondId = '106';
   const dispatches = [];
   const observations = [];
   const replies = [];
@@ -173,9 +173,9 @@ test('simulated: current native ACK releases a queued owner before the first rep
 
 test('simulated: restart releases persisted native ACK before same-owner successor', async () => {
   const { dir, db, state: initial } = fixture();
-  const firstId = 'ack-restart-first';
-  const secondId = 'ack-restart-second';
-  initial.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  const firstId = '107';
+  const secondId = '108';
+  initial.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   initial.acceptDiscordMessage({ id: firstId, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'first' });
   await new Promise(resolve => setTimeout(resolve, 2));
   initial.acceptDiscordMessage({ id: secondId, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'second' });

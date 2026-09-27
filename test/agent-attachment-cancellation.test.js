@@ -33,12 +33,12 @@ test('child history attachment recovery honors cancellation while fetching fresh
     fs.rmSync(dir, { recursive: true, force: true });
   });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-child-history-cancel.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-child-history-cancel.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '100' });
   let binding = state.getBinding(target.channelId);
   binding = state.setBindingReadiness(target.channelId, READINESS.READY, 'fixture ready', binding);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
-  state.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId }, binding);
+  state.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId , adoptionCutoff: '6999'}, binding);
   state.setThreadBaseline('103', '6999', binding);
   state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
   const destination = { ...target, channelId: '103', generation: binding.generation };
@@ -93,7 +93,7 @@ test('live attachment failure fences later same-channel intake until recovery', 
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-fence.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-fence.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '6999' });
   const binding = state.getBinding(target.channelId);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
@@ -152,7 +152,7 @@ test('foreign bot attachments do not trigger agent CDN fetches', async t => {
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-foreign-bot.sock' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-foreign-bot.sock' }, { intakeCutoff: '100' });
   const binding = state.getBinding(target.channelId);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
@@ -178,7 +178,7 @@ test('live attachment fetch failures leave a durable gap receipt', async t => {
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-live-gap.sock' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-live-gap.sock' }, { intakeCutoff: '100' });
   const binding = state.getBinding(target.channelId);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
@@ -211,7 +211,7 @@ test('live attachment normalization preserves channel order', async t => {
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-order.sock' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-order.sock' }, { intakeCutoff: '100' });
   const binding = state.getBinding(target.channelId);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);

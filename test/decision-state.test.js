@@ -35,7 +35,7 @@ function fixture({ guildId = 'guild', channelId = 'channel' } = {}) {
     provider: 'codex',
     nativeId: NATIVE_ID,
     workspace: dir
-  });
+  }, { intakeCutoff: '100' });
   state.setBindingReadiness(channelId, 'ready');
   return { dir, dbPath, state };
 }
@@ -878,16 +878,16 @@ test('getMessage exposes validated decision context and rejects malformed decisi
     assert.deepEqual(decisionJson(claudeEvent(decision).content), decision.decisionResult);
 
     const ordinary = state.acceptDiscordMessage({
-      id: 'ordinary-message-1', guildId: 'guild', channelId: 'channel', authorId: 'operator',
+      id: '9001', guildId: 'guild', channelId: 'channel', authorId: 'operator',
       isBot: false, attachments: [], content: 'ordinary request'
     });
     assert.equal(ordinary.accepted, true);
-    assert.equal(state.getMessage('ordinary-message-1').decisionResult, undefined);
+    assert.equal(state.getMessage('9001').decisionResult, undefined);
 
     const agentFixtureState = fixture({ guildId: '100', channelId: '102' });
     const agentState = agentFixtureState.state;
     const agentBinding = agentState.getBinding('102');
-    agentState.enrollThread({ threadId: '103', parentChannelId: '102', guildId: '100' }, agentBinding);
+    agentState.enrollThread({ threadId: '103', parentChannelId: '102', guildId: '100' , adoptionCutoff: '100'}, agentBinding);
     agentState.markThreadBoundary('103', 'ready', 'fixture ready', null, null, agentBinding);
     const agentPacket = {
       id: 'agent-request-1',
@@ -905,12 +905,12 @@ test('getMessage exposes validated decision context and rejects malformed decisi
     };
     try {
       const agent = agentState.acceptDiscordMessage({
-        id: 'agent-message-1', guildId: agentBinding.guildId, channelId: '103', authorId: 'agent-author',
+        id: '9000', guildId: agentBinding.guildId, channelId: '103', authorId: 'agent-author',
         isBot: true, attachments: [], content: encodeAgentMessage(agentPacket, 'decision-agent-token')
       }, { agentToken: 'decision-agent-token' });
       assert.equal(agent.accepted, true);
-      assert.equal(agentState.getMessage('agent-message-1').decisionResult, undefined);
-      assert.deepEqual(agentState.getMessage('agent-message-1').agentMessage, agentPacket);
+      assert.equal(agentState.getMessage('9000').decisionResult, undefined);
+      assert.deepEqual(agentState.getMessage('9000').agentMessage, agentPacket);
     } finally {
       closeFixture(agentFixtureState);
     }

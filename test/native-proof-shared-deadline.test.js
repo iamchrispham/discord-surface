@@ -21,7 +21,7 @@ async function runSharedBudget(slowFirst) {
     state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
     for (let i = 0; i < ids.length; i++) {
       fs.writeFileSync(path.join(root, `${ids[i]}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: ids[i], cwd: dir } }) + '\n');
-      state.bindOrdinary({ channelId: channels[i], guildId: 'guild', provider: 'codex', nativeId: ids[i], workspace: dir }, { sessionId: ids[i], threadId: ids[i] });
+      state.bindOrdinary({ channelId: channels[i], guildId: 'guild', provider: 'codex', nativeId: ids[i], workspace: dir }, { sessionId: ids[i], threadId: ids[i] }, '100');
       state.setIntakeBaseline(channels[i], '100', 'fixture baseline');
       assert.equal(state.acceptDiscordMessage({ id: String(101 + i), channelId: channels[i], guildId: 'guild', authorId: 'operator', isBot: false, content: 'retained instruction' }, { ready: false }).accepted, true);
     }
@@ -108,9 +108,9 @@ test('shared deadline keeps an unattempted conductor binding retryable', { timeo
   try {
     state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
     state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId: slowId, workspace: dir },
-      { sessionId: slowId, threadId: slowId });
+      { sessionId: slowId, threadId: slowId }, '100');
     state.bind({ channelId: '2000', guildId: 'guild', provider: 'codex', nativeId: conductorId, workspace: dir,
-      conductorId: 'conductor-2000', repoKey: 'repo:2000' });
+      conductorId: 'conductor-2000', repoKey: 'repo:2000' }, { intakeCutoff: '100' });
     state.setIntakeBaseline('1000', '100', 'fixture baseline');
     state.setIntakeBaseline('2000', '100', 'fixture baseline');
     const preflights = [];

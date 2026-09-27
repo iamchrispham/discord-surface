@@ -7,7 +7,7 @@ const { CODEX_ID, fixture, waitForCondition, providers } = require('./surface-fi
 test('simulated: submitted recovery transfers custody to one live observer without redispatch', async () => {
   const { dir, db, state: initial } = fixture();
   let state = initial;
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   let sends = 0;
   let dispatches = 0;
   let observations = 0;
@@ -16,12 +16,12 @@ test('simulated: submitted recovery transfers custody to one live observer witho
     messages: { fetch: async () => ({ react: async () => {} }) },
     async send() {
       sends += 1;
-      return { id: 'reply-submitted-recovery' };
+      return { id: '102' };
     }
   };
-  await state.acceptDiscordMessage({ id: 'submitted-recovery', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'already sent' });
-  state.claimDispatch('submitted-recovery');
-  state.markSubmitted('submitted-recovery', { file: '/tmp/recovered-session.jsonl', offset: 4 }, '[[discord-surface:submitted-recovery]]');
+  await state.acceptDiscordMessage({ id: '101', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'already sent' });
+  state.claimDispatch('101');
+  state.markSubmitted('101', { file: '/tmp/recovered-session.jsonl', offset: 4 }, '[[discord-surface:101]]');
   state.close();
   state = new SurfaceState(db);
   const client = {
@@ -54,12 +54,12 @@ test('simulated: submitted recovery transfers custody to one live observer witho
   assert.equal(dispatches, 0);
   assert.equal(observations, 1);
   assert.equal(sends, 0);
-  assert.equal(state.getMessage('submitted-recovery').state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(state.getMessage('101').state, MESSAGE_STATES.SUBMITTED);
   release({ text: 'recovered reply' });
-  for (let attempt = 0; attempt < 100 && state.getMessage('submitted-recovery').state !== MESSAGE_STATES.REPLIED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
-  assert.equal(state.getMessage('submitted-recovery').state, MESSAGE_STATES.REPLIED);
+  for (let attempt = 0; attempt < 100 && state.getMessage('101').state !== MESSAGE_STATES.REPLIED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(state.getMessage('101').state, MESSAGE_STATES.REPLIED);
   assert.equal(sends, 1);
-  assert.equal(state.getMessage('submitted-recovery').observerCursor.offset, 8);
+  assert.equal(state.getMessage('101').observerCursor.offset, 8);
   await gateway.stop();
   state.close();
 });
@@ -67,8 +67,8 @@ test('simulated: submitted recovery transfers custody to one live observer witho
 test('simulated: accepted recovery transfers submitted custody without blocking on the final', async () => {
   const { dir, db, state: initial } = fixture();
   let state = initial;
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  await state.acceptDiscordMessage({ id: 'accepted-recovery-late', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'held before restart' });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  await state.acceptDiscordMessage({ id: '103', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'held before restart' });
   state.close();
   state = new SurfaceState(db);
   const sends = [];
@@ -109,14 +109,14 @@ test('simulated: accepted recovery transfers submitted custody without blocking 
   assert.ok(performance.now() - started < 250);
   assert.equal(dispatches, 1);
   assert.equal(observations, 1);
-  assert.equal(state.getMessage('accepted-recovery-late').state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(state.getMessage('103').state, MESSAGE_STATES.SUBMITTED);
   assert.equal(sends.filter(payload => String(payload.content).startsWith('Receipt:')).length, 0);
   assert.deepEqual(reactions, ['📥']);
   release({ text: 'answer after recovery' });
-  for (let attempt = 0; attempt < 100 && state.getMessage('accepted-recovery-late').state !== MESSAGE_STATES.REPLIED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
-  assert.equal(state.getMessage('accepted-recovery-late').state, MESSAGE_STATES.REPLIED);
+  for (let attempt = 0; attempt < 100 && state.getMessage('103').state !== MESSAGE_STATES.REPLIED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(state.getMessage('103').state, MESSAGE_STATES.REPLIED);
   assert.equal(sends.filter(payload => payload.content === 'answer after recovery').length, 1);
-  assert.equal(state.getMessage('accepted-recovery-late').observerCursor.offset, 12);
+  assert.equal(state.getMessage('103').observerCursor.offset, 12);
   await gateway.stop();
   state.close();
 });
@@ -124,10 +124,10 @@ test('simulated: accepted recovery transfers submitted custody without blocking 
 test('simulated: recovered observer drains next accepted message for same native owner', async () => {
   const { dir, db, state: initial } = fixture();
   let state = initial;
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'accepted-one', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'first' });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '104', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'first' });
   await new Promise(resolve => setTimeout(resolve, 2));
-  state.acceptDiscordMessage({ id: 'accepted-two', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'second' });
+  state.acceptDiscordMessage({ id: '105', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'second' });
   state.close();
   state = new SurfaceState(db);
 
@@ -161,18 +161,18 @@ test('simulated: recovered observer drains next accepted message for same native
   gateway.ready = true;
 
   await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
-  assert.deepEqual(dispatches, ['accepted-one']);
-  assert.deepEqual(observations, ['accepted-one']);
-  assert.equal(state.getMessage('accepted-two').state, MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(dispatches, ['104']);
+  assert.deepEqual(observations, ['104']);
+  assert.equal(state.getMessage('105').state, MESSAGE_STATES.ACCEPTED);
 
   releases[0]({ text: 'answer-one' });
   await waitForCondition(() => observations.length === 2);
-  assert.deepEqual(dispatches, ['accepted-one', 'accepted-two']);
-  assert.deepEqual(observations, ['accepted-one', 'accepted-two']);
-  assert.equal(state.getMessage('accepted-one').state, MESSAGE_STATES.REPLIED);
+  assert.deepEqual(dispatches, ['104', '105']);
+  assert.deepEqual(observations, ['104', '105']);
+  assert.equal(state.getMessage('104').state, MESSAGE_STATES.REPLIED);
 
   releases[1]({ text: 'answer-two' });
-  await waitForCondition(() => state.getMessage('accepted-two').state === MESSAGE_STATES.REPLIED);
+  await waitForCondition(() => state.getMessage('105').state === MESSAGE_STATES.REPLIED);
   assert.equal(sends.filter(payload => payload.content === 'answer-one').length, 1);
   assert.equal(sends.filter(payload => payload.content === 'answer-two').length, 1);
   await gateway.stop();
@@ -182,10 +182,10 @@ test('simulated: recovered observer drains next accepted message for same native
 test('simulated: recovered queue tail stays held after native owner change', async () => {
   const { dir, db, state: initial } = fixture();
   let state = initial;
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'owner-one', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'first' });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '106', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'first' });
   await new Promise(resolve => setTimeout(resolve, 2));
-  state.acceptDiscordMessage({ id: 'owner-two', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'second' });
+  state.acceptDiscordMessage({ id: '107', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'second' });
   state.close();
   state = new SurfaceState(db);
 
@@ -219,15 +219,15 @@ test('simulated: recovered queue tail stays held after native owner change', asy
   gateway.ready = true;
 
   await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
-  assert.deepEqual(dispatches, ['owner-one']);
-  assert.deepEqual(observations, ['owner-one']);
+  assert.deepEqual(dispatches, ['106']);
+  assert.deepEqual(observations, ['106']);
   state.setConfig({ operatorId: 'revoked-owner' });
   release({ text: 'late owner reply' });
-  await waitForCondition(() => state.getMessage('owner-one').state === MESSAGE_STATES.SUBMITTED);
+  await waitForCondition(() => state.getMessage('106').state === MESSAGE_STATES.SUBMITTED);
   await new Promise(resolve => setTimeout(resolve, 25));
-  assert.deepEqual(dispatches, ['owner-one']);
-  assert.deepEqual(observations, ['owner-one']);
-  assert.equal(state.getMessage('owner-two').state, MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(dispatches, ['106']);
+  assert.deepEqual(observations, ['106']);
+  assert.equal(state.getMessage('107').state, MESSAGE_STATES.ACCEPTED);
   assert.equal(sends.filter(payload => payload.content === 'late owner reply').length, 0);
   await gateway.stop();
   state.close();

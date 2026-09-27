@@ -10,7 +10,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fixture } = require('./helpers/intake-recovery-fixture');
 const { operatorMessage } = require('./helpers/intake-recovery-scenarios');
-const { recoverThread } = require('../src/discord/thread-enrollment');
+const { enrollPublicThread, recoverThread } = require('../src/discord/thread-enrollment');
 const { waitForRecoveryOperation } = require('../src/discord');
 const { retryPendingBoundaryDetail, RECOVERY_RETRY_PENDING_PREFIX } = require('../src/discord/recovery-fetch');
 
@@ -37,9 +37,12 @@ function blockThatNeverResolves(f, gatewayProp, channelId) {
 
 test('F15a parent retry with no historical bound must not adopt newest history as cutoff', { timeout: 8000 }, async t => {
   const f = fixture(t);
-  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: SECOND_NATIVE, workspace: f.secret });
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: SECOND_NATIVE, workspace: f.secret }, { intakeCutoff: '100' });
   f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
   f.history.set('3000', []);
+  // Named historical/unknown-coverage scenario: the legacy parent route predates the
+  // atomic cutoff commit, so it carries no covered cursor at all.
+  f.state.db.prepare('UPDATE intake_watermarks SET recovered_through_id=NULL WHERE channel_id=?').run('3000');
   const admitted = f.state.acceptDiscordMessage(operatorMessage(f, '101', '3000'), { ready: false });
   assert.equal(admitted.accepted, true, 'history-only A must enter custody before recovery');
 
@@ -52,11 +55,11 @@ test('F15a parent retry with no historical bound must not adopt newest history a
     restore();
   }
 
-  // First pass: the deadline holds the no-bound parent exactly as it was.
+  // First pass: the no-bound parent is held with no coverage rather than adopting.
   assert.equal(r1.ready, false, JSON.stringify(r1));
   const w1 = f.state.getIntakeWatermark('3000');
-  assert.equal(w1.state, 'unavailable');
-  assert.match(w1.detail, /^Discord recovery deadline: /);
+  assert.equal(w1.state, 'pending');
+  assert.match(w1.detail, /refused without historical coverage|requires qualified historical coverage/);
   assert.equal(w1.recovered_through_id, null);
   assert.equal(w1.gap_from, null);
   assert.equal(w1.gap_to, null);
@@ -96,6 +99,9 @@ test('F15a parent retry with no historical bound must not adopt newest history a
 
 test('F15b child pre-adoption retry must not adopt via newest history as a fresh cutoff', { timeout: 8000 }, async t => {
   const f = fixture(t, { adoptThread: false });
+  // Named historical/unknown-coverage scenario: clear the enrollment's covered cursor
+  // so this exercises the pre-cutoff legacy child shape rather than a qualified one.
+  f.state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=NULL WHERE thread_id=?').run('2000');
 
   const restore = blockThatNeverResolves(f, 'channels.fetch', '2000');
   let first;
@@ -211,9 +217,12 @@ test('C2 adopted child preserves enrollment and admits history-only B', { timeou
 // F15 bounded controls: retries with an absent cursor are held, while genuine first
 // adoption and covered-cursor retries still recover through public producers.
 function http503NoCursorParent(f) {
-  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: SECOND_NATIVE, workspace: f.secret });
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: SECOND_NATIVE, workspace: f.secret }, { intakeCutoff: '100' });
   f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
   f.history.set('3000', []);
+  // Named historical/unknown-coverage scenario: this legacy route predates the atomic
+  // cutoff commit, so it carries no covered cursor at all.
+  f.state.db.prepare('UPDATE intake_watermarks SET recovered_through_id=NULL WHERE channel_id=?').run('3000');
   const admitted = f.state.acceptDiscordMessage(operatorMessage(f, '101', '3000'), { ready: false });
   assert.equal(admitted.accepted, true);
   return f;
@@ -271,7 +280,7 @@ test('C4 parent interrupted-retry-pending with absent cursor stays held', { time
 
 test('C5 parent genuinely fresh first adoption still installs its baseline', { timeout: 8000 }, async t => {
   const f = fixture(t); const base = f.state.getBinding('1000');
-  f.state.bind({ channelId: '4000', guildId: 'guild', provider: 'codex', nativeId: '55555555-5555-4555-8555-555555555555', workspace: base.workspace });
+  f.state.bind({ channelId: '4000', guildId: 'guild', provider: 'codex', nativeId: '55555555-5555-4555-8555-555555555555', workspace: base.workspace }, { intakeCutoff: '100' });
   f.channels.set('4000', { ...f.channels.get('1000'), id: '4000' });
   f.history.set('4000', [f.message('900', '4000')]);
   const result = await f.gateway.recoverInbound(new AbortController().signal, 'restart',
@@ -286,13 +295,24 @@ test('C5 parent genuinely fresh first adoption still installs its baseline', { t
 
 test('C6 child genuinely fresh first adoption still installs its baseline', { timeout: 8000 }, async t => {
   const f = fixture(t, { adoptThread: false });
+  // Genuinely fresh child: enrollment commits its own qualified cutoff with the
+  // active row, then the first recovery installs the observed baseline on top.
+  f.state.db.prepare('DELETE FROM thread_enrollments WHERE thread_id=?').run('2000');
   f.history.set('2000', [f.message('102', '2000')]);
+  const enrolled = f.state.enrollThread(
+    { threadId: '2000', parentChannelId: '1000', guildId: 'guild', adoptionCutoff: '100' },
+    f.state.getBinding('1000')
+  );
+  assert.equal(enrolled.state, 'pending');
+  assert.equal(enrolled.adoptedThroughId, '100');
+  assert.equal(enrolled.recoveredThroughId, '100');
   const result = await f.gateway.recoverTransport('restart');
   assert.equal(result.ready, true, JSON.stringify(result));
   const e = f.boundary('2000');
   assert.equal(e.state, 'ready');
-  assert.equal(e.adoptedThroughId, '102');
+  assert.equal(e.adoptedThroughId, '100');
   assert.ok(e.adoptedAt);
+  assert.ok(e.recoveredThroughId >= '102');
   assert.equal(f.dispatched.length, 0);
 });
 
@@ -319,7 +339,7 @@ test('C7 covered-cursor parent retry still recovers history-only B on page two',
 
 test('C8 known-empty completed adoption still installs its baseline', { timeout: 8000 }, async t => {
   const f = fixture(t); const base = f.state.getBinding('1000');
-  f.state.bind({ channelId: '5000', guildId: 'guild', provider: 'codex', nativeId: '66666666-6666-4666-8666-666666666666', workspace: base.workspace });
+  f.state.bind({ channelId: '5000', guildId: 'guild', provider: 'codex', nativeId: '66666666-6666-4666-8666-666666666666', workspace: base.workspace }, { intakeCutoff: '100' });
   f.channels.set('5000', { ...f.channels.get('1000'), id: '5000' });
   // Known-empty completed adoption: an all-null ready boundary is completion proof,
   // not a failed attempt, so the baseline may still be installed.
@@ -336,6 +356,9 @@ test('C8 known-empty completed adoption still installs its baseline', { timeout:
 
 test('C9 child interrupted-retry-pending with absent cursor stays held', { timeout: 8000 }, async t => {
   const f = fixture(t, { adoptThread: false });
+  // Named historical/unknown-coverage scenario: the legacy child carries no covered
+  // cursor, so the interrupted retry cannot install one.
+  f.state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=NULL WHERE thread_id=?').run('2000');
   f.state.markThreadBoundary('2000', 'pending',
     `${RECOVERY_RETRY_PENDING_PREFIX}startup after HTTP 503`, null, null, f.state.getBinding('1000'));
   assert.equal(f.boundary('2000').state, 'pending');
@@ -353,6 +376,8 @@ test('C9 child interrupted-retry-pending with absent cursor stays held', { timeo
 
 test('C10 child HTTP503 retry with absent cursor stays held', { timeout: 8000 }, async t => {
   const f = fixture(t, { adoptThread: false });
+  // Named historical/unknown-coverage scenario: no covered cursor on the child row.
+  f.state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=NULL WHERE thread_id=?').run('2000');
   const restore = blockThatNeverResolves(f, 'channels.fetch', '2000');
   let first;
   try {

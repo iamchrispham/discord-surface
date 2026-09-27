@@ -18,10 +18,16 @@ async function settleRecovery(operation) {
 
 for (const entrypoint of ['result', 'startup', 'reconnect']) {
   for (const scenario of ['ready', 'latest-baseline', 'empty-baseline']) {
-    test(`${entrypoint} includes recovery after ${scenario} CAS loss`, { timeout: 6000 }, async t => {
+    const unknownCoverage = scenario !== 'ready';
+    test(unknownCoverage
+      ? `${entrypoint} holds an unknown-coverage legacy parent (${scenario}) instead of inventing a baseline`
+      : `${entrypoint} includes recovery after ${scenario} CAS loss`, { timeout: 6000 }, async t => {
       const f = fixture(t);
       const baseline = scenario !== 'ready';
       if (baseline) {
+        // Named historical/unknown-coverage scenario: the legacy parent route carries
+        // no covered cursor. The restored owner refuses to infer one from newest
+        // history, so recovery must leave the route visibly held.
         f.state.db.prepare('DELETE FROM intake_watermarks WHERE channel_id=?').run('1000');
         f.state.markIntakeBoundary('1000', 'pending', 'first baseline');
       }
@@ -60,7 +66,14 @@ for (const entrypoint of ['result', 'startup', 'reconnect']) {
           ? f.gateway.beginReconnectRecovery('probe')
           : f.gateway.recoverTransport('startup');
         const result = await settleRecovery(operation);
-        assert.equal(result.ready, true, 'caller must receive completed recovery');
+        if (!unknownCoverage) assert.equal(result.ready, true, 'caller must receive completed recovery');
+      }
+      if (unknownCoverage) {
+        assert.equal(injected, false, 'unknown coverage must not reach a baseline commit');
+        assert.equal(f.boundary('1000').state, 'pending');
+        assert.match(f.boundary('1000').detail, /requires qualified historical coverage|refused without historical coverage/);
+        assert.equal(f.dispatched.length, 0);
+        return;
       }
       assert.ok(injected);
       assert.equal(f.boundary('1000').state, 'ready');
@@ -82,7 +95,7 @@ for (const withArrival of [false, true]) {
     const f = fixture(t);
     f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
       nativeId: '33333333-3333-4333-8333-333333333333',
-      workspace: f.state.getBinding('1000').workspace });
+      workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
     f.state.setIntakeBaseline('3000', '100', 'fixture');
     f.state.markIntakeBoundary('3000', 'ready');
     f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
@@ -239,7 +252,7 @@ test('initial caller includes three consecutive arrival followups', { timeout: 3
 test('selected recovery remains selected after an arrival followup', { timeout: 3000 }, async t => {
   const f = fixture(t);
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
-    nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace });
+    nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
   f.state.setIntakeBaseline('3000', '100', 'fixture');
   f.state.markIntakeBoundary('3000', 'ready');
   f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
@@ -259,7 +272,7 @@ for (const settled of [false, true]) {
   test(`expired queued recovery preserves healthy custody (${settled ? 'settled' : 'unsettled'} caller)`, { timeout: 3000 }, async t => {
     const f = fixture(t);
     f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
-      nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace });
+      nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
     f.state.setIntakeBaseline('3000', '100', 'fixture');
     f.state.markIntakeBoundary('3000', 'ready');
     const before = f.state.getIntakeWatermark('3000');

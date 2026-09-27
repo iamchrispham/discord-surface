@@ -54,7 +54,7 @@ function fixture(t, { bind = true, endpoint = null, preflight = true } = {}) {
   let binding = null;
   if (bind) {
     binding = state.bindOrdinaryClaude({ channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId: CLAUDE, workspace: dir, endpoint: socketPath },
-      { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' });
+      { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }, '100');
     if (preflight) state.recordOrdinaryPreflight(binding, {
       file: session.file, sessionId: CLAUDE, threadId: CLAUDE, workspace: dir, endpoint: socketPath, harness: 'claude-code'
     });
@@ -191,7 +191,7 @@ test('ordinary Claude state bind rejects an identity that differs from nativeId 
   assert.throws(() => f.state.bindOrdinaryClaude({
     channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
     workspace: f.dir, endpoint: f.socketPath
-  }, { sessionId: OTHER, threadId: OTHER, harness: 'claude-code' }), /does not match the native session/);
+  }, { sessionId: OTHER, threadId: OTHER, harness: 'claude-code' }, '100'), /does not match the native session/);
   assert.equal(f.state.getBinding('claude-channel'), null);
   assert.equal(f.state.listReceipts().some(receipt => receipt.kind === 'ordinary-bound'), false);
 });
@@ -223,7 +223,11 @@ test('generic rebind cannot mutate ordinary Claude owner or endpoint, while tomb
 
 test('ordinary Claude bind compares resolved channel selectors before mutation', async t => {
   const f = fixture(t, { bind: false });
-  const channel = { id: '123456789012345678', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: '123456789012345678', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
   const deps = {
     resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code' }),
     requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
@@ -279,7 +283,11 @@ test('ordinary Claude bind rejects conflicting endpoint aliases before mutation'
 
 test('ordinary Claude bind uses exact caller and transcript, reuses and rebinds only same owner', async t => {
   const f = fixture(t, { bind: false });
-  const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
   const deps = {
     resolveClaudeCaller: () => ({ sessionId: CLAUDE, harness: 'claude-code', caller: { pid: 12, processStartTime: 34 } }),
     requireInstalled: () => ({ Client: fakeClient(channel), GatewayIntentBits: { Guilds: 1 } }),
@@ -314,6 +322,7 @@ test('ordinary Claude first adoption commits a latest cutoff before intake', asy
   let fetches = 0;
   const channel = {
     id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
     messages: { fetch: async () => { fetches += 1; return new Map([['latest', { id: '200' }]]); } }
   };
   const deps = {
@@ -338,6 +347,7 @@ test('ordinary Claude inactive adoption commits a latest cutoff while active reu
   let fetches = 0;
   const channel = {
     id: f.binding.channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
     messages: { fetch: async () => { fetches += 1; return new Map([['latest', { id: '200' }]]); } }
   };
   const deps = {
@@ -367,10 +377,11 @@ test('ordinary Claude inactive adoption uses the empty numeric channel cutoff', 
   const channelId = '123456789012345678';
   const binding = f.state.bindOrdinaryClaude({
     channelId, guildId: 'guild', provider: 'claude', nativeId: CLAUDE, workspace: f.dir, endpoint: f.socketPath
-  }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' });
+  }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }, '100');
   f.state.unbind(channelId);
   const channel = {
     id: channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
     messages: { fetch: async () => new Map() }
   };
   const deps = {
@@ -383,8 +394,12 @@ test('ordinary Claude inactive adoption uses the empty numeric channel cutoff', 
   const result = await ordinaryClaudeBind({ 'state-dir': f.dir, channel: channelId, transcript: f.session.file, socket: f.socketPath }, deps);
   assert.equal(result.binding.generation, binding.generation + 1);
   const watermark = f.state.getIntakeWatermark(channelId);
-  assert.equal(watermark.last_seen_id, channelId);
-  assert.equal(watermark.recovered_through_id, channelId);
+  // An empty qualified history collection commits the explicit "0" boundary, but the
+  // tombstoned channel's already-qualified watermark from its original bind ("100")
+  // is retained rather than regressed; the cutoff is never inferred from the channel
+  // ID itself.
+  assert.equal(watermark.last_seen_id, '100');
+  assert.equal(watermark.recovered_through_id, '100');
   assert.equal(watermark.state, READINESS.PENDING);
 });
 
@@ -396,6 +411,7 @@ test('ordinary Claude cutoff fetch failure preserves the tombstone and watermark
   const beforeWatermark = f.state.getIntakeWatermark(f.binding.channelId);
   const channel = {
     id: f.binding.channelId, guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
     messages: { fetch: async () => { throw new Error('history unavailable'); } }
   };
   const deps = {
@@ -428,7 +444,7 @@ test('ordinary Claude Monitor readiness is unavailable without a live socket and
   assert.equal(recovery.ready, false);
   assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
   const accepted = f.state.acceptDiscordMessage({
-    id: 'held-without-monitor', guildId: 'guild', channelId: f.binding.channelId,
+    id: '900001', guildId: 'guild', channelId: f.binding.channelId,
     authorId: 'operator', isBot: false, content: 'hold this'
   }, { ready: false });
   assert.equal(accepted.accepted, true);
@@ -677,7 +693,8 @@ for (const terminalState of [READINESS.UNAVAILABLE, READINESS.GAP]) {
     assert.equal(gateway.recoveryPromise, null);
     assert.equal(gateway.recoveryController, null);
     const accepted = f.state.acceptDiscordMessage({
-      id: `held-${terminalState}`, guildId: 'guild', channelId: f.binding.channelId,
+      id: terminalState === READINESS.UNAVAILABLE ? '900011' : '900012',
+      guildId: 'guild', channelId: f.binding.channelId,
       authorId: 'operator', isBot: false, content: `hold during ${terminalState}`
     }, { ready: false });
     assert.equal(accepted.accepted, true);
@@ -763,20 +780,20 @@ test('ordinary Claude pre-write endpoint loss demotes only matching binding and 
     if (error.code !== 'ENOENT') throw error;
   }
   const result = await gateway.consumer.handleMessage({
-    id: 'endpoint-loss', guildId: 'guild', channelId: f.binding.channelId, content: 'lost endpoint',
+    id: '900101', guildId: 'guild', channelId: f.binding.channelId, content: 'lost endpoint',
     author: { id: 'operator', bot: false }, channel
   });
   assert.equal(result.status, 'not_submitted');
-  assert.equal(f.state.getMessage('endpoint-loss').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(f.state.getMessage('900101').state, MESSAGE_STATES.ACCEPTED);
   await waitFor(() => f.state.getBinding(f.binding.channelId)?.readiness === READINESS.UNAVAILABLE);
   assert.equal(gateway.ready, false);
   const held = await gateway.consumer.intakeMessage({
-    id: 'endpoint-loss-held', guildId: 'guild', channelId: f.binding.channelId, content: 'hold after loss',
+    id: '900102', guildId: 'guild', channelId: f.binding.channelId, content: 'hold after loss',
     author: { id: 'operator', bot: false }, channel
   }, false, null, null, true);
   assert.equal(held.accepted, true);
-  assert.equal(f.state.claimDispatch('endpoint-loss-held').reason, 'binding-not-ready');
-  assert.equal(f.state.getMessage('endpoint-loss-held').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(f.state.claimDispatch('900102').reason, 'binding-not-ready');
+  assert.equal(f.state.getMessage('900102').state, MESSAGE_STATES.ACCEPTED);
   await gateway.stop();
   try { await monitor.stop(); } catch {}
 });
@@ -822,7 +839,7 @@ test('Claude Monitor releases settled dedupe after native reply becomes terminal
   const monitor = createMonitorMcp({ state: f.state, stateDir: f.dir, dbPath: f.db, stdout });
   f.state.setBindingReadiness(f.binding.channelId, READINESS.READY, 'test Monitor ready', f.binding);
   const intake = f.state.acceptDiscordMessage({
-    id: 'ordinary-claude-dedupe-release', guildId: 'guild', channelId: f.binding.channelId,
+    id: '900201', guildId: 'guild', channelId: f.binding.channelId,
     authorId: 'operator', isBot: false, content: 'answer this'
   });
   assert.equal(f.state.claimDispatch(intake.message.id).claimed, true);
@@ -853,7 +870,7 @@ test('real ClaudeProvider and Claude Monitor path preserves exact reply custody'
   await monitor.start();
   f.state.setBindingReadiness(f.binding.channelId, READINESS.READY, 'test Monitor ready', f.binding);
   const intake = f.state.acceptDiscordMessage({
-    id: 'ordinary-claude-event', guildId: 'guild', channelId: f.binding.channelId,
+    id: '900301', guildId: 'guild', channelId: f.binding.channelId,
     authorId: 'operator', isBot: false, content: 'answer this'
   });
   assert.equal(intake.accepted, true);
@@ -966,7 +983,11 @@ test('Monitor construction failure releases allocated timers and listeners', t =
 
 test('ordinary Claude preflight rereads Gateway after binding mutation', async t => {
   const f = fixture(t, { bind: false });
-  const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
   let reads = 0;
   const supportedCapabilities = [
     GATEWAY_CAPABILITIES.ordinaryBindWake,
@@ -993,7 +1014,11 @@ test('ordinary Claude preflight rereads Gateway after binding mutation', async t
 
 test('ordinary Claude bind pins recovery wake to the selected Gateway', async t => {
   const f = fixture(t, { bind: false });
-  const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
   const selected = {
     state: 'running', pid: 4242,
     capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock, GATEWAY_CAPABILITIES.ordinaryClaudeBind]
@@ -1178,7 +1203,7 @@ test('ordinary Claude channel startup reopens an endpoint-unavailable watermark,
 
 test('ordinary Claude channel startup delivers held intake through successful Gateway recovery', async t => {
   const f = fixture(t);
-  const messageId = 'claude-channel-held';
+  const messageId = '900401';
   const content = 'deliver through the Claude channel';
   const accepted = f.state.acceptDiscordMessage({
     id: messageId, guildId: 'guild', channelId: f.binding.channelId,
@@ -1204,6 +1229,7 @@ test('ordinary Claude channel startup delivers held intake through successful Ga
 
 test('ordinary Claude channel startup with no held intake still wakes the Gateway and revokes readiness on stop', async t => {
   const f = fixture(t);
+  const initialWatermark = f.state.getIntakeWatermark(f.binding.channelId);
   f.state.close();
   const observed = new SurfaceState(f.db);
   t.after(() => { try { observed.close(); } catch {} });
@@ -1212,7 +1238,7 @@ test('ordinary Claude channel startup with no held intake still wakes the Gatewa
   await expectWithin(() => listener.stderr().includes('could not wake Gateway'),
     'Claude channel startup requesting a Gateway wake');
   assert.match(listener.stderr(), /discord-surface: Claude channel startup could not wake Gateway \(gateway-not-running\)/);
-  assert.equal(observed.getIntakeWatermark(f.binding.channelId), null);
+  assert.deepEqual(observed.getIntakeWatermark(f.binding.channelId), initialWatermark);
 
   await listener.terminate();
   assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
@@ -1224,9 +1250,10 @@ test('Claude channel leaves a conductor binding untouched on start and stop', as
   const conductor = f.state.bind({
     channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
     workspace: f.dir, endpoint: f.socketPath, conductorId: 'conductor-1', repoKey: 'repo-1'
-  });
+  }, { intakeCutoff: '100' });
   assert.equal(f.state.isOrdinaryBinding(conductor), false);
   f.state.setBindingReadiness(conductor.channelId, READINESS.READY, 'conductor ready', conductor);
+  const initialWatermark = f.state.getIntakeWatermark(conductor.channelId);
   f.state.close();
   const observed = new SurfaceState(f.db);
   t.after(() => { try { observed.close(); } catch {} });
@@ -1236,7 +1263,7 @@ test('Claude channel leaves a conductor binding untouched on start and stop', as
   await sleep(50);
   assert.equal(observed.getBinding(conductor.channelId).readiness, READINESS.READY);
   assert.equal(listener.stderr().includes('could not wake Gateway (gateway-not-running)'), true);
-  assert.equal(observed.getIntakeWatermark(conductor.channelId), null);
+  assert.deepEqual(observed.getIntakeWatermark(conductor.channelId), initialWatermark);
 
   await listener.terminate();
   assert.equal(observed.getBinding(conductor.channelId).readiness, READINESS.READY);

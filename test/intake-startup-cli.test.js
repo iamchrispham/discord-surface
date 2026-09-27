@@ -47,12 +47,12 @@ async function runCliStartup(mode, t) {
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile });
   if (mode === 'mixed') {
     state.bind({ channelId: '1000', guildId: 'guild', provider: 'codex',
-      nativeId: '11111111-1111-1111-1111-111111111111', workspace: fixtureDir });
+      nativeId: '11111111-1111-1111-1111-111111111111', workspace: fixtureDir }, { intakeCutoff: '100' });
     state.setIntakeBaseline('1000', '100', 'fixture');
     state.markIntakeBoundary('1000', 'ready');
   }
   state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
-    nativeId: '33333333-3333-4333-8333-333333333333', workspace: fixtureDir });
+    nativeId: '33333333-3333-4333-8333-333333333333', workspace: fixtureDir }, { intakeCutoff: '100' });
   state.setIntakeBaseline('3000', '100', 'fixture');
   state.markIntakeBoundary('3000', 'gap', 'explicit uncovered history', '101', '102');
   assert.equal(state.acceptDiscordMessage({ id: '102', guildId: 'guild', channelId: '3000',

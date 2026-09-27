@@ -27,15 +27,15 @@ function setup(t, { acknowledge = true, kind = KINDS.REQUEST, customSessionRoot 
   const sourceSessionRoot = customSessionRoot ? path.join(dir, 'codex-sessions') : null;
   const sourceBinding = state.bind({ ...requester, provider: sourceProvider, workspace: dir, sessionRoot: sourceSessionRoot,
     ...(sourceProvider === 'claude' ? { endpoint: path.join(dir, 'requester.sock') } : {}),
-    conductorId: 'withdraw-source', repoKey: 'repo:withdraw-source' });
+    conductorId: 'withdraw-source', repoKey: 'repo:withdraw-source' }, { intakeCutoff: '100' });
   const targetBinding = state.bind({ ...recipient, workspace: dir, endpoint: '/tmp/agent-withdraw-target.sock',
-    conductorId: 'withdraw-target', repoKey: 'repo:withdraw-target' });
+    conductorId: 'withdraw-target', repoKey: 'repo:withdraw-target' }, { intakeCutoff: '100' });
   for (const binding of [sourceBinding, targetBinding]) {
     state.setBindingReadiness(binding.channelId, READINESS.READY, 'fixture ready', binding);
   }
-  state.enrollThread({ threadId: '103', parentChannelId: requester.channelId, guildId: '100' }, sourceBinding);
+  state.enrollThread({ threadId: '103', parentChannelId: requester.channelId, guildId: '100', adoptionCutoff: '100'}, sourceBinding);
   state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture child ready', null, null, sourceBinding);
-  state.enrollThread({ threadId: '104', parentChannelId: recipient.channelId, guildId: '100' }, targetBinding);
+  state.enrollThread({ threadId: '104', parentChannelId: recipient.channelId, guildId: '100', adoptionCutoff: '100'}, targetBinding);
   state.markThreadBoundary('104', THREAD_STATES.READY, 'fixture child ready', null, null, targetBinding);
   const source = { ...requester, provider: sourceProvider, channelId: '103', generation: sourceBinding.generation };
   const target = { ...recipient, channelId: '104', generation: targetBinding.generation };
@@ -98,7 +98,7 @@ test('a late result cannot reopen withdrawn request custody', t => {
 test('withdrawal leaves a sibling child result with the same request id untouched', t => {
   const fixture = setup(t);
   const binding = fixture.state.getBinding(recipient.channelId);
-  fixture.state.enrollThread({ threadId: '105', parentChannelId: recipient.channelId, guildId: '100' }, binding);
+  fixture.state.enrollThread({ threadId: '105', parentChannelId: recipient.channelId, guildId: '100', adoptionCutoff: '100'}, binding);
   fixture.state.markThreadBoundary('105', THREAD_STATES.READY, 'fixture child ready', null, null, binding);
   const siblingTarget = { ...fixture.target, channelId: '105' };
   const siblingRequest = { ...fixture.packet, target: siblingTarget };

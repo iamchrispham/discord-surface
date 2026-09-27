@@ -24,7 +24,7 @@ function coldChild(f, { failReads = false } = {}) {
 }
 
 test('cold public child refuses activation when qualified history acquisition fails',
-  { todo: 'known defect: public enrollment activates before qualified history acquisition', timeout: 8000 }, async t => {
+  { timeout: 8000 }, async t => {
     const f = fixture(t);
     const reads = coldChild(f, { failReads: true });
     const before = f.state.getBinding('1000');
@@ -74,7 +74,7 @@ async function coldChildSequence(f, covered) {
 }
 
 test('cold public child delivers accepted A and offline B exactly once after history retry',
-  { todo: 'known defect: cold child accepted custody stays held after history failure', timeout: 8000 }, async t => {
+  { timeout: 8000 }, async t => {
     await coldChildSequence(fixture(t), false);
   });
 

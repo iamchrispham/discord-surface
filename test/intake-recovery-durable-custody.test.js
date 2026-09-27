@@ -96,7 +96,7 @@ test('F12 attached wrong-guild parent channel is refused before send', CASES, as
 
 test('F13 unvisited terminal watermark must restore paused binding readiness', CASES, async t => {
   const f = fixture(t); const base = f.state.getBinding('1000');
-  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace }, { intakeCutoff: '100' });
   f.state.setIntakeBaseline('3000', '100', 'fixture');
   f.state.markIntakeBoundary('3000', 'gap', 'explicit uncovered history', '101', '102');
   f.history.set('1000', [f.message('101', '1000')]);
@@ -118,7 +118,7 @@ test('F13 unvisited terminal watermark must restore paused binding readiness', C
 test('F14 slow first fetch must not starve a later submitted observation', CASES, async t => {
   const f = fixture(t); submitted(f, '101');
   const base = f.state.getBinding('1000');
-  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace }, { intakeCutoff: '100' });
   f.state.setIntakeBaseline('3000', '100', 'fixture'); f.state.markIntakeBoundary('3000', 'ready');
   submitted(f, '102', '3000'); hold(f);
   const owner = f.state.getBinding('3000');
@@ -173,7 +173,7 @@ test('C12 saved reply on a held same-guild channel sends exactly once', CASES, a
 
 test('C13 visited terminal watermark without a deadline advance restores gap readiness', CASES, async t => {
   const f = fixture(t); const base = f.state.getBinding('1000');
-  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace }, { intakeCutoff: '100' });
   f.state.setIntakeBaseline('3000', '100', 'fixture');
   f.state.markIntakeBoundary('3000', 'gap', 'explicit uncovered history', '101', '102');
   f.history.set('1000', [f.message('101', '1000')]);
@@ -191,7 +191,7 @@ test('C13 visited terminal watermark without a deadline advance restores gap rea
 for (const newer of ['ready', 'pending']) {
   test(`F13 same-generation newer ${newer} is not overwritten by the terminal restore`, CASES, async t => {
     const f = fixture(t); const base = f.state.getBinding('1000');
-    f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
+    f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace }, { intakeCutoff: '100' });
     f.state.setIntakeBaseline('3000', '100', 'fixture');
     f.state.markIntakeBoundary('3000', 'gap', 'explicit uncovered history', '101', '102');
     f.history.set('1000', [f.message('101', '1000')]);
@@ -229,7 +229,7 @@ for (const newer of ['ready', 'pending']) {
 test('C14 unexhausted reconcile observes both owners exactly once', CASES, async t => {
   const f = fixture(t); submitted(f, '101');
   const base = f.state.getBinding('1000');
-  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace }, { intakeCutoff: '100' });
   f.state.setIntakeBaseline('3000', '100', 'fixture'); f.state.markIntakeBoundary('3000', 'ready');
   submitted(f, '102', '3000'); hold(f);
   f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
@@ -292,7 +292,7 @@ test('C16 deadline exhaustion mid-recovery keeps the partial cursor and does not
 test('C17 owner change during recovery await is not overwritten', CASES, async t => {
   const f = fixture(t);
   const base = f.state.getBinding('1000');
-  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace });
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace }, { intakeCutoff: '100' });
   f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
   f.state.setIntakeBaseline('3000', '100', 'fixture'); f.state.markIntakeBoundary('3000', 'ready');
   f.history.set('3000', [f.message('101', '3000')]);

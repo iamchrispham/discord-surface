@@ -115,7 +115,9 @@ export function createOrdinaryBindingHandlers(
       if (identity.sessionId !== binding.nativeId || identity.threadId !== binding.nativeId) {
         throw new BindingError('ordinary Codex identity does not match the native session');
       }
-      return state.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? options : {
+      // The caller's real adoption cutoff is forwarded verbatim; a missing value is
+      // never defaulted, so state.bind's fresh-activation gate refuses it.
+      return state.bind({ ...binding, provider: PROVIDERS.CODEX, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, {
         intakeCutoff: adoptionCutoff,
         intakeCutoffDetail: 'ordinary binding adoption cutoff',
         beforeMutation: options.beforeMutation

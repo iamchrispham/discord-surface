@@ -23,7 +23,7 @@ test('startup keeps a native proof deadline marker until a later lifecycle wake'
   const state = new SurfaceState(db);
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: secret });
   state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
-    { sessionId: nativeId, threadId: nativeId });
+    { sessionId: nativeId, threadId: nativeId }, '100');
   state.setIntakeBaseline('1000', '100', 'fixture baseline');
   let preflights = 0;
   const channel = {
@@ -79,7 +79,7 @@ test('an explicit binding wake retries a native proof deadline marker', { timeou
   const state = new SurfaceState(db);
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: secret });
   state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
-    { sessionId: nativeId, threadId: nativeId });
+    { sessionId: nativeId, threadId: nativeId }, '100');
   state.setIntakeBaseline('1000', '100', 'fixture baseline');
   let preflights = 0;
   const channel = { id: '1000', guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) };
@@ -137,7 +137,7 @@ test('Claude endpoint recovery does not invent a native proof wake', { timeout: 
   const state = new SurfaceState(db);
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: secret });
   state.bindOrdinary({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId, workspace: dir },
-    { sessionId: nativeId, threadId: nativeId });
+    { sessionId: nativeId, threadId: nativeId }, '100');
   state.setIntakeBaseline('1000', '100', 'fixture baseline');
   let failPreflights = false;
   const channel = { id: '1000', guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) };

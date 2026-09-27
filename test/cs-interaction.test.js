@@ -35,7 +35,7 @@ function fixture() {
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.secret') });
   state.bind({
     channelId: 'channel', guildId: 'guild', provider: 'codex', nativeId: NATIVE_ID, workspace: dir
-  });
+  }, { intakeCutoff: '100' });
   return { dir, state };
 }
 
@@ -218,7 +218,7 @@ test('command registration failure is reported without taking down the ordinary 
   fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile });
-  state.bind({ channelId: 'channel', guildId: 'guild', provider: 'codex', nativeId: NATIVE_ID, workspace: dir });
+  state.bind({ channelId: 'channel', guildId: 'guild', provider: 'codex', nativeId: NATIVE_ID, workspace: dir }, { intakeCutoff: '100' });
   state.setBindingReadiness('channel', 'ready');
 
   const listeners = new Map();
@@ -307,7 +307,7 @@ test('interaction admission is atomic, duplicate-safe, and outside history evide
     assert.equal(accepted.accepted, true);
     assert.equal(state.getMessage('custody-1').content, '/cs');
     assert.equal(state.getMessage('custody-1').state, MESSAGE_STATES.ACCEPTED);
-    assert.equal(state.getIntakeWatermark('channel'), before);
+    assert.deepEqual(state.getIntakeWatermark('channel'), before);
     assert.equal(state.hasIntakeEvidence('custody-1'), false);
     assert.equal(state.listReceipts().filter(row => row.discord_id === 'custody-1' && row.kind === 'interaction-origin').length, 1);
     assert.equal(state.beginInteractionCallback('custody-1').started, true);
@@ -813,6 +813,7 @@ test('native ACK is recorded before final channel send and callback target does 
   const events = [];
   try {
     const parsed = parseCsInteraction(interaction('ack-order', true), 'application');
+    const beforeWatermark = state.getIntakeWatermark('channel');
     assert.equal(state.acceptInteraction(parsed, state.getBinding('channel')).accepted, true);
     assert.equal(state.beginInteractionCallback('ack-order').started, true);
     state.recordInteractionCallbackOutcome('ack-order', 'sent', { responseMessageId: 'response-ack-order', visibility: 'available' });
@@ -837,7 +838,7 @@ test('native ACK is recorded before final channel send and callback target does 
     const result = await consumer.processAccepted(state.getMessage('ack-order'));
     assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
     assert.deepEqual(events, ['dispatch', 'native-observe', 'prepare:true', 'channel-send:true']);
-    assert.equal(state.getIntakeWatermark('channel'), null);
+    assert.deepEqual(state.getIntakeWatermark('channel'), beforeWatermark);
     assert.equal(state.interactionResponseTarget('ack-order'), 'response-ack-order');
   } finally {
     closeFixture(fixtureState);

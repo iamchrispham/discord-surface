@@ -75,7 +75,7 @@ test('ordinary bind rejects an inactive different owner despite verified proof',
   const original = setup.bindOrdinary({
     channelId: 'ordinary-successor-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir
-  }, { sessionId: CODEX, threadId: CODEX });
+  }, { sessionId: CODEX, threadId: CODEX }, '100');
   setup.unbind(original.channelId);
   setup.close();
   t.after(() => {
@@ -123,7 +123,7 @@ test('ordinary handoff clears an explicit default transcript root', t => {
   const binding = f.state.bindOrdinary({
     channelId: 'ordinary-null-root-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: f.dir, sessionRoot: predecessorRoot
-  }, f.identity);
+  }, f.identity, '100');
   f.state.unbind(binding.channelId);
   const transcriptFile = path.join(successorRoot, OTHER + '.jsonl');
   fs.writeFileSync(transcriptFile, '');
@@ -160,7 +160,7 @@ test('ordinary CLI handoff preserves a custom transcript root when omitted', asy
   const original = setup.bindOrdinary({
     channelId: '123456789012345679', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir, sessionRoot: predecessorRoot
-  }, { sessionId: CODEX, threadId: CODEX });
+  }, { sessionId: CODEX, threadId: CODEX }, '100');
   setup.unbind(original.channelId);
   setup.close();
   t.after(() => {

@@ -8,9 +8,9 @@ const { CODEX_ID, SUCCESSOR_ID, fixture, discordMessage, historyPermissions, pro
 
 test('simulated: pending recovery channel fetch is bounded and stop settles without losing custody', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   await createSurfaceConsumer({ state, providers: {}, sendReply: async () => ({ id: 'unused' }) })
-    .intakeMessage(discordMessage({ id: 'pending-recovery', channelId: 'channel-codex' }), true);
+    .intakeMessage(discordMessage({ id: '101', channelId: 'channel-codex' }), true);
   let release;
   const blocked = new Promise(resolve => { release = resolve; });
   const client = {
@@ -31,13 +31,13 @@ test('simulated: pending recovery channel fetch is bounded and stop settles with
   assert.equal(stopSettled, true);
   release(null);
   await Promise.all([recovery, stop]);
-  assert.equal(state.getMessage('pending-recovery').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
   state.close();
 });
 
 test('simulated: static address survives successor handoff without a topic rewrite', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'handoff-recovery', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'handoff-recovery-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'handoff-recovery', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'handoff-recovery-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.markIntakeBoundary('handoff-recovery', 'ready');
   const oldMarker = conductorMarker({ provider: 'codex', nativeId: CODEX_ID, conductorId: 'handoff-recovery-conductor', repoKey: 'repo:alpha', generation: 1, readiness: READINESS.READY });
   const channel = {
@@ -78,7 +78,7 @@ test('simulated: static address survives successor handoff without a topic rewri
 
 test('simulated: handoff during history fetch cannot authorize the successor', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'mid-fetch-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'mid-fetch-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'mid-fetch-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'mid-fetch-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.setIntakeBaseline('mid-fetch-handoff', '100', 'previous completed recovery');
   state.markIntakeBoundary('mid-fetch-handoff', 'ready');
   const old = state.getBinding('mid-fetch-handoff');
@@ -122,7 +122,7 @@ test('simulated: handoff during history fetch cannot authorize the successor', a
 
 test('simulated: recovery and successor handoff share a static topic address', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'mid-topic-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'mid-topic-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'mid-topic-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'mid-topic-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.setIntakeBaseline('mid-topic-handoff', '100', 'previous completed recovery');
   state.markIntakeBoundary('mid-topic-handoff', 'ready');
   const old = state.getBinding('mid-topic-handoff');
@@ -169,7 +169,7 @@ test('simulated: recovery and successor handoff share a static topic address', a
 
 test('simulated: terminal recovery does not create publication custody', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'terminal-topic-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'terminal-topic-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'terminal-topic-handoff', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'terminal-topic-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.setIntakeBaseline('terminal-topic-handoff', '100', 'previous completed recovery');
   state.markIntakeBoundary('terminal-topic-handoff', 'ready');
   const old = state.getBinding('terminal-topic-handoff');
@@ -217,7 +217,7 @@ test('simulated: old topic rate limits are irrelevant to static recovery', async
     ['ambiguous send', () => Object.assign(new Error('socket closed after topic send'), { code: 'ECONNRESET' }), 'unknown']
   ]) {
     const { dir, state } = fixture();
-    state.bind({ channelId: `topic-${label.replace(/\s/g, '-')}`, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: `topic-${label}`, repoKey: 'repo:alpha' });
+    state.bind({ channelId: `topic-${label.replace(/\s/g, '-')}`, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: `topic-${label}`, repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
     const channelId = `topic-${label.replace(/\s/g, '-')}`;
     state.setIntakeBaseline(channelId, '100', 'previous completed recovery');
     state.markIntakeBoundary(channelId, 'ready');
@@ -258,7 +258,7 @@ test('simulated: old topic rate limits are irrelevant to static recovery', async
 test('simulated: uncooperative legacy topic clients are never called during recovery', async () => {
   const { dir, state } = fixture();
   const channelId = 'topic-deadline';
-  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-deadline-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-deadline-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.setIntakeBaseline(channelId, '100', 'previous completed recovery');
   state.markIntakeBoundary(channelId, 'ready');
   let topicCalls = 0;
@@ -294,7 +294,7 @@ test('simulated: uncooperative legacy topic clients are never called during reco
 
 test('simulated: unresolved legacy publication fences ownership changes, not local readiness', () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'topic-custody-guards', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-custody-guards', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'topic-custody-guards', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-custody-guards', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   const binding = state.getBinding('topic-custody-guards');
   const custody = state.beginTopicPublication('topic-custody-guards', {
     desiredReadiness: READINESS.READY,
@@ -316,7 +316,7 @@ test('simulated: unresolved legacy publication fences ownership changes, not loc
 test('simulated: legacy publication settlement cannot clear a newer intake gap', () => {
   const { dir, state } = fixture();
   const channelId = 'topic-restart-reconcile';
-  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-restart-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-restart-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   const binding = state.getBinding(channelId);
   const desiredTopic = 'discord-surface:v2 conductor=topic-restart-conductor provider=codex repo=repo%3Aalpha native=' + CODEX_ID + ' generation=1 readiness=ready';
   const custody = state.beginTopicPublication(channelId, { desiredReadiness: READINESS.READY, desiredTopic }, binding);
@@ -335,7 +335,7 @@ test('simulated: legacy publication settlement cannot clear a newer intake gap',
 test('simulated: topic reconciliation requires remote terminal evidence and fresh readback', () => {
   const { dir, state } = fixture();
   const channelId = 'topic-reconcile-proof';
-  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-reconcile-proof', repoKey: 'repo:alpha' });
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-reconcile-proof', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   const binding = state.getBinding(channelId);
   const oldTopic = 'discord-surface:v2 conductor=topic-reconcile-proof provider=codex repo=repo%3Aalpha native=' + CODEX_ID + ' generation=1 readiness=pending';
   const desiredTopic = 'discord-surface:v2 conductor=topic-reconcile-proof provider=codex repo=repo%3Aalpha native=' + CODEX_ID + ' generation=1 readiness=ready';
@@ -360,7 +360,7 @@ test('simulated: topic reconciliation requires remote terminal evidence and fres
 test('simulated: explicit legacy adoption fails closed on unresolved publication custody', () => {
   const { dir, state } = fixture();
   const channelId = 'legacy-adoption';
-  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'legacy-adoption-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'legacy-adoption-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   const binding = state.getBinding(channelId);
   const custody = state.beginTopicPublication(channelId, {
     desiredReadiness: READINESS.READY,
@@ -377,7 +377,7 @@ test('simulated: explicit legacy adoption fails closed on unresolved publication
 test('simulated: legacy publication audit cannot mutate successor readiness', () => {
   const { dir, state } = fixture();
   const channelId = 'topic-late-mutation';
-  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-late-mutation', repoKey: 'repo:alpha' });
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-late-mutation', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   const binding = state.getBinding(channelId);
   const desiredTopic = 'discord-surface:v2 conductor=topic-late-mutation provider=codex repo=repo%3Aalpha native=' + CODEX_ID + ' generation=1 readiness=ready';
   const custody = state.beginTopicPublication(channelId, { desiredReadiness: READINESS.READY, desiredTopic }, binding);
@@ -397,7 +397,7 @@ test('simulated: legacy publication audit cannot mutate successor readiness', ()
 
 test('simulated: readiness transaction rejects a second-connection successor', () => {
   const { dir, db, state } = fixture();
-  state.bind({ channelId: 'atomic-readiness', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'atomic-readiness-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'atomic-readiness', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'atomic-readiness-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   const old = state.getBinding('atomic-readiness');
   const other = new SurfaceState(db);
   other.handoffConductor({ ...old, fromNativeId: old.nativeId, fromGeneration: old.generation, nativeId: SUCCESSOR_ID, handoffId: 'atomic-readiness-1' });
