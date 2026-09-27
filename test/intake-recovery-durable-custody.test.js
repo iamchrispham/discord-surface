@@ -94,6 +94,48 @@ test('F12 attached wrong-guild parent channel is refused before send', CASES, as
   assert.equal(f.dispatched.length, 0);
 });
 
+test('P1 held parent reply revalidates reply permission before send', CASES, async t => {
+  const f = fixture(t); submitted(f, '101');
+  const message = f.state.getMessage('101');
+  f.state.recordNativeReply({ provider: message.provider, messageId: message.id, nativeId: message.nativeId, generation: message.generation, text: 'saved reply' });
+  hold(f); f.enableDelivery();
+  f.channels.get('1000').permissionsFor = () => ({ has: () => false });
+  await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+  assert.equal(f.replies.length, 0);
+  assert.equal(f.state.getMessage('101').state, 'reply_ready');
+});
+
+test('P2 reply-ready custody gets a fresh reconciliation deadline after an earlier timeout', CASES, async t => {
+  const f = fixture(t); submitted(f, '101');
+  const first = f.state.getMessage('101');
+  f.state.recordNativeReply({ provider: first.provider, messageId: first.id, nativeId: first.nativeId, generation: first.generation, text: 'first reply' });
+  hold(f);
+  const base = f.state.getBinding('1000');
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
+    nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace }, { intakeCutoff: '100' });
+  f.state.setIntakeBaseline('3000', '100', 'fixture');
+  f.state.markIntakeBoundary('3000', 'ready');
+  f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
+  submitted(f, '102', '3000');
+  const second = f.state.getMessage('102');
+  f.state.recordNativeReply({ provider: second.provider, messageId: second.id, nativeId: second.nativeId, generation: second.generation, text: 'second reply' });
+  f.enableDelivery();
+  f.gateway.recoveryTimeoutMs = 30;
+  let firstFetch = true;
+  f.gateway.client.channels.fetch = async id => {
+    if (id === '1000' && firstFetch) {
+      firstFetch = false;
+      return new Promise(() => {});
+    }
+    return f.channels.get(id);
+  };
+  await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(f.replies.length, 2);
+  assert.equal(f.state.getMessage('101').state, 'replied');
+  assert.equal(f.state.getMessage('102').state, 'replied');
+});
+
 test('F13 unvisited terminal watermark must restore paused binding readiness', CASES, async t => {
   const f = fixture(t); const base = f.state.getBinding('1000');
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex', nativeId: '33333333-3333-4333-8333-333333333333', workspace: base.workspace }, { intakeCutoff: '100' });

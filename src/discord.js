@@ -2485,10 +2485,16 @@ class DiscordGateway {
           const restored = this.state.markIntakeBoundary(binding.channelId, retryBoundary.state,
             retryBoundary.detail || `${reason} retry deadline expired`, retryBoundary.gap_from,
             retryBoundary.gap_to, binding, null, retryBoundary, ownedReadiness);
-          if (restored) failure ||= { ready: false, state: 'unavailable' };
+          if (restored) {
+            scheduleRecoveryRetry(binding.channelId, Date.now() + this.recoveryTimeoutMs);
+            failure ||= { ready: false, state: 'unavailable' };
+          }
           else {
             const current = adoptCurrentReadiness();
             if (current?.state === READINESS.READY) continue;
+            if (current?.state === READINESS.PENDING) {
+              scheduleRecoveryRetry(binding.channelId, Date.now() + this.recoveryTimeoutMs);
+            }
             failure ||= { ready: false, state: current?.state || 'unavailable' };
           }
           continue;
@@ -2993,6 +2999,16 @@ class DiscordGateway {
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
     const ordered = candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const blockedOwners = new Set();
+    let reconciliationRetryQueued = false;
+    const queueReconciliationRetry = () => {
+      if (reconciliationRetryQueued || this.stopping || signal?.aborted) return;
+      reconciliationRetryQueued = true;
+      queueMicrotask(() => {
+        if (this.stopping || signal?.aborted) return;
+        this.reconcilePending(before, { allowPaused: true, readyOnly: true, channelIds })
+          .catch(error => this.logger(`Discord reply reconciliation retry failed: ${error.message}`));
+      });
+    };
     const storedMessages = new Map();
     const storedMessageFor = message => {
       let storedMessage = storedMessages.get(message.id);
@@ -3052,6 +3068,12 @@ class DiscordGateway {
         );
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE) {
+          const current = this.state.getMessage(message.id);
+          if (!channelFetchStarted && (message.state === 'reply_ready' || current?.state === 'reply_ready')) {
+            queueReconciliationRetry();
+          }
+        }
         blockedOwners.add(key);
         if (!channelFetchStarted) continue;
         this.markThreadDeliveryUnavailable(message, error);
@@ -3072,11 +3094,25 @@ class DiscordGateway {
           blockedOwners.add(key);
           continue;
         }
-      } else if (!storedChannelMatches(channel, message)) {
-        // F12: never attach refreshed parent context from a channel that disagrees
-        // with the stored message's guild/channel destination.
-        blockedOwners.add(key);
-        continue;
+      } else {
+        const binding = this.state.getBinding(message.channelId);
+        if (!binding?.active || !storedChannelMatches(channel, message)) {
+          blockedOwners.add(key);
+          continue;
+        }
+        if (isHeldDurable(message)) {
+          const ordinary = this.state.isOrdinaryBinding?.(binding) === true;
+          if ((ordinary && channel.guildId && channel.guildId !== binding.guildId) ||
+              (!ordinary && !conductorMarkerMatchesTopic(channel.topic, binding))) {
+            blockedOwners.add(key);
+            continue;
+          }
+          const permission = this.historyPermission(channel, { requireSend: ordinary });
+          if (!permission.known || !permission.allowed) {
+            blockedOwners.add(key);
+            continue;
+          }
+        }
       }
       storedMessage.channel = channel;
       // F11: attach the verified channel to the ORIGINAL observation entry without
