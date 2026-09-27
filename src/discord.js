@@ -1734,9 +1734,11 @@ class DiscordGateway {
     this.attachmentIntakeBlockedChannels.add(intakeChannelId);
     this.attachmentIntakeRetryMessages.set(intakeChannelId, { message, binding });
     const watermark = childDelivery ? null : this.state.getIntakeWatermark(binding.channelId);
+    // Preserve verified-empty coverage when a live gap races startup migration.
     const gapFrom = childDelivery
       ? enrollment.recoveredThroughId || enrollment.lastSeenId || null
-      : watermark?.recovered_through_id || watermark?.last_seen_id || null;
+      : watermark?.recovered_through_id || watermark?.last_seen_id ||
+        (watermark?.state === READINESS.READY && !watermark.last_seen_id ? '0' : null);
     const detail = `live attachment intake failed for ${message?.id || 'unknown message'}: ${String(error?.message || error).slice(0, 900)}`;
     const boundary = childDelivery
       ? this.state.markThreadBoundary(intakeChannelId, THREAD_STATES.GAP, detail, gapFrom, message?.id || null, binding)
@@ -2608,6 +2610,7 @@ class DiscordGateway {
         if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'unavailable', error };
         continue;
       }
+      let qualifiedEmptyBaseline = false;
       if (watermark?.state === READINESS.READY && !watermark.last_seen_id && !watermark.recovered_through_id) {
         // An upgraded empty READY watermark is verified empty coverage, not an
         // unknown baseline. Qualify it without replaying historical messages.
@@ -2627,6 +2630,7 @@ class DiscordGateway {
         }
         ownedBoundary = migrated;
         watermark = migrated;
+        qualifiedEmptyBaseline = true;
         const recorded = await recordOwnedBoundary(
           binding,
           channel,
@@ -2640,15 +2644,15 @@ class DiscordGateway {
         );
         if (!recorded?.watermark || recorded.stale || recorded.blocked || (!recorded.concurrentReady && !currentRecovery())) {
           failure ||= { ready: false, state: READINESS.PENDING };
+          continue;
         }
-        continue;
       }
       // A genuinely new parent route may only install its history boundary from a
       // permission-qualified covered cursor on the owned snapshot. A null/unknown
       // historical parent refuses visibly HERE, before any history request: no
       // cutoff is ever inferred from newest history, last_seen_id, channel id,
       // channel creation time, wall clock, or a later retry.
-      if (refusesUnqualifiedBaseline({ coveredCursor: ownedCoverageCursor })) {
+      if (!qualifiedEmptyBaseline && refusesUnqualifiedBaseline({ coveredCursor: ownedCoverageCursor })) {
         const refusalDetail = watermark
           ? retryPendingBoundaryDetail(`${reason} baseline refused without historical coverage`, watermark)
           : `${reason} history boundary requires qualified historical coverage`;
