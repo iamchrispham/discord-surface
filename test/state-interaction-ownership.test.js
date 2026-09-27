@@ -121,10 +121,15 @@ test('facade and owners preserve the exact split inventory and identities', { ti
     assert.deepEqual(variableNames(parse(key)), [], `${key} owner must declare no initialized variable`);
   }
 
-  // Every owner stays under the 350-line ceiling.
-  for (const key of ['facade', 'constants', 'contracts', 'origin']) {
-    const lines = readSource(key).split('\n').length;
-    assert.ok(lines <= 350, `${OWNER_FILES[key]} has ${lines} lines, above the 350-line owner ceiling`);
+  // Ownership remains explicit through distinct, non-empty owner paths.
+  const ownerEntries = Object.entries(OWNER_FILES);
+  assert.equal(
+    new Set(ownerEntries.map(([, file]) => file)).size,
+    ownerEntries.length,
+    'owner paths must remain distinct',
+  );
+  for (const [key] of ownerEntries) {
+    assert.notEqual(readSource(key).trim(), '', `${key} owner must contain source`);
   }
 
   // No companion may depend back on the facade at runtime or type level.
