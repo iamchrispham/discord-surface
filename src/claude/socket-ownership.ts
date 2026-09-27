@@ -204,6 +204,8 @@ function validateSocketDirectoryPath(directoryPath: string): void {
       if (!target.isDirectory()) throw new Error('Claude channel socket directory must resolve to a directory');
     } else if (!entry.isDirectory()) {
       throw new Error('Claude channel socket directory must be a directory');
+    } else if (parentIsSticky && owner !== undefined && entry.uid !== owner) {
+      throw new Error('Claude channel socket directory contains a foreign-owned directory');
     }
     current = next;
   }

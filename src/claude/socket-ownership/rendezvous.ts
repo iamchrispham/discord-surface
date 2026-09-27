@@ -31,7 +31,7 @@ export function assertLockNamespaceIsUsable(namespacePath: string, owner: number
   }
 }
 
-function publishedFallbackRoot(root: string, owner: number | undefined, homeIdentity: string | undefined): string | undefined {
+function publishedFallbackRoot(root: string, owner: number | undefined): string | undefined {
   let directory: fs.Stats;
   try { directory = fs.statSync(root); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
@@ -71,9 +71,6 @@ function publishedFallbackRoot(root: string, owner: number | undefined, homeIden
     }
     const markerLines = fs.readFileSync(rendezvousPath, 'utf8').trim().split('\n');
     const target = markerLines[0];
-    const recordedHomeIdentity = markerLines[1];
-    if (recordedHomeIdentity !== undefined &&
-      (homeIdentity === undefined || recordedHomeIdentity !== homeIdentity)) continue;
     if (!target || path.basename(target) !== target || !target.startsWith(privateRootPrefix)) {
       throw new Error('Claude channel fallback-root rendezvous is invalid');
     }
@@ -107,7 +104,7 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
   }
 
   for (const root of candidates) {
-    const publishedRoot = publishedFallbackRoot(root, owner, homeIdentity);
+    const publishedRoot = publishedFallbackRoot(root, owner);
     if (publishedRoot) return publishedRoot;
   }
 
@@ -159,8 +156,6 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
       }
       const markerLines = fs.readFileSync(rendezvousPath, 'utf8').trim().split('\n');
       const target = markerLines[0];
-      const recordedHomeIdentity = markerLines[1];
-      if (recordedHomeIdentity !== undefined && (homeIdentity === undefined || recordedHomeIdentity !== homeIdentity)) return {};
       if (!target || path.basename(target) !== target || !target.startsWith(privateRootPrefix)) {
         throw new Error('Claude channel fallback-root rendezvous is invalid');
       }
@@ -352,6 +347,13 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
         } finally {
           try { fs.unlinkSync(markerTemp); } catch { /* marker link owns the content */ }
         }
+      }
+      const publishedRoot = publishedFallbackRoot(root, owner);
+      if (publishedRoot && publishedRoot !== privateRoot) {
+        if (createdPrivateRoot) {
+          try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
+        }
+        privateRoot = publishedRoot;
       }
       const privateDirectory = fs.lstatSync(privateRoot);
       const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;

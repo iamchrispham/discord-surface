@@ -160,6 +160,30 @@ test('abrupt listener expiry can re-arm the same Claude binding', { timeout: 800
   assert.deepEqual(afterCustody, beforeCustody, 'accepted message custody must be unchanged');
 });
 
+test('foreign-owned socket directory ancestors below sticky parents are refused', t => {
+  const sharedRoot = fs.mkdtempSync('/tmp/dss-foreign-');
+  fs.chmodSync(sharedRoot, 0o1777);
+  const foreignDirectory = path.join(sharedRoot, 'foreign-directory');
+  fs.mkdirSync(foreignDirectory, { mode: 0o700 });
+  const socket = path.join(foreignDirectory, 'listener.sock');
+  const owner = process.geteuid?.() ?? process.getuid?.();
+  if (owner === undefined) return t.skip('requires an effective UID');
+  const originalLstatSync = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (candidate, options) => {
+    const stats = originalLstatSync(candidate, options);
+    if (candidate !== foreignDirectory) return stats;
+    return {
+      ...stats,
+      uid: owner + 1,
+      isDirectory: () => true,
+      isSymbolicLink: () => false
+    };
+  });
+  t.after(() => fs.rmSync(sharedRoot, { recursive: true, force: true }));
+
+  assert.throws(() => assertSocketDirectory(socket), /foreign-owned directory/);
+});
+
 test('owner records preserve a process identity when Linux exposes one', t => {
   isolatedNamespaceRoot(t);
   const socket = socketPath(t);
@@ -397,11 +421,13 @@ test('fallback lock roots ignore per-process runtime directories', t => {
 });
 
 test('fallback lock root remains stable when passwd home recovers', t => {
+  const initialHome = path.join('/tmp', `dss-initial-home-${randomUUID()}`);
   const recoveredHome = path.join('/tmp', `dss-recovered-home-${randomUUID()}`);
   const sharedRoot = fs.mkdtempSync('/tmp/dss-recovery-root-');
   fs.chmodSync(sharedRoot, 0o1777);
   const userInfo = os.userInfo();
-  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: recoveredHome }));
+  let home = initialHome;
+  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: home }));
   const originalRealpath = fs.realpathSync;
   t.mock.method(fs, 'realpathSync', (target, ...args) => {
     if (String(target) === '/tmp') return sharedRoot;
@@ -416,6 +442,7 @@ test('fallback lock root remains stable when passwd home recovers', t => {
   const first = acquireSocketLockWithPath(t, socket);
   try {
     fs.mkdirSync(recoveredHome, { mode: 0o700 });
+    home = recoveredHome;
     assert.throws(() => acquireSocketLock(socket), /already in progress/,
       'home recovery must not move contenders to a second lock namespace');
   } finally {
