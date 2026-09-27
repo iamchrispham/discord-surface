@@ -211,6 +211,24 @@ test('successful agent send targets the enrolled child and retry keeps one post'
   assert.equal((await peer.result(request.dedupe_key)).results[0].completed, true);
 });
 
+test('retired source child keeps unknown custody across replacement enrollment', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    posts += 1;
+    throw new Error('transport outcome is unknown');
+  } });
+  const input = { peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'retired-child-unknown' };
+  assert.equal((await peer.send(input)).status, 'unknown');
+  const binding = f.state.getBinding('101');
+  f.state.deactivateThreadEnrollments('101', binding);
+  f.enroll('103');
+  assert.equal((await peer.send(input)).status, 'unknown');
+  assert.equal(posts, 1);
+  assert.equal((await peer.result(input.dedupe_key)).sendOutcome, 'unknown');
+});
+
 test('peer result does not accept a parent result for a child-targeted request', async t => {
   const f = fixture(t); f.enroll('102'); const target = addRecipient(f); let requestPacket;
   const peer = service(f, { fetchImpl: async (url, options) => {

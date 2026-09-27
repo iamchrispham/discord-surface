@@ -42,7 +42,7 @@ export type {
   DirectPostHandlers
 } from './direct-post/contracts';
 import { createHash } from 'node:crypto';
-import { isAgentSourcePromotion } from './agent-routing';
+import { AGENT_ROUTING_VERSION, isAgentSourcePromotion } from './agent-routing';
 import { sameAddress, type AgentAddress, type AgentMessage, type AgentProvider } from '../agent-message';
 import type { WatcherNotice } from '../watcher-notice';
 import { DIRECT_POST_FILE_LIMITS, DIRECT_POST_FILE_PHASES, stagedDirectPostFilePath } from '../direct-post-file';
@@ -54,7 +54,25 @@ const identityKeys: readonly (keyof DirectPostPartMeta)[] = [
   'conductorId', 'repoKey', 'partCount', 'deliveryChannelId', 'agentPacket', 'agentRequestTarget', 'watcherNotice', 'caption', 'fileManifest'
 ];
 
-function identityKeyValueMatches(key: string, left: unknown, right: unknown): boolean {
+function samePeerAgentPacket(left: unknown, right: unknown, parentChannelId: string): boolean {
+  if (!left || typeof left !== 'object' || Array.isArray(left) || !right || typeof right !== 'object' || Array.isArray(right)) return false;
+  const leftPacket = left as Record<string, unknown>;
+  const rightPacket = right as Record<string, unknown>;
+  if (leftPacket.routingVersion !== AGENT_ROUTING_VERSION || rightPacket.routingVersion !== AGENT_ROUTING_VERSION) return false;
+  const leftSource = leftPacket.source;
+  const rightSource = rightPacket.source;
+  if (!leftSource || typeof leftSource !== 'object' || Array.isArray(leftSource) ||
+      !rightSource || typeof rightSource !== 'object' || Array.isArray(rightSource)) return false;
+  const normalize = (packet: Record<string, unknown>, source: Record<string, unknown>) => ({
+    ...packet,
+    source: { ...source, channelId: parentChannelId }
+  });
+  return identityValueMatches(normalize(leftPacket, leftSource as Record<string, unknown>),
+    normalize(rightPacket, rightSource as Record<string, unknown>));
+}
+
+function identityKeyValueMatches(key: string, left: unknown, right: unknown, parentChannelId: string | null = null): boolean {
+  if (key === 'agentPacket' && parentChannelId !== null && samePeerAgentPacket(left, right, parentChannelId)) return true;
   if (key === 'agentPacket' && (left === undefined || left === null || right === undefined || right === null)) return true;
   return identityValueMatches(left, right);
 }
@@ -296,8 +314,10 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     const incoming = normalizedIdentity(meta as unknown as DirectPostReceiptDetail);
     for (const row of rows) {
       const existing = normalizedLegacyRow(row.detail, meta.legacyAgentPacket, meta.channelId);
+      const samePeerRoute = samePeerAgentPacket(existing.agentPacket, incoming.agentPacket, meta.channelId);
       for (const key of identityKeys) {
-        if (!identityKeyValueMatches(key, existing[key], incoming[key])) {
+        if (key === 'textHash' && samePeerRoute) continue;
+        if (!identityKeyValueMatches(key, existing[key], incoming[key], meta.channelId)) {
           throw new BindingError('direct post request identity conflicts with existing custody');
         }
       }

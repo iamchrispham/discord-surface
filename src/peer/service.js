@@ -65,21 +65,29 @@ function requireReadyReplyPeer(state, binding) {
 function samePeerSource(detail, source, binding) {
   const packets = [detail?.agentPacket, detail?.legacyAgentPacket]
     .filter(packet => packet && typeof packet === 'object' && packet.source);
+  const persistedBinding = detail?.binding && typeof detail.binding === 'object' && !Array.isArray(detail.binding)
+    ? detail.binding : detail;
+  const sameOwner = packetSource => packetSource && packetSource.guildId === source.guildId &&
+    packetSource.provider === source.provider &&
+    canonicalNativeId(packetSource.nativeId) === canonicalNativeId(source.nativeId) &&
+    packetSource.generation === source.generation;
   if (packets.length > 0) return packets.some(packet => sameAddress(packet.source, source) ||
-    sameAddress(packet.source, { ...source, channelId: binding.channelId }));
+    sameAddress(packet.source, { ...source, channelId: binding.channelId }) ||
+    (sameOwner(packet.source) && persistedBinding?.channelId === binding.channelId));
   return detail?.guildId === binding.guildId && detail?.channelId === binding.channelId &&
-    detail?.provider === binding.provider && detail?.nativeId === binding.nativeId &&
+    detail?.provider === binding.provider && canonicalNativeId(detail?.nativeId) === canonicalNativeId(binding.nativeId) &&
     detail?.generation === binding.generation;
 }
 
-function callerCustodyKey(packetId, source) {
-  return `peer:${crypto.createHash('sha256').update(JSON.stringify([packetId, source])).digest('hex')}`;
+function callerCustodyKey(packetId, source, binding) {
+  const parentSource = { ...source, channelId: binding.channelId, nativeId: canonicalNativeId(source.nativeId) };
+  return `peer:${crypto.createHash('sha256').update(JSON.stringify([packetId, parentSource])).digest('hex')}`;
 }
 
 function custodyKeyFor(state, packetId, source, binding) {
   const rows = state.directPostRows(packetId);
   if (rows.some(row => samePeerSource(row.detail, source, binding))) return undefined;
-  return rows.length > 0 ? callerCustodyKey(packetId, source) : undefined;
+  return rows.length > 0 ? callerCustodyKey(packetId, source, binding) : undefined;
 }
 
 function assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token }) {
