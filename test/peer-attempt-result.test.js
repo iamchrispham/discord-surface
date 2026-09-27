@@ -93,3 +93,31 @@ test('peer result does not promote an enrolled child target to a legacy parent r
   };
   assert.deepEqual(inspectPeerResult(state, source, detail.requestId).results, []);
 });
+
+test('peer result preserves a legacy child result after the parent target hands off', () => {
+  const source = { guildId: '100', channelId: '101', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
+  const parent = { guildId: '100', channelId: '201', provider: 'codex', nativeId: '22222222-2222-2222-2222-222222222222', generation: 1 };
+  const child = { ...parent, channelId: '202' };
+  const packet = { id: 'legacy-request', kind: 'request', source, target: parent, replyTo: null, text: 'request' };
+  const candidate = { id: 'legacy-child-result', kind: 'result', source: child, target: source, replyTo: packet.id, text: 'accepted result' };
+  const detail = { journal: 'direct-post-v1', requestId: 'correlation', guildId: source.guildId, channelId: source.channelId,
+    provider: source.provider, nativeId: source.nativeId, generation: source.generation, agentPacket: packet, legacyAgentPacket: packet };
+  const state = {
+    directPostRows: () => [{ id: 1, kind: 'direct-post-attempt', detail }],
+    listAgentMessageReceiptIds: () => ['discord-result'],
+    getAgentMessage: () => ({ packet: candidate }),
+    getMessage: () => ({ ...candidate.target, state: 'accepted' }),
+    listAgentCompletionReceipts: () => [],
+    hasNativeAcknowledgment: () => false,
+    getMessageRoute: () => ({ binding: { ...parent, generation: 2 }, enrollment: null, ready: true })
+  };
+  assert.deepEqual(inspectPeerResult(state, source, detail.requestId).results, [{
+    messageId: 'discord-result',
+    state: 'accepted',
+    nativeAcknowledged: false,
+    completed: false,
+    completionReceiptId: null,
+    packetId: candidate.id,
+    text: candidate.text
+  }]);
+});

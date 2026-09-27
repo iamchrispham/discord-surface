@@ -53,18 +53,7 @@ function rowMatchesCaller(row, source, correlationId, requirePacketId = false) {
 function isLegacyParentTarget(state, target, frozenRequest) {
   const route = typeof state.getMessageRoute === 'function' ? state.getMessageRoute(target.channelId) : null;
   return Boolean(frozenRequest?.kind === KINDS.REQUEST && sameAddress(frozenRequest.target, target) &&
-    route && !route.enrollment && sameAddress(canonicalAddress(route.binding), target));
-}
-
-function canonicalAddress(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
-  return {
-    guildId: value.guildId,
-    channelId: value.channelId,
-    provider: value.provider,
-    nativeId: value.nativeId,
-    generation: value.generation
-  };
+    route && !route.enrollment);
 }
 
 function packetMatchesRecordedIdentity(candidate, records) {
