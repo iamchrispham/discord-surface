@@ -119,7 +119,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
     agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
     agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null,
-    preparedTextSource, agentDestinationCurrent = null, bindingCurrent = null } =
+    preparedTextSource, agentDestinationCurrent = null, bindingCurrent = null, custodyKey } =
     input as DirectPostInput & { agentThreadId?: string | null };
   const binding = watcherNotice
     ? watcherNotice.binding
@@ -148,6 +148,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     ? resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: false })
     : resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: isAgentMessage });
   const explicitRequestId = watcherNotice ? requestedRequestId || watcherNotice.packet.id : requestedRequestId;
+  const explicitCustodyKey = custodyKey === undefined ? null : requiredString(custodyKey, 'custody-key', 256);
   if (watcherNotice && explicitRequestId !== watcherNotice.packet.id) {
     throw new BindingError('watcher notice dedupe key must match its frozen identity');
   }
@@ -303,7 +304,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     };
   }
   const legacyMigration = legacyChildAddress === null || legacyPacket?.kind === KINDS.RESULT ? legacyPacket : null;
-  const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, effectiveReplyTarget);
+  const requestId = explicitCustodyKey ?? requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, effectiveReplyTarget);
   state.recoverDirectPostReceipts();
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;
@@ -429,7 +430,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   }
   const status = parts.every(part => part.status === 'sent') ? 'sent' : parts.find(part => part.status !== 'sent')?.status || 'not_sent';
   const duplicate = !claimedAny && parts.length > 0 && parts.every(part => part.status === 'sent');
-  return { requestId, dedupeKey: requestId, inReplyTo: effectiveReplyTarget, channelId: deliveryTarget?.channelId || binding.channelId, provider: binding.provider,
+  const publicRequestId = explicitRequestId ?? requestId;
+  return { requestId: publicRequestId, dedupeKey: publicRequestId, inReplyTo: effectiveReplyTarget, channelId: deliveryTarget?.channelId || binding.channelId, provider: binding.provider,
     nativeId: binding.nativeId, generation: binding.generation, status, state: status, recorded, duplicate,
     ...(source.fileManifest ? { filePreparationId: source.fileManifest.preparationId } : {}),
     messageIds: parts.filter((part): part is DirectPostPartResult & { messageId: string } => typeof part.messageId === 'string')

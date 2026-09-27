@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -9,7 +10,7 @@ const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest } = require('../../dist/
 const { readTextFile, resolveAgentAddress, runDirectPost } = require('../direct-post');
 const { postByRole } = require('./post');
 const { inspectPeerResult, validPeerId } = require('./result');
-const { encodeAgentMessage, issueAgentAddress, KINDS } = require('../agent-message');
+const { encodeAgentMessage, issueAgentAddress, sameAddress, KINDS } = require('../agent-message');
 const { READINESS } = require('../state');
 const { THREAD_STATES } = require('../state/thread-enrollment');
 
@@ -59,6 +60,26 @@ function requireReadyReplyPeer(state, binding) {
     }
     throw error;
   }
+}
+
+function samePeerSource(detail, source, binding) {
+  const packets = [detail?.agentPacket, detail?.legacyAgentPacket]
+    .filter(packet => packet && typeof packet === 'object' && packet.source);
+  if (packets.length > 0) return packets.some(packet => sameAddress(packet.source, source) ||
+    sameAddress(packet.source, { ...source, channelId: binding.channelId }));
+  return detail?.guildId === binding.guildId && detail?.channelId === binding.channelId &&
+    detail?.provider === binding.provider && detail?.nativeId === binding.nativeId &&
+    detail?.generation === binding.generation;
+}
+
+function callerCustodyKey(packetId, source) {
+  return `peer:${crypto.createHash('sha256').update(JSON.stringify([packetId, source])).digest('hex')}`;
+}
+
+function custodyKeyFor(state, packetId, source, binding) {
+  const rows = state.directPostRows(packetId);
+  if (rows.some(row => samePeerSource(row.detail, source, binding))) return undefined;
+  return rows.length > 0 ? callerCustodyKey(packetId, source) : undefined;
 }
 
 function assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token }) {
@@ -171,6 +192,7 @@ function createPeerService(context) {
       const fileSource = input.text_file === undefined ? null : readTextFile(input.text_file);
       const text = fileSource === null ? input.text : fileSource.text;
       const packetTarget = assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token });
+      const custodyKey = custodyKeyFor(state, input.dedupe_key, sourceAddress, source);
       if (input.reply_to !== undefined && destination !== null) {
         agentTarget = issueAgentAddress(packetTarget, token);
       }
@@ -195,7 +217,7 @@ function createPeerService(context) {
             requireReadyPeer(state, currentSource);
             return currentPeerDestination(state, target, destination?.binding || null, destination?.childId || null);
           },
-          textFile, dedupeKey: input.dedupe_key, signal, fetchImpl,
+          textFile, dedupeKey: input.dedupe_key, custodyKey, signal, fetchImpl,
           ...(fileSource === null ? {} : { preparedTextSource: fileSource }) });
         return { correlationId: input.dedupe_key, ...result };
       } finally {

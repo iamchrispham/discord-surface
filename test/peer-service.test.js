@@ -247,7 +247,9 @@ test('peer custody scopes a reused packet ID to each caller channel', async t =>
   const secondResult = await second.send({ peer: { conductorId: 'recipient' }, text: 'second', dedupe_key: 'shared-packet-id' });
   assert.equal(firstResult.status, 'sent');
   assert.equal(secondResult.status, 'sent');
+  assert.equal((await first.send({ peer: { conductorId: 'recipient' }, text: 'first', dedupe_key: 'shared-packet-id' })).status, 'sent');
   assert.equal(posts, 2);
+  assert.equal((await second.result('shared-packet-id')).sendOutcome, 'sent');
 });
 
 test('peer custody scopes a reused packet ID to the caller source identity', async t => {

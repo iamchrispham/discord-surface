@@ -32,10 +32,39 @@ function packetRecordsMatch(left, right) {
     (left.legacyAgentPacket && right.legacyAgentPacket && packetMatches(left.legacyAgentPacket, right.legacyAgentPacket));
 }
 
+function sourceMatchesCaller(packet, source) {
+  const packetSource = packet && typeof packet === 'object' ? packet.source : null;
+  if (!packetSource || typeof packetSource !== 'object') return true;
+  return packetSource.guildId === source.guildId && packetSource.provider === source.provider &&
+    packetSource.nativeId === source.nativeId && packetSource.generation === source.generation;
+}
+
+function rowMatchesCaller(row, source, correlationId, requirePacketId = false) {
+  const detail = row.detail;
+  const packets = [detail.agentPacket, detail.legacyAgentPacket]
+    .filter(packet => packet && typeof packet === 'object');
+  const packetIdMatches = packets.some(packet => packet.id === correlationId);
+  if (requirePacketId ? !packetIdMatches : detail.requestId !== correlationId && !packetIdMatches) return false;
+  return detail.guildId === source.guildId && detail.provider === source.provider &&
+    detail.nativeId === source.nativeId && detail.generation === source.generation &&
+    (packets.length === 0 || packets.some(packet => sourceMatchesCaller(packet, source)));
+}
+
 function isLegacyParentTarget(state, target, frozenRequest) {
   const route = typeof state.getMessageRoute === 'function' ? state.getMessageRoute(target.channelId) : null;
   return Boolean(frozenRequest?.kind === KINDS.REQUEST && sameAddress(frozenRequest.target, target) &&
-    route && !route.enrollment && sameAddress(route.binding, target));
+    route && !route.enrollment && sameAddress(canonicalAddress(route.binding), target));
+}
+
+function canonicalAddress(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  return {
+    guildId: value.guildId,
+    channelId: value.channelId,
+    provider: value.provider,
+    nativeId: value.nativeId,
+    generation: value.generation
+  };
 }
 
 function packetMatchesRecordedIdentity(candidate, records) {
@@ -63,10 +92,10 @@ function deliveryEvidence(state, messageId, packet) {
 
 function inspectPeerResult(state, source, correlationId) {
   if (!validPeerId(correlationId)) throw new Error('invalid correlation_id');
-  const rows = state.directPostRows(correlationId, source.channelId).filter(row => {
-    const d = row.detail;
-    return d.nativeId === source.nativeId && d.provider === source.provider && d.generation === source.generation && d.guildId === source.guildId;
-  });
+  let rows = state.directPostRows(correlationId, source.channelId).filter(row => rowMatchesCaller(row, source, correlationId));
+  if (rows.length === 0) {
+    rows = state.directPostRows(null, source.channelId).filter(row => rowMatchesCaller(row, source, correlationId, true));
+  }
   const records = rows.map(row => ({
     packet: row.detail.agentPacket,
     legacyAgentPacket: row.detail.legacyAgentPacket

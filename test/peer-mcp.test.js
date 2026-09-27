@@ -52,7 +52,7 @@ test('public MCP stdio lists the caller and refuses an unready send', { timeout:
     assert.equal(postSchema.properties.reply_to.type, 'string');
     assert.equal(postSchema.properties.text_file.maxLength, 4096);
     assert.equal(peerSendSchema.properties.dedupe_key.maxLength, 128);
-    assert.equal(peerSendSchema.properties.text.maxLength, 2500);
+    assert.ok(peerSendSchema.properties.text.maxLength < 1500);
     const packetPattern = new RegExp(peerSendSchema.properties.dedupe_key.pattern);
     assert.equal(packetPattern.test('a'.repeat(128)), true);
     assert.equal(packetPattern.test('a'.repeat(129)), false);

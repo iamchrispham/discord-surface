@@ -4,6 +4,7 @@ const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { ListToolsRequestSchema, CallToolRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const { readSecret } = require('../discord');
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, KINDS, PREFIX } = require('../agent-message');
 const { createPeerService } = require('./service');
 const { PEER_PACKET_ID_SCHEMA } = require('./result');
 
@@ -11,7 +12,15 @@ const packetId = PEER_PACKET_ID_SCHEMA;
 const nonBlankString = { type: 'string', minLength: 1,
   pattern: '[^\\s\\u0000-\\u001F\\u007F-\\u009F]', not: { pattern: '[\\u0000-\\u001F\\u007F-\\u009F]' } };
 const textFile = { ...nonBlankString, maxLength: 4096 };
-const MAX_PEER_TEXT_BYTES = 10000;
+const AGENT_SIGNATURE_LENGTH = 43;
+const AGENT_WIRE_FIXED_OVERHEAD = PREFIX.length + 1 + AGENT_SIGNATURE_LENGTH;
+const MAX_AGENT_ADDRESS = { guildId: '0'.repeat(20), channelId: '0'.repeat(20), provider: 'claude', nativeId: '0'.repeat(36), generation: Number.MAX_SAFE_INTEGER };
+const MAX_PACKET_METADATA_BYTES = Buffer.byteLength(JSON.stringify({
+  id: 'a'.repeat(128), kind: KINDS.RESULT, source: MAX_AGENT_ADDRESS, target: MAX_AGENT_ADDRESS,
+  replyTo: 'a'.repeat(128), routingVersion: 2, sourceParentChannelId: '0'.repeat(20), text: ''
+}), 'utf8');
+const MAX_PEER_TEXT_BYTES = Math.max(1,
+  Math.floor((AGENT_MESSAGE_MAX_ENCODED_LENGTH - AGENT_WIRE_FIXED_OVERHEAD) * 3 / 4) - MAX_PACKET_METADATA_BYTES);
 const payloadText = { type: 'string', minLength: 1, maxLength: Math.floor(MAX_PEER_TEXT_BYTES / 4), pattern: '[^\\s]' };
 
 const selector = { oneOf: [
