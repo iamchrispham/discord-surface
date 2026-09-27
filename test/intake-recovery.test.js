@@ -34,6 +34,15 @@ for (const kind of ['channel', 'history']) {
   });
 }
 
+test('legacy empty child recovery commits a verified zero baseline', async t => {
+  const f = fixture(t, { adoptThread: false });
+
+  await f.recover();
+
+  assert.equal(f.boundary('2000').state, 'ready');
+  assert.equal(f.cursor('2000'), '0');
+});
+
 for (const [state, detail] of [['gap', 'explicit child gap'], ['unavailable', 'explicit child hold']]) {
   test(`thread delivery 503 preserves enrolled ${state} boundary`, async t => {
     const f = fixture(t);

@@ -391,11 +391,13 @@ export function createThreadEnrollmentHandlers({
           ? recoveredThroughId
           : null;
         if (!qualifiedRecovered) {
-          // The one exact legacy tuple may establish zero coverage only when the caller
-          // explicitly requests the literal "0", never by inference from observation.
-          const legacyEmpty = existing.active === true && existing.adoptedAt !== null &&
-            existing.adoptedThroughId === null && existing.recoveredThroughId === null;
-          if (!(legacyEmpty && latestId === '0')) {
+          // Exact legacy tuples may establish zero coverage only from an explicit
+          // verified-empty result or the literal "0", never by inference from observation.
+          const legacyZero = existing.active === true && existing.adoptedAt !== null &&
+            existing.adoptedThroughId === null && existing.recoveredThroughId === null && latestId === '0';
+          const legacyVerifiedEmpty = existing.active === true && existing.adoptedAt === null &&
+            existing.adoptedThroughId === null && existing.recoveredThroughId === null && latestId === null;
+          if (!legacyZero && !legacyVerifiedEmpty) {
             throw Object.assign(new BindingError(PERSISTENCE_REFUSAL_DETAILS.CHILD_COVERAGE), {
               detail: PERSISTENCE_REFUSAL_DETAILS.CHILD_COVERAGE
             });

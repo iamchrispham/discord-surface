@@ -20,7 +20,6 @@ const { assertPublicThread, historyPermission, recoverThread } = require('./disc
 const {
   classifyRecoveryFailure,
   isInterruptedRetryBoundary,
-  isLegacyPreBaselineDeadlineBoundary,
   isPreAdoptionRetryableThread,
   isRetryableFetchBoundary,
   isRetryableIntakeBoundary,
@@ -1762,7 +1761,13 @@ class DiscordGateway {
         }
         if (!reconciled) return;
         if (!reconciled.recovered_through_id) {
-          const baseline = this.state.setIntakeBaseline(binding.channelId, gapFrom || '0', 'live attachment gap recovery cursor', binding);
+          let baseline;
+          try {
+            baseline = this.state.setIntakeBaseline(binding.channelId, gapFrom || '0', 'live attachment gap recovery cursor', binding);
+          } catch (recoveryError) {
+            this.logger(`live attachment gap baseline refused: ${recoveryError.message}`);
+            return;
+          }
           if (!baseline) return;
         }
       } else {
@@ -2440,7 +2445,6 @@ class DiscordGateway {
       if (isRetryableRecoveryBoundary(watermark)) {
         retryBoundary = watermark;
       }
-      const retryingLegacyPreBaseline = isLegacyPreBaselineDeadlineBoundary(watermark);
       let nativeProofRetryDetail = retryBoundary && isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)
         ? retryBoundary.detail : null;
       if (watermark && ['gap', 'unavailable'].includes(watermark.state) && !retryBoundary) {
@@ -2609,7 +2613,7 @@ class DiscordGateway {
       // historical parent refuses visibly HERE, before any history request: no
       // cutoff is ever inferred from newest history, last_seen_id, channel id,
       // channel creation time, wall clock, or a later retry.
-      if (refusesUnqualifiedBaseline({ coveredCursor: ownedCoverageCursor }) && !retryingLegacyPreBaseline) {
+      if (refusesUnqualifiedBaseline({ coveredCursor: ownedCoverageCursor })) {
         const refusalDetail = watermark
           ? retryPendingBoundaryDetail(`${reason} baseline refused without historical coverage`, watermark)
           : `${reason} history boundary requires qualified historical coverage`;
