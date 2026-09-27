@@ -693,10 +693,21 @@ test('reply-ready recovery retries when delivery misses the preflight deadline',
   f.gateway.recoveryTimeoutMs = 25;
   const originalFetch = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
   let fetchCalls = 0;
+  // The single-flight owner must never overlap two lookups for the same
+  // destination: the retry continuation attaches to (or reuses) the one settled
+  // lookup rather than stacking a speculative second request on top of it.
+  let inFlight = 0;
+  let peakInFlight = 0;
   f.gateway.client.channels.fetch = async id => {
     fetchCalls += 1;
-    if (fetchCalls === 1) await new Promise(resolve => setTimeout(resolve, 5));
-    return originalFetch(id);
+    inFlight += 1;
+    peakInFlight = Math.max(peakInFlight, inFlight);
+    try {
+      if (fetchCalls === 1) await new Promise(resolve => setTimeout(resolve, 5));
+      return await originalFetch(id);
+    } finally {
+      inFlight -= 1;
+    }
   };
   const originalPermission = f.gateway.historyPermission.bind(f.gateway);
   let permissionCalls = 0;
@@ -716,6 +727,7 @@ test('reply-ready recovery retries when delivery misses the preflight deadline',
       await new Promise(resolve => setTimeout(resolve, 10));
     }
     assert.ok(fetchCalls >= 2, 'the preflight timeout must queue another reconciliation pass');
+    assert.equal(peakInFlight, 1, `reconciliation lookups must not overlap, peak ${peakInFlight}`);
     assert.equal(f.state.getMessage('101').state, 'replied');
     assert.equal(f.replies.length, 1);
   } finally {

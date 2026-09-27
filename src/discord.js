@@ -28,6 +28,13 @@ const {
   retryPendingBoundaryDetail
 } = require('./discord/recovery-fetch');
 const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail, isNativeProofRetryBoundary } = require('./discord/native-proof-recovery');
+const {
+  attachReconciliationWaiter,
+  hasReconciliationLookup,
+  invalidateReconciliationWaiters,
+  startReconciliationLookup,
+  storeReconciliationSnapshot
+} = require('../dist/discord/reconciliation-lookups.js');
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer } = require('./discord/decision');
@@ -3095,6 +3102,8 @@ class DiscordGateway {
 
   async _reconcilePending(before, signal, readyOnly = false, channelIds = null, messageIds = null) {
     const deadline = Date.now() + this.recoveryTimeoutMs;
+    const passLifecycle = this.lifecycleEpoch;
+    const passConnectionEpoch = this.connectionEpoch;
     const selectedChannels = channelIds ? new Set(channelIds) : null;
     const selectedMessages = messageIds ? new Set(messageIds) : null;
     this.consumer?.releaseHandledWithoutPost?.();
@@ -3193,20 +3202,52 @@ class DiscordGateway {
       let result;
       let channel;
       let channelFetchStarted = false;
+      let lookupAbandoned = false;
+      let releaseLookupWaiter = null;
+      const lookupDestinationId = message.deliveryChannelId || message.channelId;
       try {
         channel = await waitForRecoveryOperation(
-          () => recoveryFetch(() => {
-            channelFetchStarted = true;
-            return this.client.channels.fetch(message.deliveryChannelId || message.channelId);
-          }),
+          () => {
+            const lookupPromise = startReconciliationLookup(
+              this.client,
+              lookupDestinationId,
+              message.id,
+              () => recoveryFetch(() => {
+                channelFetchStarted = true;
+                return this.client.channels.fetch(lookupDestinationId);
+              })
+            );
+            releaseLookupWaiter = attachReconciliationWaiter(this.client, lookupDestinationId, {
+              isCurrent: () => !this.stopping && this.isCurrentLifecycle(passLifecycle) &&
+                passConnectionEpoch === this.connectionEpoch,
+              settled: settledChannel => {
+                // A caller whose bounded wait ended must not lose the lookup. Save
+                // the one-use snapshot for this exact continuation and wake it via
+                // the existing retry producer only when this pass gave up waiting.
+                if (!lookupAbandoned) return;
+                storeReconciliationSnapshot(this.client, lookupDestinationId, message.id, settledChannel);
+                if (this.stopping || signal?.aborted || !this.isCurrentLifecycle(passLifecycle) ||
+                    passConnectionEpoch !== this.connectionEpoch) return;
+                queueReconciliationRetry([message.id]);
+              },
+              failed: () => {}
+            });
+            return lookupPromise;
+          },
           signal,
           deadline
         );
+        releaseLookupWaiter?.();
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
-        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE) {
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE && channelFetchStarted) {
+          lookupAbandoned = true;
           // Rotate unrelated candidates ahead of the retry, but keep undispatched
-          // custody for this native owner in its original order.
+          // custody for this native owner in its original order. A destination
+          // whose single-flight lookup is still owned is NOT requeued here: its
+          // attached waiter wakes it on genuine settlement, and requeuing it every
+          // deadline would be the endless replacement chain the ruling forbids.
+          const lookupInFlight = hasReconciliationLookup(this.client, lookupDestinationId);
           const laterCandidates = ordered.slice(candidateIndex + 1);
           const laterOwnerIds = [];
           const otherOwnerIds = [];
@@ -3215,7 +3256,9 @@ class DiscordGateway {
             if (candidateKey === key) laterOwnerIds.push(candidate.id);
             else otherOwnerIds.push(candidate.id);
           }
-          const retryMessageIds = [...otherOwnerIds, message.id, ...laterOwnerIds];
+          const retryMessageIds = lookupInFlight
+            ? [...otherOwnerIds, ...laterOwnerIds]
+            : [...otherOwnerIds, message.id, ...laterOwnerIds];
           queueReconciliationRetry(retryMessageIds);
         }
         blockedOwners.add(key);
@@ -3370,6 +3413,7 @@ class DiscordGateway {
     this.started = false;
     this.transportReady = false;
     this.resolveInteractionRecovery(false);
+    invalidateReconciliationWaiters(this.client);
     for (const timer of this.liveAttachmentRecoveryTimers) clearImmediate(timer);
     this.liveAttachmentRecoveryTimers.clear();
     for (const channelId of this.attachmentIntakeBlockedChannels) this.consumer.releaseIntake(channelId);
