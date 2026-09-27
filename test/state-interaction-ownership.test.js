@@ -101,8 +101,8 @@ test('facade and owners preserve responsibilities and identities', { timeout: 80
     assert.equal(Object.prototype.hasOwnProperty.call(facade, name), false, `${name} must stay type-only on the facade`);
   }
 
-  // Each known responsibility stays in its designated owner, while allowing
-  // that owner to grow with legitimate local declarations.
+  // Each known responsibility stays in its designated owner. Ownership is
+  // proven by symbols, so local declarations may grow without a size limit.
   const ownerParses = Object.fromEntries(Object.keys(OWNER_FILES).map(key => [key, parse(key)]));
   const assertOwned = (name, owner, namesByOwner, kind) => {
     assert.ok(namesByOwner[owner].includes(name), `${kind} ${name} moved out of ${owner}`);
@@ -129,8 +129,10 @@ test('facade and owners preserve responsibilities and identities', { timeout: 80
   );
   for (const name of CONSTANTS) assertOwned(name, 'constants', constantsByOwner, 'constant');
 
-  // Ownership remains explicit through distinct, non-empty owner paths.
+  // Ownership remains explicit through distinct, non-empty owner paths rather
+  // than an arbitrary file-size threshold.
   const ownerEntries = Object.entries(OWNER_FILES);
+  assert.ok(ownerEntries.length > 0, 'ownership contract must enumerate owners');
   assert.equal(
     new Set(ownerEntries.map(([, file]) => file)).size,
     ownerEntries.length,
