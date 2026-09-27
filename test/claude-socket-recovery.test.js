@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const net = require('node:net');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
@@ -1775,4 +1776,140 @@ test('stop joins a pending listener startup before releasing the socket lock', {
   resumeListen();
   await assert.rejects(start, /Claude channel stopped during listener startup/);
   await stop;
+});
+
+test('qualified bound identity cleans its own real socket', { timeout: 6000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const directory = path.dirname(socket);
+  const controlPath = path.join(directory, 'control.sock');
+  const server = http.createServer((request, response) => {
+    response.end();
+  });
+  const controlServer = http.createServer((request, response) => {
+    response.end();
+  });
+  t.after(async () => {
+    try {
+      if (controlServer.listening) {
+        const controlClosed = once(controlServer, 'close');
+        controlServer.close();
+        await controlClosed;
+      }
+      if (server.listening) {
+        const serverClosed = once(server, 'close');
+        server.close();
+        await serverClosed;
+      }
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socket, resolve);
+  });
+  const candidate = await socketOwnership.boundSocketIdentity(server, socket);
+  try {
+    await new Promise((resolve, reject) => {
+      controlServer.once('error', reject);
+      controlServer.listen(controlPath, resolve);
+    });
+    const controlIdentity = socketOwnership.socketPathIdentity(controlPath);
+    assert.ok(controlIdentity, 'control socket path identity must be readable');
+    socketOwnership.unlinkSocketIfOwned(controlPath, controlIdentity);
+    assert.equal(fs.existsSync(controlPath), false, 'pathname identity must remove a live real socket');
+  } finally {
+    if (controlServer.listening) {
+      const controlClosed = once(controlServer, 'close');
+      controlServer.close();
+      await controlClosed;
+    }
+  }
+  assert.ok(candidate, 'descriptor-backed bound identity must be captured');
+  socketOwnership.unlinkSocketIfOwned(socket, candidate);
+  assert.equal(fs.existsSync(socket), false, 'qualified bound identity must clean its own real socket path');
+});
+
+test('capture refuses a different real listener at the path', { timeout: 6000 }, async t => {
+  const directory = fs.mkdtempSync('/tmp/dss-');
+  fs.chmodSync(directory, 0o700);
+  const publicPath = path.join(directory, 'public.sock');
+  const movedPath = path.join(directory, 'moved.sock');
+  const privatePath = path.join(directory, 'private.sock');
+  const serverA = http.createServer((request, response) => {
+    response.end();
+  });
+  const serverB = http.createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ id: 'ordinary-logical-id' }));
+  });
+  t.after(async () => {
+    try {
+      if (fs.existsSync(publicPath)) fs.renameSync(publicPath, privatePath);
+      if (serverA.listening) {
+        const aClosed = once(serverA, 'close');
+        serverA.close();
+        await aClosed;
+      }
+      if (serverB.listening) {
+        const bClosed = once(serverB, 'close');
+        serverB.close();
+        await bClosed;
+      }
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    serverA.once('error', reject);
+    serverA.listen(publicPath, resolve);
+  });
+  fs.renameSync(publicPath, movedPath);
+  await new Promise((resolve, reject) => {
+    serverB.once('error', reject);
+    serverB.listen(publicPath, resolve);
+  });
+  const probePublicListener = () => new Promise((resolve, reject) => {
+    let abort;
+    const request = http.request({
+      socketPath: publicPath,
+      path: '/identity',
+      method: 'GET',
+      agent: false,
+      headers: { connection: 'close' }
+    }, response => {
+      const status = response.statusCode;
+      response.resume();
+      void once(response, 'end').then(() => {
+        clearTimeout(abort);
+        resolve(status);
+      }, error => {
+        clearTimeout(abort);
+        reject(error);
+      });
+    });
+    abort = setTimeout(() => request.destroy(new Error('public listener request timed out')), 500);
+    request.once('error', error => {
+      clearTimeout(abort);
+      reject(error);
+    });
+    request.end();
+  });
+  assert.equal(await probePublicListener(), 200, 'public listener must serve the identity probe');
+  const bIdentity = socketOwnership.socketPathIdentity(publicPath);
+  assert.ok(bIdentity, 'public listener path identity must be readable');
+  let captureOutcome;
+  try {
+    captureOutcome = { status: 'fulfilled', value: await socketOwnership.boundSocketIdentity(serverA, publicPath) };
+  } catch (error) {
+    captureOutcome = { status: 'rejected', error };
+  }
+  assert.equal(await probePublicListener(), 200, 'different real listener must remain reachable');
+  const observedIdentity = socketOwnership.socketPathIdentity(publicPath);
+  assert.ok(observedIdentity, 'public listener path identity must remain readable');
+  assert.equal(observedIdentity.dev, bIdentity.dev, 'public listener dev must be preserved');
+  assert.equal(observedIdentity.ino, bIdentity.ino, 'public listener ino must be preserved');
+  assert.equal(observedIdentity.ctimeNs, bIdentity.ctimeNs, 'public listener ctimeNs must be preserved');
+  assert.equal(observedIdentity.birthtimeNs, bIdentity.birthtimeNs, 'public listener birthtimeNs must be preserved');
+  assert.equal(captureOutcome.status, 'rejected', 'capture must refuse a different real listener at the path');
 });
