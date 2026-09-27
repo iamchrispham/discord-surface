@@ -18,7 +18,7 @@ const READER_CALLEES = new Set(['directPostRows', 'queryDirectPostRows']);
 
 // Frozen reader inventory for PR109 F2. Owner keys are `<src-relative path>\0<enclosing function>`.
 const ADOPTING_OWNERS = new Map([
-  ['peer/result.js\u0000inspectPeerResult', 1],
+  ['peer/result.js\u0000inspectPeerResult', 2],
   ['state/agent-routing.ts\u0000legacyParentSourcedReceipt', 1],
   ['state/direct-post.ts\u0000scopedAgentRows', 1],
   ['state/direct-post.ts\u0000hasUnresolvedBindingPost', 1]
@@ -27,7 +27,9 @@ const EXCLUDED_OWNERS = new Map([
   ['state/direct-post.ts\u0000releaseDirectPostFilePreparation', 2],
   ['state/direct-post.ts\u0000recordDirectPostOutcome', 1],
   ['state/direct-post.ts\u0000reconcileDirectPostOutcome', 1],
-  ['state.js\u0000recoverDirectPostReceiptsInternal', 1]
+  ['state.js\u0000recoverDirectPostReceiptsInternal', 1],
+  // Retirement custody is keyed to the originating caller, not the merged projection.
+  ['peer/service.js\u0000custodyKeyFor', 1]
 ]);
 const FACADE_OWNER = 'state.js\u0000directPostRows';
 
@@ -117,7 +119,7 @@ test('reader inventory classifies exactly the adopted, excluded and facade owner
   const readers = enumerateReaders(SRC_ROOT);
   const direct = readers.filter(reader => reader.callee === 'directPostRows');
   const facadeCalls = readers.filter(reader => reader.callee === 'queryDirectPostRows');
-  assert.equal(direct.length, 9, 'directPostRows call expression count');
+  assert.equal(direct.length, 11, 'directPostRows call expression count');
   assert.equal(facadeCalls.length, 1, 'queryDirectPostRows facade call count');
   const { adopting, excluded, facade } = classifyReaders(readers);
   assert.deepEqual(adopting, ADOPTING_OWNERS);

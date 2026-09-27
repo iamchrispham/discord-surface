@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { fixture, service, addRecipient } = require('./fixtures/peer-fixture');
 const { inspectPeerResult } = require('../src/peer/result');
+const { createDirectPostHandlers } = require('../dist/state/direct-post');
 
 const request = { peer: { conductorId: 'recipient' }, text: 'retry after rate limit', dedupe_key: 'held-retry' };
 
@@ -136,4 +137,50 @@ test('peer result preserves a legacy child result after the parent target hands 
     packetId: candidate.id,
     text: candidate.text
   }]);
+});
+
+test('newest promoted packet recognizes the enrolled return route', () => {
+  const source = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
+  const target = { guildId: '100', channelId: '202', provider: 'codex', nativeId: '22222222-2222-2222-2222-222222222222', generation: 1 };
+  function packet(from) { return { id: 'reused-request', kind: 'request', source: from, target, replyTo: null, text: 'inspect' }; }
+  const oldSource = { ...source, channelId: '101' };
+  const legacy = packet(oldSource);
+  const promoted = { ...packet(source), routingVersion: 2, sourceParentChannelId: '101' };
+  const base = { requestId: legacy.id, ...oldSource };
+  const rows = [
+    { id: 1, kind: 'direct-post-attempt', detail: { ...base, agentPacket: legacy, attemptId: 'a' } },
+    { id: 2, kind: 'direct-post-outcome', detail: { ...base, agentPacket: promoted, legacyAgentPacket: legacy, attemptId: 'a', outcome: 'sent' } }
+  ];
+  const candidate = { id: 'result-promoted', kind: 'result', source: target, target: source, replyTo: legacy.id, text: 'answer', routingVersion: 2 };
+  const state = {
+    directPostRows: () => rows,
+    listAgentMessageReceiptIds: () => ['receipt'],
+    getAgentMessage: () => ({ packet: candidate }),
+    getMessage: () => ({ ...source, state: 'accepted' }),
+    listAgentCompletionReceipts: () => [],
+    hasNativeAcknowledgment: () => false,
+    getMessageRoute: () => ({ enrollment: { threadId: '202' } })
+  };
+  const result = inspectPeerResult(state, source, legacy.id);
+  assert.equal(result.sendOutcome, 'sent');
+  assert.equal(result.results.length, 1);
+  assert.equal(result.results[0].packetId, candidate.id);
+});
+
+test('retirement cannot merge a foreign caller failure into pending custody', () => {
+  const source = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
+  function packet(from) { return { id: 'reused-request', kind: 'request', source: from, target: { guildId: '100', channelId: '202', provider: 'codex', nativeId: '22222222-2222-2222-2222-222222222222', generation: 1 }, replyTo: null, text: 'inspect' }; }
+  const other = { ...source, channelId: '302', nativeId: '33333333-3333-3333-3333-333333333333' };
+  const first = { requestId: 'reused-request', ...source, agentPacket: packet(source), attemptId: 'a', partIndex: 0, partCount: 1 };
+  const second = { requestId: 'reused-request', ...other, agentPacket: packet(other), attemptId: 'b', partIndex: 0, partCount: 1 };
+  const rows = [
+    { id: 1, kind: 'direct-post-attempt', detail: first },
+    { id: 2, kind: 'direct-post-attempt', detail: second },
+    { id: 3, kind: 'direct-post-outcome', detail: { ...second, outcome: 'rate_limited' } }
+  ];
+  const state = { directPostRows: () => rows, listThreadEnrollments: () => [{ threadId: '202' }] };
+  const handlers = createDirectPostHandlers({ DIRECT_POST_ATTEMPT: 'direct-post-attempt', DIRECT_POST_OUTCOME: 'direct-post-outcome' });
+  assert.equal(handlers.hasUnresolvedBindingPost(state, '201'), true);
+  rows.push({ id: 4, kind: 'direct-post-outcome', detail: { ...first, outcome: 'sent' } });
+  assert.equal(handlers.hasUnresolvedBindingPost(state, '201'), false);
 });
