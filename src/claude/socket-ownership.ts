@@ -647,7 +647,17 @@ export async function withSocketLock<T>(socketPath: string, action: () => Promis
   try {
     return await action();
   } finally {
-    release();
+    let releaseError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        release();
+        releaseError = undefined;
+        break;
+      } catch (error) {
+        releaseError = error;
+      }
+    }
+    if (releaseError) throw releaseError;
   }
 }
 

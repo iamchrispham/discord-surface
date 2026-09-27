@@ -465,7 +465,6 @@ export class ClaudeChannel<
     let startupCancelled = false;
     let startupPhase: ClaudeStartupPhase = CLAUDE_STARTUP_PHASES.SOCKET_PREPARATION;
     let listenerStartup: Promise<void> | null = null;
-    let connectionClosedAfterCancellation = false;
     const startupController = new AbortController();
     this.startupPhase = startupPhase;
     const startupCancellation = new Promise<never>((_, reject) => {
@@ -520,14 +519,8 @@ export class ClaudeChannel<
           await Promise.race([connection, startupCancellation]);
         } catch (error) {
           if (startupCancelled) {
-            void connection.then(
-              () => Promise.resolve((this.mcp as unknown as ClaudeRuntimeMcp).close?.()).catch(() => {}),
-              () => {}
-            );
-            if (!this.stopping) {
-              try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
-            }
-            connectionClosedAfterCancellation = true;
+            try { await connection; } catch {}
+            try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
           }
           throw error;
         }
@@ -631,7 +624,7 @@ export class ClaudeChannel<
         try { await listenerStartup; } catch {}
         listenerStartup = null;
       }
-      if (!this.stopping && !connectionClosedAfterCancellation) {
+      if (!this.stopping) {
         try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
       }
       try { this.server?.close(); } catch {}

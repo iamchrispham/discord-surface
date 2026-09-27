@@ -71,7 +71,9 @@ function publishedFallbackRoot(root: string, owner: number | undefined, homeIden
     }
     const markerLines = fs.readFileSync(rendezvousPath, 'utf8').trim().split('\n');
     const target = markerLines[0];
-    if (homeIdentity === undefined || markerLines.length < 2 || markerLines[1] !== homeIdentity) continue;
+    const recordedHomeIdentity = markerLines[1];
+    if (recordedHomeIdentity !== undefined &&
+      (homeIdentity === undefined || recordedHomeIdentity !== homeIdentity)) continue;
     if (!target || path.basename(target) !== target || !target.startsWith(privateRootPrefix)) {
       throw new Error('Claude channel fallback-root rendezvous is invalid');
     }
@@ -128,7 +130,6 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
     if (!stickySharedRoot) continue;
     const privateRootPrefix = `.claude-channel-${ownerName}-`;
     const rendezvousName = path.basename(lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`));
-    const rendezvousPrefix = `${rendezvousName}-`;
     type RendezvousState = { root?: string; staleMarker?: FileGeneration };
     const isUsableRendezvousDirectory = (candidate: string): boolean => {
       try {
@@ -205,58 +206,26 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
             return false;
           }
         });
-      const rendezvousCandidates = fs.readdirSync(root)
-        .filter(entry => entry === rendezvousName || entry.startsWith(rendezvousPrefix))
-        .map(entry => path.join(root, entry))
-        .filter(isUsableRendezvousDirectory)
-        .sort();
+      const rendezvousNames = [
+        rendezvousName,
+        `${rendezvousName}-shared`,
+        `${rendezvousName}-election`
+      ];
       let rendezvousDirectory: string | undefined;
       let rendezvousState: RendezvousState = {};
-      for (const candidate of rendezvousCandidates) {
-        const candidateState = readRendezvousRoot(candidate);
-        if (candidateState.root) {
-          rendezvousDirectory = candidate;
-          rendezvousState = candidateState;
-          break;
+      for (const rendezvousNameCandidate of rendezvousNames) {
+        const candidate = path.join(root, rendezvousNameCandidate);
+        if (!isUsableRendezvousDirectory(candidate)) {
+          try {
+            fs.mkdirSync(candidate, { mode: 0o700 });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          }
         }
-        if (!rendezvousDirectory || candidateState.staleMarker) {
-          rendezvousDirectory = candidate;
-          rendezvousState = candidateState;
-        }
-      }
-      if (!rendezvousDirectory) {
-        const deterministicRendezvousDirectory = path.join(root, rendezvousName);
-        try {
-          fs.mkdirSync(deterministicRendezvousDirectory, { mode: 0o700 });
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        }
-        if (isUsableRendezvousDirectory(deterministicRendezvousDirectory)) {
-          rendezvousDirectory = deterministicRendezvousDirectory;
-        }
-      }
-      if (!rendezvousDirectory) {
-        const sharedRendezvousDirectory = path.join(root, `${rendezvousName}-shared`);
-        try {
-          fs.mkdirSync(sharedRendezvousDirectory, { mode: 0o700 });
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        }
-        if (isUsableRendezvousDirectory(sharedRendezvousDirectory)) {
-          rendezvousDirectory = sharedRendezvousDirectory;
-        }
-      }
-      if (!rendezvousDirectory) {
-        const coordinatedRendezvousDirectory = path.join(root, `${rendezvousName}-election`);
-        try {
-          fs.mkdirSync(coordinatedRendezvousDirectory, { mode: 0o700 });
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        }
-        if (isUsableRendezvousDirectory(coordinatedRendezvousDirectory)) {
-          rendezvousDirectory = coordinatedRendezvousDirectory;
-          rendezvousState = readRendezvousRoot(rendezvousDirectory);
-        }
+        if (!isUsableRendezvousDirectory(candidate)) continue;
+        rendezvousDirectory = candidate;
+        rendezvousState = readRendezvousRoot(candidate);
+        break;
       }
       if (!rendezvousDirectory) {
         throw new Error('Claude channel fallback-root rendezvous is unusable');

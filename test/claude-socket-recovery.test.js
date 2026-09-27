@@ -423,6 +423,36 @@ test('fallback lock root remains stable when passwd home recovers', t => {
   }
 });
 
+test('fallback lock root remains stable when home identity is temporarily unavailable', t => {
+  const recoveredHome = path.join('/tmp', `dss-recovered-home-${randomUUID()}`);
+  const sharedRoot = fs.mkdtempSync('/tmp/dss-recovery-root-');
+  fs.chmodSync(sharedRoot, 0o1777);
+  const userInfo = os.userInfo();
+  let homeAvailable = false;
+  t.mock.method(os, 'userInfo', () => {
+    if (!homeAvailable) throw new Error('passwd home unavailable');
+    return { ...userInfo, homedir: recoveredHome };
+  });
+  const originalRealpath = fs.realpathSync;
+  t.mock.method(fs, 'realpathSync', (target, ...args) => {
+    if (String(target) === '/tmp') return sharedRoot;
+    return originalRealpath(target, ...args);
+  });
+  t.after(() => fs.rmSync(recoveredHome, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(sharedRoot, { recursive: true, force: true }));
+
+  const socket = socketPath(t);
+  const first = acquireSocketLockWithPath(t, socket);
+  try {
+    fs.mkdirSync(recoveredHome, { mode: 0o700 });
+    homeAvailable = true;
+    assert.throws(() => acquireSocketLock(socket), /already in progress/,
+      'home recovery must not move contenders to a second lock namespace');
+  } finally {
+    first.release();
+  }
+});
+
 test('missing home and runtime roots bootstrap an unpredictable owner-only child under shared temp', t => {
   const missingHome = path.join('/tmp', `dss-missing-home-${randomUUID()}`);
   const userInfo = os.userInfo();
@@ -561,6 +591,62 @@ test('foreign users cannot exhaust both predictable fallback rendezvous names', 
   } finally {
     release();
   }
+});
+
+test('concurrent fallback contenders publish one coordinated namespace', { timeout: 8000 }, async t => {
+  const sharedRoot = fs.mkdtempSync('/tmp/dss-concurrent-root-');
+  fs.chmodSync(sharedRoot, 0o1777);
+  const missingHome = path.join('/tmp', `dss-missing-home-${randomUUID()}`);
+  const barrier = path.join(sharedRoot, 'start');
+  const modulePath = path.resolve(__dirname, '../src/claude/socket-ownership');
+  const sockets = [socketPath(t), socketPath(t)];
+  const childScript = `
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const [modulePath, socket, sharedRoot, missingHome, barrier] = process.argv.slice(1);
+    const userInfo = os.userInfo();
+    os.userInfo = () => ({ ...userInfo, homedir: missingHome });
+    const originalRealpath = fs.realpathSync;
+    fs.realpathSync = (target, ...args) => String(target) === '/tmp'
+      ? sharedRoot
+      : originalRealpath(target, ...args);
+    const deadline = setTimeout(() => process.exit(2), 7000);
+    deadline.unref();
+    process.stdout.write('ready\\n');
+    const waitForStart = setInterval(() => {
+      if (!fs.existsSync(barrier)) return;
+      clearInterval(waitForStart);
+      try {
+        const { acquireSocketLock } = require(modulePath);
+        const release = acquireSocketLock(socket);
+        const privateRoot = fs.readdirSync(sharedRoot)
+          .find(entry => entry.startsWith('.claude-channel-'));
+        process.stdout.write(path.join(sharedRoot, privateRoot) + '\\n');
+        process.stdin.resume();
+        process.stdin.on('end', () => {
+          try { release(); process.exit(0); }
+          catch (error) { process.stderr.write(String(error)); process.exit(1); }
+        });
+      } catch (error) {
+        process.stderr.write(String(error));
+        process.exit(1);
+      }
+    }, 2);
+  `;
+  const children = sockets.map(socket => spawn(process.execPath, ['-e', childScript, modulePath, socket, sharedRoot, missingHome, barrier], {
+    stdio: ['pipe', 'pipe', 'pipe']
+  }));
+  t.after(() => {
+    for (const child of children) child.kill('SIGKILL');
+    fs.rmSync(sharedRoot, { recursive: true, force: true });
+  });
+  await Promise.all(children.map(child => once(child.stdout, 'data')));
+  fs.writeFileSync(barrier, 'go');
+  const roots = await Promise.all(children.map(async child => String((await once(child.stdout, 'data'))[0]).trim()));
+  assert.equal(roots[0], roots[1]);
+  for (const child of children) child.stdin.end();
+  await Promise.all(children.map(child => once(child, 'exit')));
 });
 
 test('a foreign shared-temp namespace cannot preempt the owner-controlled root', t => {
@@ -1308,6 +1394,25 @@ test('socket-lock release remains retryable after owner removal fails', t => {
   assert.equal(fs.existsSync(lockPath), false);
 });
 
+test('public socket-lock helper retries a transient release failure', async t => {
+  const socket = socketPath(t);
+  assertSocketDirectory(socket);
+  const originalRename = fs.renameSync;
+  let failOwnerMove = true;
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    if (failOwnerMove && path.basename(source) === 'owner' && path.basename(path.dirname(destination)).startsWith('.transition-')) {
+      failOwnerMove = false;
+      const error = new Error('owner move failed');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return originalRename(source, destination);
+  });
+
+  await assert.doesNotReject(() => socketOwnership.withSocketLock(socket, async () => {}));
+  assert.equal(failOwnerMove, false);
+});
+
 test('aliased socket parents share a live preparation lock', t => {
   const socket = socketPath(t);
   const realDirectory = path.dirname(socket);
@@ -1392,6 +1497,8 @@ test('stop aborts a pending MCP connection and releases startup', { timeout: 800
   state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
   let connectStarted;
   const connected = new Promise(resolve => { connectStarted = resolve; });
+  let settleConnection;
+  const connectionSettled = new Promise(resolve => { settleConnection = resolve; });
   let closeCalls = 0;
   const channel = new ClaudeChannel({
     state,
@@ -1402,7 +1509,7 @@ test('stop aborts a pending MCP connection and releases startup', { timeout: 800
       transportFactory: () => ({}),
       connect: async () => {
         connectStarted();
-        return new Promise(() => {});
+        return connectionSettled;
       },
       close: async () => { closeCalls += 1; }
     }
@@ -1412,11 +1519,15 @@ test('stop aborts a pending MCP connection and releases startup', { timeout: 800
   });
   const starting = channel.start();
   await connected;
-  await channel.stop();
+  const stopping = channel.stop();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  settleConnection();
+  await stopping;
   await assert.rejects(starting, /stopped during MCP connection/);
   assert.equal(channel.ready, false);
   assert.equal(fs.existsSync(socket), false);
-  assert.equal(closeCalls, 1);
+  assert.equal(closeCalls, 2);
 });
 
 test('stop retains the socket lock until MCP teardown completes', { timeout: 8000 }, async t => {
