@@ -149,7 +149,7 @@ function hasUnresolvedBindingPost(state: BoardState, channelId: string): boolean
     const value = OUTCOME_VALUES.has(String(outcome.detail.outcome))
       ? String(outcome.detail.outcome) as BoardOutcome
       : BOARD_OUTCOMES.UNKNOWN;
-    if (value === BOARD_OUTCOMES.IN_FLIGHT) return true;
+    if (UNRESOLVED_OUTCOMES.has(value)) return true;
   }
   return false;
 }

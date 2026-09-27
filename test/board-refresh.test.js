@@ -795,16 +795,15 @@ test('unresolved board PATCH fences binding retirement until its outcome is reco
   assert.doesNotThrow(() => f.state.unbind('channel-1', { expectedBinding: f.binding }));
 });
 
-test('recovered unknown board outcome releases binding retirement but fences the exact target', t => {
+test('recovered unknown board outcome keeps binding retirement fenced', t => {
   const f = fixture();
   t.after(() => f.state.close());
   const target = boardTarget();
-  const provenance = f.state.boardMessageProvenance(target)[0];
-  const seeded = seedBoardOutcome(f, 'unknown-retirement', BOARD_OUTCOMES.UNKNOWN);
+  seedBoardOutcome(f, 'unknown-retirement', BOARD_OUTCOMES.UNKNOWN);
 
-  assert.equal(f.state.hasUnresolvedBindingPost(target.channelId), false);
+  assert.equal(f.state.hasUnresolvedBindingPost(target.channelId), true);
   const old = f.state.getBinding(target.channelId);
-  const successor = f.state.handoffConductor({
+  assert.throws(() => f.state.handoffConductor({
     channelId: old.channelId,
     provider: old.provider,
     conductorId: old.conductorId,
@@ -815,21 +814,7 @@ test('recovered unknown board outcome releases binding retirement but fences the
     workspace: old.workspace,
     endpoint: old.endpoint,
     handoffId: 'unknown-board-handoff'
-  });
-  assert.equal(successor.generation, old.generation + 1);
-
-  const admission = f.state.beginBoardRefresh({
-    requestId: 'successor-board-refresh',
-    target,
-    content: 'successor board',
-    preEditContent: 'old board',
-    payloadHash: 'hash-successor-board-refresh',
-    binding: successor,
-    targetAuthorId: 'bot-1',
-    provenance
-  }, f.state.captureBoardRevision(target).revision);
-  assert.equal(admission.status, BOARD_OUTCOMES.UNKNOWN);
-  assert.equal(admission.attemptId, seeded.attemptId);
+  }), /cannot handoff while work is unresolved/);
 });
 
 test('late PATCH stays fenced across handoff, ordinary readiness, and successor refresh', async t => {
