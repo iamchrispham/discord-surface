@@ -2663,7 +2663,7 @@ class DiscordGateway {
         const recorded = await recordOwnedBoundary(
           binding,
           channel,
-          READINESS.READY,
+          READINESS.PENDING,
           `${reason} verified empty history baseline`,
           null,
           null,
@@ -3281,13 +3281,13 @@ class DiscordGateway {
         };
         const deliverReplyWithinRecovery = (replyMessage, replyResult) => {
           const deliveryController = new AbortController();
-          const relayAbort = () => deliveryController.abort();
-          if (signal?.aborted) deliveryController.abort();
-          else signal?.addEventListener('abort', relayAbort, { once: true });
           const settle = () => {
             deliveryController.abort();
             settleReplyDeadline();
           };
+          const relayAbort = () => settle();
+          if (signal?.aborted) settle();
+          else signal?.addEventListener('abort', relayAbort, { once: true });
           return waitForRecoveryOperation(
             () => startRecoveryOperation(() => this.consumer.deliverReply(replyMessage, replyResult, deliveryController.signal)),
             signal,
