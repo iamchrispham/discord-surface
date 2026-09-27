@@ -2402,3 +2402,87 @@ test('startup stop retains its lock until the failed listener actually closes', 
     fs.rmSync(path.dirname(socket), { recursive: true, force: true });
   }
 });
+
+test('startup qualification quarantines a replacement before closing the failed listener', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  let witnessResolve;
+  const witnessed = new Promise(resolve => { witnessResolve = resolve; });
+  let releaseQualification;
+  const qualificationReleased = new Promise(resolve => { releaseQualification = resolve; });
+  const originalCreateServer = http.createServer;
+  t.mock.method(http, 'createServer', handler => originalCreateServer.call(http, (request, response) => {
+    if (request.method === 'HEAD' && request.url === '/identity' && request.headers['x-discord-socket-qualification']) {
+      request.resume();
+      witnessResolve();
+      void qualificationReleased.then(() => handler(request, response));
+      return;
+    }
+    handler(request, response);
+  }));
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  const starting = channel.start();
+  await witnessed;
+
+  const oldPath = `${socket}.old`;
+  fs.renameSync(socket, oldPath);
+  const replacement = http.createServer((_request, response) => response.end('replacement'));
+  t.after(async () => {
+    if (replacement.listening) await new Promise(resolve => replacement.close(resolve));
+    try { fs.unlinkSync(oldPath); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    try { await channel.stop(); } catch {}
+    fs.rmSync(path.dirname(socket), { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  await listenOn(replacement, socket);
+  releaseQualification();
+
+  await assert.rejects(starting, /pathname identity changed|qualification refused/);
+  assert.equal(fs.lstatSync(socket).isSocket(), true, 'replacement listener must survive failed qualification');
+  const response = await requestOverSocket(socket);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body, 'replacement');
+});
+
+test('stop retains server custody when replacement quarantine setup fails', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  await channel.start();
+  const oldPath = `${socket}.old`;
+  fs.renameSync(socket, oldPath);
+  fs.writeFileSync(socket, 'replacement');
+  let failQuarantine = true;
+  const originalQuarantine = socketOwnership.quarantineMismatchedSocket;
+  t.mock.method(socketOwnership, 'quarantineMismatchedSocket', (...args) => {
+    if (failQuarantine) throw new Error('quarantine unavailable');
+    return originalQuarantine(...args);
+  });
+  t.after(async () => {
+    try { await channel.stop(); } catch {}
+    try { fs.unlinkSync(oldPath); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    fs.rmSync(path.dirname(socket), { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const stopError = await channel.stop().catch(error => error);
+  assert.ok(stopError instanceof AggregateError);
+  assert.ok(stopError.errors.some(error => /quarantine unavailable/.test(String(error))));
+  assert.ok(channel.server, 'failed quarantine must retain the listener reference');
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  assert.equal(fs.readFileSync(socket, 'utf8'), 'replacement');
+
+  failQuarantine = false;
+  await channel.stop();
+  assert.equal(fs.readFileSync(socket, 'utf8'), 'replacement');
+  const release = acquireSocketLock(socket);
+  release();
+});

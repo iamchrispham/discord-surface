@@ -599,6 +599,7 @@ export class ClaudeChannel<
           server.off('error', reject);
           let socketIdentity: socketOwnership.SocketPathIdentity | undefined;
           try { fs.chmodSync(this.socketPath, 0o600); } catch {}
+          try { socketIdentity = socketOwnership.socketPathIdentity(this.socketPath); } catch {}
           void socketOwnership.boundSocketIdentity(server, this.socketPath, startupController.signal)
             .then(identity => {
               socketIdentity = identity;
@@ -616,10 +617,28 @@ export class ClaudeChannel<
               this.ownsSocket = true;
               resolve();
             }, error => {
-              void closeServer(server).then(() => reject(error), () => reject(error));
+              let socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
+              try {
+                socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, socketIdentity);
+              } catch (quarantineError) {
+                reject(new AggregateError([error, quarantineError], 'Claude channel listener cleanup failed'));
+                return;
+              }
+              void closeServer(server).then(() => {
+                try {
+                  if (socketQuarantine && !socketQuarantine.restore()) {
+                    reject(new Error('Claude channel socket restore is unavailable'));
+                    return;
+                  }
+                } catch (restoreError) {
+                  reject(restoreError);
+                  return;
+                }
+                reject(error);
+              }, closeError => reject(closeError));
             });
+          });
         });
-      });
       await Promise.race([listenerStartup, startupCancellation]);
       if (this.transportClosed) throw new Error('Claude channel transport closed during startup');
       listenerStartup = null;
@@ -688,10 +707,17 @@ export class ClaudeChannel<
           if (!socketQuarantine.restore()) errors.push(new Error('Claude channel socket restore is unavailable'));
         } catch (error) { errors.push(error); }
       }
+      if (errors.length) {
+        this.stopping = false;
+        throw new AggregateError(errors, 'Claude channel stop failed');
+      }
       this.server = null;
       if (this.ownsSocket) {
         try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch (error) {
-          if ((error as { code?: unknown }).code !== 'ENOENT') errors.push(error);
+          if ((error as { code?: unknown }).code !== 'ENOENT') {
+            this.stopping = false;
+            throw new AggregateError([error], 'Claude channel stop failed');
+          }
         }
         this.ownsSocket = false;
         this.socketIdentity = null;
@@ -702,8 +728,10 @@ export class ClaudeChannel<
       try {
         release?.();
         if (release && this.socketLockRelease === release) this.socketLockRelease = null;
-      } catch (error) { errors.push(error); }
-      if (errors.length) throw new AggregateError(errors, 'Claude channel stop failed');
+      } catch (error) {
+        this.stopping = false;
+        throw new AggregateError([error], 'Claude channel stop failed');
+      }
     })();
     try { await this.stopPromise; } finally { this.stopPromise = null; }
   }

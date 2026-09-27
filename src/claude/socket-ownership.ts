@@ -328,9 +328,6 @@ export function quarantineMismatchedSocket(
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
-  const owner = effectiveUserId();
-  if (!observedStats.isSocket() || observedStats.isSymbolicLink() ||
-    (owner !== undefined && observedStats.uid !== BigInt(owner))) return undefined;
   const observed: SocketIdentity = {
     dev: observedStats.dev,
     ino: observedStats.ino,
