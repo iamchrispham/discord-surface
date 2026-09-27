@@ -1138,10 +1138,11 @@ class SurfaceState {
     const confirmedCoverageId = coverageId;
     const verifiedEmptyCoverage = existing?.state === READINESS.READY &&
       !existing.last_seen_id && !existing.recovered_through_id;
+    const qualifyingEmptyCoverage = verifiedEmptyCoverage && !confirmedCoverageId;
     const recoveredThrough = confirmedCoverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, confirmedCoverageId) < 0)
       ? confirmedCoverageId
       : existing?.recovered_through_id || (verifiedEmptyCoverage ? '0' : null);
-    const state = existing?.state === READINESS.GAP ? 'gap' : existing?.state === READINESS.UNAVAILABLE ? 'unavailable' : ready ? 'ready' : 'pending';
+    const state = existing?.state === READINESS.GAP ? 'gap' : existing?.state === READINESS.UNAVAILABLE ? 'unavailable' : qualifyingEmptyCoverage || !ready ? READINESS.PENDING : READINESS.READY;
     if (existing) {
       this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, updated_at=? WHERE channel_id=?')
         .run(event.guildId, lastSeen, recoveredThrough, state, now(), event.channelId);
@@ -1149,13 +1150,14 @@ class SurfaceState {
       this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, recovered_through_id, state, updated_at) VALUES(?, ?, ?, ?, ?, ?)')
         .run(event.channelId, event.guildId, lastSeen, recoveredThrough, state, now());
     }
-    if (!ready) {
+    if (!ready || qualifyingEmptyCoverage) {
       const binding = this.getBinding(event.channelId);
       if (binding?.active && binding.guildId === event.guildId) {
-        const updated = this.db.prepare("UPDATE bindings SET readiness='recovering', updated_at=? WHERE channel_id=? AND active=1 AND readiness='ready'")
-          .run(now(), event.channelId);
+        const readiness = qualifyingEmptyCoverage ? READINESS.PENDING : READINESS.RECOVERING;
+        const updated = this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1 AND readiness=?')
+          .run(readiness, now(), event.channelId, READINESS.READY);
         if (Number(updated.changes) === 1) {
-          this.receipt(null, 'binding-readiness', { channelId: event.channelId, readiness: READINESS.RECOVERING });
+          this.receipt(null, 'binding-readiness', { channelId: event.channelId, readiness });
         }
       }
     }

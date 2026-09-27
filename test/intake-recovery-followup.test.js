@@ -145,23 +145,31 @@ test('completed-empty parent stays pending while history backfill is in flight',
   assert.equal(f.state.getMessage('101').state, 'accepted');
 });
 
-test('held live intake preserves verified empty parent coverage before startup recovery', { timeout: 4000 }, async t => {
+test('held live intake preserves verified empty parent coverage across restart', { timeout: 4000 }, async t => {
   const f = fixture(t);
   f.state.db.prepare('UPDATE intake_watermarks SET state=?, last_seen_id=NULL, recovered_through_id=NULL WHERE channel_id=?')
     .run('ready', '1000');
-  const message = { ...f.message('101', '1000'), authorId: 'operator', isBot: false, attachments: [] };
-  assert.equal(f.state.acceptDiscordMessage(message, {
+  const older = { ...f.message('100', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+  const live = { ...f.message('101', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+  assert.equal(f.state.acceptDiscordMessage(live, {
     expectedBinding: f.state.getBinding('1000'),
     ready: true
   }).accepted, true);
   assert.equal(f.boundary('1000').recovered_through_id, '0');
-  f.history.set('1000', [message]);
+  assert.equal(f.boundary('1000').state, 'pending');
+  assert.equal(f.state.getBinding('1000').readiness, 'pending');
+  f.history.set('1000', [older, live]);
+  f.enableDelivery();
+  await f.reopen();
 
-  const result = await settleRecovery(f.gateway.recoverTransport('startup'));
+  const result = await settleRecovery(f.gateway.recoverTransport('restart'));
 
   assert.equal(result.ready, true, JSON.stringify(result));
   assert.equal(f.boundary('1000').state, 'ready');
   assert.equal(f.boundary('1000').recovered_through_id, '101');
+  await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  await f.gateway.consumer.waitForNativeWork();
+  assert.deepEqual(f.dispatched.map(message => message.id), ['100', '101']);
 });
 
 test('verified-empty legacy child records adoption before live checkpointing', { timeout: 4000 }, async t => {
