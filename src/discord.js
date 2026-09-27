@@ -3003,6 +3003,13 @@ class DiscordGateway {
           request.waiter.extendDeadline(passDeadline);
           for (const parent of request.waiter.parents) parent.extendDeadline(passDeadline);
         }
+        if (request.capturedClosingCustodyAttempts) {
+          for (const [channelId, attempt] of request.capturedClosingCustodyAttempts) {
+            if (this.closingCustodyRetries.get(channelId) === attempt && attempt.lifecycleEpoch === request.lifecycleEpoch) {
+              attempt.deadline = passDeadline;
+            }
+          }
+        }
         let result;
         try {
           result = await startRecoveryPass(request.scope, passDeadline, request.reason,
@@ -3043,12 +3050,23 @@ class DiscordGateway {
     if (recoveryAlreadyQueued) {
       if (callerScope === null) this.ready = false;
       attachParents(waiter);
+      let capturedClosingCustodyAttempts = null;
+      if (callerScope !== null && recoveryDeadline !== null) {
+        for (const channelId of callerScope) {
+          const attempt = this.closingCustodyRetries.get(channelId);
+          if (attempt && attempt.lifecycleEpoch === lifecycleEpoch && attempt.deadline === recoveryDeadline) {
+            if (!capturedClosingCustodyAttempts) capturedClosingCustodyAttempts = new Map();
+            capturedClosingCustodyAttempts.set(channelId, attempt);
+          }
+        }
+      }
       this.pendingRecoveryRequests.push({
         scope: callerScope === null ? null : new Set(callerScope),
         deadline: queuedScoped ? null : overallDeadline,
         reason,
         lifecycleEpoch,
-        waiter
+        waiter,
+        capturedClosingCustodyAttempts
       });
       this.recoveryFollowupScope = callerScope === null ? null : new Set(callerScope);
       ensureFollowupCoordinator();

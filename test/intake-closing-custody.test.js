@@ -108,6 +108,25 @@ for (const entrypoint of ['result', 'reconnect']) {
 test('channel custody that history never shows records gap after one extra pass', { timeout: 8000 }, async t => {
   const f = fixture(t);
   const landed = landDuringFinalFetch(f, '101', '1000', { visible: false });
+  const recoverInbound = f.gateway.recoverInbound.bind(f.gateway);
+  let wholeSurfaceDelayed = false;
+  f.gateway.recoverInbound = async (...args) => {
+    const result = await recoverInbound(...args);
+    if (!wholeSurfaceDelayed && args[3] === null) {
+      wholeSurfaceDelayed = true;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    return result;
+  };
+  const fetchHistory = f.gateway.fetchHistory;
+  let channel1000Fetches = 0;
+  f.gateway.fetchHistory = async (channel, fetchOptions) => {
+    if (channel.id === '1000') {
+      channel1000Fetches += 1;
+      if (channel1000Fetches > 2) throw new Error('channel 1000 history fetch bound exceeded: reverted coordinator would loop');
+    }
+    return fetchHistory(channel, fetchOptions);
+  };
   const result = await run(f, 'result');
   assert.ok(landed());
   assert.equal(result.ready, false);
