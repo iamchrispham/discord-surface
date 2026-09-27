@@ -8,6 +8,7 @@ const { observeSubmitted } = require('../src/native');
 const { createSurfaceConsumer, DiscordGateway } = require('../src/discord');
 const { gatewayProcessStatus, pathsFor, requestGatewayRecovery } = require('../src/cli');
 const { CODEX_ID, CLI_PATH, fixture, discordMessage, waitForFile, waitForProcessGone, waitForCondition, providers } = require('./surface-fixtures');
+const { waitForFixturePidRecord } = require('./fixture-publication');
 
 test('simulated: status distinguishes matching, stopped, stale, and unknown Gateway owners', async () => {
   const { dir, db, state } = fixture('gateway-status.sqlite');
@@ -41,7 +42,7 @@ require.cache[target].exports = { ...loaded, DiscordGateway: FixtureGateway };
     stdio: 'ignore'
   });
   try {
-    await waitForFile(paths.pid);
+    await waitForFixturePidRecord(paths.pid, 1000);
     fs.writeFileSync(paths.pid, JSON.stringify({ pid: matching.pid, guildId: 'guild-1', stateDir: dir, db, command: 'run', startedAt: new Date().toISOString() }), { mode: 0o600 });
     const running = status();
     assert.equal(running.state, 'running');

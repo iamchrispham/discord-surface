@@ -293,8 +293,9 @@ esac
   const childScript = path.join(dir, 'commit-child.cjs');
   fs.writeFileSync(childScript, `
 const fs = require('node:fs');
+const { publishFixtureFile } = require(${JSON.stringify(path.join(__dirname, 'fixture-publication.js'))});
 const waiter = new Int32Array(new SharedArrayBuffer(4));
-fs.writeFileSync(process.env.DISCORD_SURFACE_GATE_CHILD_STARTED, String(process.pid));
+publishFixtureFile(process.env.DISCORD_SURFACE_GATE_CHILD_STARTED, String(process.pid));
 const deadline = Date.now() + 5000;
 while (!fs.existsSync(process.env.DISCORD_SURFACE_GATE_CHILD_RELEASE)) {
   if (Date.now() >= deadline) process.exit(124);

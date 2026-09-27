@@ -142,11 +142,12 @@ test('simulated: public liaison SIGTERM aborts the child group before closing st
   const childPidPath = path.join(dir, 'liaison-public-child.pid');
   fs.writeFileSync(preloadPath, `
 const fs = require('node:fs');
+const { publishFixtureFile } = require(${JSON.stringify(path.join(__dirname, 'fixture-publication.js'))});
 const childProcess = require('node:child_process');
 const originalSpawn = childProcess.spawn;
 childProcess.spawn = (_command, _args, options) => {
-  const child = originalSpawn(process.execPath, ['-e', "process.stdin.resume(); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"], options);
-  fs.writeFileSync(process.env.DISCORD_SURFACE_TEST_CHILD_PID, String(child.pid));
+  const child = originalSpawn(process.execPath, ['-e', "process.stdin.resume(); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); setTimeout(() => process.exit(124), 7000);"], options);
+  publishFixtureFile(process.env.DISCORD_SURFACE_TEST_CHILD_PID, String(child.pid));
   return child;
 };
 `, { mode: 0o600 });

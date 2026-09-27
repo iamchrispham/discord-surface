@@ -7,6 +7,7 @@ const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { SurfaceState, THREAD_STATES } = require('../src/state');
 const { gatewayProcessStatus, pathsFor, requestGatewayRecovery } = require('../src/cli');
+const { waitForFixturePidRecord } = require('./fixture-publication');
 
 for (const routeId of ['fixture route', 'fixture route ', ' ']) {
 for (const explicitDb of [false, true]) {
@@ -50,12 +51,7 @@ for (const explicitDb of [false, true]) {
       await exited;
       fs.rmSync(dir, { recursive: true, force: true });
     });
-    const deadline = Date.now() + 5000;
-    while (!fs.existsSync(paths.pid) && Date.now() < deadline && child.exitCode === null) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    assert.ok(fs.existsSync(paths.pid), 'public run writes its PID record');
-    const record = JSON.parse(fs.readFileSync(paths.pid, 'utf8'));
+    const record = await waitForFixturePidRecord(paths.pid, 5000, t.signal);
     assert.equal(gatewayProcessStatus(paths).state, 'running');
     assert.equal(record.courierRouteId, routeId);
     const signals = [];

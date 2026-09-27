@@ -1045,6 +1045,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
   const successorDeadline = path.join(f.dir, 'successor-fixture-deadline.marker');
   const successorScript = `
     const fs = require('node:fs');
+    const { publishFixtureFile } = require(${JSON.stringify(path.join(__dirname, 'fixture-publication.js'))});
     const { main } = require(${JSON.stringify(CLI_PATH)});
     const { SurfaceState } = require(${JSON.stringify(STATE_PATH)});
     const { createSurfaceConsumer } = require(${JSON.stringify(DISCORD_PATH)});
@@ -1065,7 +1066,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
       process.argv = [process.execPath, ...JSON.parse(process.env.DISCORD_SURFACE_CONTENDER_ARGS)];
       const contender = await main();
       process.exitCode = 0;
-      fs.writeFileSync(process.env.DISCORD_SURFACE_CONTENDER_RESULT_FILE, JSON.stringify(contender));
+      publishFixtureFile(process.env.DISCORD_SURFACE_CONTENDER_RESULT_FILE, JSON.stringify(contender));
       if (contender?.status !== 'in_flight') throw new Error('concurrent board contender was not refused as in-flight');
       await waitForFile(process.env.DISCORD_SURFACE_ORDINARY_START_FILE);
 
@@ -1113,7 +1114,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
         await consumer.waitForNativeWork();
         await consumer.waitForReceipts();
         const ordinaryMessage = state.getMessage('101');
-        fs.writeFileSync(process.env.DISCORD_SURFACE_ORDINARY_RESULT_FILE, JSON.stringify({
+        publishFixtureFile(process.env.DISCORD_SURFACE_ORDINARY_RESULT_FILE, JSON.stringify({
           resultStatus: ordinary?.status || null,
           messageState: ordinaryMessage?.state || null,
           generation: ordinaryMessage?.generation || null,
@@ -1167,7 +1168,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
       await main();
       process.argv = [process.execPath, ...JSON.parse(process.env.DISCORD_SURFACE_SUCCESSOR_ARGS)];
       const result = await main();
-      fs.writeFileSync(process.env.DISCORD_SURFACE_SUCCESSOR_RESULT_FILE, JSON.stringify({ result, observedAt, readbackContent: readback.content }));
+      publishFixtureFile(process.env.DISCORD_SURFACE_SUCCESSOR_RESULT_FILE, JSON.stringify({ result, observedAt, readbackContent: readback.content }));
       if (result?.status !== 'applied') throw new Error('successor board refresh did not apply: ' + result?.status);
     })().then(() => clearTimeout(fixtureDeadline), error => {
       clearTimeout(fixtureDeadline);
