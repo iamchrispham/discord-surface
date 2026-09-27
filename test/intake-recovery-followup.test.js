@@ -415,3 +415,47 @@ for (const kind of ['channel', 'history']) {
     assert.equal(f.dispatched.length, 0);
   });
 }
+
+test('live attachment recovery preserves a verified empty cursor', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare(`UPDATE intake_watermarks
+    SET state='ready', last_seen_id=NULL, recovered_through_id=NULL
+    WHERE channel_id=?`).run('1000');
+  const binding = f.state.getBinding('1000');
+  const message = { ...f.message('101', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+
+  await f.gateway.recordLiveAttachmentGap(message, binding, new Error('attachment fetch failed'));
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline && f.boundary('1000').state !== 'ready') {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+
+  assert.equal(f.boundary('1000').state, 'ready');
+  assert.equal(f.boundary('1000').recovered_through_id, '0');
+});
+
+test('direct reply-ready recovery send obeys the shared deadline', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const message = f.message('101', '1000');
+  assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, 'submitted');
+  const stored = f.state.getMessage('101');
+  f.state.recordNativeReply({
+    provider: stored.provider,
+    messageId: stored.id,
+    nativeId: stored.nativeId,
+    generation: stored.generation,
+    text: 'saved reply'
+  });
+  f.enableDelivery();
+  f.gateway.recoveryTimeoutMs = 25;
+  const originalDeliverReply = f.gateway.consumer.deliverReply;
+  f.gateway.consumer.deliverReply = () => new Promise(() => {});
+  try {
+    await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  } finally {
+    f.gateway.consumer.deliverReply = originalDeliverReply;
+  }
+  assert.equal(f.state.getMessage('101').state, 'reply_ready');
+});

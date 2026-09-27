@@ -1603,7 +1603,12 @@ class DiscordGateway {
           const message = this.state.getMessage(messageId);
           if (![MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY].includes(message?.state)) return ACK_WAITING;
           this.consumer?.releaseAcknowledged?.(messageId);
-          return this.consumer?.resumeSubmitted(message, undefined, { awaitExisting: false, continueUntilFinal: true });
+          return this.reconcilePending(undefined, {
+            allowPaused: true,
+            readyOnly: true,
+            channelIds: [message.channelId],
+            messageIds: [messageId]
+          });
         },
         logger: this.logger
       });
@@ -1735,10 +1740,20 @@ class DiscordGateway {
     this.attachmentIntakeRetryMessages.set(intakeChannelId, { message, binding });
     const watermark = childDelivery ? null : this.state.getIntakeWatermark(binding.channelId);
     // Preserve verified-empty coverage when a live gap races startup migration.
+    const verifiedEmptyCursor = !childDelivery && watermark?.state === READINESS.READY &&
+      !watermark.last_seen_id && !watermark.recovered_through_id ? '0' : null;
+    if (verifiedEmptyCursor) {
+      try {
+        this.state.setIntakeBaseline(binding.channelId, verifiedEmptyCursor,
+          'live attachment gap recovery cursor', binding);
+      } catch (baselineError) {
+        this.logger(`live attachment gap baseline failed: ${baselineError.message}`);
+      }
+    }
     const gapFrom = childDelivery
       ? enrollment.recoveredThroughId || enrollment.lastSeenId || null
       : watermark?.recovered_through_id || watermark?.last_seen_id ||
-        (watermark?.state === READINESS.READY && !watermark.last_seen_id ? '0' : null);
+        verifiedEmptyCursor;
     const detail = `live attachment intake failed for ${message?.id || 'unknown message'}: ${String(error?.message || error).slice(0, 900)}`;
     const boundary = childDelivery
       ? this.state.markThreadBoundary(intakeChannelId, THREAD_STATES.GAP, detail, gapFrom, message?.id || null, binding)
@@ -2396,11 +2411,11 @@ class DiscordGateway {
         }
         return current;
       };
-      const queueRecoveryIfPending = () => {
+      const queueRecoveryIfPending = (retryDeadline = deadline) => {
         if (this.stopping) return;
         const current = classifyCurrentReadiness();
         if (current?.state !== READINESS.PENDING) return;
-        scheduleRecoveryRetry(binding.channelId, deadline);
+        scheduleRecoveryRetry(binding.channelId, retryDeadline);
       };
       const recordOwnedBoundary = async (owner, channel, nextState, detail, gapFrom, gapTo, signal, deadline, expectedBoundary) => {
         if (nextState === READINESS.GAP || nextState === READINESS.UNAVAILABLE) {
@@ -2747,11 +2762,12 @@ class DiscordGateway {
       const finalBinding = this.state.getBinding(binding.channelId);
       const liveCustodyAhead = finalWatermark?.last_seen_id && (!finalWatermark.recovered_through_id || compareDiscordIds(finalWatermark.last_seen_id, finalWatermark.recovered_through_id) > 0);
       if (liveCustodyAhead && !closingCustodyRetry) {
-        // Custody accepted during the close is still in Discord history, so re-read it under this pass's deadline.
-        this.closingCustodyRetries.set(binding.channelId, { lifecycleEpoch, deadline });
+        // Custody accepted during the close still needs one bounded history reread.
+        const retryDeadline = Date.now() + this.recoveryTimeoutMs;
+        this.closingCustodyRetries.set(binding.channelId, { lifecycleEpoch, deadline: retryDeadline });
         const retrying = await recordOwnedBoundary(binding, channel, READINESS.PENDING, `${reason} ${CLOSING_CUSTODY_DETAIL}`,
           null, null, signal, deadline, finalWatermark);
-        queueRecoveryIfPending();
+        queueRecoveryIfPending(retryDeadline);
         if (!retrying?.concurrentReady) failure ||= { ready: false, state: classifyCurrentReadiness()?.state || READINESS.PENDING };
       } else if (liveCustodyAhead || (finalBinding?.readiness !== READINESS.READY && finalBinding?.readiness !== READINESS.UNAVAILABLE)) {
         const detail = liveCustodyAhead
@@ -3191,7 +3207,7 @@ class DiscordGateway {
             blockedOwners.add(key);
             continue;
           }
-          const permission = this.historyPermission(channel, { requireSend: ordinary });
+          const permission = this.historyPermission(channel, { requireSend: true });
           if (!permission.known || !permission.allowed) {
             blockedOwners.add(key);
             continue;
@@ -3232,7 +3248,11 @@ class DiscordGateway {
           }
         } else {
           this.state.recoverNativeReplyAcknowledgment(message.id);
-          result = await this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal);
+          result = await waitForRecoveryOperation(
+            () => this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal),
+            signal,
+            deadline
+          );
         }
         if (result === DISPATCH_OUTCOMES.NOT_SUBMITTED || result?.status === DISPATCH_OUTCOMES.NOT_SUBMITTED) {
           blockedOwners.add(key);
