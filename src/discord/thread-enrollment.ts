@@ -205,6 +205,8 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       if (!baselineEnrollment) return false;
       ownedEnrollment = baselineEnrollment;
       after = baselineEnrollment.recoveredThroughId;
+    } else if (enrollment.adoptedThroughId === null && enrollment.recoveredThroughId === null) {
+      after = '0';
     }
     let pages = 0;
     let total = 0;
