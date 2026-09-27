@@ -492,7 +492,7 @@ test('live attachment recovery preserves a verified empty cursor', { timeout: 40
   assert.equal(f.boundary('1000').recovered_through_id, '0');
 });
 
-test('direct reply-ready recovery send obeys the shared deadline', { timeout: 4000 }, async t => {
+test('direct reply-ready recovery send settles as unknown at the shared deadline', { timeout: 4000 }, async t => {
   const f = fixture(t);
   const message = f.message('101', '1000');
   assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
@@ -508,12 +508,20 @@ test('direct reply-ready recovery send obeys the shared deadline', { timeout: 40
   });
   f.enableDelivery();
   f.gateway.recoveryTimeoutMs = 25;
-  const originalDeliverReply = f.gateway.consumer.deliverReply;
-  f.gateway.consumer.deliverReply = () => new Promise(() => {});
+  const channel = f.channels.get('1000');
+  const originalSend = channel.send;
+  let sendStarted = false;
+  let releaseSend;
+  channel.send = async () => {
+    sendStarted = true;
+    await new Promise(resolve => { releaseSend = resolve; });
+  };
   try {
     await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+    assert.equal(sendStarted, true);
+    assert.equal(f.state.getMessage('101').state, 'reply_unknown');
   } finally {
-    f.gateway.consumer.deliverReply = originalDeliverReply;
+    channel.send = originalSend;
+    releaseSend?.({ id: 'late-reply' });
   }
-  assert.equal(f.state.getMessage('101').state, 'reply_ready');
 });

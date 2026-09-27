@@ -3238,6 +3238,11 @@ class DiscordGateway {
         continue;
       }
       try {
+        const settleReplyDeadline = () => {
+          const current = this.state.getMessage(message.id);
+          if (current?.state !== 'replying') return current;
+          return this.state.markReplyFailure(message.id, new Error('Discord recovery deadline exceeded while delivering reply'), true);
+        };
         if (message.state === 'accepted') {
           for (let attempt = 0; attempt < 2; attempt += 1) {
             result = await waitForRecoveryOperation(
@@ -3256,7 +3261,8 @@ class DiscordGateway {
             result = await waitForRecoveryOperation(
               () => this.consumer.deliverReply(storedMessage, { status: current.state, message: current }, signal),
               signal,
-              deadline
+              deadline,
+              settleReplyDeadline
             );
           }
         } else {
@@ -3264,7 +3270,8 @@ class DiscordGateway {
           result = await waitForRecoveryOperation(
             () => this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal),
             signal,
-            deadline
+            deadline,
+            settleReplyDeadline
           );
         }
         if (result === DISPATCH_OUTCOMES.NOT_SUBMITTED || result?.status === DISPATCH_OUTCOMES.NOT_SUBMITTED) {
