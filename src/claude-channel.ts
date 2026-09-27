@@ -479,6 +479,11 @@ export class ClaudeChannel<
     };
     let releaseSocketLock: (() => void);
     try {
+      const retainedRelease = this.socketLockRelease;
+      if (retainedRelease) {
+        retainedRelease();
+        if (this.socketLockRelease === retainedRelease) this.socketLockRelease = null;
+      }
       releaseSocketLock = socketOwnership.acquireSocketLock(this.socketPath);
     } catch (error) {
       if (errorMessage(error) === 'Claude channel socket preparation is already in progress') {

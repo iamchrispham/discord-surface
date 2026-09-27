@@ -461,7 +461,18 @@ function ownerControlledNamespaceRoot(): string {
         }
       }
       if (!rendezvousDirectory) {
-        rendezvousDirectory = fs.mkdtempSync(path.join(root, rendezvousPrefix));
+        const sharedRendezvousDirectory = path.join(root, `${rendezvousName}-shared`);
+        try {
+          fs.mkdirSync(sharedRendezvousDirectory, { mode: 0o700 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        if (isUsableRendezvousDirectory(sharedRendezvousDirectory)) {
+          rendezvousDirectory = sharedRendezvousDirectory;
+        }
+      }
+      if (!rendezvousDirectory) {
+        throw new Error('Claude channel fallback-root rendezvous is unusable');
       }
       const rendezvousPath = path.join(rendezvousDirectory, 'fallback-root');
       let privateRoot = rendezvousState.root;
@@ -488,16 +499,81 @@ function ownerControlledNamespaceRoot(): string {
         try {
           if (staleMarker) {
             const markerBeforeReplace = readRendezvousRoot(rendezvousDirectory).staleMarker;
-            if (markerBeforeReplace && sameGeneration(markerBeforeReplace, staleMarker)) {
-              fs.renameSync(markerTemp, rendezvousPath);
-              staleMarker = undefined;
-            } else {
+            if (!markerBeforeReplace || !sameGeneration(markerBeforeReplace, staleMarker)) {
               const winnerRoot = readRendezvousRoot(rendezvousDirectory).root;
               if (!winnerRoot) throw new Error('Claude channel fallback-root rendezvous changed');
               if (createdPrivateRoot && winnerRoot !== privateRoot) {
                 try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
               }
               privateRoot = winnerRoot;
+            } else {
+              // Move the observed marker out, then publish with a no-overwrite link.
+              const markerClaim = path.join(rendezvousDirectory, `.fallback-root-claim-${process.pid}-${randomUUID()}`);
+              let claimed = false;
+              try {
+                fs.renameSync(rendezvousPath, markerClaim);
+                claimed = true;
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+              }
+              if (!claimed) {
+                let published = false;
+                try {
+                  fs.linkSync(markerTemp, rendezvousPath);
+                  published = true;
+                } catch (error) {
+                  if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+                }
+                if (published) {
+                  staleMarker = undefined;
+                } else {
+                  const winnerRoot = readRendezvousRoot(rendezvousDirectory).root;
+                  if (!winnerRoot) throw new Error('Claude channel fallback-root rendezvous changed');
+                  if (createdPrivateRoot && winnerRoot !== privateRoot) {
+                    try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
+                  }
+                  privateRoot = winnerRoot;
+                }
+              } else {
+                const claimedIdentity = fileIdentity(markerClaim);
+                if (!sameFile(claimedIdentity, staleMarker)) {
+                  try {
+                    fs.linkSync(markerClaim, rendezvousPath);
+                  } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+                  }
+                  try { fs.unlinkSync(markerClaim); } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+                  }
+                  const winnerRoot = readRendezvousRoot(rendezvousDirectory).root;
+                  if (!winnerRoot) throw new Error('Claude channel fallback-root rendezvous changed');
+                  if (createdPrivateRoot && winnerRoot !== privateRoot) {
+                    try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
+                  }
+                  privateRoot = winnerRoot;
+                } else {
+                  let published = false;
+                  try {
+                    fs.linkSync(markerTemp, rendezvousPath);
+                    published = true;
+                  } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+                  }
+                  try { fs.unlinkSync(markerClaim); } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+                  }
+                  if (published) {
+                    staleMarker = undefined;
+                  } else {
+                    const winnerRoot = readRendezvousRoot(rendezvousDirectory).root;
+                    if (!winnerRoot) throw new Error('Claude channel fallback-root rendezvous changed');
+                    if (createdPrivateRoot && winnerRoot !== privateRoot) {
+                      try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
+                    }
+                    privateRoot = winnerRoot;
+                  }
+                }
+              }
             }
           } else {
             try {
@@ -786,9 +862,10 @@ function clearOrphanStagingDirs(namespacePath: string): void {
     if (!legacyMatch) continue;
     const identityMatch = entry.match(/^\.staging-(\d+)-i([0-9a-f]+|u)-/);
     const pid = Number(legacyMatch[1]);
-    const identity = identityMatch && identityMatch[2] !== 'u'
-      ? Buffer.from(identityMatch[2], 'hex').toString('utf8')
-      : processIdentity(pid);
+    const identityToken = identityMatch?.[2];
+    const identity = identityToken && identityToken !== 'u'
+      ? Buffer.from(identityToken, 'hex').toString('utf8')
+      : identityToken === 'u' ? undefined : processIdentity(pid);
     if (isSocketLockOwnerAlive({ pid, identity })) continue;
     removeLockDirectory(path.join(namespacePath, entry));
   }
@@ -1023,7 +1100,8 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
         return;
       }
       if (!current.isSocket() || current.uid !== original.uid || current.dev !== original.dev ||
-        current.ino !== original.ino || current.ctimeMs !== original.ctimeMs) {
+        current.ino !== original.ino || current.ctimeMs !== original.ctimeMs ||
+        current.birthtimeMs !== original.birthtimeMs) {
         reject(new Error('Claude channel socket changed during stale probe'));
         return;
       }
@@ -1034,7 +1112,8 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
         fs.renameSync(socketPath, quarantinedPath);
         const quarantined = fs.lstatSync(quarantinedPath);
         if (!quarantined.isSocket() || quarantined.uid !== original.uid ||
-          quarantined.dev !== original.dev || quarantined.ino !== original.ino) {
+          quarantined.dev !== original.dev || quarantined.ino !== original.ino ||
+          quarantined.birthtimeMs !== original.birthtimeMs) {
           restoreQuarantinedSocket(quarantinedPath, socketPath);
           fs.rmdirSync(quarantineDirectory);
           quarantineDirectory = undefined;
