@@ -59,6 +59,7 @@ function completePidRecord(text) {
 // record. The parent directory is watched before the first read, so a writer
 // that publishes right after admission is observed rather than missed.
 function waitForFixturePidRecord(file, timeoutMs, signal) {
+  const invokedAt = Date.now();
   return new Promise((resolve, reject) => {
     if (signal && signal.aborted) {
       reject(signal.reason);
@@ -108,28 +109,13 @@ function waitForFixturePidRecord(file, timeoutMs, signal) {
       return completePidRecord(text);
     };
 
-    // Directory watchers on some platforms replay the destination's prior
-    // creation event right after registration. Compare the observable file
-    // identity so only a real change to the record triggers a content read.
-    const signatureNow = () => {
-      try {
-        const stats = fs.statSync(file, { bigint: true });
-        return `${stats.ino}:${stats.mtimeNs}:${stats.size}`;
-      } catch {
-        return null;
-      }
-    };
-
     const watchedName = path.basename(file);
-    let baselineSignature;
     const onEvent = (_eventType, filename) => {
       if (settled) return;
       // Directory watchers can report unrelated events (including the parent
       // directory itself). Only a string filename naming the record is a
       // relevant publication signal; a missing filename cannot be filtered.
       if (typeof filename === 'string' && filename.length > 0 && filename !== watchedName) return;
-      const current = signatureNow();
-      if (current !== null && current === baselineSignature) return;
       const record = readNow();
       if (record) finish('resolve', record);
     };
@@ -152,9 +138,9 @@ function waitForFixturePidRecord(file, timeoutMs, signal) {
 
     watcher.on('error', error => finish('reject', error));
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
-    timer = setTimeout(onExpiry, timeoutMs);
+    const remainingMs = Math.max(0, timeoutMs - (Date.now() - invokedAt));
+    timer = setTimeout(onExpiry, remainingMs);
 
-    baselineSignature = signatureNow();
     const immediate = readNow();
     if (immediate) finish('resolve', immediate);
   });
