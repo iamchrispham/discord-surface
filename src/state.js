@@ -1136,9 +1136,11 @@ class SurfaceState {
     const existing = this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(event.channelId);
     const lastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, event.id) >= 0 ? existing.last_seen_id : event.id;
     const confirmedCoverageId = coverageId;
+    const verifiedEmptyCoverage = existing?.state === READINESS.READY &&
+      !existing.last_seen_id && !existing.recovered_through_id;
     const recoveredThrough = confirmedCoverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, confirmedCoverageId) < 0)
       ? confirmedCoverageId
-      : existing?.recovered_through_id || null;
+      : existing?.recovered_through_id || (verifiedEmptyCoverage ? '0' : null);
     const state = existing?.state === READINESS.GAP ? 'gap' : existing?.state === READINESS.UNAVAILABLE ? 'unavailable' : ready ? 'ready' : 'pending';
     if (existing) {
       this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, updated_at=? WHERE channel_id=?')

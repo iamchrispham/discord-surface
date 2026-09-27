@@ -115,6 +115,25 @@ test('startup qualifies a completed empty legacy parent and replays post-baselin
   assert.equal(f.cursor('1000'), '101');
 });
 
+test('held live intake preserves verified empty parent coverage before startup recovery', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare('UPDATE intake_watermarks SET state=?, last_seen_id=NULL, recovered_through_id=NULL WHERE channel_id=?')
+    .run('ready', '1000');
+  const message = { ...f.message('101', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+  assert.equal(f.state.acceptDiscordMessage(message, {
+    expectedBinding: f.state.getBinding('1000'),
+    ready: true
+  }).accepted, true);
+  assert.equal(f.boundary('1000').recovered_through_id, '0');
+  f.history.set('1000', [message]);
+
+  const result = await settleRecovery(f.gateway.recoverTransport('startup'));
+
+  assert.equal(result.ready, true, JSON.stringify(result));
+  assert.equal(f.boundary('1000').state, 'ready');
+  assert.equal(f.boundary('1000').recovered_through_id, '101');
+});
+
 test('verified-empty legacy child records adoption before live checkpointing', { timeout: 4000 }, async t => {
   const f = fixture(t, { adoptThread: false });
 
@@ -527,7 +546,7 @@ test('direct reply-ready recovery send settles as unknown at the shared deadline
   let releaseSend;
   channel.send = async () => {
     sendStarted = true;
-    await new Promise(resolve => { releaseSend = resolve; });
+    return new Promise(resolve => { releaseSend = resolve; });
   };
   try {
     await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
@@ -536,6 +555,48 @@ test('direct reply-ready recovery send settles as unknown at the shared deadline
   } finally {
     channel.send = originalSend;
     releaseSend?.({ id: 'late-reply' });
+  }
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline && f.state.getMessage('101').state !== 'replied') {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(f.state.getMessage('101').state, 'replied');
+  assert.equal(f.state.getMessage('101').replyMessageId, 'late-reply');
+});
+
+test('submitted observer does not post after route readiness is lost before settlement', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const message = f.message('101', '1000');
+  assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, 'submitted');
+  f.enableDelivery();
+  const originalObserve = f.gateway.providers.codex.observe;
+  let observeStarted = false;
+  let releaseObserve;
+  f.gateway.providers.codex.observe = async (...args) => {
+    observeStarted = true;
+    await new Promise(resolve => { releaseObserve = resolve; });
+    return originalObserve(...args);
+  };
+  try {
+    const recovery = f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+    const startDeadline = Date.now() + 1000;
+    while (!observeStarted && Date.now() < startDeadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(observeStarted, true);
+    const channelDeadline = Date.now() + 1000;
+    while (!f.calls.some(call => call.kind === 'channel' && call.id === '1000') && Date.now() < channelDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    f.gateway.pauseConnection('observer settlement route hold');
+    releaseObserve?.();
+    await settleRecovery(recovery);
+    await f.gateway.consumer.waitForNativeWork();
+    assert.equal(f.replies.length, 0);
+    assert.equal(f.state.getMessage('101').state, 'reply_ready');
+  } finally {
+    releaseObserve?.();
+    f.gateway.providers.codex.observe = originalObserve;
   }
 });
 

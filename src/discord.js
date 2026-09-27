@@ -638,7 +638,17 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
         const sent = await sendReply(message, { ...ready.message, replyText: part.content, replyNonce: part.nonce, replyPart: part });
         const replyId = sent?.id || sent?.messageId;
         if (!replyId) throw new Error('Discord did not return a message id');
-        const saved = state.markReplyPartSent(ready.message.id, part.index, replyId);
+        let saved;
+        try {
+          saved = state.markReplyPartSent(ready.message.id, part.index, replyId);
+        } catch (error) {
+          const current = state.getMessage(ready.message.id);
+          if (current?.state !== MESSAGE_STATES.REPLY_UNKNOWN || typeof state.reconcileReplyDelivery !== 'function') throw error;
+          saved = state.reconcileReplyDelivery(ready.message.id, 'sent', {
+            partIndex: part.index,
+            replyMessageId: replyId
+          });
+        }
         if (saved.state === 'replied') return { ...result, message: saved };
       } catch (error) {
         const unknown = classifyReplyError(error) === 'unknown';
@@ -3111,12 +3121,15 @@ class DiscordGateway {
       if (reconciliationRetryQueued || !reconciliationRetryMessageIds.length) return;
       reconciliationRetryQueued = true;
       queueMicrotask(() => {
-        if (this.stopping || signal?.aborted) return;
+        // Drain this batch before the awaited pass so later settlements can queue a new one.
+        reconciliationRetryQueued = false;
+        const retryMessageIds = reconciliationRetryMessageIds.splice(0);
+        if (this.stopping || signal?.aborted || !retryMessageIds.length) return;
         this.reconcilePending(before, {
           allowPaused: true,
           readyOnly: true,
           channelIds,
-          messageIds: reconciliationRetryMessageIds
+          messageIds: retryMessageIds
         }).catch(error => this.logger(`Discord reply reconciliation retry failed: ${error.message}`));
       });
     };
@@ -3136,6 +3149,13 @@ class DiscordGateway {
       }
       return storedMessage;
     };
+    const canDeliverSettledReply = (message, storedMessage) => {
+      if (!storedMessage.channel) return false;
+      const route = this.state.getMessageRoute(message.deliveryChannelId || message.channelId);
+      if (!route?.ready) return false;
+      const permission = this.historyPermission(storedMessage.channel, { requireSend: true });
+      return permission.known && permission.allowed;
+    };
     // F14 phase 1: admit every eligible submitted native observation up front through
     // the existing per-owner queue ordering/deduplication/cancellation, WITHOUT
     // spending the network deadline and WITHOUT waiting for native completion.
@@ -3149,8 +3169,8 @@ class DiscordGateway {
         const admitted = this.consumer.resumeSubmitted(storedMessage, signal, {
           continueUntilFinal: true,
           deferReply: () => {
-            const deferred = !storedMessage.channel;
-            if (deferred) queueReconciliationRetry([message.id]);
+            const deferred = !canDeliverSettledReply(message, storedMessage);
+            if (deferred && !storedMessage.channel) queueReconciliationRetry([message.id]);
             return deferred;
           }
         });
