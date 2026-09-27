@@ -72,6 +72,22 @@ test('peer result surfaces a newer rejected preflight after a rate-limited attem
     request.dedupe_key).sendOutcome, 'rejected');
 });
 
+test('peer result ignores packetless ordinary attempts after agent preflight', () => {
+  const source = { guildId: '100', channelId: '101', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
+  const target = { guildId: '100', channelId: '202', provider: 'codex', nativeId: '22222222-2222-2222-2222-222222222222', generation: 1 };
+  const packet = { id: 'packetless-mix', kind: 'request', source, target, replyTo: null, routingVersion: 2, text: 'hello' };
+  const base = { requestId: packet.id, guildId: source.guildId, channelId: source.channelId, provider: source.provider,
+    nativeId: source.nativeId, generation: source.generation, partIndex: 0, partCount: 1 };
+  const rows = [
+    { id: 1, kind: 'direct-post-outcome', detail: { ...base, agentPacket: packet, attemptId: 'agent-attempt', outcome: 'rejected', phase: 'preflight' } },
+    { id: 2, kind: 'direct-post-attempt', detail: { ...base, attemptId: 'ordinary-attempt' } },
+    { id: 3, kind: 'direct-post-outcome', detail: { ...base, attemptId: 'ordinary-attempt', outcome: 'sent', phase: 'final' } }
+  ];
+  const state = { directPostRows: () => rows, listAgentMessageReceiptIds: () => [], getAgentMessage: () => null,
+    getMessage: () => null, listAgentCompletionReceipts: () => [], hasNativeAcknowledgment: () => false };
+  assert.equal(inspectPeerResult(state, source, packet.id).sendOutcome, 'rejected');
+});
+
 test('peer result does not promote an enrolled child target to a legacy parent route', () => {
   const source = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
   const sourceParent = { ...source, channelId: '101' };

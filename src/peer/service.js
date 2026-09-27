@@ -245,7 +245,13 @@ function createPeerService(context) {
             const currentIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
             if (!currentSource || currentSource.readiness !== sourceReadiness || currentIntakeState !== sourceIntakeState) return false;
             requireReadyPeer(state, currentSource);
-            return currentPeerDestination(state, target, destination?.binding || null, destination?.childId || null);
+            if (input.reply_to === undefined && destination?.binding) {
+              const currentDestination = state.getBinding(destination.binding.channelId);
+              if (!currentDestination || !samePeerBinding(currentDestination, destination.binding)) return false;
+              requireReadyPeer(state, currentDestination);
+            }
+            return currentPeerDestination(state, target, destination?.binding || null,
+              input.reply_to === undefined ? null : destination?.childId || null);
           },
           textFile, dedupeKey: input.dedupe_key, custodyKey, signal, fetchImpl,
           ...(fileSource === null ? {} : { preparedTextSource: fileSource }) });

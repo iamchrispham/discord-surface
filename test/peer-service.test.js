@@ -489,6 +489,26 @@ test('peer-qualified reply keeps the recorded child when the peer has multiple r
   assert.match(postUrl, /channels\/202\/messages$/);
 });
 
+test('new peer request refuses publication after destination child ambiguity appears during verification', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
+  let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100' }, target);
+      f.state.markThreadBoundary('203', THREAD_STATES.READY, 'fixture', null, null, target);
+      return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    }
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: '10003' }) };
+  } });
+  const result = await peer.send({ peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'ambiguous-new' });
+  assert.equal(result.status, 'stale');
+  assert.equal(posts, 0);
+  const rows = f.state.directPostRows('ambiguous-new');
+  assert.equal(rows.filter(row => row.kind === 'direct-post-attempt').length, 0);
+  assert.deepEqual(rows.filter(row => row.kind === 'direct-post-outcome').map(row => row.detail.outcome), ['stale']);
+});
+
 test('peer result refuses to expose text after caller handoff during inspection', async t => {
   const f = fixture(t); f.enroll('102'); addRecipient(f);
   const peer = service(f, { fetchImpl: async (url, options) => {

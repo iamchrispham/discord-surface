@@ -118,7 +118,9 @@ function inspectPeerResult(state, source, correlationId) {
       results.push({ ...evidence, packetId: candidate.id, text: candidate.text });
     }
   }
-  const projection = projectNewestDirectPostAttempt(rows, {
+  const packetRows = rows.filter(row => packetVariants(row.detail.agentPacket, row.detail.legacyAgentPacket)
+    .some(variant => variant.id === packet.id));
+  const projection = projectNewestDirectPostAttempt(packetRows, {
     attemptKind: DIRECT_POST_ATTEMPT,
     outcomeKind: DIRECT_POST_OUTCOME
   });
