@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
 const { createSurfaceConsumer, DiscordGateway } = require('../src/discord');
 const { ACK, recordNativeAcknowledgment } = require('../src/acknowledgment');
-const { CODEX_ID, fixture, discordMessage, waitForCondition, providers } = require('./surface-fixtures');
+const { CODEX_ID, fixture, discordMessage, historyPermissions, waitForCondition, providers } = require('./surface-fixtures');
 
 test('simulated: same native owner dispatches its next message while the prior ACK is pending', async () => {
   const { dir, state } = fixture();
@@ -192,6 +192,7 @@ test('simulated: restart releases persisted native ACK before same-owner success
   let releaseFirst;
   const firstReply = new Promise(resolve => { releaseFirst = resolve; });
   const channel = {
+    permissionsFor: () => historyPermissions(),
     messages: { fetch: async () => ({ react: async () => {} }) },
     async send(payload) {
       if (payload.content !== 'Receipt: saved for this conductor.' && payload.content !== 'Receipt: saved. Delivery was paused when this receipt was prepared.') {
@@ -203,7 +204,7 @@ test('simulated: restart releases persisted native ACK before same-owner success
   };
   const gateway = new DiscordGateway({
     state,
-    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} },
+    client: { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} },
     providers: {
       codex: {
         async dispatch(message) {

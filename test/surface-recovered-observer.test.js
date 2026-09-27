@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { SurfaceState, MESSAGE_STATES } = require('../src/state');
 const { DiscordGateway } = require('../src/discord');
-const { CODEX_ID, fixture, waitForCondition, providers } = require('./surface-fixtures');
+const { CODEX_ID, fixture, historyPermissions, waitForCondition, providers } = require('./surface-fixtures');
 
 test('simulated: submitted recovery transfers custody to one live observer without redispatch', async () => {
   const { dir, db, state: initial } = fixture();
@@ -13,6 +13,7 @@ test('simulated: submitted recovery transfers custody to one live observer witho
   let observations = 0;
   let release;
   const channel = {
+    permissionsFor: () => historyPermissions(),
     messages: { fetch: async () => ({ react: async () => {} }) },
     async send() {
       sends += 1;
@@ -25,6 +26,7 @@ test('simulated: submitted recovery transfers custody to one live observer witho
   state.close();
   state = new SurfaceState(db);
   const client = {
+    user: { id: 'bot-1' },
     on() {},
     off() {},
     channels: { fetch: async () => channel },

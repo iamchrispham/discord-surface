@@ -3037,7 +3037,13 @@ class DiscordGateway {
       try {
         const admitted = this.consumer.resumeSubmitted(storedMessage, signal, {
           continueUntilFinal: true,
-          deferReply: () => !storedMessage.channel
+          deferReply: () => {
+            const deferred = !storedMessage.channel;
+            if (deferred && this.state.getMessage(message.id)?.state === MESSAGE_STATES.REPLY_READY) {
+              queueReconciliationRetry();
+            }
+            return deferred;
+          }
         });
         // Admission observes existing submitted work; its settlement is handled by the
         // owning observer/queue, so a rejected admission must not become an unhandled

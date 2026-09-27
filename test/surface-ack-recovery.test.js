@@ -4,7 +4,7 @@ const path = require('node:path');
 const { SurfaceState, StaleGenerationError, MESSAGE_STATES } = require('../src/state');
 const { DiscordGateway } = require('../src/discord');
 const { ACK, recordNativeAcknowledgment } = require('../src/acknowledgment');
-const { CODEX_ID, CLAUDE_ID, fixture, waitForCondition, providers } = require('./surface-fixtures');
+const { CODEX_ID, CLAUDE_ID, fixture, historyPermissions, waitForCondition, providers } = require('./surface-fixtures');
 
 test('simulated: explicit native ACK survives restart without entering reply custody', async () => {
   const { dir, db, state } = fixture('ack-reply-boundary.sqlite');
@@ -133,6 +133,7 @@ test('simulated: omitted native ACK survives restart with one reply and no redis
   let observations = 0;
   const events = [];
   const channel = {
+    permissionsFor: () => historyPermissions(),
     messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
     async send() { events.push('reply'); return { id: 'restart-reply' }; }
   };
@@ -144,7 +145,7 @@ test('simulated: omitted native ACK survives restart with one reply and no redis
         async observe() { observations += 1; return { text: 'unexpected redispatch' }; }
       }
     },
-    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+    client: { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
   });
   gateway.ready = true;
   await gateway.reconcilePending();
@@ -171,12 +172,13 @@ test('simulated: legacy REPLY_READY with native reply provenance recovers omitte
   state.recoverAfterRestart();
   const events = [];
   const channel = {
+    permissionsFor: () => historyPermissions(),
     messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
     async send() { events.push('reply'); return { id: 'legacy-reply' }; }
   };
   const gateway = new DiscordGateway({
     state,
-    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+    client: { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
   });
   gateway.ready = true;
   await gateway.reconcilePending();
@@ -203,12 +205,13 @@ test('simulated: legacy REPLY_READY with pre-submit reply provenance recovers om
   state.recoverAfterRestart();
   const events = [];
   const channel = {
+    permissionsFor: () => historyPermissions(),
     messages: { fetch: async () => ({ react: async reaction => { events.push(reaction); } }) },
     async send() { events.push('reply'); return { id: 'before-submit-reply' }; }
   };
   const gateway = new DiscordGateway({
     state,
-    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+    client: { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
   });
   gateway.ready = true;
   await gateway.reconcilePending();
@@ -238,7 +241,7 @@ test('simulated: legacy REPLY_READY without native reply provenance stays held',
   };
   const gateway = new DiscordGateway({
     state,
-    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+    client: { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
   });
   gateway.ready = true;
   await gateway.reconcilePending();
@@ -269,7 +272,7 @@ test('simulated: legacy REPLY_READY with mismatched native reply provenance stay
   };
   const gateway = new DiscordGateway({
     state,
-    client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+    client: { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
   });
   gateway.ready = true;
   await gateway.reconcilePending();

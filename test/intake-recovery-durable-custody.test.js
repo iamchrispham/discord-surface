@@ -8,6 +8,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fixture } = require('./helpers/intake-recovery-fixture');
 const { CASES, operatorMessage } = require('./helpers/intake-recovery-scenarios');
+const { waitForCondition } = require('./surface-fixtures');
 
 function submitted(f, id, channel = '1000') {
   assert.equal(f.state.acceptDiscordMessage(operatorMessage(f, id, channel)).accepted, true);
@@ -32,20 +33,19 @@ test('F11 recovered channel must attach to an existing native observation', CASE
     return answer;
   };
   const fetch = f.gateway.client.channels.fetch;
-  f.gateway.client.channels.fetch = async () => {
-    throw Object.assign(new Error('channel fetch unavailable'), { status: 503 });
-  };
+  f.gateway.recoveryTimeoutMs = 30;
+  f.gateway.client.channels.fetch = async () => new Promise(() => {});
   try {
     await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
     assert.equal(f.state.getMessage('101').state, 'submitted');
     f.gateway.client.channels.fetch = fetch;
-    await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
-    assert.equal(f.state.getMessage('101').state, 'submitted');
+    release({ text: 'late reply' });
+    await waitForCondition(() => f.state.getMessage('101').state === 'replied');
   } finally {
     release({ text: 'late reply' });
   }
   await f.gateway.consumer.waitForNativeWork();
-  assert.equal(f.state.getMessage('101').state, 'replied', 'successful second fetch must deliver when the original observer settles');
+  assert.equal(f.state.getMessage('101').state, 'replied', 'observer settlement must wake reconciliation without redispatch');
   assert.equal(f.replies.length, 1);
   assert.equal(f.dispatched.length, 0);
 });
