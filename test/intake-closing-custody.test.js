@@ -128,6 +128,7 @@ test('channel custody that history never shows records gap after one extra pass'
     return fetchHistory(channel, fetchOptions);
   };
   const result = await run(f, 'result');
+  assert.equal(wholeSurfaceDelayed, true, 'the first whole-surface return must be delayed before the queued retry');
   assert.ok(landed());
   assert.equal(result.ready, false);
   assert.equal(f.boundary('1000').state, 'gap');
