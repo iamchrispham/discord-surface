@@ -20,6 +20,7 @@ const { assertPublicThread, historyPermission, recoverThread } = require('./disc
 const {
   classifyRecoveryFailure,
   isInterruptedRetryBoundary,
+  isLegacyPreBaselineDeadlineBoundary,
   isPreAdoptionRetryableThread,
   isRetryableFetchBoundary,
   isRetryableIntakeBoundary,
@@ -2439,6 +2440,7 @@ class DiscordGateway {
       if (isRetryableRecoveryBoundary(watermark)) {
         retryBoundary = watermark;
       }
+      const retryingLegacyPreBaseline = isLegacyPreBaselineDeadlineBoundary(watermark);
       let nativeProofRetryDetail = retryBoundary && isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)
         ? retryBoundary.detail : null;
       if (watermark && ['gap', 'unavailable'].includes(watermark.state) && !retryBoundary) {
@@ -2607,7 +2609,7 @@ class DiscordGateway {
       // historical parent refuses visibly HERE, before any history request: no
       // cutoff is ever inferred from newest history, last_seen_id, channel id,
       // channel creation time, wall clock, or a later retry.
-      if (refusesUnqualifiedBaseline({ coveredCursor: ownedCoverageCursor })) {
+      if (refusesUnqualifiedBaseline({ coveredCursor: ownedCoverageCursor }) && !retryingLegacyPreBaseline) {
         const refusalDetail = watermark
           ? retryPendingBoundaryDetail(`${reason} baseline refused without historical coverage`, watermark)
           : `${reason} history boundary requires qualified historical coverage`;
@@ -3039,9 +3041,7 @@ class DiscordGateway {
           continueUntilFinal: true,
           deferReply: () => {
             const deferred = !storedMessage.channel;
-            if (deferred && this.state.getMessage(message.id)?.state === MESSAGE_STATES.REPLY_READY) {
-              queueReconciliationRetry();
-            }
+            if (deferred) queueReconciliationRetry();
             return deferred;
           }
         });
@@ -3075,10 +3075,7 @@ class DiscordGateway {
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE) {
-          const current = this.state.getMessage(message.id);
-          if (message.state === 'reply_ready' || current?.state === 'reply_ready') {
-            queueReconciliationRetry();
-          }
+          queueReconciliationRetry();
         }
         blockedOwners.add(key);
         if (!channelFetchStarted) continue;

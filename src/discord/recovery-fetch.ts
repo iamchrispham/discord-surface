@@ -57,8 +57,12 @@ function isLegacyDeadlineDetail(detail: string | null | undefined): boolean {
       detail.endsWith(LEGACY_DEADLINE_DETAIL_SUFFIX));
 }
 
-function isBoundedLegacyDeadlineDetail(detail: string | null | undefined): boolean {
-  return Object.values(LEGACY_DEADLINE_DETAILS).includes(detail as typeof LEGACY_DEADLINE_DETAILS[keyof typeof LEGACY_DEADLINE_DETAILS]);
+function isLegacyHistoryDeadlineDetail(detail: string | null | undefined): boolean {
+  return typeof detail === 'string' && (
+    detail.endsWith(LEGACY_DEADLINE_DETAIL_SUFFIX) ||
+    [LEGACY_DEADLINE_DETAILS.THREAD, LEGACY_DEADLINE_DETAILS.HISTORY_ADMISSION, LEGACY_DEADLINE_DETAILS.HISTORY_BOUND]
+      .includes(detail as typeof LEGACY_DEADLINE_DETAILS.THREAD | typeof LEGACY_DEADLINE_DETAILS.HISTORY_ADMISSION | typeof LEGACY_DEADLINE_DETAILS.HISTORY_BOUND)
+  );
 }
 
 function hasConfirmedLegacyCursor(boundary: IntakeBoundaryLike): boolean {
@@ -73,10 +77,19 @@ function hasLegacyCursorBounds(boundary: IntakeBoundaryLike): boolean {
 export function isRetryableIntakeBoundary(boundary: IntakeBoundaryLike | null | undefined): boolean {
   if (!boundary) return false;
   if (isRetryableFetchBoundary(boundary.state || '', boundary.detail)) return true;
-  return boundary.state === 'gap' && isLegacyDeadlineDetail(boundary.detail) &&
-    hasConfirmedLegacyCursor(boundary) &&
-    (boundary.gap_from == null && boundary.gap_to == null ||
-      (isBoundedLegacyDeadlineDetail(boundary.detail) && hasLegacyCursorBounds(boundary)));
+  if (boundary.state !== 'gap' || !isLegacyDeadlineDetail(boundary.detail)) return false;
+  const hasConfirmedCursor = hasConfirmedLegacyCursor(boundary);
+  const hasEmptyBounds = boundary.gap_from == null && boundary.gap_to == null;
+  const hasPreBaselineHistoryDeadline = hasEmptyBounds && boundary.recovered_through_id == null &&
+    isLegacyHistoryDeadlineDetail(boundary.detail);
+  return hasPreBaselineHistoryDeadline ||
+    (hasEmptyBounds && hasConfirmedCursor) ||
+    (hasConfirmedCursor && hasLegacyCursorBounds(boundary));
+}
+
+export function isLegacyPreBaselineDeadlineBoundary(boundary: IntakeBoundaryLike | null | undefined): boolean {
+  return Boolean(boundary && boundary.state === 'gap' && boundary.recovered_through_id == null &&
+    boundary.gap_from == null && boundary.gap_to == null && isLegacyHistoryDeadlineDetail(boundary.detail));
 }
 
 export function retryPendingBoundaryDetail(reason: string, boundary: RetryBoundaryLike): string {

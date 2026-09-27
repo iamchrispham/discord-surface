@@ -72,3 +72,51 @@ test('reply-ready custody retries after its channel fetch starts before expiry',
   assert.equal(f.state.getMessage('101').state, 'replied');
   assert.equal(f.replies.length, 1);
 });
+
+test('a later submitted observer wakes reconciliation after an earlier candidate expires', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const first = f.message('101', '1000');
+  const second = f.message('102', '1000');
+  for (const message of [first, second]) {
+    assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+    assert.equal(f.state.claimDispatch(message.id).claimed, true);
+    assert.equal(f.state.markSubmitted(message.id).state, 'submitted');
+  }
+  const firstStored = f.state.getMessage(first.id);
+  f.state.recordNativeReply({
+    provider: firstStored.provider,
+    messageId: firstStored.id,
+    nativeId: firstStored.nativeId,
+    generation: firstStored.generation,
+    text: 'already observed'
+  });
+  assert.equal(f.state.getMessage(first.id).state, 'reply_ready');
+  f.enableDelivery();
+  f.gateway.recoveryTimeoutMs = 30;
+  const originalObserve = f.gateway.providers.codex.observe;
+  f.gateway.providers.codex.observe = async (...args) => {
+    await new Promise(resolve => setTimeout(resolve, 100));
+    return originalObserve(...args);
+  };
+  let fetches = 0;
+  f.gateway.client.channels.fetch = async id => {
+    fetches += 1;
+    if (fetches === 1) return new Promise(() => {});
+    return f.channels.get(id);
+  };
+
+  try {
+    await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+    const waitUntil = Date.now() + 1500;
+    while (f.replies.length < 2 && Date.now() < waitUntil) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  } finally {
+    f.gateway.providers.codex.observe = originalObserve;
+  }
+
+  assert.ok(fetches >= 3, `expected a fresh pass for both durable candidates, saw ${fetches} fetches`);
+  assert.equal(f.state.getMessage(first.id).state, 'replied');
+  assert.equal(f.state.getMessage(second.id).state, 'replied');
+  assert.equal(f.replies.length, 2);
+});
