@@ -2294,3 +2294,79 @@ test('qualification preserves unrelated accepted connections', { timeout: 6000 }
   unrelatedSocket.destroy();
   keepAliveAgent.destroy();
 });
+
+test('startup stop retains its lock until the failed listener actually closes', { timeout: 6000 }, async t => {
+  const { dir, state } = fixture();
+  const socket = socketPath(t, { cleanup: false });
+  state.bind({ channelId: 'channel', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  let server;
+  let closed = false;
+  let witnessResolve;
+  const witnessed = new Promise(resolve => { witnessResolve = resolve; });
+  const connections = new Set();
+  const originalCreate = http.createServer;
+  t.mock.method(http, 'createServer', handler => {
+    server = originalCreate.call(http, (request, response) => {
+      if (request.method === 'HEAD' && request.url === '/identity' && request.headers['x-discord-socket-qualification']) {
+        request.resume();
+        witnessResolve();
+        return;
+      }
+      return handler(request, response);
+    });
+    server.on('connection', connection => {
+      connections.add(connection);
+      connection.on('close', () => connections.delete(connection));
+    });
+    server.once('close', () => { closed = true; });
+    return server;
+  });
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  let client;
+  let stopping;
+  const starting = channel.start().catch(error => error);
+  try {
+    await witnessed;
+    const accepted = once(server, 'connection');
+    client = net.createConnection(socket);
+    client.on('error', () => {});
+    await Promise.all([once(client, 'connect'), accepted]);
+    let stopResolved = false;
+    stopping = channel.stop().then(() => { stopResolved = true; }, error => { throw error; });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    let lockCanAcquire = false;
+    try {
+      const release = acquireSocketLock(socket);
+      lockCanAcquire = true;
+      release();
+    } catch {
+      // A live preparation lock refusing the contender is the expected path.
+    }
+    // The disputed ordering is conditional, not a frozen pre-close snapshot: a correct
+    // correction may already have closed the failed listener two immediate turns after
+    // stop() was called, but stop() must never resolve and the preparation lock must
+    // never become re-acquirable while that listener is still open with live sockets.
+    assert.ok(!stopResolved || closed, 'stop must not resolve before the failed listener actually closes');
+    assert.ok(!lockCanAcquire || closed, 'preparation lock must not be acquirable before the failed listener actually closes');
+    let deadline;
+    const finishedInTime = await Promise.race([
+      stopping.then(() => true),
+      new Promise(resolve => { deadline = setTimeout(() => resolve(false), 500); })
+    ]).finally(() => clearTimeout(deadline));
+    assert.equal(finishedInTime, true, 'stop must finish within the fixture bound once the listener closes');
+    assert.equal(closed, true, 'failed listener must actually close before stop resolves');
+    assert.equal(connections.size, 0, 'failed listener retains no accepted connection');
+    await stopping;
+    await starting;
+  } finally {
+    client?.destroy();
+    for (const connection of connections) connection.destroy();
+    try { await stopping; } catch {}
+    try { await channel.stop(); } catch {}
+    if (server && !closed) await new Promise(resolve => server.close(() => resolve()));
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(path.dirname(socket), { recursive: true, force: true });
+  }
+});
