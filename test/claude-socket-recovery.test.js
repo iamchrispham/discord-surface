@@ -697,8 +697,10 @@ test('foreign users cannot exhaust both predictable fallback rendezvous names', 
     : `${componentPrefix}${'x'.repeat(minimumComponentLength - componentPrefix.length)}`;
   const deterministic = path.join(sharedRoot, rendezvousName);
   const shared = path.join(sharedRoot, `${rendezvousName}-shared`);
+  const election = path.join(sharedRoot, `${rendezvousName}-election`);
   fs.mkdirSync(deterministic, { mode: 0o700 });
   fs.mkdirSync(shared, { mode: 0o700 });
+  fs.mkdirSync(election, { mode: 0o700 });
   const originalStat = fs.statSync;
   t.mock.method(fs, 'statSync', (target, ...args) => {
     const stats = originalStat(target, ...args);
@@ -714,7 +716,7 @@ test('foreign users cannot exhaust both predictable fallback rendezvous names', 
   const originalLstat = fs.lstatSync;
   t.mock.method(fs, 'lstatSync', (target, ...args) => {
     const stats = originalLstat(target, ...args);
-    if ((String(target) !== deterministic && String(target) !== shared) ||
+    if ((String(target) !== deterministic && String(target) !== shared && String(target) !== election) ||
       (args.length > 0 && args[0] && args[0].bigint)) return stats;
     return {
       ...stats,
@@ -1755,6 +1757,36 @@ test('late stop cleanup preserves a replacement listener', { timeout: 8000 }, as
   finishClose();
   await stopping;
   assert.equal(fs.lstatSync(socket).isSocket(), true);
+  await new Promise(resolve => replacement.close(resolve));
+});
+
+test('stop preserves a replacement listener published before old close', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  await channel.start();
+  const oldPath = `${socket}.old-${randomUUID()}`;
+  fs.renameSync(socket, oldPath);
+  const replacement = http.createServer((_request, response) => response.end('replacement'));
+  t.after(async () => {
+    if (replacement.listening) await new Promise(resolve => replacement.close(resolve));
+    try { fs.unlinkSync(oldPath); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    removeSocketDirectory(socket);
+  });
+  await new Promise((resolve, reject) => {
+    replacement.once('error', reject);
+    replacement.listen(socket, resolve);
+  });
+
+  await channel.stop();
+  assert.equal(fs.lstatSync(socket).isSocket(), true);
+  const response = await requestOverSocket(socket);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body, 'replacement');
   await new Promise(resolve => replacement.close(resolve));
 });
 

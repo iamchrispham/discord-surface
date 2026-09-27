@@ -243,7 +243,8 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
       const rendezvousNames = [
         rendezvousName,
         `${rendezvousName}-shared`,
-        `${rendezvousName}-election`
+        `${rendezvousName}-election`,
+        `${rendezvousName}-${randomUUID()}`
       ];
       let rendezvousDirectory: string | undefined;
       let rendezvousState: RendezvousState = {};
@@ -363,11 +364,29 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
                   }
                   privateRoot = winnerRoot;
                 } else {
-                  fs.linkSync(markerTemp, rendezvousPath);
-                  try { fs.unlinkSync(markerClaim); } catch (error) {
-                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+                  let published = false;
+                  try {
+                    fs.linkSync(markerTemp, rendezvousPath);
+                    published = true;
+                  } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
                   }
-                  staleMarker = undefined;
+                  if (published) {
+                    try { fs.unlinkSync(markerClaim); } catch (error) {
+                      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+                    }
+                    staleMarker = undefined;
+                  } else {
+                    const winnerRoot = readPublishedRendezvousRoot(rendezvousDirectory,
+                      'Claude channel fallback-root rendezvous changed');
+                    if (createdPrivateRoot && winnerRoot !== privateRoot) {
+                      try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
+                    }
+                    privateRoot = winnerRoot;
+                    try { fs.unlinkSync(markerClaim); } catch (error) {
+                      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+                    }
+                  }
                 }
               }
             }

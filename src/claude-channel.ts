@@ -670,9 +670,24 @@ export class ClaudeChannel<
           if (!/^Claude channel stopped during /.test(errorMessage(error))) errors.push(error);
         }
       }
+      let socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
+      let quarantineFailed = false;
       try {
-        await closeServer(this.server);
-      } catch (error) { errors.push(error); }
+        socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, this.socketIdentity);
+      } catch (error) {
+        quarantineFailed = true;
+        errors.push(error);
+      }
+      if (!quarantineFailed) {
+        try {
+          await closeServer(this.server);
+        } catch (error) { errors.push(error); }
+      }
+      if (socketQuarantine) {
+        try {
+          if (!socketQuarantine.restore()) errors.push(new Error('Claude channel socket restore is unavailable'));
+        } catch (error) { errors.push(error); }
+      }
       this.server = null;
       if (this.ownsSocket) {
         try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch (error) {

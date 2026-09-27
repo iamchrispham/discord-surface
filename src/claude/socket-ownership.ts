@@ -314,6 +314,64 @@ export function unlinkSocketIfOwned(socketPath: string, expected: SocketPathIden
   unlinkSocketIfOwnedQuarantine(socketPath, expected, quarantineDependencies());
 }
 
+export type SocketPathQuarantine = {
+  restore: () => boolean;
+};
+
+export function quarantineMismatchedSocket(
+  socketPath: string,
+  expected: SocketPathIdentity | null | undefined
+): SocketPathQuarantine | undefined {
+  if (!expected) return undefined;
+  let observedStats: fs.BigIntStats;
+  try { observedStats = fs.lstatSync(socketPath, { bigint: true }); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const owner = effectiveUserId();
+  if (!observedStats.isSocket() || observedStats.isSymbolicLink() ||
+    (owner !== undefined && observedStats.uid !== BigInt(owner))) return undefined;
+  const observed: SocketIdentity = {
+    dev: observedStats.dev,
+    ino: observedStats.ino,
+    ctimeNs: observedStats.ctimeNs,
+    birthtimeNs: observedStats.birthtimeNs
+  };
+  if (sameSocket(observed, expected)) return undefined;
+
+  const quarantineDeps = quarantineDependencies();
+  const quarantine = prepareSocketQuarantine(socketPath, observed, quarantineDeps);
+  const quarantinedPath = path.join(quarantine.directory, 'socket');
+  let moved = false;
+  try {
+    fs.renameSync(socketPath, quarantinedPath);
+    moved = true;
+    const quarantined = socketIdentity(quarantinedPath);
+    if (!sameQuarantinedSocket(quarantined, observed)) {
+      if (!restoreQuarantinedSocket(quarantinedPath, socketPath)) {
+        throw new Error('Claude channel socket restore is unavailable');
+      }
+      removeSocketQuarantine(quarantine.directory);
+      throw new Error('Claude channel socket changed during stop');
+    }
+  } catch (error) {
+    if (!moved) removeSocketQuarantine(quarantine.directory);
+    throw error;
+  }
+
+  let restored = false;
+  return {
+    restore: (): boolean => {
+      if (restored) return true;
+      const didRestore = restoreQuarantinedSocket(quarantinedPath, socketPath);
+      if (!didRestore) return false;
+      removeSocketQuarantine(quarantine.directory);
+      restored = true;
+      return true;
+    }
+  };
+}
+
 function unlinkIfPresent(filePath: string): void {
   try { fs.unlinkSync(filePath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
