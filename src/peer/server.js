@@ -11,7 +11,8 @@ const packetId = PEER_PACKET_ID_SCHEMA;
 const nonBlankString = { type: 'string', minLength: 1,
   pattern: '[^\\s\\u0000-\\u001F\\u007F-\\u009F]', not: { pattern: '[\\u0000-\\u001F\\u007F-\\u009F]' } };
 const textFile = { ...nonBlankString, maxLength: 4096 };
-const payloadText = { type: 'string', minLength: 1, maxLength: 10000, pattern: '[^\\s]' };
+const MAX_PEER_TEXT_BYTES = 10000;
+const payloadText = { type: 'string', minLength: 1, maxLength: Math.floor(MAX_PEER_TEXT_BYTES / 4), pattern: '[^\\s]' };
 
 const selector = { oneOf: [
   { type: 'object', properties: { repoKey: nonBlankString, provider: { enum: ['codex', 'claude'] } }, required: ['repoKey', 'provider'], additionalProperties: false },

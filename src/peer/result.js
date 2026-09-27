@@ -33,9 +33,9 @@ function packetRecordsMatch(left, right) {
 }
 
 function isLegacyParentTarget(state, target, frozenRequest) {
-  if (frozenRequest?.kind === KINDS.REQUEST && sameAddress(frozenRequest.target, target)) return true;
   const route = typeof state.getMessageRoute === 'function' ? state.getMessageRoute(target.channelId) : null;
-  return Boolean(route && !route.enrollment && sameAddress(route.binding, target));
+  return Boolean(frozenRequest?.kind === KINDS.REQUEST && sameAddress(frozenRequest.target, target) &&
+    route && !route.enrollment && sameAddress(route.binding, target));
 }
 
 function packetMatchesRecordedIdentity(candidate, records) {

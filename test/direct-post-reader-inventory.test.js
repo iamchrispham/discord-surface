@@ -19,11 +19,11 @@ const READER_CALLEES = new Set(['directPostRows', 'queryDirectPostRows']);
 // Frozen reader inventory for PR109 F2. Owner keys are `<src-relative path>\0<enclosing function>`.
 const ADOPTING_OWNERS = new Map([
   ['peer/result.js\u0000inspectPeerResult', 1],
+  ['state/agent-routing.ts\u0000legacyParentSourcedReceipt', 1],
   ['state/direct-post.ts\u0000scopedAgentRows', 1],
   ['state/direct-post.ts\u0000hasUnresolvedBindingPost', 1]
 ]);
 const EXCLUDED_OWNERS = new Map([
-  ['state/agent-routing.ts\u0000legacyParentSourcedReceipt', 1],
   ['state/direct-post.ts\u0000releaseDirectPostFilePreparation', 2],
   ['state/direct-post.ts\u0000recordDirectPostOutcome', 1],
   ['state/direct-post.ts\u0000reconcileDirectPostOutcome', 1],

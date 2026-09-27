@@ -71,3 +71,25 @@ test('peer result surfaces a newer rejected preflight after a rate-limited attem
     { channelId: '101', guildId: '100', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 },
     request.dedupe_key).sendOutcome, 'rejected');
 });
+
+test('peer result does not promote an enrolled child target to a legacy parent route', () => {
+  const source = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
+  const sourceParent = { ...source, channelId: '101' };
+  const parent = { guildId: '100', channelId: '201', provider: 'codex', nativeId: '22222222-2222-2222-2222-222222222222', generation: 1 };
+  const child = { ...parent, channelId: '202' };
+  const packet = { id: 'promoted-request', kind: 'request', source, target: child, replyTo: null, routingVersion: 2, text: 'request' };
+  const legacyAgentPacket = { id: packet.id, kind: packet.kind, source: sourceParent, target: child, replyTo: null, text: packet.text };
+  const candidate = { id: 'legacy-parent-result', kind: 'result', source: parent, target: source, replyTo: packet.id, text: 'wrong route' };
+  const detail = { journal: 'direct-post-v1', requestId: 'correlation', guildId: source.guildId, channelId: sourceParent.channelId,
+    provider: source.provider, nativeId: source.nativeId, generation: source.generation, agentPacket: packet, legacyAgentPacket };
+  const state = {
+    directPostRows: () => [{ id: 1, kind: 'direct-post-attempt', detail }],
+    listAgentMessageReceiptIds: () => ['discord-result'],
+    getAgentMessage: () => ({ packet: candidate }),
+    getMessage: () => ({ ...candidate.target, state: 'accepted' }),
+    listAgentCompletionReceipts: () => [],
+    hasNativeAcknowledgment: () => false,
+    getMessageRoute: () => ({ binding: parent, enrollment: { threadId: child.channelId }, ready: true })
+  };
+  assert.deepEqual(inspectPeerResult(state, source, detail.requestId).results, []);
+});

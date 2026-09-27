@@ -161,7 +161,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     const allowLegacyChildRoute = isLegacyAgentAddressEnvelope(agentTarget) || agentThreadId !== null ||
       (agentKind === KINDS.RESULT && agentReplyTo !== null);
     legacy = legacyParentSourcedReceipt(state, binding, explicitRequestId, Object.values(DIRECT_POST_OUTCOMES),
-      allowLegacyChildRoute);
+      allowLegacyChildRoute, agentThreadId ?? binding.channelId);
   }
   let source: DirectPostSource;
   try {
