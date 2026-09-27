@@ -649,6 +649,52 @@ test('reply-ready recovery retries when delivery misses the preflight deadline',
   }
 });
 
+test('reply preparation aborts at the recovery deadline before a held route can send', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const message = f.message('101', '1000');
+  assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, 'submitted');
+  const stored = f.state.getMessage('101');
+  f.state.recordNativeReply({
+    provider: stored.provider,
+    messageId: stored.id,
+    nativeId: stored.nativeId,
+    generation: stored.generation,
+    text: 'saved reply'
+  });
+  f.enableDelivery();
+  f.gateway.recoveryTimeoutMs = 25;
+  const channel = f.channels.get('1000');
+  const originalPermissionsFor = channel.permissionsFor;
+  const originalSendAcknowledgment = f.gateway.sendAcknowledgment.bind(f.gateway);
+  const originalFetch = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+  let acknowledgmentAttempts = 0;
+  let fetchCalls = 0;
+  f.gateway.sendAcknowledgment = async (...args) => {
+    acknowledgmentAttempts += 1;
+    if (acknowledgmentAttempts === 1) throw Object.assign(new Error('acknowledgment unavailable'), { status: 503 });
+    return originalSendAcknowledgment(...args);
+  };
+  f.gateway.client.channels.fetch = async id => {
+    fetchCalls += 1;
+    return originalFetch(id);
+  };
+  try {
+    await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+    channel.permissionsFor = () => ({ has: () => false });
+    f.gateway.pauseConnection('route held after reply preparation deadline');
+    await new Promise(resolve => setTimeout(resolve, 350));
+    assert.ok(fetchCalls >= 2, 'reply preparation timeout must queue another reconciliation pass');
+    assert.equal(acknowledgmentAttempts, 1, 'held-route retry must stop before acknowledgment preparation');
+    assert.equal(f.replies.length, 0, 'a settled preparation must not send through the held route');
+    assert.equal(f.state.getMessage('101').state, 'reply_ready');
+  } finally {
+    channel.permissionsFor = originalPermissionsFor;
+    f.gateway.sendAcknowledgment = originalSendAcknowledgment;
+  }
+});
+
 for (const pageLimit of [10, 2]) {
   test(`completed-empty parent retains descending history with page limit ${pageLimit}`, { timeout: 4000 }, async t => {
     const f = fixture(t);

@@ -3279,6 +3279,22 @@ class DiscordGateway {
           if (current?.state !== 'replying') return current;
           return this.state.markReplyFailure(message.id, new Error('Discord recovery deadline exceeded while delivering reply'), true);
         };
+        const deliverReplyWithinRecovery = (replyMessage, replyResult) => {
+          const deliveryController = new AbortController();
+          const relayAbort = () => deliveryController.abort();
+          if (signal?.aborted) deliveryController.abort();
+          else signal?.addEventListener('abort', relayAbort, { once: true });
+          const settle = () => {
+            deliveryController.abort();
+            settleReplyDeadline();
+          };
+          return waitForRecoveryOperation(
+            () => startRecoveryOperation(() => this.consumer.deliverReply(replyMessage, replyResult, deliveryController.signal)),
+            signal,
+            deadline,
+            settle
+          ).finally(() => signal?.removeEventListener('abort', relayAbort));
+        };
         if (message.state === 'accepted') {
           for (let attempt = 0; attempt < 2; attempt += 1) {
             recoveryOperationStarted = false;
@@ -3296,31 +3312,24 @@ class DiscordGateway {
           if (current?.state === 'reply_ready') {
             this.state.recoverNativeReplyAcknowledgment(message.id);
             recoveryOperationStarted = false;
-            result = await waitForRecoveryOperation(
-              () => startRecoveryOperation(() => this.consumer.deliverReply(storedMessage, { status: current.state, message: current }, signal)),
-              signal,
-              deadline,
-              settleReplyDeadline
-            );
+            result = await deliverReplyWithinRecovery(storedMessage, { status: current.state, message: current });
           }
         } else {
           this.state.recoverNativeReplyAcknowledgment(message.id);
           recoveryOperationStarted = false;
-          result = await waitForRecoveryOperation(
-            () => startRecoveryOperation(() => this.consumer.deliverReply(storedMessage, { status: message.state, message }, signal)),
-            signal,
-            deadline,
-            settleReplyDeadline
-          );
+          result = await deliverReplyWithinRecovery(storedMessage, { status: message.state, message });
         }
         if (result === DISPATCH_OUTCOMES.NOT_SUBMITTED || result?.status === DISPATCH_OUTCOMES.NOT_SUBMITTED) {
           blockedOwners.add(key);
         }
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
-        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE && !recoveryOperationStarted) {
-          // The preflight check skipped delivery and its deadline settlement, so retain custody for a fresh pass.
-          queueReconciliationRetry([message.id]);
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE) {
+          const current = this.state.getMessage(message.id);
+          if (!recoveryOperationStarted || current?.state === 'reply_ready') {
+            // The preflight check or reply preparation skipped delivery, so retain custody for a fresh pass.
+            queueReconciliationRetry([message.id]);
+          }
         }
         blockedOwners.add(key);
         this.state.markObservationUnavailable(message.id, error);
