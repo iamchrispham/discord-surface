@@ -698,9 +698,11 @@ test('foreign users cannot exhaust both predictable fallback rendezvous names', 
   const deterministic = path.join(sharedRoot, rendezvousName);
   const shared = path.join(sharedRoot, `${rendezvousName}-shared`);
   const election = path.join(sharedRoot, `${rendezvousName}-election`);
+  const electionMarker = path.join(sharedRoot, `${rendezvousName}-fallback-election`);
   fs.mkdirSync(deterministic, { mode: 0o700 });
   fs.mkdirSync(shared, { mode: 0o700 });
   fs.mkdirSync(election, { mode: 0o700 });
+  fs.writeFileSync(electionMarker, `${rendezvousName}-random-foreign\n`, { mode: 0o600 });
   const originalStat = fs.statSync;
   t.mock.method(fs, 'statSync', (target, ...args) => {
     const stats = originalStat(target, ...args);
@@ -716,7 +718,7 @@ test('foreign users cannot exhaust both predictable fallback rendezvous names', 
   const originalLstat = fs.lstatSync;
   t.mock.method(fs, 'lstatSync', (target, ...args) => {
     const stats = originalLstat(target, ...args);
-    if ((String(target) !== deterministic && String(target) !== shared && String(target) !== election) ||
+    if ((String(target) !== deterministic && String(target) !== shared && String(target) !== election && String(target) !== electionMarker) ||
       (args.length > 0 && args[0] && args[0].bigint)) return stats;
     return {
       ...stats,
@@ -2483,6 +2485,93 @@ test('stop retains server custody when replacement quarantine setup fails', { ti
   failQuarantine = false;
   await channel.stop();
   assert.equal(fs.readFileSync(socket, 'utf8'), 'replacement');
+  const release = acquireSocketLock(socket);
+  release();
+});
+
+test('startup retains server custody when replacement quarantine setup fails', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  let witnessResolve;
+  const witnessed = new Promise(resolve => { witnessResolve = resolve; });
+  let releaseQualification;
+  const qualificationReleased = new Promise(resolve => { releaseQualification = resolve; });
+  const originalCreateServer = http.createServer;
+  t.mock.method(http, 'createServer', handler => originalCreateServer.call(http, (request, response) => {
+    if (request.method === 'HEAD' && request.url === '/identity' && request.headers['x-discord-socket-qualification']) {
+      request.resume();
+      witnessResolve();
+      void qualificationReleased.then(() => handler(request, response));
+      return;
+    }
+    handler(request, response);
+  }));
+  const originalQuarantine = socketOwnership.quarantineMismatchedSocket;
+  let failQuarantine = true;
+  t.mock.method(socketOwnership, 'quarantineMismatchedSocket', (...args) => {
+    if (failQuarantine) throw new Error('quarantine unavailable during startup');
+    return originalQuarantine(...args);
+  });
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  const starting = channel.start();
+  await witnessed;
+
+  const oldPath = `${socket}.old`;
+  fs.renameSync(socket, oldPath);
+  const replacement = http.createServer((_request, response) => response.end('replacement'));
+  t.after(async () => {
+    if (replacement.listening) await new Promise(resolve => replacement.close(resolve));
+    try { fs.unlinkSync(oldPath); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    try { await channel.stop(); } catch {}
+    fs.rmSync(path.dirname(socket), { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  await listenOn(replacement, socket);
+  releaseQualification();
+
+  await assert.rejects(starting, /listener cleanup failed/);
+  assert.ok(channel.server, 'failed startup quarantine must retain the listener reference');
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  const response = await requestOverSocket(socket);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body, 'replacement');
+
+  failQuarantine = false;
+  await channel.stop();
+  assert.equal(fs.lstatSync(socket).isSocket(), true, 'replacement listener must survive retry cleanup');
+  await new Promise(resolve => replacement.close(resolve));
+});
+
+test('stop refuses a directory replacement without stranding it', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const { dir, state } = fixture();
+  t.after(() => state.close());
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  await channel.start();
+  const oldPath = `${socket}.old`;
+  fs.renameSync(socket, oldPath);
+  fs.mkdirSync(socket, { mode: 0o700 });
+  t.after(async () => {
+    try { await channel.stop(); } catch {}
+    try { fs.rmSync(oldPath, { recursive: true, force: true }); } catch {}
+    fs.rmSync(path.dirname(socket), { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const stopError = await channel.stop().catch(error => error);
+  assert.ok(stopError instanceof AggregateError);
+  assert.ok(stopError.errors.some(error => /is a directory/.test(String(error))));
+  assert.ok(channel.server, 'directory replacement must retain the listener reference');
+  assert.throws(() => acquireSocketLock(socket), /already in progress/);
+  assert.equal(fs.lstatSync(socket).isDirectory(), true, 'directory replacement must remain untouched');
+
+  fs.rmdirSync(socket);
+  await channel.stop();
   const release = acquireSocketLock(socket);
   release();
 });

@@ -360,6 +360,7 @@ export class ClaudeChannel<
   declare startupPromise: Promise<void> | null;
   declare startupPhase: ClaudeStartupPhase | null;
   declare socketLockRelease: (() => void) | null;
+  declare startupCleanupPending: boolean;
   declare ready: boolean;
   declare transportClosed: boolean;
   declare beforeTransportClose: (() => void | Promise<void>) | null;
@@ -397,6 +398,7 @@ export class ClaudeChannel<
     this.startupPromise = null;
     this.startupPhase = null;
     this.socketLockRelease = null;
+    this.startupCleanupPending = false;
     this.ready = false;
     this.transportClosed = false;
     this.beforeTransportClose = typeof beforeTransportClose === 'function' ? beforeTransportClose : null;
@@ -454,6 +456,7 @@ export class ClaudeChannel<
   async start(): Promise<void> {
     if (this.stopPromise) await this.stopPromise;
     if (this.started) return;
+    if (this.startupCleanupPending) throw new Error('Claude channel startup cleanup is pending; stop the channel first');
     if (this.startupPromise) return this.startupPromise;
     const startup = this.startUnlocked();
     this.startupPromise = startup;
@@ -466,6 +469,7 @@ export class ClaudeChannel<
 
   private async startUnlocked(): Promise<void> {
     this.transportClosed = false;
+    this.startupCleanupPending = false;
     socketOwnership.assertSocketPath(this.socketPath);
     socketOwnership.assertSocketDirectory(this.socketPath);
     let rejectStartup: ((error: Error) => void) | null = null;
@@ -618,9 +622,12 @@ export class ClaudeChannel<
               resolve();
             }, error => {
               let socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
+              this.socketIdentity = socketIdentity ?? null;
+              this.ownsSocket = socketIdentity !== undefined;
               try {
                 socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, socketIdentity);
               } catch (quarantineError) {
+                this.startupCleanupPending = true;
                 reject(new AggregateError([error, quarantineError], 'Claude channel listener cleanup failed'));
                 return;
               }
@@ -653,18 +660,20 @@ export class ClaudeChannel<
       if (!this.stopping) {
         try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
       }
-      try { await closeServer(this.server); } catch {}
-      this.server = null;
-      if (this.ownsSocket) {
-        try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch {}
-        this.ownsSocket = false;
-        this.socketIdentity = null;
+      if (!this.startupCleanupPending) {
+        try { await closeServer(this.server); } catch {}
+        this.server = null;
+        if (this.ownsSocket) {
+          try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch {}
+          this.ownsSocket = false;
+          this.socketIdentity = null;
+        }
       }
       throw error;
     } finally {
       if (this.startupAbort === abortStartup) this.startupAbort = null;
       if (this.startupPhase === startupPhase) this.startupPhase = null;
-      if (!this.started) {
+      if (!this.started && !this.startupCleanupPending) {
         const release = this.socketLockRelease;
         if (release) {
           release();
@@ -711,6 +720,7 @@ export class ClaudeChannel<
         this.stopping = false;
         throw new AggregateError(errors, 'Claude channel stop failed');
       }
+      this.startupCleanupPending = false;
       this.server = null;
       if (this.ownsSocket) {
         try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch (error) {

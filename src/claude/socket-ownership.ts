@@ -335,6 +335,9 @@ export function quarantineMismatchedSocket(
     birthtimeNs: observedStats.birthtimeNs
   };
   if (sameSocket(observed, expected)) return undefined;
+  if (observedStats.isDirectory()) {
+    throw new Error('Claude channel socket replacement is a directory');
+  }
 
   const quarantineDeps = quarantineDependencies();
   const quarantine = prepareSocketQuarantine(socketPath, observed, quarantineDeps);

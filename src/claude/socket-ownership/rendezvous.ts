@@ -262,25 +262,63 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
         break;
       }
       if (!rendezvousDirectory) {
-        const electionPath = path.join(root, `${rendezvousName}-fallback-election`);
+        const legacyElectionName = `${rendezvousName}-fallback-election`;
+        const electionPrefix = `${legacyElectionName}-`;
         const randomPrefix = `${rendezvousName}-random-`;
         const readElection = (): string | undefined => {
-          let marker: fs.Stats;
+          let entries: string[];
           try {
-            marker = fs.lstatSync(electionPath);
+            entries = fs.readdirSync(root)
+              .filter(entry => entry === legacyElectionName || entry.startsWith(electionPrefix))
+              .sort();
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
             throw error;
           }
-          const markerOwnerControlled = owner === undefined || marker.uid === owner;
-          if (!marker.isFile() || marker.isSymbolicLink() || !markerOwnerControlled || (marker.mode & 0o077) !== 0) {
-            throw new Error('Claude channel fallback-root rendezvous election is unusable');
+          for (const entry of entries) {
+            const electionPath = path.join(root, entry);
+            let marker: fs.Stats;
+            try {
+              marker = fs.lstatSync(electionPath);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+              throw error;
+            }
+            const markerOwnerControlled = owner === undefined || marker.uid === owner;
+            if (!markerOwnerControlled) continue;
+            if (!marker.isFile() || marker.isSymbolicLink() || (marker.mode & 0o077) !== 0) {
+              throw new Error('Claude channel fallback-root rendezvous election is unusable');
+            }
+            const candidate = fs.readFileSync(electionPath, 'utf8').trim();
+            if (!candidate || path.basename(candidate) !== candidate || !candidate.startsWith(randomPrefix)) {
+              throw new Error('Claude channel fallback-root rendezvous election is invalid');
+            }
+            const candidatePath = path.join(root, candidate);
+            if (isUsableRendezvousDirectory(candidatePath)) return candidate;
+            let candidateExists = true;
+            try { fs.lstatSync(candidatePath); } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') candidateExists = false;
+              else throw error;
+            }
+            if (!candidateExists) {
+              let markerGeneration: FileGeneration;
+              try { markerGeneration = deps.fileGeneration(electionPath); } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+                throw error;
+              }
+              let currentGeneration: FileGeneration;
+              try { currentGeneration = deps.fileGeneration(electionPath); } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+                throw error;
+              }
+              if (deps.sameGeneration(currentGeneration, markerGeneration)) {
+                try { fs.unlinkSync(electionPath); } catch (error) {
+                  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+                }
+              }
+            }
           }
-          const candidate = fs.readFileSync(electionPath, 'utf8').trim();
-          if (!candidate || path.basename(candidate) !== candidate || !candidate.startsWith(randomPrefix)) {
-            throw new Error('Claude channel fallback-root rendezvous election is invalid');
-          }
-          return candidate;
+          return undefined;
         };
         let randomRendezvousName = readElection();
         if (!randomRendezvousName) {
@@ -290,14 +328,31 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
           const markerTemp = path.join(root, `.fallback-election-${process.pid}-${randomUUID()}`);
           fs.writeFileSync(markerTemp, `${candidate}\n`, { mode: 0o600, flag: 'wx' });
           let published = false;
+          let publishedElectionPath: string | undefined;
           try {
-            try {
-              fs.linkSync(markerTemp, electionPath);
-              published = true;
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+            for (;;) {
+              const electionPath = path.join(root, `${electionPrefix}${randomUUID()}`);
+              try {
+                fs.linkSync(markerTemp, electionPath);
+                published = true;
+                publishedElectionPath = electionPath;
+                break;
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+              }
             }
             randomRendezvousName = published ? candidate : readElection();
+            if (published) {
+              const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
+              for (let attempt = 0; attempt < 8; attempt += 1) {
+                const winner = readElection();
+                if (winner && winner !== candidate) {
+                  randomRendezvousName = winner;
+                  break;
+                }
+                Atomics.wait(waitBuffer, 0, 0, 1);
+              }
+            }
           } finally {
             try { fs.unlinkSync(markerTemp); } catch (error) {
               if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -305,6 +360,11 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
           }
           if (!randomRendezvousName) throw new Error('Claude channel fallback-root rendezvous election is missing');
           if (randomRendezvousName !== candidate) {
+            if (publishedElectionPath) {
+              try { fs.unlinkSync(publishedElectionPath); } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+              }
+            }
             try { fs.rmdirSync(candidatePath); } catch { /* preserve the winner if cleanup races */ }
           }
         }
