@@ -219,6 +219,13 @@ function errorMessage(error: unknown): string {
   return String((error as { message?: unknown }).message);
 }
 
+function closeServer(server: { listening: boolean; close(callback: (error?: Error) => void): void } | null | undefined): Promise<void> {
+  if (!server || !server.listening) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve());
+  });
+}
+
 function markPotentiallyDelivered(error: unknown): void {
   const deliveryError = error as { potentiallyDelivered?: unknown };
   if (deliveryError.potentiallyDelivered === undefined) deliveryError.potentiallyDelivered = true;
@@ -596,17 +603,20 @@ export class ClaudeChannel<
             .then(identity => {
               socketIdentity = identity;
               if (this.transportClosed) {
-                try { server.close(); } catch {}
-                try { socketOwnership.unlinkSocketIfOwned(this.socketPath, identity); } catch {}
-                reject(new Error('Claude channel stopped during listener startup'));
+                void closeServer(server).then(() => {
+                  try { socketOwnership.unlinkSocketIfOwned(this.socketPath, identity); } catch {}
+                  reject(new Error('Claude channel stopped during listener startup'));
+                }, () => {
+                  try { socketOwnership.unlinkSocketIfOwned(this.socketPath, identity); } catch {}
+                  reject(new Error('Claude channel stopped during listener startup'));
+                });
                 return;
               }
               this.socketIdentity = identity;
               this.ownsSocket = true;
               resolve();
             }, error => {
-              try { server.close(); } catch {}
-              reject(error);
+              void closeServer(server).then(() => reject(error), () => reject(error));
             });
         });
       });
@@ -624,7 +634,7 @@ export class ClaudeChannel<
       if (!this.stopping) {
         try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
       }
-      try { this.server?.close(); } catch {}
+      try { await closeServer(this.server); } catch {}
       this.server = null;
       if (this.ownsSocket) {
         try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch {}
@@ -661,9 +671,7 @@ export class ClaudeChannel<
         }
       }
       try {
-        if (this.server) await new Promise<void>((resolve, reject) => {
-          this.server!.close(error => error ? reject(error) : resolve());
-        });
+        await closeServer(this.server);
       } catch (error) { errors.push(error); }
       this.server = null;
       if (this.ownsSocket) {
