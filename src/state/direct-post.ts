@@ -248,8 +248,10 @@ function scopedAgentRows(state: DirectPostState, meta: DirectPostPartMeta): Dire
   return rows.filter(row => row.detail.guildId === meta.guildId && row.detail.channelId === meta.channelId &&
     row.detail.provider === meta.provider && row.detail.nativeId === meta.nativeId &&
     row.detail.generation === meta.generation &&
-    [row.detail.agentPacket, row.detail.legacyAgentPacket].some(packet =>
-      packet && typeof packet === 'object' && sources.some(source => sameAddress((packet as AgentMessage).source, source))));
+    ([row.detail.agentPacket, row.detail.legacyAgentPacket].every(packet => !packet || typeof packet !== 'object') ||
+      [row.detail.agentPacket, row.detail.legacyAgentPacket].some(packet =>
+        packet && typeof packet === 'object' && sources.some(source => sameAddress((packet as AgentMessage).source, source))) ||
+      row.detail.routingVersion !== undefined));
 }
 
 export function createDirectPostHandlers(dependencies: DirectPostDependencies): DirectPostHandlers {
