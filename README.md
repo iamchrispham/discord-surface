@@ -694,7 +694,7 @@ repair, resume or replace a session.
   network requests or change custody. A ready binding without one ready child
   is not reachable.
 - `peer_send({peer, text|text_file, dedupe_key})` resolves an exact
-  `{repoKey, provider}`, `{conductorId}` or `{channelName}` at call time.
+  `{repoKey, provider}`, `{conductorId}`, `{channelId}` or `{channelName}` at call time.
   Channel names come from the configured guild. Unknown or ambiguous peers and
   multiple active children refuse rather than select an arbitrary destination.
   Requests use signed agent packets and the existing `attachment-v1` delivery.

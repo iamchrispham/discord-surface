@@ -105,11 +105,16 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
       ]
       : [resolveAgentAddress(state, destination.binding, destination.childId), parentSelector];
     let lastError;
+    let withdrawalError;
     const matches = [];
     for (const selector of selectors) {
       try {
         matches.push(resolveAgentReplyRequest(state, input.reply_to, sourceAddress, selector, callerAddress, Error).source);
       } catch (error) {
+        if (error instanceof Error && error.message === 'agent request was withdrawn') {
+          withdrawalError = error;
+          continue;
+        }
         if (!(error instanceof Error) || error.message !== 'agent reply target is unknown or does not match the active request') {
           throw error;
         }
@@ -118,7 +123,7 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
     }
     if (matches.length > 1) throw new Error('agent reply target is ambiguous across parent and child routes');
     if (matches.length === 1) target = matches[0];
-    else throw lastError;
+    else throw withdrawalError ?? lastError;
   } else {
     target = resolveAgentAddress(state, destination.binding, destination.childId);
   }

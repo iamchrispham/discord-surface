@@ -349,6 +349,37 @@ test('reply_to can select a colliding legacy parent request through its peer', a
   assert.equal(posts, 1);
 });
 
+test('reply_to continues past a withdrawn child route to an active parent request', async t => {
+  const f = fixture(t); f.enroll('102');
+  const target = addRecipient(f);
+  const caller = f.state.getBinding('101');
+  const callerAddress = { guildId: caller.guildId, channelId: '102', provider: caller.provider,
+    nativeId: caller.nativeId, generation: caller.generation };
+  const requestPacket = channelId => ({
+    id: 'withdrawn-child-collision', kind: 'request',
+    source: { guildId: target.guildId, channelId, provider: target.provider,
+      nativeId: target.nativeId, generation: target.generation },
+    target: callerAddress, replyTo: null, routingVersion: 2, text: 'hello'
+  });
+  const childRequest = requestPacket('202');
+  const parentRequest = requestPacket('201');
+  f.state.receipt(null, 'agent-message', { packet: childRequest });
+  f.state.receipt(null, 'agent-message', { packet: parentRequest });
+  f.state.receipt(null, 'agent-request-withdrawn', {
+    packetId: childRequest.id, source: childRequest.source, target: childRequest.target
+  });
+  let postUrl;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '201', guild_id: '100' }) };
+    postUrl = url;
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  const result = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: childRequest.id,
+    text: 'reply', dedupe_key: 'withdrawn-child-reply' });
+  assert.equal(result.status, 'sent');
+  assert.match(postUrl, /channels\/201\/messages$/);
+});
+
 test('reply_to refuses a same-peer parent and child collision', async t => {
   const f = fixture(t); f.enroll('102');
   const target = addRecipient(f);
