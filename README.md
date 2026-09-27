@@ -388,12 +388,14 @@ node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
 
 `status` reports pending custody and labels live permission, native approval, quota, billing, and connection gates. Simulated tests do not prove those live gates. Completion evidence and live trials remain conductor-owned.
 
-To clear a recorded Discord intake gap after inspecting the attempted range, request explicit reconciliation and restart the Gateway:
+To clear a recorded Discord intake gap after inspecting the attempted range, request explicit reconciliation:
 
 ```sh
 node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
   --intake-channel-id CHANNEL_ID
 ```
+
+For an enrolled thread, the command also requests a wake from a compatible running Gateway. For a parent channel, it records pending reconciliation without waking the Gateway. Its owner can use the exported `requestGatewayRecovery(paths, { expectedPid })` helper in `src/cli.js` after verifying the installed Gateway's PID and wake capability. A supported wake keeps the same process and does not require a restart. If that capability is absent or the Gateway is stopped, coordinate recovery with its owner. Do not send an unchecked signal. A requested wake is not delivery proof: verify intake readiness, retained custody and the actual native pickup afterward.
 
 Delivery-only reconciliation never calls a native provider. Use `--resolution reply_not_sent` after evidence that no Discord message was created, or `--resolution reply_sent --part-index N --reply-message-id MESSAGE_ID` after finding the message. The adapter does not infer either outcome from a timeout.
 
