@@ -450,6 +450,74 @@ test('missing home and runtime roots bootstrap an unpredictable owner-only child
   }
 });
 
+test('foreign users cannot exhaust both predictable fallback rendezvous names', t => {
+  const missingHome = path.join('/tmp', `dss-missing-home-${randomUUID()}`);
+  const userInfo = os.userInfo();
+  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: missingHome }));
+  const previousRuntimeRoot = process.env.XDG_RUNTIME_DIR;
+  delete process.env.XDG_RUNTIME_DIR;
+
+  const sharedRoot = fs.mkdtempSync('/tmp/dss-rendezvous-root-');
+  fs.chmodSync(sharedRoot, 0o1777);
+  t.after(() => {
+    if (previousRuntimeRoot === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = previousRuntimeRoot;
+    fs.rmSync(sharedRoot, { recursive: true, force: true });
+  });
+  const originalRealpath = fs.realpathSync;
+  t.mock.method(fs, 'realpathSync', (target, ...args) => {
+    if (String(target) === '/tmp') return sharedRoot;
+    return originalRealpath(target, ...args);
+  });
+  const owner = process.geteuid?.() ?? process.getuid?.();
+  const ownerName = owner === undefined ? 'shared' : String(owner);
+  const componentPrefix = `.discord-surface-locks-${ownerName}-coordination`;
+  const minimumComponentLength = 90 + 1 - sharedRoot.length - path.sep.length;
+  const rendezvousName = componentPrefix.length >= minimumComponentLength
+    ? componentPrefix
+    : `${componentPrefix}${'x'.repeat(minimumComponentLength - componentPrefix.length)}`;
+  const deterministic = path.join(sharedRoot, rendezvousName);
+  const shared = path.join(sharedRoot, `${rendezvousName}-shared`);
+  fs.mkdirSync(deterministic, { mode: 0o700 });
+  fs.mkdirSync(shared, { mode: 0o700 });
+  const originalStat = fs.statSync;
+  t.mock.method(fs, 'statSync', (target, ...args) => {
+    const stats = originalStat(target, ...args);
+    if (String(target) !== sharedRoot || (args.length > 0 && args[0] && args[0].bigint)) return stats;
+    return {
+      ...stats,
+      uid: owner === undefined ? 1 : owner + 1,
+      mode: (stats.mode & ~0o1777) | 0o1777,
+      isDirectory: () => stats.isDirectory(),
+      isSymbolicLink: () => stats.isSymbolicLink()
+    };
+  });
+  const originalLstat = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    const stats = originalLstat(target, ...args);
+    if ((String(target) !== deterministic && String(target) !== shared) ||
+      (args.length > 0 && args[0] && args[0].bigint)) return stats;
+    return {
+      ...stats,
+      uid: owner === undefined ? 1 : owner + 1,
+      isDirectory: () => stats.isDirectory(),
+      isSymbolicLink: () => stats.isSymbolicLink()
+    };
+  });
+
+  const socket = socketPath(t);
+  const { release, lockPath } = acquireSocketLockWithPath(t, socket);
+  try {
+    const rendezvousChildren = fs.readdirSync(sharedRoot)
+      .filter(entry => entry === rendezvousName || entry.startsWith(`${rendezvousName}-`));
+    assert.ok(rendezvousChildren.some(entry => entry !== rendezvousName && entry !== `${rendezvousName}-shared`),
+      'selection must create an unpredictable owner-controlled rendezvous');
+    assert.equal(path.dirname(path.dirname(lockPath)).startsWith(sharedRoot), true);
+  } finally {
+    release();
+  }
+});
+
 test('a foreign shared-temp namespace cannot preempt the owner-controlled root', t => {
   const ownerRoot = isolatedNamespaceRoot(t);
   const socket = socketPath(t);
@@ -766,9 +834,28 @@ test('preparation refuses a live socket without deleting it', async t => {
   assert.equal(fs.lstatSync(socket).ino, inode);
 });
 
-test('preparation reclaims a quarantine whose creator is dead', async t => {
+test('preparation preserves name-only quarantine directories', async t => {
   isolatedNamespaceRoot(t);
   const socket = socketPath(t);
+  const deadPid = 2147480001;
+  const quarantine = path.join(path.dirname(socket), `.stale-${deadPid}-unknown-${randomUUID()}`);
+  const payload = path.join(quarantine, 'payload');
+  fs.mkdirSync(payload, { mode: 0o700, recursive: true });
+  fs.writeFileSync(path.join(payload, 'do-not-delete'), 'retained');
+
+  await assert.doesNotReject(prepareSocketAsync(socket));
+  assert.equal(fs.existsSync(quarantine), true, 'unmarked quarantine must remain untouched');
+  assert.equal(fs.readFileSync(path.join(payload, 'do-not-delete'), 'utf8'), 'retained');
+});
+
+test('preparation restores an authenticated orphan quarantine before cleanup', { timeout: 8000 }, async t => {
+  isolatedNamespaceRoot(t);
+  const socket = socketPath(t, { cleanup: false });
+  const server = net.createServer(connection => connection.destroy());
+  await new Promise(resolve => server.listen(socket, resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const expected = socketOwnership.socketPathIdentity(socket);
+  assert.ok(expected);
   const deadPid = 2147480001;
   const quarantine = path.join(path.dirname(socket), `.stale-${deadPid}-unknown-${randomUUID()}`);
   fs.mkdirSync(quarantine, { mode: 0o700 });
@@ -777,10 +864,16 @@ test('preparation reclaims a quarantine whose creator is dead', async t => {
     identity: 'fixture-dead-identity',
     generation: randomUUID()
   }), { mode: 0o600 });
-  fs.writeFileSync(path.join(quarantine, 'socket'), 'stale socket');
+  fs.writeFileSync(path.join(quarantine, 'manifest'), JSON.stringify({
+    version: 1,
+    endpoint: path.basename(socket),
+    socket: Object.fromEntries(Object.entries(expected).map(([key, value]) => [key, value.toString()]))
+  }), { mode: 0o600 });
+  fs.renameSync(socket, path.join(quarantine, 'socket'));
 
-  await assert.doesNotReject(prepareSocketAsync(socket));
+  await assert.rejects(prepareSocketAsync(socket), /already exists/);
   assert.equal(fs.existsSync(quarantine), false, 'dead quarantine must be reclaimed on restart');
+  assert.equal(fs.lstatSync(socket).isSocket(), true, 'live moved endpoint must be restored before probing');
 });
 
 test('preparation preserves regular files and symlinks', async t => {

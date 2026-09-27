@@ -1,46 +1,32 @@
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as net from 'node:net';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-
-type OwnerRecord = {
-  pid: number;
-  identity?: string;
-  generation?: string;
-};
-
-type FileIdentity = {
-  dev: bigint;
-  ino: bigint;
-};
-
-type FileGeneration = FileIdentity & { ctimeNs: bigint };
-
-type SocketIdentity = FileIdentity & { ctimeNs: bigint; birthtimeNs: bigint };
-
-type OwnerMarkerSnapshot = {
-  owner: OwnerRecord;
-  identity: FileGeneration;
-};
+import { canonicalSocketPath, pathsOverlap } from './socket-ownership/path';
+import {
+  assertLockNamespaceIsUsable,
+  LOCK_NAMESPACE,
+  lockNamespaceCandidate,
+  ownerControlledNamespaceRoot,
+  SOCKET_ENDPOINT_MAX_LENGTH
+} from './socket-ownership/rendezvous';
+import {
+  clearSocketQuarantines,
+  prepareSocketQuarantine,
+  removeSocketQuarantine,
+  restoreQuarantinedSocket,
+  unlinkSocketIfOwned as unlinkSocketIfOwnedQuarantine,
+  type QuarantineDependencies
+} from './socket-ownership/quarantine';
+import type { FileGeneration, FileIdentity, OwnerMarkerSnapshot, OwnerRecord, SocketIdentity } from './socket-ownership/types';
 
 export type SocketPathIdentity = SocketIdentity;
 
 export type SocketLockRelease = () => void;
 
-const LOCK_NAMESPACE = '.discord-surface-locks';
-const SOCKET_ENDPOINT_MAX_LENGTH = 90;
-const LOCK_NAMESPACE_SUFFIX = 'coordination';
-const caseSensitivityByDirectory = new Map<string, boolean>();
-const normalizationSensitivityByDirectory = new Map<string, boolean>();
 const linuxBootId = readLinuxBootId();
 const ownerIdentity = processIdentity(process.pid);
-
-function staleQuarantinePrefix(): string {
-  const identity = ownerIdentity ? Buffer.from(ownerIdentity).toString('base64url') : 'unknown';
-  return `.stale-${process.pid}-${identity}-`;
-}
 
 function effectiveUserId(): number | undefined {
   return process.geteuid?.() ?? process.getuid?.();
@@ -155,551 +141,12 @@ export function socketPathIdentity(socketPath: string): SocketPathIdentity | und
   }
 }
 
-function restoreQuarantinedSocket(quarantinedPath: string, socketPath: string): void {
-  try {
-    fs.linkSync(quarantinedPath, socketPath);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'EEXIST') {
-      fs.unlinkSync(quarantinedPath);
-      return;
-    }
-    if (code === 'EPERM' || code === 'EOPNOTSUPP' || code === 'EXDEV') return;
-    throw error;
-  }
-  fs.unlinkSync(quarantinedPath);
-}
-
-function removeSocketQuarantine(quarantineDirectory: string): void {
-  fs.rmSync(quarantineDirectory, { recursive: true, force: true });
-}
-
-function quarantineOwner(quarantineDirectory: string): OwnerRecord | undefined {
-  const ownerPath = path.join(quarantineDirectory, 'owner');
-  let ownerValue: string | undefined;
-  try {
-    ownerValue = fs.readFileSync(ownerPath, 'utf8').trim();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return undefined;
-  }
-  if (ownerValue) {
-    try { return parseSocketLockOwner(ownerValue); } catch {}
-  }
-  const match = path.basename(quarantineDirectory).match(/^\.stale-(\d+)-([A-Za-z0-9_-]+)-/);
-  if (!match) return undefined;
-  const pid = Number(match[1]);
-  if (!Number.isSafeInteger(pid) || pid < 1) return undefined;
-  if (match[2] === 'unknown') return { pid };
-  try { return { pid, identity: Buffer.from(match[2], 'base64url').toString('utf8') }; } catch { return undefined; }
-}
-
-function clearOrphanSocketQuarantines(socketDirectory: string): void {
-  let entries: string[];
-  try { entries = fs.readdirSync(socketDirectory); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw error;
-  }
-  for (const entry of entries) {
-    if (!entry.startsWith('.stale-')) continue;
-    const quarantineDirectory = path.join(socketDirectory, entry);
-    let stats: fs.Stats;
-    try { stats = fs.lstatSync(quarantineDirectory); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw error;
-    }
-    if (!stats.isDirectory() || stats.isSymbolicLink()) continue;
-    const owner = quarantineOwner(quarantineDirectory);
-    if (!owner || isSocketLockOwnerAlive(owner)) continue;
-    removeSocketQuarantine(quarantineDirectory);
-  }
-}
-
-function createSocketQuarantine(socketDirectory: string): { directory: string; ownerPath: string } {
-  const directory = fs.mkdtempSync(path.join(socketDirectory, staleQuarantinePrefix()));
-  const ownerPath = path.join(directory, 'owner');
-  try {
-    writeOwnerMarker(ownerPath);
-    return { directory, ownerPath };
-  } catch (error) {
-    removeSocketQuarantine(directory);
-    throw error;
-  }
-}
-
-export function unlinkSocketIfOwned(socketPath: string, expected: SocketPathIdentity | null | undefined): void {
-  clearOrphanSocketQuarantines(path.dirname(socketPath));
-  if (!expected) return;
-  let observed: SocketIdentity;
-  try { observed = socketIdentity(socketPath); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw error;
-  }
-  if (!sameSocket(observed, expected)) return;
-  let quarantineDirectory: string | undefined;
-  let quarantineMoved = false;
-  try {
-    const quarantine = createSocketQuarantine(path.dirname(socketPath));
-    quarantineDirectory = quarantine.directory;
-    const quarantinedPath = path.join(quarantineDirectory, 'socket');
-    fs.renameSync(socketPath, quarantinedPath);
-    quarantineMoved = true;
-    const quarantined = socketIdentity(quarantinedPath);
-    if (!sameQuarantinedSocket(quarantined, expected)) {
-      restoreQuarantinedSocket(quarantinedPath, socketPath);
-      removeSocketQuarantine(quarantineDirectory);
-      quarantineDirectory = undefined;
-      return;
-    }
-    fs.unlinkSync(quarantinedPath);
-    removeSocketQuarantine(quarantineDirectory);
-    quarantineDirectory = undefined;
-  } catch (error) {
-    if (quarantineDirectory !== undefined && !quarantineMoved) {
-      removeSocketQuarantine(quarantineDirectory);
-      quarantineDirectory = undefined;
-    }
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-}
-
-function alternateCase(value: string): string {
-  const index = value.search(/[A-Za-z]/);
-  if (index < 0) return value;
-  const character = value[index];
-  const replacement = character === character.toLowerCase() ? character.toUpperCase() : character.toLowerCase();
-  return `${value.slice(0, index)}${replacement}${value.slice(index + 1)}`;
-}
-
-function isCaseInsensitiveDirectory(directoryPath: string): boolean {
-  const cached = caseSensitivityByDirectory.get(directoryPath);
-  if (cached !== undefined) return cached;
-  const probeName = `.discord-surface-case-${randomUUID()}`;
-  const probePath = path.join(directoryPath, probeName);
-  const alternatePath = path.join(directoryPath, alternateCase(probeName));
-  let descriptor: number | undefined;
-  let insensitive = false;
-  try {
-    descriptor = fs.openSync(probePath, 'wx', 0o600);
-    try {
-      insensitive = sameFile(fileIdentity(probePath), fileIdentity(alternatePath));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    return false;
-  } finally {
-    if (descriptor !== undefined) {
-      try { fs.closeSync(descriptor); } catch {}
-    }
-    try { fs.unlinkSync(probePath); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-  }
-  caseSensitivityByDirectory.set(directoryPath, insensitive);
-  return insensitive;
-}
-
-function isNormalizationInsensitiveDirectory(directoryPath: string): boolean {
-  const cached = normalizationSensitivityByDirectory.get(directoryPath);
-  if (cached !== undefined) return cached;
-  const probeName = `.discord-surface-normalization-${randomUUID()}`;
-  const composedPath = path.join(directoryPath, `${probeName}-é`);
-  const decomposedPath = path.join(directoryPath, `${probeName}-e\u0301`);
-  let descriptor: number | undefined;
-  let insensitive = false;
-  try {
-    descriptor = fs.openSync(composedPath, 'wx', 0o600);
-    try {
-      insensitive = sameFile(fileIdentity(composedPath), fileIdentity(decomposedPath));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    return false;
-  } finally {
-    if (descriptor !== undefined) {
-      try { fs.closeSync(descriptor); } catch {}
-    }
-    try { fs.unlinkSync(composedPath); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    try { fs.unlinkSync(decomposedPath); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-  }
-  normalizationSensitivityByDirectory.set(directoryPath, insensitive);
-  return insensitive;
-}
-
-function canonicalSocketPath(socketPath: string): string {
-  const parentPath = path.dirname(socketPath);
-  let canonicalParentPath = parentPath;
-  try {
-    canonicalParentPath = fs.realpathSync(parentPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-  const basename = path.basename(socketPath);
-  const caseInsensitive = isCaseInsensitiveDirectory(canonicalParentPath);
-  const normalizationInsensitive = isNormalizationInsensitiveDirectory(canonicalParentPath);
-  const normalizedBasename = normalizationInsensitive ? basename.normalize('NFC') : basename;
-  if (!caseInsensitive && !normalizationInsensitive) return path.join(canonicalParentPath, basename);
-  const comparableBasename = caseInsensitive ? filesystemCaseFold(normalizedBasename) : normalizedBasename;
-  return path.join(canonicalParentPath, comparableBasename);
-}
-
-function pathIsWithin(parentPath: string, childPath: string): boolean {
-  const relativePath = path.relative(parentPath, childPath);
-  return relativePath === '' || (relativePath !== '..' && !relativePath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePath));
-}
-
-function pathsOverlap(leftPath: string, rightPath: string): boolean {
-  return pathIsWithin(leftPath, rightPath) || pathIsWithin(rightPath, leftPath);
-}
-
-function filesystemCaseFold(value: string): string {
-  // Per-code-point folding keeps final sigma and the Unicode special cases stable.
-  return Array.from(value, character => {
-    const codePoint = character.codePointAt(0)!;
-    if (codePoint === 0x1e9e) return 'ss';
-    if (codePoint === 0x0131 || (codePoint >= 0x13a0 && codePoint <= 0x13f5)) return character;
-    if (codePoint >= 0x13f8 && codePoint <= 0x13fd) {
-      return String.fromCodePoint(codePoint - 8);
-    }
-    if (codePoint >= 0xab70 && codePoint <= 0xabbf) {
-      return String.fromCodePoint(codePoint - 0x97d0);
-    }
-    return character.toUpperCase().toLowerCase();
-  }).join('');
-}
-
-function lockNamespaceCandidate(parentPath: string, prefix: string): string {
-  const componentPrefix = `${prefix}-${LOCK_NAMESPACE_SUFFIX}`;
-  const minimumComponentLength = SOCKET_ENDPOINT_MAX_LENGTH + 1 - parentPath.length - path.sep.length;
-  const component = componentPrefix.length >= minimumComponentLength
-    ? componentPrefix
-    : `${componentPrefix}${'x'.repeat(minimumComponentLength - componentPrefix.length)}`;
-  return path.join(parentPath, component);
-}
-
-function assertLockNamespaceIsUsable(namespacePath: string, owner: number | undefined): void {
-  const directory = fs.lstatSync(namespacePath);
-  if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0 ||
-    (owner !== undefined && directory.uid !== owner)) {
-    throw new Error('Claude channel socket lock namespace is unusable');
-  }
-}
-
-function ownerControlledNamespaceRoot(): string {
-  const owner = effectiveUserId();
-  const ownerName = owner === undefined ? 'shared' : String(owner);
-  const candidates: string[] = [];
-  try {
-    // The passwd-backed home directory is stable across invocations when it
-    // is usable, but service accounts may not have one.
-    candidates.push(fs.realpathSync(os.userInfo().homedir));
-  } catch {
-    // Try the stable system temporary root below.
-  }
-  try { candidates.push(fs.realpathSync('/tmp')); } catch {
-    // No stable system temporary root is available.
-  }
-
-  for (const root of candidates) {
-    let directory: fs.Stats;
-    try { directory = fs.statSync(root); } catch { continue; }
-    if (!directory.isDirectory()) continue;
-    const ownerControlledRoot = owner === undefined || directory.uid === owner;
-    const ownerWritableRoot = owner === undefined || (directory.mode & 0o200) !== 0;
-    if (ownerControlledRoot && ownerWritableRoot && (directory.mode & 0o022) === 0) {
-      try {
-        fs.accessSync(root, fs.constants.W_OK | fs.constants.X_OK);
-        return root;
-      } catch {
-        // Try the next candidate.
-      }
-    }
-
-    // A sticky shared temporary root can safely contain a randomly named,
-    // owner-only child. A group-writable home without the sticky bit is not a
-    // safe fallback because another UID could replace that child.
-    const stickySharedRoot = (directory.mode & 0o1000) !== 0 && (directory.mode & 0o002) !== 0;
-    if (!stickySharedRoot) continue;
-    const privateRootPrefix = `.claude-channel-${ownerName}-`;
-    const rendezvousName = path.basename(lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`));
-    const rendezvousPrefix = `${rendezvousName}-`;
-    type RendezvousState = { root?: string; staleMarker?: FileGeneration };
-    const isUsableRendezvousDirectory = (candidate: string): boolean => {
-      try {
-        const directory = fs.lstatSync(candidate);
-        const ownerControlled = owner === undefined || directory.uid === owner;
-        const ownerWritable = owner === undefined || (directory.mode & 0o200) !== 0;
-        return directory.isDirectory() && !directory.isSymbolicLink() && ownerControlled && ownerWritable &&
-          (directory.mode & 0o077) === 0;
-      } catch {
-        return false;
-      }
-    };
-    const readRendezvousRoot = (rendezvousDirectory: string): RendezvousState => {
-      const rendezvousPath = path.join(rendezvousDirectory, 'fallback-root');
-      let marker: fs.Stats;
-      try {
-        marker = fs.lstatSync(rendezvousPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
-        throw error;
-      }
-      const markerOwnerControlled = owner === undefined || marker.uid === owner;
-      const markerOwnerWritable = owner === undefined || (marker.mode & 0o200) !== 0;
-      if (!marker.isFile() || marker.isSymbolicLink() || !markerOwnerControlled || !markerOwnerWritable ||
-        (marker.mode & 0o077) !== 0) {
-        throw new Error('Claude channel fallback-root rendezvous is unusable');
-      }
-      const target = fs.readFileSync(rendezvousPath, 'utf8').trim();
-      if (!target || path.basename(target) !== target || !target.startsWith(privateRootPrefix)) {
-        throw new Error('Claude channel fallback-root rendezvous is invalid');
-      }
-      const privateRoot = path.join(root, target);
-      try {
-        const privateDirectory = fs.lstatSync(privateRoot);
-        const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
-        const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
-        if (!privateDirectory.isDirectory() || privateDirectory.isSymbolicLink() || !privateOwnerControlled ||
-          !privateOwnerWritable || (privateDirectory.mode & 0o077) !== 0) {
-          throw new Error('Claude channel fallback-root target is unusable');
-        }
-        return { root: privateRoot };
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        let staleMarker: FileGeneration;
-        try { staleMarker = fileGeneration(rendezvousPath); } catch (markerError) {
-          if ((markerError as NodeJS.ErrnoException).code === 'ENOENT') return {};
-          throw markerError;
-        }
-        return { staleMarker };
-      }
-    };
-    const readPublishedRendezvousRoot = (rendezvousDirectory: string, message: string): string => {
-      for (let attempt = 0; attempt < 8; attempt += 1) {
-        const winnerRoot = readRendezvousRoot(rendezvousDirectory).root;
-        if (winnerRoot) return winnerRoot;
-      }
-      throw new Error(message);
-    };
-    try {
-      const privateRoots = fs.readdirSync(root)
-        .filter(entry => entry.startsWith(privateRootPrefix))
-        .map(entry => path.join(root, entry))
-        .filter(candidate => {
-          try {
-            const privateDirectory = fs.lstatSync(candidate);
-            const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
-            const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
-            return privateDirectory.isDirectory() && !privateDirectory.isSymbolicLink() && privateOwnerControlled &&
-              privateOwnerWritable && (privateDirectory.mode & 0o077) === 0;
-          } catch {
-            return false;
-          }
-        });
-      const rendezvousCandidates = fs.readdirSync(root)
-        .filter(entry => entry === rendezvousName || entry.startsWith(rendezvousPrefix))
-        .map(entry => path.join(root, entry))
-        .filter(isUsableRendezvousDirectory)
-        .sort();
-      let rendezvousDirectory: string | undefined;
-      let rendezvousState: RendezvousState = {};
-      for (const candidate of rendezvousCandidates) {
-        const candidateState = readRendezvousRoot(candidate);
-        if (candidateState.root) {
-          rendezvousDirectory = candidate;
-          rendezvousState = candidateState;
-          break;
-        }
-        if (!rendezvousDirectory || candidateState.staleMarker) {
-          rendezvousDirectory = candidate;
-          rendezvousState = candidateState;
-        }
-      }
-      if (!rendezvousDirectory) {
-        const deterministicRendezvousDirectory = path.join(root, rendezvousName);
-        try {
-          fs.mkdirSync(deterministicRendezvousDirectory, { mode: 0o700 });
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        }
-        if (isUsableRendezvousDirectory(deterministicRendezvousDirectory)) {
-          rendezvousDirectory = deterministicRendezvousDirectory;
-        }
-      }
-      if (!rendezvousDirectory) {
-        const sharedRendezvousDirectory = path.join(root, `${rendezvousName}-shared`);
-        try {
-          fs.mkdirSync(sharedRendezvousDirectory, { mode: 0o700 });
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        }
-        if (isUsableRendezvousDirectory(sharedRendezvousDirectory)) {
-          rendezvousDirectory = sharedRendezvousDirectory;
-        }
-      }
-      if (!rendezvousDirectory) {
-        throw new Error('Claude channel fallback-root rendezvous is unusable');
-      }
-      const rendezvousPath = path.join(rendezvousDirectory, 'fallback-root');
-      let privateRoot = rendezvousState.root;
-      let staleMarker = rendezvousState.staleMarker;
-      let createdPrivateRoot = false;
-      if (!privateRoot) {
-        privateRoot = privateRoots.sort()[0];
-      }
-      if (!privateRoot) {
-        privateRoot = fs.mkdtempSync(path.join(root, privateRootPrefix));
-        createdPrivateRoot = true;
-      }
-      const currentRendezvousState = readRendezvousRoot(rendezvousDirectory);
-      staleMarker = currentRendezvousState.staleMarker ?? staleMarker;
-      if (currentRendezvousState.root) {
-        const rendezvousRoot = currentRendezvousState.root;
-        if (createdPrivateRoot && rendezvousRoot !== privateRoot) {
-          try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
-        }
-        privateRoot = rendezvousRoot;
-      } else {
-        const markerTemp = path.join(rendezvousDirectory, `.fallback-root-${process.pid}-${randomUUID()}`);
-        fs.writeFileSync(markerTemp, path.basename(privateRoot), { mode: 0o600, flag: 'wx' });
-        try {
-          if (staleMarker) {
-            const markerBeforeReplace = readRendezvousRoot(rendezvousDirectory).staleMarker;
-            if (!markerBeforeReplace) {
-              let published = false;
-              try {
-                fs.linkSync(markerTemp, rendezvousPath);
-                published = true;
-              } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-              }
-              if (published) {
-                staleMarker = undefined;
-              } else {
-                const winnerRoot = readPublishedRendezvousRoot(rendezvousDirectory,
-                  'Claude channel fallback-root rendezvous changed');
-                if (createdPrivateRoot && winnerRoot !== privateRoot) {
-                  try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
-                }
-                privateRoot = winnerRoot;
-              }
-            } else if (!sameGeneration(markerBeforeReplace, staleMarker)) {
-              const winnerRoot = readPublishedRendezvousRoot(rendezvousDirectory,
-                'Claude channel fallback-root rendezvous changed');
-              if (createdPrivateRoot && winnerRoot !== privateRoot) {
-                try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
-              }
-              privateRoot = winnerRoot;
-            } else {
-              // Move the observed marker out, then publish with a no-overwrite link.
-              const markerClaim = path.join(rendezvousDirectory, `.fallback-root-claim-${process.pid}-${randomUUID()}`);
-              let claimed = false;
-              try {
-                fs.renameSync(rendezvousPath, markerClaim);
-                claimed = true;
-              } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-              }
-              if (!claimed) {
-                let published = false;
-                try {
-                  fs.linkSync(markerTemp, rendezvousPath);
-                  published = true;
-                } catch (error) {
-                  if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-                }
-                if (published) {
-                  staleMarker = undefined;
-                } else {
-                  const winnerRoot = readPublishedRendezvousRoot(rendezvousDirectory,
-                    'Claude channel fallback-root rendezvous changed');
-                  if (createdPrivateRoot && winnerRoot !== privateRoot) {
-                    try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
-                  }
-                  privateRoot = winnerRoot;
-                }
-              } else {
-                const claimedIdentity = fileIdentity(markerClaim);
-                if (!sameFile(claimedIdentity, staleMarker)) {
-                  try {
-                    fs.linkSync(markerClaim, rendezvousPath);
-                  } catch (error) {
-                    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-                  }
-                  try { fs.unlinkSync(markerClaim); } catch (error) {
-                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-                  }
-                  const winnerRoot = readPublishedRendezvousRoot(rendezvousDirectory,
-                    'Claude channel fallback-root rendezvous changed');
-                  if (createdPrivateRoot && winnerRoot !== privateRoot) {
-                    try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
-                  }
-                  privateRoot = winnerRoot;
-                } else {
-                  let published = false;
-                  try {
-                    fs.linkSync(markerTemp, rendezvousPath);
-                    published = true;
-                  } catch (error) {
-                    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-                  }
-                  try { fs.unlinkSync(markerClaim); } catch (error) {
-                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-                  }
-                  if (published) {
-                    staleMarker = undefined;
-                  } else {
-                    const winnerRoot = readPublishedRendezvousRoot(rendezvousDirectory,
-                      'Claude channel fallback-root rendezvous changed');
-                    if (createdPrivateRoot && winnerRoot !== privateRoot) {
-                      try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
-                    }
-                    privateRoot = winnerRoot;
-                  }
-                }
-              }
-            }
-          } else {
-            try {
-              fs.linkSync(markerTemp, rendezvousPath);
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-              const winnerRoot = readPublishedRendezvousRoot(rendezvousDirectory,
-                'Claude channel fallback-root rendezvous is missing');
-              if (createdPrivateRoot && winnerRoot !== privateRoot) {
-                try { fs.rmdirSync(privateRoot); } catch { /* preserve the winner if cleanup races */ }
-              }
-              privateRoot = winnerRoot;
-            }
-          }
-        } finally {
-          try { fs.unlinkSync(markerTemp); } catch { /* marker link owns the content */ }
-        }
-      }
-      const privateDirectory = fs.lstatSync(privateRoot);
-      const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
-      const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
-      if (privateDirectory.isDirectory() && !privateDirectory.isSymbolicLink() && privateOwnerControlled &&
-        privateOwnerWritable && (privateDirectory.mode & 0o077) === 0) {
-        fs.accessSync(privateRoot, fs.constants.W_OK | fs.constants.X_OK);
-        return privateRoot;
-      }
-    } catch {
-      // Try the next candidate.
-    }
-  }
-  throw new Error('Claude channel socket lock namespace root is unusable');
-}
-
 function lockNamespacePath(socketPath: string): string {
-  const root = ownerControlledNamespaceRoot();
+  const root = ownerControlledNamespaceRoot({
+    effectiveUserId,
+    fileGeneration,
+    sameGeneration
+  });
   const owner = effectiveUserId();
   const ownerName = owner === undefined ? 'shared' : String(owner);
   const namespacePath = lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`);
@@ -810,6 +257,23 @@ function isSocketLockOwnerAlive(owner: OwnerRecord): boolean {
   const currentIdentity = processIdentity(owner.pid);
   if (!currentIdentity) return true;
   return currentIdentity === owner.identity;
+}
+
+function quarantineDependencies(): QuarantineDependencies {
+  return {
+    ownerIdentity,
+    effectiveUserId,
+    parseOwner: parseSocketLockOwner,
+    isOwnerAlive: isSocketLockOwnerAlive,
+    writeOwnerMarker,
+    socketIdentity,
+    sameSocket,
+    sameQuarantinedSocket
+  };
+}
+
+export function unlinkSocketIfOwned(socketPath: string, expected: SocketPathIdentity | null | undefined): void {
+  unlinkSocketIfOwnedQuarantine(socketPath, expected, quarantineDependencies());
 }
 
 function unlinkIfPresent(filePath: string): void {
@@ -1158,7 +622,8 @@ export async function withSocketLock<T>(socketPath: string, action: () => Promis
 }
 
 export async function prepareSocket(socketPath: string, signal?: AbortSignal): Promise<void> {
-  clearOrphanSocketQuarantines(path.dirname(socketPath));
+  const quarantineDeps = quarantineDependencies();
+  clearSocketQuarantines(path.dirname(socketPath), quarantineDeps);
   let original: fs.Stats;
   try { original = fs.lstatSync(socketPath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
@@ -1200,16 +665,19 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
       let quarantineDirectory: string | undefined;
       let quarantineMoved = false;
       try {
-        const quarantine = createSocketQuarantine(path.dirname(socketPath));
+        const expected = socketIdentity(socketPath);
+        const quarantine = prepareSocketQuarantine(socketPath, expected, quarantineDeps);
         quarantineDirectory = quarantine.directory;
         const quarantinedPath = path.join(quarantineDirectory, 'socket');
         fs.renameSync(socketPath, quarantinedPath);
         quarantineMoved = true;
         const quarantined = fs.lstatSync(quarantinedPath);
         if (!quarantined.isSocket() || quarantined.uid !== original.uid ||
-          quarantined.dev !== original.dev || quarantined.ino !== original.ino ||
-          quarantined.birthtimeMs !== original.birthtimeMs) {
-          restoreQuarantinedSocket(quarantinedPath, socketPath);
+          !sameQuarantinedSocket(socketIdentity(quarantinedPath), expected)) {
+          if (!restoreQuarantinedSocket(quarantinedPath, socketPath)) {
+            reject(new Error('Claude channel socket restore is unavailable'));
+            return;
+          }
           removeSocketQuarantine(quarantineDirectory);
           quarantineDirectory = undefined;
           reject(new Error('Claude channel socket changed during stale probe'));
