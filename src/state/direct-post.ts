@@ -43,7 +43,7 @@ export type {
 } from './direct-post/contracts';
 import { createHash } from 'node:crypto';
 import { isAgentSourcePromotion } from './agent-routing';
-import type { AgentAddress, AgentMessage, AgentProvider } from '../agent-message';
+import { sameAddress, type AgentAddress, type AgentMessage, type AgentProvider } from '../agent-message';
 import type { WatcherNotice } from '../watcher-notice';
 import { DIRECT_POST_FILE_LIMITS, DIRECT_POST_FILE_PHASES, stagedDirectPostFilePath } from '../direct-post-file';
 import type { DirectPostFileManifest, DirectPostFilePreparation } from '../direct-post-file';
@@ -244,9 +244,12 @@ function directPostCustodyKey(detail: DirectPostReceiptDetail): string {
 function scopedAgentRows(state: DirectPostState, meta: DirectPostPartMeta): DirectPostReceiptRow[] {
   const rows = state.directPostRows(meta.requestId, meta.agentPacket ? meta.channelId : null);
   if (!meta.agentPacket) return rows;
+  const sources = [meta.agentPacket.source, meta.legacyAgentPacket?.source].filter(Boolean);
   return rows.filter(row => row.detail.guildId === meta.guildId && row.detail.channelId === meta.channelId &&
     row.detail.provider === meta.provider && row.detail.nativeId === meta.nativeId &&
-    row.detail.generation === meta.generation);
+    row.detail.generation === meta.generation &&
+    [row.detail.agentPacket, row.detail.legacyAgentPacket].some(packet =>
+      packet && typeof packet === 'object' && sources.some(source => sameAddress((packet as AgentMessage).source, source))));
 }
 
 export function createDirectPostHandlers(dependencies: DirectPostDependencies): DirectPostHandlers {

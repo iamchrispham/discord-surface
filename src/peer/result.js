@@ -71,14 +71,13 @@ function inspectPeerResult(state, source, correlationId) {
     packet: row.detail.agentPacket,
     legacyAgentPacket: row.detail.legacyAgentPacket
   })).filter(record => record.packet);
-  const packets = records.map(record => record.packet);
   for (const record of records) {
     validateAgentMessage(record.packet);
     if (record.legacyAgentPacket) validateAgentMessage(record.legacyAgentPacket);
   }
-  const packet = packets[0];
+  const canonicalRecord = records.at(-1);
+  const packet = canonicalRecord?.packet;
   if (!packet) throw new Error('correlation is unknown for this caller');
-  const canonicalRecord = records[0];
   if (records.some(candidate => !packetRecordsMatch(candidate, canonicalRecord))) throw new Error('correlation has conflicting custody');
   const receipts = state.listAgentMessageReceiptIds(packet.id);
   const deliveries = [];
