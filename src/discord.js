@@ -3076,7 +3076,7 @@ class DiscordGateway {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE) {
           const current = this.state.getMessage(message.id);
-          if (!channelFetchStarted && (message.state === 'reply_ready' || current?.state === 'reply_ready')) {
+          if (message.state === 'reply_ready' || current?.state === 'reply_ready') {
             queueReconciliationRetry();
           }
         }
