@@ -21,7 +21,9 @@ const MAX_PACKET_METADATA_BYTES = Buffer.byteLength(JSON.stringify({
 }), 'utf8');
 const MAX_PEER_TEXT_BYTES = Math.max(1,
   Math.floor((AGENT_MESSAGE_MAX_ENCODED_LENGTH - AGENT_WIRE_FIXED_OVERHEAD) * 3 / 4) - MAX_PACKET_METADATA_BYTES);
-const payloadText = { type: 'string', minLength: 1, maxLength: Math.floor(MAX_PEER_TEXT_BYTES / 4), pattern: '[^\\s]' };
+const MAX_JSON_ESCAPED_TEXT_BYTES = 6;
+const payloadText = { type: 'string', minLength: 1,
+  maxLength: Math.floor(MAX_PEER_TEXT_BYTES / MAX_JSON_ESCAPED_TEXT_BYTES), pattern: '[^\\s]' };
 
 const selector = { oneOf: [
   { type: 'object', properties: { repoKey: nonBlankString, provider: { enum: ['codex', 'claude'] } }, required: ['repoKey', 'provider'], additionalProperties: false },

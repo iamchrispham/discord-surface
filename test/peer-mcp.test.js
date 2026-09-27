@@ -5,7 +5,24 @@ const path = require('node:path');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
 const { fixture } = require('./fixtures/peer-fixture');
+const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { parseArgs } = require('../src/cli');
+
+function maxEncodedNullText() {
+  const packet = {
+    id: 'a'.repeat(128), kind: KINDS.RESULT,
+    source: { guildId: '0'.repeat(20), channelId: '1'.repeat(20), provider: 'claude',
+      nativeId: '00000000-0000-0000-0000-000000000000', generation: Number.MAX_SAFE_INTEGER },
+    target: { guildId: '0'.repeat(20), channelId: '2'.repeat(20), provider: 'claude',
+      nativeId: '11111111-1111-1111-1111-111111111111', generation: Number.MAX_SAFE_INTEGER },
+    replyTo: 'a'.repeat(128), routingVersion: 2, sourceParentChannelId: '0'.repeat(20), text: ''
+  };
+  let length = 0;
+  while (true) {
+    try { encodeAgentMessage({ ...packet, text: '\0'.repeat(length + 1) }, 'fixture'); length++; }
+    catch { return length; }
+  }
+}
 
 test('mcp accepts provider and state flags, rejects unknown and repeated flags', () => {
   for (const provider of ['codex', 'claude']) {
@@ -52,7 +69,7 @@ test('public MCP stdio lists the caller and refuses an unready send', { timeout:
     assert.equal(postSchema.properties.reply_to.type, 'string');
     assert.equal(postSchema.properties.text_file.maxLength, 4096);
     assert.equal(peerSendSchema.properties.dedupe_key.maxLength, 128);
-    assert.ok(peerSendSchema.properties.text.maxLength < 1500);
+    assert.ok(peerSendSchema.properties.text.maxLength <= maxEncodedNullText());
     const packetPattern = new RegExp(peerSendSchema.properties.dedupe_key.pattern);
     assert.equal(packetPattern.test('a'.repeat(128)), true);
     assert.equal(packetPattern.test('a'.repeat(129)), false);

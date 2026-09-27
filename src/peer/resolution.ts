@@ -16,7 +16,7 @@ interface PeerState {
   getBindingReadinessReceipt(channelId: string): Record<string, unknown> | null;
 }
 
-function selectorValues(selector: PeerSelector): [string, string][] {
+export function validatePeerSelector(selector: PeerSelector): void {
   if (!selector || typeof selector !== 'object' || Array.isArray(selector)) throw new Error('peer selector must be an object');
   const entries = Object.entries(selector);
   const keys = entries.map(([key]) => key).sort().join(',');
@@ -25,11 +25,10 @@ function selectorValues(selector: PeerSelector): [string, string][] {
       ('provider' in selector && !['codex', 'claude'].includes(selector.provider))) {
     throw new Error('peer selector requires exactly repoKey and provider, conductorId, channelId, or channelName');
   }
-  return entries;
 }
 
 export function resolvePeerBinding(state: PeerState, selector: PeerSelector, channels: readonly PeerChannel[] = []): PeerBinding {
-  selectorValues(selector);
+  validatePeerSelector(selector);
   const { guildId } = state.requireConfig();
   const bindings = state.listBindings().filter(binding => binding.active && binding.guildId === guildId);
   let candidates: PeerBinding[];

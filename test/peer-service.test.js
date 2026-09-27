@@ -104,6 +104,14 @@ test('handoff during name lookup refuses before network send or custody', async 
   assert.equal(f.state.listReceipts().length, before);
 });
 
+test('malformed channel-name selectors refuse before channel lookup', async t => {
+  const f = fixture(t); f.enroll('102'); let lookups = 0;
+  const peer = service(f, { loadChannels: async () => { lookups++; return []; } });
+  await assert.rejects(peer.send({ peer: { channelName: {}, extra: true }, text: 'hello', dedupe_key: 'invalid-channel-selector' }),
+    /peer selector requires exactly/);
+  assert.equal(lookups, 0);
+});
+
 test('tool arguments cannot override the native caller or combine destinations', async t => {
   const f = fixture(t); const peer = service(f); const before = f.state.listReceipts().length;
   await assert.rejects(peer.send({ ...request, nativeId: id }), /invalid peer send/);
@@ -397,6 +405,31 @@ test('peer result preserves current and rejects stale legacy parent destinations
   f.state.db.prepare("UPDATE bindings SET generation=generation+1 WHERE channel_id='101'").run();
   const stale = await recipient.send({ reply_to: request.id, text: 'stale result', dedupe_key: 'legacy-parent-stale' });
   assert.equal(stale.status, 'stale');
+});
+
+test('correlated reply keeps a recorded child route when another child enrolls', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
+  const caller = f.state.getBinding('101');
+  const request = {
+    id: 'child-route-request', kind: 'request',
+    source: { guildId: target.guildId, channelId: '202', provider: target.provider,
+      nativeId: target.nativeId, generation: target.generation },
+    target: { guildId: caller.guildId, channelId: '102', provider: caller.provider,
+      nativeId: caller.nativeId, generation: caller.generation },
+    replyTo: null, text: 'child request'
+  };
+  f.state.receipt(null, 'agent-message', { packet: request });
+  f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100' }, target);
+  f.state.markThreadBoundary('203', THREAD_STATES.READY, 'fixture', null, null, target);
+  let postUrl;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    postUrl = url;
+    return { ok: true, status: 200, json: async () => ({ id: '10003' }) };
+  } });
+  const result = await peer.send({ reply_to: request.id, text: 'child result', dedupe_key: 'child-route-result' });
+  assert.equal(result.status, 'sent');
+  assert.match(postUrl, /channels\/202\/messages$/);
 });
 
 for (const outcome of ['sent', 'unknown']) {

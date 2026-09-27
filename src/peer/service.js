@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { resolvePeerCaller } = require('./caller');
-const { resolvePeerBinding, requireReadyPeer } = require('../../dist/peer/resolution');
+const { resolvePeerBinding, validatePeerSelector, requireReadyPeer } = require('../../dist/peer/resolution');
 const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest } = require('../../dist/state/agent-routing');
 const { readTextFile, resolveAgentAddress, runDirectPost } = require('../direct-post');
 const { postByRole } = require('./post');
@@ -40,9 +40,9 @@ function currentPeerDestination(state, target, expectedBinding = null, expectedC
     const watermark = state.getIntakeWatermark(binding.channelId);
     const parentRoute = binding.channelId === target.channelId &&
       (!expectedBinding || samePeerBinding(binding, expectedBinding));
-    const childRoute = children.length === 1 && children[0].state === THREAD_STATES.READY &&
-      children[0].threadId === target.channelId &&
-      (expectedChildId === null || expectedChildId === target.channelId);
+    const childRoute = children.some(child => child.state === THREAD_STATES.READY &&
+      child.threadId === target.channelId &&
+      (expectedChildId === null || expectedChildId === child.threadId));
     return binding.readiness === READINESS.READY &&
       (!watermark || watermark.state === READINESS.READY) && (parentRoute || childRoute);
   });
@@ -165,11 +165,12 @@ function createPeerService(context) {
       if (input.peer === undefined && input.reply_to === undefined) throw new Error('provide peer or reply_to');
       if (!validPeerId(input.dedupe_key)) throw new Error('dedupe_key must be a valid packet id');
       if (input.reply_to !== undefined && !validPeerId(input.reply_to)) throw new Error('reply_to must be a valid packet id');
+      if (input.peer !== undefined) validatePeerSelector(input.peer);
       if (input.text !== undefined && (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > 10000)) throw new Error('text must be non-empty and at most 10000 bytes');
       if (input.text !== undefined && Buffer.from(input.text, 'utf8').toString('utf8') !== input.text) throw new Error('text must round-trip losslessly through UTF-8');
       if (input.text_file !== undefined && (typeof input.text_file !== 'string' || !input.text_file.trim())) throw new Error('text_file must be non-empty');
       const initial = await caller(signal);
-      const channels = input.peer?.channelName ? await loadChannels(signal) : [];
+      const channels = input.peer && Object.hasOwn(input.peer, 'channelName') ? await loadChannels(signal) : [];
       const source = await caller(signal);
       if (source.channelId !== initial.channelId || canonicalNativeId(source.nativeId) !== canonicalNativeId(initial.nativeId) || source.generation !== initial.generation) {
         throw new Error('peer caller changed during resolution');
