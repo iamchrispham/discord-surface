@@ -9,6 +9,7 @@ const test = require('node:test');
 const { SurfaceState, MESSAGE_STATES } = require('../src/state');
 const { DiscordGateway, createSurfaceConsumer } = require('../src/discord');
 const { recordNativeAcknowledgment, watchAcknowledgments } = require('../src/acknowledgment.js');
+const { staticConductorMarker } = require('../src/topic');
 
 const NATIVE = {
   codex: '9caa5d21-2169-429d-918b-5f08651b5dbd',
@@ -73,6 +74,16 @@ function directPreparationSeed(f, index) {
   };
 }
 
+function qualifiedRecoveryChannel(f, channel) {
+  const binding = f.state.getBinding('channel');
+  return {
+    ...channel,
+    guildId: binding.guildId,
+    topic: staticConductorMarker({ provider: f.provider, conductorId: binding.conductorId, repoKey: binding.repoKey }),
+    permissionsFor: () => ({ has: () => true })
+  };
+}
+
 module.exports = {
   assert,
   fs,
@@ -93,5 +104,6 @@ module.exports = {
   fixture,
   submitted,
   waitForCondition,
-  directPreparationSeed
+  directPreparationSeed,
+  qualifiedRecoveryChannel
 };

@@ -11,7 +11,8 @@ const {
   DiscordGateway,
   fixture,
   submitted,
-  waitForCondition
+  waitForCondition,
+  qualifiedRecoveryChannel
 } = require('./native-reply-file-fixture');
 
 const CONCURRENT_CHILD_DEADLINE_MS = 8000;
@@ -180,14 +181,14 @@ test('concurrent PREPARING native file wakes existing Gateway with exact attachm
     submitted(f, id);
     const reactions = [];
     const finalPosts = [];
-    const channel = {
+    const channel = qualifiedRecoveryChannel(f, {
       id: 'channel',
       messages: { fetch: async targetId => ({ react: async reaction => { assert.equal(targetId, id); reactions.push(reaction); } }) },
       send: async payload => {
         if (!String(payload.content || '').startsWith('Receipt:')) finalPosts.push(payload);
         return { id: `final-${provider}` };
       }
-    };
+    });
     const client = new EventEmitter();
     client.user = { id: 'bot' };
     client.login = async token => { assert.equal(token, 'fixture'); return token; };

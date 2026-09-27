@@ -32,6 +32,7 @@ const {
   attachReconciliationWaiter,
   hasReconciliationLookup,
   invalidateReconciliationWaiters,
+  pruneReconciliationWaiters,
   startReconciliationLookup,
   storeReconciliationSnapshot
 } = require('../dist/discord/reconciliation-lookups.js');
@@ -1513,6 +1514,7 @@ class DiscordGateway {
     this.ready = false;
     this.transportReady = false;
     this.connectionEpoch += 1;
+    pruneReconciliationWaiters(this.client);
     this.recoveryController?.abort();
     this.liveCheckpointController?.abort();
     for (const binding of this.state.listBindings().filter(item => item.active)) {
@@ -3197,7 +3199,8 @@ class DiscordGateway {
           continueUntilFinal: true,
           deferReply: () => {
             const deferred = !canDeliverSettledReply(message, storedMessage);
-            if (deferred && !storedMessage.channel) queueReconciliationRetry([message.id]);
+            if (deferred && !storedMessage.channel &&
+              this.state.getMessage(message.id)?.state === MESSAGE_STATES.REPLY_READY) queueReconciliationRetry([message.id]);
             return deferred;
           }
         });
@@ -3266,7 +3269,10 @@ class DiscordGateway {
         );
         releaseLookupWaiter?.();
       } catch (error) {
-        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) {
+          releaseLookupWaiter?.();
+          return this.state.recoveryCandidates(before).filter(allowed);
+        }
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE && waiterAttached) {
           lookupAbandoned = true;
           // Rotate unrelated candidates ahead of the retry, but keep undispatched

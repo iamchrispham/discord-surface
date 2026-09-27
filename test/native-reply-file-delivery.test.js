@@ -9,7 +9,8 @@ const {
   DiscordGateway,
   fixture,
   submitted,
-  waitForCondition
+  waitForCondition,
+  qualifiedRecoveryChannel
 } = require('./native-reply-file-fixture');
 
 test('Codex and Claude file replies recover submitted and uncertain dispatch', async t => {
@@ -112,14 +113,14 @@ test('early file-reply acknowledgment wakes the existing Gateway consumer when r
       const posts = [];
       const observations = [];
       const resumes = [];
-      const channel = {
+      const channel = qualifiedRecoveryChannel(f, {
         id: 'channel',
         messages: { fetch: async () => ({ react: async reaction => reactions.push(reaction) }) },
         send: async payload => {
           if (!String(payload.content || '').startsWith('Receipt:')) posts.push(payload);
           return { id: `posted-${posts.length}` };
         }
-      };
+      });
       const client = new EventEmitter();
       client.user = { id: 'bot' };
       client.login = async token => assert.equal(token, 'fixture');
@@ -151,8 +152,8 @@ test('early file-reply acknowledgment wakes the existing Gateway consumer when r
           text: 'answer with file', fileManifest: manifest });
         await gateway.acknowledgments.drain();
         await waitForCondition(() => posts.length === 1);
-        assert.deepEqual(resumes, dispatchState === MESSAGE_STATES.SUBMITTED ? [id, id] : [id]);
-        assert.deepEqual(observations, dispatchState === MESSAGE_STATES.SUBMITTED ? [id, id] : [id]);
+        assert.deepEqual(resumes, dispatchState === MESSAGE_STATES.SUBMITTED ? [id] : []);
+        assert.deepEqual(observations, dispatchState === MESSAGE_STATES.SUBMITTED ? [id] : []);
         assert.equal(posts[0].content, 'answer with file');
         assert.deepEqual(posts[0].files[0].attachment, bytes);
         assert.equal(posts[0].files[0].name, 'answer.bin');

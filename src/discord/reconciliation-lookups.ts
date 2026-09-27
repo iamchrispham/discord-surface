@@ -153,6 +153,22 @@ export function attachReconciliationWaiter(
 }
 
 /**
+ * Drops only registrations whose `isCurrent()` is not exactly true (or throws)
+ * from every in-flight lookup, using the same validity semantics as settlement.
+ * In-flight entries and one-use settled snapshots are preserved so a shared
+ * client's other gateway keeps its lookup and pending continuation.
+ */
+export function pruneReconciliationWaiters(owner: object): void {
+  for (const entry of scopeFor(owner).lookups.values()) {
+    for (const waiter of entry.waiters) {
+      let valid = false;
+      try { valid = waiter.isCurrent() === true; } catch { valid = false; }
+      if (!valid) entry.waiters.delete(waiter);
+    }
+  }
+}
+
+/**
  * Makes every currently registered waiter inert without awaiting any lookup.
  * In-flight entries are retained so a reconnect attaches to the same
  * unresolved operation; one-use snapshots are dropped so a retired scope cannot
