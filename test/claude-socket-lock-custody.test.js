@@ -125,6 +125,7 @@ test('the fixed UID namespace keeps one lock across HOME and TMPDIR changes', t 
 });
 
 test('a dead regular-file lock is preserved instead of deleted', t => {
+  isolatedNamespaceRoot(t);
   const socket = claudeSocket(privateSocketDir(t));
   const seed = acquireSocketLockWithPath(t, socket);
   const lockPath = seed.lockPath;
@@ -168,6 +169,7 @@ test('a dead regular-file lock is preserved instead of deleted', t => {
 });
 
 test('a symlink at the canonical lock path is refused untouched', t => {
+  isolatedNamespaceRoot(t);
   const socket = claudeSocket(privateSocketDir(t));
   const seed = acquireSocketLockWithPath(t, socket);
   const lockPath = seed.lockPath;
@@ -187,6 +189,7 @@ test('a symlink at the canonical lock path is refused untouched', t => {
 });
 
 test('a dead transition claim does not spuriously refuse the first lock acquire', t => {
+  isolatedNamespaceRoot(t);
   const socket = claudeSocket(privateSocketDir(t));
   const seed = acquireSocketLockWithPath(t, socket);
   const lockPath = seed.lockPath;
@@ -209,6 +212,7 @@ test('a dead transition claim does not spuriously refuse the first lock acquire'
 });
 
 test('a transition race that replaces the lock directory refuses and preserves it', t => {
+  isolatedNamespaceRoot(t);
   const socket = claudeSocket(privateSocketDir(t));
   const seed = acquireSocketLockWithPath(t, socket);
   const lockPath = seed.lockPath;
@@ -247,6 +251,7 @@ test('a transition race that replaces the lock directory refuses and preserves i
 });
 
 test('a transition race that installs a new owner refuses and preserves it', t => {
+  isolatedNamespaceRoot(t);
   const socket = claudeSocket(privateSocketDir(t));
   const seed = acquireSocketLockWithPath(t, socket);
   const lockPath = seed.lockPath;
@@ -281,6 +286,7 @@ test('a transition race that installs a new owner refuses and preserves it', t =
 });
 
 test('stale socket unlink preserves a socket whose generation changed', async t => {
+  isolatedNamespaceRoot(t);
   const dir = privateSocketDir(t);
   const controlSocket = path.join(dir, 'control.sock');
   const observedSocket = path.join(dir, 'observed.sock');
@@ -327,6 +333,7 @@ test('stale socket unlink preserves a socket whose generation changed', async t 
 });
 
 test('release refuses an owner marker whose generation changed in place', t => {
+  isolatedNamespaceRoot(t);
   const socket = claudeSocket(privateSocketDir(t));
   const seed = acquireSocketLockWithPath(t, socket);
   const lockPath = seed.lockPath;

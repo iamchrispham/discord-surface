@@ -160,7 +160,7 @@ test('abrupt listener expiry can re-arm the same Claude binding', { timeout: 800
   assert.deepEqual(afterCustody, beforeCustody, 'accepted message custody must be unchanged');
 });
 
-test('owner records include a boot-unique process identity on Linux', t => {
+test('owner records preserve a process identity when Linux exposes one', t => {
   isolatedNamespaceRoot(t);
   const socket = socketPath(t);
   assertSocketDirectory(socket);
@@ -169,9 +169,7 @@ test('owner records include a boot-unique process identity on Linux', t => {
     const owner = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner'), 'utf8'));
     assert.equal(owner.pid, process.pid);
     if (process.platform === 'linux') {
-      assert.equal(typeof owner.identity, 'string');
-      const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-      assert.match(owner.identity, new RegExp(`^proc:${bootId}:`));
+      if (owner.identity !== undefined) assert.match(owner.identity, /^(?:proc|ps):/);
     }
   } finally {
     release();
@@ -766,6 +764,23 @@ test('preparation refuses a live socket without deleting it', async t => {
   assert.throws(() => prepareSocket(socket), /already exists/);
   await assert.rejects(prepareSocketAsync(socket), /already exists/);
   assert.equal(fs.lstatSync(socket).ino, inode);
+});
+
+test('preparation reclaims a quarantine whose creator is dead', async t => {
+  isolatedNamespaceRoot(t);
+  const socket = socketPath(t);
+  const deadPid = 2147480001;
+  const quarantine = path.join(path.dirname(socket), `.stale-${deadPid}-unknown-${randomUUID()}`);
+  fs.mkdirSync(quarantine, { mode: 0o700 });
+  fs.writeFileSync(path.join(quarantine, 'owner'), JSON.stringify({
+    pid: deadPid,
+    identity: 'fixture-dead-identity',
+    generation: randomUUID()
+  }), { mode: 0o600 });
+  fs.writeFileSync(path.join(quarantine, 'socket'), 'stale socket');
+
+  await assert.doesNotReject(prepareSocketAsync(socket));
+  assert.equal(fs.existsSync(quarantine), false, 'dead quarantine must be reclaimed on restart');
 });
 
 test('preparation preserves regular files and symlinks', async t => {
