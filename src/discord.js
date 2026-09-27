@@ -2608,6 +2608,41 @@ class DiscordGateway {
         if (!recorded?.concurrentReady) failure ||= { ready: false, state: 'unavailable', error };
         continue;
       }
+      if (watermark?.state === READINESS.READY && !watermark.last_seen_id && !watermark.recovered_through_id) {
+        // An upgraded empty READY watermark is verified empty coverage, not an
+        // unknown baseline. Qualify it without replaying historical messages.
+        const migrated = this.state.setIntakeBaseline(
+          binding.channelId,
+          '0',
+          `${reason} verified empty history baseline`,
+          binding,
+          watermark
+        );
+        if (!migrated) {
+          const current = adoptCurrentReadiness();
+          if (current?.state === READINESS.READY) continue;
+          if (current?.state === READINESS.PENDING) queueRecoveryIfPending();
+          failure ||= { ready: false, state: current?.state || READINESS.PENDING };
+          continue;
+        }
+        ownedBoundary = migrated;
+        watermark = migrated;
+        const recorded = await recordOwnedBoundary(
+          binding,
+          channel,
+          READINESS.READY,
+          `${reason} verified empty history baseline`,
+          null,
+          null,
+          signal,
+          deadline,
+          migrated
+        );
+        if (!recorded?.watermark || recorded.stale || recorded.blocked || (!recorded.concurrentReady && !currentRecovery())) {
+          failure ||= { ready: false, state: READINESS.PENDING };
+        }
+        continue;
+      }
       // A genuinely new parent route may only install its history boundary from a
       // permission-qualified covered cursor on the owned snapshot. A null/unknown
       // historical parent refuses visibly HERE, before any history request: no
@@ -3106,10 +3141,17 @@ class DiscordGateway {
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE) {
-          // Rotate the timed-out candidate behind every unvisited candidate so a
-          // fresh deadline can make progress without abandoning its retry.
-          const retryMessageIds = ordered.slice(candidateIndex + 1).map(candidate => candidate.id);
-          retryMessageIds.push(message.id);
+          // Rotate unrelated candidates ahead of the retry, but keep undispatched
+          // custody for this native owner in its original order.
+          const laterCandidates = ordered.slice(candidateIndex + 1);
+          const laterOwnerIds = [];
+          const otherOwnerIds = [];
+          for (const candidate of laterCandidates) {
+            const candidateKey = `${candidate.provider}:${candidate.nativeId}`;
+            if (candidateKey === key) laterOwnerIds.push(candidate.id);
+            else otherOwnerIds.push(candidate.id);
+          }
+          const retryMessageIds = [...otherOwnerIds, message.id, ...laterOwnerIds];
           queueReconciliationRetry(retryMessageIds);
         }
         blockedOwners.add(key);
@@ -3178,7 +3220,11 @@ class DiscordGateway {
           const current = this.state.getMessage(message.id);
           if (current?.state === 'reply_ready') {
             this.state.recoverNativeReplyAcknowledgment(message.id);
-            result = await this.consumer.deliverReply(storedMessage, { status: current.state, message: current }, signal);
+            result = await waitForRecoveryOperation(
+              () => this.consumer.deliverReply(storedMessage, { status: current.state, message: current }, signal),
+              signal,
+              deadline
+            );
           }
         } else {
           this.state.recoverNativeReplyAcknowledgment(message.id);

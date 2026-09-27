@@ -90,6 +90,26 @@ for (const entrypoint of ['result', 'startup', 'reconnect']) {
   }
 }
 
+test('startup qualifies a completed empty legacy parent without replaying history', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare('UPDATE intake_watermarks SET state=?, last_seen_id=NULL, recovered_through_id=NULL WHERE channel_id=?')
+    .run('ready', '1000');
+  let historyCalls = 0;
+  const originalFetchHistory = f.gateway.fetchHistory.bind(f.gateway);
+  f.gateway.fetchHistory = async (channel, ...args) => {
+    if (channel.id === '1000') historyCalls += 1;
+    return originalFetchHistory(channel, ...args);
+  };
+
+  const result = await settleRecovery(f.gateway.recoverTransport('startup'));
+
+  assert.equal(result.ready, true, JSON.stringify(result));
+  assert.equal(f.boundary('1000').state, 'ready');
+  assert.equal(f.boundary('1000').last_seen_id, '0');
+  assert.equal(f.boundary('1000').recovered_through_id, '0');
+  assert.equal(historyCalls, 0);
+});
+
 for (const withArrival of [false, true]) {
   test(`full recovery retains an unavailable sibling, concurrent arrival=${withArrival}`, { timeout: 6000 }, async t => {
     const f = fixture(t);

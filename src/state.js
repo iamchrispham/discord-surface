@@ -1185,6 +1185,15 @@ class SurfaceState {
       // observed history row must never be promoted into the covered cursor, so an
       // owned watermark without an already-qualified recovered_through_id refuses.
       if (!existing) throw persistenceRefusal(BindingError, PERSISTENCE_REFUSAL_DETAILS.PARENT_COVERAGE);
+      const legacyEmptyReady = existing.state === READINESS.READY &&
+        !existing.last_seen_id && !existing.recovered_through_id && lastSeenId === '0';
+      if (legacyEmptyReady) {
+        const detailText = String(detail || '').slice(0, 1000) || null;
+        this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
+          .run(binding.guildId, '0', '0', READINESS.PENDING, detailText, now(), channelId);
+        this.receipt(null, 'intake-baseline', { channelId, lastSeenId: '0', detail: detailText });
+        return this.getIntakeWatermark(channelId);
+      }
       const coveredCursor = qualifiedCoverageId(existing.recovered_through_id);
       if (!coveredCursor) throw persistenceRefusal(BindingError, PERSISTENCE_REFUSAL_DETAILS.PARENT_COVERAGE);
       const retainedLastSeen = existing.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
