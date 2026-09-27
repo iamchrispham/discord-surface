@@ -29,7 +29,7 @@ const postInputSchema = { type: 'object', properties: { role: { enum: ['announce
     { properties: { role: { const: 'child' }, dedupe_key: packetId, peer: selector, reply_to: packetId }, required: ['role'],
       not: { required: ['message_id'] }, oneOf: [
         { required: ['peer'], not: { required: ['reply_to'] } },
-        { required: ['reply_to'] }
+        { required: ['reply_to'], not: { required: ['peer'] } }
       ] }
   ] };
 const tools = [
@@ -48,7 +48,7 @@ const tools = [
         ] },
         { oneOf: [
           { required: ['peer'], not: { required: ['reply_to'] } },
-          { required: ['reply_to'] }
+          { required: ['reply_to'], not: { required: ['peer'] } }
         ] }
       ] } }
 ];

@@ -26,6 +26,8 @@ const byChannel: PeerSelector = { channelName: 'peer' };
 
 // @ts-expect-error peer providers are finite
 const invalidSelector: PeerSelector = { repoKey: 'repo', provider: 'other' };
+// @ts-expect-error selectors require one supported route shape
+const invalidSelectorShape: PeerSelector = {};
 // @ts-expect-error readiness is finite
 const invalidBinding: PeerBinding = { ...binding, readiness: 'online' };
 
@@ -48,13 +50,18 @@ const invalidWatermarkState: Readiness = 'online';
 
 const resolved: PeerBinding = resolvePeerBinding(state, selector);
 const ready = requireReadyPeer(state, resolved);
+const resolvedByChannel: PeerBinding = resolvePeerBinding(state, byChannelId);
+const readyBinding: PeerBinding = ready.binding;
 const childId: string = ready.childId;
 
 void byConductor;
 void byChannelId;
 void byChannel;
 void invalidSelector;
+void invalidSelectorShape;
 void invalidBinding;
 void invalidThreadState;
 void invalidWatermarkState;
+void resolvedByChannel;
+void readyBinding;
 void childId;

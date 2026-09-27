@@ -42,6 +42,7 @@ test('public MCP stdio lists the caller and refuses an unready send', { timeout:
     const boardSchema = postSchema.oneOf.find(branch => branch.properties.role.const === 'board');
     assert.deepEqual(childSchema.properties.reply_to, peerSendSchema.properties.reply_to);
     assert.deepEqual(childSchema.oneOf.map(branch => branch.required), [['peer'], ['reply_to']]);
+    assert.deepEqual(childSchema.oneOf.map(branch => branch.not), [{ required: ['reply_to'] }, { required: ['peer'] }]);
     assert.deepEqual(announceSchema.not.anyOf.map(branch => branch.required), [['message_id'], ['peer'], ['reply_to']]);
     assert.deepEqual(boardSchema.required, ['role', 'message_id']);
     assert.deepEqual(boardSchema.not.anyOf.map(branch => branch.required), [['peer'], ['reply_to']]);
@@ -59,8 +60,7 @@ test('public MCP stdio lists the caller and refuses an unready send', { timeout:
     assert.deepEqual(peerSendSchema.allOf.map(branch => branch.oneOf.map(option => option.required)), [
       [['text'], ['text_file']], [['peer'], ['reply_to']]
     ]);
-    assert.equal(peerSendSchema.allOf[1].oneOf[1].not, undefined);
-    assert.equal(childSchema.oneOf[1].not, undefined);
+    assert.deepEqual(peerSendSchema.allOf[1].oneOf.map(option => option.not), [{ required: ['reply_to'] }, { required: ['peer'] }]);
     for (const property of ['text', 'text_file']) {
       const pattern = new RegExp(peerSendSchema.properties[property].pattern);
       assert.equal(pattern.test(' '), false);
