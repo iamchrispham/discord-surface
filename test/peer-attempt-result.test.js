@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { fixture, service, addRecipient } = require('./fixtures/peer-fixture');
 const { inspectPeerResult } = require('../src/peer/result');
+const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { createDirectPostHandlers } = require('../dist/state/direct-post');
 
 const request = { peer: { conductorId: 'recipient' }, text: 'retry after rate limit', dedupe_key: 'held-retry' };
@@ -137,6 +138,45 @@ test('peer result preserves a legacy child result after the parent target hands 
     packetId: candidate.id,
     text: candidate.text
   }]);
+});
+
+test('peer result preserves an unmarked legacy child result before and after a parent handoff', async t => {
+  const f = fixture(t);
+  f.enroll('102');
+  const target = addRecipient(f);
+  const caller = f.state.getBinding('101');
+  const request = {
+    id: 'unmarked-legacy-request', kind: KINDS.REQUEST,
+    source: { guildId: '100', channelId: '102', provider: 'claude', nativeId: caller.nativeId, generation: caller.generation },
+    target: { guildId: '100', channelId: '201', provider: 'codex', nativeId: target.nativeId, generation: target.generation },
+    replyTo: null, text: 'request without a promotion marker'
+  };
+  const detail = {
+    journal: 'direct-post-v1', requestId: request.id, guildId: caller.guildId, channelId: caller.channelId,
+    provider: caller.provider, nativeId: caller.nativeId, generation: caller.generation,
+    partIndex: 0, partCount: 1, attemptId: 'unmarked-legacy-attempt', agentPacket: request
+  };
+  f.state.receipt(null, 'direct-post-attempt', detail);
+  f.state.receipt(null, 'direct-post-outcome', { ...detail, outcome: 'sent', messageId: 'request-message' });
+
+  const result = {
+    id: 'unmarked-legacy-result', kind: KINDS.RESULT,
+    source: { guildId: target.guildId, channelId: '202', provider: target.provider,
+      nativeId: target.nativeId, generation: target.generation }, target: request.source,
+    replyTo: request.id, routingVersion: 2, sourceParentChannelId: target.channelId, text: 'accepted result'
+  };
+  const accepted = f.state.acceptDiscordMessage({ id: 'unmarked-legacy-result-discord', guildId: '100', channelId: '102',
+    authorId: '901', isBot: true, content: encodeAgentMessage(result, 'fixture') }, { agentToken: 'fixture' });
+  assert.equal(accepted.accepted, true, JSON.stringify(accepted));
+
+  const peer = service(f);
+  const beforeHandoff = await peer.result(request.id);
+  assert.equal(beforeHandoff.results.length, 1);
+  assert.equal(beforeHandoff.results[0].text, result.text);
+
+  f.state.db.prepare("UPDATE bindings SET generation=generation+1 WHERE channel_id='201'").run();
+  const afterHandoff = await peer.result(request.id);
+  assert.deepEqual(afterHandoff.results, beforeHandoff.results);
 });
 
 test('newest promoted packet recognizes the enrolled return route', () => {

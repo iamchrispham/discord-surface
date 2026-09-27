@@ -128,7 +128,8 @@ function inspectPeerResult(state, source, correlationId) {
     else if (packet.kind === KINDS.REQUEST && (candidate.kind === KINDS.RESULT && candidate.replyTo === packet.id &&
       sameAddress(candidate.source, packet.target) && sameAddress(candidate.target, packet.source) ||
       ((packet.routingVersion === undefined || canonicalRecord.legacyAgentPacket?.kind === KINDS.REQUEST) &&
-        isLegacyParentTarget(state, packet.target, canonicalRecord.legacyAgentPacket) &&
+        isLegacyParentTarget(state, packet.target,
+          canonicalRecord.legacyAgentPacket ?? packet) &&
         isLegacyChildResult(candidate, packet, packet.target, true)))) {
       results.push({ ...evidence, packetId: candidate.id, text: candidate.text });
     }
