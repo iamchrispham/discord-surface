@@ -123,7 +123,8 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
   agentPacket: AgentMessage | null = null,
   fileManifest: DirectPostFileManifest | null = null,
   watcherNotice: WatcherNotice | null = null, legacyAgentPacket: AgentMessage | null = null,
-  agentRequestTarget: AgentAddress | null = null, routingVersion: number | null = null): DirectPostPartMeta {
+  agentRequestTarget: AgentAddress | null = null, routingVersion: number | null = null,
+  peerRouting = false): DirectPostPartMeta {
   const nonceScope = agentTarget === null
     ? `direct:${requestId}:${partIndex}`
     : agentNonceScope(sourceAddress, agentTarget, requestId, partIndex);
@@ -151,6 +152,7 @@ function partMeta(binding: DirectPostBinding, operatorId: string, requestId: str
     ...(agentPacket ? { agentPacket } : {}),
     ...(legacyAgentPacket ? { legacyAgentPacket } : {}),
     ...(agentRequestTarget ? { agentRequestTarget } : {}),
+    ...(peerRouting ? { peerRouting: true } : {}),
     ...(routingVersion !== null ? { routingVersion } : {}),
     ...(watcherNotice ? { watcherNotice } : {})
   };

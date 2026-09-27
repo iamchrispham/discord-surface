@@ -245,7 +245,7 @@ function createPeerService(context) {
         }
         const result = await runDirectPost({ state, token, stateDir, provider,
           nativeId: source.nativeId, generation: source.generation, channelId: source.channelId,
-          ordinary: state.isOrdinaryBindingRecord(source), agentMode: true,
+          ordinary: state.isOrdinaryBindingRecord(source), agentMode: true, peerRouting: true,
           agentThreadId: sourceRoute.childId, agentTarget, agentKind: input.reply_to === undefined ? 'request' : 'result',
           agentReplyTo: input.reply_to ?? null, agentPresentation: 'attachment-v1',
           agentDestinationCurrent: target => {

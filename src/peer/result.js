@@ -3,7 +3,7 @@
 const { KINDS, sameAddress, validateAgentMessage } = require('../agent-message');
 const { DIRECT_POST_ATTEMPT, DIRECT_POST_OUTCOME, AGENT_COMPLETION_RECEIPTS, MESSAGE_STATES } = require('../state');
 const { isLegacyChildResult } = require('../../dist/state/agent-routing.js');
-const { projectNewestDirectPostAttempt } = require('../../dist/state/direct-post.js');
+const { projectNewestDirectPostAttempt, samePeerAgentPacket } = require('../../dist/state/direct-post.js');
 const PACKET_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
 const PEER_PACKET_ID_SCHEMA = Object.freeze({
   type: 'string',
@@ -25,11 +25,24 @@ function packetVariants(packet, legacyAgentPacket) {
   return [packet, legacyAgentPacket].filter(Boolean);
 }
 
+function peerHistoryPacketMatches(left, right, leftParentChannelId, rightParentChannelId) {
+  if (!left || !right || typeof leftParentChannelId !== 'string' || leftParentChannelId !== rightParentChannelId ||
+      left.routingVersion === undefined || right.routingVersion === undefined || left.routingVersion !== right.routingVersion) return false;
+  return samePeerAgentPacket(left, right, leftParentChannelId);
+}
+
+function packetRecordVariantsMatch(left, right, leftPacket, rightPacket) {
+  return packetMatches(leftPacket, rightPacket) ||
+    (left.peerRouting === true && right.peerRouting === true &&
+      peerHistoryPacketMatches(leftPacket, rightPacket, left.parentChannelId, right.parentChannelId));
+}
+
 function packetRecordsMatch(left, right) {
-  return packetMatches(left.packet, right.packet) ||
-    (left.legacyAgentPacket && packetMatches(left.legacyAgentPacket, right.packet)) ||
-    (right.legacyAgentPacket && packetMatches(left.packet, right.legacyAgentPacket)) ||
-    (left.legacyAgentPacket && right.legacyAgentPacket && packetMatches(left.legacyAgentPacket, right.legacyAgentPacket));
+  return packetRecordVariantsMatch(left, right, left.packet, right.packet) ||
+    (left.legacyAgentPacket && packetRecordVariantsMatch(left, right, left.legacyAgentPacket, right.packet)) ||
+    (right.legacyAgentPacket && packetRecordVariantsMatch(left, right, left.packet, right.legacyAgentPacket)) ||
+    (left.legacyAgentPacket && right.legacyAgentPacket &&
+      packetRecordVariantsMatch(left, right, left.legacyAgentPacket, right.legacyAgentPacket));
 }
 
 function sourceMatchesCaller(packet, source) {
@@ -87,7 +100,9 @@ function inspectPeerResult(state, source, correlationId) {
   }
   const records = rows.map(row => ({
     packet: row.detail.agentPacket,
-    legacyAgentPacket: row.detail.legacyAgentPacket
+    legacyAgentPacket: row.detail.legacyAgentPacket,
+    peerRouting: row.detail.peerRouting === true,
+    parentChannelId: row.detail.channelId
   })).filter(record => record.packet);
   for (const record of records) {
     validateAgentMessage(record.packet);

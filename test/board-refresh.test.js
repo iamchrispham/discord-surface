@@ -795,12 +795,40 @@ test('unresolved board PATCH fences binding retirement until its outcome is reco
   assert.doesNotThrow(() => f.state.unbind('channel-1', { expectedBinding: f.binding }));
 });
 
-test('recovered unknown board outcome keeps binding retirement fenced', t => {
+test('recovered unknown board outcome permits ordinary binding handoff', t => {
   const f = fixture();
   t.after(() => f.state.close());
   const target = boardTarget();
   seedBoardOutcome(f, 'unknown-retirement', BOARD_OUTCOMES.UNKNOWN);
 
+  assert.equal(f.state.hasUnresolvedBindingPost(target.channelId), false);
+  const old = f.state.getBinding(target.channelId);
+  const handoff = f.state.handoffConductor({
+    channelId: old.channelId,
+    provider: old.provider,
+    conductorId: old.conductorId,
+    repoKey: old.repoKey,
+    fromNativeId: old.nativeId,
+    fromGeneration: old.generation,
+    nativeId: SUCCESSOR_ID,
+    workspace: old.workspace,
+    endpoint: old.endpoint,
+    handoffId: 'unknown-board-handoff'
+  });
+  assert.equal(handoff.generation, old.generation + 1);
+});
+
+test('malformed board outcome remains binding-fenced instead of becoming valid unknown recovery', t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  const target = boardTarget();
+  const seeded = seedBoardOutcome(f, 'malformed-unknown-retirement', BOARD_OUTCOMES.UNKNOWN);
+  const row = f.state.db.prepare("SELECT id, detail FROM receipts WHERE kind='board-refresh-outcome' AND json_extract(detail, '$.attemptId')=?").get(seeded.attemptId);
+  assert.ok(row);
+  const detail = JSON.parse(row.detail);
+  f.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(
+    JSON.stringify({ ...detail, outcome: 'not-a-board-outcome' }), row.id
+  );
   assert.equal(f.state.hasUnresolvedBindingPost(target.channelId), true);
   const old = f.state.getBinding(target.channelId);
   assert.throws(() => f.state.handoffConductor({
@@ -813,7 +841,7 @@ test('recovered unknown board outcome keeps binding retirement fenced', t => {
     nativeId: SUCCESSOR_ID,
     workspace: old.workspace,
     endpoint: old.endpoint,
-    handoffId: 'unknown-board-handoff'
+    handoffId: 'malformed-unknown-handoff'
   }), /cannot handoff while work is unresolved/);
 });
 

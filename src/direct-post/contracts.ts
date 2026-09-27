@@ -211,6 +211,7 @@ export interface DirectPostInputBase {
   requestId?: unknown;
   // Internal journal scope for agent retries. The signed packet keeps dedupeKey.
   custodyKey?: unknown;
+  peerRouting?: boolean;
   inReplyTo?: unknown;
   signal?: AbortSignal;
   fetchImpl?: FetchImplementation;

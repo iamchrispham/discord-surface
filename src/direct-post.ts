@@ -119,7 +119,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
     agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
     agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null,
-    preparedTextSource, agentDestinationCurrent = null, bindingCurrent = null, custodyKey } =
+    preparedTextSource, agentDestinationCurrent = null, bindingCurrent = null, custodyKey, peerRouting = false } =
     input as DirectPostInput & { agentThreadId?: string | null };
   const binding = watcherNotice
     ? watcherNotice.binding
@@ -344,7 +344,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     }
     const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null,
       legacyMigration, agentRequestTarget,
-      legacy === null && isAgentMessage ? AGENT_ROUTING_VERSION : null);
+      legacy === null && isAgentMessage ? AGENT_ROUTING_VERSION : null, peerRouting);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     if (deliveryTarget !== null) {
       let existing;

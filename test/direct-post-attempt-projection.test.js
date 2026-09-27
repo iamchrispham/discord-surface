@@ -157,6 +157,96 @@ function seedPeer(state, kind, extra) {
     partIndex: 0, partCount: 1, agentPacket: PACKET, ...extra });
 }
 
+function peerMeta(meta, attemptId, childId, peerRouting = false) {
+  return meta(attemptId, {
+    requestId: 'peer-corr',
+    agentPacket: {
+      ...PACKET,
+      routingVersion: 2,
+      source: { ...PACKET.source, channelId: childId }
+    },
+    routingVersion: 2,
+    ...(peerRouting ? { peerRouting: true } : {})
+  });
+}
+
+function enrollPeerChild(state, binding, threadId) {
+  state.enrollThread({ threadId, parentChannelId: binding.channelId, guildId: binding.guildId }, binding);
+  state.markThreadBoundary(threadId, 'ready', 'projection fixture', null, null, binding);
+}
+
+function retirePeerChild(state, binding, threadId) {
+  state.markThreadBoundary(threadId, 'unavailable', 'projection fixture replacement', null, null, binding);
+}
+
+function allowProjectionRoute(state) {
+  state.directPostBindingCurrent = () => true;
+}
+
+for (const outcomeName of ['rate_limited', 'not_sent']) {
+  test(`marked peer retry accepts a replacement source child after ${outcomeName}`, t => {
+    const { state, binding, meta } = fixture(t);
+    allowProjectionRoute(state);
+    enrollPeerChild(state, binding, 'child-102');
+    const first = peerMeta(meta, 'attempt-1', 'child-102', true);
+    assert.equal(state.beginDirectPostPart(first).claimed, true);
+    state.recordDirectPostOutcome(first.requestId, first.attemptId, outcomeName);
+    retirePeerChild(state, binding, 'child-102');
+    enrollPeerChild(state, binding, 'child-103');
+    const retry = peerMeta(meta, 'attempt-2', 'child-103', true);
+    assert.equal(state.beginDirectPostPart(retry).claimed, true);
+    state.recordDirectPostOutcome(retry.requestId, retry.attemptId, 'sent', { messageId: 'sent-after-retry' });
+    assert.equal(state.inspectDirectPostPart(retry).status, 'sent');
+  });
+}
+
+test('marked peer UNKNOWN history does not resend after source-child replacement', t => {
+  const { state, binding, meta } = fixture(t);
+  allowProjectionRoute(state);
+  enrollPeerChild(state, binding, 'child-102');
+  const first = peerMeta(meta, 'attempt-unknown', 'child-102', true);
+  assert.equal(state.beginDirectPostPart(first).claimed, true);
+  state.recordDirectPostOutcome(first.requestId, first.attemptId, 'unknown');
+  retirePeerChild(state, binding, 'child-102');
+  enrollPeerChild(state, binding, 'child-103');
+  const retry = peerMeta(meta, 'attempt-unknown-retry', 'child-103', true);
+  const inspection = state.beginDirectPostPart(retry);
+  assert.equal(inspection.claimed, false);
+  assert.equal(inspection.status, 'unknown');
+  assert.equal(state.directPostRows('peer-corr').filter(row => row.kind === 'direct-post-attempt').length, 1);
+});
+
+test('routingVersion alone does not authorize an unmarked source-child replacement', t => {
+  const { state, binding, meta } = fixture(t);
+  allowProjectionRoute(state);
+  enrollPeerChild(state, binding, 'child-102');
+  const first = peerMeta(meta, 'attempt-unmarked', 'child-102');
+  assert.equal(state.beginDirectPostPart(first).claimed, true);
+  state.recordDirectPostOutcome(first.requestId, first.attemptId, 'rate_limited');
+  retirePeerChild(state, binding, 'child-102');
+  enrollPeerChild(state, binding, 'child-103');
+  const retry = peerMeta(meta, 'attempt-unmarked-retry', 'child-103');
+  assert.throws(() => state.beginDirectPostPart(retry), /request identity conflicts with existing custody/);
+});
+
+for (const outcomeName of ['sent', 'unknown', 'not_sent']) {
+  test(`pre-marker ${outcomeName} history preserves exact-source retry semantics`, t => {
+    const { state, binding, meta } = fixture(t);
+    allowProjectionRoute(state);
+    enrollPeerChild(state, binding, 'child-102');
+    const first = peerMeta(meta, `attempt-pre-${outcomeName}`, 'child-102');
+    assert.equal(state.beginDirectPostPart(first).claimed, true);
+    state.recordDirectPostOutcome(first.requestId, first.attemptId, outcomeName);
+    const retry = peerMeta(meta, `attempt-pre-${outcomeName}-retry`, 'child-102');
+    const inspection = state.beginDirectPostPart(retry);
+    if (outcomeName === 'not_sent') assert.equal(inspection.claimed, true);
+    else {
+      assert.equal(inspection.claimed, false);
+      assert.equal(inspection.status, outcomeName);
+    }
+  });
+}
+
 test('passive peer readback surfaces a newer preflight after the prior outcome', t => {
   const { state } = fixture(t);
   seedPeer(state, 'direct-post-attempt', { attemptId: 'a1', nonce: 'n1' });
@@ -174,8 +264,23 @@ test('passive peer readback keeps caller and generation filtering', t => {
   seedPeer(state, 'direct-post-outcome', { attemptId: 'a1', nonce: 'n1', outcome: 'sent', generation: SOURCE.generation + 1 });
   assert.equal(inspectPeerResult(state, SOURCE, 'peer-corr').sendOutcome, 'in_flight',
     'a newer-generation outcome is not visible to this caller');
+  assert.throws(() => inspectPeerResult(state, { ...SOURCE, generation: SOURCE.generation + 1 }, 'peer-corr'),
+    /correlation is unknown for this caller/,
+    'a contradictory packet source cannot authorize a newer-generation caller');
+  const generationTwoPacket = {
+    ...PACKET,
+    source: { ...PACKET.source, generation: SOURCE.generation + 1 },
+    target: { ...PACKET.target, generation: SOURCE.generation + 1 }
+  };
+  const before = state.listReceipts().length;
+  seedPeer(state, 'direct-post-outcome', {
+    generation: SOURCE.generation + 1,
+    agentPacket: generationTwoPacket,
+    outcome: 'sent'
+  });
   assert.equal(inspectPeerResult(state, { ...SOURCE, generation: SOURCE.generation + 1 }, 'peer-corr').sendOutcome, null,
-    'the newer-generation caller has an outcome but no matching admitted attempt');
+    'a consistent outcome-only packet has no admitted attempt outcome');
+  assert.equal(state.listReceipts().length, before + 1, 'passive inspection does not add custody');
 });
 
 test('passive peer readback reports no attempt as a preflight diagnostic', t => {
