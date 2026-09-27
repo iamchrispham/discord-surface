@@ -170,19 +170,21 @@ function liaisonChild(dir, mode, promptPath, pidPath) {
   const scriptPath = path.join(dir, `liaison-child-${mode}.cjs`);
   const script = `
 const fs = require('node:fs');
+const { publishFixtureFile } = require(${JSON.stringify(path.join(__dirname, 'fixture-publication.js'))});
 const [answerPath, receiptId, promptPath, pidPath] = process.argv.slice(2);
 const mode = ${JSON.stringify(mode)};
-fs.writeFileSync(pidPath, String(process.pid));
+const selfDeadline = setTimeout(() => process.exit(124), 7000);
+publishFixtureFile(pidPath, String(process.pid));
 let prompt = '';
 process.stdin.on('data', chunk => { prompt += chunk; });
 process.stdin.on('end', () => {
   fs.writeFileSync(promptPath, prompt);
   if (mode === 'valid') {
-    fs.writeFileSync(answerPath, JSON.stringify({ updates: [{ id: receiptId, fact_ids: ['source-state'], category: 'context' }] }));
+    publishFixtureFile(answerPath, JSON.stringify({ updates: [{ id: receiptId, fact_ids: ['source-state'], category: 'context' }] }));
     process.exit(0);
   }
   if (mode === 'invalid') {
-    fs.writeFileSync(answerPath, JSON.stringify({ updates: [{ id: receiptId, fact_ids: ['source-state'], category: 'context', text: 'invented prose' }] }));
+    publishFixtureFile(answerPath, JSON.stringify({ updates: [{ id: receiptId, fact_ids: ['source-state'], category: 'context', text: 'invented prose' }] }));
     process.exit(0);
   }
   if (mode === 'nonzero') process.exit(17);
