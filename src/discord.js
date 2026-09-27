@@ -3202,6 +3202,11 @@ class DiscordGateway {
       let result;
       let channel;
       let channelFetchStarted = false;
+      // Tracks whether THIS pass actually registered its settlement waiter on an
+      // owned in-flight lookup. Distinct from channelFetchStarted, which records
+      // only whether this pass initiated the SDK fetch: an adopting reconnect
+      // attaches to an already-pending promise without starting a fetch.
+      let waiterAttached = false;
       let lookupAbandoned = false;
       let releaseLookupWaiter = null;
       const lookupDestinationId = message.deliveryChannelId || message.channelId;
@@ -3232,6 +3237,10 @@ class DiscordGateway {
               },
               failed: () => {}
             });
+            // Only an actually owned in-flight lookup gives this pass late
+            // settlement interest. A consumed one-use snapshot resolves without
+            // registering an entry, so it must leave this false.
+            waiterAttached = hasReconciliationLookup(this.client, lookupDestinationId);
             return lookupPromise;
           },
           signal,
@@ -3240,7 +3249,7 @@ class DiscordGateway {
         releaseLookupWaiter?.();
       } catch (error) {
         if (recoveryKind(error) === CODEX_VALIDATION_KINDS.STOPPED) return this.state.recoveryCandidates(before).filter(allowed);
-        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE && channelFetchStarted) {
+        if (recoveryKind(error) === CODEX_VALIDATION_KINDS.DEADLINE && waiterAttached) {
           lookupAbandoned = true;
           // Rotate unrelated candidates ahead of the retry, but keep undispatched
           // custody for this native owner in its original order. A destination
