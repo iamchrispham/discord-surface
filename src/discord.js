@@ -3229,6 +3229,7 @@ class DiscordGateway {
       // attaches to an already-pending promise without starting a fetch.
       let waiterAttached = false;
       let lookupAbandoned = false;
+      let deferredRetryMessageIds = [];
       let releaseLookupWaiter = null;
       const lookupDestinationId = message.deliveryChannelId || message.channelId;
       try {
@@ -3250,11 +3251,12 @@ class DiscordGateway {
                 // A caller whose bounded wait ended must not lose the lookup. Save
                 // the one-use snapshot for this exact continuation and wake it via
                 // the existing retry producer only when this pass gave up waiting.
+                // Same-owner successors stay here until the predecessor is queued.
                 if (!lookupAbandoned) return;
                 storeReconciliationSnapshot(this.client, lookupDestinationId, message.id, settledChannel);
                 if (this.stopping || signal?.aborted || !this.isCurrentLifecycle(passLifecycle) ||
                     passConnectionEpoch !== this.connectionEpoch) return;
-                queueReconciliationRetry([message.id]);
+                queueReconciliationRetry([message.id, ...deferredRetryMessageIds]);
               },
               failed: () => {}
             });
@@ -3289,8 +3291,9 @@ class DiscordGateway {
             if (candidateKey === key) laterOwnerIds.push(candidate.id);
             else otherOwnerIds.push(candidate.id);
           }
+          if (lookupInFlight) deferredRetryMessageIds = laterOwnerIds;
           const retryMessageIds = lookupInFlight
-            ? [...otherOwnerIds, ...laterOwnerIds]
+            ? otherOwnerIds
             : [...otherOwnerIds, message.id, ...laterOwnerIds];
           queueReconciliationRetry(retryMessageIds);
         }

@@ -10,6 +10,7 @@ const { DiscordGateway, waitForRecoveryOperation } = require('../src/discord');
 const { enrollPublicThread, recoverThread, AdoptionRefusalError, ADOPTION_REFUSAL_DETAILS } = require('../src/discord/thread-enrollment');
 const { GATEWAY_CAPABILITIES, gatewayProcessStatus, main, pathsFor, threadEnroll } = require('../src/cli');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
+const { startReconciliationLookup } = require('../dist/discord/reconciliation-lookups');
 
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const SUCCESSOR = 'f8296579-092b-4503-bf98-1f3c2b6d4913';
@@ -856,6 +857,57 @@ test('recovery admits same-owner parent and child history in Discord order', asy
   assert.equal(parentMessage.accepted, true);
   assert.equal(childMessage.accepted, true);
   await f.gateway._reconcilePending(null, new AbortController().signal, true);
+  await f.gateway.consumer.waitForNativeWork();
+  assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
+});
+
+test('timed-out child lookup keeps later same-owner custody behind it', { timeout: 5000 }, async t => {
+  const f = fixture(t, { timeoutMs: 1000 }); f.ready('100');
+  const binding = f.state.getBinding(f.parent.id);
+  f.state.setBindingReadiness(f.parent.id, READINESS.READY, 'fixture ready', binding);
+  const listEnrollments = f.state.listThreadEnrollments.bind(f.state);
+  // Isolate the phase-2 lookup branch from the earlier thread-boundary fetch.
+  f.state.listThreadEnrollments = () => [];
+  for (const [id, channel] of [['101', f.child], ['102', f.parent]]) {
+    const accepted = f.state.acceptDiscordMessage({
+      id, guildId: 'guild', channelId: channel.id, authorId: 'operator', isBot: false,
+      content: 'ordered recovery question', attachments: []
+    }, { ready: true, expectedBinding: binding });
+    assert.equal(accepted.accepted, true);
+  }
+
+  let releaseChildLookup;
+  const childLookup = new Promise(resolve => { releaseChildLookup = resolve; });
+  const fetchChannel = f.client.channels.fetch.bind(f.client.channels);
+  const pendingChildLookup = startReconciliationLookup(f.client, f.child.id, 'seed', () => {
+    return childLookup.then(() => fetchChannel(f.child.id));
+  });
+  t.after(() => {
+    releaseChildLookup();
+    f.state.listThreadEnrollments = listEnrollments;
+  });
+
+  const retryPromises = [];
+  let retryStarted;
+  const retryStartedPromise = new Promise(resolve => { retryStarted = resolve; });
+  const reconcile = f.gateway.reconcilePending.bind(f.gateway);
+  f.gateway.reconcilePending = (...args) => {
+    const promise = reconcile(...args);
+    if (args[1]?.messageIds) {
+      retryPromises.push(promise);
+      retryStarted();
+    }
+    return promise;
+  };
+
+  const initial = f.gateway.reconcilePending(undefined, { readyOnly: true });
+  await initial;
+  assert.deepEqual(f.dispatched, [], 'same-owner successor stays queued while lookup is unresolved');
+
+  releaseChildLookup();
+  await retryStartedPromise;
+  await pendingChildLookup;
+  await Promise.all(retryPromises);
   await f.gateway.consumer.waitForNativeWork();
   assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
 });
