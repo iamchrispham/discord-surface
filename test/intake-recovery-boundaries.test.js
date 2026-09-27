@@ -12,6 +12,7 @@ const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { recoverThread } = require('../src/discord/thread-enrollment');
 const { waitForRecoveryOperation } = require('../src/discord');
 const { CASES, operatorMessage } = require('./helpers/intake-recovery-scenarios');
+const { waitForCondition } = require('./surface-fixtures');
 
 const LEGACY_TIMEOUT_DETAIL = 'ordinary-bind recovery exceeded 30000ms';
 const LEGACY_THREAD_TIMEOUT_DETAIL = 'Discord recovery deadline exceeded';
@@ -59,13 +60,16 @@ test('R4: deadline between full pages stays retryable after one real admission',
     assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
   });
 
-test('R4b: shared deadline preserves an unvisited ready binding', CASES, async t => {
+test('R4b: unvisited ready binding completes through its scoped follow-up', CASES, async t => {
   const f = fixture(t);
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
     nativeId: '33333333-3333-3333-3333-333333333333', workspace: f.secret }, { intakeCutoff: '100' });
   f.state.setIntakeBaseline('3000', '100', 'fixture');
   f.state.markIntakeBoundary('3000', 'ready');
+  const baseChannel = f.channels.get('1000');
+  f.channels.set('3000', { ...baseChannel, id: '3000' });
   f.history.set('1000', [f.message('101', '1000')]);
+  f.history.set('3000', [f.message('102', '3000')]);
   const realNow = Date.now;
   const realIntake = f.gateway.consumer.intakeMessage;
   let advanced = false;
@@ -81,12 +85,21 @@ test('R4b: shared deadline preserves an unvisited ready binding', CASES, async t
   try {
     await f.recover();
     assert.equal(advanced, true);
-    assert.equal(f.state.getIntakeWatermark('3000').state, 'ready');
-    assert.equal(f.state.getBinding('3000').readiness, 'ready');
   } finally {
     Date.now = realNow;
     f.gateway.consumer.intakeMessage = realIntake;
   }
+
+  await waitForCondition(() => f.state.getBinding('3000').readiness === 'ready'
+    && f.state.getIntakeWatermark('3000').state === 'ready', 2000);
+
+  assert.ok(f.calls.some(call => call.kind === 'history' && call.id === '3000'),
+    'the scoped follow-up must fetch history on channel 3000');
+  assert.equal(f.state.getIntakeWatermark('3000').recovered_through_id, '102');
+  assert.equal(f.state.getIntakeWatermark('3000').state, 'ready');
+  assert.equal(f.state.getBinding('3000').readiness, 'ready');
+  assert.equal(f.state.getMessage('102').state, 'accepted');
+  assert.equal(f.dispatched.length, 0);
 });
 
 test('R4e: shared deadline schedules a fresh retry for an unvisited pending binding', CASES, async t => {
@@ -283,7 +296,7 @@ test('R7: old timeout gap with a confirmed cursor retries after database reopen'
   assert.equal(f.dispatched[0].generation, owner.generation);
 });
 
-test('R7a: old timeout gap without a baseline cursor retries after database reopen', CASES, async t => {
+test('R7a: cursorless legacy timeout retains custody without inventing history coverage', CASES, async t => {
   const f = fixture(t);
   const owner = f.state.getBinding('1000');
   f.state.markIntakeBoundary('1000', 'gap', LEGACY_TIMEOUT_DETAIL, null, null, owner);
@@ -293,14 +306,21 @@ test('R7a: old timeout gap without a baseline cursor retries after database reop
   f.history.set('1000', [f.message('101', '1000')]);
   await f.reopen();
 
-  f.enableDelivery();
   const result = await f.recover();
-  assert.equal(result.ready, true, JSON.stringify(result));
-  assert.equal(f.boundary('1000').state, 'ready');
-  await f.gateway.reconcilePending(undefined, { readyOnly: true });
-  await f.gateway.consumer.waitForNativeWork();
-  assert.equal(f.state.getMessage('101').state, 'replied');
-  assert.equal(f.dispatched.filter(message => message.id === '101').length, 1);
+
+  assert.equal(result.ready, false, JSON.stringify(result));
+  assert.equal(f.boundary('1000').state, 'pending');
+  assert.equal(f.state.getIntakeWatermark('1000').recovered_through_id, null);
+  assert.equal(f.calls.filter(call => call.kind === 'history' && call.id === '1000').length, 0);
+  assert.equal(f.state.getMessage('101').state, 'accepted');
+  assert.equal(f.dispatched.length, 0);
+  assert.equal(f.replies.length, 0);
+
+  const reopenedOwner = f.state.getBinding('1000');
+  assert.deepEqual(
+    [reopenedOwner.provider, reopenedOwner.nativeId, reopenedOwner.generation],
+    [owner.provider, owner.nativeId, owner.generation]
+  );
 });
 
 for (const reason of ['startup', 'reconnect', 'restart']) {
