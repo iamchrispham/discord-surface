@@ -432,6 +432,53 @@ test('correlated reply keeps a recorded child route when another child enrolls',
   assert.match(postUrl, /channels\/202\/messages$/);
 });
 
+test('peer-qualified reply keeps the recorded child when the peer has multiple ready children', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
+  f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100' }, target);
+  f.state.markThreadBoundary('203', THREAD_STATES.READY, 'fixture', null, null, target);
+  const caller = f.state.getBinding('101');
+  const requestPacket = {
+    id: 'multi-child-request', kind: 'request',
+    source: { guildId: target.guildId, channelId: '202', provider: target.provider,
+      nativeId: target.nativeId, generation: target.generation },
+    target: { guildId: caller.guildId, channelId: '102', provider: caller.provider,
+      nativeId: caller.nativeId, generation: caller.generation },
+    replyTo: null, routingVersion: 2, text: 'hello'
+  };
+  f.state.receipt(null, 'agent-message', { packet: requestPacket });
+  let postUrl;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    postUrl = url;
+    return { ok: true, status: 200, json: async () => ({ id: '10003' }) };
+  } });
+  const result = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: requestPacket.id,
+    text: 'child result', dedupe_key: 'multi-child-result' });
+  assert.equal(result.status, 'sent');
+  assert.match(postUrl, /channels\/202\/messages$/);
+});
+
+test('peer result refuses to expose text after caller handoff during inspection', async t => {
+  const f = fixture(t); f.enroll('102'); addRecipient(f);
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    return { ok: true, status: 200, json: async () => ({ id: '10004' }) };
+  } });
+  const input = { peer: { conductorId: 'recipient' }, text: 'hello', dedupe_key: 'caller-fence-request' };
+  assert.equal((await peer.send(input)).status, 'sent');
+  const originalDirectPostRows = f.state.directPostRows.bind(f.state);
+  let handedOff = false;
+  f.state.directPostRows = (...args) => {
+    const rows = originalDirectPostRows(...args);
+    if (!handedOff) {
+      handedOff = true;
+      f.state.db.prepare("UPDATE bindings SET generation=generation+1 WHERE channel_id='101'").run();
+    }
+    return rows;
+  };
+  await assert.rejects(peer.result(input.dedupe_key), /caller changed during result inspection/);
+});
+
 for (const outcome of ['sent', 'unknown']) {
   test(`concurrent peer sends retain one attempt when transport is ${outcome}`, async t => {
     const f = fixture(t); f.enroll('102'); addRecipient(f);

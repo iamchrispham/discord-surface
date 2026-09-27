@@ -96,7 +96,13 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
       generation: destination.binding.generation
     };
     const selectors = destination === null ? [null] : destination.childId === null
-      ? [parentSelector]
+      ? [
+        ...state.listThreadEnrollments(destination.binding.channelId)
+          .filter(child => child.active && child.parentChannelId === destination.binding.channelId &&
+            child.guildId === destination.binding.guildId && child.state === THREAD_STATES.READY)
+          .map(child => resolveAgentAddress(state, destination.binding, child.threadId)),
+        parentSelector
+      ]
       : [resolveAgentAddress(state, destination.binding, destination.childId), parentSelector];
     let lastError;
     const matches = [];
@@ -141,7 +147,25 @@ function createPeerService(context) {
   const caller = signal => resolvePeerCaller(state, provider, callerDependencies, signal);
   const service = {
     async post(input, signal) { return postByRole(context, input, signal, service.send); },
-    async result(correlationId, signal) { return inspectPeerResult(state, await caller(signal), correlationId); },
+    async result(correlationId, signal) {
+      const callerBinding = await caller(signal);
+      const result = await inspectPeerResult(state, callerBinding, correlationId);
+      const currentCallerBinding = await caller(signal);
+      const callerAddress = {
+        guildId: callerBinding.guildId, channelId: callerBinding.channelId,
+        provider: callerBinding.provider, nativeId: canonicalNativeId(callerBinding.nativeId),
+        generation: callerBinding.generation
+      };
+      const currentCallerAddress = {
+        guildId: currentCallerBinding.guildId, channelId: currentCallerBinding.channelId,
+        provider: currentCallerBinding.provider, nativeId: canonicalNativeId(currentCallerBinding.nativeId),
+        generation: currentCallerBinding.generation
+      };
+      if (!sameAddress(callerAddress, currentCallerAddress)) {
+        throw new Error('peer caller changed during result inspection');
+      }
+      return result;
+    },
     async list(signal) {
       const callerBinding = await caller(signal);
       const { guildId } = state.requireConfig();
