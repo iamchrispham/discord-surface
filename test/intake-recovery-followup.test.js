@@ -1,6 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fixture } = require('./helpers/intake-recovery-fixture');
+const { recoverThread } = require('../src/discord/thread-enrollment');
+const { waitForRecoveryOperation } = require('../src/discord');
 
 async function settleRecovery(operation) {
   let timer;
@@ -111,6 +113,62 @@ test('startup qualifies a completed empty legacy parent and replays post-baselin
   assert.ok(historyCalls > 0);
   assert.equal(f.state.getMessage('101').state, 'accepted');
   assert.equal(f.cursor('1000'), '101');
+});
+
+test('verified-empty legacy child records adoption before live checkpointing', { timeout: 4000 }, async t => {
+  const f = fixture(t, { adoptThread: false });
+
+  const first = await settleRecovery(f.gateway.recoverTransport('startup'));
+  assert.equal(first.ready, true, JSON.stringify(first));
+  const adopted = f.state.getThreadEnrollment('2000');
+  assert.equal(adopted.recoveredThroughId, '0');
+  assert.ok(adopted.adoptedAt);
+
+  const message = { ...f.message('101', '2000'), authorId: 'operator', isBot: false, attachments: [] };
+  assert.equal(f.state.acceptDiscordMessage(message, {
+    expectedBinding: f.state.getBinding('1000'),
+    ready: false
+  }).accepted, true);
+  f.history.set('2000', [message]);
+  const checkpointed = await recoverThread(
+    f.gateway,
+    f.state.getThreadEnrollment('2000'),
+    new AbortController().signal,
+    f.gateway.lifecycleEpoch,
+    waitForRecoveryOperation,
+    true,
+    Date.now() + f.gateway.recoveryTimeoutMs
+  );
+
+  assert.equal(checkpointed, true);
+  assert.equal(f.state.getThreadEnrollment('2000').recoveredThroughId, '101');
+});
+
+test('deadline retry waits for an unvisited ready route to finish', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
+    nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
+  f.state.setIntakeBaseline('3000', '100', 'fixture');
+  f.state.markIntakeBoundary('3000', 'ready');
+  f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
+  const message = f.message('101', '3000');
+  f.history.set('3000', [message]);
+  const originalFetchHistory = f.gateway.fetchHistory.bind(f.gateway);
+  f.gateway.fetchHistory = async (channel, options) => {
+    const delay = channel.id === '1000' ? 80 : channel.id === '3000' ? 400 : 0;
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    return originalFetchHistory(channel, options);
+  };
+
+  const result = await settleRecovery(f.gateway.recoverTransport(
+    'startup', f.gateway.lifecycleEpoch, null, Date.now() + 50
+  ));
+
+  assert.equal(result.ready, false);
+  assert.ok(f.calls.some(call => call.id === '3000'), 'the skipped route must be retried');
+  assert.equal(f.state.getIntakeWatermark('3000').state, 'ready');
+  assert.equal(f.state.getBinding('3000').readiness, 'ready');
+  assert.equal(f.state.getMessage('101').state, 'accepted');
 });
 
 for (const withArrival of [false, true]) {

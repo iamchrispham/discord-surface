@@ -387,6 +387,7 @@ export function createThreadEnrollmentHandlers({
         // cursor. An already-qualified recoveredThroughId is preserved untouched.
         const lastSeenId = maxId(compareDiscordIds, existing.lastSeenId, latestId);
         let recoveredThroughId = existing.recoveredThroughId;
+        let adoptedAt = existing.adoptedAt;
         const qualifiedRecovered = typeof recoveredThroughId === 'string' && /^\d+$/.test(recoveredThroughId)
           ? recoveredThroughId
           : null;
@@ -403,14 +404,15 @@ export function createThreadEnrollmentHandlers({
             });
           }
           recoveredThroughId = '0';
+          if (legacyVerifiedEmpty) adoptedAt = timestamp;
         }
         state.db.prepare(`UPDATE thread_enrollments SET adopted_through_id=?, adopted_at=?, last_seen_id=?, recovered_through_id=?, updated_at=?
           WHERE thread_id=? AND parent_channel_id=? AND active=1`).run(
-          existing.adoptedThroughId, existing.adoptedAt, lastSeenId, recoveredThroughId, timestamp, threadId, existing.parentChannelId
+          existing.adoptedThroughId, adoptedAt, lastSeenId, recoveredThroughId, timestamp, threadId, existing.parentChannelId
         );
         state.receipt(null, THREAD_RECEIPT_KINDS.BASELINE, {
           threadId, parentChannelId: existing.parentChannelId, latestId: existing.adoptedThroughId,
-          adoptedAt: existing.adoptedAt, recoveredThroughId, lastSeenId
+          adoptedAt, recoveredThroughId, lastSeenId
         });
         return handlers.getThreadEnrollment(state, threadId);
       });

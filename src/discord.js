@@ -2316,7 +2316,11 @@ class DiscordGateway {
         }
         const currentState = classifyReadiness(binding, watermark);
         if (currentState === READINESS.READY) {
-          if (binding.readiness === READINESS.RECOVERING) {
+          // The shared deadline can expire before this route is visited. A
+          // persisted READY marker does not prove this startup pass fetched its
+          // channel and history, so give it the same fresh scoped retry as a
+          // recovering route.
+          if ([READINESS.READY, READINESS.RECOVERING].includes(binding.readiness)) {
             scheduleRecoveryRetry(binding.channelId, Date.now() + this.recoveryTimeoutMs);
           }
           continue;
@@ -2852,6 +2856,17 @@ class DiscordGateway {
         timer: null,
         promise: new Promise(resolve => { resolveWaiter = resolve; })
       };
+      const armTimer = () => {
+        if (!Number.isFinite(waiter.deadline)) return;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        waiter.timer = setTimeout(() => waiter.settle({ ready: false, state: 'unavailable' }),
+          Math.max(0, waiter.deadline - Date.now()) + RECOVERY_WAITER_DEADLINE_GRACE_MS);
+      };
+      waiter.extendDeadline = nextDeadline => {
+        if (waiter.settled || !Number.isFinite(nextDeadline) || nextDeadline <= waiter.deadline) return;
+        waiter.deadline = nextDeadline;
+        armTimer();
+      };
       const notifyParents = result => {
         for (const parent of waiter.parents) parent.childFinished(result);
       };
@@ -2897,10 +2912,7 @@ class DiscordGateway {
         waiter.pending = Math.max(0, waiter.pending - 1);
         waiter.maybeSettle();
       };
-      if (Number.isFinite(deadline)) {
-        waiter.timer = setTimeout(() => waiter.settle({ ready: false, state: 'unavailable' }),
-          Math.max(0, deadline - Date.now()) + RECOVERY_WAITER_DEADLINE_GRACE_MS);
-      }
+      armTimer();
       return waiter;
     };
     const attachParents = waiter => {
@@ -2908,6 +2920,7 @@ class DiscordGateway {
         if (parent === waiter || parent.settled || !scopesIntersect(parent.scope, waiter.scope)) continue;
         parent.pending += 1;
         parent.childCount += 1;
+        parent.extendDeadline(waiter.deadline);
         waiter.parents.add(parent);
       }
     };
