@@ -134,8 +134,7 @@ export function restoreQuarantinedSocket(quarantinedPath: string, socketPath: st
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'EEXIST') {
-      fs.unlinkSync(quarantinedPath);
-      return true;
+      return false;
     }
     if (code === 'EPERM' || code === 'EOPNOTSUPP' || code === 'EXDEV') return false;
     throw error;
@@ -144,7 +143,11 @@ export function restoreQuarantinedSocket(quarantinedPath: string, socketPath: st
   return true;
 }
 
-function clearOrphanSocketQuarantines(socketDirectory: string, deps: QuarantineDependencies): void {
+function clearOrphanSocketQuarantines(
+  socketDirectory: string,
+  deps: QuarantineDependencies,
+  endpoint?: string
+): void {
   let entries: string[];
   try { entries = fs.readdirSync(socketDirectory); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
@@ -161,6 +164,7 @@ function clearOrphanSocketQuarantines(socketDirectory: string, deps: QuarantineD
     if (!stats.isDirectory() || stats.isSymbolicLink()) continue;
     const quarantine = readQuarantine(quarantineDirectory, socketDirectory, deps);
     if (!quarantine || deps.isOwnerAlive(quarantine.owner)) continue;
+    if (endpoint !== undefined && quarantine.manifest.endpoint !== endpoint) continue;
     const socketPath = path.join(socketDirectory, quarantine.manifest.endpoint);
     let endpointExists = false;
     try {
@@ -177,7 +181,8 @@ function clearOrphanSocketQuarantines(socketDirectory: string, deps: QuarantineD
       removeSocketQuarantine(quarantineDirectory);
       continue;
     }
-    if (!endpointExists && !restoreQuarantinedSocket(quarantine.socketPath, socketPath)) continue;
+    if (endpointExists) continue;
+    if (!restoreQuarantinedSocket(quarantine.socketPath, socketPath)) continue;
     removeSocketQuarantine(quarantineDirectory);
   }
 }
@@ -210,7 +215,7 @@ export function unlinkSocketIfOwned(
   expected: SocketIdentity | null | undefined,
   deps: QuarantineDependencies
 ): void {
-  clearOrphanSocketQuarantines(path.dirname(socketPath), deps);
+  clearOrphanSocketQuarantines(path.dirname(socketPath), deps, path.basename(socketPath));
   if (!expected) return;
   let observed: SocketIdentity;
   try { observed = deps.socketIdentity(socketPath); } catch (error) {
@@ -253,6 +258,10 @@ export function prepareSocketQuarantine(
   return createSocketQuarantine(socketPath, expected, deps);
 }
 
-export function clearSocketQuarantines(socketDirectory: string, deps: QuarantineDependencies): void {
-  clearOrphanSocketQuarantines(socketDirectory, deps);
+export function clearSocketQuarantines(
+  socketDirectory: string,
+  deps: QuarantineDependencies,
+  endpoint?: string
+): void {
+  clearOrphanSocketQuarantines(socketDirectory, deps, endpoint);
 }

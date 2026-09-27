@@ -465,6 +465,7 @@ export class ClaudeChannel<
     let startupCancelled = false;
     let startupPhase: ClaudeStartupPhase = CLAUDE_STARTUP_PHASES.SOCKET_PREPARATION;
     let listenerStartup: Promise<void> | null = null;
+    let connectionClosedAfterCancellation = false;
     const startupController = new AbortController();
     this.startupPhase = startupPhase;
     const startupCancellation = new Promise<never>((_, reject) => {
@@ -512,10 +513,24 @@ export class ClaudeChannel<
       if (typeof (this.mcp as unknown as ClaudeRuntimeMcp).connect === 'function') {
         startupPhase = CLAUDE_STARTUP_PHASES.MCP_CONNECTION;
         this.startupPhase = startupPhase;
-        await Promise.race([
-          (this.mcp as unknown as ClaudeRuntimeMcp).connect!((this.mcp as unknown as ClaudeRuntimeMcp).transportFactory!()),
-          startupCancellation
-        ]);
+        const connection = Promise.resolve(
+          (this.mcp as unknown as ClaudeRuntimeMcp).connect!((this.mcp as unknown as ClaudeRuntimeMcp).transportFactory!())
+        );
+        try {
+          await Promise.race([connection, startupCancellation]);
+        } catch (error) {
+          if (startupCancelled) {
+            void connection.then(
+              () => Promise.resolve((this.mcp as unknown as ClaudeRuntimeMcp).close?.()).catch(() => {}),
+              () => {}
+            );
+            if (!this.stopping) {
+              try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
+            }
+            connectionClosedAfterCancellation = true;
+          }
+          throw error;
+        }
         if (this.transportClosed) throw new Error('Claude channel stopped during MCP connection');
       }
       startupPhase = CLAUDE_STARTUP_PHASES.LISTENER_STARTUP;
@@ -606,8 +621,8 @@ export class ClaudeChannel<
         });
       });
       await Promise.race([listenerStartup, startupCancellation]);
-      listenerStartup = null;
       if (this.transportClosed) throw new Error('Claude channel transport closed during startup');
+      listenerStartup = null;
       this.ready = true;
       this.started = true;
     } catch (error) {
@@ -616,7 +631,7 @@ export class ClaudeChannel<
         try { await listenerStartup; } catch {}
         listenerStartup = null;
       }
-      if (!this.stopping) {
+      if (!this.stopping && !connectionClosedAfterCancellation) {
         try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
       }
       try { this.server?.close(); } catch {}

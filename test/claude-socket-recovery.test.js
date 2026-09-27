@@ -396,6 +396,33 @@ test('fallback lock roots ignore per-process runtime directories', t => {
   }
 });
 
+test('fallback lock root remains stable when passwd home recovers', t => {
+  const recoveredHome = path.join('/tmp', `dss-recovered-home-${randomUUID()}`);
+  const sharedRoot = fs.mkdtempSync('/tmp/dss-recovery-root-');
+  fs.chmodSync(sharedRoot, 0o1777);
+  const userInfo = os.userInfo();
+  t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: recoveredHome }));
+  const originalRealpath = fs.realpathSync;
+  t.mock.method(fs, 'realpathSync', (target, ...args) => {
+    if (String(target) === '/tmp') return sharedRoot;
+    return originalRealpath(target, ...args);
+  });
+  t.after(() => {
+    fs.rmSync(recoveredHome, { recursive: true, force: true });
+    fs.rmSync(sharedRoot, { recursive: true, force: true });
+  });
+
+  const socket = socketPath(t);
+  const first = acquireSocketLockWithPath(t, socket);
+  try {
+    fs.mkdirSync(recoveredHome, { mode: 0o700 });
+    assert.throws(() => acquireSocketLock(socket), /already in progress/,
+      'home recovery must not move contenders to a second lock namespace');
+  } finally {
+    first.release();
+  }
+});
+
 test('missing home and runtime roots bootstrap an unpredictable owner-only child under shared temp', t => {
   const missingHome = path.join('/tmp', `dss-missing-home-${randomUUID()}`);
   const userInfo = os.userInfo();
@@ -445,6 +472,15 @@ test('missing home and runtime roots bootstrap an unpredictable owner-only child
     assert.equal(privateStats.isSymbolicLink(), false);
     if (owner !== undefined) assert.equal(privateStats.uid, owner);
     assert.equal(privateStats.mode & 0o077, 0);
+
+    const sibling = socketPath(t);
+    const second = acquireSocketLockWithPath(t, sibling);
+    try {
+      assert.equal(path.dirname(path.dirname(second.lockPath)), path.dirname(path.dirname(lockPath)),
+        'contenders must publish one coordinated fallback namespace');
+    } finally {
+      second.release();
+    }
   } finally {
     release();
   }
@@ -513,6 +549,15 @@ test('foreign users cannot exhaust both predictable fallback rendezvous names', 
     assert.ok(rendezvousChildren.some(entry => entry !== rendezvousName && entry !== `${rendezvousName}-shared`),
       'selection must create an unpredictable owner-controlled rendezvous');
     assert.equal(path.dirname(path.dirname(lockPath)).startsWith(sharedRoot), true);
+
+    const sibling = socketPath(t);
+    const second = acquireSocketLockWithPath(t, sibling);
+    try {
+      assert.equal(path.dirname(path.dirname(second.lockPath)), path.dirname(path.dirname(lockPath)),
+        'fallback contenders must share the coordinated election namespace');
+    } finally {
+      second.release();
+    }
   } finally {
     release();
   }
@@ -1278,6 +1323,32 @@ test('aliased socket parents share a live preparation lock', t => {
   } finally {
     release();
   }
+});
+
+test('foreign-owned socket directory symlinks are refused', t => {
+  const socket = socketPath(t, { cleanup: false });
+  const realDirectory = path.dirname(socket);
+  const aliasDirectory = `${realDirectory}-foreign-alias`;
+  fs.symlinkSync(realDirectory, aliasDirectory, 'dir');
+  t.after(() => {
+    fs.unlinkSync(aliasDirectory);
+    removeSocketDirectory(socket);
+  });
+  const originalLstat = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    const stats = originalLstat(target, ...args);
+    if (String(target) !== aliasDirectory || (args.length > 0 && args[0] && args[0].bigint)) return stats;
+    return {
+      ...stats,
+      uid: (process.getuid?.() ?? 0) + 1,
+      isDirectory: () => false,
+      isSymbolicLink: () => true
+    };
+  });
+  assert.throws(
+    () => assertSocketDirectory(path.join(aliasDirectory, path.basename(socket))),
+    /foreign-owned symlink/
+  );
 });
 
 test('endpoint names ending in .lock do not collide with coordination artifacts', t => {

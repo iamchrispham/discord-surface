@@ -31,9 +31,69 @@ export function assertLockNamespaceIsUsable(namespacePath: string, owner: number
   }
 }
 
+function publishedFallbackRoot(root: string, owner: number | undefined, homeIdentity: string | undefined): string | undefined {
+  let directory: fs.Stats;
+  try { directory = fs.statSync(root); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const stickySharedRoot = (directory.mode & 0o1000) !== 0 && (directory.mode & 0o002) !== 0;
+  if (!directory.isDirectory() || !stickySharedRoot) return undefined;
+
+  const ownerName = owner === undefined ? 'shared' : String(owner);
+  const privateRootPrefix = `.claude-channel-${ownerName}-`;
+  const rendezvousName = path.basename(lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`));
+  const rendezvousPrefix = `${rendezvousName}-`;
+  let entries: string[];
+  try { entries = fs.readdirSync(root); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  for (const entry of entries.filter(name => name === rendezvousName || name.startsWith(rendezvousPrefix)).sort()) {
+    const rendezvousDirectory = path.join(root, entry);
+    let rendezvousStats: fs.Stats;
+    try { rendezvousStats = fs.lstatSync(rendezvousDirectory); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    const rendezvousOwnerControlled = owner === undefined || rendezvousStats.uid === owner;
+    if (!rendezvousStats.isDirectory() || rendezvousStats.isSymbolicLink() || !rendezvousOwnerControlled ||
+      (rendezvousStats.mode & 0o077) !== 0) continue;
+    const rendezvousPath = path.join(rendezvousDirectory, 'fallback-root');
+    let marker: fs.Stats;
+    try { marker = fs.lstatSync(rendezvousPath); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    const markerOwnerControlled = owner === undefined || marker.uid === owner;
+    if (!marker.isFile() || marker.isSymbolicLink() || !markerOwnerControlled || (marker.mode & 0o077) !== 0) {
+      throw new Error('Claude channel fallback-root rendezvous is unusable');
+    }
+    const markerLines = fs.readFileSync(rendezvousPath, 'utf8').trim().split('\n');
+    const target = markerLines[0];
+    if (homeIdentity === undefined || markerLines.length < 2 || markerLines[1] !== homeIdentity) continue;
+    if (!target || path.basename(target) !== target || !target.startsWith(privateRootPrefix)) {
+      throw new Error('Claude channel fallback-root rendezvous is invalid');
+    }
+    const privateRoot = path.join(root, target);
+    let privateDirectory: fs.Stats;
+    try { privateDirectory = fs.lstatSync(privateRoot); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    const privateOwnerControlled = owner === undefined || privateDirectory.uid === owner;
+    const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
+    if (privateDirectory.isDirectory() && !privateDirectory.isSymbolicLink() && privateOwnerControlled &&
+      privateOwnerWritable && (privateDirectory.mode & 0o077) === 0) return privateRoot;
+  }
+  return undefined;
+}
+
 export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): string {
   const owner = deps.effectiveUserId();
   const ownerName = owner === undefined ? 'shared' : String(owner);
+  let homeIdentity: string | undefined;
+  try { homeIdentity = path.resolve(os.userInfo().homedir); } catch {}
   const candidates: string[] = [];
   try {
     candidates.push(fs.realpathSync(os.userInfo().homedir));
@@ -42,6 +102,11 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
   }
   try { candidates.push(fs.realpathSync('/tmp')); } catch {
     // No stable system temporary root is available.
+  }
+
+  for (const root of candidates) {
+    const publishedRoot = publishedFallbackRoot(root, owner, homeIdentity);
+    if (publishedRoot) return publishedRoot;
   }
 
   for (const root of candidates) {
@@ -91,7 +156,10 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
         (marker.mode & 0o077) !== 0) {
         throw new Error('Claude channel fallback-root rendezvous is unusable');
       }
-      const target = fs.readFileSync(rendezvousPath, 'utf8').trim();
+      const markerLines = fs.readFileSync(rendezvousPath, 'utf8').trim().split('\n');
+      const target = markerLines[0];
+      const recordedHomeIdentity = markerLines[1];
+      if (recordedHomeIdentity !== undefined && (homeIdentity === undefined || recordedHomeIdentity !== homeIdentity)) return {};
       if (!target || path.basename(target) !== target || !target.startsWith(privateRootPrefix)) {
         throw new Error('Claude channel fallback-root rendezvous is invalid');
       }
@@ -179,18 +247,15 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
         }
       }
       if (!rendezvousDirectory) {
-        const unpredictableRendezvousDirectory = fs.mkdtempSync(path.join(root, rendezvousPrefix));
-        if (isUsableRendezvousDirectory(unpredictableRendezvousDirectory)) {
-          const ownerRendezvousCandidates = fs.readdirSync(root)
-            .filter(entry => entry === rendezvousName || entry.startsWith(rendezvousPrefix))
-            .map(entry => path.join(root, entry))
-            .filter(isUsableRendezvousDirectory)
-            .sort();
-          rendezvousDirectory = ownerRendezvousCandidates[0] ?? unpredictableRendezvousDirectory;
+        const coordinatedRendezvousDirectory = path.join(root, `${rendezvousName}-election`);
+        try {
+          fs.mkdirSync(coordinatedRendezvousDirectory, { mode: 0o700 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        if (isUsableRendezvousDirectory(coordinatedRendezvousDirectory)) {
+          rendezvousDirectory = coordinatedRendezvousDirectory;
           rendezvousState = readRendezvousRoot(rendezvousDirectory);
-          if (rendezvousDirectory !== unpredictableRendezvousDirectory) {
-            try { fs.rmdirSync(unpredictableRendezvousDirectory); } catch { /* retain a concurrent candidate */ }
-          }
         }
       }
       if (!rendezvousDirectory) {
@@ -217,7 +282,10 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
         privateRoot = rendezvousRoot;
       } else {
         const markerTemp = path.join(rendezvousDirectory, `.fallback-root-${process.pid}-${randomUUID()}`);
-        fs.writeFileSync(markerTemp, path.basename(privateRoot), { mode: 0o600, flag: 'wx' });
+        const markerContents = homeIdentity === undefined
+          ? `${path.basename(privateRoot)}\n`
+          : `${path.basename(privateRoot)}\n${homeIdentity}\n`;
+        fs.writeFileSync(markerTemp, markerContents, { mode: 0o600, flag: 'wx' });
         try {
           if (staleMarker) {
             const markerBeforeReplace = readRendezvousRoot(rendezvousDirectory).staleMarker;

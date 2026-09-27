@@ -181,8 +181,38 @@ function stagingPathForNamespace(namespacePath: string): string {
   return path.join(namespacePath, `.staging-${process.pid}-${randomUUID()}`);
 }
 
+function validateSocketDirectoryPath(directoryPath: string): void {
+  const owner = effectiveUserId();
+  const root = path.parse(directoryPath).root;
+  let current = root;
+  for (const component of directoryPath.slice(root.length).split(path.sep).filter(Boolean)) {
+    const next = path.join(current, component);
+    let entry: fs.Stats;
+    try { entry = fs.lstatSync(next); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') break;
+      throw error;
+    }
+    const parent = fs.statSync(current);
+    const parentIsSticky = (parent.mode & 0o1000) !== 0;
+    const parentIsMutable = (parent.mode & 0o022) !== 0 && !parentIsSticky;
+    if (parentIsMutable) throw new Error('Claude channel socket directory contains a mutable path component');
+    if (entry.isSymbolicLink()) {
+      if (parentIsSticky && owner !== undefined && entry.uid !== owner) {
+        throw new Error('Claude channel socket directory contains a foreign-owned symlink');
+      }
+      const target = fs.statSync(next);
+      if (!target.isDirectory()) throw new Error('Claude channel socket directory must resolve to a directory');
+    } else if (!entry.isDirectory()) {
+      throw new Error('Claude channel socket directory must be a directory');
+    }
+    current = next;
+  }
+}
+
 function ensureDirectoryOwnerOnly(directoryPath: string): void {
+  validateSocketDirectoryPath(directoryPath);
   fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
+  validateSocketDirectoryPath(directoryPath);
   const directory = fs.statSync(directoryPath);
   if ((directory.mode & 0o077) || directory.uid !== effectiveUserId()) {
     throw new Error('Claude channel socket directory must be owner-only');
@@ -623,14 +653,15 @@ export async function withSocketLock<T>(socketPath: string, action: () => Promis
 
 export async function prepareSocket(socketPath: string, signal?: AbortSignal): Promise<void> {
   const quarantineDeps = quarantineDependencies();
-  clearSocketQuarantines(path.dirname(socketPath), quarantineDeps);
-  let original: fs.Stats;
-  try { original = fs.lstatSync(socketPath); } catch (error) {
+  clearSocketQuarantines(path.dirname(socketPath), quarantineDeps, path.basename(socketPath));
+  let original: fs.BigIntStats;
+  try { original = fs.lstatSync(socketPath, { bigint: true }); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
   if (!original.isSocket()) throw new Error('Claude channel path exists and is not a socket');
-  if (original.uid !== effectiveUserId()) throw new Error('Claude channel socket belongs to another owner');
+  const owner = effectiveUserId();
+  if (owner !== undefined && original.uid !== BigInt(owner)) throw new Error('Claude channel socket belongs to another owner');
   if (signal?.aborted) throw new Error('Claude channel stopped during socket preparation');
   await new Promise<void>((resolve, reject) => {
     if (signal?.aborted) {
@@ -651,28 +682,37 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
         reject(error);
         return;
       }
-      let current: fs.Stats;
-      try { current = fs.lstatSync(socketPath); } catch (statError) {
+      let current: fs.BigIntStats;
+      try { current = fs.lstatSync(socketPath, { bigint: true }); } catch (statError) {
+        if ((statError as NodeJS.ErrnoException).code === 'ENOENT') {
+          resolve();
+          return;
+        }
         reject(statError);
         return;
       }
       if (!current.isSocket() || current.uid !== original.uid || current.dev !== original.dev ||
-        current.ino !== original.ino || current.ctimeMs !== original.ctimeMs ||
-        current.birthtimeMs !== original.birthtimeMs) {
+        current.ino !== original.ino || current.ctimeNs !== original.ctimeNs ||
+        current.birthtimeNs !== original.birthtimeNs) {
         reject(new Error('Claude channel socket changed during stale probe'));
         return;
       }
       let quarantineDirectory: string | undefined;
       let quarantineMoved = false;
       try {
-        const expected = socketIdentity(socketPath);
+        const expected: SocketIdentity = {
+          dev: original.dev,
+          ino: original.ino,
+          ctimeNs: original.ctimeNs,
+          birthtimeNs: original.birthtimeNs
+        };
         const quarantine = prepareSocketQuarantine(socketPath, expected, quarantineDeps);
         quarantineDirectory = quarantine.directory;
         const quarantinedPath = path.join(quarantineDirectory, 'socket');
         fs.renameSync(socketPath, quarantinedPath);
         quarantineMoved = true;
         const quarantined = fs.lstatSync(quarantinedPath);
-        if (!quarantined.isSocket() || quarantined.uid !== original.uid ||
+        if (!quarantined.isSocket() || (owner !== undefined && quarantined.uid !== owner) ||
           !sameQuarantinedSocket(socketIdentity(quarantinedPath), expected)) {
           if (!restoreQuarantinedSocket(quarantinedPath, socketPath)) {
             reject(new Error('Claude channel socket restore is unavailable'));
@@ -690,6 +730,11 @@ export async function prepareSocket(socketPath: string, signal?: AbortSignal): P
       } catch (cleanupError) {
         if (quarantineDirectory !== undefined && !quarantineMoved) {
           removeSocketQuarantine(quarantineDirectory);
+          quarantineDirectory = undefined;
+        }
+        if ((cleanupError as NodeJS.ErrnoException).code === 'ENOENT') {
+          resolve();
+          return;
         }
         reject(cleanupError);
       }
