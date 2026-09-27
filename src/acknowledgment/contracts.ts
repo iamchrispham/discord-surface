@@ -1,5 +1,5 @@
 import type * as fs from 'node:fs';
-import type { NativeProvider, MessageState } from '../acknowledgment';
+import type { NativeProvider, MessageState } from './constants';
 
 interface SqlRow {
   [key: string]: unknown;
