@@ -392,9 +392,9 @@ test('real direct MCP notification carries the shared ACK branch before per-kind
     assert.ok(humanContent.includes(`Use the reply tool with messageId "${human.id}" and generation ${human.generation}`));
 
     const agentContent = contentFor(agent.id);
-    assertDirectEventAcknowledgment(agentContent, agent.id, agent.generation, 'either use the reply tool');
-    assert.ok(agentContent.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT) < agentContent.indexOf('either use the reply tool'), 'agent work instruction must follow the shared condition');
-    assert.ok(agentContent.includes(`or run the exact no-post completion command below`));
+    assertDirectEventAcknowledgment(agentContent, agent.id, agent.generation, 'After handling this agent result');
+    assert.ok(agentContent.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT) < agentContent.indexOf('After handling this agent result'), 'agent work instruction must follow the shared condition');
+    assert.ok(agentContent.includes('Do not use the reply tool.'));
     assert.ok(agentContent.includes(JSON.stringify(completionFor(f.state.getMessage(agent.id)))));
 
     const watcherContent = contentFor(watcher.id);
