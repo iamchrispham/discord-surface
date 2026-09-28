@@ -179,27 +179,65 @@ test('worker proof treats an unavailable canonical symlink target as unknown', (
   }
 });
 
-test('legacy-only predecessor proof uses the documented fallback safely', () => {
+test('worker proof ignores the external Codex registry when the canonical root is absent', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-legacy-home-'));
   try {
     const legacy = path.join(home, '.codex', 'work-control', 'workers');
     fs.mkdirSync(legacy, { recursive: true });
     const nativeId = 'legacy-predecessor-native-id';
     const owner = 'legacy-owner';
-    const manifestPath = path.join(legacy, `${owner}.json`);
     const expected = { fullUUID: nativeId, provider: 'codex', workspace: fs.realpathSync(home) };
-    function discover(state, pid, mockLive) {
-      fs.writeFileSync(manifestPath, JSON.stringify({
-        sessionId: nativeId, fullUUID: nativeId, worktree: home, state,
-        harness: 'codex', pid, processStartTime: 1700000000, generation: 1
+    fs.writeFileSync(path.join(legacy, `${owner}.json`), JSON.stringify({
+      sessionId: nativeId, fullUUID: nativeId, worktree: home, state: 'done',
+      harness: 'codex', pid: 999999, processStartTime: 1700000000, generation: 1
+    }));
+    const code = [
+      'import json',
+      'import conductor_worker_proof as proof',
+      `print(json.dumps(proof.discover_predecessor(${JSON.stringify(expected)}, ${JSON.stringify(owner)})))`
+    ].join('; ');
+    const result = spawnSync(PYTHON, ['-c', code], {
+      env: {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
+        ),
+        HOME: home,
+        PYTHONPATH: path.join(__dirname, '..', 'src')
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout.trim()).status, 'missing');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('worker proof treats unavailable canonical ancestor symlinks as unknown', () => {
+  for (const ancestor of ['agents', 'work-control']) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), `worker-proof-missing-${ancestor}-home-`));
+    try {
+      const legacy = path.join(home, '.codex', 'work-control', 'workers');
+      const missing = path.join(home, 'registry-mount', 'work-control');
+      if (ancestor === 'agents') {
+        fs.symlinkSync(path.dirname(missing), path.join(home, '.agents'), 'dir');
+      } else {
+        fs.mkdirSync(path.join(home, '.agents'), { recursive: true });
+        fs.symlinkSync(missing, path.join(home, '.agents', 'work-control'), 'dir');
+      }
+      fs.mkdirSync(legacy, { recursive: true });
+      const nativeId = `missing-${ancestor}-predecessor-native-id`;
+      const owner = `missing-${ancestor}-owner`;
+      fs.writeFileSync(path.join(legacy, `${owner}.json`), JSON.stringify({
+        sessionId: nativeId, fullUUID: nativeId, worktree: home,
+        harness: 'codex', pid: 999999, processStartTime: 1700000000, generation: 1
       }));
+      const expected = { fullUUID: nativeId, provider: 'codex', workspace: fs.realpathSync(home) };
       const code = [
         'import json',
         'import conductor_worker_proof as proof',
-        mockLive ? "proof.process_probe = lambda pid: ('live', 1700000000)" : '',
-        `result = proof.discover_predecessor(${JSON.stringify(expected)}, ${JSON.stringify(owner)})`,
-        'print(json.dumps(result))'
-      ].filter(Boolean).join('; ');
+        `print(json.dumps(proof.discover_predecessor(${JSON.stringify(expected)}, ${JSON.stringify(owner)})))`
+      ].join('; ');
       const result = spawnSync(PYTHON, ['-c', code], {
         env: {
           ...Object.fromEntries(
@@ -211,12 +249,10 @@ test('legacy-only predecessor proof uses the documented fallback safely', () => 
         encoding: 'utf8'
       });
       assert.equal(result.status, 0, result.stderr);
-      return JSON.parse(result.stdout.trim()).status;
+      assert.equal(JSON.parse(result.stdout.trim()).status, 'unknown', ancestor);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
     }
-    assert.equal(discover('done', 999999, false), 'gone');
-    assert.equal(discover('active', 1, true), 'alive');
-  } finally {
-    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
