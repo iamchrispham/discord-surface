@@ -131,7 +131,7 @@ test('worker proof ignores a distinct Codex alias when canonical death is proven
   }
 });
 
-test('legacy-only predecessor proof cannot authorize takeover', () => {
+test('legacy-only predecessor proof uses the documented fallback safely', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-legacy-home-'));
   try {
     const legacy = path.join(home, '.codex', 'work-control', 'workers');
@@ -159,8 +159,8 @@ test('legacy-only predecessor proof cannot authorize takeover', () => {
       assert.equal(result.status, 0, result.stderr);
       return JSON.parse(result.stdout.trim()).status;
     }
-    assert.equal(discover('done', 999999, false), 'missing');
-    assert.equal(discover('active', 1, true), 'missing');
+    assert.equal(discover('done', 999999, false), 'gone');
+    assert.equal(discover('active', 1, true), 'alive');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -19,6 +19,7 @@ FORCED_VERBS = frozenset({'steal', 'override', 'preempt'})
 PROOF_LIMIT = 1024 * 1024
 IDENTITY_ALIAS_KEYS = ('sessionId', 'fullUUID', 'fullUuid')
 DEFAULT_WORKERS_ROOT = '~/.agents/work-control/workers'
+LEGACY_WORKERS_ROOT = '~/.codex/work-control/workers'
 
 
 class GateError(Exception):
@@ -254,6 +255,19 @@ def workers_root():
     return os.path.realpath(os.path.abspath(os.path.expanduser(requested)))
 
 
+def worker_roots():
+    override = os.environ.get('CONDUCTOR_WORKERS_DIR')
+    if override:
+        return [workers_root()]
+    canonical = workers_root()
+    roots = [canonical]
+    if not os.path.exists(canonical):
+        legacy = os.path.realpath(os.path.abspath(os.path.expanduser(LEGACY_WORKERS_ROOT)))
+        if legacy != canonical:
+            roots.append(legacy)
+    return roots
+
+
 def expected_filename_match(stem, expected_owner):
     if not expected_owner:
         return False
@@ -323,7 +337,7 @@ def discover_predecessor(expected_identity, expected_owner):
              'reason': str, 'record': manifest fields|None, 'filename': str|None}.
     'gone' is the only status that qualifies a steal; every other status refuses.
     """
-    roots = [workers_root()]
+    roots = worker_roots()
     candidates = []
     exact_matches = []
     unknown_matching = False
