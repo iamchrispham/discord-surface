@@ -258,10 +258,21 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return normalizeReplyContext({ messageId, channelId, guildId, excerpt, isBotAuthor });
   }
 
+  // Discord's REST payload types mark APIUser.bot and APIMessage.guild_id as
+  // optional, so a reply fetched over REST may omit either. The caller already
+  // proved same-channel/guild before the request and the URL targets that exact
+  // channel, so an absent guild_id is trusted; when the field IS present it must
+  // still match. An absent author.bot is likewise accepted, while a present
+  // non-boolean is rejected as malformed. Author identity is never inferred from
+  // this field: replyContextFromAuthor derives isBotAuthor from the connected id.
   function rawReplyContextIsValid(raw, messageId, channelId, guildId) {
-    return Boolean(raw) && typeof raw === 'object' && raw.id === messageId && raw.channel_id === channelId &&
-      (!guildId || raw.guild_id === guildId) && typeof raw.content === 'string' &&
-      typeof raw.author?.id === 'string' && typeof raw.author?.bot === 'boolean';
+    if (!raw || typeof raw !== 'object') return false;
+    if (raw.id !== messageId || raw.channel_id !== channelId) return false;
+    if (guildId && raw.guild_id !== undefined && raw.guild_id !== guildId) return false;
+    if (typeof raw.content !== 'string') return false;
+    if (typeof raw.author?.id !== 'string') return false;
+    if (raw.author.bot !== undefined && typeof raw.author.bot !== 'boolean') return false;
+    return true;
   }
 
   async function optionalReplyContext(message, options = {}) {

@@ -21,6 +21,7 @@
     "src/native/errors.ts",
     "src/native/prompts.ts",
     "src/reply-context.ts",
+    "test/types/reply-context-types.ts",
     "src/agent-message.ts",
     "src/watcher-notice.ts",
     "src/agent-presentation.ts",
