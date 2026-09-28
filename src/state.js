@@ -10,6 +10,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { normalizeAttachments } = require('./attachments');
+const { deserializeReplyContext } = require('./reply-context');
 const { ORDINARY_RECEIPT_KINDS } = require('./ordinary/constants');
 const { createOrdinaryRepository } = require('./ordinary');
 const { createDirectPostHandlers, queryDirectPostRows, DIRECT_POST_OUTCOMES } = require('./state/direct-post');
@@ -324,6 +325,21 @@ function parseJson(value, fallback = null) {
 
 function now() {
   return new Date().toISOString();
+}
+
+// Attach the persisted reply context to an ordinary human message. The first
+// accepted receipt wins permanently; later accepted receipts are never
+// consulted. A stored context whose channel does not match the message's own
+// channel is out of scope and is omitted, as is a malformed blob. Hydration
+// never throws into getMessage.
+function hydrateReplyContext(state, message) {
+  const row = state.db.prepare("SELECT id, detail FROM receipts WHERE discord_id=? AND kind='accepted' ORDER BY id LIMIT 1").get(message.id);
+  if (!row) return;
+  const detail = parseJson(row.detail, null);
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return;
+  if (detail.channelId !== message.channelId) return;
+  const replyContext = deserializeReplyContext(detail.replyContext);
+  if (replyContext) message.replyContext = replyContext;
 }
 
 function compareDiscordIds(left, right) {
@@ -2144,6 +2160,7 @@ class SurfaceState {
       }
       const decisionResult = interactionHandlers.decisionResult(this, message);
       if (decisionResult) message.decisionResult = decisionResult;
+      else if (!agent && !notice) hydrateReplyContext(this, message);
     }
     return message;
   }
