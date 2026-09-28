@@ -904,6 +904,8 @@ test('timed-out child lookup keeps later same-owner custody behind it', { timeou
   await initial;
   assert.deepEqual(f.dispatched, [], 'same-owner successor stays queued while lookup is unresolved');
 
+  f.state.listThreadEnrollments = listEnrollments;
+  f.histories.set(f.child.id, [f.message('101')]);
   releaseChildLookup();
   await retryStartedPromise;
   await pendingChildLookup;
