@@ -171,7 +171,7 @@ function peerMeta(meta, attemptId, childId, peerRouting = false) {
 }
 
 function enrollPeerChild(state, binding, threadId) {
-  state.enrollThread({ threadId, parentChannelId: binding.channelId, guildId: binding.guildId }, binding);
+  state.enrollThread({ threadId, parentChannelId: binding.channelId, guildId: binding.guildId, adoptionCutoff: '100' }, binding);
   state.markThreadBoundary(threadId, 'ready', 'projection fixture', null, null, binding);
 }
 
