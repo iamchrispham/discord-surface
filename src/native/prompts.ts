@@ -110,17 +110,27 @@ function commandValue(command: readonly string[], flag: string): string | null {
 }
 
 function agentResultInstruction(message: NativeMessage, agent: NonNullable<NativeMessage['agentMessage']>, completion: readonly string[] | null | undefined): string {
-  const resultKey = crypto.createHash('sha256').update(JSON.stringify([agent.id, agent.source, agent.target])).digest('hex').slice(0, 24);
+  const localParentChannelId = message.channelId;
+  const localChildChannelId = agent.target.channelId;
+  const localRoute = {
+    guildId: agent.target.guildId,
+    parentChannelId: localParentChannelId,
+    childChannelId: localChildChannelId,
+    provider: agent.target.provider,
+    nativeId: agent.target.nativeId,
+    generation: agent.target.generation
+  };
+  const resultKey = crypto.createHash('sha256').update(JSON.stringify([agent.id, agent.source, localRoute])).digest('hex').slice(0, 24);
   const stateDir = completion ? commandValue(completion, '--state-dir') : null;
   const dbPath = completion ? commandValue(completion, '--db') : null;
   const cliPath = completion?.[1] || null;
   if (!stateDir || !dbPath || !cliPath || !completion?.[0]) {
     return [
       'Return exactly one correlated result through the agent-send command.',
-      `Write this exact JSON to an owner-only target file: ${JSON.stringify(agent.source)}.`,
-      `Use --agent-reply-to ${JSON.stringify(agent.id)}, --channel-id ${JSON.stringify(message.channelId)}, --agent-thread-id ${JSON.stringify(agent.target.channelId)}, --native-id ${JSON.stringify(agent.target.nativeId)}, --generation ${JSON.stringify(String(agent.target.generation))}, --target-file <owner-only target file>, and --text-file <owner-only result file>.`,
+      `Write this exact JSON to an owner-only target file: ${JSON.stringify(agent.source)}. The target file preserves the immutable incoming source route and is the exact source selector, not a route inferred from the packet ID.`,
+      `Use --agent-reply-to ${JSON.stringify(agent.id)}, --channel-id ${JSON.stringify(localParentChannelId)}, --agent-thread-id ${JSON.stringify(localChildChannelId)}, --native-id ${JSON.stringify(agent.target.nativeId)}, --generation ${JSON.stringify(String(agent.target.generation))}, --target-file <owner-only target file>, and --text-file <owner-only result file>.`,
+      `The local send route is ${JSON.stringify(localRoute)}. --channel-id is the enrolled parent binding and --agent-thread-id is the enrolled child route.`,
       `Use a stable dedupe key such as ${JSON.stringify(`agent-result-${resultKey}`)} and preserve the receiving agent route ${JSON.stringify(agent.target)}.`,
-      'The target file preserves the immutable incoming source route, so this remains unambiguous when packet IDs collide.',
       'Then run agent-complete. Do not use an ordinary Discord reply. An ordinary Discord reply does not complete this request.'
     ].join(' ');
   }
@@ -131,8 +141,8 @@ function agentResultInstruction(message: NativeMessage, agent: NonNullable<Nativ
     '--state-dir', stateDir,
     '--db', dbPath,
     '--provider', agent.target.provider,
-    '--channel-id', message.channelId,
-    '--agent-thread-id', agent.target.channelId,
+    '--channel-id', localParentChannelId,
+    '--agent-thread-id', localChildChannelId,
     '--native-id', agent.target.nativeId,
     '--generation', String(agent.target.generation),
     '--target-file', targetFile,
@@ -142,10 +152,10 @@ function agentResultInstruction(message: NativeMessage, agent: NonNullable<Nativ
   ];
   return [
     'Return exactly one correlated result with this exact routed CLI invocation.',
-    `Write this exact JSON to the owner-only target file ${JSON.stringify(targetFile)} before running it: ${JSON.stringify(agent.source)}.`,
+    `Write this exact JSON to the owner-only target file ${JSON.stringify(targetFile)} before running it: ${JSON.stringify(agent.source)}. The target file preserves the immutable incoming source route and is the exact source selector, not a route inferred from the packet ID.`,
     `Write the result text to the owner-only text file ${JSON.stringify(textFile)}.`,
     `Command argv: ${JSON.stringify(command)}.`,
-    'The target file preserves the immutable incoming source route, so this remains unambiguous when packet IDs collide.',
+    `The local send route is ${JSON.stringify(localRoute)}. --channel-id is the enrolled parent binding and --agent-thread-id is the enrolled child route.`,
     'Then run agent-complete. Do not use an ordinary Discord reply. An ordinary Discord reply does not complete this request.'
   ].join(' ');
 }

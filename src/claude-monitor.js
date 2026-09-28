@@ -7,7 +7,7 @@ const { ClaudeChannel, CLAUDE_PICKUP_ACKNOWLEDGMENT } = require('./claude-channe
 const { agentCompletionCommand, watcherNoticeCompletionCommand, messageRequest } = require('./native');
 const { MESSAGE_STATES, normalizeAttachments } = require('./state');
 
-const PAYLOAD_SCHEMA_VERSION = 6;
+const PAYLOAD_SCHEMA_VERSION = 7;
 const MONITOR_DEDUPE_CLEANUP_INTERVAL_MS = 1000;
 const MONITOR_DEDUPE_STATES = new Set([MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED]);
 

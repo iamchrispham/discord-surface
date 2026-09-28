@@ -212,7 +212,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
     const trustedCompletion = agentCompletionCommand({ ...state.getMessage(agentId), channelId: destination.channelId }, db, path.resolve(path.join(__dirname, '../src/cli.js')), dir);
 
     const oldPayloadPath = path.join(dir, '.cm-e', `${crypto.createHash('sha256')
-      .update(`4\0${path.resolve(db)}\0${agentId}\0${destination.nativeId}\0${destination.generation}`)
+      .update(`5\0${path.resolve(db)}\0${agentId}\0${destination.nativeId}\0${destination.generation}`)
       .digest('hex').slice(0, 32)}.json`);
     const oldPayload = monitorEvent({
       content: agentEvent.content,
@@ -258,7 +258,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
       const firstPayloadText = fs.readFileSync(firstPointer.payloadPath, 'utf8');
       const firstPayload = JSON.parse(firstPayloadText);
       assert.notEqual(firstPointer.payloadPath, oldPayloadPath);
-      assert.equal(firstPayload.version, 6);
+      assert.equal(firstPayload.version, 7);
       assert.equal(firstPayload.content, messageRequest(state.getMessage(agentId)));
       assert.match(firstPayload.content, /Agent result result-1 from codex/);
       assert.match(firstPayload.content, /Correlates to agent message work-1/);
