@@ -118,19 +118,19 @@ const expectedDigests = {
   courierForwardingPrompt: '00a4064173913f094c396da42a14de9121933f57c94e752aaaa2117194b27ce3',
   attachmentPrompt: '51bed8777c238572c49865aa895a615f05842d43f194ee5f3f42b96ae0f0132e',
   messageRequestHuman: '79057b1e52d3d81405bb67993c5087743594770f62ca344e556eb223fc4c2ce2',
-  messageRequestAgentRequest: '1c7edfb83766cf11d98a4d8396656e5134560780157a44a051fad86f80dcecfe',
+  messageRequestAgentRequest: '781c9543600520d29ebb74fa99cd0181474d31b8f423c24c34909e6c49d1fddf',
   messageRequestAgentResult: 'c8dd89fdf246bfb441ba998b79d80837758919746f7b7146c0477cce55fc8649',
   messageRequestDecision: '61bf6fab877b903ac62e83f33903465896b3942f3374b986da8380b5d83d469a',
   messageRequestWatcher: '778ebfecc08c0621fb1e6ee1ac96cfb417aad3576c1f1c6a55e52a47b9d32b9d',
   codexPromptHuman: '214cc1a09949c904d2144fc85a729826e661ea84f89569d5acb88c47f1088b39',
   codexPromptAttachment: '236c32b2160a03dc257ef12ec93463c79faed582466f47c54a84fb144c21b04b',
-  codexPromptAgentRequest: 'ca3e4549cb79c7f96da272638a465df6bdf8c4217956f32f1f5508da2df152de',
+  codexPromptAgentRequest: '980e0839f37548fc29dc24fb907b13ac447c79649b446f0bda378b961db02546',
   codexPromptAgentResult: '329612b9f60d99d02787f3ea62b403977e548392e3841da348dc611601a40878',
   codexPromptDecision: 'fa9ba7f924595df3cfab549840962960ae5cc3f5fab299412dc51dc8c4ce9510',
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
   claudeEventHuman: '3cf57a00278c64f0f1f5e4e180189002af5e7a97584e42326741bf752c71ddcc',
   claudeEventAttachment: 'd04456537d38c4309bae542a35f13c52cbbaa2f3e83c062cec959f7a8db24f6d',
-  claudeEventAgentRequest: '9eaa3d4cc0148e35b5112bcef4a44bad87f3198a3a6bf2cfffb6e80161dba2d2',
+  claudeEventAgentRequest: '877fac5796a5cccaf5e0e88a967027d353f9f8ab55e2d17270bd75d2a0d27835',
   claudeEventAgentResult: '602b9b65c94ab98f5361182aee95462473c679c4146bcb0c178e50c6da229fff',
   claudeEventDecision: '9fa9567ee39e6e4824c584991a8dad2c5267be9c3aa282ba2021e30de868e610',
   claudeEventWatcher: '45d9fbf706942a0fd9be6523d7b8dc61dc1b059e290d9a403be2010599dd3d14'
@@ -158,6 +158,8 @@ test('agent requests direct both native providers to a correlated result', () =>
   assert.match(request, /immutable incoming source route/);
   assert.match(request, /--channel-id is the enrolled parent binding/);
   assert.match(request, /--agent-thread-id is the enrolled child route/);
+  assert.match(request, /duplicate=true/);
+  assert.match(request, /continue with the required completion step/);
   assert.doesNotMatch(request, /peer_send/);
   for (const prompt of [codex, claude]) {
     assert.match(prompt, /agent-send/);
@@ -171,6 +173,8 @@ test('agent requests direct both native providers to a correlated result', () =>
     assert.match(prompt, /--agent-thread-id is the enrolled child route/);
     assert.match(prompt, /--agent-reply-to","agent-request"/);
     assert.match(prompt, /ordinary Discord reply does not complete this request/);
+    assert.match(prompt, /duplicate=true/);
+    assert.match(prompt, /continue with the required completion step/);
   }
   const collidingRequest = {
     ...agentRequest,

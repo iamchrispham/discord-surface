@@ -131,7 +131,7 @@ function agentResultInstruction(message: NativeMessage, agent: NonNullable<Nativ
       `Use --agent-reply-to ${JSON.stringify(agent.id)}, --channel-id ${JSON.stringify(localParentChannelId)}, --agent-thread-id ${JSON.stringify(localChildChannelId)}, --native-id ${JSON.stringify(agent.target.nativeId)}, --generation ${JSON.stringify(String(agent.target.generation))}, --target-file <owner-only target file>, and --text-file <owner-only result file>.`,
       `The local send route is ${JSON.stringify(localRoute)}. --channel-id is the enrolled parent binding and --agent-thread-id is the enrolled child route.`,
       `Use a stable dedupe key such as ${JSON.stringify(`agent-result-${resultKey}`)} and preserve the receiving agent route ${JSON.stringify(agent.target)}.`,
-      'Then run agent-complete. Do not use an ordinary Discord reply. An ordinary Discord reply does not complete this request.'
+      'If agent-send reports duplicate=true, the immutable result is already recorded. Do not send another result or stop; continue with the required completion step. Then run agent-complete. Do not use an ordinary Discord reply. An ordinary Discord reply does not complete this request.'
     ].join(' ');
   }
   const targetFile = path.join(stateDir, `.discord-agent-reply-${resultKey}.json`);
@@ -156,7 +156,7 @@ function agentResultInstruction(message: NativeMessage, agent: NonNullable<Nativ
     `Write the result text to the owner-only text file ${JSON.stringify(textFile)}.`,
     `Command argv: ${JSON.stringify(command)}.`,
     `The local send route is ${JSON.stringify(localRoute)}. --channel-id is the enrolled parent binding and --agent-thread-id is the enrolled child route.`,
-    'Then run agent-complete. Do not use an ordinary Discord reply. An ordinary Discord reply does not complete this request.'
+    'If agent-send reports duplicate=true, the immutable result is already recorded. Do not send another result or stop; continue with the required completion step. Then run agent-complete. Do not use an ordinary Discord reply. An ordinary Discord reply does not complete this request.'
   ].join(' ');
 }
 
