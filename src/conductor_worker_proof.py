@@ -411,6 +411,11 @@ def discover_predecessor(expected_identity, expected_owner):
     if alive is not None:
         return {'status': 'alive', 'reason': 'predecessor process is still live',
                 'record': alive['fields'], 'filename': alive['filename']}
+    legacy_root = os.path.realpath(os.path.abspath(os.path.expanduser(LEGACY_WORKERS_ROOT)))
+    if not os.environ.get('CONDUCTOR_WORKERS_DIR') and root == legacy_root:
+        return {'status': 'missing',
+                'reason': 'legacy worker registry is not authoritative for predecessor death proof',
+                'record': None, 'filename': None}
     return {'status': 'gone', 'reason': 'predecessor process is confirmed gone',
             'record': exact_matches[0]['fields'], 'filename': exact_matches[0]['filename']}
 

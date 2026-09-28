@@ -95,6 +95,41 @@ test('worker proof falls back to the documented Codex registry when canonical ro
   }
 });
 
+test('legacy-only predecessor proof refuses dead records but observes active records', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-legacy-home-'));
+  try {
+    const legacy = path.join(home, '.codex', 'work-control', 'workers');
+    fs.mkdirSync(legacy, { recursive: true });
+    const nativeId = 'legacy-predecessor-native-id';
+    const owner = 'legacy-owner';
+    const manifestPath = path.join(legacy, `${owner}.json`);
+    const expected = { fullUUID: nativeId, provider: 'codex', workspace: fs.realpathSync(home) };
+    function discover(state, pid, mockLive) {
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        sessionId: nativeId, fullUUID: nativeId, worktree: home, state,
+        harness: 'codex', pid, processStartTime: 1700000000, generation: 1
+      }));
+      const code = [
+        'import json',
+        'import conductor_worker_proof as proof',
+        mockLive ? "proof.process_probe = lambda pid: ('live', 1700000000)" : '',
+        `result = proof.discover_predecessor(${JSON.stringify(expected)}, ${JSON.stringify(owner)})`,
+        'print(json.dumps(result))'
+      ].filter(Boolean).join('; ');
+      const result = spawnSync(PYTHON, ['-c', code], {
+        env: { ...process.env, HOME: home, PYTHONPATH: path.join(__dirname, '..', 'src') },
+        encoding: 'utf8'
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout.trim()).status;
+    }
+    assert.equal(discover('done', 999999, false), 'missing');
+    assert.equal(discover('active', 1, true), 'alive');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 function fakeDiscordPreload({ channelId, categoryId, topic }) {
   return `
 const fs = require('node:fs');
