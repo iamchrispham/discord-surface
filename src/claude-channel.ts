@@ -602,11 +602,14 @@ export class ClaudeChannel<
         server.listen(this.socketPath, () => {
           server.off('error', reject);
           let socketIdentity: socketOwnership.SocketPathIdentity | undefined;
-          try { fs.chmodSync(this.socketPath, 0o600); } catch {}
-          try { socketIdentity = socketOwnership.socketPathIdentity(this.socketPath); } catch {}
+          socketIdentity = socketOwnership.boundSocketPathIdentity(server);
           void socketOwnership.boundSocketIdentity(server, this.socketPath, startupController.signal)
             .then(identity => {
               socketIdentity = identity;
+              if (!socketOwnership.chmodBoundSocketPath(server, 0o600)) {
+                reject(new Error('Claude channel bound socket permissions are unavailable'));
+                return;
+              }
               if (this.transportClosed) {
                 void closeServer(server).then(() => {
                   try { socketOwnership.unlinkSocketIfOwned(this.socketPath, identity); } catch {}
@@ -621,9 +624,15 @@ export class ClaudeChannel<
               this.ownsSocket = true;
               resolve();
             }, error => {
+              socketIdentity = socketOwnership.boundSocketPathIdentity(server) ?? socketIdentity;
               let socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
               this.socketIdentity = socketIdentity ?? null;
               this.ownsSocket = socketIdentity !== undefined;
+              if (!socketIdentity) {
+                this.startupCleanupPending = true;
+                reject(new AggregateError([error, new Error('Claude channel bound socket identity is unavailable for cleanup')], 'Claude channel listener cleanup failed'));
+                return;
+              }
               try {
                 socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, socketIdentity);
               } catch (quarantineError) {
@@ -700,8 +709,16 @@ export class ClaudeChannel<
       }
       let socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
       let quarantineFailed = false;
+      if (!this.socketIdentity && this.server?.listening) {
+        this.socketIdentity = socketOwnership.boundSocketPathIdentity(this.server) ?? null;
+        this.ownsSocket = this.socketIdentity !== null;
+      }
+      if (this.server?.listening && !this.socketIdentity) {
+        quarantineFailed = true;
+        errors.push(new Error('Claude channel bound socket identity is unavailable for cleanup'));
+      }
       try {
-        socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, this.socketIdentity);
+        if (!quarantineFailed) socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, this.socketIdentity);
       } catch (error) {
         quarantineFailed = true;
         errors.push(error);

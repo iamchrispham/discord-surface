@@ -13,6 +13,40 @@ type CaptureOptions = {
   signal?: AbortSignal;
 };
 
+type BoundServer = http.Server & {
+  _handle?: { fd?: number };
+};
+
+function boundSocketFd(server: http.Server): number | undefined {
+  const fd = (server as BoundServer)._handle?.fd;
+  return typeof fd === 'number' && Number.isInteger(fd) && fd >= 0 ? fd : undefined;
+}
+
+// The pathname can be replaced before qualification completes, so cleanup proof
+// must come from the listener handle rather than a later pathname snapshot.
+export function boundSocketFileIdentity(server: http.Server): SocketIdentity | undefined {
+  const fd = boundSocketFd(server);
+  if (fd === undefined) return undefined;
+  try {
+    const stats = fs.fstatSync(fd, { bigint: true });
+    if (!stats.isSocket()) return undefined;
+    return { dev: stats.dev, ino: stats.ino, ctimeNs: stats.ctimeNs, birthtimeNs: stats.birthtimeNs };
+  } catch {
+    return undefined;
+  }
+}
+
+export function chmodBoundSocket(server: http.Server, mode: number): boolean {
+  const fd = boundSocketFd(server);
+  if (fd === undefined) return false;
+  try {
+    fs.fchmodSync(fd, mode);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function unavailable(detail: string): Error {
   return new Error(`Claude channel bound socket identity is unavailable: ${detail}`);
 }
@@ -67,6 +101,11 @@ export function captureBoundSocketIdentity(
       candidate = readOwnedSocket(socketPath, owner);
     } catch (error) {
       reject(error);
+      return;
+    }
+    const bound = boundSocketFileIdentity(server);
+    if (bound && !sameSocket(candidate, bound)) {
+      reject(refused('pathname identity does not belong to the supplied listener'));
       return;
     }
 
@@ -130,7 +169,7 @@ export function captureBoundSocketIdentity(
         finish(refused('pathname identity changed during qualification'));
         return;
       }
-      finish(undefined, candidate);
+      finish(undefined, bound ?? candidate);
     }
 
     server.on('request', onRequest);

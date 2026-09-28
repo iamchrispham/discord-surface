@@ -5,7 +5,7 @@ import * as net from 'node:net';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { canonicalSocketPath, pathsOverlap } from './socket-ownership/path';
-import { captureBoundSocketIdentity } from './socket-ownership/bound-identity';
+import { boundSocketFileIdentity, captureBoundSocketIdentity, chmodBoundSocket } from './socket-ownership/bound-identity';
 import {
   assertLockNamespaceIsUsable,
   LOCK_NAMESPACE,
@@ -149,6 +149,14 @@ export function socketPathIdentity(socketPath: string): SocketPathIdentity | und
   }
 }
 
+export function boundSocketPathIdentity(server: http.Server): SocketPathIdentity | undefined {
+  return boundSocketFileIdentity(server);
+}
+
+export function chmodBoundSocketPath(server: http.Server, mode: number): boolean {
+  return chmodBoundSocket(server, mode);
+}
+
 export async function boundSocketIdentity(server: http.Server, socketPath: string, signal?: AbortSignal): Promise<SocketPathIdentity> { return captureBoundSocketIdentity(server, socketPath, { owner: effectiveUserId(), sameSocket, signal }); }
 
 function lockNamespacePath(socketPath: string): string {
@@ -207,6 +215,12 @@ function validateSocketDirectoryPath(directoryPath: string): void {
     const parentIsMutable = ((parent.mode & 0o022) !== 0 && !parentIsSticky) ||
       (owner !== undefined && parent.uid !== 0 && parent.uid !== owner);
     if (parentIsMutable) throw new Error('Claude channel socket directory contains a mutable path component');
+    const entryIsForeign = owner !== undefined && entry.uid !== 0 && entry.uid !== owner;
+    const entryIsOwnerWritable = (entry.mode & 0o200) !== 0;
+    if (entryIsForeign && entryIsOwnerWritable) {
+      if (entry.isSymbolicLink()) throw new Error('Claude channel socket directory contains a foreign-owned symlink');
+      if (entry.isDirectory()) throw new Error('Claude channel socket directory contains a foreign-owned directory');
+    }
     if (entry.isSymbolicLink()) {
       if (parentIsSticky && owner !== undefined && entry.uid !== owner) {
         throw new Error('Claude channel socket directory contains a foreign-owned symlink');

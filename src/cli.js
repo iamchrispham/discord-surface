@@ -1603,16 +1603,18 @@ function createRetryableListenerStop({ revoke, stopTransport, closeState }) {
   return () => {
     if (stopPromise) return stopPromise;
     let transportStopped = false;
+    let stateClosed = false;
     const attempt = Promise.resolve().then(async () => {
       let revokeError;
       try { revoke(); } catch (error) { revokeError = error; }
       await stopTransport();
       transportStopped = true;
       closeState();
+      stateClosed = true;
       if (revokeError) throw revokeError;
     });
     stopPromise = attempt.catch(error => {
-      if (!transportStopped) stopPromise = null;
+      if (!transportStopped || !stateClosed) stopPromise = null;
       throw error;
     });
     return stopPromise;

@@ -265,6 +265,29 @@ test('foreign-owned read-only socket ancestors are refused', t => {
   assert.throws(() => assertSocketDirectory(path.join(child, 'listener.sock')), /mutable path component/);
 });
 
+test('foreign-owned owner-writable socket ancestors are refused', t => {
+  const root = fs.mkdtempSync('/tmp/dss-foreign-writable-');
+  const foreign = path.join(root, 'foreign');
+  const child = path.join(foreign, 'child');
+  fs.mkdirSync(child, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const owner = process.geteuid?.() ?? process.getuid?.();
+  if (owner === undefined) return t.skip('requires an effective UID');
+  const originalLstat = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (candidate, ...args) => {
+    const stats = originalLstat(candidate, ...args);
+    return candidate === foreign ? {
+      ...stats,
+      uid: owner + 1,
+      mode: (stats.mode & ~0o777) | 0o700,
+      isDirectory: () => true,
+      isSymbolicLink: () => false
+    } : stats;
+  });
+
+  assert.throws(() => assertSocketDirectory(path.join(child, 'listener.sock')), /foreign-owned directory/);
+});
+
 test('owner records preserve a process identity when Linux exposes one', t => {
   isolatedNamespaceRoot(t);
   const socket = socketPath(t);
@@ -2465,6 +2488,47 @@ test('startup qualification quarantines a replacement before closing the failed 
   releaseQualification();
 
   await assert.rejects(starting, /pathname identity changed|qualification refused/);
+  assert.equal(fs.lstatSync(socket).isSocket(), true, 'replacement listener must survive failed qualification');
+  const response = await requestOverSocket(socket);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body, 'replacement');
+});
+
+test('startup cleanup uses the listener identity when the pathname changes before callback', { timeout: 8000 }, async t => {
+  const socket = socketPath(t, { cleanup: false });
+  const movedPath = `${socket}.old`;
+  const { dir, state } = fixture();
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  const replacement = http.createServer((_request, response) => response.end('replacement'));
+  t.after(async () => {
+    if (replacement.listening) await closeListeningServer(replacement);
+    try { fs.unlinkSync(movedPath); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    try { await channel.stop(); } catch {}
+    try { state.close(); } catch {}
+    fs.rmSync(path.dirname(socket), { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const originalCreateServer = http.createServer;
+  t.mock.method(http, 'createServer', (...args) => {
+    const server = originalCreateServer(...args);
+    const originalListen = server.listen.bind(server);
+    server.listen = (...listenArgs) => {
+      const callback = listenArgs[listenArgs.length - 1];
+      if (listenArgs[0] !== socket || typeof callback !== 'function') return originalListen(...listenArgs);
+      listenArgs[listenArgs.length - 1] = (...callbackArgs) => {
+        fs.renameSync(socket, movedPath);
+        replacement.listen(socket, () => callback(...callbackArgs));
+      };
+      return originalListen(...listenArgs);
+    };
+    return server;
+  });
+
+  const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
+  await assert.rejects(channel.start(), /pathname identity|qualification refused/);
   assert.equal(fs.lstatSync(socket).isSocket(), true, 'replacement listener must survive failed qualification');
   const response = await requestOverSocket(socket);
   assert.equal(response.statusCode, 200);
