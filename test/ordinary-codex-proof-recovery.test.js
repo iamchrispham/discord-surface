@@ -346,6 +346,7 @@ test('ordinary bind after Gateway start wakes real recovery and dispatches held 
   assert.equal(second.reused, true);
   releaseHistory();
   await wake.wait();
+  await gateway.consumer.waitForNativeWork();
   assert.deepEqual(wakeErrors, []);
   assert.ok(historyCalls >= 1);
   assert.equal(state.getBinding(channel.id).readiness, READINESS.READY);

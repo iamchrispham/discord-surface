@@ -33,16 +33,22 @@ test('F11 recovered channel must attach to an existing native observation', CASE
     return answer;
   };
   const fetch = f.gateway.client.channels.fetch;
+  let releaseFetch;
+  const pendingFetch = new Promise(resolve => { releaseFetch = resolve; });
   f.gateway.recoveryTimeoutMs = 30;
-  f.gateway.client.channels.fetch = async () => new Promise(() => {});
+  f.gateway.client.channels.fetch = async () => pendingFetch;
   try {
     await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
     assert.equal(f.state.getMessage('101').state, 'submitted');
     f.gateway.client.channels.fetch = fetch;
     release({ text: 'late reply' });
+    await waitForCondition(() => f.state.getMessage('101').state === 'reply_ready');
+    assert.equal(f.replies.length, 0, 'a reply cannot send before its channel lookup settles');
+    releaseFetch(f.channels.get('1000'));
     await waitForCondition(() => f.state.getMessage('101').state === 'replied');
   } finally {
     release({ text: 'late reply' });
+    releaseFetch(f.channels.get('1000'));
   }
   await f.gateway.consumer.waitForNativeWork();
   assert.equal(f.state.getMessage('101').state, 'replied', 'observer settlement must wake reconciliation without redispatch');
@@ -122,15 +128,20 @@ test('P2 reply-ready custody gets a fresh reconciliation deadline after an earli
   f.enableDelivery();
   f.gateway.recoveryTimeoutMs = 30;
   let firstFetch = true;
+  let releaseFirstFetch;
+  const pendingFirstFetch = new Promise(resolve => { releaseFirstFetch = resolve; });
   f.gateway.client.channels.fetch = async id => {
     if (id === '1000' && firstFetch) {
       firstFetch = false;
-      return new Promise(() => {});
+      return pendingFirstFetch;
     }
     return f.channels.get(id);
   };
   await f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
-  await new Promise(resolve => setTimeout(resolve, 100));
+  await waitForCondition(() => f.state.getMessage('102').state === 'replied');
+  assert.equal(f.state.getMessage('101').state, 'reply_ready');
+  releaseFirstFetch(f.channels.get('1000'));
+  await waitForCondition(() => f.state.getMessage('101').state === 'replied');
   assert.equal(f.replies.length, 2);
   assert.equal(f.state.getMessage('101').state, 'replied');
   assert.equal(f.state.getMessage('102').state, 'replied');

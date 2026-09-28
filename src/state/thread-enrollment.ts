@@ -493,9 +493,13 @@ export function createThreadEnrollmentHandlers({
       const timestamp = now();
       const lastSeenId = maxId(compareDiscordIds, existing.lastSeenId, messageId);
       const lastAcceptedId = accepted ? maxId(compareDiscordIds, existing.lastAcceptedId, messageId) : existing.lastAcceptedId;
-      const recoveredThroughId = maxId(compareDiscordIds, existing.recoveredThroughId, coverageId);
-      state.db.prepare('UPDATE thread_enrollments SET last_seen_id=?, last_accepted_id=?, recovered_through_id=?, updated_at=? WHERE thread_id=? AND active=1')
-        .run(lastSeenId, lastAcceptedId, recoveredThroughId, timestamp, threadId);
+      const qualifyingEmptyCoverage = existing.state === states.READY && coverageId === null &&
+        existing.adoptedAt !== null && existing.adoptedThroughId === null && existing.recoveredThroughId === null;
+      const recoveredThroughId = maxId(compareDiscordIds, existing.recoveredThroughId, coverageId) ||
+        (qualifyingEmptyCoverage ? '0' : null);
+      const nextState = qualifyingEmptyCoverage ? states.PENDING : existing.state;
+      state.db.prepare('UPDATE thread_enrollments SET last_seen_id=?, last_accepted_id=?, recovered_through_id=?, state=?, updated_at=? WHERE thread_id=? AND active=1')
+        .run(lastSeenId, lastAcceptedId, recoveredThroughId, nextState, timestamp, threadId);
       return handlers.getThreadEnrollment(state, threadId);
     }
   };

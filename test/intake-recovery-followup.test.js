@@ -201,6 +201,37 @@ test('verified-empty legacy child records adoption before live checkpointing', {
   assert.equal(f.state.getThreadEnrollment('2000').recoveredThroughId, '101');
 });
 
+test('completed-empty child holds live custody before startup history replay', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare(`UPDATE thread_enrollments
+    SET state='ready', adopted_through_id=NULL, last_seen_id=NULL, recovered_through_id=NULL, last_accepted_id=NULL,
+      gap_from=NULL, gap_to=NULL, detail='Thread history recovered'
+    WHERE thread_id=?`).run('2000');
+  const live = { ...f.message('102', '2000'), authorId: 'operator', isBot: false, attachments: [] };
+  const older = { ...f.message('101', '2000'), authorId: 'operator', isBot: false, attachments: [] };
+  f.enableDelivery();
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  f.gateway.boundMessage(live);
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForReceipts();
+  assert.equal(f.state.getMessage('102').state, 'accepted');
+  assert.equal(f.dispatched.length, 0);
+  assert.equal(f.boundary('2000').state, 'pending');
+  assert.equal(f.boundary('2000').recoveredThroughId, '0');
+
+  f.history.set('2000', [older, live]);
+  const result = await settleRecovery(f.gateway.recoverTransport('startup'));
+  assert.equal(result.ready, true, JSON.stringify(result));
+  await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  await f.gateway.consumer.waitForNativeWork();
+
+  assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
+  assert.equal(f.boundary('2000').state, 'ready');
+  assert.equal(f.boundary('2000').recoveredThroughId, '102');
+});
+
 test('deadline retry waits for an unvisited ready route to finish', { timeout: 4000 }, async t => {
   const f = fixture(t);
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',

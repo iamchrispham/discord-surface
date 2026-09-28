@@ -206,7 +206,13 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       ownedEnrollment = baselineEnrollment;
       after = baselineEnrollment.recoveredThroughId;
     } else if (enrollment.adoptedThroughId === null && enrollment.recoveredThroughId === null) {
-      after = '0';
+      const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery pending before first fetch', null);
+      if (!pending) return false;
+      const baselineEnrollment = gateway.state.setThreadBaseline(enrollment.threadId, '0', binding, pending);
+      if (!baselineEnrollment) return false;
+      ownedEnrollment = baselineEnrollment;
+      after = baselineEnrollment.recoveredThroughId;
+      checkpointOnly = false;
     }
     let pages = 0;
     let total = 0;
@@ -304,7 +310,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
           const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery pending before first fetch', null);
           if (!pending) return false;
         }
-        if (gateway.recoverTransport) {
+        if (retryableHold && gateway.recoverTransport) {
           void gateway.recoverTransport(
             'thread history recovery deadline retry',
             epoch,
