@@ -312,9 +312,10 @@ with open(sys.argv[2], 'w', encoding='utf-8') as output:
     output.write('acquired')
 `;
   const boundedGate = path.join(dir, 'bounded-gate.py');
-  fs.writeFileSync(boundedGate, `import runpy, signal, sys
+  fs.writeFileSync(boundedGate, `import os, runpy, signal, sys
 signal.alarm(7)
 sys.argv = sys.argv[1:]
+sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 runpy.run_path(sys.argv[0], run_name='__main__')
 `);
   let gateStderr = '';
