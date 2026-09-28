@@ -27,7 +27,7 @@ def fail(message):
     raise GateError(message)
 
 
-def read_regular(path, label, limit=PROOF_LIMIT, first_line=False):
+def read_regular(path, label, limit=PROOF_LIMIT, first_line=False, with_identity=False):
     try:
         before = os.lstat(path)
     except OSError as error:
@@ -56,7 +56,12 @@ def read_regular(path, label, limit=PROOF_LIMIT, first_line=False):
                 break
         if size > limit:
             fail(f'{label} exceeds the {limit} byte proof limit')
-        return b''.join(chunks)
+        body = b''.join(chunks)
+        if with_identity:
+            # Same descriptor that produced these bytes, so the path cannot be
+            # swapped underneath and re-stat'ed as if it held these bytes.
+            return body, {'dev': after.st_dev, 'ino': after.st_ino}
+        return body
     finally:
         os.close(descriptor)
 
@@ -88,8 +93,11 @@ def json_object(text, label):
     return value
 
 
-def read_json(path, label):
-    return json_object(read_regular(path, label).decode('utf-8'), label)
+def read_json(path, label, with_identity=False):
+    if not with_identity:
+        return json_object(read_regular(path, label).decode('utf-8'), label)
+    body, identity = read_regular(path, label, with_identity=True)
+    return json_object(body.decode('utf-8'), label), identity
 
 
 def native_token(native_id):
@@ -237,14 +245,19 @@ def expected_filename_match(stem, expected_owner):
 
 
 def predecessor_identity(worker):
-    """Return the exact full identity a manifest claims, or None."""
+    """Return the exact full identity a manifest claims, or None.
+
+    An absent alias key is optional. A present alias must be a nonempty string,
+    and every present alias must agree; otherwise the manifest cannot prove any
+    exact native identity.
+    """
     if not isinstance(worker, dict):
         return None
     aliases = []
     for key in ('sessionId', 'fullUUID', 'fullUuid'):
-        value = worker.get(key)
-        if value is None:
+        if key not in worker:
             continue
+        value = worker[key]
         if not isinstance(value, str) or not value:
             return None
         aliases.append(value)
@@ -253,8 +266,6 @@ def predecessor_identity(worker):
     full_uuid = aliases[0]
     harness = worker.get('harness')
     workspace = worker.get('worktree')
-    if not isinstance(full_uuid, str) or not full_uuid:
-        return None
     if harness == 'claude-code':
         provider = 'claude'
     elif harness == 'codex':
@@ -266,7 +277,7 @@ def predecessor_identity(worker):
     return {'fullUUID': full_uuid, 'provider': provider, 'workspace': os.path.realpath(os.path.abspath(workspace))}
 
 
-def _manifest_identity_fields(worker):
+def _manifest_identity_fields(worker, file_identity=None):
     return {
         'fullUUID': worker.get('fullUUID') or worker.get('fullUuid'),
         'pid': worker.get('pid'),
@@ -274,6 +285,10 @@ def _manifest_identity_fields(worker):
         'generation': worker.get('generation'),
         'harness': worker.get('harness'),
         'worktree': worker.get('worktree'),
+        # Device+inode come from the descriptor that produced these bytes, not
+        # from a later path stat. Size is not stable identity for a predecessor:
+        # an ordinary heartbeat rewrite changes it without changing authority.
+        'fileIdentity': file_identity,
     }
 
 
@@ -296,7 +311,7 @@ def discover_predecessor(expected_identity, expected_owner):
         stem = name[:-len('.json')]
         path = os.path.join(root, name)
         try:
-            worker = read_json(path, 'worker manifest')
+            worker, file_identity = read_json(path, 'worker manifest', with_identity=True)
         except GateError as error:
             if expected_filename_match(stem, expected_owner):
                 unknown_matching = True
@@ -305,23 +320,24 @@ def discover_predecessor(expected_identity, expected_owner):
             continue
         claimed = predecessor_identity(worker)
         if claimed is None:
-            if expected_filename_match(stem, expected_owner):
+            expected_uuid = expected_identity.get('fullUUID') if isinstance(expected_identity, dict) else None
+            # A malformed record is still relevant when its filename matches the
+            # expected owner or a string-valued alias names the expected UUID.
+            claims_expected = any(
+                isinstance(worker.get(key), str) and worker.get(key) and worker.get(key) == expected_uuid
+                for key in ('sessionId', 'fullUUID', 'fullUuid'))
+            if expected_filename_match(stem, expected_owner) or claims_expected:
                 unknown_matching = True
                 return {'status': 'unknown', 'reason': 'matching predecessor manifest has no exact native identity',
                         'record': None, 'filename': name}
             continue
         if claimed == expected_identity:
-            fields = _manifest_identity_fields(worker)
+            fields = _manifest_identity_fields(worker, file_identity)
             for key in ('pid', 'processStartTime', 'generation'):
                 value = fields.get(key)
                 if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                     return {'status': 'unknown', 'reason': 'predecessor manifest has invalid process identity',
                             'record': None, 'filename': stem}
-            identity = _file_identity(path)
-            # Only device+inode are stable identity; size changes with ordinary
-            # heartbeat rewrites and must not read as an authority change.
-            fields['fileIdentity'] = None if identity is None else {
-                'dev': identity.get('dev'), 'ino': identity.get('ino')}
             exact_matches.append({'filename': stem, 'fields': fields})
         else:
             candidates.append(claimed)

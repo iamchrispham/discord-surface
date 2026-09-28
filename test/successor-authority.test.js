@@ -443,6 +443,49 @@ test('20: contradictory session identity aliases refuse while an unrelated malfo
   const alias = runScenario('contradictory_alias');
   assertRefused(alias, 'contradictory fullUuid alias');
   assert.match(alias.stderr, /matching predecessor manifest has no exact native identity/);
+  // A PRESENT alias that is null, empty or a non-string is not a missing alias:
+  // it must fail exact native identity, while an absent alias stays optional.
+  const invalidAliases = [
+    ['alias_null', 'present null sessionId'],
+    ['alias_zero', 'present zero sessionId'],
+    ['alias_false', 'present false sessionId'],
+    ['alias_empty', 'present empty-string sessionId'],
+    ['alias_list', 'present list sessionId'],
+    ['alias_object', 'present object sessionId']
+  ];
+  for (const [scenario, label] of invalidAliases) {
+    const result = runScenario(scenario);
+    assertRefused(result, label);
+    assert.match(result.stderr, /matching predecessor manifest has no exact native identity/);
+  }
+  const conflicting = runScenario('alias_conflict');
+  assertRefused(conflicting, 'conflicting sessionId/fullUUID pair');
+  assert.match(conflicting.stderr, /matching predecessor manifest has no exact native identity/);
+  // Null is present on any alias key, not only sessionId, even when the other
+  // aliases would otherwise resolve an exact match.
+  for (const [scenario, label] of [['alias_null_fulluuid', 'present null fullUUID'],
+    ['alias_null_fulluuid_lower', 'present null fullUuid']]) {
+    const result = runScenario(scenario);
+    assertRefused(result, label);
+    assert.match(result.stderr, /matching predecessor manifest has no exact native identity/);
+  }
+  // F-023 regression guard (not a baseline-red F1 case; baseline also commits):
+  // an OMITTED optional alias is allowed. Dropping sessionId and keeping a valid
+  // fullUUID is still an exact dead match, so the normal commit path must run.
+  const absentAlias = runScenario('alias_absent_session');
+  assertCommitted(absentAlias, '1', 'absent optional sessionId alias stays allowed');
+  // F-024 regression guard (not a baseline-red F1 case; baseline also refuses):
+  // a single PRESENT non-string alias with no other alias keys can only be
+  // refused by the nonempty-string type guard, so the exact reason must appear.
+  const nonStringAlone = runScenario('alias_nonstring_alone');
+  assertRefused(nonStringAlone, 'present non-string sessionId with no other alias');
+  assert.match(nonStringAlone.stderr, /matching predecessor manifest has no exact native identity/);
+  // Two readable records disagreeing about the expected identity: the canonical
+  // dead exact match named after oldOwner must not win while a differently named
+  // live record claims the same fullUUID. Refuse as unknown with no commit child.
+  const twoRecord = runScenario('canonical_plus_contradictory_live');
+  assertRefused(twoRecord, 'canonical gone plus contradictory live record');
+  assert.match(twoRecord.stderr, /matching predecessor manifest has no exact native identity/);
   const noise = runScenario('extra_invalid_identity');
   assertCommitted(noise, '1', 'unrelated malformed manifest is skipped');
 });
@@ -459,4 +502,12 @@ test('21: replacing the predecessor manifest inode refuses while a same-content 
   const heartbeat = runScenario('predecessor_rewrite_in_place',
     { mutationPredecessor: { after: 2, set: { note: 'heartbeat' } } });
   assertCommitted(heartbeat, '1', 'byte-length in-place heartbeat rewrite');
+  // Replacing the pathname with identical bytes immediately AFTER the manifest
+  // read returns (inside the first snapshot capture, before discover_predecessor
+  // returns) must still be caught: the snapshot identity comes from the read
+  // descriptor, so the unlocked snapshot binds the old inode while the locked
+  // recheck binds the replacement inode.
+  const afterRead = runScenario('predecessor_replace_after_read');
+  assertRefused(afterRead, 'predecessor replacement after the read returns');
+  assert.match(afterRead.stderr, /conductor worker identity changed while acquiring the writer gate/);
 });

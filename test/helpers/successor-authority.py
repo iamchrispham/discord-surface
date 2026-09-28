@@ -174,6 +174,35 @@ if spec.get('unknownStartPid'):
 
     proof.process_start_time = _perhaps_none
 
+# Descriptor-window identity proof: replace the predecessor manifest pathname
+# with identical bytes immediately after the real manifest read returns, so the
+# bytes and the pathname identity provably come from different inodes. The gate
+# reads the predecessor manifest four times (pre-lock validation, first snapshot
+# capture, locked validation, second snapshot capture); this fires once, right
+# after read number `after`, and never mutates again.
+if spec.get('replaceAfterRead'):
+    _real_read_json = proof.read_json
+    _read_counts = {'predecessor': 0}
+
+    def _read_json_replacing(path, label, *args, **kwargs):
+        result = _real_read_json(path, label, *args, **kwargs)
+        mutation = spec['replaceAfterRead']
+        if os.path.basename(path) == os.path.basename(mutation['path']):
+            _read_counts['predecessor'] += 1
+            if _read_counts['predecessor'] == mutation['after']:
+                target = mutation['path']
+                with open(target, 'rb') as handle:
+                    body = handle.read()
+                descriptor, replacement = tempfile.mkstemp(
+                    dir=os.path.dirname(target), prefix='.swap-', suffix='.json')
+                with os.fdopen(descriptor, 'wb') as handle:
+                    handle.write(body)
+                os.chmod(replacement, 0o600)
+                os.replace(replacement, target)
+        return result
+
+    proof.read_json = _read_json_replacing
+
 
 def _patch_after(original, mutation, key):
     def wrapped(*args, **kwargs):
@@ -321,6 +350,68 @@ def _predecessor_entries(cfg, workspace, live, dead):
         body = predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')
         body['fullUuid'] = 'feedface-0000-4000-8000-000000000000'
         return [{'name': f'{owner}.json', 'raw': None, 'body': body}]
+    if mode in ('alias_null', 'alias_zero', 'alias_false', 'alias_empty', 'alias_list', 'alias_object'):
+        # An otherwise valid dead exact-match manifest whose sessionId alias is
+        # PRESENT but not a nonempty string. Null must be treated as present, not
+        # absent, and every non-string/empty value must fail exact identity.
+        body = predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')
+        shapes = {
+            'alias_null': None,
+            'alias_zero': 0,
+            'alias_false': False,
+            'alias_empty': '',
+            'alias_list': [],
+            'alias_object': {},
+        }
+        body['sessionId'] = shapes[mode]
+        return [{'name': f'{owner}.json', 'raw': None, 'body': body}]
+    if mode == 'alias_conflict':
+        body = predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')
+        body['sessionId'] = 'feedface-0000-4000-8000-000000000000'
+        body['fullUUID'] = uuid
+        return [{'name': f'{owner}.json', 'raw': None, 'body': body}]
+    if mode in ('alias_null_fulluuid', 'alias_null_fulluuid_lower'):
+        # Present-null on the other two alias keys, with the remaining aliases
+        # valid, so only the null-must-be-rejected rule refuses this manifest.
+        body = predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')
+        body['fullUUID' if mode == 'alias_null_fulluuid' else 'fullUuid'] = None
+        return [{'name': f'{owner}.json', 'raw': None, 'body': body}]
+    if mode == 'alias_absent_session':
+        # F-023 regression guard: the sessionId key is OMITTED entirely and only
+        # fullUUID carries the identity. An absent alias is optional, so this is
+        # an otherwise valid dead exact match and must take the normal commit
+        # path (baseline 23b4b7b also commits; not one of the baseline-red F1 cases).
+        body = predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')
+        body.pop('sessionId', None)
+        return [{'name': f'{owner}.json', 'raw': None, 'body': body}]
+    if mode == 'alias_nonstring_alone':
+        # F-024 regression guard: a single PRESENT alias with a non-string value
+        # (0) and no other alias keys. The nonempty-string type guard is the only
+        # rule that can refuse this record, so the refusal must carry the exact
+        # no-exact-native-identity reason (baseline 23b4b7b also refuses it; not
+        # one of the baseline-red F1 cases).
+        body = predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')
+        body['sessionId'] = 0
+        body.pop('fullUUID', None)
+        body.pop('fullUuid', None)
+        return [{'name': f'{owner}.json', 'raw': None, 'body': body}]
+    if mode == 'canonical_plus_contradictory_live':
+        # F2 two-record case: a canonical valid dead exact-match manifest named
+        # after oldOwner, plus a differently named readable manifest that claims
+        # the SAME fullUUID as the expected identity while contradicting it with a
+        # different sessionId, harness and workspace, backed by a live process.
+        # The second record is relevant (same fullUUID) and must refuse as
+        # unknown, never fall through to the canonical dead record's 'gone'.
+        other_workspace = os.path.join(workspace, 'contradictory')
+        os.makedirs(other_workspace, mode=0o700, exist_ok=True)
+        conflicting = predecessor_manifest(uuid, other_workspace, live[0], live[1],
+                                           state='done', harness='claude-code')
+        conflicting['sessionId'] = 'feedface-0000-4000-8000-000000000000'
+        conflicting['fullUUID'] = uuid
+        return [
+            {'name': f'{owner}.json', 'raw': None,
+             'body': predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')},
+            {'name': 'predecessor-conflict.json', 'raw': None, 'body': conflicting}]
     if mode == 'malformed':
         return [{'name': f'{owner}.json', 'raw': '{not-json'}]
     if mode == 'duplicate_keys':
@@ -363,7 +454,8 @@ def run_gate(cfg):
 
         dead = spawn_dead()
         live = (dead, 1700000000)
-        if cfg.get('predecessor') in ('live', 'different_start', 'different_filename') or (
+        if cfg.get('predecessor') in ('live', 'different_start', 'different_filename',
+                                      'canonical_plus_contradictory_live') or (
                 cfg.get('predecessor') == 'invalid_identity' and not cfg.get('invalidDead')):
             child, pid, started = spawn_live()
             children.append(child)
@@ -432,6 +524,10 @@ def run_gate(cfg):
         if cfg.get('mutationPredecessorReplace'):
             mocks['mutationPredecessorReplace'] = {
                 'after': cfg['mutationPredecessorReplace']['after'],
+                'path': os.path.join(workers, f"{cfg['oldOwner']}.json")}
+        if cfg.get('replaceAfterRead'):
+            mocks['replaceAfterRead'] = {
+                'after': cfg['replaceAfterRead']['after'],
                 'path': os.path.join(workers, f"{cfg['oldOwner']}.json")}
         if cfg.get('mutationSuccessor'):
             mocks['mutationSuccessor'] = {
@@ -529,6 +625,20 @@ SCENARIOS = {
                                   'mutationPredecessorReplace': {'after': 2}},
     'predecessor_rewrite_in_place': {'predecessor': 'dead',
                                      'mutationPredecessor': {'after': 2, 'set': {}}},
+    'alias_null': {'predecessor': 'alias_null'},
+    'alias_zero': {'predecessor': 'alias_zero'},
+    'alias_false': {'predecessor': 'alias_false'},
+    'alias_empty': {'predecessor': 'alias_empty'},
+    'alias_list': {'predecessor': 'alias_list'},
+    'alias_object': {'predecessor': 'alias_object'},
+    'alias_conflict': {'predecessor': 'alias_conflict'},
+    'alias_null_fulluuid': {'predecessor': 'alias_null_fulluuid'},
+    'alias_null_fulluuid_lower': {'predecessor': 'alias_null_fulluuid_lower'},
+    'alias_absent_session': {'predecessor': 'alias_absent_session'},
+    'alias_nonstring_alone': {'predecessor': 'alias_nonstring_alone'},
+    'canonical_plus_contradictory_live': {'predecessor': 'canonical_plus_contradictory_live'},
+    'predecessor_replace_after_read': {'predecessor': 'dead',
+                                       'replaceAfterRead': {'after': 2}},
 }
 
 
