@@ -784,6 +784,43 @@ test('23: rejected intake skips optional reply lookup before the transaction', a
   assert.equal(restCalls, 0);
 });
 
+test('ordinary handoff pause preserves reply context for an accepted enrolled reply', async t => {
+  const { dir, state } = fixture();
+  t.after(() => cleanup(state, dir));
+  const childNativeId = '33333333-3333-3333-3333-333333333333';
+  state.bind({ channelId: '102', guildId: '100', provider: 'codex', nativeId: childNativeId, workspace: dir }, { intakeCutoff: '100' });
+  let parent = state.getBinding('102');
+  parent = state.setBindingReadiness('102', 'ready', 'fixture', parent) || parent;
+  state.enrollThread({ threadId: '103', parentChannelId: '102', guildId: '100', adoptionCutoff: '100' }, parent);
+  state.setThreadBaseline('103', '100', parent);
+  state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture', null, null, parent);
+  state.pauseOrdinaryHandoffIntake('102', parent);
+
+  const consumer = consumerFor(state);
+  let cacheCalls = 0;
+  const pausedParent = await consumer.intakeMessage(gm({
+    id: '150', channelId: '102', reference: { messageId: '900' },
+    cacheGet: () => { cacheCalls += 1; return cacheEntry('900', { channelId: '102' }); }
+  }), true);
+  assert.equal(pausedParent.reason, 'handoff-intake-paused');
+  assert.equal(cacheCalls, 0);
+
+  const heldChild = await consumer.intakeMessage(gm({
+    id: '151', channelId: '103', reference: { messageId: '901' },
+    cacheGet: id => {
+      cacheCalls += 1;
+      return cacheEntry(id, { channelId: '103', content: 'child question' });
+    }
+  }), true);
+  assert.equal(heldChild.accepted, true);
+  assert.equal(heldChild.message.channelId, '102');
+  assert.equal(heldChild.message.deliveryChannelId, '103');
+  assert.deepEqual(state.getMessage('151').replyContext, {
+    messageId: '901', channelId: '103', guildId: '100', excerpt: 'child question', isBotAuthor: null
+  });
+  assert.equal(cacheCalls, 1);
+});
+
 test('24: an authorized human watcher-looking reply keeps its context', async t => {
   const { dir, state } = fixture();
   t.after(() => cleanup(state, dir));

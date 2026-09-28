@@ -277,7 +277,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       const binding = route?.binding || state.getBinding(input.channelId);
       if (!binding || !binding.active || binding.guildId !== input.guildId) return false;
       if (expectedBinding && !bindingIdentityMatches(expectedBinding, binding)) return false;
-      if (state.ordinaryHandoffPauses?.has(binding.channelId)) return false;
+      if (state.ordinaryHandoffPauses?.has(binding.channelId) && !route?.enrollment) return false;
       if (route?.enrollment && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(route.enrollment.state)) return false;
       if (state.getMessage(input.id)) return false;
 
