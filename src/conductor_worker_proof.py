@@ -95,9 +95,18 @@ def json_object(text, label):
 
 def read_json(path, label, with_identity=False):
     if not with_identity:
-        return json_object(read_regular(path, label).decode('utf-8'), label)
+        try:
+            body = read_regular(path, label)
+            text = body.decode('utf-8')
+        except UnicodeDecodeError as error:
+            fail(f'{label} is not valid JSON: {error}')
+        return json_object(text, label)
     body, identity = read_regular(path, label, with_identity=True)
-    return json_object(body.decode('utf-8'), label), identity
+    try:
+        text = body.decode('utf-8')
+    except UnicodeDecodeError as error:
+        fail(f'{label} is not valid JSON: {error}')
+    return json_object(text, label), identity
 
 
 def native_token(native_id):
@@ -198,13 +207,19 @@ def verify_worker(path, provider, native_id, owner, workspace):
     lane_id = worker.get('laneId')
     if owner_token(lane_id, provider) != owner_token(owner, provider):
         fail('worker manifest lane token does not match the current lock owner')
-    session_id = worker.get('sessionId')
-    full_uuid = worker.get('fullUUID') or worker.get('fullUuid')
-    if session_id is not None and session_id != native_id:
-        fail('worker manifest session does not match the requested native UUID')
-    if full_uuid is not None and full_uuid != native_id:
-        fail('worker manifest full UUID does not match the requested native UUID')
-    if session_id is None and full_uuid is None:
+    identity_aliases = []
+    for key in ('sessionId', 'fullUUID', 'fullUuid'):
+        if key not in worker:
+            continue
+        value = worker[key]
+        if not isinstance(value, str) or not value:
+            fail(f'worker manifest {key} must be a nonempty string')
+        if value != native_id:
+            if key == 'sessionId':
+                fail('worker manifest session does not match the requested native UUID')
+            fail('worker manifest full UUID does not match the requested native UUID')
+        identity_aliases.append(value)
+    if not identity_aliases:
         fail('worker manifest has no exact native session identity')
     expected_worktree = os.path.realpath(os.path.abspath(workspace))
     actual_worktree = worker.get('worktree')
@@ -278,8 +293,9 @@ def predecessor_identity(worker):
 
 
 def _manifest_identity_fields(worker, file_identity=None):
+    identity = predecessor_identity(worker)
     return {
-        'fullUUID': worker.get('fullUUID') or worker.get('fullUuid'),
+        'fullUUID': identity['fullUUID'] if identity is not None else None,
         'pid': worker.get('pid'),
         'processStartTime': worker.get('processStartTime'),
         'generation': worker.get('generation'),
@@ -390,9 +406,9 @@ def _file_identity(path):
 def successor_snapshot(worker_path, provider, native_id, owner, workspace):
     """Capture the successor's own stable identity shape from its manifest."""
     try:
-        worker = read_json(worker_path, 'worker manifest')
+        worker, file_identity = read_json(worker_path, 'worker manifest', with_identity=True)
     except GateError as error:
-        return {'error': str(error), 'fileIdentity': _file_identity(worker_path)}
+        return {'error': str(error), 'fileIdentity': None}
     return {
         'laneId': worker.get('laneId'),
         'fullUUID': worker.get('fullUUID') or worker.get('fullUuid'),
@@ -403,7 +419,7 @@ def successor_snapshot(worker_path, provider, native_id, owner, workspace):
         'harness': worker.get('harness'),
         'worktree': worker.get('worktree'),
         'state': worker.get('state'),
-        'fileIdentity': _file_identity(worker_path),
+        'fileIdentity': file_identity,
     }
 
 
@@ -476,4 +492,3 @@ def snapshots_differ(before, after):
     detail = f'predecessor={_stable_predecessor(before["predecessor"])} -> {_stable_predecessor(after["predecessor"])}; ' \
              f'successor={_stable_successor(before["successor"])} -> {_stable_successor(after["successor"])}'
     return True, detail
-
