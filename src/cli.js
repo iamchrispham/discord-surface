@@ -220,6 +220,20 @@ const WATCHER_CONSUME_USAGE = `Usage: discord-surface watcher-consume --message-
 Consumes an acknowledged watcher notice without posting a Discord reply.
 `;
 
+const RECOVER_USAGE = `Usage: discord-surface recover [options]
+
+Courier recovery:
+  recover --courier-message-id <id> --courier-attempt-id <id>
+
+Explicitly retires one queue-admitted courier attempt whose queue submission was
+recorded but that was never forwarding-claimed and never natively acknowledged.
+Both flags are required together and cannot combine with another recover mode.
+
+Retirement means only that this attempt can no longer gain forwarding permission.
+It is NOT native completion and implies no native execution, retry, or reply.
+A stopped or stale Gateway leaves the durable retirement for the next startup.
+`;
+
 function printUsage(command) {
   let usage = GENERAL_USAGE;
   if (command === 'mcp') usage = 'Usage: discord-surface mcp --provider codex|claude [--state-dir DIR] [--db FILE]\n\nRuns authenticated peer tools over stdio. Native caller identity must be available.\n';
@@ -229,6 +243,7 @@ function printUsage(command) {
   if (command === 'watcher-arm') usage = WATCHER_ARM_USAGE;
   if (command === 'watcher-send') usage = WATCHER_SEND_USAGE;
   if (command === 'watcher-consume') usage = WATCHER_CONSUME_USAGE;
+  if (command === 'recover') usage = RECOVER_USAGE;
   process.stdout.write(usage);
 }
 
@@ -718,7 +733,13 @@ async function unbind(args, dependencies = {}) {
 
 function status(args) {
   const { state } = openState(args);
-  try { print({ config: state.getConfig(), gateway: gatewayProcessStatus(pathsFor(args)), readiness: state.getReadiness(), bindings: state.listBindings(), messages: state.listMessages(), receipts: state.listReceipts() }); }
+  try {
+    const messages = state.listMessages();
+    const courierDeliveries = messages
+      .filter(message => state.getCourierAttempt(message.id))
+      .flatMap(message => state.getCourierDeliveryStatus(message.id));
+    print({ config: state.getConfig(), gateway: gatewayProcessStatus(pathsFor(args)), readiness: state.getReadiness(), bindings: state.listBindings(), messages, receipts: state.listReceipts(), courierDeliveries });
+  }
   finally { state.close(); }
 }
 
@@ -745,10 +766,48 @@ async function liaisonDraft(args) {
   }
 }
 
-function recover(args) {
+function recoverCourier(args, dependencies = {}) {
+  const messageId = required(args, 'courier-message-id');
+  const attemptId = required(args, 'courier-attempt-id');
   const { paths, state } = openState(args);
   try {
-    const mode = require('./cli/flag-policy').recoverMode(args);
+    const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
+    const runtime = gatewayStatus(paths);
+    const requiredCapability = GATEWAY_CAPABILITIES.courierRecovery;
+    // Unknown or malformed runtime evidence refuses before any mutation. A
+    // running Gateway must name a safe-integer positive pid and a string-only
+    // capability list; a boolean or string pid, or a non-array/mixed-type
+    // capabilities container, is malformed rather than "supported".
+    const malformedPid = runtime?.state === 'running' &&
+      !(typeof runtime.pid === 'number' && Number.isSafeInteger(runtime.pid) && runtime.pid > 0);
+    const malformedCapabilities = runtime?.state === 'running' &&
+      !(Array.isArray(runtime.capabilities) && runtime.capabilities.every(capability => typeof capability === 'string'));
+    if (!runtime || !['running', 'stopped', 'stale'].includes(runtime.state) || malformedPid || malformedCapabilities) {
+      throw new Error('Gateway status is unknown; stop or restart it before courier recovery');
+    }
+    const live = runtime.state === 'running';
+    if (live && !runtime.capabilities.includes(requiredCapability)) {
+      throw new Error('running Gateway does not support courier recovery; stop or restart it before recovery');
+    }
+    // The retirement transaction is authoritative. The wake below never rolls it
+    // back and never claims a retry happened.
+    const result = state.recoverCourierAttempt(messageId, attemptId);
+    const gatewayWake = (dependencies.requestGatewayRecovery || requestGatewayRecovery)(paths, {
+      status: gatewayStatus, kill: dependencies.killProcess || process.kill,
+      ...(live ? { expectedPid: runtime.pid } : {}), requiredCapability
+    });
+    const response = { ...result, gatewayWake };
+    (dependencies.print || print)(response);
+    return response;
+  } finally { state.close(); }
+}
+
+function recover(args) {
+  const mode = require('./cli/flag-policy').recoverMode(args);
+  // Courier mode is exclusive and owns its own Gateway preflight before mutation.
+  if (mode === 'courier') return recoverCourier(args);
+  const { paths, state } = openState(args);
+  try {
     if (mode === 'board') {
       const boardTarget = {
         guildId: required(args, 'board-guild-id'),
@@ -1346,7 +1405,8 @@ function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
       GATEWAY_CAPABILITIES.ordinaryClaudeBind,
       GATEWAY_CAPABILITIES.agentHandledWithoutPost,
       GATEWAY_CAPABILITIES.agentRequestWithdrawal,
-      GATEWAY_CAPABILITIES.watcherNoticeIngress
+      GATEWAY_CAPABILITIES.watcherNoticeIngress,
+      GATEWAY_CAPABILITIES.courierRecovery
     ]
   }), { mode: 0o600 });
   fs.chmodSync(pidFile, 0o600);
@@ -2254,7 +2314,7 @@ async function main() {
   }
 }
 
-module.exports = { agentComplete, agentSend, agentWithdraw, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
+module.exports = { agentComplete, agentSend, agentWithdraw, attachOrdinaryListener, bindingArgs, boardRefresh, claudeChannel, claudeMonitor, claudeReply, conductorMarker, createBindingWakeController, decisionPresent, detachOrdinaryListener, directPost, directPostFileCleanup, ensureProvisionedChannel, GATEWAY_CAPABILITIES, gatewayProcessStatus, handoffInternal, liaisonDraft, main, migrateLegacyTopic, nativeReply, NATIVE_PROOF_STATUSES, ordinaryBind, ordinaryClaudeBind, ordinaryBindingArgs, ordinaryHandoffInternal, openState, parseArgs, pathsFor, provisionMarker, recoverCourier, requestGatewayRecovery, resolveCourierRoute, resolveCurrentClaudeCaller, servedOrdinaryBinding, start, threadEnroll, unbind, watcherArm, watcherConsume, watcherSend };
 
 if (require.main === module) {
   main().catch(error => {

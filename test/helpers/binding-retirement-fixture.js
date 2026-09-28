@@ -45,25 +45,25 @@ function bindConductor(f, channelId = '101', nativeId = CODEX_A, provider = 'cod
     channelId, guildId: GUILD, provider, nativeId, workspace: f.dir,
     conductorId: CONDUCTOR, repoKey: REPO,
     ...(provider === 'claude' ? { endpoint: path.join(f.dir, `${channelId}.sock`) } : {})
-  });
+  }, { intakeCutoff: '100' });
 }
 
 function bindOrdinary(f, channelId = '201', nativeId = CODEX_A) {
   return f.state.bindOrdinary({
     channelId, guildId: GUILD, provider: 'codex', nativeId, workspace: f.dir
-  }, { sessionId: nativeId, threadId: nativeId });
+  }, { sessionId: nativeId, threadId: nativeId }, '100');
 }
 
 function bindOrdinaryClaude(f, channelId = '202', nativeId = CLAUDE_A) {
   return f.state.bindOrdinaryClaude({
     channelId, guildId: GUILD, provider: 'claude', nativeId,
     workspace: f.dir, endpoint: path.join(f.dir, `${channelId}.sock`)
-  }, { sessionId: nativeId, threadId: nativeId, harness: 'claude-code' });
+  }, { sessionId: nativeId, threadId: nativeId, harness: 'claude-code' }, '100');
 }
 
 function enroll(f, parentChannelId, threadId = '102') {
   const binding = f.state.getBinding(parentChannelId);
-  f.state.enrollThread({ threadId, parentChannelId, guildId: GUILD }, binding);
+  f.state.enrollThread({ threadId, parentChannelId, guildId: GUILD, adoptionCutoff: '100' }, binding);
   f.state.markThreadBoundary(threadId, 'ready', 'fixture', null, null, binding);
   return binding;
 }
@@ -71,7 +71,7 @@ function enroll(f, parentChannelId, threadId = '102') {
 // Real queued, undispatched owner work: accepted but not yet claimed. This
 // selects rebindOrdinary's root-relocation branch through hasUnresolved while
 // the direct-post classifier itself stays clear outside the transaction.
-function seedQueuedWork(state, channelId, id = `queued-${channelId}`) {
+function seedQueuedWork(state, channelId, id = `900${channelId}`) {
   const accepted = state.acceptDiscordMessage({
     id, guildId: GUILD, channelId, authorId: 'operator', isBot: false, content: 'queued work'
   });

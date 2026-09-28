@@ -14,6 +14,67 @@ const socketOwnership = require('../src/claude/socket-ownership');
 const { acquireSocketLock, assertSocketDirectory, assertSocketPath } = socketOwnership;
 const { fixture, CLAUDE_ID } = require('./surface-fixtures');
 
+// ---------------------------------------------------------------------------
+// Suite namespace isolation. Socket-lock acquisition derives its coordination
+// root from `os.userInfo().homedir` and `fs.realpathSync('/tmp')`. Every test
+// and every spawned child must read the disposable suite roots installed here,
+// never the operator's real HOME or the real /tmp coordination namespace.
+// ---------------------------------------------------------------------------
+const SUITE_TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dss-suite-'));
+const SUITE_HOME_ROOT = fs.realpathSync(fs.mkdtempSync(path.join(SUITE_TEMP_ROOT, 'home-')));
+fs.chmodSync(SUITE_HOME_ROOT, 0o700);
+const SUITE_SHARED_TEMP_ROOT = fs.realpathSync(fs.mkdtempSync(path.join(SUITE_TEMP_ROOT, 'shared-temp-')));
+fs.chmodSync(SUITE_SHARED_TEMP_ROOT, 0o1777);
+
+const trueUserInfo = os.userInfo;
+const trueRealpathSync = fs.realpathSync;
+const trueMkdirSync = fs.mkdirSync;
+const trueRenameSync = fs.renameSync;
+const trueLinkSync = fs.linkSync;
+const trueWriteFileSync = fs.writeFileSync;
+const trueUnlinkSync = fs.unlinkSync;
+
+const baselineUserInfo = (...args) => ({ ...trueUserInfo(...args), homedir: SUITE_HOME_ROOT });
+const baselineRealpathSync = (target, ...options) =>
+  (String(target) === '/tmp' ? SUITE_SHARED_TEMP_ROOT : trueRealpathSync(target, ...options));
+
+function installBaselineNamespaceMocks() {
+  os.userInfo = baselineUserInfo;
+  fs.realpathSync = baselineRealpathSync;
+}
+// Coordination artifacts (lock namespaces and `direct-home` rendezvous markers)
+// accumulate under the suite roots across tests. Because acquisition publishes a
+// direct-home marker into the sticky shared root, later tests that mock only the
+// home root would resolve `/tmp` through the baseline shim and pick up a stale
+// rendezvous. Start every test from a clean suite-owned coordination state.
+function resetSuiteCoordinationArtifacts() {
+  for (const root of [SUITE_HOME_ROOT, SUITE_SHARED_TEMP_ROOT]) {
+    let entries;
+    try { entries = fs.readdirSync(root); } catch { continue; }
+    for (const entry of entries) {
+      if (entry.startsWith('.claude-channel-') || entry.startsWith('.discord-surface-locks-')) {
+        fs.rmSync(path.join(root, entry), { recursive: true, force: true });
+      }
+    }
+  }
+}
+resetSuiteCoordinationArtifacts();
+// Active before the first acquisition and before every test's first acquisition.
+installBaselineNamespaceMocks();
+// Reinstall per test because the negative control below drops the shims to prove
+// the guard is real. Per-test `t.after` hooks run *before* node:test restores
+// `t.mock.method` shims, so an after-hook reinstall would be clobbered; a global
+// beforeEach is what guarantees every other test starts from the baseline.
+test.beforeEach(() => {
+  resetSuiteCoordinationArtifacts();
+  installBaselineNamespaceMocks();
+});
+test.after(() => {
+  os.userInfo = trueUserInfo;
+  fs.realpathSync = trueRealpathSync;
+  fs.rmSync(SUITE_TEMP_ROOT, { recursive: true, force: true });
+});
+
 function removeSocketDirectory(socket) {
   fs.rmSync(path.dirname(socket), { recursive: true, force: true });
 }
@@ -143,6 +204,14 @@ async function orphan(socket, { db, workspace } = {}) {
   const child = spawn(process.execPath, ['-e', `
     const deadline = setTimeout(() => process.exit(2), 3000);
     deadline.unref();
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const childUserInfo = os.userInfo();
+    os.userInfo = () => ({ ...childUserInfo, homedir: process.argv[7] });
+    const childRealpathSync = fs.realpathSync;
+    fs.realpathSync = (target, ...options) => String(target) === '/tmp'
+      ? process.argv[8]
+      : childRealpathSync(target, ...options);
     const { ClaudeChannel } = require(process.argv[1]);
     const { CLAUDE_ID } = require(process.argv[2]);
     const socket = process.argv[3];
@@ -156,14 +225,14 @@ async function orphan(socket, { db, workspace } = {}) {
       const { fixture } = require(process.argv[2]);
       const created = fixture();
       state = created.state;
-      state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: workspace || created.dir, endpoint: socket });
+      state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: workspace || created.dir, endpoint: socket }, { intakeCutoff: '100' });
     }
     const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
     channel.start().then(() => process.stdout.write('ready')).catch(error => {
       process.stderr.write(String(error));
       process.exit(1);
     });
-  `, channelModule, fixturesModule, socket, db || '', workspace || '', stateModule], { stdio: ['ignore', 'pipe', 'pipe'] });
+  `, channelModule, fixturesModule, socket, db || '', workspace || '', stateModule, SUITE_HOME_ROOT, SUITE_SHARED_TEMP_ROOT], { stdio: ['ignore', 'pipe', 'pipe'] });
   const deadline = setTimeout(() => child.kill('SIGKILL'), 4000);
   try {
     await once(child.stdout, 'data');
@@ -178,8 +247,8 @@ async function orphan(socket, { db, workspace } = {}) {
 test('abrupt listener expiry can re-arm the same Claude binding', { timeout: 8000 }, async t => {
   const socket = socketPath(t, { cleanup: false });
   const { dir, db, state } = fixture();
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket, generation: 7 });
-  const messageId = 'abrupt-custody-message';
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket, generation: 7 }, { intakeCutoff: '100' });
+  const messageId = '101';
   state.acceptDiscordMessage({
     id: messageId, guildId: 'guild-1', channelId: 'claude', authorId: 'operator-1', isBot: false,
     content: 'retain this accepted custody across abrupt listener death'
@@ -348,6 +417,14 @@ test('live socket locks survive contenders with different timezones', { timeout:
   const holder = spawn(process.execPath, ['-e', `
     const deadline = setTimeout(() => process.exit(2), 7000);
     deadline.unref();
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const childUserInfo = os.userInfo();
+    os.userInfo = () => ({ ...childUserInfo, homedir: process.argv[3] });
+    const childRealpathSync = fs.realpathSync;
+    fs.realpathSync = (target, ...options) => String(target) === '/tmp'
+      ? process.argv[4]
+      : childRealpathSync(target, ...options);
     const { acquireSocketLock } = require(process.argv[1]);
     const release = acquireSocketLock(process.argv[2]);
     process.stdout.write('ready');
@@ -355,7 +432,7 @@ test('live socket locks survive contenders with different timezones', { timeout:
     process.stdin.on('end', () => {
       try { release(); process.exit(0); } catch (error) { process.stderr.write(String(error)); process.exit(1); }
     });
-  `, modulePath, socket], {
+  `, modulePath, socket, SUITE_HOME_ROOT, SUITE_SHARED_TEMP_ROOT], {
     env: { ...process.env, TZ: 'UTC' },
     stdio: ['pipe', 'pipe', 'pipe']
   });
@@ -364,10 +441,18 @@ test('live socket locks survive contenders with different timezones', { timeout:
   const contender = spawnSync(process.execPath, ['-e', `
     const deadline = setTimeout(() => process.exit(2), 4000);
     deadline.unref();
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const childUserInfo = os.userInfo();
+    os.userInfo = () => ({ ...childUserInfo, homedir: process.argv[3] });
+    const childRealpathSync = fs.realpathSync;
+    fs.realpathSync = (target, ...options) => String(target) === '/tmp'
+      ? process.argv[4]
+      : childRealpathSync(target, ...options);
     const { acquireSocketLock } = require(process.argv[1]);
     try { const release = acquireSocketLock(process.argv[2]); release(); process.stdout.write('acquired'); }
     catch (error) { process.stdout.write(String(error)); }
-  `, modulePath, socket], {
+  `, modulePath, socket, SUITE_HOME_ROOT, SUITE_SHARED_TEMP_ROOT], {
     env: { ...process.env, TZ: 'America/Los_Angeles' },
     encoding: 'utf8',
     timeout: 5000
@@ -394,10 +479,18 @@ test('unreadable live owner markers preserve the preparation lock', { timeout: 8
     const contender = spawnSync(process.execPath, ['-e', `
       const deadline = setTimeout(() => process.exit(2), 4000);
       deadline.unref();
+      const fs = require('node:fs');
+      const os = require('node:os');
+      const childUserInfo = os.userInfo();
+      os.userInfo = () => ({ ...childUserInfo, homedir: process.argv[3] });
+      const childRealpathSync = fs.realpathSync;
+      fs.realpathSync = (target, ...options) => String(target) === '/tmp'
+        ? process.argv[4]
+        : childRealpathSync(target, ...options);
       const { acquireSocketLock } = require(process.argv[1]);
       try { acquireSocketLock(process.argv[2]); process.stdout.write('acquired'); }
       catch (error) { process.stdout.write(String(error.code || error)); }
-    `, path.resolve(__dirname, '../src/claude/socket-ownership'), socket], {
+    `, path.resolve(__dirname, '../src/claude/socket-ownership'), socket, SUITE_HOME_ROOT, SUITE_SHARED_TEMP_ROOT], {
       encoding: 'utf8',
       timeout: 5000
     });
@@ -1225,7 +1318,7 @@ test('concurrent re-arms retain exactly one listener', { timeout: 8000 }, async 
   await orphan(socket);
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const channels = [0, 1].map(() => new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } }));
   t.after(async () => {
     try {
@@ -1449,7 +1542,7 @@ test('stop during orphan probe prevents subsequent listener startup', { timeout:
   });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   const starting = channel.start();
   const rejected = assert.rejects(starting, /stopped during socket preparation/);
@@ -1696,7 +1789,7 @@ test('stop aborts a pending MCP connection and releases startup', { timeout: 800
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   let connectStarted;
   const connected = new Promise(resolve => { connectStarted = resolve; });
   let settleConnection;
@@ -1736,7 +1829,7 @@ test('stop retains the socket lock until MCP teardown completes', { timeout: 800
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   let releaseClose;
   const closeGate = new Promise(resolve => { releaseClose = resolve; });
   let enterClose;
@@ -1770,7 +1863,7 @@ test('late stop cleanup preserves a replacement listener', { timeout: 8000 }, as
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   await channel.start();
   const server = channel.server;
@@ -1809,7 +1902,7 @@ test('stop preserves a replacement listener published before old close', { timeo
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   await channel.start();
   const oldPath = `${socket}.old-${randomUUID()}`;
@@ -1839,7 +1932,7 @@ test('stop retries a failed socket-lock release', { timeout: 8000 }, async t => 
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const originalAcquire = socketOwnership.acquireSocketLock;
   let releaseCalls = 0;
   t.mock.method(socketOwnership, 'acquireSocketLock', endpoint => {
@@ -1871,7 +1964,7 @@ test('start calls during stop share one post-stop startup', { timeout: 8000 }, a
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   let releaseClose;
   const closeGate = new Promise(resolve => { releaseClose = resolve; });
   let closeCalls = 0;
@@ -1905,7 +1998,7 @@ test('stop joins a pending listener startup before releasing the socket lock', {
   const socket = socketPath(t);
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   let signalListenCalled;
   const listenCalled = new Promise(resolve => { signalListenCalled = resolve; });
@@ -2073,7 +2166,7 @@ test('pending qualification keeps the preparation lock through stop', { timeout:
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   let signalObservedResolve;
   const signalObserved = new Promise(resolve => { signalObservedResolve = resolve; });
   let suppliedServer;
@@ -2375,7 +2468,7 @@ test('qualification preserves unrelated accepted connections', { timeout: 6000 }
 test('startup stop retains its lock until the failed listener actually closes', { timeout: 6000 }, async t => {
   const { dir, state } = fixture();
   const socket = socketPath(t, { cleanup: false });
-  state.bind({ channelId: 'channel', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'channel', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   let server;
   let closed = false;
   let witnessResolve;
@@ -2453,7 +2546,7 @@ test('startup qualification quarantines a replacement before closing the failed 
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   let witnessResolve;
   const witnessed = new Promise(resolve => { witnessResolve = resolve; });
   let releaseQualification;
@@ -2498,7 +2591,7 @@ test('startup cleanup uses the listener identity when the pathname changes befor
   const socket = socketPath(t, { cleanup: false });
   const movedPath = `${socket}.old`;
   const { dir, state } = fixture();
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const replacement = http.createServer((_request, response) => response.end('replacement'));
   t.after(async () => {
     if (replacement.listening) await closeListeningServer(replacement);
@@ -2539,7 +2632,7 @@ test('stop retains server custody when replacement quarantine setup fails', { ti
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   await channel.start();
   const oldPath = `${socket}.old`;
@@ -2578,7 +2671,7 @@ test('startup retains server custody when replacement quarantine setup fails', {
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   let witnessResolve;
   const witnessed = new Promise(resolve => { witnessResolve = resolve; });
   let releaseQualification;
@@ -2635,7 +2728,7 @@ test('stop refuses a directory replacement without stranding it', { timeout: 800
   const socket = socketPath(t, { cleanup: false });
   const { dir, state } = fixture();
   t.after(() => state.close());
-  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => {} } });
   await channel.start();
   const oldPath = `${socket}.old`;
@@ -2675,4 +2768,81 @@ test('quarantine refuses a FIFO replacement without moving it', { timeout: 8000 
   assert.equal(fs.lstatSync(socket).isFIFO(), true);
   assert.equal(fs.lstatSync(original).isSocket(), true);
   assert.deepEqual(fs.readdirSync(path.dirname(socket)).sort(), before);
+});
+
+test('namespace isolation refuses acquisition against the real home and system temporary root', { timeout: 8000 }, t => {
+  // Negative control: drop the baseline shims so acquisition resolves the real
+  // passwd-backed home and the real '/tmp'. The realpath guard is the primary gate
+  // that makes acquisition refuse before any coordination I/O; the write hooks
+  // below are fail-loud backstops. This test never writes inside either real
+  // namespace, even though acquisition is deliberately pointed at them.
+  const realHome = trueUserInfo().homedir;
+  const suiteRoots = [SUITE_TEMP_ROOT, SUITE_HOME_ROOT, SUITE_SHARED_TEMP_ROOT];
+  const consulted = [];
+  // Gate on the suite's isolation: if the module-level baseline install were ever
+  // removed, these fail before the guard is even reached.
+  assert.equal(os.userInfo().homedir, SUITE_HOME_ROOT, 'baseline home shim must be active');
+  assert.equal(fs.realpathSync('/tmp'), SUITE_SHARED_TEMP_ROOT, "baseline '/tmp' shim must be active");
+  os.userInfo = trueUserInfo;
+  fs.realpathSync = trueRealpathSync;
+  // Per-test `t.after` hooks run BEFORE node:test restores `t.mock.method` shims,
+  // so an after-hook baseline reinstall would be clobbered by that restore. The
+  // module-level `test.beforeEach(installBaselineNamespaceMocks)` is what repairs
+  // the baseline for the next test; keep this hook only as a best-effort backstop.
+  t.after(installBaselineNamespaceMocks);
+  t.mock.method(fs, 'realpathSync', (target, ...options) => {
+    const value = String(target);
+    if (value === realHome || value === '/tmp') {
+      consulted.push(value);
+      throw Object.assign(new Error(`namespace guard blocked realpath ${value}`), { code: 'EACCES' });
+    }
+    return trueRealpathSync(target, ...options);
+  });
+  // The realpath guard above is the primary refusal gate: it makes acquisition
+  // refuse before it can derive any coordination candidate. These write hooks are
+  // fail-loud backstops, so a future change that reaches coordination I/O outside
+  // the disposable roots aborts here instead of writing to the real namespace.
+  let outsideWriteAttempt;
+  let socketDirectory;
+  const suiteOwnedTarget = value => suiteRoots.some(root => value === root || value.startsWith(`${root}${path.sep}`)) ||
+    value.startsWith('/tmp/dss-') ||
+    (socketDirectory !== undefined && (value === socketDirectory || value.startsWith(`${socketDirectory}${path.sep}`)));
+  const guardWrite = (operation, ...targets) => {
+    for (const target of targets) {
+      const value = String(target);
+      if (value && !suiteOwnedTarget(value)) {
+        outsideWriteAttempt = `${operation} ${value}`;
+        throw Object.assign(new Error(`namespace guard blocked ${operation} ${value}`), { code: 'EACCES' });
+      }
+    }
+  };
+  t.mock.method(fs, 'mkdirSync', (target, options) => {
+    guardWrite('mkdir', target);
+    return trueMkdirSync(target, options);
+  });
+  t.mock.method(fs, 'renameSync', (source, destination) => {
+    guardWrite('rename', source, destination);
+    return trueRenameSync(source, destination);
+  });
+  t.mock.method(fs, 'linkSync', (existingPath, newPath) => {
+    guardWrite('link', existingPath, newPath);
+    return trueLinkSync(existingPath, newPath);
+  });
+  t.mock.method(fs, 'writeFileSync', (target, data, options) => {
+    guardWrite('writeFile', target);
+    return trueWriteFileSync(target, data, options);
+  });
+  t.mock.method(fs, 'unlinkSync', target => {
+    guardWrite('unlink', target);
+    return trueUnlinkSync(target);
+  });
+
+  const socket = socketPath(t);
+  // The socket directory is itself a disposable fixture under /tmp; resolve it so
+  // the guard permits its (non-coordination) case-sensitivity probes.
+  socketDirectory = trueRealpathSync(path.dirname(socket));
+  assert.throws(() => acquireSocketLock(socket), /namespace root is unusable/);
+  assert.ok(consulted.includes(realHome), `the real home ${realHome} must have been consulted`);
+  assert.ok(consulted.includes('/tmp'), "the real '/tmp' must have been consulted");
+  assert.equal(outsideWriteAttempt, undefined, 'no coordination write hook may fire outside the disposable suite roots');
 });

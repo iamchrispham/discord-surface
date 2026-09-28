@@ -5,7 +5,8 @@ const GATEWAY_CAPABILITIES = Object.freeze({
   ordinaryClaudeBind: 'ordinary-claude-bind-v1',
   agentHandledWithoutPost: 'agent-handled-without-post-v1',
   agentRequestWithdrawal: 'agent-request-withdrawal-v1',
-  watcherNoticeIngress: 'watcher-notice-ingress-v1'
+  watcherNoticeIngress: 'watcher-notice-ingress-v1',
+  courierRecovery: 'courier-recovery-v1'
 });
 
 module.exports = { GATEWAY_CAPABILITIES };

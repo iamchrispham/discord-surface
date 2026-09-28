@@ -27,7 +27,7 @@ const {
   recoveryFetch,
   retryPendingBoundaryDetail
 } = require('./discord/recovery-fetch');
-const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail, isNativeProofRetryBoundary } = require('./discord/native-proof-recovery');
+const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail, isNativeProofRetryBoundary, isNativeProofBeforeBindingBoundary } = require('./discord/native-proof-recovery');
 const {
   attachReconciliationWaiter,
   hasReconciliationLookup,
@@ -264,6 +264,15 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
         !state.hasRetiredCourierAttempt?.(messageId, attempt.attempt.receiptId)));
   }
 
+  function retiredCourierCustodyHeld(messageId) {
+    const latest = state.getMessage(messageId);
+    const attempt = state.getCourierAttempt?.(messageId);
+    return Boolean(latest && latest.state === MESSAGE_STATES.ACCEPTED &&
+      !hasCurrentNativeAcknowledgment(latest) && attempt &&
+      !state.hasCourierForwardClaim?.(messageId) &&
+      state.hasRetiredCourierAttempt?.(messageId, attempt.attempt.receiptId));
+  }
+
   function refreshCourierCustodyBlock(messageId, ownerEntry) {
     if (ownerEntry.dispatchBlocked || !courierCustodyRequiresOwnerHold(messageId)) return;
     ownerEntry.dispatchBlocked = true;
@@ -354,7 +363,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       pumpOwner(entry.ownerKey);
       return;
     }
-    if (entry.dispatchBlocked) {
+    if (entry.dispatchBlocked || retiredCourierCustodyHeld(entry.message.id)) {
       queue.blockedMessageId = entry.message.id;
       queue.blockedReason = 'not_submitted';
       return;
@@ -764,7 +773,23 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return { status: savedStatus, cursor: observerCursor, ...(error ? { error } : {}) };
   }
 
-  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {
+  function processAccepted(message, signal, options) {
+    const ownerKey = nativeOwnerKey(message);
+    const old = nativeWork.get(message.id);
+    const queue = ownerQueues.get(ownerKey);
+    if (old?.controller && queue && retiredCourierCustodyHeld(message.id)) {
+      old.controller.abort();
+      return old.promise.then(
+        result => result?.error || signal?.aborted || ownerQueues.get(ownerKey) !== queue || !retiredCourierCustodyHeld(message.id)
+          ? { status: 'stopped', message: state.getMessage(message.id) }
+          : startAccepted(message, signal, options),
+        () => ({ status: 'stopped', message: state.getMessage(message.id) })
+      );
+    }
+    return startAccepted(message, signal, options);
+  }
+
+  function startAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
     const durable = state.getMessage(message?.id) || message;
@@ -2268,8 +2293,20 @@ class DiscordGateway {
       baseReason = baseReason.replace(/(?: full follow-up| boundary retry| follow-up)$/, '');
     } while (baseReason !== previousReason);
     const selectedChannels = channelIds ? new Set(channelIds) : null;
-    const bindings = this.state.listBindings().filter(binding => binding.active &&
+    let bindings = this.state.listBindings().filter(binding => binding.active &&
       (!selectedChannels || selectedChannels.has(binding.channelId)));
+    const isBeforeBindingPriority = binding => {
+      if (binding.provider !== 'codex' || !this.state.isOrdinaryBinding(binding)) return false;
+      const watermark = this.state.getIntakeWatermark(binding.channelId);
+      return isNativeProofBeforeBindingBoundary(watermark?.state, watermark?.detail);
+    };
+    const prioritized = [];
+    const deferred = [];
+    for (const binding of bindings) {
+      if (isBeforeBindingPriority(binding)) prioritized.push(binding);
+      else deferred.push(binding);
+    }
+    if (prioritized.length) bindings = prioritized.concat(deferred);
     const hasCoveredReadyWatermark = currentBoundary => currentBoundary?.state === READINESS.READY &&
       ((currentBoundary.last_seen_id === null && currentBoundary.recovered_through_id === null) ||
         (typeof currentBoundary.last_seen_id === 'string' && currentBoundary.last_seen_id.length > 0 &&
@@ -2510,9 +2547,13 @@ class DiscordGateway {
       try {
         channel = await waitForRecoveryOperation(() => {
           if (retryBoundary) {
-            const retryDetail = isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)
-              ? retryBoundary.detail : retryPendingBoundaryDetail(reason, retryBoundary);
-            if (isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)) nativeProofRetryDetail = retryDetail;
+            const beforeBindingRetry = isNativeProofBeforeBindingBoundary(retryBoundary.state, retryBoundary.detail);
+            const nativeProofRetry = isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail);
+            let retryDetail;
+            if (beforeBindingRetry) retryDetail = nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, deadline);
+            else if (nativeProofRetry) retryDetail = retryBoundary.detail;
+            else retryDetail = retryPendingBoundaryDetail(reason, retryBoundary);
+            if (nativeProofRetry) nativeProofRetryDetail = retryDetail;
             const retrying = this.state.markIntakeBoundary(binding.channelId, 'pending', retryDetail,
               retryBoundary.gap_from, retryBoundary.gap_to, binding, null, retryBoundary, ownedReadiness);
             if (!retrying) throw recoveryError('stale', 'Discord intake boundary changed before channel recovery');
