@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const test = require('node:test');
 const { createClaudeMonitor, createMonitorMcp } = require('../../src/claude-monitor');
 const { DiscordGateway } = require('../../src/discord');
-const { ClaudeProvider, waitForReply } = require('../../src/native');
+const { ClaudeProvider, probeClaudeChannel, waitForReply } = require('../../src/native');
 const { MESSAGE_STATES, READINESS, SurfaceState } = require('../../src/state');
 const { CLAUDE, CLI_PATH, fixture, waitFor } = require('./fixture.cjs');
 
@@ -114,7 +114,12 @@ test('ordinary Claude Monitor leaves readiness promotion to Gateway and revokes 
     if (child.exitCode === null) child.kill('SIGTERM');
   });
   const observed = new SurfaceState(f.db);
-  await waitFor(() => fs.existsSync(f.socketPath));
+  await waitFor(async () => {
+    try {
+      const identity = await probeClaudeChannel(f.socketPath, { nativeId: CLAUDE, generation: f.binding.generation, workspace: f.dir, endpoint: f.socketPath }, { timeoutMs: 100 });
+      return identity.channelReady === true;
+    } catch { return false; }
+  });
   assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.PENDING);
   child.kill('SIGTERM');
   await new Promise((resolve, reject) => {
