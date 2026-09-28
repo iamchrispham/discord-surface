@@ -95,7 +95,41 @@ test('worker proof falls back to the documented Codex registry when canonical ro
   }
 });
 
-test('legacy-only predecessor proof refuses dead records but observes active records', () => {
+test('worker proof checks the legacy registry before accepting canonical death proof', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-dual-home-'));
+  try {
+    const canonical = path.join(home, '.agents', 'work-control', 'workers');
+    const legacy = path.join(home, '.codex', 'work-control', 'workers');
+    fs.mkdirSync(canonical, { recursive: true });
+    fs.mkdirSync(legacy, { recursive: true });
+    const nativeId = 'dual-registry-predecessor-native-id';
+    const owner = 'dual-registry-owner';
+    const manifest = JSON.stringify({
+      sessionId: nativeId, fullUUID: nativeId, worktree: home, state: 'done',
+      harness: 'codex', pid: 999999, processStartTime: 1700000000, generation: 1
+    });
+    fs.writeFileSync(path.join(canonical, `${owner}.json`), manifest);
+    fs.writeFileSync(path.join(legacy, `${owner}.json`), manifest);
+    const expected = { fullUUID: nativeId, provider: 'codex', workspace: fs.realpathSync(home) };
+    const code = [
+      'import json',
+      'import conductor_worker_proof as proof',
+      'probes = iter([("gone", None), ("live", 1700000000)])',
+      'proof.process_probe = lambda pid: next(probes)',
+      `print(json.dumps(proof.discover_predecessor(${JSON.stringify(expected)}, ${JSON.stringify(owner)})))`
+    ].join('; ');
+    const result = spawnSync(PYTHON, ['-c', code], {
+      env: { ...process.env, HOME: home, PYTHONPATH: path.join(__dirname, '..', 'src') },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout.trim()).status, 'alive');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('legacy-only predecessor proof accepts dead records and observes active records', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-legacy-home-'));
   try {
     const legacy = path.join(home, '.codex', 'work-control', 'workers');
@@ -123,7 +157,7 @@ test('legacy-only predecessor proof refuses dead records but observes active rec
       assert.equal(result.status, 0, result.stderr);
       return JSON.parse(result.stdout.trim()).status;
     }
-    assert.equal(discover('done', 999999, false), 'missing');
+    assert.equal(discover('done', 999999, false), 'gone');
     assert.equal(discover('active', 1, true), 'alive');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });

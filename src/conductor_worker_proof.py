@@ -325,61 +325,71 @@ def _manifest_identity_fields(worker, file_identity=None):
 
 
 def discover_predecessor(expected_identity, expected_owner):
-    """Prove the bound predecessor is gone using the canonical worker registry.
+    """Prove the bound predecessor is gone using the documented worker registries.
 
     Returns {'status': 'gone'|'alive'|'unknown'|'missing'|'conflict',
              'reason': str, 'record': manifest fields|None, 'filename': str|None}.
     'gone' is the only status that qualifies a steal; every other status refuses.
     """
-    root = workers_root()
-    try:
-        names = sorted(name for name in os.listdir(root) if name.endswith('.json'))
-    except OSError:
-        return {'status': 'missing', 'reason': 'predecessor worker registry is unavailable', 'record': None, 'filename': None}
+    roots = [workers_root()]
+    if not os.environ.get('CONDUCTOR_WORKERS_DIR'):
+        legacy_root = os.path.realpath(os.path.abspath(os.path.expanduser(LEGACY_WORKERS_ROOT)))
+        if legacy_root not in roots:
+            roots.append(legacy_root)
     candidates = []
     exact_matches = []
     unknown_matching = False
-    for name in names:
-        stem = name[:-len('.json')]
-        path = os.path.join(root, name)
+    unknown_reason = None
+    unavailable = False
+    for root in roots:
         try:
-            worker, file_identity = read_json(path, 'worker manifest', with_identity=True)
-        except GateError as error:
-            if expected_filename_match(stem, expected_owner):
-                unknown_matching = True
-                return {'status': 'unknown', 'reason': f'matching predecessor manifest is unreadable: {error}',
-                        'record': None, 'filename': name}
+            names = sorted(name for name in os.listdir(root) if name.endswith('.json'))
+        except FileNotFoundError:
             continue
-        claimed = predecessor_identity(worker)
-        if claimed is None:
-            expected_uuid = expected_identity.get('fullUUID') if isinstance(expected_identity, dict) else None
-            # A malformed record is still relevant when its filename matches the
-            # expected owner or a string-valued alias names the expected UUID.
-            claims_expected = any(
-                isinstance(worker.get(key), str) and worker.get(key) and worker.get(key) == expected_uuid
-                for key in IDENTITY_ALIAS_KEYS)
-            if expected_filename_match(stem, expected_owner) or claims_expected:
-                unknown_matching = True
-                return {'status': 'unknown', 'reason': 'matching predecessor manifest has no exact native identity',
-                        'record': None, 'filename': name}
+        except OSError:
+            unavailable = True
             continue
-        if claimed == expected_identity:
-            fields = _manifest_identity_fields(worker, file_identity)
-            for key in ('pid', 'processStartTime', 'generation'):
-                value = fields.get(key)
-                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                    return {'status': 'unknown', 'reason': 'predecessor manifest has invalid process identity',
-                            'record': None, 'filename': stem}
-            exact_matches.append({'filename': stem, 'fields': fields})
-        else:
-            if expected_filename_match(stem, expected_owner):
-                return {'status': 'conflict',
-                        'reason': 'matching predecessor manifest claims a different native identity',
-                        'record': None, 'filename': name}
-            candidates.append(claimed)
+        for name in names:
+            stem = name[:-len('.json')]
+            path = os.path.join(root, name)
+            try:
+                worker, file_identity = read_json(path, 'worker manifest', with_identity=True)
+            except GateError as error:
+                if expected_filename_match(stem, expected_owner):
+                    unknown_matching = True
+                    unknown_reason = f'matching predecessor manifest is unreadable: {error}'
+                continue
+            claimed = predecessor_identity(worker)
+            if claimed is None:
+                expected_uuid = expected_identity.get('fullUUID') if isinstance(expected_identity, dict) else None
+                # A malformed record is still relevant when its filename matches the
+                # expected owner or a string-valued alias names the expected UUID.
+                claims_expected = any(
+                    isinstance(worker.get(key), str) and worker.get(key) and worker.get(key) == expected_uuid
+                    for key in IDENTITY_ALIAS_KEYS)
+                if expected_filename_match(stem, expected_owner) or claims_expected:
+                    unknown_matching = True
+                    unknown_reason = 'matching predecessor manifest has no exact native identity'
+                continue
+            if claimed == expected_identity:
+                fields = _manifest_identity_fields(worker, file_identity)
+                for key in ('pid', 'processStartTime', 'generation'):
+                    value = fields.get(key)
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                        return {'status': 'unknown', 'reason': 'predecessor manifest has invalid process identity',
+                                'record': None, 'filename': stem}
+                exact_matches.append({'filename': stem, 'fields': fields})
+            else:
+                if expected_filename_match(stem, expected_owner):
+                    return {'status': 'conflict',
+                            'reason': 'matching predecessor manifest claims a different native identity',
+                            'record': None, 'filename': name}
+                candidates.append(claimed)
     if not exact_matches:
         if unknown_matching:
-            return {'status': 'unknown', 'reason': 'matching predecessor manifest is unreadable', 'record': None, 'filename': None}
+            return {'status': 'unknown', 'reason': unknown_reason, 'record': None, 'filename': None}
+        if unavailable:
+            return {'status': 'missing', 'reason': 'predecessor worker registry is unavailable', 'record': None, 'filename': None}
         return {'status': 'missing', 'reason': 'no readable manifest matches the bound predecessor identity exactly',
                 'record': None, 'filename': None}
     # Conflicting records: anything that claims the same full UUID but a
@@ -411,11 +421,11 @@ def discover_predecessor(expected_identity, expected_owner):
     if alive is not None:
         return {'status': 'alive', 'reason': 'predecessor process is still live',
                 'record': alive['fields'], 'filename': alive['filename']}
-    legacy_root = os.path.realpath(os.path.abspath(os.path.expanduser(LEGACY_WORKERS_ROOT)))
-    if not os.environ.get('CONDUCTOR_WORKERS_DIR') and root == legacy_root:
-        return {'status': 'missing',
-                'reason': 'legacy worker registry is not authoritative for predecessor death proof',
+    if unavailable:
+        return {'status': 'unknown', 'reason': 'predecessor worker registry is unavailable',
                 'record': None, 'filename': None}
+    if unknown_matching:
+        return {'status': 'unknown', 'reason': unknown_reason, 'record': None, 'filename': None}
     return {'status': 'gone', 'reason': 'predecessor process is confirmed gone',
             'record': exact_matches[0]['fields'], 'filename': exact_matches[0]['filename']}
 
