@@ -222,6 +222,39 @@ function clearOrphanSocketQuarantines(
   }
 }
 
+function resumeOwnedSocketQuarantines(
+  socketPath: string,
+  expected: SocketIdentity,
+  deps: QuarantineDependencies
+): void {
+  const socketDirectory = path.dirname(socketPath);
+  const endpoint = path.basename(socketPath);
+  let entries: string[];
+  try { entries = fs.readdirSync(socketDirectory); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith('.stale-')) continue;
+    const quarantineDirectory = path.join(socketDirectory, entry);
+    const quarantine = readQuarantine(quarantineDirectory, socketDirectory, deps);
+    if (!quarantine || quarantine.manifest.endpoint !== endpoint ||
+      quarantine.owner.pid !== process.pid || quarantine.owner.identity !== deps.ownerIdentity) continue;
+    const manifestIdentity = deserializeSocketIdentity(quarantine.manifest.socket);
+    if (!manifestIdentity || !deps.sameQuarantinedSocket(manifestIdentity, expected)) continue;
+    if (quarantine.socketPath) {
+      try {
+        const hiddenIdentity = deps.socketIdentity(quarantine.socketPath);
+        if (!deps.sameQuarantinedSocket(hiddenIdentity, expected)) continue;
+        fs.unlinkSync(quarantine.socketPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    removeSocketQuarantine(quarantineDirectory);
+  }
+}
+
 function createSocketQuarantine(
   socketPath: string,
   expected: SocketIdentity,
@@ -254,6 +287,7 @@ export function unlinkSocketIfOwned(
 ): void {
   clearOrphanSocketQuarantines(path.dirname(socketPath), deps, path.basename(socketPath));
   if (!expected) return;
+  resumeOwnedSocketQuarantines(socketPath, expected, deps);
   let observed: SocketIdentity;
   try { observed = deps.socketIdentity(socketPath); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
@@ -270,7 +304,9 @@ export function unlinkSocketIfOwned(
     quarantineMoved = true;
     const quarantined = deps.socketIdentity(quarantinedPath);
     if (!deps.sameQuarantinedSocket(quarantined, expected)) {
-      if (!restoreQuarantinedSocket(quarantinedPath, socketPath)) return;
+      if (!restoreQuarantinedSocket(quarantinedPath, socketPath)) {
+        throw new Error('Claude channel socket restore is unavailable');
+      }
       removeSocketQuarantine(quarantineDirectory);
       quarantineDirectory = undefined;
       return;
@@ -283,7 +319,7 @@ export function unlinkSocketIfOwned(
       removeSocketQuarantine(quarantineDirectory);
       quarantineDirectory = undefined;
     }
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || quarantineMoved) throw error;
   }
 }
 

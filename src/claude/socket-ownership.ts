@@ -153,8 +153,8 @@ export function boundSocketPathIdentity(server: http.Server): SocketPathIdentity
   return boundSocketFileIdentity(server);
 }
 
-export function chmodBoundSocketPath(server: http.Server, mode: number): boolean {
-  return chmodBoundSocket(server, mode);
+export function chmodBoundSocketPath(socketPath: string, mode: number): boolean {
+  return chmodBoundSocket(socketPath, mode);
 }
 
 export async function boundSocketIdentity(server: http.Server, socketPath: string, signal?: AbortSignal): Promise<SocketPathIdentity> { return captureBoundSocketIdentity(server, socketPath, { owner: effectiveUserId(), sameSocket, signal }); }

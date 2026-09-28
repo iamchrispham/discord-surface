@@ -36,11 +36,9 @@ export function boundSocketFileIdentity(server: http.Server): SocketIdentity | u
   }
 }
 
-export function chmodBoundSocket(server: http.Server, mode: number): boolean {
-  const fd = boundSocketFd(server);
-  if (fd === undefined) return false;
+export function chmodBoundSocket(socketPath: string, mode: number): boolean {
   try {
-    fs.fchmodSync(fd, mode);
+    fs.chmodSync(socketPath, mode);
     return true;
   } catch {
     return false;

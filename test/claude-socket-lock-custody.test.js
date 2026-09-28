@@ -288,7 +288,7 @@ test('a transition race that installs a new owner refuses and preserves it', t =
   assert.equal(fs.readFileSync(ownerPath, 'utf8'), ownerBytes, 'appearing owner record must be preserved');
 });
 
-test('stale socket unlink preserves a socket whose generation changed', async t => {
+test('stale socket unlink ignores metadata-only generation changes', async t => {
   isolatedNamespaceRoot(t);
   const dir = privateSocketDir(t);
   const controlSocket = path.join(dir, 'control.sock');
@@ -324,15 +324,46 @@ test('stale socket unlink preserves a socket whose generation changed', async t 
     const stats = originalLstat(target, ...args);
     if (target === observedSocket && args.length > 0 && args[0] && args[0].bigint) {
       shimCalls += 1;
-      return { dev: stats.dev, ino: stats.ino, ctimeNs: stats.ctimeNs + 1n };
+      return { dev: stats.dev, ino: stats.ino, ctimeNs: stats.ctimeNs + 1n, birthtimeNs: stats.birthtimeNs };
     }
     return stats;
   });
 
   unlinkSocketIfOwned(observedSocket, expectedIdentity);
   assert.ok(shimCalls > 0, 'lstat shim must be exercised by the ownership comparison');
-  assert.equal(fs.existsSync(observedSocket), true, 'a changed socket generation must be preserved');
-  assert.equal(originalLstat(observedSocket).isSocket(), true, 'preserved path must remain the live socket');
+  assert.equal(fs.existsSync(observedSocket), false, 'metadata-only changes must not block cleanup');
+});
+
+test('stale socket cleanup resumes a moved quarantine on retry', async t => {
+  const dir = privateSocketDir(t);
+  const observedSocket = path.join(dir, 'observed.sock');
+  const observedServer = net.createServer(connection => connection.destroy());
+  await new Promise((resolve, reject) => {
+    observedServer.once('error', reject);
+    observedServer.listen(observedSocket, resolve);
+  });
+  t.after(async () => {
+    if (observedServer.listening) await new Promise(resolve => observedServer.close(resolve));
+  });
+
+  const expectedIdentity = socketPathIdentity(observedSocket);
+  assert.ok(expectedIdentity, 'observed socket identity must be captured');
+  const originalUnlink = fs.unlinkSync;
+  let failMovedUnlink = true;
+  t.mock.method(fs, 'unlinkSync', (target, ...args) => {
+    const targetPath = String(target);
+    if (failMovedUnlink && path.basename(targetPath) === 'socket' && path.basename(path.dirname(targetPath)).startsWith('.stale-')) {
+      throw Object.assign(new Error('simulated moved socket unlink failure'), { code: 'EACCES' });
+    }
+    return originalUnlink(target, ...args);
+  });
+
+  assert.throws(() => unlinkSocketIfOwned(observedSocket, expectedIdentity), error => error.code === 'EACCES');
+  assert.equal(fs.existsSync(observedSocket), false, 'failed cleanup must retain the moved socket off the endpoint');
+
+  failMovedUnlink = false;
+  unlinkSocketIfOwned(observedSocket, expectedIdentity);
+  assert.equal(fs.readdirSync(dir).some(entry => entry.startsWith('.stale-')), false, 'retry must remove the owned quarantine');
 });
 
 test('release refuses an owner marker whose generation changed in place', t => {

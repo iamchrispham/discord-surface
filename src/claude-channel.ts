@@ -599,16 +599,15 @@ export class ClaudeChannel<
       });
       const server = this.server;
       if (!server) throw new Error('Claude channel server failed to initialize');
+      let socketIdentity: socketOwnership.SocketPathIdentity | undefined;
       listenerStartup = new Promise<void>((resolve, reject) => {
         server.once('error', reject);
         server.listen(this.socketPath, () => {
           server.off('error', reject);
-          let socketIdentity: socketOwnership.SocketPathIdentity | undefined;
-          socketIdentity = socketOwnership.boundSocketPathIdentity(server);
           void socketOwnership.boundSocketIdentity(server, this.socketPath, startupController.signal)
             .then(identity => {
               socketIdentity = identity;
-              if (!socketOwnership.chmodBoundSocketPath(server, 0o600)) {
+              if (!socketOwnership.chmodBoundSocketPath(this.socketPath, 0o600)) {
                 reject(new Error('Claude channel bound socket permissions are unavailable'));
                 return;
               }
@@ -626,7 +625,7 @@ export class ClaudeChannel<
               this.ownsSocket = true;
               resolve();
             }, error => {
-              socketIdentity = socketOwnership.boundSocketPathIdentity(server) ?? socketIdentity;
+              socketIdentity = socketIdentity ?? socketOwnership.socketPathIdentity(this.socketPath);
               let socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
               this.socketIdentity = socketIdentity ?? null;
               this.ownsSocket = socketIdentity !== undefined;
@@ -637,6 +636,7 @@ export class ClaudeChannel<
               }
               try {
                 socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, socketIdentity);
+                this.socketQuarantine = socketQuarantine;
               } catch (quarantineError) {
                 this.startupCleanupPending = true;
                 reject(new AggregateError([error, quarantineError], 'Claude channel listener cleanup failed'));
@@ -645,10 +645,12 @@ export class ClaudeChannel<
               void closeServer(server).then(() => {
                 try {
                   if (socketQuarantine && !socketQuarantine.restore()) {
+                    this.startupCleanupPending = true;
                     reject(new Error('Claude channel socket restore is unavailable'));
                     return;
                   }
                 } catch (restoreError) {
+                  this.startupCleanupPending = true;
                   reject(restoreError);
                   return;
                 }
@@ -656,6 +658,7 @@ export class ClaudeChannel<
               }, closeError => reject(closeError));
             });
           });
+          socketIdentity = socketOwnership.socketPathIdentity(this.socketPath) ?? socketIdentity;
         });
       await Promise.race([listenerStartup, startupCancellation]);
       if (this.transportClosed) throw new Error('Claude channel transport closed during startup');
