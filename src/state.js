@@ -2,6 +2,7 @@ const createReplyLifecycleHandlers = (...args) => require('./state/reply-lifecyc
 const createMessageIntakeHandlers = (...args) => require('./state/message-intake').createMessageIntakeHandlers(...args);
 const createTopicPublicationHandlers = (...args) => require('./state/topic-publication').createTopicPublicationHandlers(...args);
 const createSchemaHandlers = (...args) => require('./state/schema').createSchemaHandlers(...args);
+const createConductorCustodyHandlers = (...args) => require('./state/conductor-custody').createConductorCustodyHandlers(...args);
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const { WATCHER_NOTICE_PREFIX, validateWatcherNotice } = require('./watcher-notice');
 const crypto = require('node:crypto');
@@ -481,6 +482,15 @@ function assertOrdinaryNativeIdentity(provider, nativeId, identity) {
 const schemaHandlers = createSchemaHandlers({ SCHEMA_VERSION, StateCorruptError, parseJson, compareDiscordIds, READINESS, now });
 
 const topicPublicationHandlers = createTopicPublicationHandlers({ assertText, BindingError, UnresolvedWorkError, StaleGenerationError, READINESS, TOPIC_PUBLICATION_STATES, bindingMatchesExpected, now });
+
+const conductorCustodyHandlers = createConductorCustodyHandlers({
+  ACTIVE_STATES,
+  MESSAGE_STATES,
+  BindingError,
+  StaleGenerationError,
+  UnresolvedWorkError,
+  now
+});
 
 class SurfaceState {
   constructor(dbPath, options = {}) {
@@ -1060,7 +1070,7 @@ class SurfaceState {
     return ordinaryBindingHandlers.handoffOrdinary(this, input);
   }
 
-  handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff = null, enrollmentProof = null }) {
+  handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff = null, enrollmentProof = null, carryAcceptedHuman = false }) {
     assertUuid(fromNativeId, 'fromNativeId');
     if (!Number.isInteger(fromGeneration) || fromGeneration < 1) throw new BindingError('fromGeneration must be a positive integer');
     assertText(handoffId, 'handoffId', 256);
@@ -1088,12 +1098,28 @@ class SurfaceState {
       throw new BindingError('active thread enrollments require an observed intake cutoff');
     }
     if (nativeId === fromNativeId) throw new BindingError('successor handoff requires a different native session UUID');
-    if (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+    const custodyRequest = {
+      channelId, provider, conductorId, repoKey, handoffId,
+      fromNativeId, fromGeneration,
+      nativeId: input.nativeId, workspace: input.workspace, endpoint: input.endpoint,
+      expectedGeneration: existing.generation + 1
+    };
+    // Carry mode computes eligibility and the deterministic evidence snapshot
+    // before opening the transaction. The companion refuses the whole operation
+    // when any active row on the channel does not qualify.
+    const custodySnapshot = carryAcceptedHuman === true
+      ? conductorCustodyHandlers.snapshotEligibleCustody(this, custodyRequest)
+      : null;
+    if (carryAcceptedHuman !== true && (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId))) {
+      throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+    }
     this.assertNativeOwnerFree(provider, nativeId, channelId);
     return this.transaction(() => {
       const current = this.getBinding(channelId);
       if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('handoff source identity is stale');
-      if (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId)) throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+      if (carryAcceptedHuman !== true && (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId))) {
+        throw new UnresolvedWorkError('cannot handoff while work is unresolved');
+      }
       if (this._hasActiveThreadEnrollments(channelId) && intakeCutoff === null) {
         throw new BindingError('active thread enrollments require an observed intake cutoff');
       }
@@ -1107,6 +1133,9 @@ class SurfaceState {
       }
       this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
         .run(input.nativeId, input.workspace, input.sessionRoot, input.endpoint, READINESS.PENDING, generation, updatedAt, channelId, provider, conductorId, fromGeneration, fromNativeId);
+      if (custodySnapshot) {
+        conductorCustodyHandlers.verifySnapshotAndTransfer(this, custodySnapshot, custodyRequest, updatedAt);
+      }
       this.receipt(null, 'conductor-handoff', {
         channelId, conductorId, repoKey, provider, handoffId,
         fromNativeId, fromGeneration, nativeId: input.nativeId, generation, intakeCutoff: intakeCutoff || undefined

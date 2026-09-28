@@ -1,181 +1,31 @@
 #!/usr/bin/env python3
 import argparse
-import datetime
 import fcntl
 import hashlib
 import json
 import os
-import re
 import stat
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-OWNER_CHANGE_VERBS = frozenset({'claim', 'release', 'steal', 'override', 'preempt'})
-FORCED_VERBS = frozenset({'steal', 'override', 'preempt'})
-PROOF_LIMIT = 1024 * 1024
-
-
-class GateError(Exception):
-    pass
-
-
-def fail(message):
-    raise GateError(message)
-
-
-def read_regular(path, label, limit=PROOF_LIMIT, first_line=False):
-    try:
-        before = os.lstat(path)
-    except OSError as error:
-        fail(f'{label} cannot be read: {error}')
-    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-        fail(f'{label} must be a single-link regular file')
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        fail(f'{label} cannot be opened safely: {error}')
-    try:
-        after = os.fstat(descriptor)
-        if (not stat.S_ISREG(after.st_mode) or after.st_nlink != 1 or
-                (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)):
-            fail(f'{label} changed identity while opening')
-        chunks = []
-        size = 0
-        while size <= limit:
-            chunk = os.read(descriptor, min(65536, limit + 1 - size))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-            if first_line and b'\n' in b''.join(chunks):
-                break
-        if size > limit:
-            fail(f'{label} exceeds the {limit} byte proof limit')
-        return b''.join(chunks)
-    finally:
-        os.close(descriptor)
+from conductor_worker_proof import (  # noqa: E402
+    FORCED_VERBS,
+    GateError,
+    OWNER_CHANGE_VERBS,
+    capture_snapshot,
+    discover_predecessor,
+    fail,
+    native_token,
+    owner_token,
+    snapshots_differ,
+    verify_transcript,
+    verify_worker,
+)
 
 
-def read_json(path, label):
-    try:
-        value = json.loads(read_regular(path, label).decode('utf-8'))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        fail(f'{label} is not valid JSON: {error}')
-    if not isinstance(value, dict):
-        fail(f'{label} must contain a JSON object')
-    return value
-
-
-def native_token(native_id):
-    return native_id.split('-', 1)[0].lower()
-
-
-def owner_token(owner, provider):
-    prefix = f'session-{provider}-'
-    if not isinstance(owner, str) or not owner.startswith(prefix):
-        return None
-    token = owner[len(prefix):].split('-', 1)[0].lower()
-    return token if re.fullmatch(r'[0-9a-f]{8}', token) else None
-
-
-def verify_transcript(path, provider, native_id):
-    root_name = 'CONDUCTOR_CLAUDE_PROJECTS_DIR' if provider == 'claude' else 'CONDUCTOR_CODEX_SESSIONS_DIR'
-    configured_root = os.environ.get(root_name)
-    default_root = '~/.claude/projects' if provider == 'claude' else '~/.codex/sessions'
-    root = os.path.realpath(os.path.abspath(configured_root or os.path.expanduser(default_root)))
-    requested = os.path.abspath(path)
-    resolved = os.path.realpath(requested)
-    try:
-        inside = os.path.commonpath([resolved, root]) == root
-    except ValueError:
-        inside = False
-    if not inside:
-        fail('session transcript is outside the canonical provider transcript root')
-    name = os.path.basename(resolved)
-    if provider == 'claude':
-        if name != f'{native_id}.jsonl':
-            fail('Claude session transcript filename does not match the native UUID')
-    elif not re.fullmatch(rf'rollout-.*-{re.escape(native_id)}\.jsonl', name):
-        fail('Codex session transcript filename does not match the native UUID')
-    raw = read_regular(requested, 'session transcript', limit=65536, first_line=True)
-    first = next((line for line in raw.splitlines() if line.strip()), None)
-    if first is None:
-        fail('session transcript header is absent')
-    try:
-        header = json.loads(first.decode('utf-8'))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        fail(f'session transcript header is invalid: {error}')
-    if provider == 'claude':
-        observed = header.get('sessionId') if isinstance(header, dict) else None
-    else:
-        payload = header.get('payload') if isinstance(header, dict) else None
-        if not isinstance(header, dict) or header.get('type') != 'session_meta' or not isinstance(payload, dict):
-            fail('Codex session transcript header is not a session_meta event')
-        observed = payload.get('id') or payload.get('session_id')
-    if observed != native_id:
-        fail('session transcript header does not match the requested native UUID')
-
-
-def process_start_time(pid):
-    try:
-        probe = subprocess.run(
-            ['ps', '-p', str(pid), '-o', 'lstart='],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if probe.returncode != 0 or not probe.stdout.strip():
-        return None
-    try:
-        value = ' '.join(probe.stdout.split())
-        return int(datetime.datetime.strptime(value, '%a %b %d %H:%M:%S %Y').timestamp())
-    except (OverflowError, ValueError):
-        return None
-
-
-def verify_worker(path, provider, native_id, owner, workspace):
-    worker = read_json(path, 'worker manifest')
-    lane_id = worker.get('laneId')
-    if owner_token(lane_id, provider) != owner_token(owner, provider):
-        fail('worker manifest lane token does not match the current lock owner')
-    session_id = worker.get('sessionId')
-    full_uuid = worker.get('fullUUID') or worker.get('fullUuid')
-    if session_id is not None and session_id != native_id:
-        fail('worker manifest session does not match the requested native UUID')
-    if full_uuid is not None and full_uuid != native_id:
-        fail('worker manifest full UUID does not match the requested native UUID')
-    if session_id is None and full_uuid is None:
-        fail('worker manifest has no exact native session identity')
-    expected_worktree = os.path.realpath(os.path.abspath(workspace))
-    actual_worktree = worker.get('worktree')
-    if not isinstance(actual_worktree, str) or os.path.realpath(os.path.abspath(actual_worktree)) != expected_worktree:
-        fail('worker manifest worktree does not match the requested workspace')
-    expected_harness = 'claude-code' if provider == 'claude' else 'codex'
-    if worker.get('harness') != expected_harness:
-        fail('worker manifest harness does not match the requested provider')
-    if worker.get('state') != 'active':
-        fail('worker manifest is not active')
-    generation = worker.get('generation')
-    pid = worker.get('pid')
-    started = worker.get('processStartTime')
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
-        fail('worker manifest has no valid process generation')
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
-        fail('worker manifest has no valid pid')
-    if isinstance(started, bool) or not isinstance(started, int) or started < 1:
-        fail('worker manifest has no valid process start time')
-    try:
-        os.kill(pid, 0)
-    except OSError as error:
-        fail(f'worker process is not live: {error}')
-    observed = process_start_time(pid)
-    if observed is None or observed != started:
-        fail('worker process generation does not match the manifest')
+CARRY_ENV = 'DISCORD_SURFACE_HANDOFF_CARRY_ACCEPTED_HUMAN'
 
 
 def run_lock(lock_script, repo, provider, verb):
@@ -201,17 +51,98 @@ def run_lock(lock_script, repo, provider, verb):
     return value
 
 
-def transition_and_id(history, owner, provider, native_id, from_native_id, old_binding, require_predecessor):
+def expected_predecessor_owner(history):
+    """Return the prior owner of the latest owner-changing event when it is a steal."""
+    if not isinstance(history, list):
+        return None
+    latest = None
+    latest_index = None
+    for index, row in enumerate(history):
+        if isinstance(row, dict) and row.get('verb') in OWNER_CHANGE_VERBS:
+            latest = row
+            latest_index = index
+    if latest is None or latest.get('verb') != 'steal':
+        return None
+    prior = next((history[position] for position in range(latest_index - 1, -1, -1)
+                  if isinstance(history[position], dict) and history[position].get('verb') in OWNER_CHANGE_VERBS), None)
+    return prior.get('who') if isinstance(prior, dict) else None
+
+
+def bound_predecessor_identity(from_native_id, provider, from_workspace):
+    if not from_native_id or not from_workspace:
+        return None
+    return {
+        'fullUUID': from_native_id,
+        'provider': provider,
+        'workspace': os.path.realpath(os.path.abspath(from_workspace)),
+    }
+
+
+def steal_and_id(history, steal, steal_index, provider, native_id, from_native_id, from_workspace,
+                 old_binding, require_predecessor, predecessor):
+    prior = next((history[position] for position in range(steal_index - 1, -1, -1)
+                  if history[position].get('verb') in OWNER_CHANGE_VERBS), None)
+    if not isinstance(prior, dict):
+        fail('canonical steal has no identifiable prior owner')
+    if prior.get('verb') == 'release':
+        fail('canonical steal predecessor record does not establish ownership')
+    if prior.get('who') == steal.get('who'):
+        fail('canonical steal does not follow a different prior owner')
+    for row in history[steal_index + 1:]:
+        if row.get('verb') in OWNER_CHANGE_VERBS and row.get('who') != steal.get('who'):
+            fail('conductor lock changed owner after the identified steal')
+    if require_predecessor:
+        if owner_token(prior.get('who'), provider) != native_token(from_native_id):
+            fail('canonical steal predecessor does not match the existing binding native UUID')
+        expected = bound_predecessor_identity(from_native_id, provider, from_workspace)
+        status = (predecessor or {}).get('status')
+        if status != 'gone':
+            reason = (predecessor or {}).get('reason') or 'no death proof was available'
+            fail(f'canonical steal predecessor is not proven gone: {reason}')
+        record = (predecessor or {}).get('record') or {}
+        record_provider = 'claude' if record.get('harness') == 'claude-code' else 'codex'
+        record_workspace = record.get('worktree')
+        if (record.get('fullUUID') != expected.get('fullUUID') or record_provider != expected.get('provider')
+                or not isinstance(record_workspace, str)
+                or os.path.realpath(os.path.abspath(record_workspace)) != expected.get('workspace')):
+            fail('canonical steal predecessor evidence does not match the bound identity')
+    stable = {
+        'transition': {'prior': prior, 'steal': steal},
+        'oldBinding': old_binding,
+        'successorNativeId': native_id,
+    }
+    digest = hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return steal, prior, f'lock-handoff-{digest}', bool(require_predecessor)
+
+
+def transition_and_id(history, owner, provider, native_id, from_native_id, from_workspace,
+                      old_binding, require_predecessor, predecessor=None):
     if not isinstance(history, list) or not history:
         fail('normal release-to-claim transition is missing from lock history')
-    candidate = None
-    release = None
-    candidate_index = None
-    for index, row in enumerate(history):
+    for row in history:
         if (not isinstance(row, dict) or not isinstance(row.get('at'), str) or
                 not isinstance(row.get('verb'), str) or not isinstance(row.get('who'), str) or
                 not isinstance(row.get('note'), str)):
             fail('conductor lock history contains an invalid transition')
+    latest = None
+    latest_index = None
+    for index, row in enumerate(history):
+        if row.get('verb') in OWNER_CHANGE_VERBS:
+            latest = row
+            latest_index = index
+    if latest is None:
+        fail('normal release-to-claim transition is missing from lock history')
+    if latest.get('verb') in ('override', 'preempt'):
+        fail('forced takeover is not a normal release-to-claim handoff')
+    if latest.get('verb') == 'steal':
+        if latest.get('who') != owner:
+            fail('canonical steal owner does not match the held successor')
+        return steal_and_id(history, latest, latest_index, provider, native_id, from_native_id,
+                            from_workspace, old_binding, require_predecessor, predecessor)
+    candidate = None
+    release = None
+    candidate_index = None
+    for index, row in enumerate(history):
         if row.get('verb') != 'claim' or row.get('who') != owner:
             continue
         previous = next((history[position] for position in range(index - 1, -1, -1)
@@ -240,10 +171,10 @@ def transition_and_id(history, owner, provider, native_id, from_native_id, old_b
         'successorNativeId': native_id,
     }
     digest = hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    return candidate, release, f'lock-handoff-{digest}'
+    return candidate, release, f'lock-handoff-{digest}', False
 
 
-def validate_authority(readback, identity, options, *, require_predecessor):
+def validate_authority(readback, identity, options, *, require_predecessor, predecessor=None):
     if readback.get('repo_key') != options.repo_key or readback.get('vendor') != options.provider:
         fail('conductor lock repository or vendor does not match the request')
     if identity.get('repo_key') != options.repo_key or identity.get('vendor') != options.provider:
@@ -269,13 +200,14 @@ def validate_authority(readback, identity, options, *, require_predecessor):
         'workspace': options.from_workspace,
         'endpoint': options.from_endpoint,
     }
-    _claim, _release, handoff_id = transition_and_id(
+    _change, _prior, handoff_id, carry = transition_and_id(
         slot.get('history'), owner, options.provider, options.native_id,
-        options.from_native_id, old_binding, require_predecessor
+        options.from_native_id, options.from_workspace, old_binding,
+        require_predecessor, predecessor
     )
     verify_transcript(options.session_file, options.provider, options.native_id)
     verify_worker(options.worker_file, options.provider, options.native_id, owner, options.workspace)
-    return handoff_id
+    return handoff_id, carry
 
 
 def open_lock_parent(lock_file):
@@ -350,16 +282,31 @@ def main():
     lock_file = os.path.abspath(os.environ.get('CONDUCTOR_LOCK_FILE', os.path.expanduser('~/.agents/conductor.lock.json')))
     first_identity = run_lock(options.lock_script, options.repo, options.provider, 'identity')
     first_readback = run_lock(options.lock_script, options.repo, options.provider, 'inspect')
-    first_handoff_id = validate_authority(first_readback, first_identity, options, require_predecessor=not options.reuse)
+    bound_identity = bound_predecessor_identity(options.from_native_id, options.provider, options.from_workspace)
+    predecessor_owner = expected_predecessor_owner(first_readback.get('slot', {}).get('history')) \
+        if isinstance(first_readback.get('slot'), dict) else None
+    predecessor = discover_predecessor(bound_identity, predecessor_owner) if not options.reuse else None
+    first_handoff_id, carry = validate_authority(
+        first_readback, first_identity, options, require_predecessor=not options.reuse, predecessor=predecessor)
+    first_snapshot = capture_snapshot(options, bound_identity, predecessor_owner, include_predecessor=carry)
 
     parent_descriptor = open_lock_parent(lock_file)
     try:
         fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
         second_identity = run_lock(options.lock_script, options.repo, options.provider, 'identity')
         second_readback = run_lock(options.lock_script, options.repo, options.provider, 'inspect')
-        second_handoff_id = validate_authority(second_readback, second_identity, options, require_predecessor=not options.reuse)
+        second_predecessor_owner = expected_predecessor_owner(second_readback.get('slot', {}).get('history')) \
+            if isinstance(second_readback.get('slot'), dict) else None
+        second_predecessor = discover_predecessor(bound_identity, second_predecessor_owner) if not options.reuse else None
+        second_handoff_id, second_carry = validate_authority(
+            second_readback, second_identity, options, require_predecessor=not options.reuse, predecessor=second_predecessor)
         if first_identity.get('beacon') != second_identity.get('beacon') or first_handoff_id != second_handoff_id:
             fail('conductor authority changed while acquiring the writer gate')
+        second_snapshot = capture_snapshot(options, bound_identity, second_predecessor_owner, include_predecessor=second_carry)
+        changed, detail = snapshots_differ(first_snapshot, second_snapshot)
+        if changed:
+            fail(f'conductor worker identity changed while acquiring the writer gate: {detail}')
+        carry = bool(second_carry)
         commit = [
             options.node_path, options.cli_path, 'handoff-local',
             '--state-dir', options.state_dir, '--db', options.db,
@@ -378,11 +325,15 @@ def main():
             commit.append('--reuse')
         else:
             commit.extend(['--handoff-id', second_handoff_id])
+        child_env = {**os.environ, 'DISCORD_SURFACE_HANDOFF_GATE_HELD': '1'}
+        child_env.pop(CARRY_ENV, None)
+        if carry and not options.reuse:
+            child_env[CARRY_ENV] = '1'
         try:
             # The child must retain the directory lock if this gate process is terminated by its caller.
             result = subprocess.run(
                 commit, check=False, capture_output=True, text=True, timeout=30,
-                env={**os.environ, 'DISCORD_SURFACE_HANDOFF_GATE_HELD': '1'},
+                env=child_env,
                 pass_fds=(parent_descriptor,)
             )
         except (OSError, subprocess.SubprocessError) as error:

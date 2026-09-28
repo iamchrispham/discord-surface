@@ -1313,7 +1313,8 @@ function localHandoff(args) {
       print({ handedOff: false, reused: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding: current, readiness: current.readiness });
       return;
     }
-    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff, enrollmentProof });
+    const carryAcceptedHuman = process.env.DISCORD_SURFACE_HANDOFF_CARRY_ACCEPTED_HUMAN === '1';
+    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff, enrollmentProof, carryAcceptedHuman });
     print({ handedOff: true, reused: false, conductorId, repoKey, channelId, handoffId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
   } finally { state.close(); }
 }
