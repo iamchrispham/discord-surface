@@ -1,7 +1,20 @@
 import { createCourierAttemptHandlers } from './attempt';
 import { canonicalWorkspace, claimCourierForward, hasCourierForwardClaim, hasRetiredCourierAttempt, matchesFixedRecipient } from './forward';
-import { COURIER_ATTEMPT_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_RESULT_STATUSES, COURIER_ROUTE_STATES, COURIER_SOURCE_KINDS, ENVELOPE_TYPE, PROMPT_PREFIX } from './constants';
+import {
+  COURIER_ATTEMPT_STATES,
+  COURIER_DELIVERY_STATUSES,
+  COURIER_OUTCOMES,
+  COURIER_RECEIPT_KINDS,
+  COURIER_RECOVERY_REASONS,
+  COURIER_RECOVERY_SOURCES,
+  COURIER_RESULT_STATUSES,
+  COURIER_ROUTE_STATES,
+  COURIER_SOURCE_KINDS,
+  ENVELOPE_TYPE,
+  PROMPT_PREFIX
+} from './constants';
 import { createEnvelope } from './envelope';
+import { getCourierDeliveryStatus, recoverCourierAttempt } from './recovery';
 import { getRoute, isCourierOriginAllowed, listRoutes, registerRoute, revokeRoute } from './route';
 import type { CourierDependencies, CourierState } from './types';
 
@@ -18,6 +31,8 @@ export function createCourierRouteHandlers(deps: CourierDependencies) {
     listCourierRoutes: (state: CourierState) => listRoutes(deps, state),
     recordCourierOutcome: attempts.recordCourierOutcome,
     recoverCourierAttemptsAfterRestart: attempts.recoverCourierAttemptsAfterRestart,
+    recoverCourierAttempt: recoverCourierAttempt.bind(null, deps),
+    getCourierDeliveryStatus: getCourierDeliveryStatus.bind(null, deps),
     registerCourierRoute: (state: CourierState, input: unknown) => registerRoute(deps, state, input),
     revokeCourierRoute: (state: CourierState, routeId: string, reason: string | null = null) => revokeRoute(deps, state, routeId, reason),
     getCourierRoute: (state: CourierState, routeId: string) => getRoute(deps, state, routeId)
@@ -26,8 +41,11 @@ export function createCourierRouteHandlers(deps: CourierDependencies) {
 
 export {
   COURIER_ATTEMPT_STATES,
+  COURIER_DELIVERY_STATUSES,
   COURIER_OUTCOMES,
   COURIER_RECEIPT_KINDS,
+  COURIER_RECOVERY_REASONS,
+  COURIER_RECOVERY_SOURCES,
   COURIER_RESULT_STATUSES,
   COURIER_ROUTE_STATES,
   COURIER_SOURCE_KINDS,
