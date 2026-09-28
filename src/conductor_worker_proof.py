@@ -17,6 +17,8 @@ import subprocess
 OWNER_CHANGE_VERBS = frozenset({'claim', 'release', 'steal', 'override', 'preempt'})
 FORCED_VERBS = frozenset({'steal', 'override', 'preempt'})
 PROOF_LIMIT = 1024 * 1024
+IDENTITY_ALIAS_KEYS = ('sessionId', 'fullUUID', 'fullUuid')
+DEFAULT_WORKERS_ROOT = '~/.codex/work-control/workers'
 
 
 class GateError(Exception):
@@ -93,20 +95,19 @@ def json_object(text, label):
     return value
 
 
-def read_json(path, label, with_identity=False):
-    if not with_identity:
-        try:
-            body = read_regular(path, label)
-            text = body.decode('utf-8')
-        except UnicodeDecodeError as error:
-            fail(f'{label} is not valid JSON: {error}')
-        return json_object(text, label)
-    body, identity = read_regular(path, label, with_identity=True)
+def _decode_json(body, label):
     try:
         text = body.decode('utf-8')
     except UnicodeDecodeError as error:
         fail(f'{label} is not valid JSON: {error}')
-    return json_object(text, label), identity
+    return json_object(text, label)
+
+
+def read_json(path, label, with_identity=False):
+    if not with_identity:
+        return _decode_json(read_regular(path, label), label)
+    body, identity = read_regular(path, label, with_identity=True)
+    return _decode_json(body, label), identity
 
 
 def native_token(native_id):
@@ -208,7 +209,7 @@ def verify_worker(path, provider, native_id, owner, workspace):
     if owner_token(lane_id, provider) != owner_token(owner, provider):
         fail('worker manifest lane token does not match the current lock owner')
     identity_aliases = []
-    for key in ('sessionId', 'fullUUID', 'fullUuid'):
+    for key in IDENTITY_ALIAS_KEYS:
         if key not in worker:
             continue
         value = worker[key]
@@ -250,7 +251,7 @@ def verify_worker(path, provider, native_id, owner, workspace):
 
 def workers_root():
     configured = os.environ.get('CONDUCTOR_WORKERS_DIR')
-    return os.path.realpath(os.path.abspath(configured or os.path.expanduser('~/.codex/work-control/workers')))
+    return os.path.realpath(os.path.abspath(configured or os.path.expanduser(DEFAULT_WORKERS_ROOT)))
 
 
 def expected_filename_match(stem, expected_owner):
@@ -269,7 +270,7 @@ def predecessor_identity(worker):
     if not isinstance(worker, dict):
         return None
     aliases = []
-    for key in ('sessionId', 'fullUUID', 'fullUuid'):
+    for key in IDENTITY_ALIAS_KEYS:
         if key not in worker:
             continue
         value = worker[key]
@@ -341,7 +342,7 @@ def discover_predecessor(expected_identity, expected_owner):
             # expected owner or a string-valued alias names the expected UUID.
             claims_expected = any(
                 isinstance(worker.get(key), str) and worker.get(key) and worker.get(key) == expected_uuid
-                for key in ('sessionId', 'fullUUID', 'fullUuid'))
+                for key in IDENTITY_ALIAS_KEYS)
             if expected_filename_match(stem, expected_owner) or claims_expected:
                 unknown_matching = True
                 return {'status': 'unknown', 'reason': 'matching predecessor manifest has no exact native identity',
@@ -413,9 +414,15 @@ def successor_snapshot(worker_path, provider, native_id, owner, workspace):
         worker, file_identity = read_json(worker_path, 'worker manifest', with_identity=True)
     except GateError as error:
         return {'error': str(error), 'fileIdentity': None}
+    identity = predecessor_identity(worker)
+    if identity is None:
+        return {'error': 'worker manifest has no exact native session identity', 'fileIdentity': file_identity}
+    if identity['fullUUID'] != native_id:
+        return {'error': 'worker manifest native identity does not match the requested native UUID',
+                'fileIdentity': file_identity}
     return {
         'laneId': worker.get('laneId'),
-        'fullUUID': worker.get('fullUUID') or worker.get('fullUuid'),
+        'fullUUID': identity['fullUUID'],
         'sessionId': worker.get('sessionId'),
         'pid': worker.get('pid'),
         'processStartTime': worker.get('processStartTime'),
