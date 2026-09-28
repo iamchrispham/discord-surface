@@ -2522,9 +2522,13 @@ class DiscordGateway {
       try {
         channel = await waitForRecoveryOperation(() => {
           if (retryBoundary) {
-            const retryDetail = isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)
-              ? retryBoundary.detail : retryPendingBoundaryDetail(reason, retryBoundary);
-            if (isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail)) nativeProofRetryDetail = retryDetail;
+            const beforeBindingRetry = isNativeProofBeforeBindingBoundary(retryBoundary.state, retryBoundary.detail);
+            const nativeProofRetry = isNativeProofRetryBoundary(retryBoundary.state, retryBoundary.detail);
+            let retryDetail;
+            if (beforeBindingRetry) retryDetail = nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, deadline);
+            else if (nativeProofRetry) retryDetail = retryBoundary.detail;
+            else retryDetail = retryPendingBoundaryDetail(reason, retryBoundary);
+            if (nativeProofRetry) nativeProofRetryDetail = retryDetail;
             const retrying = this.state.markIntakeBoundary(binding.channelId, 'pending', retryDetail,
               retryBoundary.gap_from, retryBoundary.gap_to, binding, null, retryBoundary, ownedReadiness);
             if (!retrying) throw recoveryError('stale', 'Discord intake boundary changed before channel recovery');

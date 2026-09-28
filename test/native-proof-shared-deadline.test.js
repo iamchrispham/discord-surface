@@ -117,6 +117,81 @@ test('shared deadline does not permanently hold an unattempted binding', async (
   await runSharedBudget(false);
   await runSharedBudget(true);
 });
+
+test('attempted before-binding lookup retries rotate behind unattempted routes', { timeout: 5000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-lookup-rotation-'));
+  const root = path.join(dir, 'sessions');
+  const ids = ['88888888-8888-4888-8888-888888888888', '99999999-9999-4999-8999-999999999999'];
+  const channels = ['1000', '2000'];
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  let gateway;
+  try {
+    fs.mkdirSync(root);
+    state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
+    for (let i = 0; i < channels.length; i++) {
+      fs.writeFileSync(path.join(root, `${ids[i]}.jsonl`), JSON.stringify({
+        type: 'session_meta', payload: { id: ids[i], cwd: dir }
+      }) + '\n');
+      state.bindOrdinary({ channelId: channels[i], guildId: 'guild', provider: 'codex', nativeId: ids[i], workspace: dir },
+        { sessionId: ids[i], threadId: ids[i] }, '100');
+      state.setIntakeBaseline(channels[i], '100', 'fixture baseline');
+      state.markIntakeBoundary(channels[i], 'unavailable',
+        nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, Date.now() + 1000),
+        '100', null, state.getBinding(channels[i]));
+    }
+    const lookups = [];
+    const preflights = [];
+    let failLookup = true;
+    gateway = new DiscordGateway({
+      state,
+      client: {
+        user: { id: 'bot' },
+        channels: {
+          fetch: async id => {
+            lookups.push(id);
+            if (id === '1000' && failLookup) {
+              failLookup = false;
+              const error = new Error('Service Unavailable');
+              error.status = 503;
+              throw error;
+            }
+            return { id, guildId: 'guild', topic: null, permissionsFor: () => ({ has: () => true }) };
+          }
+        },
+        on() {}, off() {}, async destroy() {}
+      },
+      fetchHistory: async () => [],
+      providers: { codex: { async dispatch() { throw new Error('lookup rotation fixture must not dispatch'); } } },
+      recoveryOptions: {
+        timeoutMs: 1000,
+        ordinaryNativePreflight: async (binding, options) => {
+          preflights.push(binding.channelId);
+          return validateCodexSessionIdentityAsync(binding.nativeId, binding.workspace, root, options);
+        }
+      }
+    });
+
+    const first = await gateway.recoverInbound(new AbortController().signal, 'reconnect', gateway.lifecycleEpoch,
+      ['1000'], Date.now() + 1000);
+    assert.equal(first.ready, false);
+    assert.equal(isNativeProofBeforeBindingBoundary(
+      state.getIntakeWatermark('1000').state, state.getIntakeWatermark('1000').detail), false);
+    assert.match(state.getIntakeWatermark('1000').detail, /"phase":"preflight"/);
+    assert.equal(isNativeProofBeforeBindingBoundary(
+      state.getIntakeWatermark('2000').state, state.getIntakeWatermark('2000').detail), true);
+
+    const second = await gateway.recoverInbound(new AbortController().signal, 'reconnect', gateway.lifecycleEpoch,
+      null, Date.now() + 1000);
+    assert.equal(second.ready, true);
+    assert.deepEqual(lookups, ['1000', '2000', '1000']);
+    assert.deepEqual(preflights, ['2000', '1000']);
+  } finally {
+    if (gateway) await gateway.stop();
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('shared deadline keeps an unattempted conductor binding retryable', { timeout: 8000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-shared-conductor-'));
   const root = path.join(dir, 'sessions');
