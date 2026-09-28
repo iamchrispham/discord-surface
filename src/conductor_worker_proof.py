@@ -19,7 +19,6 @@ FORCED_VERBS = frozenset({'steal', 'override', 'preempt'})
 PROOF_LIMIT = 1024 * 1024
 IDENTITY_ALIAS_KEYS = ('sessionId', 'fullUUID', 'fullUuid')
 DEFAULT_WORKERS_ROOT = '~/.agents/work-control/workers'
-LEGACY_WORKERS_ROOT = '~/.codex/work-control/workers'
 
 
 class GateError(Exception):
@@ -256,14 +255,7 @@ def workers_root():
 
 
 def worker_roots():
-    canonical = workers_root()
-    if os.environ.get('CONDUCTOR_WORKERS_DIR'):
-        return [canonical]
-    configured = os.path.abspath(os.path.expanduser(DEFAULT_WORKERS_ROOT))
-    if os.path.lexists(configured):
-        return [canonical]
-    legacy = os.path.realpath(os.path.abspath(os.path.expanduser(LEGACY_WORKERS_ROOT)))
-    return [canonical] if legacy == canonical else [canonical, legacy]
+    return [workers_root()]
 
 
 def expected_filename_match(stem, expected_owner):
@@ -340,7 +332,7 @@ def _canonical_symlink_target_unavailable(root):
             if not component:
                 continue
             current = os.path.join(current, component)
-            if os.path.islink(current) and not os.path.exists(current):
+            if os.path.lexists(current) and os.path.islink(current) and not os.path.exists(current):
                 return True
         return os.path.lexists(canonical) and not os.path.exists(canonical)
     except OSError:

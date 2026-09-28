@@ -25,6 +25,16 @@ function runScenario(name, overrides = {}) {
   return JSON.parse(result.stdout.trim());
 }
 
+function defaultWorkerEnv(home) {
+  const env = {
+    ...process.env,
+    HOME: home,
+    PYTHONPATH: path.join(__dirname, '..', 'src')
+  };
+  delete env.CONDUCTOR_WORKERS_DIR;
+  return env;
+}
+
 function assertRefused(result, label) {
   assert.equal(result.status, 2, `${label}: expected refusal exit 2, got ${result.status}: ${result.stderr}`);
   assert.equal(result.refused, true, `${label}: stderr must carry REFUSED:`);
@@ -44,14 +54,7 @@ test('worker proof uses the canonical conductor registry, with or without the Co
   try {
     const expected = path.join(home, '.agents', 'work-control', 'workers');
     fs.mkdirSync(expected, { recursive: true });
-    const env = {
-      ...Object.fromEntries(
-        Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
-      ),
-      HOME: home,
-      PYTHONPATH: path.join(__dirname, '..', 'src')
-    };
-    delete env.CONDUCTOR_WORKERS_DIR;
+    const env = defaultWorkerEnv(home);
     function resolvedRoot() {
       const result = spawnSync(PYTHON, ['-c',
         'import conductor_worker_proof as proof; print(proof.workers_root())'], {
@@ -84,11 +87,7 @@ test('worker proof keeps the publisher root when only the Codex alias exists', (
     const result = spawnSync(PYTHON, ['-c',
       'import conductor_worker_proof as proof; print(proof.workers_root())'], {
       env: {
-        ...Object.fromEntries(
-          Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
-        ),
-        HOME: home,
-        PYTHONPATH: path.join(__dirname, '..', 'src')
+        ...defaultWorkerEnv(home)
       },
       encoding: 'utf8'
     });
@@ -126,11 +125,7 @@ test('worker proof ignores a distinct Codex alias when canonical death is proven
     ].join('; ');
     const result = spawnSync(PYTHON, ['-c', code], {
       env: {
-        ...Object.fromEntries(
-          Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
-        ),
-        HOME: home,
-        PYTHONPATH: path.join(__dirname, '..', 'src')
+        ...defaultWorkerEnv(home)
       },
       encoding: 'utf8'
     });
@@ -164,11 +159,7 @@ test('worker proof treats an unavailable canonical symlink target as unknown', (
     ].join('; ');
     const result = spawnSync(PYTHON, ['-c', code], {
       env: {
-        ...Object.fromEntries(
-          Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
-        ),
-        HOME: home,
-        PYTHONPATH: path.join(__dirname, '..', 'src')
+        ...defaultWorkerEnv(home)
       },
       encoding: 'utf8'
     });
@@ -179,7 +170,7 @@ test('worker proof treats an unavailable canonical symlink target as unknown', (
   }
 });
 
-test('worker proof falls back to the documented Codex registry when canonical root is absent', () => {
+test('worker proof refuses a distinct Codex registry when canonical root is absent', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-legacy-home-'));
   try {
     const legacy = path.join(home, '.codex', 'work-control', 'workers');
@@ -198,16 +189,12 @@ test('worker proof falls back to the documented Codex registry when canonical ro
     ].join('; ');
     const result = spawnSync(PYTHON, ['-c', code], {
       env: {
-        ...Object.fromEntries(
-          Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
-        ),
-        HOME: home,
-        PYTHONPATH: path.join(__dirname, '..', 'src')
+        ...defaultWorkerEnv(home)
       },
       encoding: 'utf8'
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(result.stdout.trim()).status, 'gone');
+    assert.equal(JSON.parse(result.stdout.trim()).status, 'missing');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -240,11 +227,7 @@ test('worker proof treats unavailable canonical ancestor symlinks as unknown', (
       ].join('; ');
       const result = spawnSync(PYTHON, ['-c', code], {
         env: {
-          ...Object.fromEntries(
-            Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
-          ),
-          HOME: home,
-          PYTHONPATH: path.join(__dirname, '..', 'src')
+          ...defaultWorkerEnv(home)
         },
         encoding: 'utf8'
       });
