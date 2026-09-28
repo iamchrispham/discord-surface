@@ -49,6 +49,7 @@ export interface DirectPostPartMeta {
   agentPacket?: AgentMessage;
   legacyAgentPacket?: AgentMessage;
   agentRequestTarget?: AgentAddress;
+  peerRouting?: boolean;
   routingVersion?: number;
   presentation?: string;
   watcherNotice?: WatcherNotice;
@@ -78,7 +79,8 @@ export interface DirectPostState {
   isAgentResultForWithdrawnRequest(packet: AgentMessage): boolean;
   activeFilePreparationCount?(): number;
   transaction<T>(operation: () => T): T;
-  directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
+  directPostRows(requestId?: string | null, channelId?: string | null, relatedChannelIds?: readonly string[]): DirectPostReceiptRow[];
+  listThreadEnrollments(parentChannelId?: string | null): Array<{ threadId: string; parentChannelId: string; active: boolean }>;
   directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null, deliveryChannelId?: string | null): boolean;
   directPostOwnerIdentity(pid: number): DirectPostOwnerIdentity | null;
   directPostOwnerAlive(pid: number, expectedIdentity: DirectPostOwnerIdentity): boolean;
@@ -163,6 +165,7 @@ export interface DirectPostOutcomeRecord extends DirectPostReceiptDetail {
 }
 
 export interface DirectPostHandlers {
+  hasUnresolvedBindingPost(state: DirectPostState, channelId: string): boolean;
   hasUnresolvedOrdinaryPost(state: DirectPostState, channelId: string): boolean;
   inspectDirectPostPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null;
   recordDirectPostPreflight(state: DirectPostState, meta: DirectPostPartMeta, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostOutcomeRecord;

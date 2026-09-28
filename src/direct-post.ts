@@ -118,7 +118,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     agentThreadId = null, agentMode = false,
     dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
     agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
-    agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null } =
+    agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null,
+    preparedTextSource, agentDestinationCurrent = null, bindingCurrent = null, custodyKey, peerRouting = false } =
     input as DirectPostInput & { agentThreadId?: string | null };
   const binding = watcherNotice
     ? watcherNotice.binding
@@ -147,24 +148,43 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     ? resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: false })
     : resolveDedupeKey({ dedupeKey, requestId: legacyRequestId }, { required: isAgentMessage });
   const explicitRequestId = watcherNotice ? requestedRequestId || watcherNotice.packet.id : requestedRequestId;
+  const explicitCustodyKey = custodyKey === undefined ? null : requiredString(custodyKey, 'custody-key', 256);
   if (watcherNotice && explicitRequestId !== watcherNotice.packet.id) {
     throw new BindingError('watcher notice dedupe key must match its frozen identity');
   }
   if (fileRequested && explicitRequestId === undefined) throw new BindingError('file posts require an explicit dedupe-key');
+  if (fileRequested && preparedTextSource !== undefined) {
+    throw new BindingError('prepared text source cannot be combined with file or resume input');
+  }
   let legacy: LegacyParentSourcedReceipt | null = null;
   if (!watcherNotice && isAgentMessage && explicitRequestId !== undefined) {
     state.recoverDirectPostReceipts();
     const allowLegacyChildRoute = isLegacyAgentAddressEnvelope(agentTarget) || agentThreadId !== null ||
       (agentKind === KINDS.RESULT && agentReplyTo !== null);
     legacy = legacyParentSourcedReceipt(state, binding, explicitRequestId, Object.values(DIRECT_POST_OUTCOMES),
-      allowLegacyChildRoute);
+      false, binding.channelId);
+    if (!legacy && allowLegacyChildRoute && agentThreadId !== null) {
+      legacy = legacyParentSourcedReceipt(state, binding, explicitRequestId, Object.values(DIRECT_POST_OUTCOMES),
+        allowLegacyChildRoute, agentThreadId);
+    }
+    if (!legacy && allowLegacyChildRoute && agentThreadId === null) {
+      legacy = legacyParentSourcedReceipt(state, binding, explicitRequestId, Object.values(DIRECT_POST_OUTCOMES),
+        allowLegacyChildRoute, null);
+    }
   }
   let source: DirectPostSource;
   try {
     source = fileRequested
       ? prepareFileSource({ state, requestId: explicitRequestId as string, textFile, attachmentFile, resume, stateDir,
         binding, operatorId, inReplyTo })
-      : readTextFile(textFile);
+      : preparedTextSource !== undefined
+        ? {
+          sourcePath: preparedTextSource.sourcePath,
+          text: preparedTextSource.text,
+          textHash: preparedTextSource.textHash,
+          parts: [...preparedTextSource.parts]
+        }
+        : readTextFile(textFile);
   } catch (error) {
     const legacySourcePath = legacy?.attempt.sourcePath;
     const requestedSourcePath = typeof textFile === 'string' ? path.resolve(textFile) : null;
@@ -292,7 +312,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     };
   }
   const legacyMigration = legacyChildAddress === null || legacyPacket?.kind === KINDS.RESULT ? legacyPacket : null;
-  const requestId = requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, effectiveReplyTarget);
+  const requestId = explicitCustodyKey ?? requestIdFor(binding, operatorId, source.sourcePath, source.textHash, explicitRequestId, effectiveReplyTarget);
   state.recoverDirectPostReceipts();
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;
@@ -306,6 +326,17 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       return false;
     }
   };
+  const currentReady = () => {
+    if (!currentBinding()) return false;
+    if (typeof bindingCurrent !== 'function') return true;
+    try { return bindingCurrent(); }
+    catch { return false; }
+  };
+  const currentDestination = () => {
+    if (deliveryTarget === null || typeof agentDestinationCurrent !== 'function') return true;
+    try { return agentDestinationCurrent(deliveryTarget); }
+    catch { return false; }
+  };
   for (let partIndex = 0; partIndex < source.parts.length; partIndex += 1) {
     if (signal?.aborted) {
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
@@ -313,7 +344,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     }
     const meta = partMeta(binding, operatorId, requestId, effectiveReplyTarget, source.sourcePath, source.textHash, source.parts, partIndex, address, deliveryTarget, agentPresentation, agentPacket, source.fileManifest || null, watcherNotice?.packet || null,
       legacyMigration, agentRequestTarget,
-      legacy === null && isAgentMessage ? AGENT_ROUTING_VERSION : null);
+      legacy === null && isAgentMessage ? AGENT_ROUTING_VERSION : null, peerRouting);
     if (deliveryTarget !== null) meta.deliveryChannelId = deliveryTarget.channelId;
     if (deliveryTarget !== null) {
       let existing;
@@ -331,7 +362,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       try {
         await verifyAgentDestination({ token, agentTarget: deliveryTarget, fetchImpl, signal, timeoutMs });
       } catch (error) {
-        if (!currentBinding()) {
+        if (!currentBinding() || !currentDestination()) {
           const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
           parts.push({ index: partIndex, status: stale.outcome, messageId: null });
           break;
@@ -342,7 +373,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         parts.push({ index: partIndex, status: preflight.outcome, messageId: null });
         break;
       }
-      if (!currentBinding()) {
+      if (!currentBinding() || !currentDestination()) {
         const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
         parts.push({ index: partIndex, status: stale.outcome, messageId: null });
         break;
@@ -354,6 +385,10 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       }
     }
     let claim;
+    if (deliveryTarget === null && !currentReady()) {
+      parts.push({ index: partIndex, status: 'stale', messageId: null });
+      break;
+    }
     try { claim = state.beginDirectPostPart(meta); }
     catch (error) {
       if (!(error instanceof StaleGenerationError)) throw error;
@@ -371,13 +406,13 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       continue;
     }
     claimedAny = true;
-    if (!currentBinding()) {
+    if (!currentReady() || !currentDestination()) {
       const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before network' });
       parts.push({ index: partIndex, status: stale.outcome });
       break;
     }
     try {
-      if (!currentBinding()) {
+      if (!currentReady() || !currentDestination()) {
         const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before send' });
         parts.push({ index: partIndex, status: stale.outcome });
         break;
@@ -403,7 +438,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   }
   const status = parts.every(part => part.status === 'sent') ? 'sent' : parts.find(part => part.status !== 'sent')?.status || 'not_sent';
   const duplicate = !claimedAny && parts.length > 0 && parts.every(part => part.status === 'sent');
-  return { requestId, dedupeKey: requestId, inReplyTo: effectiveReplyTarget, channelId: deliveryTarget?.channelId || binding.channelId, provider: binding.provider,
+  const publicRequestId = explicitRequestId ?? requestId;
+  return { requestId: publicRequestId, dedupeKey: publicRequestId, inReplyTo: effectiveReplyTarget, channelId: deliveryTarget?.channelId || binding.channelId, provider: binding.provider,
     nativeId: binding.nativeId, generation: binding.generation, status, state: status, recorded, duplicate,
     ...(source.fileManifest ? { filePreparationId: source.fileManifest.preparationId } : {}),
     messageIds: parts.filter((part): part is DirectPostPartResult & { messageId: string } => typeof part.messageId === 'string')

@@ -872,25 +872,42 @@ test('historic receipts without reply metadata normalize to null', async t => {
   assert.ok(f.state.directPostRows('historic-request').every(row => row.detail.inReplyTo === null));
 });
 
-test('rebind and operator revocation stop before the next multipart network request', async t => {
-  for (const revoke of ['rebind', 'operator']) {
-    const f = fixture(t);
-    fs.writeFileSync(f.textFile, `${'a'.repeat(2000)}${'b'.repeat(2000)}`);
-    const recorder = fetchRecorder();
-    const originalFetch = recorder.fetchImpl;
-    const fetchImpl = async (...args) => {
-      const result = await originalFetch(...args);
-      if (recorder.calls.length === 1) {
-        if (revoke === 'rebind') f.state.rebind({ ...f.state.getBinding('channel'), nativeId: '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b' });
-        else f.state.setConfig({ operatorId: 'another-operator' });
-      }
-      return result;
-    };
-    const result = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl });
-    assert.equal(recorder.calls.length, 1);
-    assert.equal(result.status, 'stale');
-    assert.deepEqual(result.messageIds, ['direct-1']);
-  }
+test('rebind refuses while a multipart publication is unresolved without failing the transport', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, `${'a'.repeat(2000)}${'b'.repeat(2000)}`);
+  const recorder = fetchRecorder();
+  const originalFetch = recorder.fetchImpl;
+  const fetchImpl = async (...args) => {
+    const result = await originalFetch(...args);
+    if (recorder.calls.length === 1) {
+      const before = f.state.getBinding('channel');
+      assert.throws(() => f.state.rebind({
+        ...before, nativeId: '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b'
+      }), /publication is unresolved/, 'retirement refuses while the admitted publication is unresolved');
+      assert.deepEqual(f.state.getBinding('channel'), before, 'refused rebind leaves binding identity unchanged');
+    }
+    return result;
+  };
+  const result = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl });
+  assert.equal(recorder.calls.length, 2, 'the refused rebind does not turn into a transport failure');
+  assert.equal(result.status, 'sent');
+  assert.deepEqual(result.messageIds, ['direct-1', 'direct-2']);
+});
+
+test('operator revocation stops before the next multipart network request', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, `${'a'.repeat(2000)}${'b'.repeat(2000)}`);
+  const recorder = fetchRecorder();
+  const originalFetch = recorder.fetchImpl;
+  const fetchImpl = async (...args) => {
+    const result = await originalFetch(...args);
+    if (recorder.calls.length === 1) f.state.setConfig({ operatorId: 'another-operator' });
+    return result;
+  };
+  const result = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl });
+  assert.equal(recorder.calls.length, 1);
+  assert.equal(result.status, 'stale');
+  assert.deepEqual(result.messageIds, ['direct-1']);
 });
 
 

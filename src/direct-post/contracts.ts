@@ -204,14 +204,21 @@ export interface DirectPostInputBase {
   textFile?: unknown;
   attachmentFile?: unknown;
   resume?: boolean;
+  // Internal handoff for already-read text sources. Never a public tool argument or CLI flag.
+  preparedTextSource?: Pick<DirectPostSource, 'sourcePath' | 'text' | 'textHash' | 'parts'>;
   stateDir?: string;
   dedupeKey?: unknown;
   requestId?: unknown;
+  // Internal journal scope for agent retries. The signed packet keeps dedupeKey.
+  custodyKey?: unknown;
+  peerRouting?: boolean;
   inReplyTo?: unknown;
   signal?: AbortSignal;
   fetchImpl?: FetchImplementation;
   timeoutMs?: number;
   ordinary?: boolean;
+  bindingCurrent?: (() => boolean) | null;
+  agentDestinationCurrent?: ((target: AgentAddress) => boolean) | null;
   watcherNotice?: { packet: WatcherNotice; binding: DirectPostBinding } | null;
 }
 

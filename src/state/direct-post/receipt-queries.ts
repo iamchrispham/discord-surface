@@ -30,7 +30,8 @@ export function latestFilePreparation(state: DirectPostState, kind: string, pars
 export function queryDirectPostRows(
   { db, assertText, parseJson, StateCorruptError, attemptKind, outcomeKind }: DirectPostQueryDependencies,
   requestId: string | null = null,
-  channelId: string | null = null
+  channelId: string | null = null,
+  relatedChannelIds: readonly string[] = []
 ): DirectPostReceiptRow[] {
   if (requestId !== null) assertText(requestId, 'requestId', 256);
   if (channelId !== null) assertText(channelId, 'channelId', 128);
@@ -44,6 +45,15 @@ export function queryDirectPostRows(
     clauses.push("json_extract(detail, '$.channelId')=?");
     parameters.push(channelId);
   }
+  const relatedChannels = [...new Set(relatedChannelIds)];
+  relatedChannels.forEach(value => assertText(value, 'relatedChannelId', 128));
+  if (relatedChannels.length > 0) {
+    const placeholders = relatedChannels.map(() => '?').join(', ');
+    clauses.push(`(json_extract(detail, '$.channelId') IN (${placeholders}) OR
+      json_extract(detail, '$.deliveryChannelId') IN (${placeholders}) OR
+      json_extract(detail, '$.agentPacket.target.channelId') IN (${placeholders}))`);
+    parameters.push(...relatedChannels, ...relatedChannels, ...relatedChannels);
+  }
   const rows = db.prepare(`SELECT id, kind, detail, created_at FROM receipts
     WHERE ${clauses.join(' AND ')} ORDER BY id`).all<RawReceiptRow>(...parameters);
   return rows.map(row => {
@@ -52,6 +62,34 @@ export function queryDirectPostRows(
     if (detail.inReplyTo === undefined) detail.inReplyTo = null;
     return { id: Number(row.id), kind: row.kind, detail, createdAt: row.created_at };
   });
+}
+
+export function projectNewestDirectPostAttempt(
+  rows: readonly DirectPostReceiptRow[],
+  kinds: Pick<DirectPostQueryDependencies, 'attemptKind' | 'outcomeKind'>
+): {
+  attempt: DirectPostReceiptRow | null;
+  outcome: DirectPostReceiptRow | null;
+  latestPreflight: DirectPostReceiptRow | null;
+} {
+  let attempt: DirectPostReceiptRow | null = null;
+  for (const row of rows) {
+    if (row.kind === kinds.attemptKind && (!attempt || row.id > attempt.id)) attempt = row;
+  }
+  const attemptId = attempt && typeof attempt.detail.attemptId === 'string' && attempt.detail.attemptId
+    ? attempt.detail.attemptId
+    : null;
+  let outcome: DirectPostReceiptRow | null = null;
+  let latestPreflight: DirectPostReceiptRow | null = null;
+  for (const row of rows) {
+    if (row.kind !== kinds.outcomeKind) continue;
+    if (row.detail.phase === 'preflight') {
+      if (!latestPreflight || row.id > latestPreflight.id) latestPreflight = row;
+      continue;
+    }
+    if (attemptId && row.detail.attemptId === attemptId && (!outcome || row.id > outcome.id)) outcome = row;
+  }
+  return { attempt, outcome, latestPreflight };
 }
 
 export function querySentAgentResultRows(

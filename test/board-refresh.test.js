@@ -764,6 +764,87 @@ test('preflight signal stop exits with signal status and sends no PATCH', async 
   assert.equal(f.state.listReceipts().some(row => row.kind === 'board-refresh-attempt'), false);
 });
 
+test('unresolved board PATCH fences binding retirement until its outcome is recorded', async t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  const patchStarted = deferred();
+  const releasePatch = deferred();
+  const board = { content: 'initial board' };
+  fs.writeFileSync(f.textFile, 'pending board');
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/users/@me')) return response({ id: 'bot-1' });
+    if (init.method === 'GET' && url.endsWith('/channels/channel-1')) return boardChannelResponse();
+    if (init.method === 'GET') return boardMessageResponse(board.content);
+    if (init.method === 'PATCH') {
+      patchStarted.resolve();
+      await releasePatch.promise;
+      board.content = JSON.parse(init.body).content;
+      return boardMessageResponse(board.content);
+    }
+    throw new Error(`unexpected board request ${init.method} ${url}`);
+  };
+
+  const running = refresh(f, 'pending board', 'refresh-fence', fetchImpl);
+  await waitFor(patchStarted, 'board PATCH admission');
+  assert.equal(f.state.hasUnresolvedBindingPost('channel-1'), true);
+  assert.throws(() => f.state.unbind('channel-1', { expectedBinding: f.binding }), /cannot unbind while work is unresolved/);
+
+  releasePatch.resolve();
+  assert.equal((await running).status, BOARD_OUTCOMES.APPLIED);
+  assert.equal(f.state.hasUnresolvedBindingPost('channel-1'), false);
+  assert.doesNotThrow(() => f.state.unbind('channel-1', { expectedBinding: f.binding }));
+});
+
+test('recovered unknown board outcome permits ordinary binding handoff', t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  const target = boardTarget();
+  seedBoardOutcome(f, 'unknown-retirement', BOARD_OUTCOMES.UNKNOWN);
+
+  assert.equal(f.state.hasUnresolvedBindingPost(target.channelId), false);
+  const old = f.state.getBinding(target.channelId);
+  const handoff = f.state.handoffConductor({
+    channelId: old.channelId,
+    provider: old.provider,
+    conductorId: old.conductorId,
+    repoKey: old.repoKey,
+    fromNativeId: old.nativeId,
+    fromGeneration: old.generation,
+    nativeId: SUCCESSOR_ID,
+    workspace: old.workspace,
+    endpoint: old.endpoint,
+    handoffId: 'unknown-board-handoff'
+  });
+  assert.equal(handoff.generation, old.generation + 1);
+});
+
+test('malformed board outcome remains binding-fenced instead of becoming valid unknown recovery', t => {
+  const f = fixture();
+  t.after(() => f.state.close());
+  const target = boardTarget();
+  const seeded = seedBoardOutcome(f, 'malformed-unknown-retirement', BOARD_OUTCOMES.UNKNOWN);
+  const row = f.state.db.prepare("SELECT id, detail FROM receipts WHERE kind='board-refresh-outcome' AND json_extract(detail, '$.attemptId')=?").get(seeded.attemptId);
+  assert.ok(row);
+  const detail = JSON.parse(row.detail);
+  f.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(
+    JSON.stringify({ ...detail, outcome: 'not-a-board-outcome' }), row.id
+  );
+  assert.equal(f.state.hasUnresolvedBindingPost(target.channelId), true);
+  const old = f.state.getBinding(target.channelId);
+  assert.throws(() => f.state.handoffConductor({
+    channelId: old.channelId,
+    provider: old.provider,
+    conductorId: old.conductorId,
+    repoKey: old.repoKey,
+    fromNativeId: old.nativeId,
+    fromGeneration: old.generation,
+    nativeId: SUCCESSOR_ID,
+    workspace: old.workspace,
+    endpoint: old.endpoint,
+    handoffId: 'malformed-unknown-handoff'
+  }), /cannot handoff while work is unresolved/);
+});
+
 test('late PATCH stays fenced across handoff, ordinary readiness, and successor refresh', async t => {
   const f = fixture();
   t.after(() => f.state.close());
@@ -1073,7 +1154,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
       let state = new SurfaceState(process.env.DISCORD_SURFACE_DB);
       try {
         const fenced = state.inspectBoardRequest('refresh-old', target);
-        if (fenced?.status !== 'in_flight') throw new Error('board was not fenced during ordinary successor work: ' + fenced?.status);
+        if (fenced?.status !== 'unknown') throw new Error('board was not fenced during ordinary successor work: ' + fenced?.status);
         const binding = state.getBinding('channel-1');
         if (binding?.nativeId !== process.env.DISCORD_SURFACE_SUCCESSOR_ID || binding.generation !== 2) {
           throw new Error('successor binding was not ready before ordinary work');
@@ -1138,7 +1219,10 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
         if (!oldAttempt) throw new Error('predecessor board attempt is missing');
         const oldDetail = JSON.parse(oldAttempt.detail);
         const recovered = state.recoverBoardRefreshAttempt(target, oldDetail.attemptId);
-        if (recovered !== 1) throw new Error('selected orphan recovery returned ' + recovered);
+        if (recovered !== 0) throw new Error('selected orphan recovery unexpectedly changed custody: ' + recovered);
+        if (state.inspectBoardRequest('refresh-old', target)?.status !== 'unknown') {
+          throw new Error('selected orphan was not classified as unknown before reconciliation');
+        }
       } finally {
         state.close();
         state = null;
@@ -1210,6 +1294,8 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
   assert.ok(oldAttempt);
   const oldDetail = JSON.parse(oldAttempt.detail);
   assert.equal(f.state.inspectBoardRequest('refresh-old', target).status, BOARD_OUTCOMES.IN_FLIGHT);
+  assert.equal(f.state.recoverBoardRefreshAttempt(target, oldDetail.attemptId, () => false), 1);
+  assert.equal(f.state.inspectBoardRequest('refresh-old', target).status, BOARD_OUTCOMES.UNKNOWN);
 
   const old = f.state.getBinding('channel-1');
   const handoff = f.state.handoffConductor({
@@ -1223,9 +1309,9 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
   const ordinaryResult = JSON.parse(await waitForFile(ordinaryResultFile, 'ordinary successor result'));
   assert.equal(ordinaryResult.messageState, 'replied');
   assert.equal(ordinaryResult.generation, 2);
-  assert.equal(ordinaryResult.fencedStatus, BOARD_OUTCOMES.IN_FLIGHT);
+  assert.equal(ordinaryResult.fencedStatus, BOARD_OUTCOMES.UNKNOWN);
   assert.deepEqual(ordinaryResult.events.map(event => event.phase).sort(), ['dispatch', 'observe', 'receipt', 'reply'].sort());
-  assert.equal(f.state.inspectBoardRequest('refresh-old', target).status, BOARD_OUTCOMES.IN_FLIGHT);
+  assert.equal(f.state.inspectBoardRequest('refresh-old', target).status, BOARD_OUTCOMES.UNKNOWN);
   assert.equal(board.managedPatchCount, 1);
   assert.equal(board.content, 'initial board');
 

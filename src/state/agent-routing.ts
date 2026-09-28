@@ -102,8 +102,12 @@ function receiptDetail(row: DirectPostReceiptRow): Record<string, unknown> | nul
 }
 
 export function legacyParentSourcedReceipt(state: DirectPostState, binding: DirectPostBinding, requestId: string,
-  validOutcomes: readonly DirectPostOutcome[], allowLegacyChildRoute = false): LegacyParentSourcedReceipt | null {
-  const rows = state.directPostRows(requestId);
+  validOutcomes: readonly DirectPostOutcome[], allowLegacyChildRoute = false, sourceChannelId: string | null = null): LegacyParentSourcedReceipt | null {
+  const rows = state.directPostRows(requestId, binding.channelId).filter(row => {
+    const detail = receiptDetail(row);
+    return detail?.guildId === binding.guildId && detail?.provider === binding.provider &&
+      detail?.nativeId === binding.nativeId && detail?.generation === binding.generation;
+  });
   const attempts = new Map<string, Record<string, unknown>>();
   for (const row of rows) {
     if (row.kind !== 'direct-post-attempt') continue;
@@ -140,6 +144,12 @@ export function legacyParentSourcedReceipt(state: DirectPostState, binding: Dire
     const attemptPacket = attempt?.legacyAgentPacket ?? attempt?.agentPacket;
     const packet = detail.legacyAgentPacket ?? detail.agentPacket ?? attemptPacket;
     if (!attempt || !attemptPacket || !packet || typeof attemptPacket !== 'object' || typeof packet !== 'object') continue;
+    const sourcePackets = [attempt?.legacyAgentPacket, attempt?.agentPacket, detail.legacyAgentPacket, detail.agentPacket]
+      .filter(candidate => candidate && typeof candidate === 'object');
+    if (sourceChannelId !== null && !sourcePackets.some(candidate => {
+      const source = (candidate as Record<string, unknown>).source;
+      return source && typeof source === 'object' && (source as Record<string, unknown>).channelId === sourceChannelId;
+    })) continue;
     const attemptSource = (attemptPacket as Record<string, unknown>).source;
     const packetSource = (packet as Record<string, unknown>).source;
     const legacyReceipt = isLegacyAgentReceipt(attempt) && isLegacyAgentReceipt(detail);

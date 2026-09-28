@@ -139,6 +139,36 @@ function inspectBoardRequest(state: BoardState, requestId: string, rawTarget: Bo
   return duplicateRecord(readReceipts(state), requestId, target);
 }
 
+function isValidUnknownOutcome(attempt: ReceiptRow, outcome: ReceiptRow): boolean {
+  const attemptDetail = attempt.detail;
+  const outcomeDetail = outcome.detail;
+  return outcomeDetail.outcome === BOARD_OUTCOMES.UNKNOWN &&
+    typeof attemptDetail.attemptId === 'string' && attemptDetail.attemptId.length > 0 &&
+    outcomeDetail.attemptId === attemptDetail.attemptId &&
+    typeof attemptDetail.guildId === 'string' && outcomeDetail.guildId === attemptDetail.guildId &&
+    typeof attemptDetail.channelId === 'string' && outcomeDetail.channelId === attemptDetail.channelId &&
+    typeof attemptDetail.targetMessageId === 'string' && outcomeDetail.targetMessageId === attemptDetail.targetMessageId &&
+    typeof outcomeDetail.operationEndedAt === 'string' && Number.isFinite(Date.parse(outcomeDetail.operationEndedAt));
+}
+
+function hasUnresolvedBindingPost(state: BoardState, channelId: string): boolean {
+  const rows = readReceipts(state, [BOARD_RECEIPT_KINDS.ATTEMPT, BOARD_RECEIPT_KINDS.OUTCOME]);
+  for (const attempt of rows.filter(row => row.kind === BOARD_RECEIPT_KINDS.ATTEMPT && row.detail.channelId === channelId)) {
+    const attemptId = typeof attempt.detail.attemptId === 'string' ? attempt.detail.attemptId : '';
+    if (!attemptId) return true;
+    const outcome = latestOutcome(rows, attemptId);
+    if (!outcome) return true;
+    if (!OUTCOME_VALUES.has(String(outcome.detail.outcome))) return true;
+    const value = String(outcome.detail.outcome) as BoardOutcome;
+    if (value === BOARD_OUTCOMES.UNKNOWN) {
+      if (isValidUnknownOutcome(attempt, outcome)) continue;
+      return true;
+    }
+    if (UNRESOLVED_OUTCOMES.has(value)) return true;
+  }
+  return false;
+}
+
 function boardMessageProvenance(state: BoardState, rawTarget: BoardTarget): BoardProvenance[] {
   const target = assertTarget(rawTarget);
   const direct = state.db.prepare(`SELECT detail, created_at FROM receipts
@@ -423,6 +453,7 @@ export function createBoardRefreshHandlers() {
   return {
     captureBoardRevision,
     inspectBoardRequest,
+    hasUnresolvedBindingPost,
     boardMessageProvenance,
     recoverBoardRefreshReceipts,
     recoverBoardRefreshAttempt,

@@ -48,6 +48,7 @@ const COMMAND_FLAGS = Object.freeze({
   'ordinary-claude-bind-run': ['channel', 'channel-id', 'endpoint', 'socket', 'transcript', 'workspace', 'native-id'],
   unbind: ['channel-id'],
   status: [],
+  mcp: ['provider'],
   recover: RECOVER_FLAGS.restart,
   'board-refresh': ['channel-id', 'dedupe-key', 'generation', 'message-id', 'native-id', 'request-id', 'text-file'],
   provision: ['provider', 'native-id', 'conductor-id', 'repo-key', 'channel-id', 'task-name', 'workspace', 'endpoint', 'category-id', 'migrate-legacy-topic'],

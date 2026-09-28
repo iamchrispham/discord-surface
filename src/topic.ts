@@ -1,12 +1,19 @@
-const READINESS = Object.freeze(['pending', 'ready', 'unavailable', 'recovering', 'gap'] as const);
-const READINESS_PATTERN = READINESS.join('|');
+const READINESS_VALUES = Object.freeze(['pending', 'ready', 'unavailable', 'recovering', 'gap'] as const);
+export const READINESS = Object.freeze({
+  PENDING: 'pending',
+  READY: 'ready',
+  UNAVAILABLE: 'unavailable',
+  RECOVERING: 'recovering',
+  GAP: 'gap'
+} as const);
+const READINESS_PATTERN = READINESS_VALUES.join('|');
 const STATUS_SUFFIX = new RegExp(` \\[last-published-intake=(${READINESS_PATTERN}) at=(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z)\\]$`);
 const ADDRESS_QUALIFIER = '[address only, not live status]';
 const STATIC_CONDUCTOR_MARKER = /^discord-surface:v3 conductor=([^\s]+) provider=(codex|claude) repo=([^\s]+) \[address only, not live status\]$/;
 const LEGACY_CONDUCTOR_MARKER = new RegExp(`^discord-surface:v2 conductor=([^\\s]+) provider=(codex|claude) repo=([^\\s]+) native=([^\\s]+) generation=(\\d+) readiness=(${READINESS_PATTERN})$`);
 
 export type Provider = 'codex' | 'claude';
-export type Readiness = typeof READINESS[number];
+export type Readiness = typeof READINESS[keyof typeof READINESS];
 
 export interface TopicPresentation {
   base: string;
@@ -112,7 +119,7 @@ export function staticConductorMarker({ provider, conductorId, repoKey }: Static
 
 export function topicWithReadiness(topic: unknown, readiness: Readiness, publishedAt?: string): string;
 export function topicWithReadiness(topic: unknown, readiness: string, publishedAt = new Date().toISOString()): string {
-  if (!(READINESS as readonly string[]).includes(readiness)) throw new Error('invalid Discord topic readiness');
+  if (!READINESS_VALUES.includes(readiness as Readiness)) throw new Error('invalid Discord topic readiness');
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(publishedAt)) throw new Error('invalid Discord topic publication timestamp');
   const base = topicPresentation(topic).base;
   const nextBase = /\breadiness=[^\s]+/.test(base)

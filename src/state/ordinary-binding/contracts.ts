@@ -121,7 +121,8 @@ export interface OrdinaryBindingState {
   isOrdinaryBinding(binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
   transaction<T>(operation: () => T): T;
   hasUnresolved(channelId: string): boolean;
-  hasUnresolvedOrdinaryPost(channelId: string): boolean;
+  hasUnresolvedBindingPost(channelId: string): boolean;
+  hasUnresolvedOrdinaryPost?(channelId: string): boolean;
   listThreadEnrollments(parentChannelId?: string | null): ThreadEnrollment[];
   assertThreadEnrollmentCoverage?(parentChannelId: string, proof: ThreadEnrollmentCoverageProof): void;
   bindingInput(binding: OrdinaryBindingInput, existing?: OrdinaryBindingRecord | null): OrdinaryBindingInput;
