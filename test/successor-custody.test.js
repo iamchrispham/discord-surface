@@ -5,6 +5,7 @@ const { SurfaceState, MESSAGE_STATES, READINESS, INTERACTION_ORIGIN, NATIVE_ACK_
 const { encodeAgentMessage, decodeAgentMessage, KINDS } = require('../src/agent-message');
 const { assertHandoffIntakeCoverage } = require('../src/discord/handoff-fence');
 const { AGENT_ROUTING_VERSION } = require('../src/state/agent-routing');
+const { WATCHER_NOTICE_RECEIPTS } = require('../src/state/watcher-notice');
 const { CODEX_ID, CLAUDE_ID, SUCCESSOR_ID, fixture } = require('./surface-fixtures');
 
 const AGENT_TOKEN = 'successor-custody-fixture-token';
@@ -164,7 +165,7 @@ test('refuses a carryAcceptedHuman handoff while an accepted row carries interac
   assertRefusalUnchanged(f, '101', () => f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true })));
 });
 
-test('expected red: parent accepted-human custody transfers to the successor', { todo: 'issue132 implementation pending' }, t => {
+test('parent accepted-human custody transfers to the successor', t => {
   const f = conductorFixture(t, 'successor-parent-transfer');
   const attachments = [{ url: 'https://cdn.example.test/carry.txt', filename: 'carry.txt', contentType: 'text/plain', size: 24 }];
   const message = acceptHuman(f.state, f.channelId, '101', { content: 'carry this accepted human work', attachments });
@@ -201,7 +202,7 @@ test('expected red: parent accepted-human custody transfers to the successor', {
   assert.equal(replyReceipts(f.state, '101').length, 0);
 });
 
-test('expected red: enrolled child accepted-human custody transfers and serves under the successor generation', { todo: 'issue132 implementation pending' }, async t => {
+test('enrolled child accepted-human custody transfers and serves under the successor generation', async t => {
   const f = conductorFixture(t, 'successor-child-transfer');
   const child = 'successor-child-thread';
   assert.ok(f.state.enrollThread({ threadId: child, parentChannelId: f.channelId, guildId: 'guild-1', adoptionCutoff: '100' }));
@@ -232,7 +233,7 @@ test('expected red: enrolled child accepted-human custody transfers and serves u
   assert.throws(() => f.state.recordNativeReply({ provider: 'codex', messageId: '105', nativeId: CODEX_ID, generation: 1, text: 'stale reply' }), /stale/);
 });
 
-test('expected red: repeated handoff with one handoffId transfers custody exactly once across restart', { todo: 'issue132 implementation pending' }, t => {
+test('repeated handoff with one handoffId transfers custody exactly once across restart', t => {
   const f = conductorFixture(t, 'successor-idempotent');
   acceptHuman(f.state, f.channelId, '101');
   const input = handoffInput(f, { carryAcceptedHuman: true });
@@ -252,7 +253,7 @@ test('expected red: repeated handoff with one handoffId transfers custody exactl
   assert.equal(reopened.listMessages().length, 1);
 });
 
-test('expected red: transfer receipt failure rolls custody back to the predecessor', { todo: 'issue132 implementation pending' }, t => {
+test('transfer receipt failure rolls custody back to the predecessor', t => {
   const f = conductorFixture(t, 'successor-receipt-failure');
   acceptHuman(f.state, f.channelId, '101');
   const bindingBefore = clone(f.state.getBinding(f.channelId));
@@ -279,7 +280,7 @@ test('expected red: transfer receipt failure rolls custody back to the predecess
   assert.deepEqual(clone(acceptedReceipt(f.state, '101')), acceptedBefore);
 });
 
-test('expected red: second-connection claim after snapshot refuses the handoff atomically', { todo: 'issue132 implementation pending' }, t => {
+test('second-connection claim after snapshot refuses the handoff atomically', t => {
   const f = conductorFixture(t, 'successor-claim-seam');
   acceptHuman(f.state, f.channelId, '101');
   const bindingBefore = clone(f.state.getBinding(f.channelId));
@@ -304,7 +305,7 @@ test('expected red: second-connection claim after snapshot refuses the handoff a
   assert.ok(f.state.listReceipts().some(row => row.kind === 'dispatching' && row.discord_id === '101'));
 });
 
-test('expected red: second-connection admission after snapshot refuses the handoff atomically', { todo: 'issue132 implementation pending' }, t => {
+test('second-connection admission after snapshot refuses the handoff atomically', t => {
   const f = conductorFixture(t, 'successor-admission-seam');
   acceptHuman(f.state, f.channelId, '101');
   const bindingBefore = clone(f.state.getBinding(f.channelId));
@@ -334,4 +335,174 @@ test('expected red: second-connection admission after snapshot refuses the hando
   assert.equal(extra.nativeId, CODEX_ID);
   assert.equal(extra.generation, 1);
   assert.equal(extra.state, MESSAGE_STATES.ACCEPTED);
+});
+
+test('15: refuse an unknown future receipt kind on an accepted human candidate (deny by default)', t => {
+  const f = conductorFixture(t, 'custody-unknown-receipt');
+  acceptHuman(f.state, f.channelId, '101');
+  // A future producer writes a kind this state version has never classified. The
+  // transfer path must refuse it instead of assuming it is harmless history.
+  f.state.receipt('101', 'future-execution-evidence', { generation: 1, source: 'brand-new-producer' });
+  assertRefusalUnchanged(f, '101', () => f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true })));
+});
+
+test('16: refuse watcher-origin provenance evidence on an accepted human candidate', t => {
+  const f = conductorFixture(t, 'custody-watcher-provenance');
+  const message = acceptHuman(f.state, f.channelId, '101');
+  // Real persisted shape written by message-intake when a watcher notice is accepted.
+  f.state.receipt('101', WATCHER_NOTICE_RECEIPTS.PROVENANCE, {
+    journal: 'watcher-notice',
+    packet: { id: 'watcher-packet-1', kind: 'notice', text: 'watcher-authored publication' },
+    authorId: message.authorId,
+    authority: 'notice-only'
+  });
+  assert.equal(WATCHER_NOTICE_RECEIPTS.PROVENANCE, 'watcher-notice');
+  assertRefusalUnchanged(f, '101', () => f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true })));
+});
+
+test('17: refuse a raw present observer cursor and corrupt raw serialized evidence', t => {
+  const present = conductorFixture(t, 'custody-observer-present');
+  acceptHuman(present.state, present.channelId, '101');
+  // A live native observer cursor means the predecessor already started observing this
+  // message, so custody is attempted even though the row still reads accepted.
+  present.state.db.prepare('UPDATE messages SET observer_cursor=? WHERE discord_id=?').run('{"turn":1}', '101');
+  assertRefusalUnchanged(present, '101', () => present.state.handoffConductor(handoffInput(present, { carryAcceptedHuman: true })));
+
+  const corrupt = conductorFixture(t, 'custody-observer-corrupt');
+  acceptHuman(corrupt.state, corrupt.channelId, '101');
+  // Corrupt serialized data in the raw cursor column is not proof of a safe untouched
+  // row. rowMessage would parse it away to null, so a reader that trusts the projection
+  // misses this attempted work; the raw column must be inspected and must refuse.
+  corrupt.state.db.prepare('UPDATE messages SET observer_cursor=? WHERE discord_id=?').run('{not-valid-json', '101');
+  assert.equal(corrupt.state.getMessage('101').observerCursor, null);
+  assertRefusalUnchanged(corrupt, '101', () => corrupt.state.handoffConductor(handoffInput(corrupt, { carryAcceptedHuman: true })));
+});
+
+test('18: refuse a recovered accepted row whose receipt history records a real dispatch attempt', t => {
+  const f = conductorFixture(t, 'custody-recovered-dispatch');
+  acceptHuman(f.state, f.channelId, '101');
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  // A real dispatch attempt transitioned the row through dispatching, then the
+  // interrupted dispatch was restored to accepted. The receipt history still proves
+  // the work was attempted even though the row now reads accepted.
+  f.state.markNotSubmitted('101', new Error('process interrupted'));
+  assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+  assert.ok(f.state.listReceipts().some(row => row.kind === 'dispatching' && row.discord_id === '101'));
+  assertRefusalUnchanged(f, '101', () => f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true })));
+});
+
+test('19: refuse an unresolved topic publication on the channel and leave custody unchanged', t => {
+  const f = conductorFixture(t, 'custody-topic-publication');
+  acceptHuman(f.state, f.channelId, '101');
+  // Use the real public publication custody API instead of stubbing hasUnresolvedBindingPost.
+  const publication = f.state.beginTopicPublication(f.channelId, {
+    desiredReadiness: 'unavailable',
+    desiredTopic: 'successor custody topic custody',
+    publishedAt: null
+  }, f.binding);
+  assert.ok(publication);
+  assert.equal(f.state.hasUnresolvedTopicPublication(f.channelId), true);
+  assertRefusalUnchanged(f, '101', () => f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true })));
+  assert.equal(f.state.hasUnresolvedTopicPublication(f.channelId), true);
+});
+
+test('20: refuse a single-field candidate source tuple mismatch', t => {
+  // Each case mutates exactly one field of the candidate/authority tuple and expects
+  // the whole handoff to refuse with binding, message and receipts unchanged.
+  const candidates = [
+    ['channel', '{channel}'],
+    ['provider', { column: 'provider', value: 'claude' }],
+    ['nativeId', { column: 'native_id', value: CLAUDE_ID }],
+    ['generation', { column: 'generation', value: 2 }],
+    ['conductorId', { column: 'conductor_id', value: 'other-conductor' }],
+    ['repoKey', { column: 'repo_key', value: 'repo:beta' }],
+    ['workspace', { column: 'workspace', value: '/tmp/other-workspace' }],
+    ['endpoint', { column: 'endpoint', value: '/tmp/other-endpoint.sock' }],
+    ['guild', { column: 'guild_id', value: 'guild-2' }]
+  ];
+  for (const [label, mutation] of candidates) {
+    const f = conductorFixture(t, `custody-tuple-${label}`);
+    acceptHuman(f.state, f.channelId, '101');
+    let input = handoffInput(f, { carryAcceptedHuman: true });
+    if (label === 'channel') {
+      input = { ...input, channelId: `${f.channelId}-other` };
+    } else {
+      f.state.db.prepare(`UPDATE messages SET ${mutation.column}=? WHERE discord_id=?`).run(mutation.value, '101');
+    }
+    assertRefusalUnchanged(f, '101', () => f.state.handoffConductor(input));
+  }
+});
+
+test('21: a still-unattempted message can transfer twice, and a broken prior chain refuses a third handoff', t => {
+  const f = conductorFixture(t, 'custody-chained-succession');
+  acceptHuman(f.state, f.channelId, '101');
+  const originalAcceptance = clone(acceptedReceipt(f.state, '101'));
+
+  f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true }));
+  assert.equal(f.state.getMessage('101').nativeId, SUCCESSOR_ID);
+  assert.equal(f.state.getMessage('101').generation, 2);
+  assert.equal(transferReceipts(f.state, '101').length, 1);
+
+  const secondInput = handoffInput(f, {
+    carryAcceptedHuman: true,
+    fromNativeId: SUCCESSOR_ID,
+    fromGeneration: 2,
+    nativeId: CLAUDE_ID,
+    handoffId: `${f.channelId}-handoff-2`
+  });
+  f.state.handoffConductor(secondInput);
+  assert.equal(f.state.getBinding(f.channelId).nativeId, CLAUDE_ID);
+  assert.equal(f.state.getBinding(f.channelId).generation, 3);
+  const transferred = f.state.getMessage('101');
+  assert.equal(transferred.nativeId, CLAUDE_ID);
+  assert.equal(transferred.generation, 3);
+  assert.deepEqual(clone(acceptedReceipt(f.state, '101')), originalAcceptance);
+  const transfers = transferReceipts(f.state, '101');
+  assert.equal(transfers.length, 2);
+  const details = transfers.map(row => JSON.parse(row.detail));
+  assert.deepEqual(details.map(detail => [detail.handoffId, detail.fromNativeId, detail.fromGeneration, detail.nativeId, detail.generation]), [
+    [`${f.channelId}-handoff-1`, CODEX_ID, 1, SUCCESSOR_ID, 2],
+    [`${f.channelId}-handoff-2`, SUCCESSOR_ID, 2, CLAUDE_ID, 3]
+  ]);
+
+  // Corrupt the first hop's recorded handoff ID so the chain can no longer resolve
+  // back to the original acceptance generation, then require the next handoff to refuse.
+  const firstReceipt = transfers[0];
+  const corrupted = JSON.parse(firstReceipt.detail);
+  corrupted.handoffId = `${f.channelId}-handoff-corrupted`;
+  f.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(JSON.stringify(corrupted), firstReceipt.id);
+
+  const thirdInput = handoffInput(f, {
+    carryAcceptedHuman: true,
+    fromNativeId: CLAUDE_ID,
+    fromGeneration: 3,
+    nativeId: CODEX_ID,
+    handoffId: `${f.channelId}-handoff-3`
+  });
+  const bindingBefore = clone(f.state.getBinding(f.channelId));
+  const messageBefore = clone(f.state.getMessage('101'));
+  assert.throws(() => f.state.handoffConductor(thirdInput));
+  assert.deepEqual(f.state.getBinding(f.channelId), bindingBefore);
+  assert.deepEqual(f.state.getMessage('101'), messageBefore);
+  assert.equal(transferReceipts(f.state, '101').length, 2);
+});
+
+test('22: refuse an absent original accepted receipt and a malformed original accepted receipt', t => {
+  const absent = conductorFixture(t, 'custody-acceptance-absent');
+  acceptHuman(absent.state, absent.channelId, '101');
+  // Removal of the original acceptance evidence is not a licence to transfer: the
+  // never-attempted status cannot be established without it.
+  absent.state.db.prepare("DELETE FROM receipts WHERE discord_id=? AND kind='accepted'").run('101');
+  assert.equal(acceptedReceipt(absent.state, '101'), undefined);
+  assertRefusalUnchanged(absent, '101', () => absent.state.handoffConductor(handoffInput(absent, { carryAcceptedHuman: true })));
+
+  const malformed = conductorFixture(t, 'custody-acceptance-malformed');
+  acceptHuman(malformed.state, malformed.channelId, '101');
+  // Corrupt the accepted receipt body itself. The receipts JSON index normally blocks
+  // writing syntactically invalid JSON through this connection, so drop that index on
+  // the disposable fixture database first to reproduce genuine on-disk corruption.
+  malformed.state.db.exec('DROP INDEX receipts_channel_kind_idx');
+  malformed.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='accepted'").run('{not-json', '101');
+  assert.equal(malformed.state.db.prepare("SELECT detail FROM receipts WHERE discord_id=? AND kind='accepted'").get('101').detail, '{not-json');
+  assertRefusalUnchanged(malformed, '101', () => malformed.state.handoffConductor(handoffInput(malformed, { carryAcceptedHuman: true })));
 });
