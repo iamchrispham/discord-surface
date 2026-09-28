@@ -3,6 +3,7 @@ import type { AgentMessage } from '../agent-message';
 import type { WatcherNotice } from '../watcher-notice';
 import type { DecisionResult } from '../state/decision';
 import type { ENVELOPE_TYPE } from '../state/courier-route/constants';
+import type { ReplyContext } from '../reply-context';
 
 export type NativeStateExports = {
   MESSAGE_STATES: {
@@ -61,6 +62,7 @@ export interface NativeMessage {
   state: MessageState;
   replyText?: string | null;
   observerCursor?: PersistedObserverCursor | null;
+  replyContext?: ReplyContext | null;
 }
 
 export interface NativeBinding {

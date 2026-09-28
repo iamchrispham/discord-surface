@@ -20,6 +20,7 @@
     "src/native/claude-identity.ts",
     "src/native/errors.ts",
     "src/native/prompts.ts",
+    "src/reply-context.ts",
     "src/agent-message.ts",
     "src/watcher-notice.ts",
     "src/agent-presentation.ts",

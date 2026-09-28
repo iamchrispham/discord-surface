@@ -41,6 +41,7 @@ const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, 
 const { createDecisionConsumer } = require('./discord/decision');
 const { cancelResponseBody, readRetryAfter, sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
 const { createTransportReceiptDelivery } = require('./discord/transport-receipts');
+const { isSnowflakeId, normalizeReplyContext, truncateExcerpt } = require('./reply-context');
 
 const requireInstalled = require;
 const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
@@ -239,10 +240,96 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return { ...input, content: stored.content, attachments: stored.attachments };
   }
 
+  // Reply context is optional enrichment for a plain human ordinary message. A
+  // validated target whose id is known but whose text is unavailable still
+  // preserves the declared ids with an empty excerpt. Every failure degrades to
+  // that ID-only shape (or no context at all for an invalid reference) and never
+  // throws into intake.
+  function degradedReplyContext(messageId, channelId, guildId) {
+    return normalizeReplyContext({ messageId, channelId, guildId, excerpt: '', isBotAuthor: null });
+  }
+
+  function replyContextFromAuthor(details, messageId, channelId, guildId, botId) {
+    const excerpt = truncateExcerpt(typeof details?.content === 'string' ? details.content : null) ?? '';
+    const authorId = details?.author?.id;
+    const isBotAuthor = typeof botId === 'string' && botId.length > 0
+      ? authorId === botId
+      : null;
+    return normalizeReplyContext({ messageId, channelId, guildId, excerpt, isBotAuthor });
+  }
+
+  function rawReplyContextIsValid(raw, messageId, channelId, guildId) {
+    return Boolean(raw) && typeof raw === 'object' && raw.id === messageId && raw.channel_id === channelId &&
+      (!guildId || raw.guild_id === guildId) && typeof raw.content === 'string' &&
+      typeof raw.author?.id === 'string' && typeof raw.author?.bot === 'boolean';
+  }
+
+  async function optionalReplyContext(message, options = {}) {
+    const messageId = message?.reference?.messageId;
+    if (!isSnowflakeId(messageId)) return null;
+    const currentChannelId = message?.channelId;
+    const currentGuildId = message?.guildId;
+    if (!isSnowflakeId(currentChannelId) || !isSnowflakeId(currentGuildId)) return null;
+    const reference = message.reference;
+    const targetChannelId = typeof reference.channelId === 'string' && reference.channelId.length > 0 ? reference.channelId : currentChannelId;
+    const targetGuildId = typeof reference.guildId === 'string' && reference.guildId.length > 0 ? reference.guildId : currentGuildId;
+    if (!isSnowflakeId(targetChannelId) || !isSnowflakeId(targetGuildId)) return null;
+    const degraded = degradedReplyContext(messageId, targetChannelId, targetGuildId);
+    if (targetGuildId !== currentGuildId || targetChannelId !== currentChannelId) return degraded;
+    const { signal, timeoutMs, deadline, botId } = options;
+    let budget = Infinity;
+    if (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs)) budget = Math.min(budget, timeoutMs);
+    if (typeof deadline === 'number' && Number.isFinite(deadline)) budget = Math.min(budget, deadline - Date.now());
+    if (!Number.isFinite(budget) || budget <= 0 || signal?.aborted) return degraded;
+    try {
+      const cached = message?.channel?.messages?.cache?.get?.(messageId);
+      if (cached && cached.id === messageId && cached.channelId === targetChannelId && cached.guildId === targetGuildId) {
+        return replyContextFromAuthor(cached, messageId, targetChannelId, targetGuildId, botId);
+      }
+    } catch {}
+    let Routes;
+    try { ({ Routes } = requireInstalled('discord.js')); } catch { return degraded; }
+    if (!Routes?.channelMessage) return degraded;
+    const rest = message?.client?.rest;
+    if (typeof rest?.get !== 'function') return degraded;
+    const controller = new AbortController();
+    const abortWith = () => {
+      try { controller.abort(); } catch {}
+    };
+    const relayAbort = () => abortWith();
+    signal?.addEventListener('abort', relayAbort, { once: true });
+    const timer = setTimeout(abortWith, Math.max(1, budget));
+    let restPending = true;
+    const restPromise = Promise.resolve()
+      .then(() => rest.get(Routes.channelMessage(targetChannelId, messageId), { signal: controller.signal }))
+      .then(
+        raw => (rawReplyContextIsValid(raw, messageId, targetChannelId, targetGuildId)
+          ? replyContextFromAuthor(raw, messageId, targetChannelId, targetGuildId, botId)
+          : degraded),
+        () => degraded
+      );
+    restPromise.catch(() => {});
+    restPromise.then(() => { restPending = false; }, () => { restPending = false; });
+    const abortPromise = new Promise(resolve => {
+      if (controller.signal.aborted) return resolve(degraded);
+      controller.signal.addEventListener('abort', () => resolve(degraded), { once: true });
+    });
+    try {
+      return await Promise.race([restPromise, abortPromise]);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', relayAbort);
+      if (restPending) abortWith();
+    }
+  }
+
   async function normalizeSurfaceMessage(message, options) {
     const input = eventToInput(message);
     if (typeof input.content === 'string' && input.content.startsWith(WATCHER_NOTICE_PREFIX)) return input;
-    return normalizeAgentMessage(message, input, options);
+    const normalized = await normalizeAgentMessage(message, input, options);
+    if (message?.author?.bot) return normalized;
+    const replyContext = await optionalReplyContext(message, options);
+    return replyContext ? { ...normalized, replyContext } : normalized;
   }
 
   function nativeOwnerKey(message) {
