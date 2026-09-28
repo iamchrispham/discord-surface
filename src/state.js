@@ -65,8 +65,10 @@ const {
 const {
   createCourierRouteHandlers,
   COURIER_ATTEMPT_STATES,
+  COURIER_DELIVERY_STATUSES,
   COURIER_OUTCOMES,
   COURIER_RECEIPT_KINDS,
+  COURIER_RECOVERY_REASONS,
   COURIER_RESULT_STATUSES,
   COURIER_ROUTE_STATES,
   COURIER_SOURCE_KINDS
@@ -982,6 +984,14 @@ class SurfaceState {
 
   recordCourierOutcome(...args) {
     return courierRouteHandlers.recordCourierOutcome(this, ...args);
+  }
+
+  recoverCourierAttempt(...args) {
+    return courierRouteHandlers.recoverCourierAttempt(this, ...args);
+  }
+
+  getCourierDeliveryStatus(...args) {
+    return courierRouteHandlers.getCourierDeliveryStatus(this, ...args);
   }
 
   findNativeBinding(nativeId, provider = null) {
@@ -2249,8 +2259,10 @@ module.exports = {
   BOARD_OUTCOMES,
   BOARD_RECEIPT_KINDS,
   COURIER_ATTEMPT_STATES,
+  COURIER_DELIVERY_STATUSES,
   COURIER_OUTCOMES,
   COURIER_RECEIPT_KINDS,
+  COURIER_RECOVERY_REASONS,
   COURIER_RESULT_STATUSES,
   COURIER_ROUTE_STATES,
   COURIER_SOURCE_KINDS,

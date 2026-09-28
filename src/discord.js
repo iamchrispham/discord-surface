@@ -390,6 +390,15 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
         !state.hasRetiredCourierAttempt?.(messageId, attempt.attempt.receiptId)));
   }
 
+  function retiredCourierCustodyHeld(messageId) {
+    const latest = state.getMessage(messageId);
+    const attempt = state.getCourierAttempt?.(messageId);
+    return Boolean(latest && latest.state === MESSAGE_STATES.ACCEPTED &&
+      !hasCurrentNativeAcknowledgment(latest) && attempt &&
+      !state.hasCourierForwardClaim?.(messageId) &&
+      state.hasRetiredCourierAttempt?.(messageId, attempt.attempt.receiptId));
+  }
+
   function refreshCourierCustodyBlock(messageId, ownerEntry) {
     if (ownerEntry.dispatchBlocked || !courierCustodyRequiresOwnerHold(messageId)) return;
     ownerEntry.dispatchBlocked = true;
@@ -480,7 +489,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       pumpOwner(entry.ownerKey);
       return;
     }
-    if (entry.dispatchBlocked) {
+    if (entry.dispatchBlocked || retiredCourierCustodyHeld(entry.message.id)) {
       queue.blockedMessageId = entry.message.id;
       queue.blockedReason = 'not_submitted';
       return;
@@ -890,7 +899,23 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     return { status: savedStatus, cursor: observerCursor, ...(error ? { error } : {}) };
   }
 
-  function processAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {
+  function processAccepted(message, signal, options) {
+    const ownerKey = nativeOwnerKey(message);
+    const old = nativeWork.get(message.id);
+    const queue = ownerQueues.get(ownerKey);
+    if (old?.controller && queue && retiredCourierCustodyHeld(message.id)) {
+      old.controller.abort();
+      return old.promise.then(
+        result => result?.error || signal?.aborted || ownerQueues.get(ownerKey) !== queue || !retiredCourierCustodyHeld(message.id)
+          ? { status: 'stopped', message: state.getMessage(message.id) }
+          : startAccepted(message, signal, options),
+        () => ({ status: 'stopped', message: state.getMessage(message.id) })
+      );
+    }
+    return startAccepted(message, signal, options);
+  }
+
+  function startAccepted(message, signal, { continueUntilFinal = true, awaitExisting = true, handoff = false, awaitDispatchOutcome = false } = {}) {
     const existing = existingNativeWork(message, awaitExisting);
     if (existing) return existing;
     const durable = state.getMessage(message?.id) || message;
