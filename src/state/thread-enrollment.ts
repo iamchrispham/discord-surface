@@ -391,6 +391,11 @@ export function createThreadEnrollmentHandlers({
         const qualifiedRecovered = typeof recoveredThroughId === 'string' && /^\d+$/.test(recoveredThroughId)
           ? recoveredThroughId
           : null;
+        // A parent handoff can seed covered history before this child records adoption.
+        if (existing.active === true && existing.adoptedAt === null && existing.adoptedThroughId === null &&
+          qualifiedRecovered !== null && qualifiedRecovered !== '0') {
+          adoptedAt = timestamp;
+        }
         if (!qualifiedRecovered) {
           // Exact legacy tuples may establish zero coverage only from an explicit
           // verified-empty result or the literal "0", never by inference from observation.

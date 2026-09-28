@@ -3349,7 +3349,10 @@ class DiscordGateway {
           queueReconciliationRetry(retryMessageIds);
         }
         blockedOwners.add(key);
-        if (!channelFetchStarted) continue;
+        if (!channelFetchStarted) {
+          if (!waiterAttached) continue;
+          queueReconciliationRetry([message.id, ...deferredRetryMessageIds]);
+        }
         this.markThreadDeliveryUnavailable(message, error);
         this.state.markObservationUnavailable(message.id, error);
         continue;

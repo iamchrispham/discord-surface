@@ -1271,8 +1271,10 @@ class SurfaceState {
   acceptDiscordMessage(event, options = {}) {
     const result = messageIntakeHandlers.acceptDiscordMessage.call(this, event, options);
     if (!result?.accepted || options.ready === false) return result;
-    const binding = this.getBinding(result.message?.channel_id || event?.channelId);
-    return binding?.readiness === READINESS.READY ? result : { ...result, held: true };
+    const deliveryChannelId = result.message?.deliveryChannelId || result.message?.delivery_channel_id ||
+      event?.deliveryChannelId || event?.delivery_channel_id || event?.channelId;
+    const route = deliveryChannelId ? this.getMessageRoute(deliveryChannelId) : null;
+    return route?.ready ? result : { ...result, held: true };
   }
 
   acceptInteraction(input, expectedBinding = null, options = {}) {
