@@ -228,7 +228,7 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
       try {
         payload = monitorEvent({
           ...values,
-          content: messageRequest(message),
+          content: messageRequest(message, completion),
           completion,
           watcherNotice,
           agentMessage: message.agentMessage,
