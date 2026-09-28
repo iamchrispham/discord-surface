@@ -251,7 +251,8 @@ def verify_worker(path, provider, native_id, owner, workspace):
 
 def workers_root():
     configured = os.environ.get('CONDUCTOR_WORKERS_DIR')
-    return os.path.realpath(os.path.abspath(configured or os.path.expanduser(DEFAULT_WORKERS_ROOT)))
+    requested = configured if configured else DEFAULT_WORKERS_ROOT
+    return os.path.realpath(os.path.abspath(os.path.expanduser(requested)))
 
 
 def expected_filename_match(stem, expected_owner):
@@ -267,19 +268,10 @@ def predecessor_identity(worker):
     and every present alias must agree; otherwise the manifest cannot prove any
     exact native identity.
     """
-    if not isinstance(worker, dict):
+    aliases = _identity_aliases(worker)
+    if aliases is None:
         return None
-    aliases = []
-    for key in IDENTITY_ALIAS_KEYS:
-        if key not in worker:
-            continue
-        value = worker[key]
-        if not isinstance(value, str) or not value:
-            return None
-        aliases.append(value)
-    if not aliases or any(alias != aliases[0] for alias in aliases):
-        return None
-    full_uuid = aliases[0]
+    full_uuid = aliases[0][1]
     harness = worker.get('harness')
     workspace = worker.get('worktree')
     if harness == 'claude-code':
@@ -291,6 +283,22 @@ def predecessor_identity(worker):
     if not isinstance(workspace, str) or not workspace:
         return None
     return {'fullUUID': full_uuid, 'provider': provider, 'workspace': os.path.realpath(os.path.abspath(workspace))}
+
+
+def _identity_aliases(worker):
+    if not isinstance(worker, dict):
+        return None
+    aliases = []
+    for key in IDENTITY_ALIAS_KEYS:
+        if key not in worker:
+            continue
+        value = worker[key]
+        if not isinstance(value, str) or not value:
+            return None
+        aliases.append((key, value))
+    if not aliases or any(value != aliases[0][1] for _key, value in aliases):
+        return None
+    return aliases
 
 
 def _manifest_identity_fields(worker, file_identity=None):
