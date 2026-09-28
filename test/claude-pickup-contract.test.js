@@ -95,6 +95,28 @@ function submitAgentResult(f, id) {
   return f.state.getMessage(id);
 }
 
+function submitAgentRequest(f, id) {
+  const packet = {
+    id: `contract-request-${id}`,
+    kind: KINDS.REQUEST,
+    source: { guildId: GUILD_ID, channelId: '201', provider: 'codex', nativeId: CODEX_ID, generation: 1 },
+    target: {
+      guildId: GUILD_ID, channelId: CHILD_CHANNEL, provider: 'claude',
+      nativeId: CLAUDE_ID, generation: f.binding.generation
+    },
+    replyTo: null,
+    text: 'Authenticated agent request body.'
+  };
+  const accepted = f.state.acceptDiscordMessage({
+    id, guildId: GUILD_ID, channelId: CHILD_CHANNEL, authorId: '901', isBot: true,
+    attachments: [], content: encodeAgentMessage(packet, TOKEN)
+  }, { agentToken: TOKEN });
+  assert.equal(accepted.accepted, true, `agent request intake rejected: ${accepted.reason}`);
+  assert.equal(f.state.claimDispatch(id).claimed, true);
+  f.state.markSubmitted(id);
+  return f.state.getMessage(id);
+}
+
 async function submitWatcherNotice(f, id) {
   const armKey = `pickup-contract-arm-${id}`;
   const triggerKey = `pickup-contract-trigger-${id}`;
@@ -288,12 +310,13 @@ test('real default MCP handshake exposes the shared ACK branch and delegates pos
   }
 });
 
-test('real Monitor payloads carry the shared ACK branch for human, agent completion, and watcher notice', async () => {
+test('real Monitor payloads carry the shared ACK branch for human, agent requests and results, and watcher notice', async () => {
   const f = fixture();
   try {
     const human = submitHuman(f, '2002');
-    const agent = submitAgentResult(f, '2003');
-    const watcher = await submitWatcherNotice(f, '2004');
+    const agentRequest = submitAgentRequest(f, '2003');
+    const agent = submitAgentResult(f, '2004');
+    const watcher = await submitWatcherNotice(f, '2005');
 
     const { stdout, pointers } = captureStdout();
     const monitor = createMonitorMcp({ state: f.state, stateDir: f.dir, dbPath: f.db, stdout, cliPath: CLI_PATH });
@@ -306,13 +329,14 @@ test('real Monitor payloads carry the shared ACK branch for human, agent complet
     });
     try {
       await notify(human.id);
+      await notify(agentRequest.id);
       await notify(agent.id);
       await notify(watcher.id);
     } finally {
       await monitor.close();
     }
 
-    assert.equal(pointers.length, 3);
+    assert.equal(pointers.length, 4);
     const payloadFor = id => {
       const pointer = pointers.find(candidate => candidate.meta.messageId === id);
       assert.ok(pointer, `missing pointer for ${id}`);
@@ -331,14 +355,25 @@ test('real Monitor payloads carry the shared ACK branch for human, agent complet
     assert.equal(humanPayload.payload.reply.command[humanPayload.payload.reply.command.indexOf('--message-id') + 1], human.id);
     assert.equal(humanPayload.payload.reply.command[humanPayload.payload.reply.command.indexOf('--generation') + 1], String(human.generation));
 
+    const agentRequestPayload = payloadFor(agentRequest.id);
+    assertPointerDelegates(agentRequestPayload.pointer, agentRequestPayload.payload);
+    assertSharedBranchInstruction(agentRequestPayload.payload.instructions, 'Follow the correlated agent-send instruction in content');
+    assertAcknowledgmentCommand(agentRequestPayload.payload, agentRequest, f);
+    assert.deepEqual(agentRequestPayload.payload.agent, { kind: KINDS.REQUEST });
+    assert.match(agentRequestPayload.payload.instructions, /Do not use reply\.command or produce a Discord reply/);
+    assert.ok(agentRequestPayload.payload.completion, 'agent request completion branch must expose completion');
+    assert.equal(agentRequestPayload.payload.reply, undefined);
+
     const agentPayload = payloadFor(agent.id);
     assertPointerDelegates(agentPayload.pointer, agentPayload.payload);
-    assertSharedBranchInstruction(agentPayload.payload.instructions, 'If no Discord reply is needed, run completion.command exactly once');
+    assertSharedBranchInstruction(agentPayload.payload.instructions, 'Handle this agent result');
     assertAcknowledgmentCommand(agentPayload.payload, agent, f);
+    assert.deepEqual(agentPayload.payload.agent, { kind: KINDS.RESULT });
+    assert.match(agentPayload.payload.instructions, /Do not use reply\.command or produce a Discord reply/);
     assert.ok(agentPayload.payload.completion, 'agent completion branch must expose completion');
     assert.equal(agentPayload.payload.completion.command[2], 'agent-complete');
     assert.equal(agentPayload.payload.completion.messageId, agent.id);
-    assert.equal(agentPayload.payload.reply.messageId, agent.id);
+    assert.equal(agentPayload.payload.reply, undefined);
 
     const watcherPayload = payloadFor(watcher.id);
     assertPointerDelegates(watcherPayload.pointer, watcherPayload.payload);
