@@ -165,7 +165,7 @@ test('peer result preserves an unmarked legacy child result before and after a p
       nativeId: target.nativeId, generation: target.generation }, target: request.source,
     replyTo: request.id, routingVersion: 2, sourceParentChannelId: target.channelId, text: 'accepted result'
   };
-  const accepted = f.state.acceptDiscordMessage({ id: 'unmarked-legacy-result-discord', guildId: '100', channelId: '102',
+  const accepted = f.state.acceptDiscordMessage({ id: '10002', guildId: '100', channelId: '102',
     authorId: '901', isBot: true, content: encodeAgentMessage(result, 'fixture') }, { agentToken: 'fixture' });
   assert.equal(accepted.accepted, true, JSON.stringify(accepted));
 

@@ -28,9 +28,9 @@ function fixture(t, options = {}) {
   const db = path.join(dir, 'surface.sqlite');
   let state = new SurfaceState(db);
   state.setConfig({ operatorId: 'operator', guildId: '100', secretFile: path.join(dir, 'unused') });
-  state.bind({ channelId: '1000', guildId: '100', provider: 'codex', nativeId: PARENT, workspace: dir });
+  state.bind({ channelId: '1000', guildId: '100', provider: 'codex', nativeId: PARENT, workspace: dir }, { intakeCutoff: '100' });
   const binding = state.getBinding('1000');
-  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100' }, binding);
+  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100', adoptionCutoff: '100'}, binding);
   state.setThreadBaseline('2000', null, binding);
   state.markThreadBoundary('2000', THREAD_STATES.READY, 'fixture', null, null, binding);
   const target = { guildId: '100', channelId: '2000', provider: 'codex', nativeId: PARENT, generation: binding.generation };
@@ -337,11 +337,11 @@ test('foreign and older retirement receipts do not retire a courier attempt', t 
 
   const foreign = fixture(t);
   const foreignAccepted = foreign.state.acceptDiscordMessage({
-    id: 'foreign-message', guildId: '100', channelId: '1000', authorId: 'operator', isBot: false,
+    id: '2001', guildId: '100', channelId: '1000', authorId: 'operator', isBot: false,
     attachments: [], content: 'foreign'
   }, { ready: true, expectedBinding: foreign.binding });
   assert.equal(foreignAccepted.accepted, true);
-  foreign.state.receipt('foreign-message', COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, {});
+  foreign.state.receipt('2001', COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, {});
   assert.equal(invoke(foreign).status, 0);
   assert.equal(foreign.claims().length, 1);
 });

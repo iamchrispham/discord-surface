@@ -13,12 +13,14 @@ function fixture(t) {
   state.setConfig({ guildId: '100', operatorId: '900', secretFile: path.join(directory, 'secret') });
   state.bind({ guildId: '100', channelId: '101', provider: 'claude',
     nativeId: '11111111-1111-1111-1111-111111111111', workspace: directory, endpoint: path.join(directory, 'channel.sock'),
-    conductorId: 'test-conductor', repoKey: 'github.com/test/repo' });
+    conductorId: 'test-conductor', repoKey: 'github.com/test/repo' }, { intakeCutoff: '100' });
+  state.markIntakeBoundary('101', 'ready', 'fixture history recovered');
   const ready = () => state.setBindingReadiness('101', READINESS.READY, 'fixture', state.getBinding('101'));
   ready();
   function enroll(id) {
     const binding = state.getBinding('101');
-    state.enrollThread({ threadId: id, parentChannelId: '101', guildId: '100' }, binding);
+    state.enrollThread({ threadId: id, parentChannelId: '101', guildId: '100', adoptionCutoff: '100' }, binding);
+    state.setThreadBaseline(id, '100', binding);
     state.markThreadBoundary(id, THREAD_STATES.READY, 'fixture', null, null, binding);
   }
   return { state, ready, enroll };
@@ -32,9 +34,11 @@ function service(f, extras = {}) {
 }
 function addRecipient(f) {
   f.state.bind({ guildId: '100', channelId: '201', provider: 'codex', nativeId: '22222222-2222-2222-2222-222222222222',
-    workspace: '/tmp', conductorId: 'recipient', repoKey: 'github.com/test/recipient' });
+    workspace: '/tmp', conductorId: 'recipient', repoKey: 'github.com/test/recipient' }, { intakeCutoff: '100' });
+  f.state.markIntakeBoundary('201', 'ready', 'fixture history recovered');
   const target = f.state.setBindingReadiness('201', READINESS.READY, 'fixture', f.state.getBinding('201'));
-  f.state.enrollThread({ threadId: '202', parentChannelId: '201', guildId: '100' }, target);
+  f.state.enrollThread({ threadId: '202', parentChannelId: '201', guildId: '100', adoptionCutoff: '100' }, target);
+  f.state.setThreadBaseline('202', '100', target);
   f.state.markThreadBoundary('202', 'ready', 'fixture', null, null, target);
   return target;
 }

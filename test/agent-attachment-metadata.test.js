@@ -27,7 +27,7 @@ test('malformed reserved attachment follows ordinary bot coverage without waking
   const state = new SurfaceState(db);
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-attachment-metadata.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-attachment-metadata.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '100' });
   const binding = state.getBinding(target.channelId);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
@@ -62,7 +62,7 @@ test('Discord omitted attachment MIME reaches signed packet intake', async t => 
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-null-mime.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-null-mime.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '100' });
   const binding = state.getBinding(target.channelId);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
   const destination = { ...target, generation: binding.generation };
@@ -103,10 +103,11 @@ test('enrolled child attachment reaches authenticated child custody', async t =>
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'child.sock'), conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'child.sock'), conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '100' });
   let binding = state.getBinding(target.channelId);
   binding = state.setBindingReadiness(target.channelId, READINESS.READY, 'fixture ready', binding);
-  state.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId }, binding);
+  const parentWatermark = state.getIntakeWatermark(target.channelId);
+  state.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId , adoptionCutoff: '100'}, binding);
   state.setThreadBaseline('103', '7000', binding);
   state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
   const destination = { ...target, channelId: '103', generation: binding.generation };
@@ -133,7 +134,7 @@ test('enrolled child attachment reaches authenticated child custody', async t =>
   assert.equal(intake.message.channelId, target.channelId);
   assert.equal(intake.message.deliveryChannelId, destination.channelId);
   assert.deepEqual(intake.message.agentMessage, { ...packet, target: destination });
-  assert.equal(state.getIntakeWatermark(target.channelId), null);
+  assert.deepEqual(state.getIntakeWatermark(target.channelId), parentWatermark);
   assert.equal(state.getThreadEnrollment(destination.channelId).lastAcceptedId, '7001');
 });
 
@@ -143,12 +144,12 @@ test('live child intake normalizes a Discord.js attachment collection before bot
   let gateway;
   t.after(async () => { try { await gateway?.stop(); } catch {} try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/ac.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/ac.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '100' });
   let binding = state.getBinding(target.channelId);
   binding = state.setBindingReadiness(target.channelId, READINESS.READY, 'fixture ready', binding);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
-  state.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId }, binding);
+  state.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId , adoptionCutoff: '100'}, binding);
   state.setThreadBaseline('103', '6999', binding);
   state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
   const destination = { ...target, channelId: '103', generation: binding.generation };

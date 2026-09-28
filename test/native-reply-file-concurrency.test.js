@@ -11,7 +11,8 @@ const {
   DiscordGateway,
   fixture,
   submitted,
-  waitForCondition
+  waitForCondition,
+  qualifiedRecoveryChannel
 } = require('./native-reply-file-fixture');
 
 const CONCURRENT_CHILD_DEADLINE_MS = 8000;
@@ -169,7 +170,7 @@ function concurrentWaitForExit(child, timeoutMs) {
 test('concurrent PREPARING native file wakes existing Gateway with exact attachment', { timeout: CONCURRENT_PARENT_DEADLINE_MS }, async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-concurrent-preparing-${provider}`;
+    const id = '912001';
     const source = path.join(f.dir, 'answer.bin');
     const bytes = Buffer.from([0, 4, 8, 255]);
     const caption = `concurrent caption ${provider}`;
@@ -180,14 +181,14 @@ test('concurrent PREPARING native file wakes existing Gateway with exact attachm
     submitted(f, id);
     const reactions = [];
     const finalPosts = [];
-    const channel = {
+    const channel = qualifiedRecoveryChannel(f, {
       id: 'channel',
       messages: { fetch: async targetId => ({ react: async reaction => { assert.equal(targetId, id); reactions.push(reaction); } }) },
       send: async payload => {
         if (!String(payload.content || '').startsWith('Receipt:')) finalPosts.push(payload);
         return { id: `final-${provider}` };
       }
-    };
+    });
     const client = new EventEmitter();
     client.user = { id: 'bot' };
     client.login = async token => { assert.equal(token, 'fixture'); return token; };

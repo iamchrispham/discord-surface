@@ -25,9 +25,10 @@ const { runBoardRefresh } = require('./board-refresh');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
-const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
+const { SurfaceState, BindingError, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
 const { DiscordGateway, discordIdAfter, readSecret, requireInstalled, waitForRecoveryOperation } = require('./discord');
 const { enrollPublicThread } = require('./discord/thread-enrollment');
+const { readAdoptionCutoff } = require('./discord/history-access');
 const {
   assertOrdinaryIntakeRange,
   assertHandoffIntakeCoverage,
@@ -266,6 +267,9 @@ async function bind(args, rebind = false) {
   let enrollmentProof = null;
   try {
     const input = bindingArgs(args);
+    if (!rebind && state.getBinding(input.channelId)) {
+      throw new BindingError('channel is already bound; use rebind after work drains');
+    }
     const hasActiveThreads = rebind && state.listThreadEnrollments(input.channelId).some(enrollment => enrollment.active);
     let intakeCutoff = null;
     if (hasActiveThreads) {
@@ -280,8 +284,20 @@ async function bind(args, rebind = false) {
       const current = state.getBinding(input.channelId);
       if (current?.active) enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'parent rebind');
       intakeCutoff = handoffFence.id;
+    } else if (!rebind) {
+      // A genuinely new parent route acquires its boundary from a permission-qualified
+      // history read before activation. The value is never inferred from the channel id,
+      // channel creation time, wall clock, or a later retry.
+      const config = state.requireConfig();
+      if (config.guildId !== input.guildId) throw new Error('binding channel is outside the configured guild');
+      const { Client, GatewayIntentBits } = requireInstalled('discord.js');
+      client = new Client({ intents: [GatewayIntentBits.Guilds] });
+      await client.login(readSecret(config.secretFile));
+      const guild = await client.guilds.fetch(input.guildId);
+      const channel = await guild.channels.fetch(input.channelId);
+      intakeCutoff = await readAdoptionCutoff(channel, input.channelId, client.user);
     }
-    print(rebind ? state.rebind(input, { intakeCutoff, enrollmentProof }) : state.bind(input));
+    print(rebind ? state.rebind(input, { intakeCutoff, enrollmentProof }) : state.bind(input, { intakeCutoff, intakeCutoffDetail: 'parent binding adoption cutoff' }));
   } finally {
     await deleteHandoffFence(handoffFence);
     await client?.destroy();
@@ -307,17 +323,6 @@ function bindingIdentityMatches(binding, expected) {
     binding.generation === expected.generation &&
     (binding.sessionRoot || null) === (expected.sessionRoot || null) &&
     binding.conductorId === expected.conductorId && binding.repoKey === expected.repoKey;
-}
-
-async function latestChannelMessageId(channel) {
-  const cached = typeof channel?.lastMessageId === 'string' && channel.lastMessageId.length > 0 ? channel.lastMessageId : null;
-  if (typeof channel?.messages?.fetch !== 'function') return cached;
-  const fetched = await channel.messages.fetch({ limit: 1 });
-  let message = null;
-  if (Array.isArray(fetched)) message = fetched[0];
-  else if (typeof fetched?.first === 'function') message = fetched.first();
-  else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
-  return typeof message?.id === 'string' && message.id.length > 0 ? message.id : cached;
 }
 
 async function threadEnroll(args, dependencies = {}) {
@@ -481,11 +486,13 @@ async function ordinaryBind(args, dependencies = {}) {
     let adoptionCutoff = null;
     if (decision !== ORDINARY_BINDING_DECISIONS.REUSE && !existing?.active) {
       if (typeof discordChannel?.send === 'function') {
+        // The server fence message is real evidence (case 11's accepted producer).
         adoptionFence = await createHandoffFence(discordChannel, 'ordinary binding adoption');
         adoptionCutoff = adoptionFence.id;
       } else {
-        const cutoff = await latestChannelMessageId(discordChannel);
-        adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
+        // No fence channel available: acquire the boundary from a permission-qualified
+        // history read. A channel-id-derived value is never a coverage producer.
+        adoptionCutoff = await readAdoptionCutoff(discordChannel, channel.id, client.user);
       }
     }
     let binding;
@@ -944,7 +951,12 @@ async function provisionInternal(args) {
       print({ created: false, adopted: result.adopted, legacy: Boolean(legacyMetadata), migrated: false, bound: true, marker: result.channel.topic, conductorId, repoKey, channelId: existingNativeBinding.channelId, url: `https://discord.com/channels/${config.guildId}/${existingNativeBinding.channelId}`, binding: existingNativeBinding, intent });
       return;
     }
-    const binding = state.bind({ channelId: result.channel.id, guildId: config.guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey, generation: legacyMetadata?.generation ?? undefined });
+    // A newly provisioned/adopted channel acquires its boundary from a
+    // permission-qualified history read before the active binding is inserted. An
+    // empty history legitimately yields "0"; a missing permission or failed request
+    // refuses activation. Never inferred from the channel id or creation time.
+    const intakeCutoff = await readAdoptionCutoff(result.channel, result.channel.id, client.user);
+    const binding = state.bind({ channelId: result.channel.id, guildId: config.guildId, provider, nativeId, workspace, endpoint, categoryId, conductorId, repoKey, generation: legacyMetadata?.generation ?? undefined }, { intakeCutoff, intakeCutoffDetail: 'provisioned binding adoption cutoff' });
     state.completeProvisionIntent(provider, nativeId, result.channel.id, conductorId);
     if (legacyMetadata) await migrateLegacyTopic({ state, channel: result.channel, binding, token });
     print({ created: result.created, adopted: result.adopted, legacy: Boolean(legacyMetadata), migrated: Boolean(legacyMetadata), bound: true, marker: result.channel.topic, conductorId, repoKey, channelId: result.channel.id,
@@ -1507,7 +1519,8 @@ async function runRuntime(args) {
     });
     await gateway.start(config.secretFile);
     const recoveryCutoff = new Date().toISOString();
-    await gateway.reconcilePending(recoveryCutoff);
+    // Ready-only reconciliation still drains durable submitted and reply-ready custody.
+    await gateway.reconcilePending(recoveryCutoff, { allowPaused: true, readyOnly: true });
     gatewayReady = true;
     bindingWake.start();
   } catch (error) {
@@ -1599,12 +1612,34 @@ function detachOrdinaryListener({ state, startupBinding, reason }) {
   return Boolean(state.setBindingReadiness(startupBinding.channelId, READINESS.UNAVAILABLE, reason, startupBinding));
 }
 
+function createRetryableListenerStop({ revoke, stopTransport, closeState }) {
+  let stopPromise;
+  return () => {
+    if (stopPromise) return stopPromise;
+    let transportStopped = false;
+    let stateClosed = false;
+    const attempt = Promise.resolve().then(async () => {
+      let revokeError;
+      try { revoke(); } catch (error) { revokeError = error; }
+      await stopTransport();
+      transportStopped = true;
+      closeState();
+      stateClosed = true;
+      if (revokeError) throw revokeError;
+    });
+    stopPromise = attempt.catch(error => {
+      if (!transportStopped || !stateClosed) stopPromise = null;
+      throw error;
+    });
+    return stopPromise;
+  };
+}
+
 async function claudeChannel(args) {
   const { paths, state } = openState(args);
   let channel;
   let ordinaryListenerAttached = false;
   let ordinaryStartupBinding = null;
-  let stopPromise;
   let revokeFailureReported = false;
   const reportRevokeFailure = error => {
     if (revokeFailureReported) return;
@@ -1622,17 +1657,11 @@ async function claudeChannel(args) {
       throw error;
     }
   };
-  const stop = async () => {
-    if (stopPromise) return stopPromise;
-    stopPromise = (async () => {
-      try {
-        detach();
-      } finally {
-        try { await channel?.stop(); } finally { state.close(); }
-      }
-    })();
-    return stopPromise;
-  };
+  const stop = createRetryableListenerStop({
+    revoke: detach,
+    stopTransport: () => channel?.stop(),
+    closeState: () => state.close()
+  });
   // Readiness revoke and channel teardown both run inside stop, so an exit path must report
   // a stop failure rather than leaving it as an unhandled rejection.
   const handleStopFailure = error => {
@@ -1670,25 +1699,19 @@ async function claudeMonitor(args) {
   let ordinaryStartupBinding = null;
   let monitor;
   let monitorStarted = false;
-  let stopPromise;
   let detachStdoutTransport = () => {};
   const revokeOrdinaryReadiness = () => {
     if (!monitorStarted) return;
     detachOrdinaryListener({ state, startupBinding: ordinaryStartupBinding, reason: 'Claude Monitor unavailable' });
   };
-  const stop = async () => {
-    if (stopPromise) return stopPromise;
-    stopPromise = (async () => {
-      try {
-        detachStdoutTransport();
-        revokeOrdinaryReadiness();
-      } finally {
-        try { await monitor?.stop(); }
-        finally { state.close(); }
-      }
-    })();
-    return stopPromise;
-  };
+  const stop = createRetryableListenerStop({
+    revoke: () => {
+      detachStdoutTransport();
+      revokeOrdinaryReadiness();
+    },
+    stopTransport: () => monitor?.stop(),
+    closeState: () => state.close()
+  });
   const handleStopFailure = error => {
     process.stderr.write(`discord-surface: Claude Monitor stop failed: ${error.message}\n`);
     process.exitCode = 1;

@@ -10,10 +10,10 @@ const { CODEX_ID, CLAUDE_ID, CLI_PATH, fixture, discordMessage, waitForCondition
 
 test('simulated: queued acknowledged observer releases its owner slot when started', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  const firstId = 'ack-queued-first';
-  const secondId = 'ack-queued-active';
-  const thirdId = 'ack-queued-successor';
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  const firstId = '101';
+  const secondId = '102';
+  const thirdId = '103';
   for (const [id, content] of [[firstId, 'first'], [secondId, 'second'], [thirdId, 'third']]) {
     state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content });
     await new Promise(resolve => setTimeout(resolve, 2));
@@ -80,10 +80,10 @@ test('simulated: queued acknowledged observer releases its owner slot when start
 
 test('simulated: Claude CLI ACK releases a queued observer and exact reply custody', async () => {
   const { dir, db, state: initial } = fixture('claude-ack-queue.sqlite');
-  const firstId = 'claude-ack-first';
-  const secondId = 'claude-ack-second';
+  const firstId = '104';
+  const secondId = '105';
   const endpoint = path.join(dir, 'claude.sock');
-  initial.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint });
+  initial.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint }, { intakeCutoff: '100' });
   initial.acceptDiscordMessage({ id: firstId, guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: 'first' });
   await new Promise(resolve => setTimeout(resolve, 2));
   initial.acceptDiscordMessage({ id: secondId, guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: 'second' });
@@ -157,11 +157,11 @@ test('simulated: Claude CLI ACK releases a queued observer and exact reply custo
 test('simulated: Gateway ACK watcher wires native ACK into owner queue release', async () => {
   async function runScenario(disconnectRelease) {
     const { dir, db, state } = fixture(disconnectRelease ? 'gateway-ack-disconnected.sqlite' : 'gateway-ack-wired.sqlite');
-    const firstId = disconnectRelease ? 'gateway-ack-disconnected-first' : 'gateway-ack-wired-first';
-    const secondId = disconnectRelease ? 'gateway-ack-disconnected-second' : 'gateway-ack-wired-second';
+    const firstId = disconnectRelease ? '106' : '108';
+    const secondId = disconnectRelease ? '107' : '109';
     const secretFile = path.join(dir, 'discord.secret');
     fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
-    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
     state.acceptDiscordMessage({ id: firstId, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'first' });
     await new Promise(resolve => setTimeout(resolve, 2));
     state.acceptDiscordMessage({ id: secondId, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'second' });
@@ -262,7 +262,7 @@ test('simulated: Gateway ACK watcher wires native ACK into owner queue release',
   }
 
   const wired = await runScenario(false);
-  assert.deepEqual(wired.dispatches, ['gateway-ack-wired-second']);
+  assert.deepEqual(wired.dispatches, ['109']);
   assert.equal(wired.secondState, MESSAGE_STATES.REPLIED);
   const disconnected = await runScenario(true);
   assert.deepEqual(disconnected.dispatches, []);
@@ -271,9 +271,9 @@ test('simulated: Gateway ACK watcher wires native ACK into owner queue release',
 
 test('simulated: stopped owner queue ignores a late acknowledged release', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  const firstId = 'ack-stop-first';
-  const secondId = 'ack-stop-second';
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  const firstId = '110';
+  const secondId = '111';
   const dispatches = [];
   let consumer;
   let firstObserveStartedResolve;

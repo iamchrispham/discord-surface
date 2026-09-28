@@ -367,9 +367,9 @@ node src/cli.js liaison draft \
 
 `--receipt-id` accepts the source Discord message ID or the numeric SQLite receipt row ID. Both forms must resolve to one persisted transport receipt.
 
-During login and reconnect, messages are durably held while a persisted Discord watermark is backfilled. Adoption starts at the newest observed message, so pre-adoption history is not executed. Backfill is bounded at 100 messages per page, 10 pages, 1,000 messages, or 30 seconds. A processing or coverage-bound failure records a visible gap and remains held for explicit reconciliation. A channel or history fetch that fails with HTTP 503 records retryable unavailability. A later startup, reconnect, or explicit recovery rechecks that boundary within the existing recovery deadline and resumes from confirmed coverage. HTTP 403, unclassified failures, and explicit gaps do not gain automatic retry permission. The native output cursor is separate from this inbound Discord watermark.
+During login and reconnect, messages are durably held while a persisted Discord watermark is backfilled. Adoption starts at the newest observed message, so pre-adoption history is not executed. Backfill is bounded at 100 messages per page, 10 pages, 1,000 messages, or 30 seconds. A genuine coverage gap, including a page or message bound, remains held for explicit reconciliation. Deadline exhaustion records retryable unavailability instead of claiming missing history; a later startup, reconnect, attach, or explicit recovery rechecks the boundary within the existing deadline and resumes from confirmed coverage. HTTP 503 remains retryable. HTTP 403, unclassified failures, and explicit gaps do not gain automatic retry permission. The native output cursor is separate from this inbound Discord watermark.
 
-Shared Gateway policy remains fail-closed at startup when channel-history coverage is unresolved. The existing exception permits startup when the only unresolved parent bindings are unavailable because their native endpoint or transcript proof is absent. During reconnect, healthy bindings can resume while failed bindings retain their accepted custody. Neither policy declares an unresolved binding ready. Selected-channel recovery keeps its original scope, concurrent follow-ups share the caller's deadline, and stop invalidates unfinished recovery. Uncertain native submissions and uncertain Discord sends are never automatically replayed.
+Startup connects in degraded mode when every non-ready binding has a persisted non-ready intake boundary. Healthy routes can serve while held routes retain their accepted custody and remain non-dispatchable. If every route is held, the transport connects without declaring the Gateway ready. The existing endpoint-unavailable exception remains. During reconnect, healthy bindings can resume while held bindings retain their custody. Neither policy declares an unresolved route ready. Selected-channel recovery keeps its original scope, concurrent follow-ups share the caller's deadline, and stop invalidates unfinished recovery. Uncertain native submissions and uncertain Discord sends are never automatically replayed.
 
 An empty Discord history response is accepted as coverage only when the bot's effective channel permissions include View Channel and Read Message History. A denied or unknown permission state remains visibly unavailable. `status` exposes both the observed message ID and the confirmed recovered-through ID.
 
@@ -388,12 +388,14 @@ node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
 
 `status` reports pending custody and labels live permission, native approval, quota, billing, and connection gates. Simulated tests do not prove those live gates. Completion evidence and live trials remain conductor-owned.
 
-To clear a recorded Discord intake gap after inspecting the attempted range, request explicit reconciliation and restart the Gateway:
+To clear a recorded Discord intake gap after inspecting the attempted range, request explicit reconciliation:
 
 ```sh
 node src/cli.js recover --state-dir "$HOME/.config/discord-surface" \
   --intake-channel-id CHANNEL_ID
 ```
+
+For an enrolled thread, the command also requests a wake from a compatible running Gateway. For a parent channel, it records pending reconciliation without waking the Gateway. Its owner can use the exported `requestGatewayRecovery(paths, { expectedPid })` helper in `src/cli.js` after verifying the installed Gateway's PID and wake capability. A supported wake keeps the same process and does not require a restart. If that capability is absent or the Gateway is stopped, coordinate recovery with its owner. Do not send an unchecked signal. A requested wake is not delivery proof: verify intake readiness, retained custody and the actual native pickup afterward.
 
 Delivery-only reconciliation never calls a native provider. Use `--resolution reply_not_sent` after evidence that no Discord message was created, or `--resolution reply_sent --part-index N --reply-message-id MESSAGE_ID` after finding the message. The adapter does not infer either outcome from a timeout.
 

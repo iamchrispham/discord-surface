@@ -11,7 +11,7 @@ function fixture(t) {
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
   state.bind({ channelId: 'channel', guildId: 'guild', provider: 'codex',
     nativeId: '9caa5d21-2169-429d-918b-5f08651b5dbd', workspace: dir,
-    conductorId: 'conductor', repoKey: 'repo:fixture' });
+    conductorId: 'conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
   const binding = state.getBinding('channel');
   const meta = { requestId: 'request', attemptId: 'attempt', inReplyTo: null,
     sourcePath: path.join(dir, 'source'), textHash: 'text', operatorId: 'operator',

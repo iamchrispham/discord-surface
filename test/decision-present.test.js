@@ -18,7 +18,7 @@ function fixture(t) {
   fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile });
   const binding = state.bindOrdinary({ channelId: 'channel', guildId: 'guild', provider: 'codex', nativeId: NATIVE, workspace: dir },
-    { sessionId: NATIVE, threadId: NATIVE });
+    { sessionId: NATIVE, threadId: NATIVE }, '100');
   state.recordOrdinaryPreflight(binding, { file: path.join(dir, 'fixture.jsonl'), sessionId: NATIVE, threadId: NATIVE, workspace: dir });
   state.setBindingReadiness('channel', READINESS.READY);
   const canonical = { stateRoot: path.join(dir, 'canonical'), environment: { TELEGRAM_ROOT: path.join(dir, 'producer'), TG_CANONICAL_STATE_ROOT: undefined } };

@@ -49,10 +49,10 @@ function fixture() {
   state.bind({
     channelId: OWNER_CHANNEL, guildId: GUILD_ID, provider: 'claude', nativeId: CLAUDE_ID,
     workspace: dir, endpoint: path.join(dir, 'claude.sock')
-  });
+  }, { intakeCutoff: '100' });
   let binding = state.getBinding(OWNER_CHANNEL);
   binding = state.setBindingReadiness(OWNER_CHANNEL, READINESS.READY, 'pickup contract fixture ready', binding);
-  state.enrollThread({ threadId: CHILD_CHANNEL, parentChannelId: OWNER_CHANNEL, guildId: GUILD_ID }, binding);
+  state.enrollThread({ threadId: CHILD_CHANNEL, parentChannelId: OWNER_CHANNEL, guildId: GUILD_ID , adoptionCutoff: '100'}, binding);
   state.setThreadBaseline(CHILD_CHANNEL, '1000', binding);
   state.markThreadBoundary(CHILD_CHANNEL, THREAD_STATES.READY, 'pickup contract fixture adopted', null, null, binding);
   return { dir, db, state, binding };

@@ -9,14 +9,15 @@ const {
   DiscordGateway,
   fixture,
   submitted,
-  waitForCondition
+  waitForCondition,
+  qualifiedRecoveryChannel
 } = require('./native-reply-file-fixture');
 
 test('Codex and Claude file replies recover submitted and uncertain dispatch', async t => {
   for (const provider of ['codex', 'claude']) for (const dispatchState of [MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.UNCERTAIN]) {
     await t.test(`${provider} ${dispatchState}`, async t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-${provider}`;
+    const id = '914001';
     const source = path.join(f.dir, 'answer.bin');
     const bytes = Buffer.from([0, 4, 8, 255]);
     fs.writeFileSync(source, bytes);
@@ -58,7 +59,7 @@ test('Codex and Claude file replies recover submitted and uncertain dispatch', a
 test('native file send rechecks authorization after loading the snapshot', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-snapshot-auth-${provider}`;
+    const id = '914002';
     const source = path.join(f.dir, 'answer.bin');
     fs.writeFileSync(source, Buffer.from('snapshot authorization payload'));
     submitted(f, id);
@@ -103,7 +104,7 @@ test('early file-reply acknowledgment wakes the existing Gateway consumer when r
   for (const provider of ['codex', 'claude']) for (const dispatchState of [MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.UNCERTAIN]) {
     await t.test(`${provider} ${dispatchState}`, async t2 => {
       const f = fixture(t2, provider);
-      const id = `native-file-early-ack-${provider}-${dispatchState}`;
+      const id = '914003';
       const source = path.join(f.dir, 'answer.bin');
       const bytes = Buffer.from([0, 4, 8, 255]);
       fs.writeFileSync(source, bytes);
@@ -112,14 +113,14 @@ test('early file-reply acknowledgment wakes the existing Gateway consumer when r
       const posts = [];
       const observations = [];
       const resumes = [];
-      const channel = {
+      const channel = qualifiedRecoveryChannel(f, {
         id: 'channel',
         messages: { fetch: async () => ({ react: async reaction => reactions.push(reaction) }) },
         send: async payload => {
           if (!String(payload.content || '').startsWith('Receipt:')) posts.push(payload);
           return { id: `posted-${posts.length}` };
         }
-      };
+      });
       const client = new EventEmitter();
       client.user = { id: 'bot' };
       client.login = async token => assert.equal(token, 'fixture');
@@ -151,8 +152,8 @@ test('early file-reply acknowledgment wakes the existing Gateway consumer when r
           text: 'answer with file', fileManifest: manifest });
         await gateway.acknowledgments.drain();
         await waitForCondition(() => posts.length === 1);
-        assert.deepEqual(resumes, dispatchState === MESSAGE_STATES.SUBMITTED ? [id, id] : [id]);
-        assert.deepEqual(observations, dispatchState === MESSAGE_STATES.SUBMITTED ? [id, id] : [id]);
+        assert.deepEqual(resumes, dispatchState === MESSAGE_STATES.SUBMITTED ? [id] : []);
+        assert.deepEqual(observations, dispatchState === MESSAGE_STATES.SUBMITTED ? [id] : []);
         assert.equal(posts[0].content, 'answer with file');
         assert.deepEqual(posts[0].files[0].attachment, bytes);
         assert.equal(posts[0].files[0].name, 'answer.bin');
@@ -170,7 +171,7 @@ test('early file-reply acknowledgment wakes the existing Gateway consumer when r
 test('native reply retries preserve staged custody across source availability changes', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-retry-source-${provider}`;
+    const id = '914004';
     const source = path.join(f.dir, 'answer.bin');
     const alternate = path.join(f.dir, 'alternate', 'answer.bin');
     const unavailable = path.join(f.dir, 'missing', 'answer.bin');
@@ -195,7 +196,7 @@ test('native reply retries preserve staged custody across source availability ch
 test('file replies keep the caption on their attachment part', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-parts-${provider}`;
+    const id = '914005';
     const source = path.join(f.dir, 'parts.bin');
     fs.writeFileSync(source, Buffer.from('parts payload'));
     submitted(f, id);
@@ -214,7 +215,7 @@ test('file replies keep the caption on their attachment part', async t => {
 test('uncertain file preparation persists native acknowledgment before delivery retry', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-uncertain-ack-${provider}`;
+    const id = '914006';
     const source = path.join(f.dir, 'uncertain.bin');
     fs.writeFileSync(source, Buffer.from('uncertain payload'));
     submitted(f, id, MESSAGE_STATES.UNCERTAIN);

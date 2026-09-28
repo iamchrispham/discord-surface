@@ -20,10 +20,10 @@ test('native reply custody reopens with child delivery and waits for reconciliat
       const parentChannelId = 'channel';
       const childChannelId = `child-${provider}-${resolution}`;
       const binding = f.state.getBinding(parentChannelId);
-      f.state.enrollThread({ threadId: childChannelId, parentChannelId, guildId: 'guild' }, binding);
+      f.state.enrollThread({ threadId: childChannelId, parentChannelId, guildId: 'guild' , adoptionCutoff: '100'}, binding);
       f.state.setThreadBaseline(childChannelId, null, binding);
       f.state.markThreadBoundary(childChannelId, 'ready', 'native restart fixture', null, null, binding);
-      const id = `native-file-reopen-${provider}-${resolution}`;
+      const id = '911001';
       assert(f.state.acceptDiscordMessage({ id, guildId: 'guild', channelId: childChannelId,
         authorId: 'operator', isBot: false, content: 'file request' }).accepted);
       f.state.claimDispatch(id);
@@ -83,7 +83,7 @@ test('native reply custody reopens with child delivery and waits for reconciliat
 
 test('public native-reply command accepts Claude alias and records file custody', t => {
   const f = fixture(t, 'claude');
-  const id = 'native-file-cli';
+  const id = '911002';
   const caption = path.join(f.dir, 'caption.txt');
   const source = path.join(f.dir, 'answer.bin');
   fs.writeFileSync(caption, 'from cli');
@@ -117,7 +117,7 @@ test('capacity refusal CLI exposes the cleanup ID and reopens text replies', asy
       });
     }
 
-    const id = `native-file-capacity-cli-${provider}`;
+    const id = '911003';
     const textFile = path.join(f.dir, 'reply.txt');
     const source = path.join(f.dir, 'capacity.bin');
     fs.writeFileSync(textFile, 'capacity reply');

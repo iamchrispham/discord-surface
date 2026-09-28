@@ -61,13 +61,13 @@ test('ordinary preflight evidence is scoped to the active transcript root', t =>
   const binding = f.state.bindOrdinary({
     channelId: 'ordinary-root-scope', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: f.dir, sessionRoot: original.root
-  }, { sessionId: CODEX, threadId: CODEX });
+  }, { sessionId: CODEX, threadId: CODEX }, '100');
   f.state.recordOrdinaryPreflight(binding, {
     file: original.file, sessionId: CODEX, threadId: CODEX, workspace: f.dir
   });
   assert.equal(f.state.hasOrdinaryPreflight(binding), true);
   f.state.acceptDiscordMessage({
-    id: 'root-relocation-held', guildId: 'guild', channelId: binding.channelId,
+    id: '900701', guildId: 'guild', channelId: binding.channelId,
     authorId: 'operator', isBot: false, content: 'held during root relocation'
   }, { ready: false });
 
@@ -89,7 +89,7 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
   const secretFile = path.join(f.dir, 'discord.env');
   fs.writeFileSync(secretFile, 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
   const held = f.state.acceptDiscordMessage({
-    id: 'held-input', guildId: 'guild', channelId: binding.channelId,
+    id: '900702', guildId: 'guild', channelId: binding.channelId,
     authorId: 'operator', isBot: false, content: 'held until native proof'
   }, { ready: false });
   assert.equal(held.accepted, true);
@@ -109,10 +109,18 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
     channels: { fetch: async () => channel },
     on() {}, off() {}, async login() {}, async destroy() {}
   };
+  // The already-accepted held message sits ahead of the committed cutoff, so recovery
+  // must actually read it back as ordinary after-cutoff history to checkpoint through
+  // it, matching real Discord behavior rather than losing it behind an always-empty
+  // history double.
+  const historyMessage = {
+    id: '900702', guildId: 'guild', channelId: binding.channelId,
+    author: { id: 'operator', bot: false }, content: 'held until native proof', attachments: []
+  };
   const gateway = new DiscordGateway({
     state: f.state,
     client,
-    fetchHistory: async () => [],
+    fetchHistory: async (_channel, options) => (options.after === '100' ? [historyMessage] : []),
     providers: { codex: {
       async dispatch() { dispatches += 1; return { status: 'submitted' }; },
       async observe() { return { text: 'answer' }; }
@@ -133,13 +141,13 @@ test('Gateway repeats ordinary native preflight on reconnect before promoting in
   assert.deepEqual(f.state.recoveryCandidates(), []);
   assert.equal(dispatches, 1);
   assert.ok(replies >= 1);
-  assert.equal(f.state.getMessage('held-input').state, 'replied');
+  assert.equal(f.state.getMessage('900702').state, 'replied');
   gateway.pauseConnection('reconnect');
   assert.equal(f.state.getBinding(binding.channelId).readiness, READINESS.RECOVERING);
   const second = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch);
   assert.equal(second.ready, true);
   assert.equal(preflights, 2);
-  assert.equal(f.state.getMessage('held-input').state, 'replied');
+  assert.equal(f.state.getMessage('900702').state, 'replied');
   await gateway.stop();
 });
 

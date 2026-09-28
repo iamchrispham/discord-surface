@@ -21,7 +21,7 @@ test('live attachment recovery reconciles accepted packet to native provider', a
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-native-recovery.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-native-recovery.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '6999' });
   const binding = state.getBinding(target.channelId);
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
@@ -135,7 +135,7 @@ test('held-ready attachment recovery fences later same-channel admission until h
     fs.rmSync(dir, { recursive: true, force: true });
   });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-held-ready-order.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-held-ready-order.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '6999' });
   const binding = state.getBinding(target.channelId);
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
@@ -237,7 +237,7 @@ test('live attachment readiness drop during download holds durable intake and sk
     fs.rmSync(dir, { recursive: true, force: true });
   });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-readiness-drop.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-readiness-drop.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '100' });
   const binding = state.getBinding(target.channelId);
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);

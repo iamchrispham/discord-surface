@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as http from 'node:http';
-import * as path from 'node:path';
+import * as socketOwnership from './claude/socket-ownership';
 import type {
   AcknowledgmentState,
   MessageState,
@@ -177,6 +177,14 @@ type ClaudeRuntimeMcp = ClaudeChannelMcpBase & {
   transportFactory?: () => unknown;
 };
 
+export const CLAUDE_STARTUP_PHASES = {
+  SOCKET_PREPARATION: 'socket preparation',
+  MCP_CONNECTION: 'MCP connection',
+  LISTENER_STARTUP: 'listener startup'
+} as const;
+
+export type ClaudeStartupPhase = typeof CLAUDE_STARTUP_PHASES[keyof typeof CLAUDE_STARTUP_PHASES];
+
 interface ClaudeChannelOptionsBase {
   nativeId: string;
   socketPath: string;
@@ -211,6 +219,13 @@ function errorMessage(error: unknown): string {
   return String((error as { message?: unknown }).message);
 }
 
+function closeServer(server: { listening: boolean; close(callback: (error?: Error) => void): void } | null | undefined): Promise<void> {
+  if (!server || !server.listening) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve());
+  });
+}
+
 function markPotentiallyDelivered(error: unknown): void {
   const deliveryError = error as { potentiallyDelivered?: unknown };
   if (deliveryError.potentiallyDelivered === undefined) deliveryError.potentiallyDelivered = true;
@@ -236,19 +251,29 @@ export function parseBody(request: ClaudeBodyRequest): Promise<unknown> {
 }
 
 export function assertSocketPath(socketPath: string): void {
-  if (typeof socketPath !== 'string' || !path.isAbsolute(socketPath)) throw new Error('Claude channel socket must be an absolute path');
-  if (socketPath.length > 90) throw new Error('Claude channel socket path is too long for macOS');
+  socketOwnership.assertSocketPath(socketPath);
+}
+
+function assertSocketDirectory(socketPath: string): void {
+  socketOwnership.assertSocketDirectory(socketPath);
 }
 
 export function prepareSocket(socketPath: string): void {
   assertSocketPath(socketPath);
-  fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
-  const mode = fs.statSync(path.dirname(socketPath)).mode & 0o777;
-  if (mode & 0o077) throw new Error('Claude channel socket directory must be owner-only');
-  if (fs.existsSync(socketPath)) {
-    if (!fs.lstatSync(socketPath).isSocket()) throw new Error('Claude channel path exists and is not a socket');
-    throw new Error('Claude channel socket already exists; stop its owner first');
+  assertSocketDirectory(socketPath);
+  let original: fs.Stats;
+  try { original = fs.lstatSync(socketPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
   }
+  if (!original.isSocket()) throw new Error('Claude channel path exists and is not a socket');
+  const effectiveUid = process.geteuid?.() ?? process.getuid?.();
+  if (original.uid !== effectiveUid) throw new Error('Claude channel socket belongs to another owner');
+  throw new Error('Claude channel socket already exists; stop its owner first');
+}
+
+export async function prepareSocketAsync(socketPath: string): Promise<void> {
+  await socketOwnership.withSocketLock(socketPath, () => socketOwnership.prepareSocket(socketPath));
 }
 
 export function createDefaultMcp({ nativeId, state }: { nativeId: string; state: ClaudeDefaultMcpState }): ClaudeDefaultMcp<StdioServerTransport> {
@@ -328,9 +353,15 @@ export class ClaudeChannel<
   declare mcp: ClaudeResolvedMcp<TProvidedMcp>;
   declare server: http.Server | null;
   declare ownsSocket: boolean;
+  declare socketIdentity: socketOwnership.SocketPathIdentity | null;
   declare started: boolean;
   declare stopping: boolean;
   declare stopPromise: Promise<void> | null;
+  declare startupPromise: Promise<void> | null;
+  declare startupPhase: ClaudeStartupPhase | null;
+  declare socketLockRelease: (() => void) | null;
+  declare socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
+  declare startupCleanupPending: boolean;
   declare ready: boolean;
   declare transportClosed: boolean;
   declare beforeTransportClose: (() => void | Promise<void>) | null;
@@ -361,9 +392,15 @@ export class ClaudeChannel<
     this.mcp = (mcp || createDefaultMcp({ nativeId, state: state as ClaudeDefaultMcpState })) as unknown as ClaudeResolvedMcp<TProvidedMcp>;
     this.server = null;
     this.ownsSocket = false;
+    this.socketIdentity = null;
     this.started = false;
     this.stopping = false;
     this.stopPromise = null;
+    this.startupPromise = null;
+    this.startupPhase = null;
+    this.socketLockRelease = null;
+    this.socketQuarantine = undefined;
+    this.startupCleanupPending = false;
     this.ready = false;
     this.transportClosed = false;
     this.beforeTransportClose = typeof beforeTransportClose === 'function' ? beforeTransportClose : null;
@@ -371,6 +408,7 @@ export class ClaudeChannel<
     this.logger = logger;
     const handleTransportClose = () => {
       this.transportClosed = true;
+      if (!this.started) this.startupAbort?.();
       if (this.started && !this.stopPromise) {
         Promise.resolve()
           .then(() => this.beforeTransportClose?.())
@@ -418,12 +456,91 @@ export class ClaudeChannel<
   }
 
   async start(): Promise<void> {
-    if (this.started) return;
     if (this.stopPromise) await this.stopPromise;
+    if (this.started) return;
+    if (this.startupCleanupPending) throw new Error('Claude channel startup cleanup is pending; stop the channel first');
+    if (this.startupPromise) return this.startupPromise;
+    const startup = this.startUnlocked();
+    this.startupPromise = startup;
+    try { await startup; } finally {
+      if (this.startupPromise === startup) this.startupPromise = null;
+    }
+  }
+
+  private startupAbort: (() => void) | null = null;
+
+  private async startUnlocked(): Promise<void> {
     this.transportClosed = false;
-    prepareSocket(this.socketPath);
+    this.startupCleanupPending = false;
+    socketOwnership.assertSocketPath(this.socketPath);
+    socketOwnership.assertSocketDirectory(this.socketPath);
+    let rejectStartup: ((error: Error) => void) | null = null;
+    let startupCancelled = false;
+    let startupPhase: ClaudeStartupPhase = CLAUDE_STARTUP_PHASES.SOCKET_PREPARATION;
+    let listenerStartup: Promise<void> | null = null;
+    const startupController = new AbortController();
+    this.startupPhase = startupPhase;
+    const startupCancellation = new Promise<never>((_, reject) => {
+      rejectStartup = reject;
+    });
+    void startupCancellation.catch(() => {});
+    const abortStartup = (): void => {
+      if (startupCancelled) return;
+      startupCancelled = true;
+      startupController.abort();
+      rejectStartup?.(new Error(`Claude channel stopped during ${startupPhase}`));
+    };
+    let releaseSocketLock: (() => void);
     try {
-      if (typeof (this.mcp as unknown as ClaudeRuntimeMcp).connect === 'function') await (this.mcp as unknown as ClaudeRuntimeMcp).connect!((this.mcp as unknown as ClaudeRuntimeMcp).transportFactory!());
+      const retainedRelease = this.socketLockRelease;
+      if (retainedRelease) {
+        retainedRelease();
+        if (this.socketLockRelease === retainedRelease) this.socketLockRelease = null;
+      }
+      releaseSocketLock = socketOwnership.acquireSocketLock(this.socketPath);
+    } catch (error) {
+      if (errorMessage(error) === 'Claude channel socket preparation is already in progress') {
+        let socketExists = false;
+        try {
+          socketExists = fs.lstatSync(this.socketPath).isSocket();
+        } catch (pathError) {
+          if ((pathError as NodeJS.ErrnoException).code !== 'ENOENT') {
+            this.startupPhase = null;
+            throw pathError;
+          }
+        }
+        if (socketExists) {
+          this.startupPhase = null;
+          throw new Error('Claude channel socket already exists; stop its owner first');
+        }
+      }
+      this.startupPhase = null;
+      throw error;
+    }
+    this.socketLockRelease = releaseSocketLock;
+    this.startupAbort = abortStartup;
+    try {
+      await socketOwnership.prepareSocket(this.socketPath, startupController.signal);
+      if (this.transportClosed) throw new Error('Claude channel stopped during socket preparation');
+      if (typeof (this.mcp as unknown as ClaudeRuntimeMcp).connect === 'function') {
+        startupPhase = CLAUDE_STARTUP_PHASES.MCP_CONNECTION;
+        this.startupPhase = startupPhase;
+        const connection = Promise.resolve(
+          (this.mcp as unknown as ClaudeRuntimeMcp).connect!((this.mcp as unknown as ClaudeRuntimeMcp).transportFactory!())
+        );
+        try {
+          await Promise.race([connection, startupCancellation]);
+        } catch (error) {
+          if (startupCancelled) {
+            try { await connection; } catch {}
+            try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
+          }
+          throw error;
+        }
+        if (this.transportClosed) throw new Error('Claude channel stopped during MCP connection');
+      }
+      startupPhase = CLAUDE_STARTUP_PHASES.LISTENER_STARTUP;
+      this.startupPhase = startupPhase;
       this.server = http.createServer(async (request, response) => {
         if (request.method === 'GET' && request.url === '/identity') {
           let current: ClaudeBinding | null | undefined;
@@ -480,53 +597,177 @@ export class ClaudeChannel<
           response.end(status === 503 ? 'uncertain' : 'rejected');
         }
       });
-      await new Promise<void>((resolve, reject) => {
-        this.server!.once('error', reject);
-        this.server!.listen(this.socketPath, () => {
-          this.server!.off('error', reject);
-          try { fs.chmodSync(this.socketPath, 0o600); } catch {}
-          this.ownsSocket = true;
-          resolve();
+      const server = this.server;
+      if (!server) throw new Error('Claude channel server failed to initialize');
+      let socketIdentity: socketOwnership.SocketPathIdentity | undefined;
+      listenerStartup = new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(this.socketPath, () => {
+          server.off('error', reject);
+          void socketOwnership.boundSocketIdentity(server, this.socketPath, startupController.signal)
+            .then(identity => {
+              socketIdentity = identity;
+              if (!socketOwnership.chmodBoundSocketPath(this.socketPath, 0o600)) {
+                reject(new Error('Claude channel bound socket permissions are unavailable'));
+                return;
+              }
+              if (this.transportClosed) {
+                void closeServer(server).then(() => {
+                  try { socketOwnership.unlinkSocketIfOwned(this.socketPath, identity); } catch {}
+                  reject(new Error('Claude channel stopped during listener startup'));
+                }, () => {
+                  try { socketOwnership.unlinkSocketIfOwned(this.socketPath, identity); } catch {}
+                  reject(new Error('Claude channel stopped during listener startup'));
+                });
+                return;
+              }
+              this.socketIdentity = identity;
+              this.ownsSocket = true;
+              resolve();
+            }, error => {
+              socketIdentity = socketIdentity ?? socketOwnership.socketPathIdentity(this.socketPath);
+              let socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
+              this.socketIdentity = socketIdentity ?? null;
+              this.ownsSocket = socketIdentity !== undefined;
+              if (!socketIdentity) {
+                this.startupCleanupPending = true;
+                reject(new AggregateError([error, new Error('Claude channel bound socket identity is unavailable for cleanup')], 'Claude channel listener cleanup failed'));
+                return;
+              }
+              try {
+                socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, socketIdentity);
+                this.socketQuarantine = socketQuarantine;
+              } catch (quarantineError) {
+                this.startupCleanupPending = true;
+                reject(new AggregateError([error, quarantineError], 'Claude channel listener cleanup failed'));
+                return;
+              }
+              void closeServer(server).then(() => {
+                try {
+                  if (socketQuarantine && !socketQuarantine.restore()) {
+                    this.startupCleanupPending = true;
+                    reject(new Error('Claude channel socket restore is unavailable'));
+                    return;
+                  }
+                } catch (restoreError) {
+                  this.startupCleanupPending = true;
+                  reject(restoreError);
+                  return;
+                }
+                reject(error);
+              }, closeError => reject(closeError));
+            });
+          });
+          socketIdentity = socketOwnership.socketPathIdentity(this.socketPath) ?? socketIdentity;
         });
-      });
+      await Promise.race([listenerStartup, startupCancellation]);
       if (this.transportClosed) throw new Error('Claude channel transport closed during startup');
+      listenerStartup = null;
       this.ready = true;
       this.started = true;
     } catch (error) {
       this.ready = false;
-      try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
-      try { this.server?.close(); } catch {}
-      this.server = null;
-      if (this.ownsSocket) {
-        try { fs.unlinkSync(this.socketPath); } catch {}
-        this.ownsSocket = false;
+      if (listenerStartup) {
+        try { await listenerStartup; } catch {}
+        listenerStartup = null;
+      }
+      if (!this.stopping) {
+        try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch {}
+      }
+      if (!this.startupCleanupPending) {
+        try { await closeServer(this.server); } catch {}
+        this.server = null;
+        if (this.ownsSocket) {
+          try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch {}
+          this.ownsSocket = false;
+          this.socketIdentity = null;
+        }
       }
       throw error;
+    } finally {
+      if (this.startupAbort === abortStartup) this.startupAbort = null;
+      if (this.startupPhase === startupPhase) this.startupPhase = null;
+      if (!this.started && !this.startupCleanupPending) {
+        const release = this.socketLockRelease;
+        if (release) {
+          release();
+          if (this.socketLockRelease === release) this.socketLockRelease = null;
+        }
+      }
     }
   }
 
   async stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
+    this.transportClosed = true;
+    const startup = this.startupPromise;
+    this.startupAbort?.();
     this.stopPromise = (async () => {
       this.ready = false;
       const errors: unknown[] = [];
       try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch (error) { errors.push(error); }
+      if (startup) {
+        try { await startup; } catch (error) {
+          if (!/^Claude channel stopped during /.test(errorMessage(error))) errors.push(error);
+        }
+      }
+      let socketQuarantine = this.socketQuarantine;
+      let quarantineFailed = false;
+      if (!this.socketIdentity && this.server?.listening) {
+        this.socketIdentity = socketOwnership.boundSocketPathIdentity(this.server) ?? null;
+        this.ownsSocket = this.socketIdentity !== null;
+      }
+      if (this.server?.listening && !this.socketIdentity) {
+        quarantineFailed = true;
+        errors.push(new Error('Claude channel bound socket identity is unavailable for cleanup'));
+      }
       try {
-        if (this.server) await new Promise<void>((resolve, reject) => {
-          this.server!.close(error => error ? reject(error) : resolve());
-        });
-      } catch (error) { errors.push(error); }
+        if (!quarantineFailed && !socketQuarantine) {
+          socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, this.socketIdentity);
+          this.socketQuarantine = socketQuarantine;
+        }
+      } catch (error) {
+        quarantineFailed = true;
+        errors.push(error);
+      }
+      if (!quarantineFailed) {
+        try {
+          await closeServer(this.server);
+        } catch (error) { errors.push(error); }
+      }
+      if (socketQuarantine) {
+        try {
+          if (!socketQuarantine.restore()) errors.push(new Error('Claude channel socket restore is unavailable'));
+          else this.socketQuarantine = undefined;
+        } catch (error) { errors.push(error); }
+      }
+      if (errors.length) {
+        this.stopping = false;
+        throw new AggregateError(errors, 'Claude channel stop failed');
+      }
+      this.startupCleanupPending = false;
       this.server = null;
       if (this.ownsSocket) {
-        try { fs.unlinkSync(this.socketPath); } catch (error) {
-          if ((error as { code?: unknown }).code !== 'ENOENT') errors.push(error);
+        try { socketOwnership.unlinkSocketIfOwned(this.socketPath, this.socketIdentity); } catch (error) {
+          if ((error as { code?: unknown }).code !== 'ENOENT') {
+            this.stopping = false;
+            throw new AggregateError([error], 'Claude channel stop failed');
+          }
         }
         this.ownsSocket = false;
+        this.socketIdentity = null;
       }
+      const release = this.socketLockRelease;
       this.started = false;
       this.stopping = false;
-      if (errors.length) throw new AggregateError(errors, 'Claude channel stop failed');
+      try {
+        release?.();
+        if (release && this.socketLockRelease === release) this.socketLockRelease = null;
+      } catch (error) {
+        this.stopping = false;
+        throw new AggregateError([error], 'Claude channel stop failed');
+      }
     })();
     try { await this.stopPromise; } finally { this.stopPromise = null; }
   }

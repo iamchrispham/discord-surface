@@ -1,6 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fixture } = require('./helpers/intake-recovery-fixture');
+const { recoverThread } = require('../src/discord/thread-enrollment');
+const { waitForRecoveryOperation } = require('../src/discord');
 
 async function settleRecovery(operation) {
   let timer;
@@ -18,10 +20,16 @@ async function settleRecovery(operation) {
 
 for (const entrypoint of ['result', 'startup', 'reconnect']) {
   for (const scenario of ['ready', 'latest-baseline', 'empty-baseline']) {
-    test(`${entrypoint} includes recovery after ${scenario} CAS loss`, { timeout: 6000 }, async t => {
+    const unknownCoverage = scenario !== 'ready';
+    test(unknownCoverage
+      ? `${entrypoint} holds an unknown-coverage legacy parent (${scenario}) instead of inventing a baseline`
+      : `${entrypoint} includes recovery after ${scenario} CAS loss`, { timeout: 6000 }, async t => {
       const f = fixture(t);
       const baseline = scenario !== 'ready';
       if (baseline) {
+        // Named historical/unknown-coverage scenario: the legacy parent route carries
+        // no covered cursor. The restored owner refuses to infer one from newest
+        // history, so recovery must leave the route visibly held.
         f.state.db.prepare('DELETE FROM intake_watermarks WHERE channel_id=?').run('1000');
         f.state.markIntakeBoundary('1000', 'pending', 'first baseline');
       }
@@ -60,7 +68,14 @@ for (const entrypoint of ['result', 'startup', 'reconnect']) {
           ? f.gateway.beginReconnectRecovery('probe')
           : f.gateway.recoverTransport('startup');
         const result = await settleRecovery(operation);
-        assert.equal(result.ready, true, 'caller must receive completed recovery');
+        if (!unknownCoverage) assert.equal(result.ready, true, 'caller must receive completed recovery');
+      }
+      if (unknownCoverage) {
+        assert.equal(injected, false, 'unknown coverage must not reach a baseline commit');
+        assert.equal(f.boundary('1000').state, 'pending');
+        assert.match(f.boundary('1000').detail, /requires qualified historical coverage|refused without historical coverage/);
+        assert.equal(f.dispatched.length, 0);
+        return;
       }
       assert.ok(injected);
       assert.equal(f.boundary('1000').state, 'ready');
@@ -77,12 +92,179 @@ for (const entrypoint of ['result', 'startup', 'reconnect']) {
   }
 }
 
+test('startup qualifies a completed empty legacy parent and replays post-baseline history', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare('UPDATE intake_watermarks SET state=?, last_seen_id=NULL, recovered_through_id=NULL WHERE channel_id=?')
+    .run('ready', '1000');
+  f.history.set('1000', [f.message('101', '1000')]);
+  let historyCalls = 0;
+  const originalFetchHistory = f.gateway.fetchHistory.bind(f.gateway);
+  f.gateway.fetchHistory = async (channel, ...args) => {
+    if (channel.id === '1000') historyCalls += 1;
+    return originalFetchHistory(channel, ...args);
+  };
+
+  const result = await settleRecovery(f.gateway.recoverTransport('startup'));
+
+  assert.equal(result.ready, true, JSON.stringify(result));
+  assert.equal(f.boundary('1000').state, 'ready');
+  assert.equal(f.boundary('1000').last_seen_id, '101');
+  assert.equal(f.boundary('1000').recovered_through_id, '101');
+  assert.ok(historyCalls > 0);
+  assert.equal(f.state.getMessage('101').state, 'accepted');
+  assert.equal(f.cursor('1000'), '101');
+});
+
+test('completed-empty parent stays pending while history backfill is in flight', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare('UPDATE intake_watermarks SET state=?, last_seen_id=NULL, recovered_through_id=NULL WHERE channel_id=?')
+    .run('ready', '1000');
+  f.history.set('1000', [f.message('101', '1000')]);
+  const originalFetchHistory = f.gateway.fetchHistory.bind(f.gateway);
+  let fetchStarted;
+  const fetchStartedPromise = new Promise(resolve => { fetchStarted = resolve; });
+  let releaseFetch;
+  const fetchRelease = new Promise(resolve => { releaseFetch = resolve; });
+  f.gateway.fetchHistory = async (channel, ...args) => {
+    if (channel.id === '1000') {
+      fetchStarted();
+      await fetchRelease;
+    }
+    return originalFetchHistory(channel, ...args);
+  };
+
+  const recovery = f.gateway.recoverTransport('startup');
+  await fetchStartedPromise;
+  assert.equal(f.boundary('1000').state, 'pending');
+  assert.equal(f.state.getBinding('1000').readiness, 'pending');
+
+  releaseFetch();
+  const result = await settleRecovery(recovery);
+  assert.equal(result.ready, true, JSON.stringify(result));
+  assert.equal(f.boundary('1000').state, 'ready');
+  assert.equal(f.state.getMessage('101').state, 'accepted');
+});
+
+test('held live intake preserves verified empty parent coverage across restart', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare('UPDATE intake_watermarks SET state=?, last_seen_id=NULL, recovered_through_id=NULL WHERE channel_id=?')
+    .run('ready', '1000');
+  const older = { ...f.message('100', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+  const live = { ...f.message('101', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+  assert.equal(f.state.acceptDiscordMessage(live, {
+    expectedBinding: f.state.getBinding('1000'),
+    ready: true
+  }).accepted, true);
+  assert.equal(f.boundary('1000').recovered_through_id, '0');
+  assert.equal(f.boundary('1000').state, 'pending');
+  assert.equal(f.state.getBinding('1000').readiness, 'pending');
+  f.history.set('1000', [older, live]);
+  f.enableDelivery();
+  await f.reopen();
+
+  const result = await settleRecovery(f.gateway.recoverTransport('restart'));
+
+  assert.equal(result.ready, true, JSON.stringify(result));
+  assert.equal(f.boundary('1000').state, 'ready');
+  assert.equal(f.boundary('1000').recovered_through_id, '101');
+  await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  await f.gateway.consumer.waitForNativeWork();
+  assert.deepEqual(f.dispatched.map(message => message.id), ['100', '101']);
+});
+
+test('verified-empty legacy child records adoption before live checkpointing', { timeout: 4000 }, async t => {
+  const f = fixture(t, { adoptThread: false });
+
+  const first = await settleRecovery(f.gateway.recoverTransport('startup'));
+  assert.equal(first.ready, true, JSON.stringify(first));
+  const adopted = f.state.getThreadEnrollment('2000');
+  assert.equal(adopted.recoveredThroughId, '0');
+  assert.ok(adopted.adoptedAt);
+
+  const message = { ...f.message('101', '2000'), authorId: 'operator', isBot: false, attachments: [] };
+  assert.equal(f.state.acceptDiscordMessage(message, {
+    expectedBinding: f.state.getBinding('1000'),
+    ready: false
+  }).accepted, true);
+  f.history.set('2000', [message]);
+  const checkpointed = await recoverThread(
+    f.gateway,
+    f.state.getThreadEnrollment('2000'),
+    new AbortController().signal,
+    f.gateway.lifecycleEpoch,
+    waitForRecoveryOperation,
+    true,
+    Date.now() + f.gateway.recoveryTimeoutMs
+  );
+
+  assert.equal(checkpointed, true);
+  assert.equal(f.state.getThreadEnrollment('2000').recoveredThroughId, '101');
+});
+
+test('completed-empty child holds live custody before startup history replay', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare(`UPDATE thread_enrollments
+    SET state='ready', adopted_through_id=NULL, last_seen_id=NULL, recovered_through_id=NULL, last_accepted_id=NULL,
+      gap_from=NULL, gap_to=NULL, detail='Thread history recovered'
+    WHERE thread_id=?`).run('2000');
+  const live = { ...f.message('102', '2000'), authorId: 'operator', isBot: false, attachments: [] };
+  const older = { ...f.message('101', '2000'), authorId: 'operator', isBot: false, attachments: [] };
+  f.enableDelivery();
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  f.gateway.boundMessage(live);
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForReceipts();
+  assert.equal(f.state.getMessage('102').state, 'accepted');
+  assert.equal(f.dispatched.length, 0);
+  assert.equal(f.boundary('2000').state, 'pending');
+  assert.equal(f.boundary('2000').recoveredThroughId, '0');
+
+  f.history.set('2000', [older, live]);
+  const result = await settleRecovery(f.gateway.recoverTransport('startup'));
+  assert.equal(result.ready, true, JSON.stringify(result));
+  await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  await f.gateway.consumer.waitForNativeWork();
+
+  assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
+  assert.equal(f.boundary('2000').state, 'ready');
+  assert.equal(f.boundary('2000').recoveredThroughId, '102');
+});
+
+test('deadline retry waits for an unvisited ready route to finish', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
+    nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
+  f.state.setIntakeBaseline('3000', '100', 'fixture');
+  f.state.markIntakeBoundary('3000', 'ready');
+  f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
+  const message = f.message('101', '3000');
+  f.history.set('3000', [message]);
+  const originalFetchHistory = f.gateway.fetchHistory.bind(f.gateway);
+  f.gateway.fetchHistory = async (channel, options) => {
+    const delay = channel.id === '1000' ? 80 : channel.id === '3000' ? 400 : 0;
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    return originalFetchHistory(channel, options);
+  };
+
+  const result = await settleRecovery(f.gateway.recoverTransport(
+    'startup', f.gateway.lifecycleEpoch, null, Date.now() + 50
+  ));
+
+  assert.equal(result.ready, false);
+  assert.ok(f.calls.some(call => call.id === '3000'), 'the skipped route must be retried');
+  assert.equal(f.state.getIntakeWatermark('3000').state, 'ready');
+  assert.equal(f.state.getBinding('3000').readiness, 'ready');
+  assert.equal(f.state.getMessage('101').state, 'accepted');
+});
+
 for (const withArrival of [false, true]) {
   test(`full recovery retains an unavailable sibling, concurrent arrival=${withArrival}`, { timeout: 6000 }, async t => {
     const f = fixture(t);
     f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
       nativeId: '33333333-3333-4333-8333-333333333333',
-      workspace: f.state.getBinding('1000').workspace });
+      workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
     f.state.setIntakeBaseline('3000', '100', 'fixture');
     f.state.markIntakeBoundary('3000', 'ready');
     f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
@@ -239,7 +421,7 @@ test('initial caller includes three consecutive arrival followups', { timeout: 3
 test('selected recovery remains selected after an arrival followup', { timeout: 3000 }, async t => {
   const f = fixture(t);
   f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
-    nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace });
+    nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
   f.state.setIntakeBaseline('3000', '100', 'fixture');
   f.state.markIntakeBoundary('3000', 'ready');
   f.channels.set('3000', { ...f.channels.get('1000'), id: '3000' });
@@ -255,38 +437,51 @@ test('selected recovery remains selected after an arrival followup', { timeout: 
   assert.equal(f.dispatched.length, 0);
 });
 
-for (const settled of [false, true]) {
-  test(`expired queued recovery preserves healthy custody (${settled ? 'settled' : 'unsettled'} caller)`, { timeout: 3000 }, async t => {
-    const f = fixture(t);
-    f.state.bind({ channelId: '3000', guildId: 'guild', provider: 'codex',
-      nativeId: '33333333-3333-4333-8333-333333333333', workspace: f.state.getBinding('1000').workspace });
-    f.state.setIntakeBaseline('3000', '100', 'fixture');
-    f.state.markIntakeBoundary('3000', 'ready');
-    const before = f.state.getIntakeWatermark('3000');
-    let entered, release;
-    const started = new Promise(resolve => { entered = resolve; });
-    const held = new Promise(resolve => { release = resolve; });
-    const original = f.gateway.fetchHistory;
-    let paused = false;
-    f.gateway.fetchHistory = async (channel, options) => {
-      if (!paused) { paused = true; entered(); await held; }
-      return original(channel, options);
-    };
-    try {
-      const active = f.gateway.recoverTransport('active', f.gateway.lifecycleEpoch, ['1000']);
-      await started;
-      const queued = f.gateway.recoverTransport('expired', f.gateway.lifecycleEpoch, ['3000'], Date.now() - 1);
-      if (settled) await settleRecovery(queued);
-      release();
-      await settleRecovery(active);
-      await settleRecovery(queued);
-      await f.gateway.recoveryFollowupPromise;
-      assert.deepEqual(f.state.getIntakeWatermark('3000'), before);
-      assert.equal(f.calls.some(call => call.id === '3000'), false);
-      assert.equal(f.dispatched.length, 0);
-    } finally { release(); }
-  });
-}
+test('queued scoped recovery starts with a fresh deadline', { timeout: 3000 }, async t => {
+  const f = fixture(t);
+  for (const [channelId, nativeId] of [
+    ['3000', '33333333-3333-4333-8333-333333333333'],
+    ['4000', '44444444-4444-4444-8444-444444444444']
+  ]) {
+    f.state.bind({ channelId, guildId: 'guild', provider: 'codex',
+      nativeId, workspace: f.state.getBinding('1000').workspace }, { intakeCutoff: '100' });
+    f.state.setIntakeBaseline(channelId, '100', 'fixture');
+    f.state.markIntakeBoundary(channelId, 'ready');
+    f.channels.set(channelId, { ...f.channels.get('1000'), id: channelId });
+    f.history.set(channelId, []);
+  }
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const held = new Promise(resolve => { release = resolve; });
+  const original = f.gateway.fetchHistory.bind(f.gateway);
+  let paused = false;
+  let slowRoutePending = true;
+  f.gateway.fetchHistory = async (channel, options) => {
+    if (!paused) { paused = true; entered(); await held; }
+    if (channel.id === '3000' && slowRoutePending) {
+      slowRoutePending = false;
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    return original(channel, options);
+  };
+  try {
+    const active = f.gateway.recoverTransport('active', f.gateway.lifecycleEpoch, ['1000'], Date.now() + 1000);
+    await started;
+    f.gateway.recoveryTimeoutMs = 25;
+    const first = f.gateway.recoverTransport('expired-first', f.gateway.lifecycleEpoch, ['3000'], Date.now() - 1);
+    const second = f.gateway.recoverTransport('expired-second', f.gateway.lifecycleEpoch, ['4000'], Date.now() - 1);
+    release();
+    await settleRecovery(active);
+    await settleRecovery(first);
+    await settleRecovery(second);
+    await f.gateway.recoveryFollowupPromise;
+    assert.equal(f.calls.some(call => call.kind === 'channel' && call.id === '3000'), true);
+    assert.equal(f.calls.some(call => call.kind === 'channel' && call.id === '4000'), true);
+    assert.equal(f.state.getIntakeWatermark('4000').state, 'ready');
+    assert.equal(f.state.getBinding('4000').readiness, 'ready');
+    assert.equal(f.dispatched.length, 0);
+  } finally { release(); }
+});
 
 for (let hops = 0; hops <= 8; hops++) {
   test(`reconciliation and followup remain serialized at microtask ${hops}`, { timeout: 3000 }, async t => {
@@ -377,5 +572,356 @@ for (const kind of ['channel', 'history']) {
     assert.equal(f.calls.filter(c => c.kind === kind && c.id === '2000').length, 1);
     assert.equal(Boolean(f.gateway.liveCheckpointRetryTimer), false);
     assert.equal(f.dispatched.length, 0);
+  });
+}
+
+test('live attachment recovery preserves a verified empty cursor', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare(`UPDATE intake_watermarks
+    SET state='ready', last_seen_id=NULL, recovered_through_id=NULL
+    WHERE channel_id=?`).run('1000');
+  const binding = f.state.getBinding('1000');
+  const message = { ...f.message('101', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+
+  await f.gateway.recordLiveAttachmentGap(message, binding, new Error('attachment fetch failed'));
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline && f.boundary('1000').state !== 'ready') {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+
+  assert.equal(f.boundary('1000').state, 'ready');
+  assert.equal(f.boundary('1000').recovered_through_id, '0');
+});
+
+test('direct reply-ready recovery send settles as unknown at the shared deadline', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const message = f.message('101', '1000');
+  assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, 'submitted');
+  const stored = f.state.getMessage('101');
+  f.state.recordNativeReply({
+    provider: stored.provider,
+    messageId: stored.id,
+    nativeId: stored.nativeId,
+    generation: stored.generation,
+    text: 'saved reply'
+  });
+  f.enableDelivery();
+  f.gateway.recoveryTimeoutMs = 25;
+  const channel = f.channels.get('1000');
+  const originalSend = channel.send;
+  let sendStarted = false;
+  let releaseSend;
+  channel.send = async () => {
+    sendStarted = true;
+    return new Promise(resolve => { releaseSend = resolve; });
+  };
+  try {
+    await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+    assert.equal(sendStarted, true);
+    assert.equal(f.state.getMessage('101').state, 'reply_unknown');
+  } finally {
+    channel.send = originalSend;
+    releaseSend?.({ id: 'late-reply' });
+  }
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline && f.state.getMessage('101').state !== 'replied') {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(f.state.getMessage('101').state, 'replied');
+  assert.equal(f.state.getMessage('101').replyMessageId, 'late-reply');
+});
+
+test('aborted reply-ready recovery send settles as unknown', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const message = f.message('101', '1000');
+  assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, 'submitted');
+  const stored = f.state.getMessage('101');
+  f.state.recordNativeReply({
+    provider: stored.provider,
+    messageId: stored.id,
+    nativeId: stored.nativeId,
+    generation: stored.generation,
+    text: 'saved reply'
+  });
+  f.enableDelivery();
+  const channel = f.channels.get('1000');
+  const originalSend = channel.send;
+  let sendStarted = false;
+  let releaseSend;
+  channel.send = async () => {
+    sendStarted = true;
+    return new Promise(resolve => { releaseSend = resolve; });
+  };
+  try {
+    const recovery = f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+    const startDeadline = Date.now() + 1000;
+    while (!sendStarted && Date.now() < startDeadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(sendStarted, true);
+    f.gateway.pauseConnection('abort pending reply reconciliation');
+    await settleRecovery(recovery);
+    assert.equal(f.state.getMessage('101').state, 'reply_unknown');
+  } finally {
+    channel.send = originalSend;
+    releaseSend?.({ id: 'late-reply' });
+  }
+});
+
+test('submitted observer does not post after route readiness is lost before settlement', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const message = f.message('101', '1000');
+  assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, 'submitted');
+  f.enableDelivery();
+  const originalObserve = f.gateway.providers.codex.observe;
+  let observeStarted = false;
+  let releaseObserve;
+  f.gateway.providers.codex.observe = async (...args) => {
+    observeStarted = true;
+    await new Promise(resolve => { releaseObserve = resolve; });
+    return originalObserve(...args);
+  };
+  try {
+    const recovery = f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+    const startDeadline = Date.now() + 1000;
+    while (!observeStarted && Date.now() < startDeadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(observeStarted, true);
+    const channelDeadline = Date.now() + 1000;
+    while (!f.calls.some(call => call.kind === 'channel' && call.id === '1000') && Date.now() < channelDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    f.gateway.pauseConnection('observer settlement route hold');
+    releaseObserve?.();
+    await settleRecovery(recovery);
+    await f.gateway.consumer.waitForNativeWork();
+    assert.equal(f.replies.length, 0);
+    assert.equal(f.state.getMessage('101').state, 'reply_ready');
+  } finally {
+    releaseObserve?.();
+    f.gateway.providers.codex.observe = originalObserve;
+  }
+});
+
+test('reply-ready recovery retries when delivery misses the preflight deadline', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const message = f.message('101', '1000');
+  assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, 'submitted');
+  const stored = f.state.getMessage('101');
+  f.state.recordNativeReply({
+    provider: stored.provider,
+    messageId: stored.id,
+    nativeId: stored.nativeId,
+    generation: stored.generation,
+    text: 'saved reply'
+  });
+  f.enableDelivery();
+  f.gateway.recoveryTimeoutMs = 25;
+  const originalFetch = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+  let fetchCalls = 0;
+  // The single-flight owner must never overlap two lookups for the same
+  // destination: the retry continuation attaches to (or reuses) the one settled
+  // lookup rather than stacking a speculative second request on top of it.
+  let inFlight = 0;
+  let peakInFlight = 0;
+  f.gateway.client.channels.fetch = async id => {
+    fetchCalls += 1;
+    inFlight += 1;
+    peakInFlight = Math.max(peakInFlight, inFlight);
+    try {
+      if (fetchCalls === 1) await new Promise(resolve => setTimeout(resolve, 5));
+      return await originalFetch(id);
+    } finally {
+      inFlight -= 1;
+    }
+  };
+  const originalPermission = f.gateway.historyPermission.bind(f.gateway);
+  let permissionCalls = 0;
+  f.gateway.historyPermission = (...args) => {
+    const permission = originalPermission(...args);
+    permissionCalls += 1;
+    if (permissionCalls === 1) {
+      const deadline = Date.now() + 30;
+      while (Date.now() < deadline) {}
+    }
+    return permission;
+  };
+  try {
+    await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline && f.state.getMessage('101').state !== 'replied') {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok(fetchCalls >= 2, 'the preflight timeout must queue another reconciliation pass');
+    assert.equal(peakInFlight, 1, `reconciliation lookups must not overlap, peak ${peakInFlight}`);
+    assert.equal(f.state.getMessage('101').state, 'replied');
+    assert.equal(f.replies.length, 1);
+  } finally {
+    f.gateway.client.channels.fetch = originalFetch;
+    f.gateway.historyPermission = originalPermission;
+  }
+});
+
+test('reply preparation aborts at the recovery deadline before a held route can send', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  const message = f.message('101', '1000');
+  assert.equal(f.state.acceptDiscordMessage({ ...message, authorId: 'operator', isBot: false }).accepted, true);
+  assert.equal(f.state.claimDispatch('101').claimed, true);
+  assert.equal(f.state.markSubmitted('101').state, 'submitted');
+  const stored = f.state.getMessage('101');
+  f.state.recordNativeReply({
+    provider: stored.provider,
+    messageId: stored.id,
+    nativeId: stored.nativeId,
+    generation: stored.generation,
+    text: 'saved reply'
+  });
+  f.enableDelivery();
+  f.gateway.recoveryTimeoutMs = 25;
+  const channel = f.channels.get('1000');
+  const originalPermissionsFor = channel.permissionsFor;
+  const originalSendAcknowledgment = f.gateway.sendAcknowledgment.bind(f.gateway);
+  const originalFetch = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+  let acknowledgmentAttempts = 0;
+  let fetchCalls = 0;
+  f.gateway.sendAcknowledgment = async (...args) => {
+    acknowledgmentAttempts += 1;
+    if (acknowledgmentAttempts === 1) throw Object.assign(new Error('acknowledgment unavailable'), { status: 503 });
+    return originalSendAcknowledgment(...args);
+  };
+  f.gateway.client.channels.fetch = async id => {
+    fetchCalls += 1;
+    return originalFetch(id);
+  };
+  try {
+    await settleRecovery(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+    channel.permissionsFor = () => ({ has: () => false });
+    f.gateway.pauseConnection('route held after reply preparation deadline');
+    await new Promise(resolve => setTimeout(resolve, 350));
+    assert.ok(fetchCalls >= 2, 'reply preparation timeout must queue another reconciliation pass');
+    assert.equal(acknowledgmentAttempts, 1, 'held-route retry must stop before acknowledgment preparation');
+    assert.equal(f.replies.length, 0, 'a settled preparation must not send through the held route');
+    assert.equal(f.state.getMessage('101').state, 'reply_ready');
+  } finally {
+    channel.permissionsFor = originalPermissionsFor;
+    f.gateway.sendAcknowledgment = originalSendAcknowledgment;
+  }
+});
+
+for (const pageLimit of [10, 2]) {
+  test(`completed-empty parent retains descending history with page limit ${pageLimit}`, { timeout: 4000 }, async t => {
+    const f = fixture(t);
+    const binding = f.state.getBinding('1000');
+    const nativeId = binding.nativeId;
+    const generation = binding.generation;
+    f.state.db.prepare(`UPDATE intake_watermarks
+      SET state='ready', last_seen_id=NULL, recovered_through_id=NULL, last_accepted_id=NULL, detail=?
+      WHERE channel_id=?`).run('restart empty channel baseline', '1000');
+    f.gateway.historyPageLimit = pageLimit;
+    const messages = ['104', '103', '102', '101'].map(id => f.message(id, '1000'));
+    const parentCalls = [];
+    const originalFetchHistory = f.gateway.fetchHistory.bind(f.gateway);
+    f.gateway.fetchHistory = async (channel, options) => {
+      if (channel.id !== '1000') return originalFetchHistory(channel, options);
+      parentCalls.push(options);
+      const after = options.after ? BigInt(options.after) : null;
+      const before = options.before ? BigInt(options.before) : null;
+      const filtered = messages.filter(message => {
+        const value = BigInt(message.id);
+        if (after !== null && value <= after) return false;
+        if (before !== null && value >= before) return false;
+        return true;
+      });
+      if (after !== null) return filtered.reverse().slice(0, options.limit).reverse();
+      return filtered.slice(0, options.limit);
+    };
+
+    let result;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      result = await settleRecovery(f.recover());
+      if (result.ready) break;
+    }
+
+    assert.equal(parentCalls.length > 0, true);
+    assert.equal(result.ready, true);
+    assert.equal(f.boundary('1000').state, 'ready');
+    assert.equal(f.cursor('1000'), '104');
+    for (const id of ['101', '102', '103', '104']) {
+      const stored = f.state.getMessage(id);
+      assert.equal(stored.state, 'accepted');
+      assert.equal(stored.nativeId, nativeId);
+      assert.equal(stored.generation, generation);
+    }
+    assert.equal(f.state.getBinding('1000').nativeId, nativeId);
+    assert.equal(f.state.getBinding('1000').generation, generation);
+    assert.equal(f.dispatched.length, 0);
+  });
+}
+for (const pageLimit of [10, 2]) {
+  test(`historical completed-empty child retains new history with page limit ${pageLimit}`, { timeout: 4000 }, async t => {
+    const f = fixture(t);
+    f.state.db.prepare(`UPDATE thread_enrollments
+      SET adopted_through_id=NULL, last_seen_id=NULL, recovered_through_id=NULL, last_accepted_id=NULL, gap_from=NULL, gap_to=NULL, detail='Thread history recovered'
+      WHERE thread_id=?`).run('2000');
+    const preRecovery = f.state.getThreadEnrollment('2000');
+    assert.equal(preRecovery.active, true);
+    assert.equal(preRecovery.state, 'ready');
+    assert.ok(preRecovery.adoptedAt);
+    assert.equal(preRecovery.adoptedThroughId, null);
+    assert.equal(preRecovery.recoveredThroughId, null);
+    assert.equal(preRecovery.lastSeenId, null);
+    assert.equal(preRecovery.lastAcceptedId, null);
+    const parentBinding = f.state.getBinding('1000');
+    const nativeId = parentBinding.nativeId;
+    const generation = parentBinding.generation;
+    const threadAdoptedAt = preRecovery.adoptedAt;
+    const threadAdoptedThroughId = preRecovery.adoptedThroughId;
+    f.gateway.historyPageLimit = pageLimit;
+    const messages = ['104', '103', '102', '101'].map(id => f.message(id, '2000'));
+    const childCalls = [];
+    const originalFetchHistory = f.gateway.fetchHistory.bind(f.gateway);
+    f.gateway.fetchHistory = async (channel, options) => {
+      if (channel.id !== '2000') return originalFetchHistory(channel, options);
+      childCalls.push(options);
+      const after = options.after ? BigInt(options.after) : null;
+      const before = options.before ? BigInt(options.before) : null;
+      const filtered = messages.filter(message => {
+        const value = BigInt(message.id);
+        if (after !== null && value <= after) return false;
+        if (before !== null && value >= before) return false;
+        return true;
+      });
+      if (after !== null) return filtered.reverse().slice(0, options.limit).reverse();
+      return filtered.slice(0, options.limit);
+    };
+
+    let result;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      result = await settleRecovery(f.recover());
+      if (result.ready) break;
+    }
+
+    assert.equal(result.ready, true);
+    const recovered = f.state.getThreadEnrollment('2000');
+    assert.equal(recovered.state, 'ready');
+    assert.equal(recovered.recoveredThroughId, '104');
+    assert.equal(childCalls.length > 0, true);
+    assert.equal(f.state.getBinding('1000').nativeId, nativeId);
+    assert.equal(f.state.getBinding('1000').generation, generation);
+    assert.equal(f.state.getThreadEnrollment('2000').adoptedAt, threadAdoptedAt);
+    assert.equal(f.state.getThreadEnrollment('2000').adoptedThroughId, threadAdoptedThroughId);
+    assert.equal(f.dispatched.length, 0);
+    for (const id of ['101', '102', '103', '104']) {
+      const stored = f.state.getMessage(id);
+      assert.ok(stored, `message ${id} missing`);
+      assert.equal(stored.state, 'accepted');
+      assert.equal(stored.nativeId, nativeId);
+      assert.equal(stored.generation, generation);
+    }
   });
 }

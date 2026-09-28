@@ -1,7 +1,23 @@
 const discord = () => require('discord.js') as typeof import('discord.js');
 import { CODEX_VALIDATION_KINDS } from '../native-transcript';
-import { isPreAdoptionRetryableThread, isRetryableFetchBoundary, recoveryFetch } from './recovery-fetch';
+import {
+  classifyRecoveryFailure,
+  isPreAdoptionRetryableThread,
+  isRetryableIntakeBoundary,
+  isRetryableHttp503Boundary,
+  recoveryFetch,
+  refusesUnqualifiedBaseline,
+  retryPendingBoundaryDetail
+} from './recovery-fetch';
+import {
+  ADOPTION_REFUSAL_DETAILS,
+  AdoptionRefusalError,
+  historyPermission,
+  readAdoptionCutoff
+} from './history-access';
 import { THREAD_STATES, type ThreadBinding, type ThreadEnrollment, type ThreadRoute, type ThreadState } from '../state/thread-enrollment';
+
+export { ADOPTION_REFUSAL_DETAILS, AdoptionRefusalError, historyPermission, readAdoptionCutoff };
 
 export interface ThreadChannel {
   id: string;
@@ -11,22 +27,7 @@ export interface ThreadChannel {
   locked?: boolean;
   isThread?: () => boolean;
   permissionsFor?: (user: unknown) => { has: (permission: bigint) => boolean } | null;
-  messages?: { fetch: (options: unknown) => Promise<unknown> };
-}
-
-export function historyPermission(channel: ThreadChannel, user: unknown, requireSend = false) {
-  if (!user || typeof channel?.permissionsFor !== 'function') return { known: false, allowed: false };
-  try {
-    const { PermissionFlagsBits } = discord();
-    const permissions = channel.permissionsFor(user);
-    if (!permissions || typeof permissions.has !== 'function') return { known: false, allowed: false };
-    const history = permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory);
-    if (!requireSend) return { known: true, allowed: history };
-    const thread = channel.isThread?.() === true;
-    const send = permissions.has(thread ? PermissionFlagsBits.SendMessagesInThreads : PermissionFlagsBits.SendMessages);
-    const locked = thread && channel.locked === true && !permissions.has(PermissionFlagsBits.ManageThreads) && !permissions.has(PermissionFlagsBits.Administrator);
-    return { known: true, allowed: history && (!requireSend || (send && !locked)) };
-  } catch { return { known: false, allowed: false }; }
+  messages?: { fetch: (options: unknown, cacheOptions?: unknown) => Promise<unknown> };
 }
 
 export function assertPublicThread(channel: ThreadChannel | null, binding: ThreadBinding, threadId: string, user: unknown): asserts channel is ThreadChannel {
@@ -44,7 +45,7 @@ interface ThreadStateOwner {
   getBinding(id: string): ThreadBinding | null;
   getMessageRoute(id: string): ThreadRoute | null;
   getThreadEnrollment(id: string): ThreadEnrollment | null;
-  enrollThread(input: { threadId: string; parentChannelId: string; guildId: string }, binding: ThreadBinding): unknown;
+  enrollThread(input: { threadId: string; parentChannelId: string; guildId: string; adoptionCutoff?: string | null }, binding: ThreadBinding): unknown;
   setThreadBaseline(id: string, latestId: string | null, binding: ThreadBinding, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
   markThreadBoundary(id: string, state: ThreadState, detail: string, from: string | null, to: string | null, binding: ThreadBinding, coverageId?: string | null, lastSeenBaselineId?: string | null, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
   checkpointThread(id: string, coverage: string, binding: ThreadBinding, expectedEnrollment?: ThreadEnrollment | null): ThreadEnrollment | null;
@@ -74,20 +75,41 @@ interface ThreadGateway {
 
 type WaitOperation = <T>(operation: () => Promise<T>, signal: AbortSignal, deadline: number) => Promise<T>;
 const compareIds = (a: string, b: string) => BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0;
+const isRetryableThreadBoundary = (enrollment: ThreadEnrollment) => isRetryableIntakeBoundary({
+  state: enrollment.state,
+  detail: enrollment.detail,
+  gap_from: enrollment.gapFrom,
+  gap_to: enrollment.gapTo,
+  recovered_through_id: enrollment.recoveredThroughId
+});
 
 export async function enrollPublicThread(state: ThreadStateOwner, client: ThreadGateway['client'], parentId: string, threadId: string, signal?: AbortSignal) {
   if (signal?.aborted) throw new Error('Thread enrollment stopped');
   const binding = state.getBinding(parentId);
   if (!binding?.active) throw new Error('Thread parent requires an active binding');
-  const { ChannelType } = discord();
-  const parent = await client.channels.fetch(parentId);
-  if (parent?.type !== ChannelType.GuildText || parent.guildId !== binding.guildId) {
-    throw new Error('Thread parent must be the bound public text channel');
+  const existing = state.getThreadEnrollment(threadId);
+  // Already-active reuse performs no new history read and no rebaseline. It still
+  // converges on the single authoritative enrollment transaction below so the state
+  // owner revalidates parent/guild identity and the captured binding generation
+  // atomically instead of the public helper short-circuiting those checks.
+  let adoptionCutoff: string | null = null;
+  if (!existing?.active) {
+    const { ChannelType } = discord();
+    const parent = await client.channels.fetch(parentId);
+    if (parent?.type !== ChannelType.GuildText || parent.guildId !== binding.guildId) {
+      throw new Error('Thread parent must be the bound public text channel');
+    }
+    const thread = await client.channels.fetch(threadId);
+    assertPublicThread(thread, binding, threadId, client.user);
+    if (signal?.aborted) throw new Error('Thread enrollment stopped');
+    // The child must acquire its OWN permission-qualified history boundary before the
+    // enrollment transaction can insert an active binding.
+    adoptionCutoff = await readAdoptionCutoff(thread, threadId, client.user, signal);
   }
-  const thread = await client.channels.fetch(threadId);
-  assertPublicThread(thread, binding, threadId, client.user);
-  if (signal?.aborted) throw new Error('Thread enrollment stopped');
-  const enrollment = state.enrollThread({ threadId, parentChannelId: parentId, guildId: binding.guildId }, binding);
+  const enrollment = state.enrollThread(
+    { threadId, parentChannelId: parentId, guildId: binding.guildId, adoptionCutoff },
+    binding
+  );
   if (!enrollment) throw new Error('Thread parent binding changed during enrollment');
   return enrollment;
 }
@@ -101,8 +123,7 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   const parent = gateway.state.getMessageRoute(enrollment.parentChannelId);
   if (!parent?.ready) return false;
   const binding = parent.binding;
-  const retryableBoundary = enrollment.adoptedAt != null &&
-    isRetryableFetchBoundary(enrollment.state, enrollment.detail);
+  const retryableBoundary = isRetryableThreadBoundary(enrollment);
   const preAdoptionRetryBoundary = isPreAdoptionRetryableThread(enrollment);
   const retryableHold = retryableBoundary || preAdoptionRetryBoundary;
   if (!checkpointOnly && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].some(state => state === enrollment.state) &&
@@ -140,7 +161,10 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
   try {
     const channel = await wait(() => {
       if (!checkpointOnly) {
-        const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery in progress', null);
+        const detail = retryableHold
+          ? retryPendingBoundaryDetail('thread history recovery', enrollment)
+          : 'Thread history recovery in progress';
+        const pending = boundary(THREAD_STATES.PENDING, detail, null);
         if (!pending) throw stale();
       }
       recoveryAttempted = true;
@@ -168,10 +192,27 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
       const liveLastSeenId = gateway.state.getThreadEnrollment(enrollment.threadId)?.lastSeenId || null;
       let newest = fetchedNewest || liveLastSeenId;
       if (fetchedNewest && liveLastSeenId && compareIds(liveLastSeenId, fetchedNewest) > 0) newest = liveLastSeenId;
+      if (newest && refusesUnqualifiedBaseline({ coveredCursor: enrollment.recoveredThroughId })) {
+        // Gate the baseline COMMIT, not just retry eligibility: the failed attempt
+        // left no covered historical cursor and the candidate cutoff would exclude
+        // unadmitted history, so keep the route visibly held pending instead of
+        // adopting a fresh history-only message as the newest exclusion cutoff.
+        boundary(THREAD_STATES.PENDING,
+          retryPendingBoundaryDetail('thread baseline refused without historical coverage', ownedEnrollment), null);
+        return false;
+      }
       const baselineEnrollment = gateway.state.setThreadBaseline(enrollment.threadId, newest, binding, ownedEnrollment);
       if (!baselineEnrollment) return false;
       ownedEnrollment = baselineEnrollment;
       after = baselineEnrollment.recoveredThroughId;
+    } else if (enrollment.adoptedThroughId === null && enrollment.recoveredThroughId === null) {
+      const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery pending before first fetch', null);
+      if (!pending) return false;
+      const baselineEnrollment = gateway.state.setThreadBaseline(enrollment.threadId, '0', binding, pending);
+      if (!baselineEnrollment) return false;
+      ownedEnrollment = baselineEnrollment;
+      after = baselineEnrollment.recoveredThroughId;
+      checkpointOnly = false;
     }
     let pages = 0;
     let total = 0;
@@ -269,12 +310,19 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
           const pending = boundary(THREAD_STATES.PENDING, 'Thread history recovery pending before first fetch', null);
           if (!pending) return false;
         }
+        if (retryableHold && gateway.recoverTransport) {
+          void gateway.recoverTransport(
+            'thread history recovery deadline retry',
+            epoch,
+            new Set([enrollment.threadId])
+          ).catch(() => {});
+        }
         return false;
       }
       if (recoveryKind === 'stale') {
         const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
         const retryable = currentEnrollment?.active && (
-          isRetryableFetchBoundary(currentEnrollment.state, currentEnrollment.detail) ||
+          isRetryableThreadBoundary(currentEnrollment) ||
           isPreAdoptionRetryableThread(currentEnrollment)
         );
         if (retryable && gateway.recoverTransport) {
@@ -282,17 +330,17 @@ export async function recoverThread(gateway: ThreadGateway, enrollment: ThreadEn
         }
         return false;
       }
-      const detail = error instanceof Error ? error.message : String(error);
+      const classified = classifyRecoveryFailure(error);
+      const detail = classified.detail;
       const currentEnrollment = gateway.state.getThreadEnrollment(enrollment.threadId);
       if (!currentEnrollment?.active || currentEnrollment.state === THREAD_STATES.GAP || currentEnrollment.state === THREAD_STATES.UNAVAILABLE || currentEnrollment.state === THREAD_STATES.READY) {
         return false;
       }
       ownedEnrollment = currentEnrollment;
       const preAdoptionRetry = !currentEnrollment.adoptedAt &&
-        isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
-      let nextState: ThreadState = THREAD_STATES.UNAVAILABLE;
-      if (deadlineReached) nextState = THREAD_STATES.GAP;
-      else if (preAdoptionRetry) nextState = THREAD_STATES.PENDING;
+        isRetryableHttp503Boundary(THREAD_STATES.UNAVAILABLE, detail);
+      let nextState: ThreadState = classified.state;
+      if (preAdoptionRetry) nextState = THREAD_STATES.PENDING;
       boundary(nextState, detail, after);
     }
     return false;

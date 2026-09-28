@@ -105,7 +105,7 @@ const { createMonitorMcp, monitorEvent } = require('../src/claude-monitor');
 function enrollChild(state, parent, threadId, baseline = '7000') {
   let binding = state.getBinding(parent.channelId);
   binding = state.setBindingReadiness(parent.channelId, READINESS.READY, 'fixture ready', binding);
-  state.enrollThread({ threadId, parentChannelId: parent.channelId, guildId: parent.guildId }, binding);
+  state.enrollThread({ threadId, parentChannelId: parent.channelId, guildId: parent.guildId, adoptionCutoff: '100'}, binding);
   if (baseline !== null) state.setThreadBaseline(threadId, baseline, binding);
   state.markThreadBoundary(threadId, THREAD_STATES.READY, 'fixture adoption', null, null, binding);
   return { ...parent, channelId: threadId, generation: binding.generation };
@@ -117,7 +117,7 @@ test('durable agent intake survives reopen, preserves provenance and deduplicate
   let state = new SurfaceState(db);
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') }, { intakeCutoff: '100' });
     const destination = enrollChild(state, target, '103', null);
     const addressed = { ...packet, target: destination };
     const event = { id: '1001', guildId: destination.guildId, channelId: destination.channelId, authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(addressed, token) };
@@ -145,10 +145,10 @@ test('agent packet dedupe compares the full source and target route', () => {
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-route-dedupe.sock' });
+    state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-route-dedupe.sock' }, { intakeCutoff: '100' });
     const binding = state.getBinding(target.channelId);
     for (const threadId of ['103', '104']) {
-      state.enrollThread({ threadId, parentChannelId: target.channelId, guildId: target.guildId }, binding);
+      state.enrollThread({ threadId, parentChannelId: target.channelId, guildId: target.guildId, adoptionCutoff: '100'}, binding);
       state.setThreadBaseline(threadId, '8000', binding);
       state.markThreadBoundary(threadId, THREAD_STATES.READY, 'fixture adoption', null, null, binding);
     }
@@ -186,7 +186,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
   };
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') }, { intakeCutoff: '100' });
     const destination = enrollChild(state, target, '103', null);
     const resultPacket = {
       ...packet,
@@ -196,7 +196,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
       replyTo: packet.id,
       text: 'Result body from the authenticated sender.'
     };
-    const agentId = 'agent-monitor-result';
+    const agentId = '9000';
     const agentEvent = {
       id: agentId,
       guildId: destination.guildId,
@@ -230,7 +230,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
     fs.chmodSync(path.dirname(oldPayloadPath), 0o700);
     fs.writeFileSync(oldPayloadPath, oldPayloadText, { mode: 0o600 });
 
-    const humanId = 'human-monitor';
+    const humanId = '9001';
     assert.equal(state.acceptDiscordMessage({
       id: humanId,
       guildId: destination.guildId,
@@ -308,16 +308,16 @@ test('explicit sender posts one authenticated packet to recipient and retains so
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
-    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') });
+    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') }, { intakeCutoff: '100' });
     let sourceBinding = state.getBinding(source.channelId);
     sourceBinding = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', sourceBinding);
-    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, sourceBinding);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId, adoptionCutoff: '4000'}, sourceBinding);
     state.setThreadBaseline('103', '4000', sourceBinding);
     state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, sourceBinding);
     let targetBinding = state.getBinding(target.channelId);
     targetBinding = state.setBindingReadiness(target.channelId, READINESS.READY, 'fixture ready', targetBinding);
-    state.enrollThread({ threadId: '202', parentChannelId: target.channelId, guildId: target.guildId }, targetBinding);
+    state.enrollThread({ threadId: '202', parentChannelId: target.channelId, guildId: target.guildId, adoptionCutoff: '4000'}, targetBinding);
     state.setThreadBaseline('202', '4000', targetBinding);
     state.markThreadBoundary('202', THREAD_STATES.READY, 'fixture adoption', null, null, targetBinding);
     const destination = { ...target, channelId: '202', generation: targetBinding.generation };
@@ -366,13 +366,13 @@ test('explicit sender uses an enrolled child as its signed source address', asyn
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     let parent = state.getBinding(source.channelId);
     parent = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', parent);
-    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, parent);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId, adoptionCutoff: '7000'}, parent);
     state.setThreadBaseline('103', '7000', parent);
     state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, parent);
-    state.enrollThread({ threadId: '104', parentChannelId: source.channelId, guildId: source.guildId }, parent);
+    state.enrollThread({ threadId: '104', parentChannelId: source.channelId, guildId: source.guildId, adoptionCutoff: '7000'}, parent);
     state.setThreadBaseline('104', '7000', parent);
     state.markThreadBoundary('104', THREAD_STATES.READY, 'fixture adoption', null, null, parent);
     const textFile = path.join(dir, 'task.txt');
@@ -411,10 +411,10 @@ test('child outbound unknown stays child-specific across SQLite reopen', async t
   let state = new SurfaceState(db);
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     let parent = state.getBinding(source.channelId);
     parent = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', parent);
-    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, parent);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId, adoptionCutoff: '7000'}, parent);
     state.setThreadBaseline('103', '7000', parent);
     state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, parent);
     const childTarget = { ...target, channelId: '202' };
@@ -464,8 +464,8 @@ test('public destination export routes across separate installation databases', 
     const secretFile = path.join(dir, 'secret');
     fs.writeFileSync(secretFile, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
     for (const store of [state, receiver]) store.setConfig({ operatorId: '900', guildId: source.guildId, secretFile });
-    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' });
-    receiver.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock'), conductorId: 'target-conductor', repoKey: 'repo:target' });
+    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
+    receiver.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock'), conductorId: 'target-conductor', repoKey: 'repo:target' }, { intakeCutoff: '100' });
     const sourceChild = enrollChild(state, source, '103');
     const targetChild = enrollChild(receiver, target, '203', '5000');
     const binding = receiver.getBinding(target.channelId);
@@ -506,11 +506,11 @@ test('public child destination export preserves parent authority across installa
     const secretFile = path.join(dir, 'secret');
     fs.writeFileSync(secretFile, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
     for (const store of [state, receiver]) store.setConfig({ operatorId: '900', guildId: source.guildId, secretFile });
-    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' });
-    receiver.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-child-target.sock', conductorId: 'target-conductor', repoKey: 'repo:target' });
+    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
+    receiver.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-child-target.sock', conductorId: 'target-conductor', repoKey: 'repo:target' }, { intakeCutoff: '100' });
     const sourceChild = enrollChild(state, source, '105');
     const binding = receiver.getBinding(target.channelId);
-    receiver.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId }, binding);
+    receiver.enrollThread({ threadId: '103', parentChannelId: target.channelId, guildId: target.guildId, adoptionCutoff: '5000'}, binding);
     receiver.setThreadBaseline('103', '5000', binding);
     receiver.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
     const cli = path.resolve(__dirname, '../src/cli.js');
@@ -549,8 +549,8 @@ test('agent sender rejects a channel outside the declared destination guild befo
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
-    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') });
+    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') }, { intakeCutoff: '100' });
     const sourceChild = enrollChild(state, source, '103');
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
@@ -572,7 +572,7 @@ test('agent sender retries after a destination lookup failure classified as unse
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     const sourceChild = enrollChild(state, source, '103');
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
@@ -608,8 +608,8 @@ test('agent nonces include source and destination identity', async () => {
     const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
     try {
       state.setConfig({ operatorId: '900', guildId: testCase.source.guildId, secretFile: path.join(dir, 'secret') });
-      state.bind({ ...testCase.source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
-      state.bind({ ...testCase.target, workspace: dir, endpoint: path.join(dir, 'target.sock') });
+      state.bind({ ...testCase.source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
+      state.bind({ ...testCase.target, workspace: dir, endpoint: path.join(dir, 'target.sock') }, { intakeCutoff: '100' });
       const sourceChild = enrollChild(state, testCase.source, String(201 + index));
       const destination = { ...testCase.target, generation: state.getBinding(testCase.target.channelId).generation };
       const textFile = path.join(dir, 'task.txt');
@@ -633,7 +633,7 @@ test('history consumer verifies credential before durable intake', async () => {
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'claude.sock') }, { intakeCutoff: '100' });
     const destination = enrollChild(state, target, '103', null);
     const consumer = createSurfaceConsumer({ state, providers: {}, agentCredential: () => token });
     const content = encodeAgentMessage({ ...packet, target: destination }, token);
@@ -654,16 +654,16 @@ test('public agent-send command reaches authenticated outbound transport', () =>
     const secret = path.join(dir, 'secret');
     fs.writeFileSync(secret, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secret });
-    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' });
-    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') });
+    state.bind({ ...source, workspace: dir, conductorId: 'test-conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock') }, { intakeCutoff: '100' });
     let sourceBinding = state.getBinding(source.channelId);
     sourceBinding = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', sourceBinding);
-    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, sourceBinding);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId, adoptionCutoff: '7000'}, sourceBinding);
     state.setThreadBaseline('103', '7000', sourceBinding);
     state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, sourceBinding);
     let targetBinding = state.getBinding(target.channelId);
     targetBinding = state.setBindingReadiness(target.channelId, READINESS.READY, 'fixture ready', targetBinding);
-    state.enrollThread({ threadId: '202', parentChannelId: target.channelId, guildId: target.guildId }, targetBinding);
+    state.enrollThread({ threadId: '202', parentChannelId: target.channelId, guildId: target.guildId, adoptionCutoff: '7000'}, targetBinding);
     state.setThreadBaseline('202', '7000', targetBinding);
     state.markThreadBoundary('202', THREAD_STATES.READY, 'fixture adoption', null, null, targetBinding);
     const destination = path.join(dir, 'destination.json');
@@ -749,8 +749,8 @@ test('agent routes refuse the parent channel before custody or network access', 
     const secretFile = path.join(dir, 'secret');
     fs.writeFileSync(secretFile, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secretFile });
-    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:source' });
-    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock'), conductorId: 'target-conductor', repoKey: 'repo:target' });
+    state.bind({ ...source, workspace: dir, conductorId: 'source-conductor', repoKey: 'repo:source' }, { intakeCutoff: '100' });
+    state.bind({ ...target, workspace: dir, endpoint: path.join(dir, 'target.sock'), conductorId: 'target-conductor', repoKey: 'repo:target' }, { intakeCutoff: '100' });
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
     let fetches = 0;
@@ -787,7 +787,7 @@ test('retries return pre-upgrade parent-sourced outcomes without child migration
     const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
     try {
       state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-      state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+      state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
       const requestId = `legacy-${outcome}`;
       const legacyPacket = { ...packet, id: requestId, source, target };
       const attempt = {
@@ -820,7 +820,7 @@ test('retryable pre-upgrade custody requires a child route before resend', async
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     const requestId = 'legacy-not-sent';
     const legacyPacket = { ...packet, id: requestId, source, target };
     const attempt = {
@@ -850,7 +850,7 @@ test('invalid destination proof refuses before custody and source revocation dur
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     const sourceChild = enrollChild(state, source, '103');
     const textFile = path.join(dir, 'task.txt');
     fs.writeFileSync(textFile, packet.text);
@@ -879,10 +879,10 @@ test('source child revocation after destination lookup refuses before custody or
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     let binding = state.getBinding(source.channelId);
     binding = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', binding);
-    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, binding);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId, adoptionCutoff: '7000'}, binding);
     state.setThreadBaseline('103', '7000', binding);
     state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
     const textFile = path.join(dir, 'task.txt');
@@ -907,10 +907,10 @@ test('source child revocation after rejected destination lookup records stale cu
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     let binding = state.getBinding(source.channelId);
     binding = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', binding);
-    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, binding);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId, adoptionCutoff: '7000'}, binding);
     state.setThreadBaseline('103', '7000', binding);
     state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
     const textFile = path.join(dir, 'task.txt');
@@ -938,7 +938,7 @@ test('results reverse an accepted request and reject unrelated or unknown correl
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     const sourceChild = enrollChild(state, source, '103');
     const request = { ...packet, source: target, target: sourceChild };
     const intake = state.acceptDiscordMessage({ id: '8100', guildId: source.guildId, channelId: sourceChild.channelId,
@@ -975,7 +975,7 @@ test('results can answer a parent-targeted request accepted before child routing
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     const request = { ...packet, id: 'legacy-parent-request', source: target, target: source };
     const binding = state.getBinding(source.channelId);
     const content = encodeAgentMessage(request, token);
@@ -1025,18 +1025,18 @@ test('child result correlation returns to the peer child address', async () => {
   const receiver = new SurfaceState(path.join(dir, 'peer.sqlite'));
   try {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
-    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     let binding = state.getBinding(source.channelId);
     binding = state.setBindingReadiness(source.channelId, READINESS.READY, 'fixture ready', binding);
-    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, binding);
+    state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId, adoptionCutoff: '8000'}, binding);
     state.setThreadBaseline('103', '8000', binding);
     state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture adoption', null, null, binding);
     const localChild = { ...source, channelId: '103', generation: binding.generation };
     const peerChild = { ...target, channelId: '202' };
     receiver.setConfig({ operatorId: '900', guildId: peerChild.guildId, secretFile: path.join(dir, 'secret') });
-    receiver.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-result-peer.sock', conductorId: 'peer', repoKey: 'repo:peer' });
+    receiver.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-result-peer.sock', conductorId: 'peer', repoKey: 'repo:peer' }, { intakeCutoff: '100' });
     const peerBinding = receiver.getBinding(target.channelId);
-    receiver.enrollThread({ threadId: peerChild.channelId, parentChannelId: target.channelId, guildId: peerChild.guildId }, peerBinding);
+    receiver.enrollThread({ threadId: peerChild.channelId, parentChannelId: target.channelId, guildId: peerChild.guildId, adoptionCutoff: '8000'}, peerBinding);
     receiver.setThreadBaseline(peerChild.channelId, '8000', peerBinding);
     receiver.markThreadBoundary(peerChild.channelId, THREAD_STATES.READY, 'fixture adoption', null, null, peerBinding);
     const request = { ...packet, source: peerChild, target: localChild };
@@ -1077,7 +1077,7 @@ test('CLI lets a receipt-bound v1 retry reach legacy custody before v2 validatio
   try {
     fs.writeFileSync(secret, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secret });
-    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     const requestId = 'cli-legacy-retry';
     const legacyPacket = { ...packet, id: requestId, source, target };
     const attempt = {
@@ -1113,7 +1113,7 @@ test('an interrupted v1 retry recovers before v2 validation without posting', as
   try {
     fs.writeFileSync(secret, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: secret });
-    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' });
+    state.bind({ ...source, workspace: dir, conductorId: 'fixture', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
     const requestId = 'cli-legacy-interrupted';
     const legacyPacket = { ...packet, id: requestId, source, target };
     state.receipt(null, 'direct-post-attempt', {

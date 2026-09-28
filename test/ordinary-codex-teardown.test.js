@@ -110,7 +110,7 @@ test('ordinary unbind fences remote intake before revoking custody', async t => 
   const binding = setup.bindOrdinary({
     channelId: '123456789012345680', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir
-  }, { sessionId: CODEX, threadId: CODEX });
+  }, { sessionId: CODEX, threadId: CODEX }, '100');
   setup.recordOrdinaryPreflight(binding, {
     file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir
   });
@@ -167,7 +167,7 @@ test('aborted ordinary unbind restores intake and wakes the Gateway', async t =>
   const binding = setup.bindOrdinary({
     channelId: '123456789012345680', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir
-  }, { sessionId: CODEX, threadId: CODEX });
+  }, { sessionId: CODEX, threadId: CODEX }, '100');
   setup.recordOrdinaryPreflight(binding, {
     file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir
   });

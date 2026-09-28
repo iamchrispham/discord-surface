@@ -79,7 +79,8 @@ test('inventory destination child gap is diagnostic and read-only', async t => {
 
 test('inventory excludes inactive and foreign guild bindings', async t => {
   const f = fixture(t); f.enroll('102'); addRecipient(f);
-  f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: '33333333-3333-3333-3333-333333333333', workspace: '/tmp' });
+  f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: '33333333-3333-3333-3333-333333333333', workspace: '/tmp' }, { intakeCutoff: '100' });
+  f.state.markIntakeBoundary('301', 'ready', 'fixture history recovered');
   f.state.setBindingReadiness('301', READINESS.READY, 'fixture', f.state.getBinding('301'));
   f.state.unbind('301');
   assert.equal(f.state.getBinding('301').active, false);

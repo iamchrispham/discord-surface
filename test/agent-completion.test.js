@@ -99,15 +99,15 @@ test('agent retry preserves a predecessor journal without inventing completion e
 });
 
 function bindAgentOwners(state, dir) {
-  state.bind({ ...source, workspace: dir, conductorId: 'a2-source', repoKey: 'repo:a2-source' });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-a2-target.sock', conductorId: 'a2-target', repoKey: 'repo:a2-target' });
+  state.bind({ ...source, workspace: dir, conductorId: 'a2-source', repoKey: 'repo:a2-source' }, { intakeCutoff: '100' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-a2-target.sock', conductorId: 'a2-target', repoKey: 'repo:a2-target' }, { intakeCutoff: '100' });
   let sourceBinding = state.getBinding(source.channelId);
   let targetBinding = state.getBinding(target.channelId);
   sourceBinding = state.setBindingReadiness(source.channelId, READINESS.READY, 'A2 fixture ready', sourceBinding);
   targetBinding = state.setBindingReadiness(target.channelId, READINESS.READY, 'A2 fixture ready', targetBinding);
-  state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId }, sourceBinding);
+  state.enrollThread({ threadId: '103', parentChannelId: source.channelId, guildId: source.guildId, adoptionCutoff: '100'}, sourceBinding);
   state.markThreadBoundary('103', THREAD_STATES.READY, 'A2 fixture child ready', null, null, sourceBinding);
-  state.enrollThread({ threadId: '104', parentChannelId: target.channelId, guildId: target.guildId }, targetBinding);
+  state.enrollThread({ threadId: '104', parentChannelId: target.channelId, guildId: target.guildId, adoptionCutoff: '100'}, targetBinding);
   state.markThreadBoundary('104', THREAD_STATES.READY, 'A2 fixture child ready', null, null, targetBinding);
   return {
     source: { ...source, generation: sourceBinding.generation },
@@ -127,7 +127,7 @@ test('authenticated agent result reaches an explicit no-post terminal state', ()
       id: 'a2-result', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'remote-request', text: 'Authenticated result.'
     };
-    const messageId = 'a2-result-event';
+    const messageId = '1001';
     const intake = state.acceptDiscordMessage({
       id: messageId, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(resultPacket, token)
@@ -182,7 +182,7 @@ test('agent completion refuses native file custody admitted before reply record'
     const owners = bindAgentOwners(state, dir);
     const packet = { id: 'a2-file-result', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'remote-request', text: 'File result.' };
-    const messageId = 'a2-file-result-event';
+    const messageId = '1002';
     assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
     assert.equal(state.claimDispatch(messageId).claimed, true);
@@ -207,7 +207,7 @@ test('agent completion fails closed on malformed native file custody', () => {
     const owners = bindAgentOwners(state, dir);
     const packet = { id: 'a2-corrupt-file-result', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'remote-request', text: 'Corrupt file result.' };
-    const messageId = 'a2-corrupt-file-result-event';
+    const messageId = '1003';
     assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
     assert.equal(state.claimDispatch(messageId).claimed, true);
@@ -230,7 +230,7 @@ test('agent request completion requires a full reversed result receipt', () => {
     state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
     const owners = bindAgentOwners(state, dir);
     const request = { id: 'a2-request', kind: KINDS.REQUEST, source: owners.sourceChild, target: owners.targetChild, replyTo: null, text: 'Handle this request.' };
-    const requestMessageId = 'a2-request-event';
+    const requestMessageId = '1004';
     assert.equal(state.acceptDiscordMessage({
       id: requestMessageId, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(request, token)
@@ -248,7 +248,7 @@ test('agent request completion requires a full reversed result receipt', () => {
       replyTo: 'a2-different-request', text: 'Unrelated result.'
     };
     assert.equal(state.acceptDiscordMessage({
-      id: 'a2-wrong-reply-event', guildId: owners.sourceChild.guildId, channelId: owners.sourceChild.channelId,
+      id: '1005', guildId: owners.sourceChild.guildId, channelId: owners.sourceChild.channelId,
       authorId: '902', isBot: true, attachments: [], content: encodeAgentMessage(wrongReply, token)
     }, { agentToken: token }).accepted, true);
     assert.throws(() => state.completeAgentHandledWithoutPost({
@@ -259,7 +259,7 @@ test('agent request completion requires a full reversed result receipt', () => {
       id: 'a2-received-result', kind: KINDS.RESULT, source: owners.targetChild, target: owners.sourceChild,
       replyTo: request.id, text: 'The request is complete.'
     };
-    const resultMessageId = 'a2-received-result-event';
+    const resultMessageId = '1008';
     assert.equal(state.acceptDiscordMessage({
       id: resultMessageId, guildId: owners.sourceChild.guildId, channelId: owners.sourceChild.channelId,
       authorId: '902', isBot: true, attachments: [], content: encodeAgentMessage(result, token)
@@ -428,7 +428,7 @@ test('no-post completion releases a queued same-owner message through the wake p
           async dispatch(message) { dispatches.push(message.id); return { status: 'submitted' }; },
           observe(message, _outcome, { signal }) {
             observations.push(message.id);
-            if (message.id !== 'a2-queue-first-event') return { text: 'Second native answer.' };
+            if (message.id !== '1006') return { text: 'Second native answer.' };
             firstObserveStartedResolve();
             return new Promise(resolve => {
               releaseFirstObserve = resolve;
@@ -443,24 +443,24 @@ test('no-post completion releases a queued same-owner message through the wake p
     });
     const eventFor = (id, value) => ({ id, guildId: owners.targetChild.guildId, channelId: owners.targetChild.channelId,
       author: { id: '901', bot: true }, content: encodeAgentMessage(value, token), attachments: [], channel: {} });
-    const first = consumer.handleMessage(eventFor('a2-queue-first-event', firstPacket));
+    const first = consumer.handleMessage(eventFor('1006', firstPacket));
     await firstObserveStarted;
-    const firstMessage = state.getMessage('a2-queue-first-event');
+    const firstMessage = state.getMessage('1006');
     recordNativeAcknowledgment(state, { provider: owners.target.provider, messageId: firstMessage.id,
       nativeId: owners.target.nativeId, generation: owners.target.generation });
-    const second = consumer.handleMessage(eventFor('a2-queue-second-event', secondPacket));
+    const second = consumer.handleMessage(eventFor('1007', secondPacket));
     await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(dispatches, ['a2-queue-first-event']);
+    assert.deepEqual(dispatches, ['1006']);
     state.completeAgentHandledWithoutPost({ messageId: firstMessage.id, provider: owners.target.provider,
       nativeId: owners.target.nativeId, generation: owners.target.generation });
     assert.equal(consumer.releaseHandledWithoutPost(), false);
     for (let attempt = 0; attempt < 100 && dispatches.length < 2; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
-    assert.deepEqual(dispatches, ['a2-queue-first-event', 'a2-queue-second-event']);
+    assert.deepEqual(dispatches, ['1006', '1007']);
     const secondResult = await second;
     assert.equal(secondResult.message.state, MESSAGE_STATES.REPLIED);
     assert.equal(state.getMessage(firstMessage.id).state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
-    assert.deepEqual(observations, ['a2-queue-first-event', 'a2-queue-second-event']);
-    assert.deepEqual(replies, ['a2-queue-second-event']);
+    assert.deepEqual(observations, ['1006', '1007']);
+    assert.deepEqual(replies, ['1007']);
     releaseFirstObserve?.({ stopped: true });
     await first;
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
@@ -479,18 +479,18 @@ test('handled completion leaves later accepted owner work recoverable after rest
       replyTo: 'restart-first-request', text: 'First result is consumed.' };
     const secondPacket = { id: 'a2-restart-second', kind: KINDS.RESULT, source: owners.sourceChild, target: owners.targetChild,
       replyTo: 'restart-second-request', text: 'Second result remains queued.' };
-    assert.equal(state.acceptDiscordMessage(eventFor('a2-restart-first-event', firstPacket), { agentToken: token }).accepted, true);
-    assert.equal(state.acceptDiscordMessage(eventFor('a2-restart-second-event', secondPacket), { agentToken: token }).accepted, true);
-    assert.equal(state.claimDispatch('a2-restart-first-event').claimed, true);
-    state.markSubmitted('a2-restart-first-event');
-    recordNativeAcknowledgment(state, { provider: owners.target.provider, messageId: 'a2-restart-first-event',
+    assert.equal(state.acceptDiscordMessage(eventFor('1009', firstPacket), { agentToken: token }).accepted, true);
+    assert.equal(state.acceptDiscordMessage(eventFor('1011', secondPacket), { agentToken: token }).accepted, true);
+    assert.equal(state.claimDispatch('1009').claimed, true);
+    state.markSubmitted('1009');
+    recordNativeAcknowledgment(state, { provider: owners.target.provider, messageId: '1009',
       nativeId: owners.target.nativeId, generation: owners.target.generation });
-    state.completeAgentHandledWithoutPost({ messageId: 'a2-restart-first-event', provider: owners.target.provider,
+    state.completeAgentHandledWithoutPost({ messageId: '1009', provider: owners.target.provider,
       nativeId: owners.target.nativeId, generation: owners.target.generation });
-    assert.deepEqual(state.recoveryCandidates().map(message => message.id), ['a2-restart-second-event']);
+    assert.deepEqual(state.recoveryCandidates().map(message => message.id), ['1011']);
     state.close();
     state = new SurfaceState(db);
-    assert.deepEqual(state.recoveryCandidates().map(message => message.id), ['a2-restart-second-event']);
+    assert.deepEqual(state.recoveryCandidates().map(message => message.id), ['1011']);
   } finally { state?.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -517,7 +517,7 @@ test('agent completion stays eligible after newest capacity refusal cleanup and 
           ...owners.target, operatorId: '900', inReplyTo: null, ...ownerIdentity
         });
       }
-      const messageId = 'released-refusal-result-event';
+      const messageId = '1010';
       const packet = { id: 'released-refusal-result', kind: KINDS.RESULT,
         source: owners.sourceChild, target: owners.targetChild, replyTo: 'remote-request', text: 'Result.' };
       assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.targetChild.guildId,

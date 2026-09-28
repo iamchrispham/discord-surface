@@ -40,10 +40,10 @@ function fixture() {
   const db = path.join(dir, 'surface.sqlite');
   const state = new SurfaceState(db);
   state.setConfig({ operatorId: '900', guildId: owner.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...owner, workspace: dir, endpoint: path.join(dir, 'claude.sock'), conductorId: 'watcher-conductor', repoKey: 'repo:watcher' });
+  state.bind({ ...owner, workspace: dir, endpoint: path.join(dir, 'claude.sock'), conductorId: 'watcher-conductor', repoKey: 'repo:watcher' }, { intakeCutoff: '100' });
   let binding = state.getBinding(owner.channelId);
   binding = state.setBindingReadiness(owner.channelId, READINESS.READY, 'watcher fixture ready', binding);
-  state.enrollThread({ threadId: child.channelId, parentChannelId: owner.channelId, guildId: owner.guildId }, binding);
+  state.enrollThread({ threadId: child.channelId, parentChannelId: owner.channelId, guildId: owner.guildId , adoptionCutoff: '100'}, binding);
   state.setThreadBaseline(child.channelId, '1000', binding);
   state.markThreadBoundary(child.channelId, THREAD_STATES.READY, 'watcher fixture adopted', null, null, binding);
   return { dir, db, state, binding, armKey: 'watcher-arm-fixture' };

@@ -26,14 +26,18 @@ function makeFixture(t) {
   t.after(() => { state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ guildId: '100', operatorId: '900', secretFile: path.join(dir, 'secret') });
   state.bind({ guildId: '100', channelId: '101', provider: 'claude', nativeId: SOURCE_NATIVE_ID, workspace: dir,
-    endpoint: path.join(dir, 'channel.sock'), conductorId: 'test-conductor', repoKey: 'github.com/test/repo' });
+    endpoint: path.join(dir, 'channel.sock'), conductorId: 'test-conductor', repoKey: 'github.com/test/repo' }, { intakeCutoff: '100' });
+  state.markIntakeBoundary('101', 'ready', 'fixture history recovered');
   const source = state.setBindingReadiness('101', READINESS.READY, 'fixture', state.getBinding('101'));
-  state.enrollThread({ threadId: '102', parentChannelId: '101', guildId: '100' }, source);
+  state.enrollThread({ threadId: '102', parentChannelId: '101', guildId: '100', adoptionCutoff: '100' }, source);
+  state.setThreadBaseline('102', '100', source);
   state.markThreadBoundary('102', THREAD_STATES.READY, 'fixture', null, null, source);
   state.bind({ guildId: '100', channelId: '201', provider: 'codex', nativeId: RECIPIENT_NATIVE_ID, workspace: '/tmp',
-    conductorId: 'recipient', repoKey: 'github.com/test/recipient' });
+    conductorId: 'recipient', repoKey: 'github.com/test/recipient' }, { intakeCutoff: '100' });
+  state.markIntakeBoundary('201', 'ready', 'fixture history recovered');
   const recipient = state.setBindingReadiness('201', READINESS.READY, 'fixture', state.getBinding('201'));
-  state.enrollThread({ threadId: '202', parentChannelId: '201', guildId: '100' }, recipient);
+  state.enrollThread({ threadId: '202', parentChannelId: '201', guildId: '100', adoptionCutoff: '100' }, recipient);
+  state.setThreadBaseline('202', '100', recipient);
   state.markThreadBoundary('202', THREAD_STATES.READY, 'fixture', null, null, recipient);
   return { dir, state, source, recipient };
 }
@@ -115,7 +119,7 @@ async function enrollRequest(f, dedupeKey, text) {
   const caller = callerService(f, { fetchImpl: transport.fetchImpl });
   assert.equal((await caller.send({ peer: { conductorId: 'recipient' }, text, dedupe_key: dedupeKey })).status, 'sent');
   assert.equal(transport.posts.length, 1);
-  assert.equal(f.state.acceptDiscordMessage({ id: 'accepted-request', guildId: '100', channelId: '202', authorId: '901',
+  assert.equal(f.state.acceptDiscordMessage({ id: '10004', guildId: '100', channelId: '202', authorId: '901',
     isBot: true, content: transport.posts[0].wire }, { agentToken: 'fixture' }).accepted, true);
   return transport.posts[0].wire;
 }

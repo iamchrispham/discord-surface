@@ -27,8 +27,8 @@ function fixture(t, { ordinary = false } = {}) {
     workspace: dir
   };
   const binding = ordinary
-    ? state.bindOrdinary(input, { sessionId: NATIVE, threadId: NATIVE })
-    : state.bind(input);
+    ? state.bindOrdinary(input, { sessionId: NATIVE, threadId: NATIVE }, '100')
+    : state.bind(input, { intakeCutoff: '100' });
   t.after(() => {
     try { state.close(); } catch {}
     fs.rmSync(dir, { recursive: true, force: true });
@@ -45,7 +45,7 @@ function fixture(t, { ordinary = false } = {}) {
     binding,
     enroll() {
       const enrollment = state.enrollThread(
-        { threadId: 'child', parentChannelId: 'parent', guildId: 'guild' },
+        { threadId: 'child', parentChannelId: 'parent', guildId: 'guild' , adoptionCutoff: '100'},
         state.getBinding('parent')
       );
       return enrollment;
@@ -84,7 +84,7 @@ test('thread enrollment is durable, idempotent, parent-scoped, and readiness-gat
   assert.equal(first.parentChannelId, 'parent');
   assert.equal(f.state.getMessageRoute('child').ready, false);
   assert.deepEqual(f.state.enrollThread(
-    { threadId: 'child', parentChannelId: 'parent', guildId: 'guild' },
+    { threadId: 'child', parentChannelId: 'parent', guildId: 'guild' , adoptionCutoff: '100'},
     f.state.getBinding('parent')
   ), first);
 
@@ -98,7 +98,7 @@ test('thread enrollment is durable, idempotent, parent-scoped, and readiness-gat
   assert.equal(f.state.getReadiness().threadEnrollments[0].threadId, 'child');
 
   assert.equal(f.state.enrollThread(
-    { threadId: 'child', parentChannelId: 'other-parent', guildId: 'guild' },
+    { threadId: 'child', parentChannelId: 'other-parent', guildId: 'guild' , adoptionCutoff: '100'},
     f.state.getBinding('parent')
   ), null);
 });
@@ -123,13 +123,15 @@ test('unbound child stays dark then re-enrolls under the same parent with a fres
     workspace: f.dir
   });
   const reopened = f.state.enrollThread(
-    { threadId: 'child', parentChannelId: 'parent', guildId: 'guild' },
+    { threadId: 'child', parentChannelId: 'parent', guildId: 'guild' , adoptionCutoff: '100'},
     successor
   );
   assert.equal(reopened.active, true);
   assert.equal(reopened.state, THREAD_STATES.PENDING);
-  assert.equal(reopened.adoptedAt, null);
-  assert.equal(reopened.recoveredThroughId, null);
+  // Fresh enrollment commits its own explicit decimal cutoff atomically with the
+  // active row; the "fresh pending boundary" is the pending state, not a null cutoff.
+  assert.ok(reopened.adoptedAt);
+  assert.equal(reopened.recoveredThroughId, '100');
   assert.equal(f.state.getMessageRoute('child').ready, false);
 });
 
@@ -160,9 +162,9 @@ test('authorized parent generation changes preserve active thread routes behind 
     workspace: f.dir,
     conductorId: 'conductor',
     repoKey: 'repo'
-  });
+  }, { intakeCutoff: '100' });
   f.state.enrollThread(
-    { threadId: 'conductor-child', parentChannelId: conductorBinding.channelId, guildId: 'guild' },
+    { threadId: 'conductor-child', parentChannelId: conductorBinding.channelId, guildId: 'guild' , adoptionCutoff: '100'},
     conductorBinding
   );
   f.state.setThreadBaseline('conductor-child', '200', conductorBinding);
@@ -251,7 +253,11 @@ test('child intake records parent authority and child delivery while preserving 
   assert.equal(accepted.message.channelId, 'parent');
   assert.equal(accepted.message.deliveryChannelId, 'child');
   assert.equal(accepted.message.state, MESSAGE_STATES.ACCEPTED);
-  assert.equal(f.state.getIntakeWatermark('parent'), null);
+  // The parent's explicit cutoff commit creates its own intake watermark; child intake
+  // must record custody on the child enrollment without advancing the parent watermark.
+  const parentWatermark = f.state.getIntakeWatermark('parent');
+  assert.equal(parentWatermark.recovered_through_id, '100');
+  assert.equal(parentWatermark.last_seen_id, '100');
 
   const current = f.state.currentMessageBinding(accepted.message);
   assert.equal(current.current, true);
@@ -285,7 +291,7 @@ test('inactive enrollment tombstones do not shadow direct bindings', t => {
     provider: PROVIDERS.CODEX,
     nativeId: SUCCESSOR,
     workspace: f.dir
-  });
+  }, { intakeCutoff: '100' });
   const route = f.state.getMessageRoute('child');
   assert.equal(route.enrollment, null);
   assert.equal(route.binding.channelId, 'child');
@@ -329,7 +335,7 @@ test('pending and failed child routes never demote or substitute the parent', t 
     provider: PROVIDERS.CODEX,
     nativeId: 'f8296579-092b-4503-bf98-1f3c2b6d4913',
     workspace: f.dir
-  }), /already enrolled/);
+  }, { intakeCutoff: '100' }), /already enrolled/);
 });
 
 test('child reconciliation reopens terminal history without losing custody or cursors', t => {
@@ -409,6 +415,10 @@ test('paused child intake preserves source custody without claiming recovery cov
   }
   assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, '100');
   f.state.restoreOrdinaryHandoffIntake('parent', parent);
+  // The explicit bind cutoff leaves the parent watermark in a contended-but-ready
+  // shape; the ordinary readiness gate is the binding readiness, so restore reinstates
+  // the parent's original READY readiness before dispatch may claim.
+  f.state.setBindingReadiness('parent', READINESS.READY, 'restored ordinary intake', parent);
   assert.equal(f.state.claimDispatch('401').claimed, true);
   assert.equal(f.state.claimDispatch('401').claimed, false);
   assert.equal(f.state.acceptDiscordMessage(event('401'), { expectedBinding: parent }).duplicate, true);
@@ -463,7 +473,9 @@ test('ordinary handoff with active thread enrollment requires an observed cutoff
   assert.equal(enrollmentReads, 2);
   f.state.listThreadEnrollments = listThreadEnrollments;
   assert.equal(f.state.getBinding('parent').generation, predecessor.generation);
-  assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, null);
+  // The fresh enrollment already committed its own explicit cutoff atomically, so the
+  // refused no-cutoff handoff must leave that committed coverage untouched.
+  assert.equal(f.state.getThreadEnrollment('child').recoveredThroughId, '100');
 
   const successor = f.state.handoffOrdinary({ ...handoff, intakeCutoff: '150' });
   assert.equal(successor.generation, predecessor.generation + 1);

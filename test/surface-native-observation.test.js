@@ -43,7 +43,7 @@ test('simulated: live Codex consumer keeps observing past the bounded recovery w
   fs.mkdirSync(root, { mode: 0o700 });
   const file = path.join(root, `${CODEX_ID}.jsonl`);
   fs.writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { session_id: CODEX_ID }, timestamp: new Date().toISOString() })}\n`, { mode: 0o600 });
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   let dispatches = 0;
   let sends = 0;
   const provider = new CodexProvider({
@@ -57,16 +57,16 @@ test('simulated: live Codex consumer keeps observing past the bounded recovery w
     sendTransportReceipt: async () => ({ id: 'receipt-live' }),
     sendReply: async () => { sends += 1; return { id: 'reply-live' }; }
   });
-  const pending = consumer.handleMessage(discordMessage({ id: 'live-long-observation', channelId: 'channel-codex' }));
+  const pending = consumer.handleMessage(discordMessage({ id: '101', channelId: 'channel-codex' }));
   await new Promise(resolve => setTimeout(resolve, 70));
-  const marker = '[[discord-surface:live-long-observation]]';
+  const marker = '[[discord-surface:101]]';
   fs.appendFileSync(file, `${JSON.stringify({ type: 'event_msg', payload: { type: 'item_completed', item: { phase: 'final_answer', content: [{ type: 'Text', text: `${marker}\nlive answer` }] } }, timestamp: new Date().toISOString() })}\n`);
   const result = await pending;
   assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
   assert.equal(result.message.replyText, 'live answer');
   assert.equal(dispatches, 1);
   assert.equal(sends, 1);
-  assert.equal(state.getMessage('live-long-observation').observerCursor.offset, fs.statSync(file).size);
+  assert.equal(state.getMessage('101').observerCursor.offset, fs.statSync(file).size);
   state.close();
 });
 
@@ -93,7 +93,7 @@ test('simulated: repeated native polls do not accumulate abort listeners', async
 
 test('simulated: gateway stop cancels the live native observer without redispatch', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   state.markIntakeBoundary('channel-codex', 'ready');
   const client = new EventEmitter();
   client.destroy = async () => {};
@@ -118,19 +118,19 @@ test('simulated: gateway stop cancels the live native observer without redispatc
   });
   gateway.ready = true;
   gateway.started = true;
-  client.emit('messageCreate', discordMessage({ id: 'stop-live-observer', channelId: 'channel-codex' }));
+  client.emit('messageCreate', discordMessage({ id: '102', channelId: 'channel-codex' }));
   for (let attempt = 0; attempt < 100 && observations === 0; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
   assert.equal(observations, 1);
   await gateway.stop();
   assert.equal(stopped, 1);
   assert.equal(dispatches, 1);
-  assert.equal(state.getMessage('stop-live-observer').state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(state.getMessage('102').state, MESSAGE_STATES.SUBMITTED);
   state.close();
 });
 
 test('simulated: reconnect recovery reuses the live observer without starting a duplicate', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
   state.markIntakeBoundary('channel-codex', 'ready');
   const channel = {
@@ -180,7 +180,7 @@ test('simulated: reconnect recovery reuses the live observer without starting a 
 
 test('simulated: live native reply is fenced after operator revocation', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   let release;
   let observations = 0;
   let sends = 0;
@@ -198,13 +198,13 @@ test('simulated: live native reply is fenced after operator revocation', async (
     sendTransportReceipt: async () => ({ id: 'receipt-fenced' }),
     sendReply: async () => { sends += 1; return { id: 'reply-fenced' }; }
   });
-  const pending = consumer.handleMessage(discordMessage({ id: 'revoked-live-reply', channelId: 'channel-codex' }));
+  const pending = consumer.handleMessage(discordMessage({ id: '103', channelId: 'channel-codex' }));
   for (let attempt = 0; attempt < 100 && observations === 0; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
   state.setConfig({ operatorId: 'different-operator', guildId: 'guild-1', secretFile: path.join(dir, 'discord.env') });
   release({ text: 'late native reply' });
   const result = await pending;
   assert.equal(result.status, 'stale-reply');
-  assert.equal(state.getMessage('revoked-live-reply').state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(state.getMessage('103').state, MESSAGE_STATES.SUBMITTED);
   assert.equal(sends, 0);
   state.close();
 });
@@ -214,15 +214,15 @@ test('simulated: unmatched Claude IPC custody is rejected and notification failu
   const socketDir = fs.mkdtempSync(path.join('/tmp', 'discord-surface-uncertain-'));
   fs.chmodSync(socketDir, 0o700);
   const socket = path.join(socketDir, 'channel.sock');
-  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
-  state.acceptDiscordMessage({ id: 'claude-safe', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('claude-safe');
-  state.markSubmitted('claude-safe');
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '104', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('104');
+  state.markSubmitted('104');
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async () => { throw new Error('delivery uncertain'); }, close: async () => {} } });
   await channel.start();
   const unknown = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId: 'unknown-message', generation: 1, content: 'x' });
   assert.equal(unknown.statusCode, 409);
-  const uncertain = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId: 'claude-safe', generation: 1, content: 'x' });
+  const uncertain = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId: '104', generation: 1, content: 'x' });
   assert.equal(uncertain.statusCode, 503);
   await channel.stop();
   await channel.stop();
@@ -235,17 +235,17 @@ test('simulated: persisted Codex cursor resumes a late reply after state restart
   fs.mkdirSync(root, { mode: 0o700 });
   const file = path.join(root, `${CODEX_ID}.jsonl`);
   fs.writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { session_id: CODEX_ID }, timestamp: new Date().toISOString() })}\n`, { mode: 0o600 });
-  fixtureState.state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: fixtureState.dir });
-  fixtureState.state.acceptDiscordMessage({ id: 'late-after-restart', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-  fixtureState.state.claimDispatch('late-after-restart');
+  fixtureState.state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: fixtureState.dir }, { intakeCutoff: '100' });
+  fixtureState.state.acceptDiscordMessage({ id: '105', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  fixtureState.state.claimDispatch('105');
   const cursor = readInitialCursor(CODEX_ID, root);
-  fixtureState.state.markSubmitted('late-after-restart', cursor, '[[discord-surface:late-after-restart]]');
+  fixtureState.state.markSubmitted('105', cursor, '[[discord-surface:105]]');
   fixtureState.state.close();
   const restarted = new SurfaceState(fixtureState.db);
-  const marker = '[[discord-surface:late-after-restart]]';
+  const marker = '[[discord-surface:105]]';
   fs.appendFileSync(file, `${JSON.stringify({ type: 'event_msg', payload: { type: 'item_completed', item: { phase: 'final_answer', content: [{ type: 'Text', text: `${marker}\nlate reply` }] } }, timestamp: new Date().toISOString() })}\n`);
   const provider = new CodexProvider({ root, run: async () => ({ status: 'submitted' }) });
-  const result = await observeSubmitted(restarted, restarted.getMessage('late-after-restart'), provider, { timeoutMs: 500, pollMs: 5 });
+  const result = await observeSubmitted(restarted, restarted.getMessage('105'), provider, { timeoutMs: 500, pollMs: 5 });
   assert.equal(result.message.state, MESSAGE_STATES.REPLY_READY);
   assert.equal(result.message.replyText, 'late reply');
   restarted.close();

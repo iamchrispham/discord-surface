@@ -11,18 +11,22 @@ const { decodeAgentMessage, encodeAgentMessage } = require('../src/agent-message
 const id = '11111111-1111-1111-1111-111111111111';
 function addOrdinaryRecipient(f) {
   f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: '33333333-3333-3333-3333-333333333333',
-    workspace: '/tmp' });
+    workspace: '/tmp' }, { intakeCutoff: '100' });
+  f.state.markIntakeBoundary('301', 'ready', 'fixture history recovered');
   const target = f.state.setBindingReadiness('301', READINESS.READY, 'fixture', f.state.getBinding('301'));
-  f.state.enrollThread({ threadId: '302', parentChannelId: '301', guildId: '100' }, target);
+  f.state.enrollThread({ threadId: '302', parentChannelId: '301', guildId: '100', adoptionCutoff: '100' }, target);
+  f.state.setThreadBaseline('302', '100', target);
   f.state.markThreadBoundary('302', 'ready', 'fixture', null, null, target);
   return target;
 }
 
 function addSecondRecipient(f) {
   f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: '33333333-3333-3333-3333-333333333333',
-    workspace: '/tmp', conductorId: 'second-recipient', repoKey: 'github.com/test/second-recipient' });
+    workspace: '/tmp', conductorId: 'second-recipient', repoKey: 'github.com/test/second-recipient' }, { intakeCutoff: '100' });
+  f.state.markIntakeBoundary('301', 'ready', 'fixture history recovered');
   const target = f.state.setBindingReadiness('301', READINESS.READY, 'fixture', f.state.getBinding('301'));
-  f.state.enrollThread({ threadId: '302', parentChannelId: '301', guildId: '100' }, target);
+  f.state.enrollThread({ threadId: '302', parentChannelId: '301', guildId: '100', adoptionCutoff: '100' }, target);
+  f.state.setThreadBaseline('302', '100', target);
   f.state.markThreadBoundary('302', THREAD_STATES.READY, 'fixture', null, null, target);
   return target;
 }
@@ -245,7 +249,7 @@ test('peer result does not accept a parent result for a child-targeted request',
     source: { guildId: '100', channelId: '201', provider: 'codex', nativeId: target.nativeId, generation: 1 },
     target: requestPacket.source, replyTo: requestPacket.id, text: 'wrong route'
   };
-  const accepted = f.state.acceptDiscordMessage({ id: 'foreign-parent-result-discord', guildId: '100',
+  const accepted = f.state.acceptDiscordMessage({ id: '10003', guildId: '100',
     channelId: requestPacket.source.channelId, authorId: '901', isBot: true,
     content: encodeAgentMessage(foreignResult, 'fixture') }, { agentToken: 'fixture' });
   assert.equal(accepted.accepted, true, JSON.stringify(accepted));
@@ -256,9 +260,11 @@ test('peer custody scopes a reused packet ID to each caller channel', async t =>
   const f = fixture(t); f.enroll('102'); addRecipient(f);
   const secondNativeId = '33333333-3333-3333-3333-333333333333';
   f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: secondNativeId,
-    workspace: '/tmp', endpoint: '/tmp/second-caller.sock', conductorId: 'second-caller', repoKey: 'github.com/test/second-caller' });
+    workspace: '/tmp', endpoint: '/tmp/second-caller.sock', conductorId: 'second-caller', repoKey: 'github.com/test/second-caller' }, { intakeCutoff: '100' });
+  f.state.markIntakeBoundary('301', 'ready', 'fixture history recovered');
   const secondBinding = f.state.setBindingReadiness('301', READINESS.READY, 'fixture', f.state.getBinding('301'));
-  f.state.enrollThread({ threadId: '302', parentChannelId: '301', guildId: '100' }, secondBinding);
+  f.state.enrollThread({ threadId: '302', parentChannelId: '301', guildId: '100', adoptionCutoff: '100' }, secondBinding);
+  f.state.setThreadBaseline('302', '100', secondBinding);
   f.state.markThreadBoundary('302', THREAD_STATES.READY, 'fixture', null, null, secondBinding);
   let posts = 0;
   const fetchImpl = async (url, options) => {
@@ -468,7 +474,8 @@ test('correlated reply keeps a recorded child route when another child enrolls',
     replyTo: null, text: 'child request'
   };
   f.state.receipt(null, 'agent-message', { packet: request });
-  f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100' }, target);
+  f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100', adoptionCutoff: '100' }, target);
+  f.state.setThreadBaseline('203', '100', target);
   f.state.markThreadBoundary('203', THREAD_STATES.READY, 'fixture', null, null, target);
   let postUrl;
   const peer = service(f, { fetchImpl: async (url, options) => {
@@ -483,7 +490,8 @@ test('correlated reply keeps a recorded child route when another child enrolls',
 
 test('peer-qualified reply keeps the recorded child when the peer has multiple ready children', async t => {
   const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
-  f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100' }, target);
+  f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100', adoptionCutoff: '100' }, target);
+  f.state.setThreadBaseline('203', '100', target);
   f.state.markThreadBoundary('203', THREAD_STATES.READY, 'fixture', null, null, target);
   const caller = f.state.getBinding('101');
   const requestPacket = {
@@ -512,7 +520,8 @@ test('new peer request refuses publication after destination child ambiguity app
   let posts = 0;
   const peer = service(f, { fetchImpl: async (url, options) => {
     if (options.method === 'GET') {
-      f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100' }, target);
+      f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100', adoptionCutoff: '100' }, target);
+      f.state.setThreadBaseline('203', '100', target);
       f.state.markThreadBoundary('203', THREAD_STATES.READY, 'fixture', null, null, target);
       return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
     }
@@ -628,7 +637,7 @@ test('peer send refuses publication after destination handoff during channel ver
 
 test('peer send refuses publication after source intake gap during channel verification', async t => {
   const f = fixture(t); f.enroll('102'); addRecipient(f); let posts = 0;
-  f.state.upsertIntakeWatermark({ channelId: '101', guildId: '100', id: '1' }, true);
+  f.state.upsertIntakeWatermark({ channelId: '101', guildId: '100', id: '101' }, true);
   const peer = service(f, { fetchImpl: async (url, options) => {
     if (options.method === 'GET') {
       f.state.db.prepare("UPDATE intake_watermarks SET state='gap' WHERE channel_id='101'").run();
@@ -647,7 +656,7 @@ test('peer send refuses publication after source watermark changes during channe
   const f = fixture(t); f.enroll('102'); addRecipient(f); let posts = 0;
   const peer = service(f, { fetchImpl: async (url, options) => {
     if (options.method === 'GET') {
-      f.state.upsertIntakeWatermark({ channelId: '101', guildId: '100', id: '1' }, true);
+      f.state.markIntakeBoundary('101', 'pending', 'fixture recovery started', null, null, f.state.getBinding('101'));
       return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
     }
     posts += 1;

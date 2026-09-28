@@ -15,7 +15,7 @@ function seededRecovery(t) {
   const channelId = 'topic-time-proof';
   const oldTopic = 'old topic';
   const desiredTopic = 'new topic';
-  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-time-proof', repoKey: 'repo:alpha' });
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'topic-time-proof', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   const binding = state.getBinding(channelId);
   const custody = state.beginTopicPublication(channelId, { desiredReadiness: READINESS.READY, desiredTopic }, binding);
   state.recordTopicPublication(channelId, { requestId: custody.requestId, desiredReadiness: READINESS.READY, outcome: 'unknown', remoteTerminal: true, observedTopic: oldTopic }, binding);
