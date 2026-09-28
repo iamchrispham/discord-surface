@@ -103,7 +103,7 @@ function retireAcceptedCourierAttempt(f, messageId) {
   });
 }
 
-test('retired observer settlement holds queued sibling before wake', { todo: process.env.ISSUE128_STRICT !== '1', timeout: 3000 }, async t => {
+test('retired observer settlement holds queued sibling before wake', { timeout: 3000 }, async t => {
   const watchdog = setTimeout(() => { console.error('issue128 fixture watchdog'); process.exit(70); }, 5000);
   watchdog.unref();
   const f = fixture(t);
@@ -167,7 +167,7 @@ test('retired observer settlement holds queued sibling before wake', { todo: pro
   }
 });
 
-test('retired recovery cancels only its old observer before direct retry', { todo: process.env.ISSUE128_STRICT !== '1', timeout: 3000 }, async t => {
+test('retired recovery cancels only its old observer before direct retry', { timeout: 3000 }, async t => {
   const watchdog = setTimeout(() => { console.error('issue128 fixture watchdog'); process.exit(70); }, 5000);
   watchdog.unref();
   const f = fixture(t);
@@ -258,7 +258,7 @@ test('retired recovery cancels only its old observer before direct retry', { tod
   }
 });
 
-test('concurrent retired recovery dispatches directly once before sibling', { todo: process.env.ISSUE128_STRICT !== '1', timeout: 3000 }, async t => {
+test('concurrent retired recovery dispatches directly once before sibling', { timeout: 3000 }, async t => {
   const watchdog = setTimeout(() => { console.error('issue128 fixture watchdog'); process.exit(70); }, 5000);
   watchdog.unref();
   const f = fixture(t);
@@ -329,6 +329,316 @@ test('concurrent retired recovery dispatches directly once before sibling', { to
     consumer.releaseAcknowledged('9000');
     await turns();
     assert.equal(courierCalls.filter(id => id === 'request-2').length, 1, 'sibling was not released by native acknowledgment');
+  } finally {
+    clearTimeout(watchdog);
+    consumer.abortNativeWork();
+    await Promise.allSettled(started);
+    await consumer.waitForNativeWork();
+  }
+});
+
+test('missing retirement receipt keeps observer and dispatch untouched', { timeout: 3000 }, async t => {
+  const watchdog = setTimeout(() => { console.error('issue128 fixture watchdog'); process.exit(70); }, 5000);
+  watchdog.unref();
+  const f = fixture(t);
+  const courierCalls = [];
+  const directCalls = [];
+  const held = deferred();
+  const entered = deferred();
+  let oldSignal = null;
+  const consumer = createSurfaceConsumer({
+    state: f.state,
+    courierRoute: { routeId: f.route.routeId },
+    providers: {
+      codex: {
+        async dispatchCourier(envelope) {
+          courierCalls.push(envelope.packet.id);
+          return { status: 'submitted' };
+        },
+        async dispatch(message) {
+          directCalls.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message, _outcome, options) {
+          if (message.id !== '9000') return { stopped: true };
+          oldSignal = options.signal;
+          const settle = () => held.resolve({ stopped: true });
+          if (options.signal.aborted) settle();
+          else options.signal.addEventListener('abort', settle, { once: true });
+          entered.resolve();
+          return held.promise;
+        }
+      }
+    },
+    sendReply: async () => ({ id: 'reply' }),
+    sendTransportReceipt: async () => ({ id: 'receipt' })
+  });
+  const started = [];
+  try {
+    const first = consumer.processAccepted(f.message);
+    started.push(first);
+    await entered.promise;
+    const recovery = consumer.processAccepted(f.state.getMessage('9000'), undefined, { awaitExisting: false, continueUntilFinal: false });
+    started.push(recovery);
+    await turns();
+    assert.equal(oldSignal.aborted, false, 'observer was cancelled without a retirement receipt');
+    assert.equal(directCalls.filter(id => id === '9000').length, 0, 'message was retried without a retirement receipt');
+  } finally {
+    clearTimeout(watchdog);
+    consumer.abortNativeWork();
+    await Promise.allSettled(started);
+    await consumer.waitForNativeWork();
+  }
+});
+
+test('native acknowledgment before recovery keeps existing observer', { timeout: 3000 }, async t => {
+  const watchdog = setTimeout(() => { console.error('issue128 fixture watchdog'); process.exit(70); }, 5000);
+  watchdog.unref();
+  const f = fixture(t);
+  const courierCalls = [];
+  const directCalls = [];
+  const held = deferred();
+  const entered = deferred();
+  let oldSignal = null;
+  const consumer = createSurfaceConsumer({
+    state: f.state,
+    courierRoute: { routeId: f.route.routeId },
+    providers: {
+      codex: {
+        async dispatchCourier(envelope) {
+          courierCalls.push(envelope.packet.id);
+          return { status: 'submitted' };
+        },
+        async dispatch(message) {
+          directCalls.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message, _outcome, options) {
+          if (message.id !== '9000') return { stopped: true };
+          oldSignal = options.signal;
+          const settle = () => held.resolve({ stopped: true });
+          if (options.signal.aborted) settle();
+          else options.signal.addEventListener('abort', settle, { once: true });
+          entered.resolve();
+          return held.promise;
+        }
+      }
+    },
+    sendReply: async () => ({ id: 'reply' }),
+    sendTransportReceipt: async () => ({ id: 'receipt' })
+  });
+  const started = [];
+  try {
+    const first = consumer.processAccepted(f.message);
+    started.push(first);
+    await entered.promise;
+    recordNativeAcknowledgment(f.state, {
+      provider: 'codex',
+      messageId: '9000',
+      nativeId: PARENT_NATIVE,
+      generation: f.binding.generation
+    });
+    retireAcceptedCourierAttempt(f, '9000');
+    const recovery = consumer.processAccepted(f.state.getMessage('9000'), undefined, { awaitExisting: false, continueUntilFinal: false });
+    started.push(recovery);
+    await turns();
+    assert.equal(oldSignal.aborted, false, 'acknowledged message observer was cancelled by retirement recovery');
+    assert.equal(directCalls.filter(id => id === '9000').length, 0, 'acknowledged message was retried');
+    assert.equal(courierCalls.filter(id => id === 'request-1').length, 1, 'acknowledged message wrote another courier queue entry');
+  } finally {
+    clearTimeout(watchdog);
+    consumer.abortNativeWork();
+    await Promise.allSettled(started);
+    await consumer.waitForNativeWork();
+  }
+});
+
+test('rejected observer join retains custody without dispatch', { timeout: 3000 }, async t => {
+  const watchdog = setTimeout(() => { console.error('issue128 fixture watchdog'); process.exit(70); }, 5000);
+  watchdog.unref();
+  const f = fixture(t);
+  const courierCalls = [];
+  const directCalls = [];
+  const held = deferred();
+  const entered = deferred();
+  let oldSignal = null;
+  const consumer = createSurfaceConsumer({
+    state: f.state,
+    courierRoute: { routeId: f.route.routeId },
+    providers: {
+      codex: {
+        async dispatchCourier(envelope) {
+          courierCalls.push(envelope.packet.id);
+          return { status: 'submitted' };
+        },
+        async dispatch(message) {
+          directCalls.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message, _outcome, options) {
+          if (message.id !== '9000') return { stopped: true };
+          if (oldSignal === null) oldSignal = options.signal;
+          const settle = () => held.resolve();
+          if (options.signal.aborted) settle();
+          else options.signal.addEventListener('abort', settle, { once: true });
+          entered.resolve();
+          return held.promise.then(() => { throw new Error('retired observer join rejected'); });
+        }
+      }
+    },
+    sendReply: async () => ({ id: 'reply' }),
+    sendTransportReceipt: async () => ({ id: 'receipt' })
+  });
+  const started = [];
+  try {
+    const first = consumer.processAccepted(f.message);
+    started.push(first);
+    await entered.promise;
+    const siblingAccepted = f.state.acceptDiscordMessage({
+      id: '9002',
+      guildId: '100',
+      channelId: '2000',
+      authorId: 'agent-bot',
+      isBot: true,
+      attachments: [],
+      content: encodeAgentMessage({ ...f.packet, id: 'request-2' }, TOKEN)
+    }, { ready: true, expectedBinding: f.binding, agentToken: TOKEN });
+    assert.equal(siblingAccepted.accepted, true);
+    const sibling = consumer.processAccepted(f.state.getMessage('9002'));
+    started.push(sibling);
+    retireAcceptedCourierAttempt(f, '9000');
+    const recovery = consumer.processAccepted(f.state.getMessage('9000'), undefined, { awaitExisting: false, continueUntilFinal: false });
+    started.push(recovery);
+    await turns();
+    assert.equal(oldSignal.aborted, true, 'retired observer was not cancelled');
+    assert.equal(directCalls.filter(id => id === '9000').length, 0, 'rejected join retried the retired message');
+    assert.equal(courierCalls.filter(id => id === 'request-2').length, 0, 'sibling was dispatched after the rejected join');
+    assert.equal(directCalls.filter(id => id === '9002').length, 0, 'sibling was dispatched directly after the rejected join');
+    assert.equal(f.state.getMessage('9000').state, 'accepted', 'retired custody was not retained after the rejected join');
+  } finally {
+    clearTimeout(watchdog);
+    consumer.abortNativeWork();
+    await Promise.allSettled(started);
+    await consumer.waitForNativeWork();
+  }
+});
+
+test('abortNativeWork during a pending join blocks dispatch and recreation', { timeout: 3000 }, async t => {
+  const watchdog = setTimeout(() => { console.error('issue128 fixture watchdog'); process.exit(70); }, 5000);
+  watchdog.unref();
+  const f = fixture(t);
+  const courierCalls = [];
+  const directCalls = [];
+  const held = deferred();
+  const entered = deferred();
+  let oldSignal = null;
+  let observedOld = 0;
+  const consumer = createSurfaceConsumer({
+    state: f.state,
+    courierRoute: { routeId: f.route.routeId },
+    providers: {
+      codex: {
+        async dispatchCourier(envelope) {
+          courierCalls.push(envelope.packet.id);
+          return { status: 'submitted' };
+        },
+        async dispatch(message) {
+          directCalls.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message, _outcome, options) {
+          if (message.id !== '9000') return { stopped: true };
+          observedOld++;
+          oldSignal = options.signal;
+          entered.resolve();
+          return held.promise;
+        }
+      }
+    },
+    sendReply: async () => ({ id: 'reply' }),
+    sendTransportReceipt: async () => ({ id: 'receipt' })
+  });
+  const started = [];
+  try {
+    const first = consumer.processAccepted(f.message);
+    started.push(first);
+    await entered.promise;
+    retireAcceptedCourierAttempt(f, '9000');
+    const recovery = consumer.processAccepted(f.state.getMessage('9000'), undefined, { awaitExisting: false, continueUntilFinal: false });
+    started.push(recovery);
+    await turns();
+    assert.equal(oldSignal.aborted, true, 'retired observer was not cancelled');
+    assert.equal(directCalls.filter(id => id === '9000').length, 0, 'recovery dispatched before the join settled');
+    consumer.abortNativeWork();
+    held.resolve({ stopped: true });
+    const result = await recovery;
+    await turns();
+    assert.equal(result.status, 'stopped', 'abandoned join did not stop recovery');
+    assert.equal(directCalls.filter(id => id === '9000').length, 0, 'abandoned join dispatched the retired message');
+    assert.equal(courierCalls.filter(id => id === 'request-1').length, 1, 'abandoned join recreated owner work');
+    assert.equal(observedOld, 1, 'abandoned join recreated the owner observer');
+  } finally {
+    clearTimeout(watchdog);
+    consumer.abortNativeWork();
+    await Promise.allSettled(started);
+    await consumer.waitForNativeWork();
+  }
+});
+
+test('binding generation change during a pending join blocks old-generation dispatch', { timeout: 3000 }, async t => {
+  const watchdog = setTimeout(() => { console.error('issue128 fixture watchdog'); process.exit(70); }, 5000);
+  watchdog.unref();
+  const f = fixture(t);
+  const courierCalls = [];
+  const directCalls = [];
+  const held = deferred();
+  const entered = deferred();
+  let oldSignal = null;
+  let observedOld = 0;
+  const consumer = createSurfaceConsumer({
+    state: f.state,
+    courierRoute: { routeId: f.route.routeId },
+    providers: {
+      codex: {
+        async dispatchCourier(envelope) {
+          courierCalls.push(envelope.packet.id);
+          return { status: 'submitted' };
+        },
+        async dispatch(message) {
+          directCalls.push(message.id);
+          return { status: 'submitted' };
+        },
+        async observe(message, _outcome, options) {
+          if (message.id !== '9000') return { stopped: true };
+          observedOld++;
+          oldSignal = options.signal;
+          entered.resolve();
+          return held.promise;
+        }
+      }
+    },
+    sendReply: async () => ({ id: 'reply' }),
+    sendTransportReceipt: async () => ({ id: 'receipt' })
+  });
+  const started = [];
+  try {
+    const first = consumer.processAccepted(f.message);
+    started.push(first);
+    await entered.promise;
+    retireAcceptedCourierAttempt(f, '9000');
+    const recovery = consumer.processAccepted(f.state.getMessage('9000'), undefined, { awaitExisting: false, continueUntilFinal: false });
+    started.push(recovery);
+    await turns();
+    assert.equal(oldSignal.aborted, true, 'retired observer was not cancelled');
+    f.state.transaction(() => {
+      f.state.db.prepare('UPDATE bindings SET generation=generation+1 WHERE channel_id=?').run('1000');
+    });
+    held.resolve({ stopped: true });
+    await turns();
+    assert.notEqual(f.state.getBinding('1000').generation, f.binding.generation, 'binding generation did not change');
+    assert.equal(f.state.getMessage('9000').state, 'accepted', 'accepted custody was not preserved');
+    assert.equal(directCalls.filter(id => id === '9000').length, 0, 'old-generation recovery dispatched the retired message');
+    assert.equal(observedOld, 1, 'old-generation recovery recreated the owner observer');
   } finally {
     clearTimeout(watchdog);
     consumer.abortNativeWork();
