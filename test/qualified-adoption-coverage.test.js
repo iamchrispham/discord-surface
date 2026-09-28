@@ -246,6 +246,43 @@ test('generic bind acquires qualified history before activation', { timeout: 800
   }
 });
 
+test('generic bind rejects an existing channel before Discord adoption I/O', { timeout: 8000 }, async t => {
+  const dir = tempDir('qualified-bind-conflict-');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture\n', { mode: 0o600 });
+  const state = makeState(dir);
+  state.bind({
+    channelId: '500', guildId: 'guild', provider: 'codex',
+    nativeId: '11111111-1111-4111-8111-111111111111', workspace: dir,
+    conductorId: 'conductor', repoKey: 'repo:fixture'
+  }, { intakeCutoff: '100' });
+  state.close();
+
+  let clientConstructions = 0;
+  const fake = {
+    GatewayIntentBits: { Guilds: 1 },
+    Client: class FakeClient {
+      constructor() {
+        clientConstructions += 1;
+        throw new Error('Discord adoption I/O should not start for a local conflict');
+      }
+    }
+  };
+  await withFakeDiscord(fake, async () => {
+    const { main } = require('../src/cli');
+    const argv = process.argv;
+    try {
+      process.argv = ['node', 'cli.js', 'bind', '--state-dir', dir, '--channel-id', '500', '--guild-id', 'guild',
+        '--provider', 'codex', '--native-id', '22222222-2222-4222-8222-222222222222', '--workspace', dir,
+        '--conductor-id', 'replacement', '--repo-key', 'repo:replacement'];
+      await assert.rejects(() => main(), /channel is already bound/);
+    } finally {
+      process.argv = argv;
+    }
+  });
+  assert.equal(clientConstructions, 0);
+});
+
 test('ordinary Codex CLI preserves its qualified server fence', { timeout: 8000 }, async () => {
   const dir = tempDir('qualified-fence-');
   const db = path.join(dir, 'surface.sqlite');

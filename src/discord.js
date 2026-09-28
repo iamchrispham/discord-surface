@@ -3258,7 +3258,12 @@ class DiscordGateway {
                     passConnectionEpoch !== this.connectionEpoch) return;
                 queueReconciliationRetry([message.id, ...deferredRetryMessageIds]);
               },
-              failed: () => {}
+              failed: () => {
+                if (!lookupAbandoned || this.stopping || signal?.aborted ||
+                    !this.isCurrentLifecycle(passLifecycle) ||
+                    passConnectionEpoch !== this.connectionEpoch) return;
+                queueReconciliationRetry([message.id, ...deferredRetryMessageIds]);
+              }
             });
             // Only an actually owned in-flight lookup gives this pass late
             // settlement interest. A consumed one-use snapshot resolves without

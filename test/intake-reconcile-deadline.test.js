@@ -484,3 +484,31 @@ test('T6: an immediate rejection does not self-retry; an explicit later call may
   assert.equal(f.state.getMessage('101').state, 'replied');
   assert.equal(f.replies.length, 1);
 });
+
+test('T7: an abandoned lookup rejection wakes a fresh reconciliation retry', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  seedReplyReady(f, '101', '1000');
+  f.enableDelivery();
+  f.gateway.recoveryTimeoutMs = 30;
+  f.gateway.sendAcknowledgment = async () => {};
+  const originalFetch = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+  let attempts = 0;
+  let rejectLookup;
+  f.gateway.client.channels.fetch = id => {
+    attempts += 1;
+    if (attempts === 1) return new Promise((resolve, reject) => { rejectLookup = reject; });
+    return originalFetch(id);
+  };
+
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(attempts, 1);
+  assert.equal(f.state.getMessage('101').state, 'reply_ready');
+
+  rejectLookup(new Error('late fetch failed'));
+  const waitUntil = Date.now() + 1000;
+  while (f.state.getMessage('101').state !== 'replied' && Date.now() < waitUntil) await delay(10);
+
+  assert.equal(attempts, 2, 'late rejection must wake one fresh lookup');
+  assert.equal(f.state.getMessage('101').state, 'replied');
+  assert.equal(f.replies.length, 1);
+});

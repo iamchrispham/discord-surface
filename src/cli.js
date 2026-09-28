@@ -25,7 +25,7 @@ const { runBoardRefresh } = require('./board-refresh');
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { pathToFileURL } = require('node:url');
-const { SurfaceState, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
+const { SurfaceState, BindingError, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
 const { DiscordGateway, discordIdAfter, readSecret, requireInstalled, waitForRecoveryOperation } = require('./discord');
 const { enrollPublicThread } = require('./discord/thread-enrollment');
 const { readAdoptionCutoff } = require('./discord/history-access');
@@ -266,6 +266,9 @@ async function bind(args, rebind = false) {
   let enrollmentProof = null;
   try {
     const input = bindingArgs(args);
+    if (!rebind && state.getBinding(input.channelId)) {
+      throw new BindingError('channel is already bound; use rebind after work drains');
+    }
     const hasActiveThreads = rebind && state.listThreadEnrollments(input.channelId).some(enrollment => enrollment.active);
     let intakeCutoff = null;
     if (hasActiveThreads) {
