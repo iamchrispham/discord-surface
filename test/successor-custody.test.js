@@ -506,3 +506,36 @@ test('22: refuse an absent original accepted receipt and a malformed original ac
   assert.equal(malformed.state.db.prepare("SELECT detail FROM receipts WHERE discord_id=? AND kind='accepted'").get('101').detail, '{not-json');
   assertRefusalUnchanged(malformed, '101', () => malformed.state.handoffConductor(handoffInput(malformed, { carryAcceptedHuman: true })));
 });
+
+test('incomplete or mistyped accepted receipt identity refuses', t => {
+  for (const field of ['channelId', 'conductorId', 'generation', 'deliveryChannelId']) {
+    const f = conductorFixture(t, `accepted-identity-${field}`);
+    acceptHuman(f.state, f.channelId, '101');
+    const detail = JSON.parse(f.state.db.prepare("SELECT detail FROM receipts WHERE discord_id=? AND kind='accepted'").get('101').detail);
+    if (field === 'generation') detail.generation = String(detail.generation);
+    else if (field === 'deliveryChannelId') detail.deliveryChannelId = 'foreign-child';
+    else delete detail[field];
+    f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='accepted'").run(JSON.stringify(detail), '101');
+    assertRefusalUnchanged(f, '101', () => f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true })));
+  }
+});
+
+test('changed authority between eligibility snapshot and transaction refuses', t => {
+  for (const field of ['operatorId', 'guildId']) {
+    const f = conductorFixture(t, `changed-${field}`);
+    acceptHuman(f.state, f.channelId, '101');
+    const other = new SurfaceState(f.db);
+    f.open.push(other);
+    let injected = false;
+    const original = f.state.transaction.bind(f.state);
+    f.state.transaction = fn => {
+      if (!injected) {
+        injected = true;
+        other.setConfig({ [field]: 'different-authority' });
+      }
+      return original(fn);
+    };
+    t.after(() => { f.state.transaction = original; });
+    assertRefusalUnchanged(f, '101', () => f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true })));
+  }
+});

@@ -157,11 +157,11 @@ function createConductorCustodyHandlers({
 
   function validateAcceptedReceipt(messageRow, accepted, request, originalGeneration) {
     const detail = accepted.detail;
-    if (detail.channelId != null && detail.channelId !== messageRow.channel_id) refuse();
-    if (detail.conductorId != null && !sameIdentity(detail.conductorId, request.conductorId)) refuse();
-    if (detail.generation != null && Number(detail.generation) !== originalGeneration) refuse();
+    if (detail.channelId !== messageRow.channel_id) refuse();
+    if (detail.conductorId !== request.conductorId) refuse();
+    if (!Number.isInteger(detail.generation) || detail.generation !== originalGeneration) refuse();
     const delivery = messageRow.delivery_channel_id || messageRow.channel_id;
-    if (detail.deliveryChannelId != null && detail.deliveryChannelId !== delivery) refuse();
+    if ((detail.deliveryChannelId ?? messageRow.channel_id) !== delivery) refuse();
   }
 
   // A prior conductor-custody-transferred chain lets a second successor take over
@@ -242,6 +242,7 @@ function createConductorCustodyHandlers({
     return {
       channelId: request.channelId,
       expectedGeneration: request.expectedGeneration,
+      authority: { operatorId: config.operatorId, guildId: config.guildId },
       serialized: serializeEvidence(evidence),
       candidates
     };
@@ -249,6 +250,8 @@ function createConductorCustodyHandlers({
 
   function verifySnapshotAndTransfer(state, snapshot, request, updatedAt) {
     if (!snapshot || snapshot.channelId !== request.channelId) refuse();
+    const config = state.requireConfig();
+    if (config.operatorId !== snapshot.authority.operatorId || config.guildId !== snapshot.authority.guildId) refuse();
     const current = state.getBinding(request.channelId);
     if (!current || !current.active ||
       current.provider !== request.provider ||
