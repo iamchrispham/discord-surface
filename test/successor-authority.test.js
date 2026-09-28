@@ -170,7 +170,7 @@ test('worker proof treats an unavailable canonical symlink target as unknown', (
   }
 });
 
-test('worker proof falls back to the documented Codex registry when canonical root is absent', () => {
+test('worker proof requires an explicit override for the legacy Codex registry', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-legacy-home-'));
   try {
     const legacy = path.join(home, '.codex', 'work-control', 'workers');
@@ -195,7 +195,17 @@ test('worker proof falls back to the documented Codex registry when canonical ro
       encoding: 'utf8'
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(result.stdout.trim()).status, 'gone');
+    assert.equal(JSON.parse(result.stdout.trim()).status, 'missing');
+
+    const migrated = spawnSync(PYTHON, ['-c', code], {
+      env: {
+        ...defaultWorkerEnv(home),
+        CONDUCTOR_WORKERS_DIR: legacy
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(migrated.status, 0, migrated.stderr);
+    assert.equal(JSON.parse(migrated.stdout.trim()).status, 'gone');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -208,6 +218,7 @@ test('worker proof treats unavailable canonical ancestor symlinks as unknown', (
       const legacy = path.join(home, '.codex', 'work-control', 'workers');
       const missing = path.join(home, 'registry-mount', 'work-control');
       if (ancestor === 'agents') {
+        fs.mkdirSync(path.dirname(missing), { recursive: true });
         fs.symlinkSync(path.dirname(missing), path.join(home, '.agents'), 'dir');
       } else {
         fs.mkdirSync(path.join(home, '.agents'), { recursive: true });

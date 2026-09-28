@@ -19,7 +19,6 @@ FORCED_VERBS = frozenset({'steal', 'override', 'preempt'})
 PROOF_LIMIT = 1024 * 1024
 IDENTITY_ALIAS_KEYS = ('sessionId', 'fullUUID', 'fullUuid')
 DEFAULT_WORKERS_ROOT = '~/.agents/work-control/workers'
-LEGACY_WORKERS_ROOT = '~/.codex/work-control/workers'
 
 
 class GateError(Exception):
@@ -256,14 +255,7 @@ def workers_root():
 
 
 def worker_roots():
-    if os.environ.get('CONDUCTOR_WORKERS_DIR'):
-        return [workers_root()]
-    canonical = workers_root()
-    configured = os.path.abspath(os.path.expanduser(DEFAULT_WORKERS_ROOT))
-    if os.path.lexists(configured) or _canonical_symlink_target_unavailable(canonical):
-        return [canonical]
-    legacy = os.path.realpath(os.path.abspath(os.path.expanduser(LEGACY_WORKERS_ROOT)))
-    return [canonical] if legacy == canonical else [canonical, legacy]
+    return [workers_root()]
 
 
 def expected_filename_match(stem, expected_owner):
@@ -335,16 +327,23 @@ def _canonical_symlink_target_unavailable(root):
     try:
         if os.path.realpath(canonical) != root:
             return False
-        current = os.path.sep
-        for component in canonical.split(os.path.sep):
-            if not component:
+        home = os.path.abspath(os.path.expanduser('~'))
+        current = home
+        symlink_ancestor = False
+        if os.path.islink(home):
+            symlink_ancestor = True
+        relative = os.path.relpath(canonical, home)
+        for component in relative.split(os.path.sep):
+            if component == os.path.curdir:
                 continue
             current = os.path.join(current, component)
-            if os.path.lexists(current) and os.path.islink(current) and not os.path.exists(current):
-                return True
+            if os.path.islink(current):
+                symlink_ancestor = True
+        if symlink_ancestor and not os.path.exists(canonical):
+            return True
         return os.path.lexists(canonical) and not os.path.exists(canonical)
     except OSError:
-        return False
+        return True
 
 
 def discover_predecessor(expected_identity, expected_owner):
