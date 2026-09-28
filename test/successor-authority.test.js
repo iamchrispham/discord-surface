@@ -170,7 +170,7 @@ test('worker proof treats an unavailable canonical symlink target as unknown', (
   }
 });
 
-test('worker proof uses the documented Codex fallback when canonical root is absent', () => {
+test('worker proof ignores the external Codex registry when canonical root is absent', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-legacy-home-'));
   try {
     const legacy = path.join(home, '.codex', 'work-control', 'workers');
@@ -194,7 +194,7 @@ test('worker proof uses the documented Codex fallback when canonical root is abs
       encoding: 'utf8'
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(result.stdout.trim()).status, 'gone');
+    assert.equal(JSON.parse(result.stdout.trim()).status, 'missing');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

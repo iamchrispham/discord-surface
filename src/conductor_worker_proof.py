@@ -19,7 +19,6 @@ FORCED_VERBS = frozenset({'steal', 'override', 'preempt'})
 PROOF_LIMIT = 1024 * 1024
 IDENTITY_ALIAS_KEYS = ('sessionId', 'fullUUID', 'fullUuid')
 DEFAULT_WORKERS_ROOT = '~/.agents/work-control/workers'
-LEGACY_WORKERS_ROOT = '~/.codex/work-control/workers'
 
 
 class GateError(Exception):
@@ -256,13 +255,7 @@ def workers_root():
 
 
 def worker_roots():
-    if os.environ.get('CONDUCTOR_WORKERS_DIR'):
-        return [workers_root()]
-    canonical = workers_root()
-    if os.path.lexists(canonical):
-        return [canonical]
-    legacy = os.path.realpath(os.path.abspath(os.path.expanduser(LEGACY_WORKERS_ROOT)))
-    return [canonical, legacy]
+    return [workers_root()]
 
 
 def expected_filename_match(stem, expected_owner):
