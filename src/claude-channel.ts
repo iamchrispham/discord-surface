@@ -360,6 +360,7 @@ export class ClaudeChannel<
   declare startupPromise: Promise<void> | null;
   declare startupPhase: ClaudeStartupPhase | null;
   declare socketLockRelease: (() => void) | null;
+  declare socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
   declare startupCleanupPending: boolean;
   declare ready: boolean;
   declare transportClosed: boolean;
@@ -398,6 +399,7 @@ export class ClaudeChannel<
     this.startupPromise = null;
     this.startupPhase = null;
     this.socketLockRelease = null;
+    this.socketQuarantine = undefined;
     this.startupCleanupPending = false;
     this.ready = false;
     this.transportClosed = false;
@@ -707,7 +709,7 @@ export class ClaudeChannel<
           if (!/^Claude channel stopped during /.test(errorMessage(error))) errors.push(error);
         }
       }
-      let socketQuarantine: socketOwnership.SocketPathQuarantine | undefined;
+      let socketQuarantine = this.socketQuarantine;
       let quarantineFailed = false;
       if (!this.socketIdentity && this.server?.listening) {
         this.socketIdentity = socketOwnership.boundSocketPathIdentity(this.server) ?? null;
@@ -718,7 +720,10 @@ export class ClaudeChannel<
         errors.push(new Error('Claude channel bound socket identity is unavailable for cleanup'));
       }
       try {
-        if (!quarantineFailed) socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, this.socketIdentity);
+        if (!quarantineFailed && !socketQuarantine) {
+          socketQuarantine = socketOwnership.quarantineMismatchedSocket(this.socketPath, this.socketIdentity);
+          this.socketQuarantine = socketQuarantine;
+        }
       } catch (error) {
         quarantineFailed = true;
         errors.push(error);
@@ -731,6 +736,7 @@ export class ClaudeChannel<
       if (socketQuarantine) {
         try {
           if (!socketQuarantine.restore()) errors.push(new Error('Claude channel socket restore is unavailable'));
+          else this.socketQuarantine = undefined;
         } catch (error) { errors.push(error); }
       }
       if (errors.length) {

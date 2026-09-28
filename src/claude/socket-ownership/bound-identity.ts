@@ -103,12 +103,6 @@ export function captureBoundSocketIdentity(
       reject(error);
       return;
     }
-    const bound = boundSocketFileIdentity(server);
-    if (bound && !sameSocket(candidate, bound)) {
-      reject(refused('pathname identity does not belong to the supplied listener'));
-      return;
-    }
-
     const nonce = randomUUID();
     let settled = false;
     let witnessed = false;
@@ -169,7 +163,7 @@ export function captureBoundSocketIdentity(
         finish(refused('pathname identity changed during qualification'));
         return;
       }
-      finish(undefined, bound ?? candidate);
+      finish(undefined, candidate);
     }
 
     server.on('request', onRequest);

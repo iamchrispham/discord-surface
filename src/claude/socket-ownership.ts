@@ -615,14 +615,27 @@ function reclaimOwnerFile(
   const transitionPath = claimTransition(lockPath);
   if (!transitionPath) return false;
   const tombstonePath = path.join(transitionPath, 'owner');
+  let transitionGeneration: FileGeneration | undefined;
+  if (expectedLockGeneration) {
+    try { transitionGeneration = fileGeneration(transitionPath); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  }
   try {
     if (expectedLockGeneration) {
-      let observedLock: FileIdentity;
-      try { observedLock = fileIdentity(lockPath); } catch (error) {
+      let observedLock: FileGeneration;
+      try { observedLock = fileGeneration(lockPath); } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
         throw error;
       }
       if (!sameFile(observedLock, expectedLockGeneration)) return false;
+      let observedTransition: FileGeneration;
+      try { observedTransition = fileGeneration(transitionPath); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
+      }
+      if (!transitionGeneration || !sameGeneration(observedTransition, transitionGeneration)) return false;
     }
     let observed: OwnerMarkerSnapshot | undefined;
     try { observed = readSocketLockOwnerSnapshot(ownerPath); } catch (error) {

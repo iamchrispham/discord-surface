@@ -50,6 +50,7 @@ function publishedFallbackRoot(root: string, owner: number | undefined): string 
     throw error;
   }
   let publishedRoot: string | undefined;
+  let publishedKind: 'direct' | 'fallback' | undefined;
   for (const entry of entries.filter(name => name === rendezvousName || name.startsWith(rendezvousPrefix)).sort()) {
     const rendezvousDirectory = path.join(root, entry);
     let rendezvousStats: fs.Stats;
@@ -60,6 +61,37 @@ function publishedFallbackRoot(root: string, owner: number | undefined): string 
     const rendezvousOwnerControlled = owner === undefined || rendezvousStats.uid === owner;
     if (!rendezvousStats.isDirectory() || rendezvousStats.isSymbolicLink() || !rendezvousOwnerControlled ||
       (rendezvousStats.mode & 0o077) !== 0) continue;
+    const directHomePath = path.join(rendezvousDirectory, 'direct-home');
+    let directHomeMarker: fs.Stats | undefined;
+    try { directHomeMarker = fs.lstatSync(directHomePath); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (directHomeMarker) {
+      const directMarkerOwnerControlled = owner === undefined || directHomeMarker.uid === owner;
+      if (!directHomeMarker.isFile() || directHomeMarker.isSymbolicLink() || !directMarkerOwnerControlled ||
+        (directHomeMarker.mode & 0o077) !== 0) {
+        throw new Error('Claude channel direct-home rendezvous is unusable');
+      }
+      const directHomeRoot = fs.readFileSync(directHomePath, 'utf8').trim();
+      if (!path.isAbsolute(directHomeRoot)) throw new Error('Claude channel direct-home rendezvous is invalid');
+      let directHomeStats: fs.Stats | undefined;
+      try { directHomeStats = fs.lstatSync(directHomeRoot); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (directHomeStats) {
+        const directOwnerControlled = owner === undefined || directHomeStats.uid === owner;
+        if (!directHomeStats.isDirectory() || directHomeStats.isSymbolicLink() || !directOwnerControlled ||
+          (directHomeStats.mode & 0o077) !== 0) {
+          throw new Error('Claude channel direct-home target is unusable');
+        }
+        if (publishedKind === 'fallback') continue;
+        if (publishedRoot !== undefined && publishedRoot !== directHomeRoot) {
+          throw new Error('Claude channel direct-home rendezvous is ambiguous');
+        }
+        publishedRoot = directHomeRoot;
+        publishedKind = 'direct';
+      }
+    }
     const rendezvousPath = path.join(rendezvousDirectory, 'fallback-root');
     let marker: fs.Stats;
     try { marker = fs.lstatSync(rendezvousPath); } catch (error) {
@@ -85,10 +117,11 @@ function publishedFallbackRoot(root: string, owner: number | undefined): string 
     const privateOwnerWritable = owner === undefined || (privateDirectory.mode & 0o200) !== 0;
     if (privateDirectory.isDirectory() && !privateDirectory.isSymbolicLink() && privateOwnerControlled &&
       privateOwnerWritable && (privateDirectory.mode & 0o077) === 0) {
-      if (publishedRoot !== undefined && publishedRoot !== privateRoot) {
+      if (publishedKind === 'fallback' && publishedRoot !== privateRoot) {
         throw new Error('Claude channel fallback-root rendezvous is ambiguous');
       }
       publishedRoot = privateRoot;
+      publishedKind = 'fallback';
     }
   }
   return publishedRoot;
@@ -125,6 +158,84 @@ function fallbackRendezvousClaimed(root: string, owner: number | undefined): boo
   return false;
 }
 
+function publishDirectHomeRendezvous(root: string, homeRoot: string, owner: number | undefined): boolean {
+  let directory: fs.Stats;
+  try { directory = fs.statSync(root); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  const stickySharedRoot = (directory.mode & 0o1000) !== 0 && (directory.mode & 0o002) !== 0;
+  if (!directory.isDirectory() || !stickySharedRoot) return false;
+
+  const ownerName = owner === undefined ? 'shared' : String(owner);
+  const rendezvousName = path.basename(lockNamespaceCandidate(root, `${LOCK_NAMESPACE}-${ownerName}`));
+  const deterministicNames = [
+    rendezvousName,
+    `${rendezvousName}-shared`,
+    `${rendezvousName}-election`
+  ];
+  const usable = (candidate: string): boolean => {
+    try {
+      const stats = fs.lstatSync(candidate);
+      const ownerControlled = owner === undefined || stats.uid === owner;
+      return stats.isDirectory() && !stats.isSymbolicLink() && ownerControlled && (stats.mode & 0o077) === 0;
+    } catch {
+      return false;
+    }
+  };
+
+  for (const name of deterministicNames) {
+    const candidate = path.join(root, name);
+    if (!usable(candidate)) {
+      try { fs.mkdirSync(candidate, { mode: 0o700 }); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    }
+    if (!usable(candidate)) continue;
+    try { fs.lstatSync(path.join(candidate, 'fallback-root')); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return publishDirectHomeMarker(candidate, homeRoot);
+    }
+  }
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidate = path.join(root, `${rendezvousName}-direct-${randomUUID()}`);
+    try {
+      fs.mkdirSync(candidate, { mode: 0o700 });
+      return publishDirectHomeMarker(candidate, homeRoot);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  }
+  return false;
+}
+
+function publishDirectHomeMarker(rendezvousDirectory: string, homeRoot: string): boolean {
+  const markerPath = path.join(rendezvousDirectory, 'direct-home');
+  try {
+    const marker = fs.readFileSync(markerPath, 'utf8').trim();
+    if (marker !== homeRoot) throw new Error('Claude channel direct-home rendezvous is ambiguous');
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const markerTemp = path.join(rendezvousDirectory, `.direct-home-${process.pid}-${randomUUID()}`);
+  fs.writeFileSync(markerTemp, `${homeRoot}\n`, { mode: 0o600, flag: 'wx' });
+  try {
+    try {
+      fs.linkSync(markerTemp, markerPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const winner = fs.readFileSync(markerPath, 'utf8').trim();
+      if (winner !== homeRoot) throw new Error('Claude channel direct-home rendezvous is ambiguous');
+    }
+  } finally {
+    try { fs.unlinkSync(markerTemp); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  return true;
+}
+
 export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): string {
   const owner = deps.effectiveUserId();
   const ownerName = owner === undefined ? 'shared' : String(owner);
@@ -156,7 +267,22 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
     if (ownerControlledRoot && ownerWritableRoot && (directory.mode & 0o022) === 0 && !fallbackClaimedNow) {
       try {
         fs.accessSync(root, fs.constants.W_OK | fs.constants.X_OK);
-        return root;
+        let published = true;
+        let stableRootFound = false;
+        for (const stableRoot of candidates) {
+          if (stableRoot === root) continue;
+          let stableDirectory: fs.Stats;
+          try { stableDirectory = fs.statSync(stableRoot); } catch { continue; }
+          if (!stableDirectory.isDirectory() || (stableDirectory.mode & 0o1000) === 0 ||
+            (stableDirectory.mode & 0o002) === 0) continue;
+          stableRootFound = true;
+          if (publishDirectHomeRendezvous(stableRoot, root, owner)) {
+            published = true;
+            break;
+          }
+          published = false;
+        }
+        if (published || !stableRootFound) return root;
       } catch {
         // Try the next candidate.
       }
