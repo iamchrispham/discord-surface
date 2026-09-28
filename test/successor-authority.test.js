@@ -74,7 +74,7 @@ test('worker proof uses the canonical conductor registry, with or without the Co
   }
 });
 
-test('worker proof falls back to the documented Codex registry when canonical root is absent', () => {
+test('worker proof keeps the publisher root when only the Codex alias exists', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-codex-home-'));
   try {
     const legacy = path.join(home, '.codex', 'work-control', 'workers');
@@ -89,13 +89,13 @@ test('worker proof falls back to the documented Codex registry when canonical ro
       encoding: 'utf8'
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), fs.realpathSync(legacy));
+    assert.equal(result.stdout.trim(), path.join(fs.realpathSync(home), '.agents', 'work-control', 'workers'));
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
-test('worker proof checks the legacy registry before accepting canonical death proof', () => {
+test('worker proof ignores a distinct Codex alias when canonical death is proven', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-dual-home-'));
   try {
     const canonical = path.join(home, '.agents', 'work-control', 'workers');
@@ -109,13 +109,15 @@ test('worker proof checks the legacy registry before accepting canonical death p
       harness: 'codex', pid: 999999, processStartTime: 1700000000, generation: 1
     });
     fs.writeFileSync(path.join(canonical, `${owner}.json`), manifest);
-    fs.writeFileSync(path.join(legacy, `${owner}.json`), manifest);
+    fs.writeFileSync(path.join(legacy, `${owner}.json`), JSON.stringify({
+      sessionId: nativeId, fullUUID: nativeId, worktree: home, state: 'active',
+      harness: 'codex', pid: 1, processStartTime: 1700000000, generation: 1
+    }));
     const expected = { fullUUID: nativeId, provider: 'codex', workspace: fs.realpathSync(home) };
     const code = [
       'import json',
       'import conductor_worker_proof as proof',
-      'probes = iter([("gone", None), ("live", 1700000000)])',
-      'proof.process_probe = lambda pid: next(probes)',
+      'proof.process_probe = lambda pid: ("live", 1700000000) if pid == 1 else ("gone", None)',
       `print(json.dumps(proof.discover_predecessor(${JSON.stringify(expected)}, ${JSON.stringify(owner)})))`
     ].join('; ');
     const result = spawnSync(PYTHON, ['-c', code], {
@@ -123,13 +125,13 @@ test('worker proof checks the legacy registry before accepting canonical death p
       encoding: 'utf8'
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(result.stdout.trim()).status, 'alive');
+    assert.equal(JSON.parse(result.stdout.trim()).status, 'gone');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
-test('legacy-only predecessor proof accepts dead records and observes active records', () => {
+test('legacy-only predecessor proof cannot authorize takeover', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-legacy-home-'));
   try {
     const legacy = path.join(home, '.codex', 'work-control', 'workers');
@@ -157,8 +159,8 @@ test('legacy-only predecessor proof accepts dead records and observes active rec
       assert.equal(result.status, 0, result.stderr);
       return JSON.parse(result.stdout.trim()).status;
     }
-    assert.equal(discover('done', 999999, false), 'gone');
-    assert.equal(discover('active', 1, true), 'alive');
+    assert.equal(discover('done', 999999, false), 'missing');
+    assert.equal(discover('active', 1, true), 'missing');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -19,7 +19,6 @@ FORCED_VERBS = frozenset({'steal', 'override', 'preempt'})
 PROOF_LIMIT = 1024 * 1024
 IDENTITY_ALIAS_KEYS = ('sessionId', 'fullUUID', 'fullUuid')
 DEFAULT_WORKERS_ROOT = '~/.agents/work-control/workers'
-LEGACY_WORKERS_ROOT = '~/.codex/work-control/workers'
 
 
 class GateError(Exception):
@@ -251,14 +250,7 @@ def verify_worker(path, provider, native_id, owner, workspace):
 
 
 def workers_root():
-    configured = os.environ.get('CONDUCTOR_WORKERS_DIR')
-    if configured:
-        requested = configured
-    else:
-        canonical = os.path.realpath(os.path.abspath(os.path.expanduser(DEFAULT_WORKERS_ROOT)))
-        if os.path.isdir(canonical):
-            return canonical
-        requested = LEGACY_WORKERS_ROOT
+    requested = os.environ.get('CONDUCTOR_WORKERS_DIR') or DEFAULT_WORKERS_ROOT
     return os.path.realpath(os.path.abspath(os.path.expanduser(requested)))
 
 
@@ -332,10 +324,6 @@ def discover_predecessor(expected_identity, expected_owner):
     'gone' is the only status that qualifies a steal; every other status refuses.
     """
     roots = [workers_root()]
-    if not os.environ.get('CONDUCTOR_WORKERS_DIR'):
-        legacy_root = os.path.realpath(os.path.abspath(os.path.expanduser(LEGACY_WORKERS_ROOT)))
-        if legacy_root not in roots:
-            roots.append(legacy_root)
     candidates = []
     exact_matches = []
     unknown_matching = False
