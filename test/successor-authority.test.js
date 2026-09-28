@@ -39,6 +39,28 @@ function assertCommitted(result, carry, label) {
   assert.equal(result.child.carry, carry, `${label}: carry marker value`);
 }
 
+test('worker proof uses the canonical Codex registry by default', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-home-'));
+  try {
+    const expected = path.join(home, '.codex', 'work-control', 'workers');
+    fs.mkdirSync(expected, { recursive: true });
+    const env = {
+      ...process.env,
+      HOME: home,
+      PYTHONPATH: path.join(__dirname, '..', 'src')
+    };
+    delete env.CONDUCTOR_WORKERS_DIR;
+    const result = spawnSync(PYTHON, ['-c',
+      'import conductor_worker_proof as proof; print(proof.workers_root())'], {
+      env, encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), fs.realpathSync(expected));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 function fakeDiscordPreload({ channelId, categoryId, topic }) {
   return `
 const fs = require('node:fs');

@@ -235,7 +235,7 @@ def verify_worker(path, provider, native_id, owner, workspace):
 
 def workers_root():
     configured = os.environ.get('CONDUCTOR_WORKERS_DIR')
-    return os.path.realpath(os.path.abspath(configured or os.path.expanduser('~/.agents/work-control/workers')))
+    return os.path.realpath(os.path.abspath(configured or os.path.expanduser('~/.codex/work-control/workers')))
 
 
 def expected_filename_match(stem, expected_owner):
@@ -476,5 +476,4 @@ def snapshots_differ(before, after):
     detail = f'predecessor={_stable_predecessor(before["predecessor"])} -> {_stable_predecessor(after["predecessor"])}; ' \
              f'successor={_stable_successor(before["successor"])} -> {_stable_successor(after["successor"])}'
     return True, detail
-
 
