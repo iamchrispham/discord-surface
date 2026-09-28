@@ -274,15 +274,16 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       if (typeof input.content !== 'string' || input.content.length > 10000 || !Array.isArray(input.attachments) ||
         (input.content.length === 0 && input.attachments.length === 0)) return false;
       const route = state.getMessageRoute(input.channelId);
+      const enrolledRoute = route?.enrollment || null;
       const binding = route?.binding || state.getBinding(input.channelId);
       if (!binding || !binding.active || binding.guildId !== input.guildId) return false;
       if (expectedBinding && !bindingIdentityMatches(expectedBinding, binding)) return false;
-      if (state.ordinaryHandoffPauses?.has(binding.channelId) && !route?.enrollment) return false;
-      if (route?.enrollment && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(route.enrollment.state)) return false;
+      if (state.ordinaryHandoffPauses?.has(binding.channelId) && !enrolledRoute) return false;
+      if (enrolledRoute && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(enrolledRoute.state)) return false;
       if (state.getMessage(input.id)) return false;
 
       const watermark = state.getIntakeWatermark(binding.channelId);
-      let cutoff = route?.enrollment?.recoveredThroughId || watermark?.recovered_through_id || null;
+      let cutoff = enrolledRoute?.recoveredThroughId || watermark?.recovered_through_id || null;
       const handoffCutoff = route?.handoffCutoffId || null;
       if (handoffCutoff && (!cutoff || compareDiscordIds(cutoff, handoffCutoff) < 0)) cutoff = handoffCutoff;
       if (cutoff && (!/^\d+$/.test(input.id) || !/^\d+$/.test(cutoff) || compareDiscordIds(input.id, cutoff) <= 0)) return false;
@@ -364,9 +365,12 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
   async function normalizeSurfaceMessage(message, options) {
     const input = eventToInput(message);
     if (input.isBot && typeof input.content === 'string' && input.content.startsWith(WATCHER_NOTICE_PREFIX)) return input;
+    const replyContextEligibleBeforeNormalization = !input.isBot && replyContextIntakeEligible(message, options?.expectedBinding);
     const normalized = await normalizeAgentMessage(message, input, options);
     if (input.isBot) return normalized;
-    if (!replyContextIntakeEligible(message, options?.expectedBinding)) return normalized;
+    const replyContextStillEligible = replyContextEligibleBeforeNormalization &&
+      replyContextIntakeEligible(message, options?.expectedBinding);
+    if (!replyContextStillEligible) return normalized;
     const replyContext = await optionalReplyContext(message, options);
     return replyContext ? { ...normalized, replyContext } : normalized;
   }
