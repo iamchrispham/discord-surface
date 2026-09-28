@@ -19,6 +19,7 @@ FORCED_VERBS = frozenset({'steal', 'override', 'preempt'})
 PROOF_LIMIT = 1024 * 1024
 IDENTITY_ALIAS_KEYS = ('sessionId', 'fullUUID', 'fullUuid')
 DEFAULT_WORKERS_ROOT = '~/.agents/work-control/workers'
+LEGACY_WORKERS_ROOT = '~/.codex/work-control/workers'
 
 
 class GateError(Exception):
@@ -255,7 +256,15 @@ def workers_root():
 
 
 def worker_roots():
-    return [workers_root()]
+    if os.environ.get('CONDUCTOR_WORKERS_DIR'):
+        return [workers_root()]
+    canonical = workers_root()
+    legacy = os.path.realpath(os.path.abspath(os.path.expanduser(LEGACY_WORKERS_ROOT)))
+    if (legacy == canonical or not _canonical_workers_root_is_absent(canonical) or
+            not os.path.isdir(legacy)):
+        return [canonical]
+    # Older installations published manifests under the documented Codex root.
+    return [canonical, legacy]
 
 
 def expected_filename_match(stem, expected_owner):
@@ -344,6 +353,16 @@ def _canonical_symlink_target_unavailable(root):
         return os.path.lexists(canonical) and not os.path.exists(canonical)
     except OSError:
         return True
+
+
+def _canonical_workers_root_is_absent(root):
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        return not _canonical_symlink_target_unavailable(root)
+    except OSError:
+        return False
+    return False
 
 
 def discover_predecessor(expected_identity, expected_owner):

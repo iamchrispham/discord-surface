@@ -170,7 +170,7 @@ test('worker proof treats an unavailable canonical symlink target as unknown', (
   }
 });
 
-test('worker proof requires an explicit override for the legacy Codex registry', () => {
+test('worker proof discovers a legacy Codex registry when the canonical root is absent', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-legacy-home-'));
   try {
     const legacy = path.join(home, '.codex', 'work-control', 'workers');
@@ -195,7 +195,7 @@ test('worker proof requires an explicit override for the legacy Codex registry',
       encoding: 'utf8'
     });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(result.stdout.trim()).status, 'missing');
+    assert.equal(JSON.parse(result.stdout.trim()).status, 'gone');
 
     const migrated = spawnSync(PYTHON, ['-c', code], {
       env: {
