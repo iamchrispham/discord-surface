@@ -88,7 +88,7 @@ def json_object(text, label):
             object_pairs_hook=_strict_pairs,
             parse_constant=_strict_constant,
         )
-    except (UnicodeDecodeError, ValueError) as error:
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
         fail(f'{label} is not valid JSON: {error}')
     if not isinstance(value, dict):
         fail(f'{label} must contain a JSON object')

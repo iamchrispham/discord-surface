@@ -288,7 +288,7 @@ def main():
     predecessor = discover_predecessor(bound_identity, predecessor_owner) if not options.reuse else None
     first_handoff_id, carry = validate_authority(
         first_readback, first_identity, options, require_predecessor=not options.reuse, predecessor=predecessor)
-    first_snapshot = capture_snapshot(options, bound_identity, predecessor_owner, include_predecessor=not options.reuse)
+    first_snapshot = capture_snapshot(options, bound_identity, predecessor_owner, include_predecessor=carry)
 
     parent_descriptor = open_lock_parent(lock_file)
     try:
@@ -302,7 +302,7 @@ def main():
             second_readback, second_identity, options, require_predecessor=not options.reuse, predecessor=second_predecessor)
         if first_identity.get('beacon') != second_identity.get('beacon') or first_handoff_id != second_handoff_id:
             fail('conductor authority changed while acquiring the writer gate')
-        second_snapshot = capture_snapshot(options, bound_identity, second_predecessor_owner, include_predecessor=not options.reuse)
+        second_snapshot = capture_snapshot(options, bound_identity, second_predecessor_owner, include_predecessor=second_carry)
         changed, detail = snapshots_differ(first_snapshot, second_snapshot)
         if changed:
             fail(f'conductor worker identity changed while acquiring the writer gate: {detail}')
