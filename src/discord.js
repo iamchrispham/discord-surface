@@ -3154,12 +3154,55 @@ class DiscordGateway {
         reconciliationRetryQueued = false;
         const retryMessageIds = reconciliationRetryMessageIds.splice(0);
         if (this.stopping || signal?.aborted || !retryMessageIds.length) return;
-        this.reconcilePending(before, {
-          allowPaused: true,
-          readyOnly: true,
-          channelIds,
-          messageIds: retryMessageIds
-        }).catch(error => this.logger(`Discord reply reconciliation retry failed: ${error.message}`));
+        const retryThreadIds = new Set();
+        const blockedOwnerKeys = new Set();
+        for (const messageId of retryMessageIds) {
+          const message = this.state.getMessage(messageId);
+          if (message?.state !== 'accepted' || !message.deliveryChannelId ||
+              message.deliveryChannelId === message.channelId) continue;
+          if (!this.state.getMessageRoute(message.deliveryChannelId)?.ready) {
+            retryThreadIds.add(message.deliveryChannelId);
+            blockedOwnerKeys.add(`${message.provider}:${message.nativeId}`);
+          }
+        }
+        const retry = messageIds => {
+          if (!messageIds.length) return Promise.resolve();
+          return this.reconcilePending(before, {
+            allowPaused: true,
+            readyOnly: true,
+            channelIds,
+            messageIds
+          }).catch(error => this.logger(`Discord reply reconciliation retry failed: ${error.message}`));
+        };
+        if (!retryThreadIds.size) {
+          retry(retryMessageIds);
+          return;
+        }
+        const blockedRetryMessageIds = retryMessageIds.filter(messageId => {
+          const message = this.state.getMessage(messageId);
+          return message && blockedOwnerKeys.has(`${message.provider}:${message.nativeId}`);
+        });
+        const blockedRetryMessageIdSet = new Set(blockedRetryMessageIds);
+        const immediateRetryMessageIds = retryMessageIds.filter(messageId =>
+          !blockedRetryMessageIdSet.has(messageId)
+        );
+        const recoverBlocked = () => this.recoverTransport('accepted custody recovery retry', passLifecycle, [...retryThreadIds])
+          .then(recovery => {
+            const routesReady = [...retryThreadIds].every(threadId =>
+              this.state.getMessageRoute(threadId)?.ready
+            );
+            if (recovery?.ready !== true && !routesReady) {
+              this.logger(`Discord accepted custody recovery retry held: ${recovery?.state || 'unavailable'}`);
+              return;
+            }
+            retry(blockedRetryMessageIds);
+          })
+          .catch(error => this.logger(`Discord accepted custody recovery retry failed: ${error.message}`));
+        if (!immediateRetryMessageIds.length) {
+          recoverBlocked();
+          return;
+        }
+        retry(immediateRetryMessageIds).then(recoverBlocked).catch(() => {});
       });
     };
     const storedMessages = new Map();
