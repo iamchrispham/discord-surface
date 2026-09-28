@@ -330,6 +330,20 @@ def _manifest_identity_fields(worker, file_identity=None):
     }
 
 
+def _canonical_symlink_target_unavailable(root):
+    if os.environ.get('CONDUCTOR_WORKERS_DIR'):
+        return False
+    canonical = os.path.expanduser('~/.agents/work-control/workers')
+    try:
+        return (
+            os.path.lexists(canonical)
+            and not os.path.exists(canonical)
+            and os.path.realpath(canonical) == root
+        )
+    except OSError:
+        return False
+
+
 def discover_predecessor(expected_identity, expected_owner):
     """Prove the bound predecessor is gone using the documented worker registries.
 
@@ -343,10 +357,14 @@ def discover_predecessor(expected_identity, expected_owner):
     unknown_matching = False
     unknown_reason = None
     unavailable = False
+    canonical_unavailable = False
     for root in roots:
         try:
             names = sorted(name for name in os.listdir(root) if name.endswith('.json'))
         except FileNotFoundError:
+            if _canonical_symlink_target_unavailable(root):
+                unavailable = True
+                canonical_unavailable = True
             continue
         except OSError:
             unavailable = True
@@ -390,6 +408,8 @@ def discover_predecessor(expected_identity, expected_owner):
     if not exact_matches:
         if unknown_matching:
             return {'status': 'unknown', 'reason': unknown_reason, 'record': None, 'filename': None}
+        if canonical_unavailable:
+            return {'status': 'unknown', 'reason': 'predecessor worker registry is unavailable', 'record': None, 'filename': None}
         if unavailable:
             return {'status': 'missing', 'reason': 'predecessor worker registry is unavailable', 'record': None, 'filename': None}
         return {'status': 'missing', 'reason': 'no readable manifest matches the bound predecessor identity exactly',

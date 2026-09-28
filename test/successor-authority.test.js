@@ -45,7 +45,9 @@ test('worker proof uses the canonical conductor registry, with or without the Co
     const expected = path.join(home, '.agents', 'work-control', 'workers');
     fs.mkdirSync(expected, { recursive: true });
     const env = {
-      ...process.env,
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
+      ),
       HOME: home,
       PYTHONPATH: path.join(__dirname, '..', 'src')
     };
@@ -82,7 +84,9 @@ test('worker proof keeps the publisher root when only the Codex alias exists', (
     const result = spawnSync(PYTHON, ['-c',
       'import conductor_worker_proof as proof; print(proof.workers_root())'], {
       env: {
-        ...process.env,
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
+        ),
         HOME: home,
         PYTHONPATH: path.join(__dirname, '..', 'src')
       },
@@ -121,11 +125,55 @@ test('worker proof ignores a distinct Codex alias when canonical death is proven
       `print(json.dumps(proof.discover_predecessor(${JSON.stringify(expected)}, ${JSON.stringify(owner)})))`
     ].join('; ');
     const result = spawnSync(PYTHON, ['-c', code], {
-      env: { ...process.env, HOME: home, PYTHONPATH: path.join(__dirname, '..', 'src') },
+      env: {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
+        ),
+        HOME: home,
+        PYTHONPATH: path.join(__dirname, '..', 'src')
+      },
       encoding: 'utf8'
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(result.stdout.trim()).status, 'gone');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('worker proof treats an unavailable canonical symlink target as unknown', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-missing-target-home-'));
+  try {
+    const canonical = path.join(home, '.agents', 'work-control', 'workers');
+    const legacy = path.join(home, '.codex', 'work-control', 'workers');
+    fs.mkdirSync(path.dirname(canonical), { recursive: true });
+    fs.symlinkSync(path.join(home, 'registry-mount', 'workers'), canonical, 'dir');
+    fs.mkdirSync(legacy, { recursive: true });
+    const nativeId = 'missing-target-predecessor-native-id';
+    const owner = 'missing-target-owner';
+    fs.writeFileSync(path.join(legacy, `${owner}.json`), JSON.stringify({
+      sessionId: nativeId, fullUUID: nativeId, worktree: home,
+      harness: 'codex', pid: 999999, processStartTime: 1700000000, generation: 1
+    }));
+    const expected = { fullUUID: nativeId, provider: 'codex', workspace: fs.realpathSync(home) };
+    const code = [
+      'import json',
+      'import conductor_worker_proof as proof',
+      "proof.process_probe = lambda pid: ('gone', None)",
+      `print(json.dumps(proof.discover_predecessor(${JSON.stringify(expected)}, ${JSON.stringify(owner)})))`
+    ].join('; ');
+    const result = spawnSync(PYTHON, ['-c', code], {
+      env: {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
+        ),
+        HOME: home,
+        PYTHONPATH: path.join(__dirname, '..', 'src')
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout.trim()).status, 'unknown');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -153,7 +201,13 @@ test('legacy-only predecessor proof uses the documented fallback safely', () => 
         'print(json.dumps(result))'
       ].filter(Boolean).join('; ');
       const result = spawnSync(PYTHON, ['-c', code], {
-        env: { ...process.env, HOME: home, PYTHONPATH: path.join(__dirname, '..', 'src') },
+        env: {
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(([key]) => key !== 'CONDUCTOR_WORKERS_DIR')
+          ),
+          HOME: home,
+          PYTHONPATH: path.join(__dirname, '..', 'src')
+        },
         encoding: 'utf8'
       });
       assert.equal(result.status, 0, result.stderr);
