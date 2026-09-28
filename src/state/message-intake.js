@@ -2,6 +2,7 @@ const { PREFIX: AGENT_PREFIX, decodeAgentMessage } = require('../agent-message')
 const { AGENT_ROUTING_VERSION } = require('./agent-routing');
 const { WATCHER_NOTICE_PREFIX, decodeWatcherNotice, sameWatcherNotice } = require('../watcher-notice');
 const { normalizeAttachments } = require('../attachments');
+const { serializeReplyContext } = require('../reply-context');
 const { THREAD_STATES, THREAD_INTAKE_REASONS } = require('./thread-enrollment');
 const { intakeCutoffDecision } = require('./intake');
 const { WATCHER_NOTICE_RECEIPTS, WATCHER_NOTICE_JOURNAL, WATCHER_NOTICE_AUTHORITY, WATCHER_NOTICE_PUBLICATION_SOURCE } = require('./watcher-notice');
@@ -260,6 +261,7 @@ function createMessageIntakeHandlers({
         channelId: authorityChannelId,
         ...(enrollment ? { deliveryChannelId: event.channelId } : {}),
         conductorId: binding.conductorId, generation: binding.generation,
+        ...(!event.isBot && !agent && !notice ? acceptedReplyContext(event) : {}),
         readiness: ready && (!enrollment || enrollment.state === THREAD_STATES.READY) ? 'ready' : 'pending'
       });
       if (!ready || (enrollment && enrollment.state !== THREAD_STATES.READY)) {
@@ -272,6 +274,14 @@ function createMessageIntakeHandlers({
     });
   }
   };
+}
+
+// Reply context is persisted only for a plain human ordinary message. The
+// accepted-receipt detail carries the serialized string, or the property is
+// omitted entirely (no null/empty placeholder) when there is no valid context.
+function acceptedReplyContext(event) {
+  const serialized = serializeReplyContext(event?.replyContext);
+  return serialized === null ? {} : { replyContext: serialized };
 }
 
 module.exports = { createMessageIntakeHandlers };
