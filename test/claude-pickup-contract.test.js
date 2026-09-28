@@ -191,6 +191,18 @@ function assertSharedBranchInstruction(instructions, workMarker) {
   assert.ok(conditionIndex < workIndex, 'shared condition must precede the work instruction');
 }
 
+function assertAgentRequestRecoveryInstruction(instructions) {
+  const recoveryMarker = 'If it reports duplicate=true, run completion.command once as the state-backed recovery check';
+  const ackIndex = instructions.indexOf('acknowledgment.command');
+  const recoveryIndex = instructions.indexOf(recoveryMarker);
+  const workIndex = instructions.indexOf('Follow the correlated agent-send instruction in content');
+  assert.ok(ackIndex >= 0, `ack step missing from: ${instructions}`);
+  assert.ok(recoveryIndex >= 0, `duplicate recovery step missing from: ${instructions}`);
+  assert.ok(workIndex >= 0, `work marker missing from: ${instructions}`);
+  assert.ok(ackIndex < recoveryIndex, 'ACK step must precede duplicate recovery');
+  assert.ok(recoveryIndex < workIndex, 'duplicate recovery must precede the request work instruction');
+}
+
 // F1: the emitted pointer is metadata only. Every branch must delegate to the
 // payload and must not restate an unconditional reply, completion, or consume.
 function assertPointerDelegates(pointer, payload) {
@@ -357,12 +369,14 @@ test('real Monitor payloads carry the shared ACK branch for human, agent request
 
     const agentRequestPayload = payloadFor(agentRequest.id);
     assertPointerDelegates(agentRequestPayload.pointer, agentRequestPayload.payload);
-    assertSharedBranchInstruction(agentRequestPayload.payload.instructions, 'Follow the correlated agent-send instruction in content');
+    assertAgentRequestRecoveryInstruction(agentRequestPayload.payload.instructions);
     assertAcknowledgmentCommand(agentRequestPayload.payload, agentRequest, f);
     assert.deepEqual(agentRequestPayload.payload.agent, { kind: KINDS.REQUEST });
     assert.match(agentRequestPayload.payload.instructions, /Do not use reply\.command or produce a Discord reply/);
-    assert.match(agentRequestPayload.payload.instructions, /If it reports duplicate=true, first inspect the recorded correlated-result evidence/);
-    assert.match(agentRequestPayload.payload.instructions, /run completion\.command exactly once to recover completion from that result/);
+    assert.match(agentRequestPayload.payload.instructions, /If it reports duplicate=true, run completion\.command once as the state-backed recovery check/);
+    assert.match(agentRequestPayload.payload.instructions, /inspects durable correlated-result evidence/);
+    assert.match(agentRequestPayload.payload.instructions, /request lacks an immutable correlated result/);
+    assert.match(agentRequestPayload.payload.instructions, /If acknowledgment fails or its result is missing or ambiguous, stop and report the error/);
     assert.match(agentRequestPayload.payload.content, new RegExp(`--channel-id.*${OWNER_CHANNEL}`));
     assert.match(agentRequestPayload.payload.content, new RegExp(`--agent-thread-id.*${CHILD_CHANNEL}`));
     assert.match(agentRequestPayload.payload.content, /target file preserves the immutable incoming source route/);

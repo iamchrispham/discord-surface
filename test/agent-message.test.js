@@ -300,6 +300,30 @@ test('Claude Monitor persists authenticated agent context and preserves human co
   }
 });
 
+test('Claude Monitor makes duplicate agent requests recoverable through completion', () => {
+  const completion = [process.execPath, '/tmp/cli.js', 'agent-complete', '--db', '/tmp/surface.sqlite',
+    '--provider', 'claude', '--message-id', 'request-1', '--native-id', target.nativeId, '--generation', String(target.generation)];
+  const payload = monitorEvent({
+    content: 'authenticated agent request',
+    messageId: 'request-1',
+    nativeId: target.nativeId,
+    generation: target.generation,
+    completion,
+    agentMessage: { kind: KINDS.REQUEST },
+    stateDir: '/tmp',
+    dbPath: '/tmp/surface.sqlite',
+    cliPath: '/tmp/cli.js',
+    textFile: '/tmp/reply.txt'
+  });
+
+  assert.match(payload.instructions, /If it reports duplicate=true, run completion\.command once as the state-backed recovery check/);
+  assert.match(payload.instructions, /inspects durable correlated-result evidence/);
+  assert.match(payload.instructions, /request lacks an immutable correlated result/);
+  assert.match(payload.instructions, /If acknowledgment fails or its result is missing or ambiguous, stop and report the error/);
+  assert.doesNotMatch(payload.instructions, /first inspect the recorded correlated-result evidence/);
+  assert.deepEqual(payload.completion.command, completion);
+});
+
 const { runDirectPost } = require('../src/direct-post');
 const { agentSend } = require('../src/cli');
 
