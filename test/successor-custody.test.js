@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { SurfaceState, MESSAGE_STATES, READINESS, INTERACTION_ORIGIN, NATIVE_ACK_RECEIPT, COURIER_RECEIPT_KINDS } = require('../src/state');
 const { encodeAgentMessage, decodeAgentMessage, KINDS } = require('../src/agent-message');
+const { assertHandoffIntakeCoverage } = require('../src/discord/handoff-fence');
 const { AGENT_ROUTING_VERSION } = require('../src/state/agent-routing');
 const { CODEX_ID, CLAUDE_ID, SUCCESSOR_ID, fixture } = require('./surface-fixtures');
 
@@ -168,6 +169,7 @@ test('expected red: parent accepted-human custody transfers to the successor', {
   const attachments = [{ url: 'https://cdn.example.test/carry.txt', filename: 'carry.txt', contentType: 'text/plain', size: 24 }];
   const message = acceptHuman(f.state, f.channelId, '101', { content: 'carry this accepted human work', attachments });
   const rowId = f.state.getMessageRowId('101');
+  const originalAcceptance = clone(acceptedReceipt(f.state, '101'));
 
   f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true }));
 
@@ -182,6 +184,7 @@ test('expected red: parent accepted-human custody transfers to the successor', {
   assert.deepEqual(transferred.attachments, message.attachments);
   assert.equal(transferred.createdAt, message.createdAt);
   assert.equal(f.state.getMessageRowId('101'), rowId);
+  assert.deepEqual(clone(acceptedReceipt(f.state, '101')), originalAcceptance);
   assert.equal(transferred.provider, 'codex');
   assert.equal(transferred.repoKey, 'repo:alpha');
   assert.equal(transferred.conductorId, f.conductorId);
@@ -198,7 +201,7 @@ test('expected red: parent accepted-human custody transfers to the successor', {
   assert.equal(replyReceipts(f.state, '101').length, 0);
 });
 
-test('expected red: enrolled child accepted-human custody transfers and serves under the successor generation', { todo: 'issue132 implementation pending' }, t => {
+test('expected red: enrolled child accepted-human custody transfers and serves under the successor generation', { todo: 'issue132 implementation pending' }, async t => {
   const f = conductorFixture(t, 'successor-child-transfer');
   const child = 'successor-child-thread';
   assert.ok(f.state.enrollThread({ threadId: child, parentChannelId: f.channelId, guildId: 'guild-1', adoptionCutoff: '100' }));
@@ -207,8 +210,14 @@ test('expected red: enrolled child accepted-human custody transfers and serves u
   assert.equal(message.deliveryChannelId, child);
   assert.equal(message.channelId, f.channelId);
   assert.ok(BigInt(message.id) < BigInt('200'));
+  const parentChannel = { id: f.channelId, messages: { fetch: async () => [{ id: '200' }] } };
+  const childChannel = { id: child, messages: { fetch: async () => [{ id: '105' }] } };
+  const client = { channels: { fetch: async id => id === child ? childChannel : null } };
+  const enrollmentProof = await assertHandoffIntakeCoverage(parentChannel, client, f.state, f.binding, '200', 'fixture successor');
+  assert.equal(enrollmentProof.enrollments.length, 1);
+  f.state.assertThreadEnrollmentCoverage(f.channelId, enrollmentProof);
 
-  f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true }));
+  f.state.handoffConductor(handoffInput(f, { carryAcceptedHuman: true, enrollmentProof }));
 
   const transferred = f.state.getMessage('105');
   assert.equal(transferred.deliveryChannelId, child);
@@ -255,6 +264,8 @@ test('expected red: transfer receipt failure rolls custody back to the predecess
   f.state.receipt = (discordId, kind, detail) => {
     if (kind === 'conductor-custody-transferred' && !injected) {
       injected = true;
+      assert.equal(f.state.getBinding(f.channelId).nativeId, SUCCESSOR_ID);
+      assert.equal(f.state.getMessage('101').nativeId, SUCCESSOR_ID);
       throw new Error('injected transfer receipt failure');
     }
     return original(discordId, kind, detail);
