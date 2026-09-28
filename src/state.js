@@ -1268,7 +1268,12 @@ class SurfaceState {
     return intakeHandlers.reconcileIntake(this, channelId, expectedBinding, expectedBoundary);
   }
 
-  acceptDiscordMessage(event, options = {}) { return messageIntakeHandlers.acceptDiscordMessage.call(this, event, options); }
+  acceptDiscordMessage(event, options = {}) {
+    const result = messageIntakeHandlers.acceptDiscordMessage.call(this, event, options);
+    if (!result?.accepted || options.ready === false) return result;
+    const binding = this.getBinding(result.message?.channel_id || event?.channelId);
+    return binding?.readiness === READINESS.READY ? result : { ...result, held: true };
+  }
 
   acceptInteraction(input, expectedBinding = null, options = {}) {
     return interactionHandlers.acceptInteraction(this, input, expectedBinding, options);

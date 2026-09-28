@@ -26,21 +26,36 @@ export interface ReconciliationLookupWaiter {
   failed: (error: unknown) => void;
 }
 
+export interface ReconciliationConnection {
+  gateway: object;
+  epoch: number;
+}
+
 interface ReconciliationLookupEntry {
   promise: Promise<unknown>;
   waiters: Set<ReconciliationLookupWaiter>;
 }
 
+interface ReconciliationSnapshot {
+  channel: unknown;
+  connection?: ReconciliationConnection;
+}
+
 interface ReconciliationScope {
   lookups: Map<string, ReconciliationLookupEntry>;
   /** One-use settled snapshots awaiting their exact continuation. */
-  settled: Map<string, unknown>;
+  settled: Map<string, ReconciliationSnapshot>;
 }
 
 const scopes = new WeakMap<object, ReconciliationScope>();
 
 function snapshotKey(destinationId: string, consumerId: string): string {
   return `${destinationId}\u0000${consumerId}`;
+}
+
+function sameConnection(left: ReconciliationConnection | undefined, right: ReconciliationConnection | undefined): boolean {
+  if (!left || !right) return false;
+  return left.gateway === right.gateway && left.epoch === right.epoch;
 }
 
 function scopeFor(owner: object): ReconciliationScope {
@@ -77,21 +92,23 @@ export function getReconciliationLookup(owner: object, destinationId: string): P
  * Returns the single in-flight lookup for a destination, starting it with
  * `startFetch` only when none exists. A one-use snapshot left by an earlier
  * settlement for this exact consumer is consumed here instead of starting a
- * speculative second fetch. The promise is stored before any settlement can run
+ * speculative second fetch only when it belongs to this connection generation.
+ * The promise is stored before any settlement can run
  * and is removed only by its own settlement.
  */
 export function startReconciliationLookup(
   owner: object,
   destinationId: string,
   consumerId: string,
-  startFetch: () => Promise<unknown>
+  startFetch: () => Promise<unknown>,
+  connection?: ReconciliationConnection
 ): Promise<unknown> {
   const scope = scopeFor(owner);
   const key = snapshotKey(destinationId, consumerId);
-  if (scope.settled.has(key)) {
-    const channel = scope.settled.get(key);
+  const snapshot = scope.settled.get(key);
+  if (snapshot) {
     scope.settled.delete(key);
-    return Promise.resolve(channel);
+    if (!connection || sameConnection(snapshot.connection, connection)) return Promise.resolve(snapshot.channel);
   }
   const existing = scope.lookups.get(destinationId);
   if (existing) return existing.promise;
@@ -122,16 +139,17 @@ export function startReconciliationLookup(
 
 /**
  * Records a one-use settled snapshot for the exact continuation (destination +
- * consumer) that will call `startReconciliationLookup` next. Removed when
- * consumed or invalidated, so it is a handoff, never a permanent cache.
+ * consumer) and connection generation that will call `startReconciliationLookup` next.
+ * Removed when consumed or invalidated, so it is a handoff, never a permanent cache.
  */
 export function storeReconciliationSnapshot(
   owner: object,
   destinationId: string,
   consumerId: string,
-  channel: unknown
+  channel: unknown,
+  connection?: ReconciliationConnection
 ): void {
-  scopeFor(owner).settled.set(snapshotKey(destinationId, consumerId), channel);
+  scopeFor(owner).settled.set(snapshotKey(destinationId, consumerId), { channel, connection });
 }
 
 /**
@@ -155,15 +173,21 @@ export function attachReconciliationWaiter(
 /**
  * Drops only registrations whose `isCurrent()` is not exactly true (or throws)
  * from every in-flight lookup, using the same validity semantics as settlement.
- * In-flight entries and one-use settled snapshots are preserved so a shared
- * client's other gateway keeps its lookup and pending continuation.
+ * In-flight entries remain shared. Settled snapshots for a live sibling gateway
+ * are preserved, while snapshots owned by the retired connection are dropped.
  */
-export function pruneReconciliationWaiters(owner: object): void {
-  for (const entry of scopeFor(owner).lookups.values()) {
+export function pruneReconciliationWaiters(owner: object, retiredConnection?: ReconciliationConnection): void {
+  const scope = scopeFor(owner);
+  for (const entry of scope.lookups.values()) {
     for (const waiter of entry.waiters) {
       let valid = false;
       try { valid = waiter.isCurrent() === true; } catch { valid = false; }
       if (!valid) entry.waiters.delete(waiter);
+    }
+  }
+  if (retiredConnection) {
+    for (const [key, snapshot] of scope.settled) {
+      if (sameConnection(snapshot.connection, retiredConnection)) scope.settled.delete(key);
     }
   }
 }

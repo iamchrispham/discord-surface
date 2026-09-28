@@ -1513,8 +1513,9 @@ class DiscordGateway {
     if (this.stopping) return;
     this.ready = false;
     this.transportReady = false;
+    const retiredConnection = { gateway: this, epoch: this.connectionEpoch };
     this.connectionEpoch += 1;
-    pruneReconciliationWaiters(this.client);
+    pruneReconciliationWaiters(this.client, retiredConnection);
     this.recoveryController?.abort();
     this.liveCheckpointController?.abort();
     for (const binding of this.state.listBindings().filter(item => item.active)) {
@@ -3124,6 +3125,7 @@ class DiscordGateway {
     const deadline = Date.now() + this.recoveryTimeoutMs;
     const passLifecycle = this.lifecycleEpoch;
     const passConnectionEpoch = this.connectionEpoch;
+    const reconciliationConnection = { gateway: this, epoch: passConnectionEpoch };
     const selectedChannels = channelIds ? new Set(channelIds) : null;
     const selectedMessages = messageIds ? new Set(messageIds) : null;
     this.consumer?.releaseHandledWithoutPost?.();
@@ -3285,7 +3287,8 @@ class DiscordGateway {
               () => recoveryFetch(() => {
                 channelFetchStarted = true;
                 return this.client.channels.fetch(lookupDestinationId);
-              })
+              }),
+              reconciliationConnection
             );
             releaseLookupWaiter = attachReconciliationWaiter(this.client, lookupDestinationId, {
               isCurrent: () => !this.stopping && this.isCurrentLifecycle(passLifecycle) &&
@@ -3296,7 +3299,7 @@ class DiscordGateway {
                 // the existing retry producer only when this pass gave up waiting.
                 // Same-owner successors stay here until the predecessor is queued.
                 if (!lookupAbandoned) return;
-                storeReconciliationSnapshot(this.client, lookupDestinationId, message.id, settledChannel);
+                storeReconciliationSnapshot(this.client, lookupDestinationId, message.id, settledChannel, reconciliationConnection);
                 if (this.stopping || signal?.aborted || !this.isCurrentLifecycle(passLifecycle) ||
                     passConnectionEpoch !== this.connectionEpoch) return;
                 queueReconciliationRetry([message.id, ...deferredRetryMessageIds]);
