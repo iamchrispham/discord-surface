@@ -361,6 +361,8 @@ test('real Monitor payloads carry the shared ACK branch for human, agent request
     assertAcknowledgmentCommand(agentRequestPayload.payload, agentRequest, f);
     assert.deepEqual(agentRequestPayload.payload.agent, { kind: KINDS.REQUEST });
     assert.match(agentRequestPayload.payload.instructions, /Do not use reply\.command or produce a Discord reply/);
+    assert.match(agentRequestPayload.payload.instructions, /If it reports duplicate=true, first inspect the recorded correlated-result evidence/);
+    assert.match(agentRequestPayload.payload.instructions, /run completion\.command exactly once to recover completion from that result/);
     assert.match(agentRequestPayload.payload.content, new RegExp(`--channel-id.*${OWNER_CHANNEL}`));
     assert.match(agentRequestPayload.payload.content, new RegExp(`--agent-thread-id.*${CHILD_CHANNEL}`));
     assert.match(agentRequestPayload.payload.content, /target file preserves the immutable incoming source route/);
