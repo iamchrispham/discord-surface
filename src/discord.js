@@ -283,7 +283,9 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       if (state.getMessage(input.id)) return false;
 
       const watermark = state.getIntakeWatermark(binding.channelId);
-      let cutoff = enrolledRoute?.recoveredThroughId || watermark?.recovered_through_id || null;
+      let cutoff = enrolledRoute
+        ? enrolledRoute.recoveredThroughId || null
+        : watermark?.recovered_through_id || null;
       const handoffCutoff = route?.handoffCutoffId || null;
       if (handoffCutoff && (!cutoff || compareDiscordIds(cutoff, handoffCutoff) < 0)) cutoff = handoffCutoff;
       if (cutoff && (!/^\d+$/.test(input.id) || !/^\d+$/.test(cutoff) || compareDiscordIds(input.id, cutoff) <= 0)) return false;

@@ -821,6 +821,36 @@ test('ordinary handoff pause preserves reply context for an accepted enrolled re
   assert.equal(cacheCalls, 1);
 });
 
+test('an enrolled child without a recovery cursor ignores the parent watermark', async t => {
+  const { dir, state } = fixture();
+  t.after(() => cleanup(state, dir));
+  const childNativeId = '33333333-3333-3333-3333-333333333333';
+  state.bind({ channelId: '102', guildId: '100', provider: 'codex', nativeId: childNativeId, workspace: dir }, { intakeCutoff: '100' });
+  let parent = state.getBinding('102');
+  parent = state.setBindingReadiness('102', 'ready', 'fixture', parent) || parent;
+  state.enrollThread({ threadId: '103', parentChannelId: '102', guildId: '100', adoptionCutoff: '100' }, parent);
+  state.setThreadBaseline('103', '100', parent);
+  state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture', null, null, parent);
+  state.db.prepare('UPDATE thread_enrollments SET recovered_through_id=NULL WHERE thread_id=?').run('103');
+  assert.equal(state.getThreadEnrollment('103').recoveredThroughId, null);
+
+  const consumer = consumerFor(state, { readyForLiveIntake: () => false });
+  let cacheCalls = 0;
+  const accepted = await consumer.handleMessage(gm({
+    id: '100', channelId: '103', reference: { messageId: '901' },
+    cacheGet: id => {
+      cacheCalls += 1;
+      return cacheEntry(id, { channelId: '103', content: 'child question' });
+    }
+  }));
+  assert.equal(accepted.accepted, true);
+  assert.equal(accepted.held, true);
+  assert.deepEqual(state.getMessage('100').replyContext, {
+    messageId: '901', channelId: '103', guildId: '100', excerpt: 'child question', isBotAuthor: null
+  });
+  assert.equal(cacheCalls, 1);
+});
+
 test('24: an authorized human watcher-looking reply keeps its context', async t => {
   const { dir, state } = fixture();
   t.after(() => cleanup(state, dir));
