@@ -87,7 +87,7 @@ const nativeId = ${JSON.stringify(NATIVE_ID)};
 const state = new SurfaceState(db);
 state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
 state.bindOrdinaryClaude({ channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId, workspace: dir, endpoint: socket },
-  { sessionId: nativeId, threadId: nativeId, harness: 'claude-code' });
+  { sessionId: nativeId, threadId: nativeId, harness: 'claude-code' }, '100');
 state.close();
 stateCloses = 0;
 const cli = require(path.join(repo, 'src/cli.js'));

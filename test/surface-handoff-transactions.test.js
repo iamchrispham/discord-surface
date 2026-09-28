@@ -241,7 +241,7 @@ test('simulated: pending successor custody stays accepted until readiness is res
     sendReply: async () => ({ id: '103' })
   });
   const held = await consumer.handleMessage(discordMessage({ id: '102', channelId: 'pending-successor' }));
-  assert.equal(held.status, 'binding-not-ready');
+  assert.equal(held.held, true);
   assert.equal(held.message.state, MESSAGE_STATES.ACCEPTED);
   assert.equal(dispatches, 0);
   state.markIntakeBoundary('pending-successor', 'ready');

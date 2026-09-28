@@ -85,7 +85,7 @@ function fixture(t) {
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused') });
   state.bind({ channelId: 'channel', guildId: 'guild', provider: 'codex', nativeId: CODEX,
-    workspace: dir, conductorId: 'conductor', repoKey: 'repo:fixture' });
+    workspace: dir, conductorId: 'conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
   const binding = state.getBinding('channel');
   const meta = (attemptId, overrides = {}) => ({
     requestId: 'request', inReplyTo: null, attemptId, sourcePath: path.join(dir, 'source'),
@@ -171,7 +171,7 @@ function peerMeta(meta, attemptId, childId, peerRouting = false) {
 }
 
 function enrollPeerChild(state, binding, threadId) {
-  state.enrollThread({ threadId, parentChannelId: binding.channelId, guildId: binding.guildId }, binding);
+  state.enrollThread({ threadId, parentChannelId: binding.channelId, guildId: binding.guildId, adoptionCutoff: '100' }, binding);
   state.markThreadBoundary(threadId, 'ready', 'projection fixture', null, null, binding);
 }
 
