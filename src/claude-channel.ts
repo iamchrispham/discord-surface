@@ -2,12 +2,9 @@ import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as socketOwnership from './claude/socket-ownership';
 import type {
-  AcknowledgmentState,
-  MessageState,
-  NativeAcknowledgmentInput
+  MessageState
 } from './acknowledgment';
 import type { Attachment } from './attachments';
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import type { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CLAUDE_PICKUP_ACKNOWLEDGMENT } from './acknowledgment/pickup';
 export { CLAUDE_PICKUP_ACKNOWLEDGMENT } from './acknowledgment/pickup';
@@ -25,82 +22,30 @@ const { MESSAGE_STATES, normalizeAttachments, validateNativeId } = require('../s
 
 const requireInstalled = require;
 
-export interface ClaudeBinding {
-  channelId: string;
-  guildId: string;
-  provider: NativeAcknowledgmentInput['provider'];
-  nativeId: string;
-  workspace: string;
-  endpoint: string | null;
-  generation: number;
-  active: boolean;
-}
-
-export interface ClaudeMessage {
-  id: string;
-  channelId: string;
-  guildId: string;
-  provider: NativeAcknowledgmentInput['provider'];
-  nativeId: string;
-  generation: number;
-  state: MessageState;
-  channel?: unknown;
-}
-
-export type ClaudeChannelReadMessage = Pick<ClaudeMessage, 'provider' | 'nativeId' | 'generation' | 'state'>;
-
-export interface ClaudeChannelReadState {
-  findNativeBinding: (nativeId: string, provider: 'claude') => ClaudeBinding | null | undefined;
-  getBinding: (channelId: string) => ClaudeBinding | null | undefined;
-  getMessage: (messageId: string) => ClaudeChannelReadMessage | null | undefined;
-  assertMessageCurrent: (messageId: string, phase: 'native-dispatch') => ClaudeChannelReadMessage | void;
-}
-
-export interface ClaudeChannelState extends ClaudeChannelReadState {
-  getMessage: (messageId: string) => ClaudeMessage | null | undefined;
-  assertMessageCurrent: (messageId: string, phase: 'native-dispatch') => ClaudeMessage;
-}
-
-type ClaudeNativeReplyInput = Omit<NativeAcknowledgmentInput, 'provider'> & {
-  provider: 'claude';
-};
-
-export type ClaudeAcknowledgmentState = ClaudeChannelState & AcknowledgmentState & {
-  recordNativeReply: (input: ClaudeNativeReplyInput & { text: string }) => {
-    duplicate: boolean;
-    message: ClaudeMessage | null | undefined;
-  };
-};
-
-type ClaudeDefaultMcpState = AcknowledgmentState & {
-  recordNativeReply: (input: ClaudeNativeReplyInput & { text: string }) => {
-    duplicate: boolean;
-  };
-};
-
-export interface ClaudeChannelEvent {
-  nativeId: string;
-  messageId: string;
-  generation: number;
-  content: string;
-  attachments?: unknown;
-  completion?: readonly string[] | null;
-}
-
-export interface ClaudeChannelNotification {
-  method: 'notifications/claude/channel';
-  params: {
-    content: string;
-    meta: {
-      messageId: string;
-      generation: string;
-      nativeId: string;
-    };
-    attachments?: Attachment[];
-    completion?: readonly string[];
-  };
-}
-
+import type {
+  ClaudeBinding,
+  ClaudeChannelEvent,
+  ClaudeChannelNotification,
+  ClaudeChannelOptions,
+  ClaudeChannelReadState,
+  ClaudeDefaultMcp,
+  ClaudeDefaultMcpState,
+  ClaudeResolvedMcp,
+  ClaudeRuntimeMcp
+} from './claude/channel-contracts';
+export type {
+  ClaudeBinding,
+  ClaudeMessage,
+  ClaudeChannelReadMessage,
+  ClaudeChannelReadState,
+  ClaudeChannelState,
+  ClaudeAcknowledgmentState,
+  ClaudeChannelEvent,
+  ClaudeChannelNotification,
+  ClaudeDefaultMcp,
+  ClaudeChannelMcp,
+  ClaudeChannelOptions
+} from './claude/channel-contracts';
 interface ClaudeBodyRequest {
   setEncoding: (encoding: BufferEncoding) => void;
   on(event: 'data', listener: (chunk: string | Buffer) => void): void;
@@ -109,74 +54,6 @@ interface ClaudeBodyRequest {
   destroy(error?: Error): void;
 }
 
-interface ClaudeChannelMcpBase {
-  notification: (notification: ClaudeChannelNotification) => Promise<unknown> | unknown;
-  close?: () => unknown;
-  onclose?: (() => void) | null;
-  onerror?: ((error: Error) => void) | null;
-}
-
-type ClaudeDefaultMcpNotification =
-  Server['notification'] &
-  ((notification: ClaudeChannelNotification, options?: Parameters<Server['notification']>[1]) => ReturnType<Server['notification']>);
-
-export interface ClaudeDefaultMcp<TTransport = unknown> extends Omit<Server, 'connect' | 'notification'> {
-  notification: ClaudeDefaultMcpNotification;
-  connect: (transport: TTransport) => Promise<void>;
-  transportFactory: () => TTransport;
-}
-
-export type ClaudeChannelMcp<TTransport = unknown> =
-  | (ClaudeChannelMcpBase & {
-      connect: (transport: TTransport) => unknown;
-      transportFactory: () => TTransport;
-    })
-  | (ClaudeChannelMcpBase & {
-      connect?: undefined;
-      transportFactory?: () => TTransport;
-    });
-
-type ClaudeMcpValidationMember<TProvidedMcp> =
-  TProvidedMcp extends ClaudeDefaultMcp<StdioServerTransport>
-    ? unknown
-    : TProvidedMcp extends ClaudeChannelMcpBase
-      ? TProvidedMcp extends {
-          connect: (transport: infer TConnect) => unknown;
-          transportFactory: () => infer TFactory;
-        }
-        ? [TFactory] extends [TConnect]
-          ? unknown
-          : never
-        : TProvidedMcp extends {
-            connect?: undefined;
-            transportFactory?: (() => unknown) | undefined;
-          }
-          ? unknown
-          : never
-      : never;
-
-type ClaudeMcpInvalidMember<TProvidedMcp> = TProvidedMcp extends unknown
-  ? ClaudeMcpValidationMember<TProvidedMcp> extends never ? TProvidedMcp : never
-  : never;
-
-type ClaudeMcpValidation<TProvidedMcp> =
-  [TProvidedMcp] extends [undefined]
-    ? unknown
-    : [ClaudeMcpInvalidMember<Exclude<TProvidedMcp, undefined>>] extends [never]
-      ? unknown
-      : never;
-
-type ClaudeResolvedMcp<TProvidedMcp> = NonNullable<[TProvidedMcp] extends [undefined]
-  ? ClaudeDefaultMcp<StdioServerTransport>
-  : undefined extends TProvidedMcp
-    ? Exclude<TProvidedMcp, undefined> | ClaudeDefaultMcp<StdioServerTransport>
-    : TProvidedMcp>;
-
-type ClaudeRuntimeMcp = ClaudeChannelMcpBase & {
-  connect?: (transport: unknown) => unknown;
-  transportFactory?: () => unknown;
-};
-
 export const CLAUDE_STARTUP_PHASES = {
   SOCKET_PREPARATION: 'socket preparation',
   MCP_CONNECTION: 'MCP connection',
@@ -184,26 +61,6 @@ export const CLAUDE_STARTUP_PHASES = {
 } as const;
 
 export type ClaudeStartupPhase = typeof CLAUDE_STARTUP_PHASES[keyof typeof CLAUDE_STARTUP_PHASES];
-
-interface ClaudeChannelOptionsBase {
-  nativeId: string;
-  socketPath: string;
-  beforeTransportClose?: (() => void | Promise<void>) | null;
-  onTransportClose?: (() => void) | null;
-  logger?: (message: string) => void;
-}
-
-type ClaudeMcpInput<TProvidedMcp> =
-  [TProvidedMcp] extends [undefined]
-    ? { mcp?: undefined }
-    : { mcp: TProvidedMcp & ClaudeMcpValidation<TProvidedMcp> };
-
-export type ClaudeChannelOptions<
-  TProvidedMcp = undefined,
-  TState extends ClaudeChannelReadState = ClaudeChannelReadState
-> = ClaudeChannelOptionsBase & {
-  state: undefined extends TProvidedMcp ? TState & ClaudeDefaultMcpState : TState;
-} & ClaudeMcpInput<TProvidedMcp>;
 
 interface ClaudeBindingIdentity {
   channelId: string;
