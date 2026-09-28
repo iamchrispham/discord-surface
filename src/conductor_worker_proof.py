@@ -356,6 +356,10 @@ def discover_predecessor(expected_identity, expected_owner):
                             'record': None, 'filename': stem}
             exact_matches.append({'filename': stem, 'fields': fields})
         else:
+            if expected_filename_match(stem, expected_owner):
+                return {'status': 'conflict',
+                        'reason': 'matching predecessor manifest claims a different native identity',
+                        'record': None, 'filename': name}
             candidates.append(claimed)
     if not exact_matches:
         if unknown_matching:
@@ -470,6 +474,7 @@ def _stable_successor(successor):
         'processStartTime': successor.get('processStartTime'),
         'generation': successor.get('generation'),
         'harness': successor.get('harness'),
+        'state': successor.get('state'),
         'worktree': os.path.realpath(os.path.abspath(worktree)) if isinstance(worktree, str) else worktree,
         'fileIdentity': successor.get('fileIdentity'),
         'error': successor.get('error'),

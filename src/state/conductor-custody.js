@@ -199,7 +199,7 @@ function createConductorCustodyHandlers({
     }
   }
 
-  function eligibleCandidate(state, row, request, binding, evidence, config) {
+  function eligibleCandidate(state, row, request, binding, receiptsByDiscordId, evidence, config) {
     if (row.state !== MESSAGE_STATES.ACCEPTED) refuse();
     if (row.author_id !== config.operatorId) refuse();
     if (!tupleMatches(row, request, binding)) refuse();
@@ -211,7 +211,7 @@ function createConductorCustodyHandlers({
     if (row.error != null) refuse();
     const partCount = Number(state.db.prepare('SELECT COUNT(*) AS count FROM reply_parts WHERE discord_id=?').get(row.discord_id).count);
     if (partCount > 0) refuse();
-    const receiptRows = evidence.receipts.filter(item => item.discord_id === row.discord_id);
+    const receiptRows = receiptsByDiscordId.get(row.discord_id) || [];
     const { accepted, transfers } = validateCandidateReceipts(state, receiptRows, row, request);
     const originalGeneration = Number(accepted.detail.generation);
     if (!Number.isInteger(originalGeneration) || originalGeneration < 1) refuse();
@@ -234,10 +234,19 @@ function createConductorCustodyHandlers({
     }
     assertChannelCustodySettled(state, request);
     const evidence = readChannelEvidence(state, request.channelId);
+    const receiptsByDiscordId = new Map();
+    for (const receipt of evidence.receipts) {
+      const rows = receiptsByDiscordId.get(receipt.discord_id);
+      if (rows) {
+        rows.push(receipt);
+      } else {
+        receiptsByDiscordId.set(receipt.discord_id, [receipt]);
+      }
+    }
     const candidates = [];
     for (const row of evidence.messages) {
       if (!ACTIVE_STATES.has(row.state)) continue;
-      candidates.push(eligibleCandidate(state, row, request, binding, evidence, config));
+      candidates.push(eligibleCandidate(state, row, request, binding, receiptsByDiscordId, evidence, config));
     }
     return {
       channelId: request.channelId,
