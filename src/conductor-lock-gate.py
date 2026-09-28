@@ -84,6 +84,8 @@ def steal_and_id(history, steal, steal_index, provider, native_id, from_native_i
                   if history[position].get('verb') in OWNER_CHANGE_VERBS), None)
     if not isinstance(prior, dict):
         fail('canonical steal has no identifiable prior owner')
+    if prior.get('verb') == 'release':
+        fail('canonical steal predecessor record does not establish ownership')
     if prior.get('who') == steal.get('who'):
         fail('canonical steal does not follow a different prior owner')
     for row in history[steal_index + 1:]:
@@ -133,6 +135,8 @@ def transition_and_id(history, owner, provider, native_id, from_native_id, from_
     if latest.get('verb') in ('override', 'preempt'):
         fail('forced takeover is not a normal release-to-claim handoff')
     if latest.get('verb') == 'steal':
+        if latest.get('who') != owner:
+            fail('canonical steal owner does not match the held successor')
         return steal_and_id(history, latest, latest_index, provider, native_id, from_native_id,
                             from_workspace, old_binding, require_predecessor, predecessor)
     candidate = None

@@ -240,7 +240,17 @@ def predecessor_identity(worker):
     """Return the exact full identity a manifest claims, or None."""
     if not isinstance(worker, dict):
         return None
-    full_uuid = worker.get('fullUUID') or worker.get('fullUuid')
+    aliases = []
+    for key in ('sessionId', 'fullUUID', 'fullUuid'):
+        value = worker.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value:
+            return None
+        aliases.append(value)
+    if not aliases or any(alias != aliases[0] for alias in aliases):
+        return None
+    full_uuid = aliases[0]
     harness = worker.get('harness')
     workspace = worker.get('worktree')
     if not isinstance(full_uuid, str) or not full_uuid:
@@ -301,7 +311,18 @@ def discover_predecessor(expected_identity, expected_owner):
                         'record': None, 'filename': name}
             continue
         if claimed == expected_identity:
-            exact_matches.append({'filename': stem, 'fields': _manifest_identity_fields(worker)})
+            fields = _manifest_identity_fields(worker)
+            for key in ('pid', 'processStartTime', 'generation'):
+                value = fields.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    return {'status': 'unknown', 'reason': 'predecessor manifest has invalid process identity',
+                            'record': None, 'filename': stem}
+            identity = _file_identity(path)
+            # Only device+inode are stable identity; size changes with ordinary
+            # heartbeat rewrites and must not read as an authority change.
+            fields['fileIdentity'] = None if identity is None else {
+                'dev': identity.get('dev'), 'ino': identity.get('ino')}
+            exact_matches.append({'filename': stem, 'fields': fields})
         else:
             candidates.append(claimed)
     if not exact_matches:
@@ -398,6 +419,7 @@ def _stable_predecessor(predecessor):
             'generation': record.get('generation'),
             'harness': record.get('harness'),
             'worktree': os.path.realpath(os.path.abspath(worktree)) if isinstance(worktree, str) else worktree,
+            'fileIdentity': record.get('fileIdentity'),
         }
     return {
         'status': predecessor.get('status'),

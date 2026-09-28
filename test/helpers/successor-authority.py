@@ -114,6 +114,7 @@ def predecessor_manifest(native_id, workspace, pid, started, state='done', harne
         'harness': harness,
         'pid': pid,
         'processStartTime': started,
+        'generation': 1,
     }
 
 
@@ -149,12 +150,13 @@ import json
 import os
 import runpy
 import sys
+import tempfile
 
 sys.path.insert(0, os.environ['DISCORD_SURFACE_FIXTURE_SRC'])
 import conductor_worker_proof as proof  # noqa: E402
 
 spec = json.load(open(os.environ['DISCORD_SURFACE_FIXTURE_MOCKS'], 'r', encoding='utf-8'))
-counts = {'predecessor': 0, 'successor': 0}
+counts = {'predecessor': 0, 'predecessor_replace': 0, 'successor': 0}
 
 
 def _unknown(*_args, **_kwargs):
@@ -188,9 +190,30 @@ def _patch_after(original, mutation, key):
     return wrapped
 
 
+def _patch_after_replace(original, mutation, key):
+    def wrapped(*args, **kwargs):
+        result = original(*args, **kwargs)
+        counts[key] += 1
+        if counts[key] == mutation['after']:
+            path = mutation['path']
+            with open(path, 'rb') as handle:
+                body = handle.read()
+            descriptor, replacement = tempfile.mkstemp(
+                dir=os.path.dirname(path), prefix='.replace-', suffix='.json')
+            with os.fdopen(descriptor, 'wb') as handle:
+                handle.write(body)
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, path)
+        return result
+    return wrapped
+
+
 if spec.get('mutationPredecessor'):
     proof.discover_predecessor = _patch_after(
         proof.discover_predecessor, spec['mutationPredecessor'], 'predecessor')
+if spec.get('mutationPredecessorReplace'):
+    proof.discover_predecessor = _patch_after_replace(
+        proof.discover_predecessor, spec['mutationPredecessorReplace'], 'predecessor_replace')
 if spec.get('mutationSuccessor'):
     proof.successor_snapshot = _patch_after(
         proof.successor_snapshot, spec['mutationSuccessor'], 'successor')
@@ -237,6 +260,38 @@ def build_history(cfg):
     return base + tails[kind]
 
 
+def _invalid_identity_body(cfg, workspace, live, dead):
+    """A manifest that claims the exact bound identity but with one malformed field."""
+    uuid = cfg.get('predecessorUuid', cfg['oldNativeId'])
+    if cfg.get('invalidDead'):
+        pid, started = dead, 1700000000
+    else:
+        pid, started = live
+    body = predecessor_manifest(uuid, workspace, pid, started, state='done')
+    field = cfg.get('invalidField', 'pid')
+    shape = cfg.get('invalidShape', 'missing')
+    if field not in ('pid', 'processStartTime', 'generation'):
+        raise ValueError(f'unknown invalidField {field!r}')
+    shapes = {
+        'missing': None,
+        'null': None,
+        'true': True,
+        'false': False,
+        'zero': 0,
+        'negative': -1,
+        'string': '5',
+        'list': [5],
+        'object': {},
+    }
+    if shape not in shapes:
+        raise ValueError(f'unknown invalidShape {shape!r}')
+    if shape == 'missing':
+        body.pop(field, None)
+    else:
+        body[field] = shapes[shape]
+    return body
+
+
 def _predecessor_entries(cfg, workspace, live, dead):
     mode = cfg.get('predecessor', 'dead')
     uuid = cfg.get('predecessorUuid', cfg['oldNativeId'])
@@ -255,6 +310,17 @@ def _predecessor_entries(cfg, workspace, live, dead):
     if mode == 'dead':
         return [{'name': f'{owner}.json', 'raw': None,
                  'body': predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')}]
+    if mode == 'invalid_identity':
+        return [{'name': f'{owner}.json', 'raw': None,
+                 'body': _invalid_identity_body(cfg, workspace, live, dead)}]
+    if mode == 'contradictory_session':
+        body = predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')
+        body['sessionId'] = 'feedface-0000-4000-8000-000000000000'
+        return [{'name': f'{owner}.json', 'raw': None, 'body': body}]
+    if mode == 'contradictory_alias':
+        body = predecessor_manifest(uuid, workspace, dead, 1700000000, state='done')
+        body['fullUuid'] = 'feedface-0000-4000-8000-000000000000'
+        return [{'name': f'{owner}.json', 'raw': None, 'body': body}]
     if mode == 'malformed':
         return [{'name': f'{owner}.json', 'raw': '{not-json'}]
     if mode == 'duplicate_keys':
@@ -297,7 +363,8 @@ def run_gate(cfg):
 
         dead = spawn_dead()
         live = (dead, 1700000000)
-        if cfg.get('predecessor') in ('live', 'different_start', 'different_filename'):
+        if cfg.get('predecessor') in ('live', 'different_start', 'different_filename') or (
+                cfg.get('predecessor') == 'invalid_identity' and not cfg.get('invalidDead')):
             child, pid, started = spawn_live()
             children.append(child)
             live = (pid, started)
@@ -361,6 +428,10 @@ def run_gate(cfg):
             mocks['mutationPredecessor'] = {
                 'after': cfg['mutationPredecessor']['after'],
                 'set': cfg['mutationPredecessor']['set'],
+                'path': os.path.join(workers, f"{cfg['oldOwner']}.json")}
+        if cfg.get('mutationPredecessorReplace'):
+            mocks['mutationPredecessorReplace'] = {
+                'after': cfg['mutationPredecessorReplace']['after'],
                 'path': os.path.join(workers, f"{cfg['oldOwner']}.json")}
         if cfg.get('mutationSuccessor'):
             mocks['mutationSuccessor'] = {
@@ -427,6 +498,37 @@ SCENARIOS = {
     'reuse_after_steal': {'reuse': True},
     'duplicate_keys': {'predecessor': 'duplicate_keys'},
     'nonfinite': {'predecessor': 'nonfinite'},
+    'invalid_identity': {'predecessor': 'invalid_identity',
+                         'invalidField': 'pid', 'invalidShape': 'missing'},
+    'contradictory_session': {'predecessor': 'contradictory_session'},
+    'contradictory_alias': {'predecessor': 'contradictory_alias'},
+    'extra_invalid_identity': {'extraManifests': [{
+        'name': 'predecessor-noise.json',
+        'body': {
+            'sessionId': 'feedface-0000-4000-8000-000000000000',
+            'fullUUID': 'feedface-0000-4000-8000-000000000000',
+            'worktree': '/tmp/predecessor-noise-workspace',
+            'state': 'done',
+            'harness': 'codex',
+            'pid': 'not-an-int',
+            'processStartTime': 1700000000,
+            'generation': 1,
+        }}]},
+    'steal_owner_mismatch': {'history': [
+        _row('2026-09-28 00:00', 'release', 'session-codex-9caa5d21', 'release predecessor'),
+        _row('2026-09-28 00:01', 'claim', 'session-codex-9caa5d21', 'claim predecessor'),
+        _row('2026-09-28 00:02', 'steal', 'session-codex-0badc0de', 'death proof')]},
+    'steal_owner_mismatch_reuse': {'reuse': True, 'history': [
+        _row('2026-09-28 00:00', 'release', 'session-codex-9caa5d21', 'release predecessor'),
+        _row('2026-09-28 00:01', 'claim', 'session-codex-9caa5d21', 'claim predecessor'),
+        _row('2026-09-28 00:02', 'steal', 'session-codex-0badc0de', 'death proof')]},
+    'release_then_steal': {'history': [
+        _row('2026-09-28 00:00', 'release', 'session-codex-9caa5d21', 'release predecessor'),
+        _row('2026-09-28 00:01', 'steal', 'session-codex-7b7b7b7b', 'death proof')]},
+    'predecessor_inode_replace': {'predecessor': 'dead',
+                                  'mutationPredecessorReplace': {'after': 2}},
+    'predecessor_rewrite_in_place': {'predecessor': 'dead',
+                                     'mutationPredecessor': {'after': 2, 'set': {}}},
 }
 
 

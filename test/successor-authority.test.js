@@ -129,7 +129,7 @@ function buildStealFixture({ dbName, channelId, threadId, messageId, enroll }) {
   const predecessorManifest = path.join(lockDir, 'workers', `${oldOwner}.json`);
   fs.writeFileSync(predecessorManifest, JSON.stringify({
     sessionId: CODEX_ID, fullUUID: CODEX_ID, worktree: dir, state: 'done', harness: 'codex',
-    pid: predecessor.pid, processStartTime: 1700000000
+    pid: predecessor.pid, processStartTime: 1700000000, generation: 1
   }), { mode: 0o600 });
   const transcript = path.join(lockDir, 'sessions', `rollout-test-${SUCCESSOR_ID}.jsonl`);
   fs.writeFileSync(transcript, `${JSON.stringify({ type: 'session_meta', payload: { id: SUCCESSOR_ID } })}\n`, { mode: 0o600 });
@@ -396,4 +396,67 @@ test('16: duplicate JSON keys and non-finite JSON numbers in a manifest both ref
   const nonfinite = runScenario('nonfinite');
   assertRefused(nonfinite, 'non-finite manifest number');
   assert.match(nonfinite.stderr, /non-finite JSON number/);
+});
+
+test('17: a matching manifest whose pid, start time or generation is not a positive int refuses as invalid process identity', () => {
+  const rows = [
+    { invalidField: 'pid', invalidShape: 'null' },
+    { invalidField: 'pid', invalidShape: 'true' },
+    { invalidField: 'pid', invalidShape: 'false' },
+    { invalidField: 'pid', invalidShape: 'zero' },
+    { invalidField: 'pid', invalidShape: 'negative' },
+    { invalidField: 'pid', invalidShape: 'string' },
+    { invalidField: 'pid', invalidShape: 'list' },
+    { invalidField: 'processStartTime', invalidShape: 'missing' },
+    { invalidField: 'processStartTime', invalidShape: 'object' },
+    { invalidField: 'generation', invalidShape: 'zero' },
+    { invalidField: 'generation', invalidShape: 'string' },
+    { invalidField: 'pid', invalidShape: 'missing', invalidDead: true }
+  ];
+  for (const row of rows) {
+    const label = `${row.invalidField}=${row.invalidShape}${row.invalidDead ? ' (dead pid)' : ''}`;
+    const result = runScenario('invalid_identity', row);
+    assertRefused(result, label);
+    assert.match(result.stderr, /predecessor manifest has invalid process identity/);
+  }
+});
+
+test('18: a steal whose recorded owner is not the held successor refuses for fresh and reuse handoffs', () => {
+  const fresh = runScenario('steal_owner_mismatch');
+  assertRefused(fresh, 'steal owner mismatch');
+  assert.match(fresh.stderr, /canonical steal owner does not match the held successor/);
+  const reuse = runScenario('steal_owner_mismatch_reuse');
+  assertRefused(reuse, 'steal owner mismatch on reuse');
+  assert.match(reuse.stderr, /canonical steal owner does not match the held successor/);
+});
+
+test('19: a steal whose immediately-prior owner-changing record is a release refuses', () => {
+  const result = runScenario('release_then_steal');
+  assertRefused(result, 'release immediately before steal');
+  assert.match(result.stderr, /canonical steal predecessor record does not establish ownership/);
+});
+
+test('20: contradictory session identity aliases refuse while an unrelated malformed manifest is still skipped', () => {
+  const session = runScenario('contradictory_session');
+  assertRefused(session, 'contradictory sessionId');
+  assert.match(session.stderr, /matching predecessor manifest has no exact native identity/);
+  const alias = runScenario('contradictory_alias');
+  assertRefused(alias, 'contradictory fullUuid alias');
+  assert.match(alias.stderr, /matching predecessor manifest has no exact native identity/);
+  const noise = runScenario('extra_invalid_identity');
+  assertCommitted(noise, '1', 'unrelated malformed manifest is skipped');
+});
+
+test('21: replacing the predecessor manifest inode refuses while a same-content in-place rewrite commits', () => {
+  const replaced = runScenario('predecessor_inode_replace');
+  assertRefused(replaced, 'predecessor inode replacement');
+  assert.match(replaced.stderr, /conductor worker identity changed while acquiring the writer gate/);
+  const rewritten = runScenario('predecessor_rewrite_in_place');
+  assertCommitted(rewritten, '1', 'in-place same-content predecessor rewrite');
+  // A byte-length-changing in-place rewrite (same inode, untracked field) must
+  // not read as an identity change: only the predecessor file's device and
+  // inode are stable identity, so an ordinary heartbeat rewrite still commits.
+  const heartbeat = runScenario('predecessor_rewrite_in_place',
+    { mutationPredecessor: { after: 2, set: { note: 'heartbeat' } } });
+  assertCommitted(heartbeat, '1', 'byte-length in-place heartbeat rewrite');
 });
