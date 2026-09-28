@@ -74,6 +74,27 @@ test('worker proof uses the canonical conductor registry, with or without the Co
   }
 });
 
+test('worker proof falls back to the documented Codex registry when canonical root is absent', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-codex-home-'));
+  try {
+    const legacy = path.join(home, '.codex', 'work-control', 'workers');
+    fs.mkdirSync(legacy, { recursive: true });
+    const result = spawnSync(PYTHON, ['-c',
+      'import conductor_worker_proof as proof; print(proof.workers_root())'], {
+      env: {
+        ...process.env,
+        HOME: home,
+        PYTHONPATH: path.join(__dirname, '..', 'src')
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), fs.realpathSync(legacy));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 function fakeDiscordPreload({ channelId, categoryId, topic }) {
   return `
 const fs = require('node:fs');
