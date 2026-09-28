@@ -24,7 +24,7 @@ function fixture(t, provider = 'codex') {
   fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
   const nativeId = provider === 'claude' ? CLAUDE : CODEX;
   state.bind({ channelId: 'channel', guildId: 'guild', provider, nativeId, workspace: dir,
-    endpoint: provider === 'claude' ? '/tmp/claude-channel.sock' : undefined, conductorId: 'conductor', repoKey: 'repo:fixture' });
+    endpoint: provider === 'claude' ? '/tmp/claude-channel.sock' : undefined, conductorId: 'conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
   const textFile = path.join(dir, 'milestone.txt');
   t.after(() => { state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   return { dir, state, nativeId, textFile };
@@ -36,10 +36,10 @@ function agentFixture(t) {
   state.setConfig({ operatorId: '900', guildId: '100', secretFile: path.join(dir, 'discord.env') });
   fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture\n', { mode: 0o600 });
   state.bind({ channelId: '101', guildId: '100', provider: 'codex', nativeId: CODEX, workspace: dir,
-    conductorId: 'conductor', repoKey: 'repo:fixture' });
+    conductorId: 'conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
   let binding = state.getBinding('101');
   binding = state.setBindingReadiness('101', READINESS.READY, 'agent fixture ready', binding);
-  state.enrollThread({ threadId: '103', parentChannelId: '101', guildId: '100' }, binding);
+  state.enrollThread({ threadId: '103', parentChannelId: '101', guildId: '100', adoptionCutoff: '0'}, binding);
   state.setThreadBaseline('103', '0', binding);
   state.markThreadBoundary('103', THREAD_STATES.READY, 'agent fixture child ready', null, null, binding);
   const textFile = path.join(dir, 'milestone.txt');
@@ -217,7 +217,7 @@ test('resume restores the recorded reply reference and refuses owner, destinatio
     resume: true, dedupeKey: 'authority-before', inReplyTo: 'replacement-ref', fetchImpl: recorder.fetchImpl }), /replacement reply reference/);
   const otherNative = '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b';
   f.state.bind({ channelId: 'other-channel', guildId: 'guild', provider: 'codex', nativeId: otherNative, workspace: f.dir,
-    conductorId: 'other-conductor', repoKey: 'repo:other' });
+    conductorId: 'other-conductor', repoKey: 'repo:other' }, { intakeCutoff: '100' });
   await assert.rejects(runDirectPost({ state: f.state, token: 'fixture', nativeId: otherNative, generation: 1,
     channelId: 'other-channel', resume: true, dedupeKey: 'authority-before', fetchImpl: recorder.fetchImpl }), /immutable channelId/);
   assert.equal(recorder.calls.length, 1);
@@ -310,7 +310,7 @@ test('split state and database roots use the recorded custody root for cleanup',
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
   state.bind({ channelId: 'channel', guildId: 'guild', provider: 'codex', nativeId: CODEX, workspace: dir,
-    conductorId: 'conductor', repoKey: 'repo:fixture' });
+    conductorId: 'conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
   const captionFile = path.join(dir, 'caption.txt');
   const sourceFile = path.join(dir, 'source.bin');
   fs.writeFileSync(captionFile, 'split roots');
@@ -612,7 +612,7 @@ test('derived JavaScript fallback identity separates reply targets', async t => 
 
 test('claude-post selection rejects codex and generic post rejects ambiguous native owners', async t => {
   const f = fixture(t, 'claude');
-  f.state.bind({ channelId: 'codex-channel', guildId: 'guild', provider: 'codex', nativeId: CLAUDE, workspace: f.dir, conductorId: 'other', repoKey: 'repo:other' });
+  f.state.bind({ channelId: 'codex-channel', guildId: 'guild', provider: 'codex', nativeId: CLAUDE, workspace: f.dir, conductorId: 'other', repoKey: 'repo:other' }, { intakeCutoff: '100' });
   fs.writeFileSync(f.textFile, 'milestone');
   await assert.rejects(runDirectPost({ state: f.state, token: 'fixture', nativeId: CLAUDE, generation: 1, textFile: f.textFile, fetchImpl: fetchRecorder().fetchImpl }), /channel-id/);
   const recorder = fetchRecorder();
@@ -972,10 +972,10 @@ test('agent reply can correlate by accepted Discord message ID across duplicate 
   const sourceB = { guildId: '123', channelId: '902', provider: 'codex', nativeId: 'd6d5bd73-17e0-4d87-9eb7-84544b93b4f1', generation: 1 };
   state.setConfig({ operatorId: 'operator', guildId: local.guildId, secretFile: path.join(dir, 'discord.env') });
   fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
-  state.bind({ ...local, workspace: dir, conductorId: 'conductor', repoKey: 'repo:fixture' });
+  state.bind({ ...local, workspace: dir, conductorId: 'conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
   let localBinding = state.getBinding(local.channelId);
   localBinding = state.setBindingReadiness(local.channelId, READINESS.READY, 'fixture ready', localBinding);
-  state.enrollThread({ threadId: '457', parentChannelId: local.channelId, guildId: local.guildId }, localBinding);
+  state.enrollThread({ threadId: '457', parentChannelId: local.channelId, guildId: local.guildId, adoptionCutoff: '1000'}, localBinding);
   state.setThreadBaseline('457', '1000', localBinding);
   state.markThreadBoundary('457', THREAD_STATES.READY, 'fixture adoption', null, null, localBinding);
   const localChild = { ...local, channelId: '457', generation: localBinding.generation };

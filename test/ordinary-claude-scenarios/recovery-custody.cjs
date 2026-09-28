@@ -86,20 +86,20 @@ test('ordinary Claude pre-write endpoint loss demotes only matching binding and 
     if (error.code !== 'ENOENT') throw error;
   }
   const result = await gateway.consumer.handleMessage({
-    id: 'endpoint-loss', guildId: 'guild', channelId: f.binding.channelId, content: 'lost endpoint',
+    id: '900101', guildId: 'guild', channelId: f.binding.channelId, content: 'lost endpoint',
     author: { id: 'operator', bot: false }, channel
   });
   assert.equal(result.status, 'not_submitted');
-  assert.equal(f.state.getMessage('endpoint-loss').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(f.state.getMessage('900101').state, MESSAGE_STATES.ACCEPTED);
   await waitFor(() => f.state.getBinding(f.binding.channelId)?.readiness === READINESS.UNAVAILABLE);
   assert.equal(gateway.ready, false);
   const held = await gateway.consumer.intakeMessage({
-    id: 'endpoint-loss-held', guildId: 'guild', channelId: f.binding.channelId, content: 'hold after loss',
+    id: '900102', guildId: 'guild', channelId: f.binding.channelId, content: 'hold after loss',
     author: { id: 'operator', bot: false }, channel
   }, false, null, null, true);
   assert.equal(held.accepted, true);
-  assert.equal(f.state.claimDispatch('endpoint-loss-held').reason, 'binding-not-ready');
-  assert.equal(f.state.getMessage('endpoint-loss-held').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(f.state.claimDispatch('900102').reason, 'binding-not-ready');
+  assert.equal(f.state.getMessage('900102').state, MESSAGE_STATES.ACCEPTED);
   await gateway.stop();
   try { await monitor.stop(); } catch {}
 });
@@ -150,7 +150,7 @@ test('Claude Monitor releases settled dedupe after native reply becomes terminal
   const monitor = createMonitorMcp({ state: f.state, stateDir: f.dir, dbPath: f.db, stdout });
   f.state.setBindingReadiness(f.binding.channelId, READINESS.READY, 'test Monitor ready', f.binding);
   const intake = f.state.acceptDiscordMessage({
-    id: 'ordinary-claude-dedupe-release', guildId: 'guild', channelId: f.binding.channelId,
+    id: '900201', guildId: 'guild', channelId: f.binding.channelId,
     authorId: 'operator', isBot: false, content: 'answer this'
   });
   assert.equal(f.state.claimDispatch(intake.message.id).claimed, true);

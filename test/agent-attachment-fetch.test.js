@@ -74,7 +74,7 @@ test('accepted attachment duplicate skips CDN fetch and advances intake coverage
   const state = new SurfaceState(db);
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-attachment-duplicate.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-attachment-duplicate.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '100' });
   const binding = state.getBinding(target.channelId);
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);
@@ -114,7 +114,7 @@ test('attachment intake stays outside coverage until refreshed recovery, then na
   let state = new SurfaceState(db);
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
-  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-attachment-recovery.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' });
+  state.bind({ ...target, workspace: dir, endpoint: '/tmp/agent-attachment-recovery.sock', conductorId: 'destination-conductor', repoKey: 'repo:destination' }, { intakeCutoff: '6999' });
   const binding = state.getBinding(target.channelId);
   const destination = { ...target, generation: binding.generation };
   state.setIntakeBaseline(destination.channelId, '6999', 'previous completed recovery', binding);

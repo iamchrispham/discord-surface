@@ -69,6 +69,7 @@
     "src/ordinary/constants.ts",
     "src/state/thread-enrollment.ts",
     "src/discord/thread-enrollment.ts",
+    "src/discord/history-access.ts",
     "src/direct-post.ts",
     "src/direct-post/contracts.ts",
     "src/direct-post/source.ts",
@@ -106,6 +107,15 @@
     "test/decision-types.ts",
     "test/discord-decision-types.ts",
     "src/discord/recovery-fetch.ts",
+    "src/discord/reconciliation-lookups.ts",
+    "test/discord/recovery-fetch-consumer-types.ts",
+    "src/discord/native-proof-recovery.ts",
+    "test/discord/native-proof-recovery-types.ts",
+    "test/discord/native-proof-recovery-consumer-types.ts",
+    "test/discord/native-proof-recovery-public-types.ts",
+    "test/discord/native-proof-recovery-contract-types.ts",
+    "test/discord/native-proof-recovery-types.ts",
+    "test/discord/recovery-fetch-types.ts",
     "src/state/agent-routing.ts"
   ]
 }

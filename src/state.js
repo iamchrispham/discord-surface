@@ -44,8 +44,11 @@ const {
   intakeBoundaryMatches,
   pauseOrdinaryHandoffIntake,
   restoreOrdinaryHandoffIntake,
-  recoverInterruptedOrdinaryHandoffIntake
+  recoverInterruptedOrdinaryHandoffIntake,
+  persistenceRefusal,
+  qualifiedCoverageId
 } = require('./state/intake');
+const { ADOPTION_REFUSAL_DETAILS, PERSISTENCE_REFUSAL_DETAILS } = require('./discord/history-access');
 const { createInteractionHandlers, INTERACTION_ORIGIN, INTERACTION_TRANSPORT } = require('./state/interaction');
 const {
   createDecisionHandlers,
@@ -611,7 +614,6 @@ class SurfaceState {
     const intakeCutoffDetail = options.intakeCutoffDetail || null;
     const beforeMutation = options.beforeMutation;
     const input = this.bindingInput(binding);
-    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
     if (ordinaryIdentity) {
       if (input.conductorId || input.repoKey) throw new BindingError(`ordinary ${input.provider} bindings cannot carry conductor identity`);
       assertOrdinaryIdentity(input.provider, ordinaryIdentity);
@@ -624,6 +626,10 @@ class SurfaceState {
     }
     this.assertNativeOwnerFree(input.provider, input.nativeId);
     this.assertConductorOwnerFree(input.provider, input.conductorId);
+    // A genuinely fresh public binding must acquire an explicit permission-qualified
+    // history boundary before its active row is inserted. Reuse/identity-conflict
+    // diagnoses above run first; this gates only the fresh activation below.
+    if (!qualifiedCoverageId(intakeCutoff)) throw persistenceRefusal(BindingError, ADOPTION_REFUSAL_DETAILS.PARENT_CUTOFF);
     const createdAt = now();
     return this.transaction(() => {
       if (this.getBinding(input.channelId)) throw new BindingError('channel is already bound; use rebind after work drains');
@@ -631,6 +637,7 @@ class SurfaceState {
         throw new BindingError('thread channel is already enrolled');
       }
       this.assertNativeOwnerFree(input.provider, input.nativeId);
+      if (!qualifiedCoverageId(intakeCutoff)) throw persistenceRefusal(BindingError, ADOPTION_REFUSAL_DETAILS.PARENT_CUTOFF);
       const generationRow = input.conductorId
         ? this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE provider=? AND conductor_id=?').get(input.provider, input.conductorId)
         : this.db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM bindings WHERE channel_id=?').get(input.channelId);
@@ -650,9 +657,7 @@ class SurfaceState {
           harness: ordinaryIdentity.harness || undefined, endpoint: input.endpoint || undefined
         });
       }
-      if (intakeCutoff !== null) {
-        this.setIntakeCutoffInTransaction(input.channelId, input.guildId, intakeCutoff, intakeCutoffDetail);
-      }
+      this.setIntakeCutoffInTransaction(input.channelId, input.guildId, intakeCutoff, intakeCutoffDetail);
       return this.getBinding(input.channelId);
     });
   }
@@ -665,7 +670,7 @@ class SurfaceState {
     if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
     assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
     assertOrdinaryNativeIdentity(PROVIDERS.CLAUDE, binding.nativeId, identity);
-    return this.bind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, adoptionCutoff === null ? options : {
+    return this.bind({ ...binding, provider: PROVIDERS.CLAUDE, conductorId: null, repoKey: null, readiness: READINESS.PENDING, ordinaryIdentity: identity }, {
       intakeCutoff: adoptionCutoff,
       intakeCutoffDetail: 'ordinary binding adoption cutoff',
       beforeMutation: options.beforeMutation
@@ -1131,10 +1136,13 @@ class SurfaceState {
     const existing = this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(event.channelId);
     const lastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, event.id) >= 0 ? existing.last_seen_id : event.id;
     const confirmedCoverageId = coverageId;
+    const verifiedEmptyCoverage = existing?.state === READINESS.READY &&
+      !existing.last_seen_id && !existing.recovered_through_id;
+    const qualifyingEmptyCoverage = verifiedEmptyCoverage && !confirmedCoverageId;
     const recoveredThrough = confirmedCoverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, confirmedCoverageId) < 0)
       ? confirmedCoverageId
-      : existing?.recovered_through_id || null;
-    const state = existing?.state === READINESS.GAP ? 'gap' : existing?.state === READINESS.UNAVAILABLE ? 'unavailable' : ready ? 'ready' : 'pending';
+      : existing?.recovered_through_id || (verifiedEmptyCoverage ? '0' : null);
+    const state = existing?.state === READINESS.GAP ? 'gap' : existing?.state === READINESS.UNAVAILABLE ? 'unavailable' : qualifyingEmptyCoverage || !ready ? READINESS.PENDING : READINESS.READY;
     if (existing) {
       this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, updated_at=? WHERE channel_id=?')
         .run(event.guildId, lastSeen, recoveredThrough, state, now(), event.channelId);
@@ -1142,13 +1150,14 @@ class SurfaceState {
       this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, recovered_through_id, state, updated_at) VALUES(?, ?, ?, ?, ?, ?)')
         .run(event.channelId, event.guildId, lastSeen, recoveredThrough, state, now());
     }
-    if (!ready) {
+    if (!ready || qualifyingEmptyCoverage) {
       const binding = this.getBinding(event.channelId);
       if (binding?.active && binding.guildId === event.guildId) {
-        const updated = this.db.prepare("UPDATE bindings SET readiness='recovering', updated_at=? WHERE channel_id=? AND active=1 AND readiness='ready'")
-          .run(now(), event.channelId);
+        const readiness = qualifyingEmptyCoverage ? READINESS.PENDING : READINESS.RECOVERING;
+        const updated = this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1 AND readiness=?')
+          .run(readiness, now(), event.channelId, READINESS.READY);
         if (Number(updated.changes) === 1) {
-          this.receipt(null, 'binding-readiness', { channelId: event.channelId, readiness: READINESS.RECOVERING });
+          this.receipt(null, 'binding-readiness', { channelId: event.channelId, readiness });
         }
       }
     }
@@ -1176,18 +1185,27 @@ class SurfaceState {
       if (!bindingMatchesExpected(binding, expectedBinding)) return null;
       const existing = this.getIntakeWatermark(channelId);
       if (!intakeBoundaryMatches(existing, expectedBoundary, binding, expectedReadiness)) return null;
-      const retainedLastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
+      // Observation (last_seen_id) and covered coverage are separate facts. A newest
+      // observed history row must never be promoted into the covered cursor, so an
+      // owned watermark without an already-qualified recovered_through_id refuses.
+      if (!existing) throw persistenceRefusal(BindingError, PERSISTENCE_REFUSAL_DETAILS.PARENT_COVERAGE);
+      const legacyEmptyReady = existing.state === READINESS.READY &&
+        !existing.last_seen_id && !existing.recovered_through_id && lastSeenId === '0';
+      if (legacyEmptyReady) {
+        const detailText = String(detail || '').slice(0, 1000) || null;
+        this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
+          .run(binding.guildId, '0', '0', READINESS.PENDING, detailText, now(), channelId);
+        this.receipt(null, 'intake-baseline', { channelId, lastSeenId: '0', detail: detailText });
+        return this.getIntakeWatermark(channelId);
+      }
+      const coveredCursor = qualifiedCoverageId(existing.recovered_through_id);
+      if (!coveredCursor) throw persistenceRefusal(BindingError, PERSISTENCE_REFUSAL_DETAILS.PARENT_COVERAGE);
+      const retainedLastSeen = existing.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
         ? existing.last_seen_id
         : lastSeenId;
-      const retainedRecoveredThrough = existing?.recovered_through_id || lastSeenId;
-      if (existing) {
-        this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
-          .run(binding.guildId, retainedLastSeen, retainedRecoveredThrough, 'pending', String(detail || '').slice(0, 1000) || null, now(), channelId);
-      } else {
-        this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, recovered_through_id, state, detail, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
-          .run(channelId, binding.guildId, lastSeenId, lastSeenId, 'pending', String(detail || '').slice(0, 1000) || null, now());
-      }
-      this.receipt(null, 'intake-baseline', { channelId, lastSeenId, detail });
+      this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
+        .run(binding.guildId, retainedLastSeen, 'pending', String(detail || '').slice(0, 1000) || null, now(), channelId);
+      this.receipt(null, 'intake-baseline', { channelId, lastSeenId: retainedLastSeen, detail });
       return this.getIntakeWatermark(channelId);
     });
   }
@@ -1250,7 +1268,14 @@ class SurfaceState {
     return intakeHandlers.reconcileIntake(this, channelId, expectedBinding, expectedBoundary);
   }
 
-  acceptDiscordMessage(event, options = {}) { return messageIntakeHandlers.acceptDiscordMessage.call(this, event, options); }
+  acceptDiscordMessage(event, options = {}) {
+    const result = messageIntakeHandlers.acceptDiscordMessage.call(this, event, options);
+    if (!result?.accepted || options.ready === false) return result;
+    const deliveryChannelId = result.message?.deliveryChannelId || result.message?.delivery_channel_id ||
+      event?.deliveryChannelId || event?.delivery_channel_id || event?.channelId;
+    const route = deliveryChannelId ? this.getMessageRoute(deliveryChannelId) : null;
+    return route?.ready ? result : { ...result, held: true };
+  }
 
   acceptInteraction(input, expectedBinding = null, options = {}) {
     return interactionHandlers.acceptInteraction(this, input, expectedBinding, options);

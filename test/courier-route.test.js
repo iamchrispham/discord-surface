@@ -33,9 +33,9 @@ function fixture(t, { packetKind = KINDS.REQUEST, includeInitialAgent = true } =
   fs.writeFileSync(sessionFile, `${JSON.stringify({ type: 'session_meta', payload: { id: PARENT_NATIVE, session_id: PARENT_NATIVE } })}\nold transcript\n`);
   let state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   state.setConfig({ operatorId: 'operator', guildId: '100', secretFile: path.join(dir, 'secret') });
-  state.bind({ channelId: '1000', guildId: '100', provider: 'codex', nativeId: PARENT_NATIVE, workspace: dir, sessionRoot });
+  state.bind({ channelId: '1000', guildId: '100', provider: 'codex', nativeId: PARENT_NATIVE, workspace: dir, sessionRoot }, { intakeCutoff: '100' });
   const binding = state.getBinding('1000');
-  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100' }, binding);
+  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100', adoptionCutoff: '100'}, binding);
   state.setThreadBaseline('2000', null, binding);
   state.markThreadBoundary('2000', THREAD_STATES.READY, 'courier route fixture', null, null, binding);
   const target = { guildId: '100', channelId: '2000', provider: 'codex', nativeId: PARENT_NATIVE, generation: binding.generation };
@@ -197,7 +197,7 @@ test('CLI courier route validation fails closed and keeps omission disabled', ()
   assert.throws(() => resolveCourierRoute(state, parseArgs(['run', '--courier-route-id', 'missing']).args), /courier route is unknown: missing/);
 });
 
-function humanMessage(f, id = 'human-1', content = 'human instruction', attachments = [], channelId = '1000') {
+function humanMessage(f, id = '9010', content = 'human instruction', attachments = [], channelId = '1000') {
   const accepted = f.state.acceptDiscordMessage({
     id,
     guildId: '100',
@@ -349,7 +349,7 @@ test('selected agent route uses exact parent prompt and existing native lifecycl
 
 test('human parent route keeps authority and original Discord destination', async t => {
   const f = fixture(t, { includeInitialAgent: false });
-  const message = humanMessage(f, 'human-1', 'approve the release', [{
+  const message = humanMessage(f, '9010', 'approve the release', [{
     url: 'https://example.test/release.txt',
     filename: 'release.txt',
     contentType: 'text/plain',
@@ -372,11 +372,11 @@ test('human parent route keeps authority and original Discord destination', asyn
   assert.deepEqual(envelope.sourceDestination, { guildId: '100', channelId: '1000' });
   assert.equal(envelope.deliveryChannelId, '1000');
   assert.equal(envelope.prompt, parentPrompt(f.state, message));
-  assert.deepEqual(replies, [{ messageId: 'human-1', channelId: '1000', content: 'answer for human-1' }]);
+  assert.deepEqual(replies, [{ messageId: '9010', channelId: '1000', content: 'answer for 9010' }]);
   assert.equal(f.state.getMessage(message.id).authorId, 'operator');
   assert.equal(f.state.listReceipts().filter(row => row.kind === 'native-ack').length, 1);
 
-  const childMessage = humanMessage(f, 'human-child-1', 'child instruction', [], '2000');
+  const childMessage = humanMessage(f, '9011', 'child instruction', [], '2000');
   const childResult = await consumerFor(f, { courierCalls, parentCalls, replies }).processAccepted(childMessage);
   assert.equal(childResult.message.state, MESSAGE_STATES.REPLIED);
   assert.equal(courierCalls.length, 2);
@@ -384,14 +384,14 @@ test('human parent route keeps authority and original Discord destination', asyn
   assert.equal(courierCalls[1].envelope.deliveryChannelId, '2000');
   assert.equal(parentCalls.length, 0);
   assert.deepEqual(replies.map(reply => ({ messageId: reply.messageId, channelId: reply.channelId })), [
-    { messageId: 'human-1', channelId: '1000' },
-    { messageId: 'human-child-1', channelId: '2000' }
+    { messageId: '9010', channelId: '1000' },
+    { messageId: '9011', channelId: '2000' }
   ]);
 });
 
 test('ordinary agent and human origins remain courier-eligible', async t => {
   const f = fixture(t);
-  const human = humanMessage(f, 'human-origin-guard', 'ordinary human instruction');
+  const human = humanMessage(f, '9012', 'ordinary human instruction');
   assert.equal(f.state.isInteractionMessage(human.id), false);
   assert.equal(human.decisionResult, undefined);
   const courierCalls = [];
@@ -438,7 +438,7 @@ test('interaction-origin and materialized decision messages cannot mint courier 
 test('selected and unselected messages share parent owner FIFO', async t => {
   const f = fixture(t);
   const binding = f.state.getBinding('1000');
-  f.state.enrollThread({ threadId: '2001', parentChannelId: '1000', guildId: '100' }, binding);
+  f.state.enrollThread({ threadId: '2001', parentChannelId: '1000', guildId: '100', adoptionCutoff: '100'}, binding);
   f.state.setThreadBaseline('2001', null, binding);
   f.state.markThreadBoundary('2001', THREAD_STATES.READY, 'second child fixture', null, null, binding);
   const otherTarget = { ...f.route.target, channelId: '2001' };
@@ -497,7 +497,7 @@ test('restarted claimed courier custody becomes uncertain without resend', async
 test('resumed courier refusal blocks later owner work with or without route selection', async t => {
   for (const selected of [true, false]) {
     const f = fixture(t);
-    const later = humanMessage(f, `9006-${selected}`, 'later parent work');
+    const later = humanMessage(f, selected ? '9007' : '9008', 'later parent work');
     assert.equal(f.state.claimDispatch(f.message.id).claimed, true);
     const claimed = f.state.beginCourierAttempt(f.message.id, preparedInput(f, f.message));
     assert.equal(claimed.accepted, true);
@@ -733,8 +733,8 @@ test('courier route registration rejects a Claude parent', t => {
     nativeId: parentNative,
     workspace: dir,
     endpoint: '/tmp/discord-courier-claude.sock'
-  });
-  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100' }, binding);
+  }, { intakeCutoff: '100' });
+  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100', adoptionCutoff: '100'}, binding);
   state.setThreadBaseline('2000', null, binding);
   state.markThreadBoundary('2000', THREAD_STATES.READY, 'Claude route fixture', null, null, binding);
 
@@ -778,7 +778,7 @@ test('courier route registration rejects a non-parent recipient', t => {
 
 test('human messages reject a stale courier target', t => {
   const f = fixture(t, { includeInitialAgent: false });
-  const message = humanMessage(f, 'human-stale-target');
+  const message = humanMessage(f, '9013');
   f.state.receipt(null, 'courier-route', {
     ...f.route,
     target: { ...f.route.target, nativeId: '55555555-5555-5555-5555-555555555555' },

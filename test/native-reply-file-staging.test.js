@@ -24,7 +24,7 @@ function nativeFileFinalRegressionInput(f, messageId, sourcePath, caption) {
 test('native reply rejects a competing text reply before reservation', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-final-pre-reservation-${provider}`;
+    const id = '916001';
     const source = path.join(f.dir, 'answer.bin');
     fs.writeFileSync(source, Buffer.from('payload'));
     submitted(f, id);
@@ -52,7 +52,7 @@ test('native reply rejects a competing text reply before reservation', async t =
 test('native reply authorization loss during final staging retains ACK and custody', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-final-auth-loss-${provider}`;
+    const id = '916002';
     const source = path.join(f.dir, 'answer.bin');
     fs.writeFileSync(source, Buffer.from('payload'));
     submitted(f, id, MESSAGE_STATES.UNCERTAIN);
@@ -89,7 +89,7 @@ test('native reply authorization loss during final staging retains ACK and custo
 test('native reply caption mismatch refuses and matching admitted caption retries', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-final-caption-${provider}`;
+    const id = '916003';
     const source = path.join(f.dir, 'answer.bin');
     fs.writeFileSync(source, Buffer.from('payload'));
     submitted(f, id);
@@ -111,7 +111,7 @@ test('native reply caption mismatch refuses and matching admitted caption retrie
 test('native reply preparation retry exposes its existing preparation ID', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-final-preparing-retry-${provider}`;
+    const id = '916004';
     const source = path.join(f.dir, 'answer.bin');
     fs.writeFileSync(source, Buffer.from('payload'));
     submitted(f, id);

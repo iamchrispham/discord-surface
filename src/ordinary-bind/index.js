@@ -14,6 +14,7 @@ const { assertSameChannelSelection, resolveDiscordChannel } = require('./channel
 const { assertGatewayWakeCompatible } = require('./gateway-capability');
 const { GATEWAY_CAPABILITIES } = require('./constants');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('../ordinary/constants');
+const { readAdoptionCutoff } = require('../discord/history-access');
 const { reconcileProofUnavailableIntake } = require('./proof-recovery');
 
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
@@ -39,21 +40,6 @@ function requestGatewayRecovery(paths, options) {
 
 function print(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-}
-
-async function latestChannelMessageId(channel) {
-  const cached = typeof channel?.lastMessageId === 'string' && channel.lastMessageId.length > 0 ? channel.lastMessageId : null;
-  if (typeof channel?.messages?.fetch !== 'function') return cached;
-  const fetched = await channel.messages.fetch({ limit: 1 });
-  let message = null;
-  if (Array.isArray(fetched)) message = fetched[0];
-  else if (typeof fetched?.first === 'function') message = fetched.first();
-  else if (typeof fetched?.values === 'function') message = fetched.values().next().value;
-  return typeof message?.id === 'string' && message.id.length > 0 ? message.id : cached;
-}
-
-function serverDerivedChannelCutoff(channel) {
-  return typeof channel?.id === 'string' && /^\d+$/.test(channel.id) ? channel.id : null;
 }
 
 function ordinaryBindingArgs(args, environment, channelId, guildId, workspace, sessionRoot) {
@@ -145,8 +131,10 @@ async function ordinaryBind(args, dependencies = {}) {
     let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
     let adoptionCutoff = null;
     if (decision !== ORDINARY_BINDING_DECISIONS.REUSE && !existing?.active) {
-      const cutoff = await latestChannelMessageId(discordChannel);
-      adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
+      // Acquire the coverage boundary from a permission-qualified history read before
+      // the active binding is inserted. Never infer it from the channel id, a cached
+      // newest message, or any other non-history value.
+      adoptionCutoff = await readAdoptionCutoff(discordChannel, channel.id, client.user);
     }
     let binding;
     if (decision === ORDINARY_BINDING_DECISIONS.REUSE) binding = existing;
@@ -301,8 +289,10 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     let decision = ordinaryBindingDecision(existing, boundRequest, existing ? state.isOrdinaryBindingRecord(existing) : false);
     let adoptionCutoff = null;
     if (decision !== ORDINARY_BINDING_DECISIONS.REUSE && !existing?.active) {
-      const cutoff = await latestChannelMessageId(discordChannel);
-      adoptionCutoff = cutoff || serverDerivedChannelCutoff(discordChannel);
+      // Acquire the coverage boundary from a permission-qualified history read before
+      // the active binding is inserted. Never infer it from the channel id, a cached
+      // newest message, or any other non-history value.
+      adoptionCutoff = await readAdoptionCutoff(discordChannel, channel.id, client.user);
     }
     let binding;
     if (decision === ORDINARY_BINDING_DECISIONS.REUSE) binding = existing;

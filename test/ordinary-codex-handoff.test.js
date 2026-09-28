@@ -76,7 +76,7 @@ test('ordinary bind rejects a successor and explicit tombstone handoff transfers
   const binding = f.state.bindOrdinary({
     channelId: 'ordinary-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: f.dir, sessionRoot: originalRoot
-  }, f.identity);
+  }, f.identity, '100');
   f.state.setIntakeCutoff(binding.channelId, 'guild', '100', 'ordinary handoff baseline');
   f.state.unbind(binding.channelId);
   const successorWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-successor-workspace-'));
@@ -176,7 +176,7 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
   const unresolvedFixture = fixture(t);
   const unresolvedBinding = ordinary(unresolvedFixture, 'ordinary-unresolved-source');
   const accepted = unresolvedFixture.state.acceptDiscordMessage({
-    id: 'ordinary-handoff-pending', guildId: 'guild', channelId: unresolvedBinding.channelId,
+    id: '900601', guildId: 'guild', channelId: unresolvedBinding.channelId,
     authorId: 'operator', isBot: false, content: 'held'
   }, { ready: true });
   assert.equal(accepted.accepted, true);
@@ -191,7 +191,7 @@ test('ordinary handoff transfers an active drained source and holds stale, unres
   const second = collisionFixture.state.bindOrdinary({
     channelId: 'ordinary-collision-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: OTHER,
     workspace: successorWorkspace, sessionRoot: successorRoot
-  }, { sessionId: OTHER, threadId: OTHER });
+  }, { sessionId: OTHER, threadId: OTHER }, '100');
   assert.equal(second.active, true);
   assert.throws(() => collisionFixture.state.handoffOrdinary({
     channelId: collisionBinding.channelId, provider: PROVIDERS.CODEX, fromNativeId: CODEX, fromGeneration: 1,
@@ -222,7 +222,7 @@ test('explicit ordinary handoff validates the CLI proof and wakes generation-spe
   const original = setup.bindOrdinary({
     channelId: '123456789012345678', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: dir
-  }, { sessionId: CODEX, threadId: CODEX });
+  }, { sessionId: CODEX, threadId: CODEX }, '100');
   setup.setIntakeCutoff(original.channelId, 'guild', '100', 'ordinary CLI handoff baseline');
   setup.markIntakeBoundary(original.channelId, READINESS.UNAVAILABLE, 'ordinary CLI handoff previous terminal');
   setup.unbind(original.channelId);

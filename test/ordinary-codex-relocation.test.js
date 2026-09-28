@@ -39,21 +39,21 @@ test('ordinary bind starts pending with paired null conductor identity and holds
     channelId: binding.channelId, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: OTHER, workspace: f.dir
   }), /matching invocation identity/);
   const accepted = f.state.acceptDiscordMessage({
-    id: 'pending-input', guildId: 'guild', channelId: binding.channelId,
+    id: '900901', guildId: 'guild', channelId: binding.channelId,
     authorId: 'operator', isBot: false, content: 'held'
   }, { ready: false });
   assert.equal(accepted.accepted, true);
-  assert.equal(f.state.claimDispatch('pending-input').reason, 'binding-not-ready');
-  assert.equal(f.state.getMessage('pending-input').state, 'accepted');
+  assert.equal(f.state.claimDispatch('900901').reason, 'binding-not-ready');
+  assert.equal(f.state.getMessage('900901').state, 'accepted');
   assert.throws(() => f.state.bindOrdinary({
     channelId: 'second-channel', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX, workspace: f.dir
-  }, f.identity), /already owned/);
+  }, f.identity, '100'), /already owned/);
   assert.throws(() => f.state.bindOrdinary({
     channelId: binding.channelId, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: OTHER, workspace: f.dir
-  }, { sessionId: OTHER, threadId: OTHER }), /already bound/);
+  }, { sessionId: OTHER, threadId: OTHER }, '100'), /already bound/);
   assert.throws(() => f.state.bindOrdinary({
     channelId: 'identity-mismatch', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX, workspace: f.dir
-  }, { sessionId: OTHER, threadId: OTHER }), /does not match the native session/);
+  }, { sessionId: OTHER, threadId: OTHER }, '100'), /does not match the native session/);
 });
 
 test('ordinary classification excludes a conductor-owned Codex binding', t => {
@@ -61,7 +61,7 @@ test('ordinary classification excludes a conductor-owned Codex binding', t => {
   const binding = f.state.bind({
     channelId: 'conductor-owned', guildId: 'guild', provider: PROVIDERS.CODEX, nativeId: CODEX,
     workspace: f.dir, conductorId: 'conductor', repoKey: 'repo:test'
-  });
+  }, { intakeCutoff: '100' });
   f.state.receipt(null, ORDINARY_RECEIPT_KINDS.BOUND, {
     channelId: binding.channelId, provider: binding.provider, nativeId: binding.nativeId,
     workspace: binding.workspace, generation: binding.generation
@@ -122,7 +122,7 @@ test('ordinary root relocation refuses an in-flight dispatch', t => {
   });
   f.state.markIntakeBoundary(binding.channelId, 'ready', null, null, null, binding);
   const accepted = f.state.acceptDiscordMessage({
-    id: 'dispatching-root-relocation', guildId: 'guild', channelId: binding.channelId,
+    id: '900902', guildId: 'guild', channelId: binding.channelId,
     authorId: 'operator', isBot: false, content: 'dispatching'
   });
   assert.equal(accepted.accepted, true);
@@ -149,7 +149,7 @@ test('ordinary root relocation refuses an uncertain dispatch', t => {
   });
   f.state.markIntakeBoundary(binding.channelId, 'ready', null, null, null, binding);
   const accepted = f.state.acceptDiscordMessage({
-    id: 'uncertain-root-relocation', guildId: 'guild', channelId: binding.channelId,
+    id: '900903', guildId: 'guild', channelId: binding.channelId,
     authorId: 'operator', isBot: false, content: 'uncertain'
   });
   assert.equal(accepted.accepted, true);

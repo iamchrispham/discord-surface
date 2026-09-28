@@ -15,14 +15,14 @@ const { CLAUDE_ID, CLI_PATH, fixture, attachmentMetadata, waitForFile, waitForPr
 test('simulated: Claude channel forwards only the bound generation and closes its socket', async () => {
   const { dir, state } = fixture();
   const socket = path.join(dir, 'claude.sock');
-  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
-  state.acceptDiscordMessage({ id: 'claude-event', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: 'reply' });
-  state.claimDispatch('claude-event');
-  state.markSubmitted('claude-event');
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '101', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: 'reply' });
+  state.claimDispatch('101');
+  state.markSubmitted('101');
   const events = [];
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async event => events.push(event) } });
   await channel.start();
-  const response = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId: 'claude-event', generation: 1, content: 'reply' });
+  const response = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId: '101', generation: 1, content: 'reply' });
   assert.equal(response.statusCode, 202);
   const notification = events[0];
   NotificationSchema.parse(notification);
@@ -33,7 +33,7 @@ test('simulated: Claude channel forwards only the bound generation and closes it
       meta: z.record(z.string().regex(/^[A-Za-z0-9_]+$/), z.string())
     })
   }).parse(notification);
-  assert.equal(notification.params.meta.messageId, 'claude-event');
+  assert.equal(notification.params.meta.messageId, '101');
   assert.equal(notification.params.meta.generation, '1');
   await channel.stop();
   assert.equal(fs.existsSync(socket), false);
@@ -46,21 +46,21 @@ test('simulated: Claude channel validates and forwards attachment-only events', 
   fs.chmodSync(socketDir, 0o700);
   const socket = path.join(socketDir, 'channel.sock');
   const attachment = attachmentMetadata();
-  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
-  state.acceptDiscordMessage({ id: 'claude-attachment', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: '', attachments: [attachment] });
-  state.claimDispatch('claude-attachment');
-  state.markSubmitted('claude-attachment');
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '102', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: '', attachments: [attachment] });
+  state.claimDispatch('102');
+  state.markSubmitted('102');
   const events = [];
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async event => events.push(event) } });
   await channel.start();
   const response = await postUnixJson(socket, {
-    nativeId: CLAUDE_ID, messageId: 'claude-attachment', generation: 1, content: '',
+    nativeId: CLAUDE_ID, messageId: '102', generation: 1, content: '',
     attachments: [attachment]
   });
   assert.equal(response.statusCode, 202);
   assert.deepEqual(events[0].params.attachments, [attachment]);
   const rejected = await postUnixJson(socket, {
-    nativeId: CLAUDE_ID, messageId: 'claude-attachment', generation: 1, content: '',
+    nativeId: CLAUDE_ID, messageId: '102', generation: 1, content: '',
     attachments: [attachmentMetadata({ url: 'javascript:alert(1)' })]
   });
   assert.equal(rejected.statusCode, 400);
@@ -74,10 +74,10 @@ test('simulated: Claude Monitor child emits one event and CLI reply records exac
   const socketDir = fs.mkdtempSync('/tmp/dsm-');
   fs.chmodSync(socketDir, 0o700);
   const socket = path.join(socketDir, 'monitor.sock');
-  const messageId = 'claude-monitor-event';
+  const messageId = '103';
   const content = `raw monitor content ✓\n${'keep exact ✓ '.repeat(300)}`;
   const attachments = [attachmentMetadata({ filename: 'monitor.png', size: 777 })];
-  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   state.acceptDiscordMessage({ id: messageId, guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content, attachments });
   state.claimDispatch(messageId);
   state.markSubmitted(messageId);
@@ -183,14 +183,14 @@ test('simulated: Claude dispatch rechecks authorization after intake', async () 
   const socketDir = fs.mkdtempSync(path.join('/tmp', 'discord-surface-auth-'));
   fs.chmodSync(socketDir, 0o700);
   const socket = path.join(socketDir, 'channel.sock');
-  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
-  state.acceptDiscordMessage({ id: 'claude-revoked', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('claude-revoked');
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '104', guildId: 'guild-1', channelId: 'channel-claude', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('104');
   state.setConfig({ operatorId: 'operator-revoked', guildId: 'guild-1', secretFile: path.join(dir, 'discord.secret') });
   const events = [];
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: { notification: async event => events.push(event) } });
   await channel.start();
-  const response = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId: 'claude-revoked', generation: 1, content: 'x' });
+  const response = await postUnixJson(socket, { nativeId: CLAUDE_ID, messageId: '104', generation: 1, content: 'x' });
   assert.equal(response.statusCode, 409);
   assert.equal(events.length, 0);
   assert.ok(state.listReceipts().some(receipt => receipt.kind === 'native-dispatch-rejected-auth'));
@@ -203,7 +203,7 @@ test('simulated: Claude transport close stops its HTTP and socket resources', as
   const socketDir = fs.mkdtempSync(path.join('/tmp', 'discord-surface-close-'));
   fs.chmodSync(socketDir, 0o700);
   const socket = path.join(socketDir, 'channel.sock');
-  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   const mcp = { notification: async () => {}, close: async () => {} };
   let databaseClosed = false;
   const channel = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp, onTransportClose: () => { databaseClosed = true; state.close(); } });
@@ -220,7 +220,7 @@ test('simulated: Claude start failure closes MCP and stop retries a close failur
   const socketDir = fs.mkdtempSync(path.join('/tmp', 'discord-surface-start-'));
   fs.chmodSync(socketDir, 0o700);
   const socket = path.join(socketDir, 'channel.sock');
-  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket });
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CLAUDE_ID, workspace: dir, endpoint: socket }, { intakeCutoff: '100' });
   let closes = 0;
   const failedMcp = { connect: async () => { throw new Error('connect failed'); }, transportFactory: () => ({}), close: async () => { closes += 1; } };
   const failed = new ClaudeChannel({ state, nativeId: CLAUDE_ID, socketPath: socket, mcp: failedMcp });

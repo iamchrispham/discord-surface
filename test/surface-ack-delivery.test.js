@@ -15,10 +15,10 @@ test('simulated: native pickup ACK is explicit, idempotent, and included in the 
   const { dir, state } = fixture();
   const sessionRoot = path.join(dir, 'sessions');
   fs.mkdirSync(sessionRoot);
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'ack-prompt', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'ack me' });
-  state.claimDispatch('ack-prompt');
-  const message = state.getMessage('ack-prompt');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '101', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'ack me' });
+  state.claimDispatch('101');
+  const message = state.getMessage('101');
   const command = acknowledgmentCommand(message, state.dbPath);
   let codexArgs;
   const provider = new CodexProvider({ root: sessionRoot, acknowledgmentFor: item => acknowledgmentCommand(item, state.dbPath), run: async (_command, args) => {
@@ -44,15 +44,15 @@ test('simulated: native pickup ACK is explicit, idempotent, and included in the 
 
 test('simulated: acknowledgment delivery checks one message eligibility instead of rescanning history', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   for (let index = 0; index < 40; index += 1) {
-    const id = `ack-history-${index}`;
+    const id = String(200 + index);
     state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: id });
     state.claimDispatch(id);
     recordNativeAcknowledgment(state, { provider: 'codex', messageId: id, nativeId: CODEX_ID, generation: 1 });
     state.receipt(id, ACK.OUTCOME, { outcome: 'sent' });
   }
-  const target = 'ack-target';
+  const target = '102';
   state.acceptDiscordMessage({ id: target, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: target });
   state.claimDispatch(target);
   recordNativeAcknowledgment(state, { provider: 'codex', messageId: target, nativeId: CODEX_ID, generation: 1 });
@@ -77,11 +77,11 @@ test('simulated: acknowledgment delivery checks one message eligibility instead 
 
 test('simulated: ACK reaction refuses a generation handoff after channel fetch', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'ack-generation-race', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('ack-generation-race');
-  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-generation-race', nativeId: CODEX_ID, generation: 1 });
-  state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.REPLIED, 'ack-generation-race');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '103', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('103');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: '103', nativeId: CODEX_ID, generation: 1 });
+  state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.REPLIED, '103');
   let fetchStarted;
   const started = new Promise(resolve => { fetchStarted = resolve; });
   let releaseFetch;
@@ -95,13 +95,13 @@ test('simulated: ACK reaction refuses a generation handoff after channel fetch',
     async destroy() {}
   };
   const gateway = new DiscordGateway({ state, client });
-  const delivery = gateway.deliverAcknowledgment('ack-generation-race');
+  const delivery = gateway.deliverAcknowledgment('103');
   await started;
   state.rebind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir });
   releaseFetch();
   await delivery;
   assert.equal(reacted, false);
-  const outcomes = state.listReceipts().filter(row => row.discord_id === 'ack-generation-race' && row.kind === ACK.OUTCOME);
+  const outcomes = state.listReceipts().filter(row => row.discord_id === '103' && row.kind === ACK.OUTCOME);
   assert.equal(JSON.parse(outcomes.at(-1).detail).outcome, 'stale');
   await gateway.stop();
   state.close();
@@ -109,11 +109,11 @@ test('simulated: ACK reaction refuses a generation handoff after channel fetch',
 
 test('simulated: ACK reaction refuses a generation handoff after message fetch', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'ack-message-fetch-race', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('ack-message-fetch-race');
-  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-message-fetch-race', nativeId: CODEX_ID, generation: 1 });
-  state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.REPLIED, 'ack-message-fetch-race');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '104', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('104');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: '104', nativeId: CODEX_ID, generation: 1 });
+  state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.REPLIED, '104');
   let fetchStarted;
   const started = new Promise(resolve => { fetchStarted = resolve; });
   let releaseFetch;
@@ -132,13 +132,13 @@ test('simulated: ACK reaction refuses a generation handoff after message fetch',
     state,
     client: { on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
   });
-  const delivery = gateway.deliverAcknowledgment('ack-message-fetch-race');
+  const delivery = gateway.deliverAcknowledgment('104');
   await fetchStarted;
   state.rebind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir });
   releaseFetch();
   await delivery;
   assert.equal(reacted, false);
-  const outcomes = state.listReceipts().filter(row => row.discord_id === 'ack-message-fetch-race' && row.kind === ACK.OUTCOME);
+  const outcomes = state.listReceipts().filter(row => row.discord_id === '104' && row.kind === ACK.OUTCOME);
   assert.equal(JSON.parse(outcomes.at(-1).detail).outcome, 'stale');
   await gateway.stop();
   state.close();
@@ -146,10 +146,10 @@ test('simulated: ACK reaction refuses a generation handoff after message fetch',
 
 test('simulated: unknown ACK reaction reaches a terminal outcome after bounded retries', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'ack-retry-bound', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('ack-retry-bound');
-  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-retry-bound', nativeId: CODEX_ID, generation: 1 });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '105', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('105');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: '105', nativeId: CODEX_ID, generation: 1 });
   const realNow = Date.now;
   let clock = 0;
   Date.now = () => clock;
@@ -161,8 +161,8 @@ test('simulated: unknown ACK reaction reaches a terminal outcome after bounded r
     } });
     const outcomes = [];
     for (let index = 0; index < 8; index += 1) {
-      await deliver('ack-retry-bound');
-      const rows = state.listReceipts().filter(row => row.discord_id === 'ack-retry-bound' && row.kind === ACK.OUTCOME);
+      await deliver('105');
+      const rows = state.listReceipts().filter(row => row.discord_id === '105' && row.kind === ACK.OUTCOME);
       outcomes.push(JSON.parse(rows.at(-1).detail));
       if (Number.isFinite(outcomes.at(-1).retryAt)) clock = outcomes.at(-1).retryAt;
     }
@@ -170,7 +170,7 @@ test('simulated: unknown ACK reaction reaches a terminal outcome after bounded r
     assert.equal(outcomes.at(-1).attempt, 8);
     assert.equal(outcomes.at(-1).terminal, true);
     assert.equal('retryAt' in outcomes.at(-1), false);
-    assert.equal(isAcknowledgmentPending(state, 'ack-retry-bound', clock), false);
+    assert.equal(isAcknowledgmentPending(state, '105', clock), false);
   } finally {
     Date.now = realNow;
     state.close();
@@ -179,17 +179,17 @@ test('simulated: unknown ACK reaction reaches a terminal outcome after bounded r
 
 test('simulated: ACK rate limits use Discord retry-after timing', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'ack-rate-limit', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('ack-rate-limit');
-  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-rate-limit', nativeId: CODEX_ID, generation: 1 });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '106', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('106');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: '106', nativeId: CODEX_ID, generation: 1 });
   try {
     const before = Date.now();
     const deliver = createAcknowledgmentDelivery({ state, send: async () => {
       throw Object.assign(new Error('Discord rate limit'), { status: 429, retryAfterMs: 45000 });
     } });
-    await deliver('ack-rate-limit');
-    const outcome = JSON.parse(state.listReceipts().filter(row => row.discord_id === 'ack-rate-limit' && row.kind === ACK.OUTCOME).at(-1).detail);
+    await deliver('106');
+    const outcome = JSON.parse(state.listReceipts().filter(row => row.discord_id === '106' && row.kind === ACK.OUTCOME).at(-1).detail);
     assert.ok(outcome.retryAt >= before + 45000);
     assert.ok(outcome.retryAt <= Date.now() + 45000);
   } finally {
@@ -275,10 +275,10 @@ const { recordNativeAcknowledgment, watchAcknowledgments } = require(${JSON.stri
   try {
     state = new SurfaceState(db);
     state.setConfig({ operatorId: 'operator-1', guildId: 'guild-1', secretFile: path.join(dir, 'discord.secret') });
-    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: '9caa5d21-2169-429d-918b-5f08651b5dbd', workspace: dir });
-    state.acceptDiscordMessage({ id: 'ack-stop-close', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-    state.claimDispatch('ack-stop-close');
-    recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-stop-close', nativeId: '9caa5d21-2169-429d-918b-5f08651b5dbd', generation: 1 });
+    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: '9caa5d21-2169-429d-918b-5f08651b5dbd', workspace: dir }, { intakeCutoff: '100' });
+    state.acceptDiscordMessage({ id: '107', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+    state.claimDispatch('107');
+    recordNativeAcknowledgment(state, { provider: 'codex', messageId: '107', nativeId: '9caa5d21-2169-429d-918b-5f08651b5dbd', generation: 1 });
     let startCallback;
     const callbackStarted = new Promise(resolve => { startCallback = resolve; });
     let releaseCallback;
@@ -325,7 +325,7 @@ const { recordNativeAcknowledgment, watchAcknowledgments } = require(${JSON.stri
 
 test('simulated: ACK watcher uses receipt watermark after its baseline scan', async () => {
   const { dir, db, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const reactions = [];
   const callbacks = [];
   const watcher = watchAcknowledgments({
@@ -344,9 +344,9 @@ test('simulated: ACK watcher uses receipt watermark after its baseline scan', as
     queries.push(String(sql));
     return prepare(sql);
   };
-  state.acceptDiscordMessage({ id: 'ack-watcher-incremental', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('ack-watcher-incremental');
-  recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-watcher-incremental', nativeId: CODEX_ID, generation: 1 });
+  state.acceptDiscordMessage({ id: '108', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('108');
+  recordNativeAcknowledgment(state, { provider: 'codex', messageId: '108', nativeId: CODEX_ID, generation: 1 });
   callbacks[0]('change', path.basename(db));
   await waitForCondition(() => reactions.length === 1, 1000);
   assert.equal(queries.some(sql => sql.includes('SELECT done.discord_id')), false);
@@ -357,7 +357,7 @@ test('simulated: ACK watcher uses receipt watermark after its baseline scan', as
 
 test('simulated: ACK watcher quiesces past unrelated receipts and delivers a later ACK', async () => {
   const { dir, db, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const reactions = [];
   const callbacks = [];
   const watcher = watchAcknowledgments({
@@ -382,12 +382,12 @@ test('simulated: ACK watcher quiesces past unrelated receipts and delivers a lat
     const afterUnrelated = queries.filter(sql => sql.includes('WHERE id>?')).length;
     await new Promise(resolve => setTimeout(resolve, 260));
     assert.equal(queries.filter(sql => sql.includes('WHERE id>?')).length, afterUnrelated);
-    state.acceptDiscordMessage({ id: 'ack-after-idle', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-    state.claimDispatch('ack-after-idle');
-    recordNativeAcknowledgment(state, { provider: 'codex', messageId: 'ack-after-idle', nativeId: CODEX_ID, generation: 1 });
+    state.acceptDiscordMessage({ id: '109', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+    state.claimDispatch('109');
+    recordNativeAcknowledgment(state, { provider: 'codex', messageId: '109', nativeId: CODEX_ID, generation: 1 });
     callbacks[0]('change', path.basename(db));
     await waitForCondition(() => reactions.length === 1, 1000);
-    assert.deepEqual(reactions, [['ack-after-idle', '👀']]);
+    assert.deepEqual(reactions, [['109', '👀']]);
   } finally {
     await watcher.stop();
     state.close();
@@ -396,7 +396,7 @@ test('simulated: ACK watcher quiesces past unrelated receipts and delivers a lat
 
 test('simulated: ACK watcher keeps a concurrent receipt append after its snapshot', async () => {
   const { dir, db, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const callbacks = [];
   const reactions = [];
   let sendStarted;
@@ -407,7 +407,7 @@ test('simulated: ACK watcher keeps a concurrent receipt append after its snapsho
     state,
     send: async (message, reaction) => {
       reactions.push([message.id, reaction]);
-      if (message.id === 'ack-concurrent-first') {
+      if (message.id === '110') {
         sendStarted();
         await sendGate;
       }
@@ -425,17 +425,17 @@ test('simulated: ACK watcher keeps a concurrent receipt append after its snapsho
       state.claimDispatch(id);
       recordNativeAcknowledgment(state, { provider: 'codex', messageId: id, nativeId: CODEX_ID, generation: 1 });
     }
-    recordAck('ack-concurrent-first');
+    recordAck('110');
     callbacks[0]('change', path.basename(db));
     const firstDrain = watcher.drain();
     await started;
-    recordAck('ack-concurrent-second');
+    recordAck('111');
     callbacks[0]('change', path.basename(db));
     watcher.drain();
     releaseSend();
     await firstDrain;
     await waitForCondition(() => reactions.length === 2, 1000);
-    assert.deepEqual(reactions, [['ack-concurrent-first', '👀'], ['ack-concurrent-second', '👀']]);
+    assert.deepEqual(reactions, [['110', '👀'], ['111', '👀']]);
   } finally {
     releaseSend();
     await watcher.stop();

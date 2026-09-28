@@ -9,6 +9,7 @@ const test = require('node:test');
 const { SurfaceState, MESSAGE_STATES } = require('../src/state');
 const { DiscordGateway, createSurfaceConsumer } = require('../src/discord');
 const { recordNativeAcknowledgment, watchAcknowledgments } = require('../src/acknowledgment.js');
+const { staticConductorMarker } = require('../src/topic');
 
 const NATIVE = {
   codex: '9caa5d21-2169-429d-918b-5f08651b5dbd',
@@ -21,7 +22,7 @@ function fixture(t, provider = 'codex') {
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture\n', { mode: 0o600 });
   state.bind({ channelId: 'channel', guildId: 'guild', provider, nativeId: NATIVE[provider], workspace: dir,
-    endpoint: provider === 'claude' ? '/tmp/claude.sock' : undefined, conductorId: 'conductor', repoKey: 'repo:fixture' });
+    endpoint: provider === 'claude' ? '/tmp/claude.sock' : undefined, conductorId: 'conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
   const binding = state.getBinding('channel');
   state.setBindingReadiness('channel', 'ready', 'fixture ready', binding);
   t.after(() => { try { state.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
@@ -73,6 +74,16 @@ function directPreparationSeed(f, index) {
   };
 }
 
+function qualifiedRecoveryChannel(f, channel) {
+  const binding = f.state.getBinding('channel');
+  return {
+    ...channel,
+    guildId: binding.guildId,
+    topic: staticConductorMarker({ provider: f.provider, conductorId: binding.conductorId, repoKey: binding.repoKey }),
+    permissionsFor: () => ({ has: () => true })
+  };
+}
+
 module.exports = {
   assert,
   fs,
@@ -93,5 +104,6 @@ module.exports = {
   fixture,
   submitted,
   waitForCondition,
-  directPreparationSeed
+  directPreparationSeed,
+  qualifiedRecoveryChannel
 };

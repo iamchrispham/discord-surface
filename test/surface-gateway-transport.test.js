@@ -18,12 +18,12 @@ test('simulated: corrupted state fails closed', () => {
 
 test('simulated: dispatch crash becomes uncertain and is never auto-repeated', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'crash', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '101', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
   let dispatches = 0;
   const providersMap = { codex: { async dispatch() { dispatches += 1; throw new Error('crash after boundary'); } } };
-  const first = await dispatchAndObserve(state, 'crash', providersMap);
-  const second = await dispatchAndObserve(state, 'crash', providersMap);
+  const first = await dispatchAndObserve(state, '101', providersMap);
+  const second = await dispatchAndObserve(state, '101', providersMap);
   assert.equal(first.status, 'uncertain');
   assert.equal(second.status, MESSAGE_STATES.UNCERTAIN);
   assert.equal(dispatches, 1);
@@ -49,7 +49,7 @@ test('simulated: gateway stop detaches listener and destroys the native client',
 
 test('simulated: stopping the gateway settles an uncertain receipt without touching native custody', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'receipt-stop', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-stop-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'receipt-stop', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-stop-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.markIntakeBoundary('receipt-stop', 'ready');
   const listeners = new Map();
   const channel = {
@@ -70,18 +70,18 @@ test('simulated: stopping the gateway settles an uncertain receipt without touch
     providers: { codex: { async dispatch() { return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } }
   });
   gateway.ready = true;
-  const message = { id: 'receipt-stop-input', guildId: 'guild-1', channelId: 'receipt-stop', content: 'hello', author: { id: 'operator-1', bot: false }, channel };
+  const message = { id: '102', guildId: 'guild-1', channelId: 'receipt-stop', content: 'hello', author: { id: 'operator-1', bot: false }, channel };
   const result = await gateway.consumer.handleMessage(message);
   assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
   await gateway.stop();
-  assert.equal(state.getTransportReceipt('receipt-stop-input').outcome.outcome, 'unknown');
-  assert.equal(state.getMessage('receipt-stop-input').state, MESSAGE_STATES.REPLIED);
+  assert.equal(state.getTransportReceipt('102').outcome.outcome, 'unknown');
+  assert.equal(state.getMessage('102').state, MESSAGE_STATES.REPLIED);
   state.close();
 });
 
 test('simulated: real-client receipt uses one abortable request without SDK send', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'receipt-http', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-http-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'receipt-http', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-http-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.markIntakeBoundary('receipt-http', 'ready');
   const listeners = new Map();
   let fetchCalls = 0;
@@ -126,17 +126,17 @@ test('simulated: real-client receipt uses one abortable request without SDK send
   gateway.discordToken = 'fake-token';
   gateway.ready = true;
   try {
-    const result = await gateway.consumer.handleMessage({ id: 'receipt-http-input', guildId: 'guild-1', channelId: 'receipt-http', content: 'hello', author: { id: 'operator-1', bot: false }, channel });
+    const result = await gateway.consumer.handleMessage({ id: '103', guildId: 'guild-1', channelId: 'receipt-http', content: 'hello', author: { id: 'operator-1', bot: false }, channel });
     assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
     await gateway.stop();
     assert.equal(fetchCalls, 1);
-    assert.equal(capturedUrl, `https://discord.com/api/v10/channels/receipt-http/messages/receipt-http-input/reactions/${encodeURIComponent('📥')}/@me`);
+    assert.equal(capturedUrl, `https://discord.com/api/v10/channels/receipt-http/messages/103/reactions/${encodeURIComponent('📥')}/@me`);
     assert.equal(capturedOptions.method, 'PUT');
     assert.equal(capturedOptions.headers.Authorization, 'Bot fake-token');
     assert.equal(capturedOptions.body, undefined);
     assert.equal(capturedSignal.aborted, true);
     assert.equal(channelSendCalls, 1);
-    assert.equal(state.getTransportReceipt('receipt-http-input').outcome.outcome, 'unknown');
+    assert.equal(state.getTransportReceipt('103').outcome.outcome, 'unknown');
     assert.equal(acknowledgmentFetches, 1);
   } finally {
     globalThis.fetch = originalFetch;
@@ -147,7 +147,7 @@ test('simulated: real-client receipt uses one abortable request without SDK send
 
 test('simulated: rejected receipt response cancels its body before dropping the request handle', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'receipt-body', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-body-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'receipt-body', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'receipt-body-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.markIntakeBoundary('receipt-body', 'ready');
   const listeners = new Map();
   let fetchCalls = 0;
@@ -178,12 +178,12 @@ test('simulated: rejected receipt response cancels its body before dropping the 
   gateway.discordToken = 'fake-token';
   gateway.ready = true;
   try {
-    const result = await gateway.consumer.handleMessage({ id: 'receipt-body-input', guildId: 'guild-1', channelId: 'receipt-body', content: 'hello', author: { id: 'operator-1', bot: false }, channel });
+    const result = await gateway.consumer.handleMessage({ id: '104', guildId: 'guild-1', channelId: 'receipt-body', content: 'hello', author: { id: 'operator-1', bot: false }, channel });
     assert.equal(result.message.state, MESSAGE_STATES.REPLIED);
     await gateway.consumer.waitForReceipts();
     assert.equal(fetchCalls, 1);
     assert.equal(bodyCancelled, true);
-    assert.equal(state.getTransportReceipt('receipt-body-input').outcome.outcome, 'unknown');
+    assert.equal(state.getTransportReceipt('104').outcome.outcome, 'unknown');
   } finally {
     globalThis.fetch = originalFetch;
     await gateway.stop();

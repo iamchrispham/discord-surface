@@ -74,6 +74,7 @@
     "src/ordinary/constants.ts",
     "src/state/thread-enrollment.ts",
     "src/discord/thread-enrollment.ts",
+    "src/discord/history-access.ts",
     "src/direct-post.ts",
     "src/direct-post/contracts.ts",
     "src/direct-post/source.ts",
@@ -86,6 +87,8 @@
     "src/state/decision.ts",
     "src/state/courier-route/index.ts",
     "src/discord/recovery-fetch.ts",
+    "src/discord/reconciliation-lookups.ts",
+    "src/discord/native-proof-recovery.ts",
     "src/state/agent-routing.ts"
   ]
 }

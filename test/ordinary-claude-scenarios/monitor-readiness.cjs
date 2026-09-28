@@ -24,7 +24,7 @@ test('ordinary Claude Monitor readiness is unavailable without a live socket and
   assert.equal(recovery.ready, false);
   assert.equal(f.state.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
   const accepted = f.state.acceptDiscordMessage({
-    id: 'held-without-monitor', guildId: 'guild', channelId: f.binding.channelId,
+    id: '900001', guildId: 'guild', channelId: f.binding.channelId,
     authorId: 'operator', isBot: false, content: 'hold this'
   }, { ready: false });
   assert.equal(accepted.accepted, true);

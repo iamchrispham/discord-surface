@@ -55,7 +55,7 @@ function conductorFixture(t) {
   const binding = state.bind({
     channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
     workspace: dir, endpoint: socketPath, conductorId: 'conductor-1', repoKey: 'repo-1'
-  });
+  }, { intakeCutoff: '100' });
   state.setIntakeBaseline(binding.channelId, '100', 'previous completed recovery', binding);
   state.close();
   t.after(() => {

@@ -62,7 +62,7 @@ test('claude-post refuses several attachment files before custody or network', a
 
 test('claude-reply refuses several attachment files before recording the reply', t => {
   const f = fixture(t, 'claude');
-  const id = 'repeated-attachment-reply';
+  const id = '101';
   const caption = path.join(f.dir, 'caption.txt');
   fs.writeFileSync(caption, 'four frames');
   submitted(f, id);

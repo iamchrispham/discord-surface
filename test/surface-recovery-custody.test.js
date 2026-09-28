@@ -143,15 +143,15 @@ test('simulated: status readiness labels live permission and quota gates as unve
 
 test('simulated: ambiguous network reply failure is unknown and is never retried by the consumer', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   let sends = 0;
   const consumer = createSurfaceConsumer({
     state,
     providers: providers({ calls: { codex: 0, claude: 0 } }),
     sendReply: async () => { sends += 1; const error = new Error('connection reset after send'); error.code = 'ECONNRESET'; throw error; }
   });
-  const first = await consumer.handleMessage(discordMessage({ id: 'reply-unknown', channelId: 'channel-codex' }));
-  const second = await consumer.handleMessage(discordMessage({ id: 'reply-unknown', channelId: 'channel-codex' }));
+  const first = await consumer.handleMessage(discordMessage({ id: '101', channelId: 'channel-codex' }));
+  const second = await consumer.handleMessage(discordMessage({ id: '101', channelId: 'channel-codex' }));
   assert.equal(first.message.state, MESSAGE_STATES.REPLY_UNKNOWN);
   assert.equal(second.duplicate, true);
   assert.equal(sends, 1);
@@ -160,28 +160,28 @@ test('simulated: ambiguous network reply failure is unknown and is never retried
 
 test('simulated: Discord permission denial is definite and preserves reply custody', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const consumer = createSurfaceConsumer({
     state,
     providers: providers({ calls: { codex: 0, claude: 0 } }),
     sendReply: async () => { const error = new Error('missing send permission'); error.status = 403; throw error; }
   });
-  const result = await consumer.handleMessage(discordMessage({ id: 'reply-permission', channelId: 'channel-codex' }));
+  const result = await consumer.handleMessage(discordMessage({ id: '102', channelId: 'channel-codex' }));
   assert.equal(result.message.state, MESSAGE_STATES.REPLY_FAILED);
-  assert.equal(state.getMessage('reply-permission').replyText, '4');
+  assert.equal(state.getMessage('102').replyText, '4');
   assert.ok(state.listReceipts().some(receipt => receipt.kind === 'reply-failed'));
   state.close();
 });
 
 test('simulated: recovery keeps uncertain dispatch explicit and resumes only reconciled custody', () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'uncertain-recovery', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('uncertain-recovery');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '103', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('103');
   state.recoverAfterRestart();
   assert.equal(state.recoveryCandidates().length, 0);
-  assert.equal(state.getMessage('uncertain-recovery').state, MESSAGE_STATES.UNCERTAIN);
-  state.reconcileUncertain('uncertain-recovery', 'submitted');
+  assert.equal(state.getMessage('103').state, MESSAGE_STATES.UNCERTAIN);
+  state.reconcileUncertain('103', 'submitted');
   assert.equal(state.recoveryCandidates()[0].state, MESSAGE_STATES.SUBMITTED);
   assert.ok(state.listReceipts().some(receipt => receipt.kind === 'uncertain-reconciled-submitted'));
   state.close();
@@ -204,44 +204,44 @@ test('simulated: gateway stop surfaces a native client stop failure and can be r
 
 test('simulated: native observation holds scan cursor until reply custody commits', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'cursor-custody', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('cursor-custody');
-  state.markSubmitted('cursor-custody');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '104', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('104');
+  state.markSubmitted('104');
   const cursor = { file: '/tmp/session.jsonl', offset: 341, since: 1 };
-  const result = await observeSubmitted(state, state.getMessage('cursor-custody'), {
+  const result = await observeSubmitted(state, state.getMessage('104'), {
     async observe(_message, _outcome, options) {
       options.onCursor(cursor);
       return { text: 'durable answer' };
     }
   });
   assert.equal(result.message.state, MESSAGE_STATES.REPLY_READY);
-  assert.deepEqual(state.getMessage('cursor-custody').observerCursor, cursor);
+  assert.deepEqual(state.getMessage('104').observerCursor, cursor);
 
-  state.acceptDiscordMessage({ id: 'cursor-crash', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'y' });
-  state.claimDispatch('cursor-crash');
-  state.markSubmitted('cursor-crash', { file: '/tmp/session.jsonl', offset: 12 }, '[[discord-surface:cursor-crash]]');
-  const crashed = await observeSubmitted(state, state.getMessage('cursor-crash'), {
+  state.acceptDiscordMessage({ id: '105', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'y' });
+  state.claimDispatch('105');
+  state.markSubmitted('105', { file: '/tmp/session.jsonl', offset: 12 }, '[[discord-surface:105]]');
+  const crashed = await observeSubmitted(state, state.getMessage('105'), {
     async observe(_message, _outcome, options) {
       options.onCursor({ file: '/tmp/session.jsonl', offset: 99 });
       throw new Error('observer crashed after scanning');
     }
   });
   assert.equal(crashed.message.state, MESSAGE_STATES.SUBMITTED);
-  assert.equal(state.getMessage('cursor-crash').observerCursor.offset, 12);
+  assert.equal(state.getMessage('105').observerCursor.offset, 12);
   state.close();
 });
 
 test('simulated: provider identity fences same-UUID native replies', () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CODEX_ID, workspace: dir, endpoint: path.join(dir, 'claude.sock') });
-  state.acceptDiscordMessage({ id: 'provider-fence', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
-  state.claimDispatch('provider-fence');
-  state.markSubmitted('provider-fence');
-  assert.throws(() => state.recordNativeReply({ provider: 'claude', messageId: 'provider-fence', nativeId: CODEX_ID, generation: 1, text: 'wrong owner' }), StaleGenerationError);
-  assert.equal(state.getMessage('provider-fence').state, MESSAGE_STATES.SUBMITTED);
-  state.recordNativeReply({ provider: 'codex', messageId: 'provider-fence', nativeId: CODEX_ID, generation: 1, text: 'right owner' });
-  assert.equal(state.getMessage('provider-fence').state, MESSAGE_STATES.REPLY_READY);
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.bind({ channelId: 'channel-claude', guildId: 'guild-1', provider: 'claude', nativeId: CODEX_ID, workspace: dir, endpoint: path.join(dir, 'claude.sock') }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '106', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'x' });
+  state.claimDispatch('106');
+  state.markSubmitted('106');
+  assert.throws(() => state.recordNativeReply({ provider: 'claude', messageId: '106', nativeId: CODEX_ID, generation: 1, text: 'wrong owner' }), StaleGenerationError);
+  assert.equal(state.getMessage('106').state, MESSAGE_STATES.SUBMITTED);
+  state.recordNativeReply({ provider: 'codex', messageId: '106', nativeId: CODEX_ID, generation: 1, text: 'right owner' });
+  assert.equal(state.getMessage('106').state, MESSAGE_STATES.REPLY_READY);
   state.close();
 });

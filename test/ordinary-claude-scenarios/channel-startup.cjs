@@ -31,7 +31,7 @@ test('ordinary Claude channel startup reopens an endpoint-unavailable watermark,
 
 test('ordinary Claude channel startup delivers held intake through successful Gateway recovery', async t => {
   const f = fixture(t);
-  const messageId = 'claude-channel-held';
+  const messageId = '900401';
   const content = 'deliver through the Claude channel';
   const accepted = f.state.acceptDiscordMessage({
     id: messageId, guildId: 'guild', channelId: f.binding.channelId,
@@ -57,6 +57,7 @@ test('ordinary Claude channel startup delivers held intake through successful Ga
 
 test('ordinary Claude channel startup with no held intake still wakes the Gateway and revokes readiness on stop', async t => {
   const f = fixture(t);
+  const initialWatermark = f.state.getIntakeWatermark(f.binding.channelId);
   f.state.close();
   const observed = new SurfaceState(f.db);
   t.after(() => { try { observed.close(); } catch {} });
@@ -65,7 +66,7 @@ test('ordinary Claude channel startup with no held intake still wakes the Gatewa
   await expectWithin(() => listener.stderr().includes('could not wake Gateway'),
     'Claude channel startup requesting a Gateway wake');
   assert.match(listener.stderr(), /discord-surface: Claude channel startup could not wake Gateway \(gateway-not-running\)/);
-  assert.equal(observed.getIntakeWatermark(f.binding.channelId), null);
+  assert.deepEqual(observed.getIntakeWatermark(f.binding.channelId), initialWatermark);
 
   await listener.terminate();
   assert.equal(observed.getBinding(f.binding.channelId).readiness, READINESS.UNAVAILABLE);
@@ -77,9 +78,10 @@ test('Claude channel leaves a conductor binding untouched on start and stop', as
   const conductor = f.state.bind({
     channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
     workspace: f.dir, endpoint: f.socketPath, conductorId: 'conductor-1', repoKey: 'repo-1'
-  });
+  }, { intakeCutoff: '100' });
   assert.equal(f.state.isOrdinaryBinding(conductor), false);
   f.state.setBindingReadiness(conductor.channelId, READINESS.READY, 'conductor ready', conductor);
+  const initialWatermark = f.state.getIntakeWatermark(conductor.channelId);
   f.state.close();
   const observed = new SurfaceState(f.db);
   t.after(() => { try { observed.close(); } catch {} });
@@ -89,7 +91,7 @@ test('Claude channel leaves a conductor binding untouched on start and stop', as
   await sleep(50);
   assert.equal(observed.getBinding(conductor.channelId).readiness, READINESS.READY);
   assert.equal(listener.stderr().includes('could not wake Gateway (gateway-not-running)'), true);
-  assert.equal(observed.getIntakeWatermark(conductor.channelId), null);
+  assert.deepEqual(observed.getIntakeWatermark(conductor.channelId), initialWatermark);
 
   await listener.terminate();
   assert.equal(observed.getBinding(conductor.channelId).readiness, READINESS.READY);

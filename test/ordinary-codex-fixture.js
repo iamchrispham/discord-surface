@@ -41,7 +41,7 @@ function fixture(t) {
 function ordinary(fixtureState, channelId = 'ordinary-channel', nativeId = CODEX) {
   return fixtureState.state.bindOrdinary({
     channelId, guildId: 'guild', provider: PROVIDERS.CODEX, nativeId, workspace: fixtureState.dir
-  }, { sessionId: nativeId, threadId: nativeId });
+  }, { sessionId: nativeId, threadId: nativeId }, '100');
 }
 
 function transcript(t, workspace, id = CODEX, overrides = {}) {

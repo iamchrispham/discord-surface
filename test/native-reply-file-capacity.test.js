@@ -16,7 +16,7 @@ const {
 test('startup initial drain wakes a reply-ready native file', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-startup-ready-${provider}`;
+    const id = '910001';
     const source = path.join(f.dir, 'startup.bin');
     fs.writeFileSync(source, Buffer.from(`startup bytes ${provider}`));
     submitted(f, id, MESSAGE_STATES.SUBMITTED);
@@ -99,7 +99,7 @@ test('full-capacity refusal blocks competing text until later file retry', async
         }
         assert.equal(f.state.activeFilePreparationCount(), 8);
 
-        const id = `native-file-capacity-retry-${provider}-${dispatchState}`;
+        const id = '910002';
         const source = path.join(f.dir, 'capacity-retry.bin');
         fs.writeFileSync(source, Buffer.from(`capacity retry bytes ${provider}`));
         submitted(f, id, dispatchState);
@@ -183,7 +183,7 @@ test('newest capacity refusal cleanup survives changed caption and reopen', asyn
         }
         assert.equal(f.state.activeFilePreparationCount(), 8);
 
-        const id = `native-file-capacity-retry-${provider}-${dispatchState}`;
+        const id = '910003';
         const source = path.join(f.dir, 'capacity-retry.bin');
         fs.writeFileSync(source, Buffer.from(`capacity retry bytes ${provider}`));
         submitted(f, id, dispatchState);

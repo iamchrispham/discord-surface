@@ -13,7 +13,7 @@ const { CODEX_ID, CLAUDE_ID, SUCCESSOR_ID, LOCKF, CLI_PATH, fixture, discordMess
 test('simulated: empty Discord history requires known effective read permission', async () => {
   for (const [label, allowed, known] of [['revoked', false, true], ['unknown', false, false]]) {
     const { dir, state } = fixture();
-    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
     state.setIntakeBaseline('channel-codex', '100', 'previous completed recovery');
     state.markIntakeBoundary('channel-codex', 'ready');
     const secret = path.join(dir, `discord-${label}.env`);
@@ -24,11 +24,14 @@ test('simulated: empty Discord history requires known effective read permission'
       on() {}, off() {}, async login() {}, channels: { fetch: async () => channel }, async destroy() {}
     };
     const gateway = new DiscordGateway({ state, client, fetchHistory: async () => { throw new Error('history must not be fetched'); } });
-    await assert.rejects(() => gateway.start(secret), /intake recovery is unavailable/);
+    await gateway.start(secret);
+    assert.equal(gateway.started, true);
+    assert.equal(gateway.transportReady, true);
+    assert.equal(gateway.ready, false);
     const watermark = state.getIntakeWatermark('channel-codex');
     assert.equal(watermark.recovered_through_id, '100');
     assert.equal(watermark.state, 'unavailable');
-    state.acceptDiscordMessage({ id: `held-${label}`, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'held while permission is unavailable' }, { ready: false });
+    state.acceptDiscordMessage({ id: label === 'revoked' ? '101' : '102', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'held while permission is unavailable' }, { ready: false });
     assert.equal(state.getIntakeWatermark('channel-codex').state, 'unavailable');
     await gateway.stop();
     state.close();
@@ -37,7 +40,7 @@ test('simulated: empty Discord history requires known effective read permission'
 
 test('simulated: unknown Discord delivery is reconciled without native redispatch', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   let dispatches = 0;
   let sends = 0;
   const consumer = createSurfaceConsumer({
@@ -45,12 +48,12 @@ test('simulated: unknown Discord delivery is reconciled without native redispatc
     providers: { codex: { async dispatch() { dispatches += 1; return { status: 'submitted' }; }, async observe() { return { text: 'answer' }; } } },
     sendReply: async () => { sends += 1; if (sends === 1) throw new TypeError('send result was not returned'); return { id: 'reply-reconciled' }; }
   });
-  const first = await consumer.handleMessage(discordMessage({ id: 'delivery-reconcile', channelId: 'channel-codex' }));
+  const first = await consumer.handleMessage(discordMessage({ id: '101', channelId: 'channel-codex' }));
   assert.equal(first.message.state, MESSAGE_STATES.REPLY_UNKNOWN);
-  state.reconcileReplyDelivery('delivery-reconcile', 'not_sent');
-  const second = await consumer.deliverReply(discordMessage({ id: 'delivery-reconcile', channelId: 'channel-codex' }), {
+  state.reconcileReplyDelivery('101', 'not_sent');
+  const second = await consumer.deliverReply(discordMessage({ id: '101', channelId: 'channel-codex' }), {
     status: 'reply_ready',
-    message: state.getMessage('delivery-reconcile')
+    message: state.getMessage('101')
   });
   assert.equal(second.message.state, MESSAGE_STATES.REPLIED);
   assert.equal(dispatches, 1);
@@ -60,17 +63,17 @@ test('simulated: unknown Discord delivery is reconciled without native redispatc
 
 test('simulated: stable conductor identity permits distinct IDs and explicit same-channel successor handoff', () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'conductor-a', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'conductor-a', repoKey: 'repo:alpha' });
-  state.bind({ channelId: 'conductor-b', guildId: 'guild-1', provider: 'codex', nativeId: CLAUDE_ID, workspace: dir, conductorId: 'conductor-b', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'conductor-a', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'conductor-a', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
+  state.bind({ channelId: 'conductor-b', guildId: 'guild-1', provider: 'codex', nativeId: CLAUDE_ID, workspace: dir, conductorId: 'conductor-b', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.markIntakeBoundary('conductor-a', 'ready');
-  assert.throws(() => state.bind({ channelId: 'duplicate-conductor', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir, conductorId: 'conductor-a', repoKey: 'repo:alpha' }), /already bound/);
+  assert.throws(() => state.bind({ channelId: 'duplicate-conductor', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir, conductorId: 'conductor-a', repoKey: 'repo:alpha' }, { intakeCutoff: '100' }), /already bound/);
 
-  state.acceptDiscordMessage({ id: 'drained', guildId: 'guild-1', channelId: 'conductor-a', authorId: 'operator-1', isBot: false, content: 'drain' });
-  state.claimDispatch('drained');
-  state.markSubmitted('drained');
-  state.recordNativeReply({ provider: 'codex', messageId: 'drained', nativeId: CODEX_ID, generation: 1, text: 'done' });
-  state.beginReply('drained');
-  state.markReplySent('drained', 'reply-drained');
+  state.acceptDiscordMessage({ id: '102', guildId: 'guild-1', channelId: 'conductor-a', authorId: 'operator-1', isBot: false, content: 'drain' });
+  state.claimDispatch('102');
+  state.markSubmitted('102');
+  state.recordNativeReply({ provider: 'codex', messageId: '102', nativeId: CODEX_ID, generation: 1, text: 'done' });
+  state.beginReply('102');
+  state.markReplySent('102', '103');
   const successor = state.handoffConductor({
     channelId: 'conductor-a',
     provider: 'codex',
@@ -85,21 +88,21 @@ test('simulated: stable conductor identity permits distinct IDs and explicit sam
   assert.equal(successor.channelId, 'conductor-a');
   assert.equal(successor.generation, 2);
   assert.equal(successor.conductorId, 'conductor-a');
-  assert.throws(() => state.recordNativeReply({ provider: 'codex', messageId: 'drained', nativeId: CODEX_ID, generation: 1, text: 'late' }), StaleGenerationError);
+  assert.throws(() => state.recordNativeReply({ provider: 'codex', messageId: '102', nativeId: CODEX_ID, generation: 1, text: 'late' }), StaleGenerationError);
   state.markIntakeBoundary('conductor-a', 'ready');
-  state.acceptDiscordMessage({ id: 'successor-input', guildId: 'guild-1', channelId: 'conductor-a', authorId: 'operator-1', isBot: false, content: 'new owner' });
-  state.claimDispatch('successor-input');
-  state.markSubmitted('successor-input');
-  state.recordNativeReply({ provider: 'codex', messageId: 'successor-input', nativeId: SUCCESSOR_ID, generation: 2, text: 'successor answer' });
-  assert.equal(state.getMessage('successor-input').state, MESSAGE_STATES.REPLY_READY);
+  state.acceptDiscordMessage({ id: '104', guildId: 'guild-1', channelId: 'conductor-a', authorId: 'operator-1', isBot: false, content: 'new owner' });
+  state.claimDispatch('104');
+  state.markSubmitted('104');
+  state.recordNativeReply({ provider: 'codex', messageId: '104', nativeId: SUCCESSOR_ID, generation: 2, text: 'successor answer' });
+  assert.equal(state.getMessage('104').state, MESSAGE_STATES.REPLY_READY);
   state.close();
 });
 
 test('simulated: conductor generations remain monotonic after unbind and new-channel bind', () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'old-conductor', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'stable', repoKey: 'repo:alpha' });
+  state.bind({ channelId: 'old-conductor', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'stable', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.unbind('old-conductor');
-  const rebound = state.bind({ channelId: 'new-conductor', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir, conductorId: 'stable', repoKey: 'repo:alpha' });
+  const rebound = state.bind({ channelId: 'new-conductor', guildId: 'guild-1', provider: 'codex', nativeId: SUCCESSOR_ID, workspace: dir, conductorId: 'stable', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   assert.equal(rebound.generation, 2);
   state.close();
 });
@@ -149,7 +152,7 @@ test('simulated: stable conductor markers repeat, adopt the existing setup chann
 test('simulated: explicit legacy migration records terminal custody and never rewrites a static address', async () => {
   const { dir, state } = fixture();
   const channelId = 'legacy-migration';
-  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'legacy-migration-conductor', repoKey: 'repo:alpha', generation: 3 });
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'legacy-migration-conductor', repoKey: 'repo:alpha', generation: 3 }, { intakeCutoff: '100' });
   const binding = state.getBinding(channelId);
   const legacyTopic = `discord-surface:v2 conductor=legacy-migration-conductor provider=codex repo=repo%3Aalpha native=${CODEX_ID} generation=3 readiness=pending`;
   const channel = { id: channelId, topic: legacyTopic };
@@ -180,7 +183,7 @@ test('simulated: explicit legacy migration records terminal custody and never re
 test('simulated: unknown legacy migration keeps readiness fenced until explicit reconciliation', async () => {
   const { dir, state } = fixture();
   const channelId = 'legacy-migration-unknown';
-  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'legacy-unknown-conductor', repoKey: 'repo:alpha' });
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'legacy-unknown-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
   state.markIntakeBoundary(channelId, 'ready', 'prior verified history');
   const binding = state.getBinding(channelId);
   const channel = { id: channelId, topic: `discord-surface:v2 conductor=legacy-unknown-conductor provider=codex repo=repo%3Aalpha native=${CODEX_ID} generation=1 readiness=ready` };

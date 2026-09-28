@@ -24,7 +24,7 @@ test('real ClaudeProvider and Claude Monitor path preserves exact reply custody'
   await monitor.start();
   f.state.setBindingReadiness(f.binding.channelId, READINESS.READY, 'test Monitor ready', f.binding);
   const intake = f.state.acceptDiscordMessage({
-    id: 'ordinary-claude-event', guildId: 'guild', channelId: f.binding.channelId,
+    id: '900301', guildId: 'guild', channelId: f.binding.channelId,
     authorId: 'operator', isBot: false, content: 'answer this'
   });
   assert.equal(intake.accepted, true);
@@ -135,7 +135,11 @@ test('Monitor construction failure releases allocated timers and listeners', t =
 
 test('ordinary Claude preflight rereads Gateway after binding mutation', async t => {
   const f = fixture(t, { bind: false });
-  const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
   let reads = 0;
   const supportedCapabilities = [
     GATEWAY_CAPABILITIES.ordinaryBindWake,
@@ -162,7 +166,11 @@ test('ordinary Claude preflight rereads Gateway after binding mutation', async t
 
 test('ordinary Claude bind pins recovery wake to the selected Gateway', async t => {
   const f = fixture(t, { bind: false });
-  const channel = { id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true };
+  const channel = {
+    id: 'claude-channel', guildId: 'guild', name: 'dev', isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: { fetch: async () => [] }
+  };
   const selected = {
     state: 'running', pid: 4242,
     capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake, GATEWAY_CAPABILITIES.runtimeBindLock, GATEWAY_CAPABILITIES.ordinaryClaudeBind]

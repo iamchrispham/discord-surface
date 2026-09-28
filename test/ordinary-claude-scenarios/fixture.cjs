@@ -41,7 +41,7 @@ function fixture(t, { bind = true, endpoint = null, preflight = true } = {}) {
   let binding = null;
   if (bind) {
     binding = state.bindOrdinaryClaude({ channelId: 'claude-channel', guildId: 'guild', provider: 'claude', nativeId: CLAUDE, workspace: dir, endpoint: socketPath },
-      { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' });
+      { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }, '100');
     if (preflight) state.recordOrdinaryPreflight(binding, {
       file: session.file, sessionId: CLAUDE, threadId: CLAUDE, workspace: dir, endpoint: socketPath, harness: 'claude-code'
     });

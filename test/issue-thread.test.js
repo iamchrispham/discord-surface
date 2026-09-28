@@ -7,9 +7,10 @@ const { ChannelType, GatewayIntentBits } = require('discord.js');
 const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { DiscordGateway, waitForRecoveryOperation } = require('../src/discord');
-const { enrollPublicThread, recoverThread } = require('../src/discord/thread-enrollment');
+const { enrollPublicThread, recoverThread, AdoptionRefusalError, ADOPTION_REFUSAL_DETAILS } = require('../src/discord/thread-enrollment');
 const { GATEWAY_CAPABILITIES, gatewayProcessStatus, main, pathsFor, threadEnroll } = require('../src/cli');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
+const { startReconciliationLookup } = require('../dist/discord/reconciliation-lookups');
 
 const NATIVE = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 const SUCCESSOR = 'f8296579-092b-4503-bf98-1f3c2b6d4913';
@@ -18,7 +19,7 @@ function fixture(t, gatewayRecoveryOptions = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-issue-thread-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused.secret') });
-  state.bind({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId: NATIVE, workspace: dir });
+  state.bind({ channelId: '1000', guildId: 'guild', provider: 'codex', nativeId: NATIVE, workspace: dir }, { intakeCutoff: '0' });
   const sends = [], reactions = [], dispatched = [], fetched = [];
   const histories = new Map([['1000', []], ['2000', []]]);
   const channels = new Map();
@@ -51,7 +52,9 @@ function fixture(t, gatewayRecoveryOptions = {}) {
   t.after(async () => { await gateway.stop(); state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   const message = (id, channel = child) => ({ id, guildId: 'guild', channelId: channel.id, content: 'thread question', author: { id: 'operator', bot: false }, channel });
   function ready(baseline = null) {
-    state.enrollThread({ threadId: child.id, parentChannelId: parent.id, guildId: 'guild' }, state.getBinding(parent.id));
+    // The child's committed cutoff is exactly the adopted history bound; null means a
+    // prospective-empty thread and commits the explicit "0" boundary.
+    state.enrollThread({ threadId: child.id, parentChannelId: parent.id, guildId: 'guild', adoptionCutoff: baseline ?? '0' }, state.getBinding(parent.id));
     state.setThreadBaseline(child.id, baseline, state.getBinding(parent.id));
     state.markThreadBoundary(child.id, THREAD_STATES.READY, 'fixture adoption', null, null, state.getBinding(parent.id));
     gateway.ready = true;
@@ -115,7 +118,7 @@ test('live enrolled thread keeps native owner and sends receipt, eyes and answer
   assert.ok(f.sends.some(send => send.content === 'thread answer'));
   assert.ok(f.reactions.some(reaction => reaction.reaction === '👀'));
   assert.ok([...f.sends, ...f.reactions].every(send => send.channelId === f.child.id));
-  assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
+  assert.equal(f.state.getIntakeWatermark(f.parent.id).recovered_through_id, '0');
 });
 
 test('enrolled child bot attachment failure fences only child recovery', async t => {
@@ -143,7 +146,7 @@ test('enrolled child bot attachment failure fences only child recovery', async t
   await Promise.all([...f.gateway.inFlight]);
 
   assert.equal(fetchCalls, 1);
-  assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
+  assert.equal(f.state.getIntakeWatermark(f.parent.id).recovered_through_id, '0');
   assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.GAP);
   assert.equal(f.state.getThreadEnrollment(f.child.id).lastSeenId, null);
@@ -157,7 +160,7 @@ test('enrolled child bot attachment failure fences only child recovery', async t
 
 test('pending child holds live work, recovery deduplicates it and replies after child readiness', async t => {
   const f = fixture(t);
-  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild' }, f.state.getBinding(f.parent.id));
+  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild' , adoptionCutoff: '0'}, f.state.getBinding(f.parent.id));
   f.gateway.ready = true;
   f.gateway.boundMessage(f.message('100'));
   await Promise.all([...f.gateway.inFlight]);
@@ -185,7 +188,7 @@ test('archived unlocked thread backfills after its own cursor without unarchive 
   assert.equal(f.state.getMessage('100'), null);
   assert.equal(f.state.getMessage('101').deliveryChannelId, f.child.id);
   assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '102');
-  assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
+  assert.equal(f.state.getIntakeWatermark(f.parent.id).recovered_through_id, '0');
   await f.gateway._reconcilePending(null, controller.signal, true);
   await f.gateway.consumer.waitForNativeWork();
   assert.equal(f.dispatched.length, 2);
@@ -198,7 +201,7 @@ test('unavailable child does not demote parent or send accepted work to it', asy
   f.child.locked = true;
   const controller = new AbortController();
   const result = await f.gateway.recoverInbound(controller.signal, 'fixture');
-  assert.equal(result.ready, true);
+  assert.equal(result.ready, false);
   assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
   await f.gateway._reconcilePending(null, controller.signal, true);
@@ -244,7 +247,7 @@ test('thread checkpoint delivers recovered custody without an unrelated wake', a
   assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.REPLIED);
   assert.deepEqual(f.dispatched.map(message => message.id), ['101']);
   assert.deepEqual(f.sends.map(message => message.channelId), [f.child.id]);
-  assert.equal(f.state.getIntakeWatermark(f.parent.id), null);
+  assert.equal(f.state.getIntakeWatermark(f.parent.id).recovered_through_id, '0');
 });
 
 test('child checkpoint preserves a concurrent scoped recovery', { timeout: 5000 }, async t => {
@@ -253,7 +256,7 @@ test('child checkpoint preserves a concurrent scoped recovery', { timeout: 5000 
   const other = f.makeChannel('3000', ChannelType.GuildText);
   f.channels.set(other.id, other);
   f.histories.set(other.id, [f.message('901', other)]);
-  const binding = f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  const binding = f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir }, { intakeCutoff: '100' });
   f.state.acceptDiscordMessage({ id: '901', guildId: 'guild', channelId: other.id, authorId: 'operator', isBot: false, content: 'other owner' }, { ready: true, expectedBinding: binding });
   let checkpointReady, releaseCheckpoint, recoveryStarted, releaseRecovery;
   const checkpointReached = new Promise(resolve => { checkpointReady = resolve; });
@@ -344,7 +347,7 @@ test('global recovery preserves admission order across separate native owners', 
   const f = fixture(t); f.ready('100');
   const other = f.makeChannel('3000', ChannelType.GuildText);
   f.channels.set(other.id, other);
-  f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir }, { intakeCutoff: '100' });
   for (const [id, channel] of [['900', f.parent], ['101', other]]) {
     f.state.acceptDiscordMessage({ id, guildId: 'guild', channelId: channel.id, authorId: 'operator', isBot: false, content: 'owner recovery' },
       { ready: true, expectedBinding: f.state.getBinding(channel.id) });
@@ -368,7 +371,7 @@ test('child recovery attempts share one deadline across sequential children', as
     return history.filter(message => !options.after || BigInt(message.id) > BigInt(options.after)).slice(0, options.limit);
   } };
   const binding = f.state.getBinding(f.parent.id);
-  f.state.enrollThread({ threadId: second.id, parentChannelId: f.parent.id, guildId: 'guild' }, binding);
+  f.state.enrollThread({ threadId: second.id, parentChannelId: f.parent.id, guildId: 'guild' , adoptionCutoff: '100'}, binding);
   f.state.setThreadBaseline(second.id, '100', binding);
   f.state.markThreadBoundary(second.id, THREAD_STATES.READY, 'fixture adoption', null, null, binding);
   f.gateway.recoveryTimeoutMs = 1200;
@@ -515,8 +518,8 @@ test('recover child CLI wake requests the thread-specific Gateway capability', a
   const db = path.join(dir, 'surface.sqlite');
   const state = new SurfaceState(db);
   state.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'unused.secret') });
-  const binding = state.bind({ channelId: 'parent', guildId: 'guild', provider: 'codex', nativeId: NATIVE, workspace: dir });
-  state.enrollThread({ threadId: 'child', parentChannelId: 'parent', guildId: 'guild' }, binding);
+  const binding = state.bind({ channelId: 'parent', guildId: 'guild', provider: 'codex', nativeId: NATIVE, workspace: dir }, { intakeCutoff: '100' });
+  state.enrollThread({ threadId: 'child', parentChannelId: 'parent', guildId: 'guild' , adoptionCutoff: '100'}, binding);
   state.close();
   const paths = pathsFor({ 'state-dir': dir, db });
   const cliPath = path.resolve(__dirname, '..', 'src', 'cli.js');
@@ -700,8 +703,12 @@ test('accepted reply survives temporary parent and child recovery readiness', as
 
 test('initial adoption excludes old thread backlog without executing it', async t => {
   const f = fixture(t);
-  await enrollPublicThread(f.state, f.client, f.parent.id, f.child.id);
+  // The qualified cutoff is acquired synchronously inside enrollPublicThread from
+  // whatever history genuinely exists at that moment (D1/D6): populate the backlog
+  // before enrollment so it is excluded by the committed cutoff, not by a later
+  // first-recovery-page baseline step.
   f.histories.set(f.child.id, [f.message('100')]);
+  await enrollPublicThread(f.state, f.client, f.parent.id, f.child.id);
   await recoverThread(f.gateway, f.state.getThreadEnrollment(f.child.id), new AbortController().signal, f.gateway.lifecycleEpoch, waitForRecoveryOperation);
   assert.equal(f.state.getMessage('100'), null);
   assert.equal(f.state.getThreadEnrollment(f.child.id).adoptedThroughId, '100');
@@ -713,8 +720,9 @@ test('empty adoption baseline retains live child custody as the history cursor',
   const f = fixture(t);
   await enrollPublicThread(f.state, f.client, f.parent.id, f.child.id);
   const binding = f.state.getBinding(f.parent.id);
+  f.gateway.historyPageLimit = 1;
   let calls = 0;
-  f.gateway.fetchHistory = async () => {
+  f.gateway.fetchHistory = async (_channel, options) => {
     calls += 1;
     if (calls === 1) {
       const live = f.state.acceptDiscordMessage({
@@ -724,34 +732,42 @@ test('empty adoption baseline retains live child custody as the history cursor',
       assert.equal(live.accepted, true);
       return [];
     }
-    return [f.message('50')];
+    // 50 is fetched only after the empty qualified enrollment committed cutoff 0, so it
+    // is prospective custody, not excluded backlog. 101 is also fetchable as ordinary
+    // after-cutoff history once the page cursor reaches it, matching the live custody
+    // already accepted above rather than losing it behind a stale page cursor.
+    if (!options.after || options.after === '0') return [f.message('50')];
+    if (options.after === '50') return [f.message('101')];
+    return [];
   };
   await recoverThread(f.gateway, f.state.getThreadEnrollment(f.child.id), new AbortController().signal, f.gateway.lifecycleEpoch, waitForRecoveryOperation);
-  assert.equal(f.state.getMessage('50'), null);
+  assert.equal(f.state.getMessage('50').state, MESSAGE_STATES.ACCEPTED);
   assert.equal(f.state.getThreadEnrollment(f.child.id).recoveredThroughId, '101');
   assert.equal(f.state.getMessage('101').state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(f.state.getThreadEnrollment(f.child.id).adoptedThroughId, '0');
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
 });
 
 test('adoption baseline transaction keeps custody that arrives after the fetched snapshot', async t => {
   const f = fixture(t);
-  await enrollPublicThread(f.state, f.client, f.parent.id, f.child.id);
-  let baselineRead = true;
-  f.gateway.fetchHistory = async (_channel, options) => {
-    if (baselineRead && options.limit === 1 && !options.after) {
-      baselineRead = false;
-      return [f.message('50')];
-    }
-    return options.after === '102' ? [] : [f.message('51'), f.message('101')];
-  };
-  const setThreadBaseline = f.state.setThreadBaseline.bind(f.state);
-  f.state.setThreadBaseline = (threadId, latestId, binding) => {
-    const live = f.state.acceptDiscordMessage({
-      id: '102', guildId: 'guild', channelId: f.child.id, authorId: 'operator', isBot: false,
-      content: 'thread question', attachments: []
-    }, { ready: false, expectedBinding: binding });
-    assert.equal(live.accepted, true);
-    return setThreadBaseline(threadId, latestId, binding);
-  };
+  // The qualified cutoff is acquired at enrollment from whatever history genuinely
+  // exists then (D1/D6): 51 and 101 are the pre-enrollment backlog, excluded by the
+  // committed cutoff 101. 102 arrives as concurrent custody right after the atomic
+  // enrollment snapshot was persisted, and recovery reads it through an ordinary
+  // after-cutoff history page, not an invented later baseline.
+  f.histories.set(f.child.id, [f.message('51'), f.message('101')]);
+  const enrolled = await enrollPublicThread(f.state, f.client, f.parent.id, f.child.id);
+  assert.equal(enrolled.adoptedThroughId, '101');
+  const binding = f.state.getBinding(f.parent.id);
+  const live = f.state.acceptDiscordMessage({
+    id: '102', guildId: 'guild', channelId: f.child.id, authorId: 'operator', isBot: false,
+    content: 'thread question', attachments: []
+  }, { ready: false, expectedBinding: binding });
+  assert.equal(live.accepted, true);
+  // 102 is also fetchable as ordinary after-cutoff history by the time recovery reads
+  // it, matching the live gateway event above rather than losing it behind a stale
+  // page cursor or an invented later baseline.
+  f.histories.set(f.child.id, [...f.histories.get(f.child.id), f.message('102')]);
   const result = await recoverThread(
     f.gateway,
     f.state.getThreadEnrollment(f.child.id),
@@ -761,7 +777,7 @@ test('adoption baseline transaction keeps custody that arrives after the fetched
   );
   const enrollment = f.state.getThreadEnrollment(f.child.id);
   assert.equal(result, true);
-  assert.equal(enrollment.adoptedThroughId, '102');
+  assert.equal(enrollment.adoptedThroughId, '101');
   assert.equal(enrollment.recoveredThroughId, '102');
   assert.equal(f.state.getMessage('51'), null);
   assert.equal(f.state.getMessage('101'), null);
@@ -770,19 +786,19 @@ test('adoption baseline transaction keeps custody that arrives after the fetched
 
 test('missing or invalid history reader cannot falsely prove an empty ready thread', async t => {
   const f = fixture(t);
-  await enrollPublicThread(f.state, f.client, f.parent.id, f.child.id);
+  // A missing/invalid reader must be exercised before enrollment, since the qualified
+  // cutoff is now acquired synchronously inside enrollPublicThread (D1/D6). Enrolling
+  // successfully and then injecting a reader failure is a distinct, already-covered
+  // recovery scenario, not this pre-activation empty-proof claim.
   delete f.child.messages;
-  const controller = new AbortController();
-  await recoverThread(f.gateway, f.state.getThreadEnrollment(f.child.id), controller.signal, f.gateway.lifecycleEpoch, waitForRecoveryOperation);
-  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
-  assert.equal(f.state.getThreadEnrollment(f.child.id).adoptedAt, null);
-  f.state.reconcileIntake(f.child.id);
-  f.gateway.fetchHistoryInjected = true;
-  f.gateway.fetchHistory = async () => undefined;
-  await recoverThread(f.gateway, f.state.getThreadEnrollment(f.child.id), controller.signal, f.gateway.lifecycleEpoch, waitForRecoveryOperation);
-  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
-  assert.equal(f.state.getThreadEnrollment(f.child.id).adoptedAt, null);
+  const watermarkBefore = f.state.getIntakeWatermark(f.parent.id);
+  await assert.rejects(
+    enrollPublicThread(f.state, f.client, f.parent.id, f.child.id),
+    error => error instanceof AdoptionRefusalError && error.detail === ADOPTION_REFUSAL_DETAILS.READER
+  );
+  assert.equal(f.state.getThreadEnrollment(f.child.id), null);
   assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
+  assert.deepEqual(f.state.getIntakeWatermark(f.parent.id), watermarkBefore);
 });
 
 test('reopened custody dispatches once and reconciles the stored child destination', async t => {
@@ -845,11 +861,62 @@ test('recovery admits same-owner parent and child history in Discord order', asy
   assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
 });
 
+test('timed-out child lookup keeps later same-owner custody behind it', { timeout: 5000 }, async t => {
+  const f = fixture(t, { timeoutMs: 1000 }); f.ready('100');
+  const binding = f.state.getBinding(f.parent.id);
+  f.state.setBindingReadiness(f.parent.id, READINESS.READY, 'fixture ready', binding);
+  const listEnrollments = f.state.listThreadEnrollments.bind(f.state);
+  // Isolate the phase-2 lookup branch from the earlier thread-boundary fetch.
+  f.state.listThreadEnrollments = () => [];
+  for (const [id, channel] of [['101', f.child], ['102', f.parent]]) {
+    const accepted = f.state.acceptDiscordMessage({
+      id, guildId: 'guild', channelId: channel.id, authorId: 'operator', isBot: false,
+      content: 'ordered recovery question', attachments: []
+    }, { ready: true, expectedBinding: binding });
+    assert.equal(accepted.accepted, true);
+  }
+
+  let releaseChildLookup;
+  const childLookup = new Promise(resolve => { releaseChildLookup = resolve; });
+  const fetchChannel = f.client.channels.fetch.bind(f.client.channels);
+  const pendingChildLookup = startReconciliationLookup(f.client, f.child.id, 'seed', () => {
+    return childLookup.then(() => fetchChannel(f.child.id));
+  });
+  t.after(() => {
+    releaseChildLookup();
+    f.state.listThreadEnrollments = listEnrollments;
+  });
+
+  const retryPromises = [];
+  let retryStarted;
+  const retryStartedPromise = new Promise(resolve => { retryStarted = resolve; });
+  const reconcile = f.gateway.reconcilePending.bind(f.gateway);
+  f.gateway.reconcilePending = (...args) => {
+    const promise = reconcile(...args);
+    if (args[1]?.messageIds) {
+      retryPromises.push(promise);
+      retryStarted();
+    }
+    return promise;
+  };
+
+  const initial = f.gateway.reconcilePending(undefined, { readyOnly: true });
+  await initial;
+  assert.deepEqual(f.dispatched, [], 'same-owner successor stays queued while lookup is unresolved');
+
+  releaseChildLookup();
+  await retryStartedPromise;
+  await pendingChildLookup;
+  await Promise.all(retryPromises);
+  await f.gateway.consumer.waitForNativeWork();
+  assert.deepEqual(f.dispatched.map(message => message.id), ['101', '102']);
+});
+
 test('recovery preserves owner order when another owner is interleaved', async t => {
   const f = fixture(t); f.ready('100');
   const other = f.makeChannel('3000', ChannelType.GuildText);
   f.channels.set(other.id, other);
-  f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir }, { intakeCutoff: '100' });
   for (const [id, channel] of [['102', f.parent], ['900', other], ['101', f.child]]) {
     const binding = f.state.getMessageRoute(channel.id).binding;
     const accepted = f.state.acceptDiscordMessage({
@@ -894,7 +961,7 @@ test('parent handoff waits for child custody then preserves successor child rout
 test('public recovery preserves a direct binding after its enrollment is retired', async t => {
   const f = fixture(t); f.ready('100');
   f.state.unbind(f.parent.id);
-  const direct = f.state.bind({ channelId: f.child.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  const direct = f.state.bind({ channelId: f.child.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir }, { intakeCutoff: '100' });
   f.state.markIntakeBoundary(f.child.id, READINESS.PENDING, 'fixture recovery', null, null, direct);
   const originalArgv = process.argv;
   const originalWrite = process.stdout.write;
@@ -914,6 +981,10 @@ test('public recovery preserves a direct binding after its enrollment is retired
 test('restoring a parent pause dispatches its held child once to the original owner', async t => {
   const f = fixture(t); f.ready('100');
   const binding = f.state.getBinding(f.parent.id);
+  // The parent's own watermark stays 'pending' from bind() until intake recovery
+  // completes; without this the pause snapshot would capture 'pending' instead of the
+  // binding's actual readiness and restore would downgrade readiness forever (D2).
+  f.state.markIntakeBoundary(f.parent.id, READINESS.READY, 'fixture ready', null, null, binding);
   f.state.pauseOrdinaryHandoffIntake(f.parent.id, binding);
   f.gateway.boundMessage(f.message('101'));
   await Promise.all([...f.gateway.inFlight]);
@@ -954,7 +1025,7 @@ test('live child accepted while checkpoint reconciliation waits reaches native d
   const other = f.makeChannel('3000', ChannelType.GuildText);
   f.channels.set(other.id, other);
   f.histories.set(other.id, [f.message('901', other)]);
-  const binding = f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  const binding = f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir }, { intakeCutoff: '100' });
   f.state.acceptDiscordMessage({ id: '901', guildId: 'guild', channelId: other.id, authorId: 'operator', isBot: false, content: 'other' }, { ready: true, expectedBinding: binding });
   let checkpointReady, releaseCheckpoint, recoveryStarted, releaseRecovery, waiting;
   const checkpointReached = new Promise(r => { checkpointReady = r; });
@@ -1000,7 +1071,7 @@ test('later parent arrival cannot release an already blocked child route', { tim
  f.gateway.boundMessage(f.message('101', f.parent));
  const other = f.makeChannel('3000', ChannelType.GuildText);
  f.channels.set(other.id, other); f.histories.set(other.id, []);
- f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+ f.state.bind({ channelId: other.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir }, { intakeCutoff: '100' });
  f.gateway.boundMessage(f.message('901', other));
  await new Promise(r => setTimeout(r, 40));
  await f.gateway.consumer.waitForNativeWork();
@@ -1039,7 +1110,7 @@ test('old enrolled receipt cannot finish under a new direct binding', { timeout:
   try {
     await started;
     assert.equal(f.state.unbind(f.parent.id, { expectedBinding: parent }), true);
-    const direct = f.state.bind({ channelId: f.child.id, guildId: 'guild', provider: 'codex', nativeId: parent.nativeId, workspace: f.dir });
+    const direct = f.state.bind({ channelId: f.child.id, guildId: 'guild', provider: 'codex', nativeId: parent.nativeId, workspace: f.dir }, { intakeCutoff: '100' });
     assert.equal(direct.generation, stored.generation);
     release();
     await assert.rejects(pending, /message binding generation is stale/);
@@ -1161,9 +1232,9 @@ async function pendingScenario(t, secondDeadline) {
   if (secondDeadline) {
     f.channels.set(slowChild.id, slowChild);
     f.histories.set(slowChild.id, []);
-    f.state.enrollThread({ threadId: slowChild.id, parentChannelId: f.parent.id, guildId: 'guild' }, f.state.getBinding(f.parent.id));
+    f.state.enrollThread({ threadId: slowChild.id, parentChannelId: f.parent.id, guildId: 'guild' , adoptionCutoff: '100'}, f.state.getBinding(f.parent.id));
   }
-  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild' }, f.state.getBinding(f.parent.id));
+  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild' , adoptionCutoff: '100'}, f.state.getBinding(f.parent.id));
   f.state.setThreadBaseline(f.child.id, '100', f.state.getBinding(f.parent.id));
   f.histories.set(f.child.id, [f.message('101')]);
   f.gateway.boundMessage(f.message('101'));
@@ -1172,7 +1243,7 @@ async function pendingScenario(t, secondDeadline) {
   const slowParent = f.makeChannel('3000', ChannelType.GuildText);
   f.channels.set(slowParent.id, slowParent);
   f.histories.set(slowParent.id, []);
-  f.state.bind({ channelId: slowParent.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir });
+  f.state.bind({ channelId: slowParent.id, guildId: 'guild', provider: 'codex', nativeId: SUCCESSOR, workspace: f.dir }, { intakeCutoff: '100' });
   const fetch = f.client.channels.fetch;
   let slowParentCalls = 0;
   let slowChildCalls = 0;

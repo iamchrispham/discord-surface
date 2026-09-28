@@ -25,7 +25,7 @@ function fixture() {
   const binding = state.bind({
     channelId: 'channel-1', guildId: 'guild-1', provider: 'codex', nativeId: NATIVE_ID,
     workspace: dir, conductorId: 'conductor-1', repoKey: 'repo:discord-surface'
-  });
+  }, { intakeCutoff: '100' });
   state.receipt(null, 'direct-post-outcome', {
     journal: 'direct-post-v1', requestId: 'seed-post', attemptId: 'seed-attempt', outcome: 'sent', messageId: 'target-1',
     channelId: 'channel-1', guildId: 'guild-1', provider: 'codex', nativeId: NATIVE_ID, generation: binding.generation
@@ -1104,7 +1104,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
           }
         });
         const ordinary = await consumer.handleMessage({
-          id: 'ordinary-successor-message',
+          id: '101',
           guildId: 'guild-1',
           channelId: 'channel-1',
           author: { id: 'operator-1', bot: false },
@@ -1113,7 +1113,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
         }, undefined, binding);
         await consumer.waitForNativeWork();
         await consumer.waitForReceipts();
-        const ordinaryMessage = state.getMessage('ordinary-successor-message');
+        const ordinaryMessage = state.getMessage('101');
         publishFixtureFile(process.env.DISCORD_SURFACE_ORDINARY_RESULT_FILE, JSON.stringify({
           resultStatus: ordinary?.status || null,
           messageState: ordinaryMessage?.state || null,

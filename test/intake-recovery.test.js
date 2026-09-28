@@ -4,6 +4,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { fixture } = require('./helpers/intake-recovery-fixture');
+const {
+  RECOVERY_DEADLINE_MARKER_PREFIX,
+  RECOVERY_RETRY_PENDING_PREFIX
+} = require('../src/discord/recovery-fetch');
 
 for (const kind of ['channel', 'history']) {
   test(`pre-adoption thread ${kind} 503 stays pending and preserves observed custody`, async t => {
@@ -22,11 +26,22 @@ for (const kind of ['channel', 'history']) {
     f.history.set('2000', [message]);
     f.fail(null);
     await f.recover();
-    assert.equal(f.boundary('2000').state, 'ready');
-    assert.equal(f.boundary('2000').adoptedThroughId, '101');
+    // A never-adopted child has no committed cutoff, so recovery observes the
+    // cleared history without qualifying it; only a real adoption commits coverage.
+    assert.equal(f.boundary('2000').state, 'pending');
+    assert.equal(f.boundary('2000').recoveredThroughId, null);
     assert.equal(f.state.getMessage('101').state, 'accepted');
   });
 }
+
+test('legacy empty child recovery commits a verified zero baseline', async t => {
+  const f = fixture(t, { adoptThread: false });
+
+  await f.recover();
+
+  assert.equal(f.boundary('2000').state, 'ready');
+  assert.equal(f.cursor('2000'), '0');
+});
 
 for (const [state, detail] of [['gap', 'explicit child gap'], ['unavailable', 'explicit child hold']]) {
   test(`thread delivery 503 preserves enrolled ${state} boundary`, async t => {
@@ -140,8 +155,12 @@ for (const id of ['1000', '2000']) {
     assert.equal(f.state.getMessage('101').state, 'accepted');
     f.history.set(id, [message]);
     f.fail({ id, kind: 'channel', status: 503 });
-    if (id === '1000') await assert.rejects(f.gateway.start(f.secret), /intake recovery is unavailable/);
-    else await f.gateway.start(f.secret);
+    await f.gateway.start(f.secret);
+    if (id === '1000') {
+      assert.equal(f.gateway.started, true);
+      assert.equal(f.gateway.transportReady, true);
+      assert.equal(f.gateway.ready, false);
+    }
     assert.equal(f.boundary(id).state, 'unavailable');
     await f.reopen(); f.fail(null); f.enableDelivery();
     await f.gateway.start(f.secret);
@@ -220,6 +239,43 @@ test('pre-adoption 503 waits for later recovery instead of scheduling itself aga
   assert.equal(f.dispatched.length, 0);
 });
 
+test('pre-adoption retry remains held from live checkpoints while its retry boundary is pending', { timeout: 3000 }, async t => {
+  const f = fixture(t, { adoptThread: false });
+  const binding = f.state.getBinding('1000');
+  f.state.markThreadBoundary('2000', 'unavailable', `${RECOVERY_DEADLINE_MARKER_PREFIX}timeout`, null, null, binding);
+  const controller = new AbortController();
+  const fetchChannel = f.gateway.client.channels.fetch.bind(f.gateway.client.channels);
+  f.gateway.client.channels.fetch = async id => {
+    const channel = await fetchChannel(id);
+    const boundary = f.boundary('2000');
+    if (id === '2000' && boundary.state === 'pending' && boundary.detail?.startsWith(RECOVERY_RETRY_PENDING_PREFIX)) {
+      controller.abort();
+    }
+    return channel;
+  };
+  const scheduled = [];
+  f.gateway.liveCheckpointThreshold = 1;
+  f.gateway.beginLiveCheckpoint = counts => scheduled.push([...counts.entries()]);
+
+  await f.gateway.recoverInbound(controller.signal, 'fixture retry', f.gateway.lifecycleEpoch,
+    new Set(['2000']), Date.now() + 1000);
+
+  const retry = f.boundary('2000');
+  assert.equal(retry.state, 'pending');
+  assert.ok(retry.detail.startsWith(RECOVERY_RETRY_PENDING_PREFIX));
+  assert.equal(f.gateway.liveIntakeCounts.get('2000') || 0, 0,
+    'interrupted retry must not be reclassified as ordinary pending checkpoint work');
+  f.gateway.scheduleHeldLiveCheckpoints();
+  assert.deepEqual(scheduled, [], 'retry-pending pre-adoption thread must not schedule a live checkpoint');
+
+  const pending = f.state.markThreadBoundary('2000', 'pending', 'Thread history recovery in progress', null, null,
+    binding, undefined, undefined, retry);
+  assert.ok(pending);
+  f.gateway.liveIntakeCounts.set('2000', 1);
+  f.gateway.scheduleHeldLiveCheckpoints();
+  assert.deepEqual(scheduled, [[['2000', 1]]], 'ordinary pending thread remains checkpoint eligible');
+});
+
 for (const expired of [true, false]) {
   test('parent retry with ' + (expired ? 'expired' : 'fresh') + ' deadline before first fetch', { timeout: 3000 }, async t => {
     const f = fixture(t);
@@ -285,7 +341,7 @@ test('recovery fetch inventory stays covered by parent, child and delivery lifec
     const count = (fs.readFileSync(path.join(source, relative), 'utf8').match(/\brecoveryFetch\(/g) || []).length;
     if (count) consumers[relative.split(path.sep).join('/')] = count;
   }
-  assert.deepEqual(consumers, { 'discord.js': 5, 'discord/thread-enrollment.ts': 2 },
+  assert.deepEqual(consumers, { 'discord.js': 4, 'discord/thread-enrollment.ts': 2 },
     'map each new recovery fetch to deadline, concurrent-boundary and delivery custody cases');
 });
 
@@ -341,7 +397,11 @@ for (const fetchKind of ['channel', 'baseline', 'history']) {
   for (const retry of [false, true]) for (const concurrent of ['arrival', 'gap', 'readiness-hold']) {
     test(`parent failed ${fetchKind} keeps current custody: retry=${retry}, ${concurrent}`, { timeout: 5000 }, async t => {
       const f = fixture(t);
-      if (fetchKind === 'baseline') {
+      const unknownCoverage = fetchKind === 'baseline';
+      if (unknownCoverage) {
+        // Named historical/unknown-coverage scenario: the parent route carries no
+        // covered cursor at all, so the recovered production owner must refuse the
+        // baseline before any history request and keep the existing custody.
         f.state.db.prepare('DELETE FROM intake_watermarks WHERE channel_id=?').run('1000');
         f.state.markIntakeBoundary('1000', 'pending', 'new binding needs baseline');
       }
@@ -362,6 +422,23 @@ for (const fetchKind of ['channel', 'baseline', 'history']) {
         }
         throw Object.assign(new Error('fetch failed'), { status: 503 });
       };
+      if (unknownCoverage) {
+        const binding = f.state.getBinding('1000');
+        const message = { ...f.message('101', '1000'), authorId: 'operator', isBot: false, attachments: [] };
+        assert.equal(f.state.acceptDiscordMessage(message, { expectedBinding: binding }).accepted, true);
+        if (concurrent === 'gap') f.state.markIntakeBoundary('1000', 'gap', 'newer explicit hold', '101', '110', binding);
+        if (concurrent === 'readiness-hold') {
+          const mark = f.state.markIntakeBoundary.bind(f.state);
+          f.state.markIntakeBoundary = (...args) => {
+            if (args[0] === '1000' && args[1] === 'pending') {
+              f.state.setBindingReadiness('1000', 'unavailable', 'newer readiness hold', f.state.getBinding('1000'));
+              heldBinding = f.state.getBinding('1000');
+              f.state.markIntakeBoundary = mark;
+            }
+            return mark(...args);
+          };
+        }
+      }
       const originalChannelFetch = f.gateway.client.channels.fetch;
       let reached = false;
       if (fetchKind === 'channel') {
@@ -374,15 +451,38 @@ for (const fetchKind of ['channel', 'baseline', 'history']) {
         const fetch = f.gateway.fetchHistory.bind(f.gateway);
         f.gateway.fetchHistory = async (channel, options) => {
           if (channel.id !== '1000') return fetch(channel, options);
-          assert.equal(options.after, fetchKind === 'baseline' ? undefined : '100');
+          assert.equal(options.after, unknownCoverage ? undefined : '100');
           reached = true; injectFailure();
         };
       }
       await f.recover();
+      if (unknownCoverage) {
+        assert.equal(reached, false, 'unknown coverage must refuse before any history request');
+        assert.equal(f.state.getMessage('101').state, 'accepted');
+        assert.equal(f.cursor('1000'), null);
+        assert.equal(f.dispatched.length, 0);
+        if (concurrent === 'gap') {
+          assert.equal(f.boundary('1000').state, 'gap');
+          assert.equal(f.boundary('1000').detail, 'newer explicit hold');
+          return;
+        }
+        if (concurrent === 'readiness-hold') {
+          assert.equal(f.state.getBinding('1000').readiness, 'unavailable');
+          assert.deepEqual(f.state.getBinding('1000'), heldBinding);
+          return;
+        }
+        assert.equal(f.boundary('1000').state, 'pending');
+        f.gateway.client.channels.fetch = originalChannelFetch;
+        await f.reopen();
+        await f.recover();
+        assert.equal(f.boundary('1000').state, 'pending');
+        assert.equal(f.state.getMessage('101').state, 'accepted');
+        return;
+      }
       assert.equal(reached, true);
       assert.equal(f.state.getMessage('101').state, 'accepted');
       assert.equal(f.boundary('1000').last_seen_id, '101');
-      assert.equal(f.cursor('1000'), fetchKind === 'baseline' ? null : '100');
+      assert.equal(f.cursor('1000'), '100');
       assert.equal(f.dispatched.length, 0);
       if (concurrent === 'gap') {
         assert.equal(f.boundary('1000').state, 'gap');

@@ -22,8 +22,8 @@ test('stop clears queued recovery channels and preserves healthy sibling custody
   state.setConfig({ operatorId: '900', guildId: target.guildId, secretFile: path.join(dir, 'secret') });
   const channelA = '201';
   const channelB = '202';
-  state.bind({ ...target, channelId: channelA, nativeId: '33333333-3333-3333-3333-333333333333', workspace: dir, endpoint: '/tmp/agent-stop-a.sock', conductorId: 'conductor-a', repoKey: 'repo:a' });
-  state.bind({ ...target, channelId: channelB, nativeId: '44444444-4444-4444-4444-444444444444', workspace: dir, endpoint: '/tmp/agent-stop-b.sock', conductorId: 'conductor-b', repoKey: 'repo:b' });
+  state.bind({ ...target, channelId: channelA, nativeId: '33333333-3333-3333-3333-333333333333', workspace: dir, endpoint: '/tmp/agent-stop-a.sock', conductorId: 'conductor-a', repoKey: 'repo:a' }, { intakeCutoff: '100' });
+  state.bind({ ...target, channelId: channelB, nativeId: '44444444-4444-4444-4444-444444444444', workspace: dir, endpoint: '/tmp/agent-stop-b.sock', conductorId: 'conductor-b', repoKey: 'repo:b' }, { intakeCutoff: '100' });
   const bindingA = state.getBinding(channelA);
   const bindingB = state.getBinding(channelB);
   state.setIntakeBaseline(channelA, '6999', 'previous completed recovery', bindingA);
@@ -158,7 +158,7 @@ test('live stale attachment failure releases obsolete generation barrier before 
     endpoint: path.join(dir, 'g1.sock'),
     conductorId: 'destination-conductor',
     repoKey: 'repo:destination'
-  });
+  }, { intakeCutoff: '100' });
   const binding = state.getBinding(target.channelId);
   state.setIntakeBaseline(target.channelId, '6999', 'previous completed recovery', binding);
   state.markIntakeBoundary(target.channelId, 'ready', null, null, null, binding);
@@ -305,7 +305,7 @@ test('targeted attachment recovery preserves one ready sibling native dispatch',
     endpoint: path.join(dir, 'a.sock'),
     conductorId: 'conductor-a',
     repoKey: 'repo:a'
-  });
+  }, { intakeCutoff: '6999' });
   state.bind({
     ...target,
     channelId: channelB,
@@ -314,7 +314,7 @@ test('targeted attachment recovery preserves one ready sibling native dispatch',
     endpoint: path.join(dir, 'b.sock'),
     conductorId: 'conductor-b',
     repoKey: 'repo:b'
-  });
+  }, { intakeCutoff: '100' });
   const bindingA = state.getBinding(channelA);
   const bindingB = state.getBinding(channelB);
   state.setIntakeBaseline(channelA, '6999', 'previous completed recovery', bindingA);

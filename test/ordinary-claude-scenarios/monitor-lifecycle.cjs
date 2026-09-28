@@ -174,7 +174,8 @@ for (const terminalState of [READINESS.UNAVAILABLE, READINESS.GAP]) {
     assert.equal(gateway.recoveryPromise, null);
     assert.equal(gateway.recoveryController, null);
     const accepted = f.state.acceptDiscordMessage({
-      id: `held-${terminalState}`, guildId: 'guild', channelId: f.binding.channelId,
+      id: terminalState === READINESS.UNAVAILABLE ? '900011' : '900012',
+      guildId: 'guild', channelId: f.binding.channelId,
       authorId: 'operator', isBot: false, content: `hold during ${terminalState}`
     }, { ready: false });
     assert.equal(accepted.accepted, true);

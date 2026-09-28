@@ -16,7 +16,7 @@ const {
 test('HTTP 413 native file upload is definite not-sent and retries the retained snapshot', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
     const f = fixture(t2, provider);
-    const id = `native-file-413-${provider}`;
+    const id = '915001';
     const source = path.join(f.dir, 'answer.bin');
     const bytes = Buffer.from('413 retained snapshot payload');
     fs.writeFileSync(source, bytes);
@@ -72,7 +72,7 @@ test('old capacity refusal cleanup cannot shadow a later admitted native file', 
       }
       assert.equal(f.state.activeFilePreparationCount(), 8);
 
-      const id = `native-file-marker-shadow-${provider}`;
+      const id = '915002';
       const source = path.join(f.dir, 'marker-shadow.bin');
       const originalBytes = Buffer.from(`marker shadow bytes ${provider}`);
       fs.writeFileSync(source, originalBytes);
@@ -153,7 +153,7 @@ test('terminal native file retry validates its immutable request identity', asyn
   for (const provider of ['codex', 'claude']) for (const terminalState of [MESSAGE_STATES.REPLY_READY, MESSAGE_STATES.REPLIED]) {
     await t.test(`${provider} ${terminalState}`, t2 => {
       const f = fixture(t2, provider);
-      const id = `native-file-terminal-retry-${provider}-${terminalState}`;
+      const id = '915003';
       const source = path.join(f.dir, 'terminal-retry.bin');
       fs.writeFileSync(source, Buffer.from('terminal retry bytes'));
       submitted(f, id, MESSAGE_STATES.SUBMITTED);

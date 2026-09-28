@@ -10,10 +10,10 @@ const { CODEX_ID, fixture, discordMessage, waitForCondition, providers } = requi
 test('simulated: gateway owner queue orders recovered and live inputs during recovery', async () => {
   const { dir, db, state: initial } = fixture();
   let state = initial;
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'old-A', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'old A' });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '101', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'old A' });
   await new Promise(resolve => setTimeout(resolve, 2));
-  state.acceptDiscordMessage({ id: 'old-B', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'old B' });
+  state.acceptDiscordMessage({ id: '102', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'old B' });
   state.close();
   state = new SurfaceState(db);
 
@@ -59,23 +59,23 @@ test('simulated: gateway owner queue orders recovered and live inputs during rec
   gateway.ready = true;
 
   const recovery = gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
-  await waitForCondition(() => observations.includes('old-A'));
-  client.emit('messageCreate', discordMessage({ id: 'live-C', channelId: 'channel-codex', content: 'live C', sends }));
-  await waitForCondition(() => state.getMessage('live-C')?.state === MESSAGE_STATES.ACCEPTED);
-  assert.deepEqual(dispatches, ['old-A']);
+  await waitForCondition(() => observations.includes('101'));
+  client.emit('messageCreate', discordMessage({ id: '103', channelId: 'channel-codex', content: 'live C', sends }));
+  await waitForCondition(() => state.getMessage('103')?.state === MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(dispatches, ['101']);
   releaseSecondFetch();
   await recovery;
-  assert.deepEqual(dispatches, ['old-A']);
+  assert.deepEqual(dispatches, ['101']);
 
-  releases.get('old-A')({ text: 'answer A' });
-  await waitForCondition(() => observations.includes('old-B'));
-  assert.deepEqual(dispatches, ['old-A', 'old-B']);
-  releases.get('old-B')({ text: 'answer B' });
-  await waitForCondition(() => observations.includes('live-C'));
-  assert.deepEqual(dispatches, ['old-A', 'old-B', 'live-C']);
-  releases.get('live-C')({ text: 'answer C' });
-  await waitForCondition(() => state.getMessage('live-C').state === MESSAGE_STATES.REPLIED);
-  assert.deepEqual(observations, ['old-A', 'old-B', 'live-C']);
+  releases.get('101')({ text: 'answer A' });
+  await waitForCondition(() => observations.includes('102'));
+  assert.deepEqual(dispatches, ['101', '102']);
+  releases.get('102')({ text: 'answer B' });
+  await waitForCondition(() => observations.includes('103'));
+  assert.deepEqual(dispatches, ['101', '102', '103']);
+  releases.get('103')({ text: 'answer C' });
+  await waitForCondition(() => state.getMessage('103').state === MESSAGE_STATES.REPLIED);
+  assert.deepEqual(observations, ['101', '102', '103']);
   assert.deepEqual(sends.filter(payload => ['answer A', 'answer B', 'answer C'].includes(payload.content)).map(payload => payload.content), ['answer A', 'answer B', 'answer C']);
   await gateway.stop();
   state.close();
@@ -83,7 +83,7 @@ test('simulated: gateway owner queue orders recovered and live inputs during rec
 
 test('simulated: live same-owner inputs keep durable FIFO order', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
   const dispatches = [];
   const observations = [];
   const releases = new Map();
@@ -108,33 +108,33 @@ test('simulated: live same-owner inputs keep durable FIFO order', async () => {
   });
   gateway.ready = true;
 
-  client.emit('messageCreate', discordMessage({ id: 'live-one', channelId: 'channel-codex' }));
-  await waitForCondition(() => observations.includes('live-one'));
+  client.emit('messageCreate', discordMessage({ id: '104', channelId: 'channel-codex' }));
+  await waitForCondition(() => observations.includes('104'));
   await new Promise(resolve => setTimeout(resolve, 2));
-  client.emit('messageCreate', discordMessage({ id: 'live-two', channelId: 'channel-codex' }));
+  client.emit('messageCreate', discordMessage({ id: '105', channelId: 'channel-codex' }));
   await new Promise(resolve => setTimeout(resolve, 2));
-  client.emit('messageCreate', discordMessage({ id: 'live-three', channelId: 'channel-codex' }));
-  await waitForCondition(() => state.getMessage('live-three')?.state === MESSAGE_STATES.ACCEPTED);
-  assert.deepEqual(dispatches, ['live-one']);
+  client.emit('messageCreate', discordMessage({ id: '106', channelId: 'channel-codex' }));
+  await waitForCondition(() => state.getMessage('106')?.state === MESSAGE_STATES.ACCEPTED);
+  assert.deepEqual(dispatches, ['104']);
 
-  releases.get('live-one')({ text: 'one' });
-  await waitForCondition(() => observations.includes('live-two'));
-  releases.get('live-two')({ text: 'two' });
-  await waitForCondition(() => observations.includes('live-three'));
-  releases.get('live-three')({ text: 'three' });
-  await waitForCondition(() => state.getMessage('live-three').state === MESSAGE_STATES.REPLIED);
-  assert.deepEqual(dispatches, ['live-one', 'live-two', 'live-three']);
-  assert.deepEqual(observations, ['live-one', 'live-two', 'live-three']);
+  releases.get('104')({ text: 'one' });
+  await waitForCondition(() => observations.includes('105'));
+  releases.get('105')({ text: 'two' });
+  await waitForCondition(() => observations.includes('106'));
+  releases.get('106')({ text: 'three' });
+  await waitForCondition(() => state.getMessage('106').state === MESSAGE_STATES.REPLIED);
+  assert.deepEqual(dispatches, ['104', '105', '106']);
+  assert.deepEqual(observations, ['104', '105', '106']);
   await gateway.stop();
   state.close();
 });
 
 test('simulated: same-owner retry keeps equal-time admission order', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  const firstId = 'retry-order-first';
-  const secondId = 'retry-order-second';
-  const thirdId = 'retry-order-third';
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  const firstId = '107';
+  const secondId = '108';
+  const thirdId = '109';
   for (const id of [firstId, secondId, thirdId]) {
     state.acceptDiscordMessage({ id, guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: id });
   }
@@ -173,9 +173,9 @@ test('simulated: same-owner retry keeps equal-time admission order', async () =>
 test('surface state keeps equal-time admission and recovery order under another query plan', () => {
   const { dir, db, state: initialState } = fixture();
   let state = initialState;
-  const ids = ['z-equal-time-first', 'a-equal-time-second', 'm-equal-time-third'];
+  const ids = ['110', '111', '112'];
   try {
-    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
+    state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
     state.markIntakeBoundary('channel-codex', 'ready');
     for (const id of ids) {
       const result = state.acceptDiscordMessage({
@@ -199,10 +199,10 @@ test('surface state keeps equal-time admission and recovery order under another 
 
 test('simulated: recovered observer stop cancels custody without native redispatch', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'submitted-recovery-stop', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'stop me' });
-  state.claimDispatch('submitted-recovery-stop');
-  state.markSubmitted('submitted-recovery-stop');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '113', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'stop me' });
+  state.claimDispatch('113');
+  state.markSubmitted('113');
   let observations = 0;
   let stopped = 0;
   const client = {
@@ -229,16 +229,16 @@ test('simulated: recovered observer stop cancels custody without native redispat
   assert.equal(observations, 1);
   await gateway.stop();
   assert.equal(stopped, 1);
-  assert.equal(state.getMessage('submitted-recovery-stop').state, MESSAGE_STATES.SUBMITTED);
+  assert.equal(state.getMessage('113').state, MESSAGE_STATES.SUBMITTED);
   state.close();
 });
 
 test('simulated: recovered observer rejects a late reply after owner revocation', async () => {
   const { dir, state } = fixture();
-  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir });
-  state.acceptDiscordMessage({ id: 'submitted-recovery-owner', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'owner fence' });
-  state.claimDispatch('submitted-recovery-owner');
-  state.markSubmitted('submitted-recovery-owner');
+  state.bind({ channelId: 'channel-codex', guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir }, { intakeCutoff: '100' });
+  state.acceptDiscordMessage({ id: '114', guildId: 'guild-1', channelId: 'channel-codex', authorId: 'operator-1', isBot: false, content: 'owner fence' });
+  state.claimDispatch('114');
+  state.markSubmitted('114');
   let release;
   let sends = 0;
   const client = {
@@ -261,8 +261,8 @@ test('simulated: recovered observer rejects a late reply after owner revocation'
   await gateway.reconcilePending(new Date(Date.now() + 1).toISOString());
   state.setConfig({ operatorId: 'revoked-owner', guildId: 'guild-1', secretFile: path.join(dir, 'discord.env') });
   release({ text: 'late after owner change' });
-  for (let attempt = 0; attempt < 100 && state.getMessage('submitted-recovery-owner').state === MESSAGE_STATES.SUBMITTED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
-  assert.equal(state.getMessage('submitted-recovery-owner').state, MESSAGE_STATES.SUBMITTED);
+  for (let attempt = 0; attempt < 100 && state.getMessage('114').state === MESSAGE_STATES.SUBMITTED; attempt += 1) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(state.getMessage('114').state, MESSAGE_STATES.SUBMITTED);
   assert.equal(sends, 0);
   await gateway.stop();
   state.close();

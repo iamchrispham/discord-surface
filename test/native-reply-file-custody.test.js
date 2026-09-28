@@ -14,7 +14,7 @@ const {
 
 test('native file custody survives not-sent reconciliation and named cleanup only', t => {
   const f = fixture(t);
-  const id = 'native-file-reconcile';
+  const id = '913001';
   const source = path.join(f.dir, 'answer.bin');
   fs.writeFileSync(source, Buffer.from('payload'));
   submitted(f, id);
@@ -37,7 +37,7 @@ test('inactive binding cannot release admitted native file custody', async t => 
   for (const provider of ['codex', 'claude']) for (const recorded of [false, true]) {
     await t.test(`${provider} ${recorded ? 'pending' : 'no-part'}`, t2 => {
       const f = fixture(t2, provider);
-      const id = `native-file-inactive-${provider}-${recorded}`;
+      const id = '913002';
       const source = path.join(f.dir, 'retained.bin');
       const bytes = Buffer.from('retained payload');
       fs.writeFileSync(source, bytes);
@@ -58,7 +58,7 @@ test('inactive binding cannot release admitted native file custody', async t => 
 
 test('dead native preparation owner can release a pre-stage reservation', t => {
   const f = fixture(t);
-  const id = 'native-file-dead-owner';
+  const id = '913003';
   submitted(f, id);
   const preparationId = '33333333-3333-4333-8333-333333333333';
   const stagedPath = path.join(f.dir, '.direct-post-files', `${preparationId}.bin`);
@@ -76,7 +76,7 @@ test('dead native preparation owner can release a pre-stage reservation', t => {
 
 test('text reply cannot close a message while native file preparation is pending', t => {
   const f = fixture(t);
-  const id = 'native-file-preparing-fence';
+  const id = '913004';
   submitted(f, id);
   const preparationId = '44444444-4444-4444-8444-444444444444';
   f.state.receipt(id, 'native-reply-file-preparation', {
@@ -92,7 +92,7 @@ test('direct and native preparations share capacity and release permits replacem
   const f = fixture(t);
   for (let index = 0; index < 7; index += 1) f.state.beginDirectPostFilePreparation(directPreparationSeed(f, index));
   assert.equal(f.state.activeFilePreparationCount(), 7);
-  const id = 'native-file-capacity';
+  const id = '913005';
   const source = path.join(f.dir, 'capacity.bin');
   fs.writeFileSync(source, Buffer.from('capacity payload'));
   submitted(f, id);
@@ -119,7 +119,7 @@ test('full native file capacity records ownership without reserving a file', asy
   for (const provider of ['codex', 'claude']) await t.test(provider, t2 => {
     const f = fixture(t2, provider);
     for (let index = 0; index < 8; index += 1) f.state.beginDirectPostFilePreparation(directPreparationSeed(f, index));
-    const id = `native-file-full-capacity-${provider}`;
+    const id = '913006';
     const source = path.join(f.dir, 'full-capacity.bin');
     fs.writeFileSync(source, Buffer.from('full capacity payload'));
     submitted(f, id, MESSAGE_STATES.UNCERTAIN);
@@ -148,7 +148,7 @@ test('native-only capacity rejection reports native holders', async t => {
     const f = fixture(t2, provider);
     const holders = [];
     for (let index = 0; index < 8; index += 1) {
-      const id = `native-only-holder-${provider}-${index}`;
+      const id = String(913100 + index);
       const source = path.join(f.dir, `${id}.bin`);
       fs.writeFileSync(source, Buffer.from(id));
       submitted(f, id);
@@ -178,7 +178,7 @@ test('native-only capacity rejection reports native holders', async t => {
 
 test('stale native cleanup cannot release a later preparation for the same message', t => {
   const f = fixture(t);
-  const id = 'native-file-stale-cleanup';
+  const id = '913007';
   const firstId = '66666666-6666-4666-8666-666666666666';
   const secondId = '77777777-7777-4777-8777-777777777777';
   submitted(f, id);
@@ -198,7 +198,7 @@ test('stale native cleanup cannot release a later preparation for the same messa
 
 test('missing native snapshot is definitive not-sent and retains retry custody', async t => {
   const f = fixture(t);
-  const id = 'native-file-missing-snapshot';
+  const id = '913008';
   const source = path.join(f.dir, 'missing.bin');
   fs.writeFileSync(source, Buffer.from('will be removed'));
   submitted(f, id);
@@ -224,7 +224,7 @@ test('missing native snapshot is definitive not-sent and retains retry custody',
 
 test('sent cleanup reopens after unlink-before-released receipt failure', t => {
   const f = fixture(t);
-  const id = 'native-file-cleanup-crash';
+  const id = '913009';
   const source = path.join(f.dir, 'cleanup.bin');
   fs.writeFileSync(source, Buffer.from('cleanup payload'));
   submitted(f, id);
