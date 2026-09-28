@@ -116,20 +116,20 @@ const expectedDigests = {
   courierForwardingPrompt: '00a4064173913f094c396da42a14de9121933f57c94e752aaaa2117194b27ce3',
   attachmentPrompt: '51bed8777c238572c49865aa895a615f05842d43f194ee5f3f42b96ae0f0132e',
   messageRequestHuman: '79057b1e52d3d81405bb67993c5087743594770f62ca344e556eb223fc4c2ce2',
-  messageRequestAgentRequest: '5624d5e6fdba87af22888bc4a55353456c3bd4b5115897bdd90543d2d588abdb',
-  messageRequestAgentResult: 'a98c54b515af664b948fdb42d55e42073179611139b0ab1541d457ec0458f5c7',
+  messageRequestAgentRequest: '02b373bbf8aa27d52a70e5f03eb76af9030071672cb0cabb7998d74684421f73',
+  messageRequestAgentResult: 'c8dd89fdf246bfb441ba998b79d80837758919746f7b7146c0477cce55fc8649',
   messageRequestDecision: '61bf6fab877b903ac62e83f33903465896b3942f3374b986da8380b5d83d469a',
   messageRequestWatcher: '778ebfecc08c0621fb1e6ee1ac96cfb417aad3576c1f1c6a55e52a47b9d32b9d',
   codexPromptHuman: '214cc1a09949c904d2144fc85a729826e661ea84f89569d5acb88c47f1088b39',
   codexPromptAttachment: '236c32b2160a03dc257ef12ec93463c79faed582466f47c54a84fb144c21b04b',
-  codexPromptAgentRequest: '7854014437cc92c4993d42fee8c35853e157160f20562ba6564cbdfb65e18e13',
-  codexPromptAgentResult: '7c742e49ca3f3bcb6d09f58ead922b716b40b0e914b9ff2371e4629f523a1b56',
+  codexPromptAgentRequest: '74d62a39bbcea0df29732117e9af221c063146a48753a09715fc0da819fdc05c',
+  codexPromptAgentResult: '329612b9f60d99d02787f3ea62b403977e548392e3841da348dc611601a40878',
   codexPromptDecision: 'fa9ba7f924595df3cfab549840962960ae5cc3f5fab299412dc51dc8c4ce9510',
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
   claudeEventHuman: '3cf57a00278c64f0f1f5e4e180189002af5e7a97584e42326741bf752c71ddcc',
   claudeEventAttachment: 'd04456537d38c4309bae542a35f13c52cbbaa2f3e83c062cec959f7a8db24f6d',
-  claudeEventAgentRequest: '6bb6a5cb5ae61b610833eafcd57cad10cbf2c851b5cc815903bc09bf043639e7',
-  claudeEventAgentResult: '9663202e355371dbd715da7cd997e154317aa13a2bfe0e6af65a4fd4e1acbbe4',
+  claudeEventAgentRequest: 'f46dce0d22dd7382f7f761f4b938733bf7aed0b03a5d05748aa51ac45b605a2f',
+  claudeEventAgentResult: '602b9b65c94ab98f5361182aee95462473c679c4146bcb0c178e50c6da229fff',
   claudeEventDecision: '9fa9567ee39e6e4824c584991a8dad2c5267be9c3aa282ba2021e30de868e610',
   claudeEventWatcher: '45d9fbf706942a0fd9be6523d7b8dc61dc1b059e290d9a403be2010599dd3d14'
 };
@@ -143,6 +143,19 @@ test('native facade preserves the public export inventory', () => {
   for (const name of ['agentCompletionCommand', 'attachmentPrompt', 'claudeEvent', 'codexPrompt', 'courierForwardingPrompt', 'messageRequest', 'watcherNoticeCompletionCommand']) {
     assert.equal(facade[name], prompts[name], `${name} should be the facade implementation`);
   }
+});
+
+test('agent requests direct both native providers to a correlated result', () => {
+  const request = facade.messageRequest(agentRequest);
+  const codex = facade.codexPrompt(agentRequest, acknowledgment, completion);
+  const claude = facade.claudeEvent(agentRequest, completion).content;
+  for (const prompt of [request, codex, claude]) {
+    assert.match(prompt, /agent-send --agent-reply-to agent-request/);
+    assert.match(prompt, /ordinary Discord reply does not complete this request/);
+  }
+  assert.match(codex, /Do not use a normal final reply/);
+  assert.match(claude, /Do not use the reply tool/);
+  assert.match(facade.messageRequest(agentResult), /Consume this result with agent-complete/);
 });
 
 test('native presentation matches the 314de71 baseline bytes', () => {

@@ -39,7 +39,8 @@ test('native owners receive the exact no-post completion command', () => {
   assert.deepEqual(commands, [acknowledgment, completion]);
   assert.ok(prompt.includes(`Final reply: start with [[discord-surface:${message.id}]] on its own line.`));
   assert.match(prompt, /ACK means received, not completed/);
-  assert.match(prompt, /Choose exactly one:/);
+  assert.match(prompt, /Consume this result with agent-complete/);
+  assert.doesNotMatch(prompt, /normal final for a Discord reply/);
   assert.match(prompt, /If fully handled without a Discord reply, run once/);
   assert.match(prompt, /Then no normal final response/);
   assert.ok(prompt.indexOf(JSON.stringify(acknowledgment)) < prompt.indexOf(message.agentMessage.text));
