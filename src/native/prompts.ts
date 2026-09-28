@@ -116,10 +116,11 @@ function agentResultInstruction(message: NativeMessage, agent: NonNullable<Nativ
   const cliPath = completion?.[1] || null;
   if (!stateDir || !dbPath || !cliPath || !completion?.[0]) {
     return [
-      'Return exactly one correlated result through the registered peer_send tool.',
-      `Call peer_send({reply_to: ${JSON.stringify(agent.id)}, text_file: <owner-only result file>, dedupe_key: ${JSON.stringify(`agent-result-${resultKey}`)}}).`,
-      `The immutable incoming source route is ${JSON.stringify(agent.source)}. Do not infer a route from the packet ID alone.`,
-      `The receiving agent route is ${JSON.stringify(agent.target)}, including child channelId ${JSON.stringify(agent.target.channelId)}.`,
+      'Return exactly one correlated result through the agent-send command.',
+      `Write this exact JSON to an owner-only target file: ${JSON.stringify(agent.source)}.`,
+      `Use --agent-reply-to ${JSON.stringify(agent.id)}, --channel-id ${JSON.stringify(message.channelId)}, --agent-thread-id ${JSON.stringify(agent.target.channelId)}, --native-id ${JSON.stringify(agent.target.nativeId)}, --generation ${JSON.stringify(String(agent.target.generation))}, --target-file <owner-only target file>, and --text-file <owner-only result file>.`,
+      `Use a stable dedupe key such as ${JSON.stringify(`agent-result-${resultKey}`)} and preserve the receiving agent route ${JSON.stringify(agent.target)}.`,
+      'The target file preserves the immutable incoming source route, so this remains unambiguous when packet IDs collide.',
       'Then run agent-complete. Do not use an ordinary Discord reply. An ordinary Discord reply does not complete this request.'
     ].join(' ');
   }

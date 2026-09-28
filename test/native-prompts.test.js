@@ -116,7 +116,7 @@ const expectedDigests = {
   courierForwardingPrompt: '00a4064173913f094c396da42a14de9121933f57c94e752aaaa2117194b27ce3',
   attachmentPrompt: '51bed8777c238572c49865aa895a615f05842d43f194ee5f3f42b96ae0f0132e',
   messageRequestHuman: '79057b1e52d3d81405bb67993c5087743594770f62ca344e556eb223fc4c2ce2',
-  messageRequestAgentRequest: '7daa7f78875eda0e03d4862889f93701d71305e8b19269df02fb92c0ba47adba',
+  messageRequestAgentRequest: 'b7695a8dffd91547e0d58d306e2e4666774b31ad3928c687609e394f9c858cd2',
   messageRequestAgentResult: 'c8dd89fdf246bfb441ba998b79d80837758919746f7b7146c0477cce55fc8649',
   messageRequestDecision: '61bf6fab877b903ac62e83f33903465896b3942f3374b986da8380b5d83d469a',
   messageRequestWatcher: '778ebfecc08c0621fb1e6ee1ac96cfb417aad3576c1f1c6a55e52a47b9d32b9d',
@@ -149,7 +149,12 @@ test('agent requests direct both native providers to a correlated result', () =>
   const request = facade.messageRequest(agentRequest);
   const codex = facade.codexPrompt(agentRequest, acknowledgment, completion);
   const claude = facade.claudeEvent(agentRequest, completion).content;
-  assert.match(request, /peer_send\(\{reply_to: "agent-request"/);
+  assert.match(request, /agent-send command/);
+  assert.match(request, /--agent-reply-to "agent-request"/);
+  assert.match(request, /--channel-id "102"/);
+  assert.match(request, /--agent-thread-id "102"/);
+  assert.match(request, /immutable incoming source route/);
+  assert.doesNotMatch(request, /peer_send/);
   for (const prompt of [codex, claude]) {
     assert.match(prompt, /agent-send/);
     assert.match(prompt, /--state-dir","\/tmp\/state with spaces"/);
