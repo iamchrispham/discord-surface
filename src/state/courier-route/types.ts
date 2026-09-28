@@ -2,7 +2,9 @@ import type { Attachment } from '../../attachments';
 import type { AgentAddress, AgentMessage, AgentProvider } from '../../agent-message';
 import type {
   COURIER_ATTEMPT_STATES,
+  COURIER_DELIVERY_STATUSES,
   COURIER_OUTCOMES,
+  COURIER_RECOVERY_REASONS,
   COURIER_RESULT_STATUSES,
   COURIER_ROUTE_STATES,
   COURIER_SOURCE_KINDS,
@@ -129,6 +131,26 @@ export interface CourierAttempt {
 export type CourierOutcome = typeof COURIER_OUTCOMES[keyof typeof COURIER_OUTCOMES];
 export type CourierResultStatus = typeof COURIER_RESULT_STATUSES[keyof typeof COURIER_RESULT_STATUSES];
 export type CourierRouteState = typeof COURIER_ROUTE_STATES[keyof typeof COURIER_ROUTE_STATES];
+export type CourierDeliveryStatus = typeof COURIER_DELIVERY_STATUSES[keyof typeof COURIER_DELIVERY_STATUSES];
+export type CourierRecoveryReason = typeof COURIER_RECOVERY_REASONS[keyof typeof COURIER_RECOVERY_REASONS];
+
+// Issue128 public projection result. `retired` means only "this attempt can no
+// longer gain forwarding permission"; it is never a native-completion claim.
+// The CLI adds `gatewayWake` after the retirement transaction commits.
+export interface CourierRecoveryResult {
+  message: CourierMessage | null;
+  attemptId: string;
+  retired: boolean;
+  duplicate: boolean;
+}
+
+export interface CourierDeliveryStatusRow {
+  messageId: string;
+  attemptId: string;
+  status: CourierDeliveryStatus;
+  recoveryEligible: boolean;
+  recoveryReason: CourierRecoveryReason;
+}
 
 export interface CourierOutcomeRecord {
   attemptId: string;
@@ -150,6 +172,7 @@ export interface SqlRow {
 export interface SqlStatement {
   all<T extends SqlRow = SqlRow>(...parameters: unknown[]): T[];
   get<T extends SqlRow = SqlRow>(...parameters: unknown[]): T | undefined;
+  run(...parameters: unknown[]): unknown;
 }
 
 export interface CourierState {

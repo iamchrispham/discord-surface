@@ -22,10 +22,19 @@ const RECOVER_FLAGS = Object.freeze({
   directPost: ['direct-post-request-id', 'direct-post-attempt-id', 'direct-post-message-id', 'direct-post-nonce',
     'resolution', 'evidence-scope'],
   message: ['message-id', 'resolution'],
+  courier: ['courier-message-id', 'courier-attempt-id'],
   restart: []
 });
 
+// Recover selectors that identify every non-courier mode. A courier recovery is
+// exclusive: it cannot be combined with any of these.
+const RECOVER_NON_COURIER_SELECTORS = Object.freeze([
+  'intake-channel-id', 'topic-channel-id', 'board-attempt-id', 'direct-post-request-id',
+  'message-id', 'resolution'
+]);
+
 function recoverMode(args = {}) {
+  if (args['courier-message-id'] !== undefined || args['courier-attempt-id'] !== undefined) return 'courier';
   if (Object.keys(args).some(key => key.startsWith('board-') && args[key] !== undefined)) return 'board';
   if (args['topic-channel-id']) return 'topic';
   if (args['intake-channel-id']) return 'intake';
@@ -146,7 +155,7 @@ const BOOLEAN_FLAGS = new Set([
   'reuse'
 ]);
 const BOOLEAN_VALUES = new Set([true, false, 'true', 'false']);
-const REQUIRED_VALUE_FLAGS = new Set(['part-index']);
+const REQUIRED_VALUE_FLAGS = new Set(['part-index', 'courier-message-id', 'courier-attempt-id']);
 
 // Validates the parsed args for one selected command. `help` and `--help` are
 // read-only and bypass unknown-flag validation; callers run that check after the
@@ -154,6 +163,29 @@ const REQUIRED_VALUE_FLAGS = new Set(['part-index']);
 // startup path can keep its existing deny JSON and exit code 2.
 function validateFlags({ command, subcommand, args } = {}) {
   if (command === 'help' || args?.help === true) return;
+  // Courier recovery is its own exclusive recover mode: both selector flags are
+  // required together, a valueless flag is refused, and no other recover selector
+  // may accompany it. This runs before the unknown-flag scan and before state is
+  // opened, so a malformed invocation can never create a database file.
+  if (command === 'recover' && recoverMode(args) === 'courier') {
+    const conflict = RECOVER_NON_COURIER_SELECTORS.find(flag => Object.hasOwn(args || {}, flag));
+    if (conflict !== undefined) {
+      throw Object.assign(new Error(`--${conflict} cannot be combined with courier recovery`), { command });
+    }
+    for (const flag of RECOVER_FLAGS.courier) {
+      const value = (args || {})[flag];
+      if (!Object.hasOwn(args || {}, flag)) {
+        throw Object.assign(
+          new Error('courier recovery requires both --courier-message-id and --courier-attempt-id'),
+          { command }
+        );
+      }
+      if (value === true) throw Object.assign(new Error(`--${flag} requires a value`), { command });
+      if (typeof value !== 'string' || value.length === 0) {
+        throw Object.assign(new Error(`--${flag} requires a non-empty value`), { command });
+      }
+    }
+  }
   const allowed = allowedFlags(command, subcommand, args);
   const unknown = Object.keys(args || {}).find(key => {
     if (allowed === null) return true;
