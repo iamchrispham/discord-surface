@@ -37,7 +37,7 @@ test('native owners receive the exact no-post completion command', () => {
   const prompt = codexPrompt(message, acknowledgment, completion);
   const commands = [...prompt.matchAll(/exact argv: (\[.*\])/g)].map(match => JSON.parse(match[1]));
   assert.deepEqual(commands, [acknowledgment, completion]);
-  assert.ok(prompt.includes(`Final reply: start with [[discord-surface:${message.id}]] on its own line.`));
+  assert.doesNotMatch(prompt, /Final reply:/);
   assert.match(prompt, /ACK means received, not completed/);
   assert.match(prompt, /Consume this result with agent-complete/);
   assert.doesNotMatch(prompt, /normal final for a Discord reply/);
