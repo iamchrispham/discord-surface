@@ -124,14 +124,14 @@ const expectedDigests = {
   messageRequestWatcher: '778ebfecc08c0621fb1e6ee1ac96cfb417aad3576c1f1c6a55e52a47b9d32b9d',
   codexPromptHuman: '214cc1a09949c904d2144fc85a729826e661ea84f89569d5acb88c47f1088b39',
   codexPromptAttachment: '236c32b2160a03dc257ef12ec93463c79faed582466f47c54a84fb144c21b04b',
-  codexPromptAgentRequest: '980e0839f37548fc29dc24fb907b13ac447c79649b446f0bda378b961db02546',
-  codexPromptAgentResult: '329612b9f60d99d02787f3ea62b403977e548392e3841da348dc611601a40878',
+  codexPromptAgentRequest: '06338c0d3ac477b4bf64350227870bf92ac14d777e11a28c8e26b067ac3ad15d',
+  codexPromptAgentResult: 'c50abc0da1ae25f9382cf40d605d2f844c8fa6214a9182db91cd9621bf3d1cba',
   codexPromptDecision: 'fa9ba7f924595df3cfab549840962960ae5cc3f5fab299412dc51dc8c4ce9510',
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
   claudeEventHuman: '3cf57a00278c64f0f1f5e4e180189002af5e7a97584e42326741bf752c71ddcc',
   claudeEventAttachment: 'd04456537d38c4309bae542a35f13c52cbbaa2f3e83c062cec959f7a8db24f6d',
-  claudeEventAgentRequest: '877fac5796a5cccaf5e0e88a967027d353f9f8ab55e2d17270bd75d2a0d27835',
-  claudeEventAgentResult: '602b9b65c94ab98f5361182aee95462473c679c4146bcb0c178e50c6da229fff',
+  claudeEventAgentRequest: '145ba481958c7f369840ad1d733387ea8f34f524cb79570d70704f0f9c9a162d',
+  claudeEventAgentResult: '9c1a045d39e1d787cd604734283f13a9dc8e3421dd52d1fcd62a5172ff056c25',
   claudeEventDecision: '9fa9567ee39e6e4824c584991a8dad2c5267be9c3aa282ba2021e30de868e610',
   claudeEventWatcher: '45d9fbf706942a0fd9be6523d7b8dc61dc1b059e290d9a403be2010599dd3d14'
 };
@@ -187,7 +187,9 @@ test('agent requests direct both native providers to a correlated result', () =>
   const replyFile = prompt => prompt.match(/\.discord-agent-reply-([a-f0-9]{24})\.json/)?.[1];
   assert.notEqual(replyFile(codex), replyFile(collidingCodex), 'source-route collisions must not share result files');
   assert.match(codex, /Do not use a normal final reply/);
+  assert.doesNotMatch(codex, /Final reply: start with/);
   assert.match(claude, /Do not use the reply tool/);
+  assert.match(claude, /state-backed recovery check/);
   assert.match(facade.messageRequest(agentResult), /Consume this result with agent-complete/);
 });
 

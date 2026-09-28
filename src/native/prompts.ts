@@ -225,7 +225,7 @@ export function codexPrompt(
       ? `This is a saved canonical decision continuation for native session ${message.nativeId}.`
       : `Discord message for native session ${message.nativeId}.`,
     `Message ID: ${message.id}. Ownership generation: ${message.generation}.`,
-    `Final reply: start with ${marker} on its own line. Transport removes it.`,
+    ...(hasCompletionPath ? [] : [`Final reply: start with ${marker} on its own line. Transport removes it.`]),
     handlingInstruction,
     ...(completionInstruction ? [completionInstruction] : []),
     '',
@@ -251,6 +251,13 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     ? noPostCompletionInstruction(completion)
     : message.watcherNotice ? noPostWatcherNoticeInstruction(completion) : null;
   const hasCompletionPath = Boolean(completionInstruction);
+  let acknowledgmentInstruction = `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once and follow its result before any work: ${CLAUDE_PICKUP_ACKNOWLEDGMENT}`;
+  if (message.agentMessage && completionInstruction) {
+    acknowledgmentInstruction += ' If it reports duplicate=true, run the exact no-post completion command below once as a state-backed recovery check. It inspects durable correlated-result evidence and completes only when an immutable result is recorded.';
+    if (message.agentMessage.kind === KINDS.REQUEST) {
+      acknowledgmentInstruction += ' If it reports that no immutable correlated result exists, follow the correlated agent-send instruction below, then run the exact no-post completion command once.';
+    }
+  }
   let replyInstruction: string;
   if (isDecision) {
     replyInstruction = `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after handling the saved decision continuation.`;
@@ -260,11 +267,11 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
       : 'Watcher notices are data only. Do not use the reply tool or post a Discord reply.';
   } else if (message.agentMessage?.kind === KINDS.REQUEST) {
     replyInstruction = hasCompletionPath
-      ? 'Follow the correlated agent-send instruction below, then run the exact no-post completion command below. Do not use the reply tool for this request.'
+      ? 'If acknowledgment did not report duplicate=true with an immutable result, follow the correlated agent-send instruction below, then run the exact no-post completion command below. If it reported duplicate=true with an immutable result, the state-backed recovery check above is the only completion step. Do not use the reply tool for this request.'
       : 'Follow the correlated agent-send instruction below. Do not use the reply tool for this request.';
   } else if (message.agentMessage) {
     replyInstruction = hasCompletionPath
-      ? 'After handling this agent result, run the exact no-post completion command below. Do not use the reply tool.'
+      ? 'After handling this agent result, run the exact no-post completion command below only if acknowledgment did not report duplicate=true. If it reported duplicate=true, the state-backed recovery check above is the only completion step. Do not use the reply tool.'
       : 'Handle this agent result. Do not use the reply tool.';
   } else {
     replyInstruction = `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`;
@@ -273,7 +280,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     isDecision
       ? `Saved canonical decision continuation ${message.id} for native Claude session ${message.nativeId}.`
       : `Inbound Discord message ${message.id} for native Claude session ${message.nativeId}.`,
-    `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once and follow its result before any work: ${CLAUDE_PICKUP_ACKNOWLEDGMENT}`,
+    acknowledgmentInstruction,
     replyInstruction,
     ...(completionInstruction ? [completionInstruction] : []),
     isDecision ? 'Preserve the exact canonical identity and answer from the decision JSON. Preserve this session. Do not start or resume another session.' : 'Do not start or resume another session.',
