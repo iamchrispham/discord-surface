@@ -7,6 +7,8 @@ const test = require('node:test');
 const { SurfaceState } = require(path.join(installed, 'src/state'));
 const { DiscordGateway } = require(path.join(installed, 'src/discord'));
 const { validateCodexSessionIdentityAsync } = require(path.join(installed, 'src/native'));
+const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail, isNativeProofBeforeBindingBoundary } =
+  require(path.join(installed, 'src/discord/native-proof-recovery'));
 
 async function runSharedBudget(slowFirst) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-proof-shared-budget-'));
@@ -65,7 +67,10 @@ async function runSharedBudget(slowFirst) {
       assert.equal(first.ready, false);
       assert.equal(held.state, 'unavailable');
       assert.match(held.detail, /Native proof recovery v1:/);
+      assert.equal(isNativeProofBeforeBindingBoundary(held.state, held.detail), true);
+      assert.equal(state.getIntakeWatermark('1000').state, 'unavailable');
       assert.deepEqual(preflights, ['1000']);
+      assert.equal(held.recovered_through_id, '100');
       assert.equal(transcriptOpenStarted, true);
     } else {
       assert.equal(first.ready, true);
@@ -75,12 +80,17 @@ async function runSharedBudget(slowFirst) {
     const proof = await validateCodexSessionIdentityAsync(ids[1], dir, root, { deadline: Date.now() + 1000 });
     assert.equal(proof.sessionId, ids[1]);
     const before = preflights.length;
-    const second = await gateway.recoverTransport('reconnect', gateway.lifecycleEpoch, ['2000']);
+    const second = await gateway.recoverTransport('ordinary-bind', gateway.lifecycleEpoch);
     if (slowFirst) {
-      assert.equal(second.ready, true);
+      assert.deepEqual(preflights.slice(before), ['2000', '1000']);
       assert.equal(state.getIntakeWatermark('2000').state, 'ready');
-      assert.equal(preflights.length, before + 1);
-    } else assert.equal(second.ready, true);
+      assert.equal(state.getIntakeWatermark('1000').state, 'unavailable');
+      assert.equal(state.getIntakeWatermark('1000').recovered_through_id, '100');
+      assert.equal(second.ready, false);
+    } else {
+      assert.deepEqual(preflights.slice(before), channels);
+      assert.equal(second.ready, true);
+    }
     assert.equal(state.getMessage('102').state, 'accepted');
     assert.equal(dispatches, 0);
     assert.equal(state.getBinding('2000').generation, 1);
@@ -92,6 +102,18 @@ async function runSharedBudget(slowFirst) {
   }
 }
 test('shared deadline does not permanently hold an unattempted binding', async () => {
+  assert.equal(isNativeProofBeforeBindingBoundary('unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, Date.now())), true);
+  assert.equal(isNativeProofBeforeBindingBoundary('pending',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, Date.now())), true);
+  assert.equal(isNativeProofBeforeBindingBoundary('unavailable',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.PREFLIGHT, Date.now())), false);
+  assert.equal(isNativeProofBeforeBindingBoundary('ready',
+    nativeProofDeadlineDetail(NATIVE_PROOF_PHASES.BEFORE_BINDING, Date.now())), false);
+  assert.equal(isNativeProofBeforeBindingBoundary('unavailable', ''), false);
+  assert.equal(isNativeProofBeforeBindingBoundary('unavailable', undefined), false);
+  assert.equal(isNativeProofBeforeBindingBoundary('unavailable', 'Native proof recovery v1: {not json'), false);
+  assert.equal(isNativeProofBeforeBindingBoundary('unavailable', 'unrelated detail'), false);
   await runSharedBudget(false);
   await runSharedBudget(true);
 });

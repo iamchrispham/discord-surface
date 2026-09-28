@@ -27,7 +27,7 @@ const {
   recoveryFetch,
   retryPendingBoundaryDetail
 } = require('./discord/recovery-fetch');
-const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail, isNativeProofRetryBoundary } = require('./discord/native-proof-recovery');
+const { NATIVE_PROOF_PHASES, nativeProofDeadlineDetail, isNativeProofRetryBoundary, isNativeProofBeforeBindingBoundary } = require('./discord/native-proof-recovery');
 const {
   attachReconciliationWaiter,
   hasReconciliationLookup,
@@ -2268,8 +2268,20 @@ class DiscordGateway {
       baseReason = baseReason.replace(/(?: full follow-up| boundary retry| follow-up)$/, '');
     } while (baseReason !== previousReason);
     const selectedChannels = channelIds ? new Set(channelIds) : null;
-    const bindings = this.state.listBindings().filter(binding => binding.active &&
+    let bindings = this.state.listBindings().filter(binding => binding.active &&
       (!selectedChannels || selectedChannels.has(binding.channelId)));
+    const isBeforeBindingPriority = binding => {
+      if (binding.provider !== 'codex' || !this.state.isOrdinaryBinding(binding)) return false;
+      const watermark = this.state.getIntakeWatermark(binding.channelId);
+      return isNativeProofBeforeBindingBoundary(watermark?.state, watermark?.detail);
+    };
+    const prioritized = [];
+    const deferred = [];
+    for (const binding of bindings) {
+      if (isBeforeBindingPriority(binding)) prioritized.push(binding);
+      else deferred.push(binding);
+    }
+    if (prioritized.length) bindings = prioritized.concat(deferred);
     const hasCoveredReadyWatermark = currentBoundary => currentBoundary?.state === READINESS.READY &&
       ((currentBoundary.last_seen_id === null && currentBoundary.recovered_through_id === null) ||
         (typeof currentBoundary.last_seen_id === 'string' && currentBoundary.last_seen_id.length > 0 &&
