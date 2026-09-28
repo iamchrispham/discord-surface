@@ -264,6 +264,8 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
       if (!rendezvousDirectory) {
         const legacyElectionName = `${rendezvousName}-fallback-election`;
         const electionPrefix = `${legacyElectionName}-`;
+        const winnerElectionName = `${electionPrefix}winner`;
+        const winnerElectionPath = path.join(root, winnerElectionName);
         const randomPrefix = `${rendezvousName}-random-`;
         const readElection = (): string | undefined => {
           let entries: string[];
@@ -275,6 +277,7 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
             throw error;
           }
+          const candidates: Array<{ candidate: string; createdAt: number; inode: number; entry: string }> = [];
           for (const entry of entries) {
             const electionPath = path.join(root, entry);
             let marker: fs.Stats;
@@ -294,7 +297,17 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
               throw new Error('Claude channel fallback-root rendezvous election is invalid');
             }
             const candidatePath = path.join(root, candidate);
-            if (isUsableRendezvousDirectory(candidatePath)) return candidate;
+            if (isUsableRendezvousDirectory(candidatePath)) {
+              if (entry === winnerElectionName) return candidate;
+              candidates.push({
+                candidate,
+                createdAt: Number.isFinite(marker.ctimeMs) ? marker.ctimeMs :
+                  (Number.isFinite(marker.birthtimeMs) ? marker.birthtimeMs : 0),
+                inode: marker.ino,
+                entry
+              });
+              continue;
+            }
             let candidateExists = true;
             try { fs.lstatSync(candidatePath); } catch (error) {
               if ((error as NodeJS.ErrnoException).code === 'ENOENT') candidateExists = false;
@@ -318,7 +331,9 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
               }
             }
           }
-          return undefined;
+          candidates.sort((left, right) => left.createdAt - right.createdAt || left.inode - right.inode ||
+            left.entry.localeCompare(right.entry));
+          return candidates[0]?.candidate;
         };
         let randomRendezvousName = readElection();
         if (!randomRendezvousName) {
@@ -330,18 +345,28 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
           let published = false;
           let publishedElectionPath: string | undefined;
           try {
-            for (;;) {
-              const electionPath = path.join(root, `${electionPrefix}${randomUUID()}`);
-              try {
-                fs.linkSync(markerTemp, electionPath);
-                published = true;
-                publishedElectionPath = electionPath;
-                break;
-              } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+            try {
+              fs.linkSync(markerTemp, winnerElectionPath);
+              published = true;
+              publishedElectionPath = winnerElectionPath;
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+            }
+            if (!published) randomRendezvousName = readElection();
+            if (!randomRendezvousName && !published) {
+              for (;;) {
+                const electionPath = path.join(root, `${electionPrefix}${randomUUID()}`);
+                try {
+                  fs.linkSync(markerTemp, electionPath);
+                  published = true;
+                  publishedElectionPath = electionPath;
+                  break;
+                } catch (error) {
+                  if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+                }
               }
             }
-            randomRendezvousName = published ? candidate : readElection();
+            if (published) randomRendezvousName = candidate;
             if (published) {
               const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
               for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -361,7 +386,9 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
           if (!randomRendezvousName) throw new Error('Claude channel fallback-root rendezvous election is missing');
           if (randomRendezvousName !== candidate) {
             if (publishedElectionPath) {
-              try { fs.unlinkSync(publishedElectionPath); } catch (error) {
+              try {
+                fs.unlinkSync(publishedElectionPath);
+              } catch (error) {
                 if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
               }
             }

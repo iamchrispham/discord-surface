@@ -1598,12 +1598,32 @@ function detachOrdinaryListener({ state, startupBinding, reason }) {
   return Boolean(state.setBindingReadiness(startupBinding.channelId, READINESS.UNAVAILABLE, reason, startupBinding));
 }
 
+function createRetryableListenerStop({ revoke, stopTransport, closeState }) {
+  let stopPromise;
+  return () => {
+    if (stopPromise) return stopPromise;
+    let transportStopped = false;
+    const attempt = Promise.resolve().then(async () => {
+      let revokeError;
+      try { revoke(); } catch (error) { revokeError = error; }
+      await stopTransport();
+      transportStopped = true;
+      closeState();
+      if (revokeError) throw revokeError;
+    });
+    stopPromise = attempt.catch(error => {
+      if (!transportStopped) stopPromise = null;
+      throw error;
+    });
+    return stopPromise;
+  };
+}
+
 async function claudeChannel(args) {
   const { paths, state } = openState(args);
   let channel;
   let ordinaryListenerAttached = false;
   let ordinaryStartupBinding = null;
-  let stopPromise;
   let revokeFailureReported = false;
   const reportRevokeFailure = error => {
     if (revokeFailureReported) return;
@@ -1621,17 +1641,11 @@ async function claudeChannel(args) {
       throw error;
     }
   };
-  const stop = async () => {
-    if (stopPromise) return stopPromise;
-    stopPromise = (async () => {
-      try {
-        detach();
-      } finally {
-        try { await channel?.stop(); } finally { state.close(); }
-      }
-    })();
-    return stopPromise;
-  };
+  const stop = createRetryableListenerStop({
+    revoke: detach,
+    stopTransport: () => channel?.stop(),
+    closeState: () => state.close()
+  });
   // Readiness revoke and channel teardown both run inside stop, so an exit path must report
   // a stop failure rather than leaving it as an unhandled rejection.
   const handleStopFailure = error => {
@@ -1669,25 +1683,19 @@ async function claudeMonitor(args) {
   let ordinaryStartupBinding = null;
   let monitor;
   let monitorStarted = false;
-  let stopPromise;
   let detachStdoutTransport = () => {};
   const revokeOrdinaryReadiness = () => {
     if (!monitorStarted) return;
     detachOrdinaryListener({ state, startupBinding: ordinaryStartupBinding, reason: 'Claude Monitor unavailable' });
   };
-  const stop = async () => {
-    if (stopPromise) return stopPromise;
-    stopPromise = (async () => {
-      try {
-        detachStdoutTransport();
-        revokeOrdinaryReadiness();
-      } finally {
-        try { await monitor?.stop(); }
-        finally { state.close(); }
-      }
-    })();
-    return stopPromise;
-  };
+  const stop = createRetryableListenerStop({
+    revoke: () => {
+      detachStdoutTransport();
+      revokeOrdinaryReadiness();
+    },
+    stopTransport: () => monitor?.stop(),
+    closeState: () => state.close()
+  });
   const handleStopFailure = error => {
     process.stderr.write(`discord-surface: Claude Monitor stop failed: ${error.message}\n`);
     process.exitCode = 1;

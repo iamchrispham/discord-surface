@@ -108,6 +108,10 @@ function sameSocket(left: SocketIdentity, right: SocketIdentity): boolean {
   return sameFile(left, right) && left.ctimeNs === right.ctimeNs && left.birthtimeNs === right.birthtimeNs;
 }
 
+function sameSocketPath(left: SocketIdentity, right: SocketIdentity): boolean {
+  return sameFile(left, right) && left.birthtimeNs === right.birthtimeNs;
+}
+
 function sameQuarantinedSocket(left: SocketIdentity, right: SocketIdentity): boolean {
   return sameFile(left, right) && left.birthtimeNs !== undefined && right.birthtimeNs !== undefined &&
     left.birthtimeNs === right.birthtimeNs;
@@ -200,7 +204,8 @@ function validateSocketDirectoryPath(directoryPath: string): void {
     }
     const parent = fs.statSync(current);
     const parentIsSticky = (parent.mode & 0o1000) !== 0;
-    const parentIsMutable = (parent.mode & 0o022) !== 0 && !parentIsSticky;
+    const parentIsMutable = ((parent.mode & 0o022) !== 0 && !parentIsSticky) ||
+      (owner !== undefined && parent.uid !== 0 && parent.uid !== owner);
     if (parentIsMutable) throw new Error('Claude channel socket directory contains a mutable path component');
     if (entry.isSymbolicLink()) {
       if (parentIsSticky && owner !== undefined && entry.uid !== owner) {
@@ -305,7 +310,7 @@ function quarantineDependencies(): QuarantineDependencies {
     isOwnerAlive: isSocketLockOwnerAlive,
     writeOwnerMarker,
     socketIdentity,
-    sameSocket,
+    sameSocket: sameSocketPath,
     sameQuarantinedSocket
   };
 }
@@ -334,13 +339,17 @@ export function quarantineMismatchedSocket(
     ctimeNs: observedStats.ctimeNs,
     birthtimeNs: observedStats.birthtimeNs
   };
-  if (sameSocket(observed, expected)) return undefined;
+  if (sameSocketPath(observed, expected)) return undefined;
   if (observedStats.isDirectory()) {
     throw new Error('Claude channel socket replacement is a directory');
   }
+  if (!observedStats.isSymbolicLink() && !observedStats.isSocket() && !observedStats.isFile()) {
+    throw new Error('Claude channel socket replacement has an unsupported type');
+  }
 
+  const entryType = observedStats.isSymbolicLink() ? 'symlink' : observedStats.isSocket() ? 'socket' : 'file';
   const quarantineDeps = quarantineDependencies();
-  const quarantine = prepareSocketQuarantine(socketPath, observed, quarantineDeps);
+  const quarantine = prepareSocketQuarantine(socketPath, observed, quarantineDeps, entryType);
   const quarantinedPath = path.join(quarantine.directory, 'socket');
   let moved = false;
   try {
@@ -348,7 +357,7 @@ export function quarantineMismatchedSocket(
     moved = true;
     const quarantined = socketIdentity(quarantinedPath);
     if (!sameQuarantinedSocket(quarantined, observed)) {
-      if (!restoreQuarantinedSocket(quarantinedPath, socketPath)) {
+      if (!restoreQuarantinedSocket(quarantinedPath, socketPath, entryType)) {
         throw new Error('Claude channel socket restore is unavailable');
       }
       removeSocketQuarantine(quarantine.directory);
@@ -363,7 +372,7 @@ export function quarantineMismatchedSocket(
   return {
     restore: (): boolean => {
       if (restored) return true;
-      const didRestore = restoreQuarantinedSocket(quarantinedPath, socketPath);
+      const didRestore = restoreQuarantinedSocket(quarantinedPath, socketPath, entryType);
       if (!didRestore) return false;
       removeSocketQuarantine(quarantine.directory);
       restored = true;

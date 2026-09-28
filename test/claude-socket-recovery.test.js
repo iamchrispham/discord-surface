@@ -45,7 +45,10 @@ function isolatedNamespaceRoot(t) {
   const root = fs.mkdtempSync('/tmp/dss-root-');
   fs.chmodSync(root, 0o700);
   const userInfo = os.userInfo();
+  const realpathSync = fs.realpathSync;
   t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
+  t.mock.method(fs, 'realpathSync', (target, ...options) =>
+    target === '/tmp' ? root : realpathSync(target, ...options));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return fs.realpathSync(root);
 }
@@ -243,6 +246,23 @@ test('foreign-owned socket directory ancestors below sticky parents are refused'
   t.after(() => fs.rmSync(sharedRoot, { recursive: true, force: true }));
 
   assert.throws(() => assertSocketDirectory(socket), /foreign-owned directory/);
+});
+
+test('foreign-owned read-only socket ancestors are refused', t => {
+  const root = fs.mkdtempSync('/tmp/dss-foreign-parent-');
+  const foreign = path.join(root, 'foreign');
+  const child = path.join(foreign, 'child');
+  fs.mkdirSync(child, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const owner = process.geteuid?.() ?? process.getuid?.();
+  if (owner === undefined) return t.skip('requires an effective UID');
+  const originalStat = fs.statSync;
+  t.mock.method(fs, 'statSync', (candidate, ...args) => {
+    const stats = originalStat(candidate, ...args);
+    return candidate === foreign ? { ...stats, uid: owner + 1, mode: (stats.mode & ~0o777) | 0o555 } : stats;
+  });
+
+  assert.throws(() => assertSocketDirectory(path.join(child, 'listener.sock')), /mutable path component/);
 });
 
 test('owner records preserve a process identity when Linux exposes one', t => {
@@ -1298,7 +1318,7 @@ test('foreign socket owner is refused before probing', { timeout: 8000 }, async 
         ino: stats.ino,
         ctimeMs: stats.ctimeMs,
         ctimeNs: stats.ctimeNs,
-        uid: stats.uid + 1,
+        uid: stats.uid + 1n,
         isSocket: () => true
       };
     }
@@ -2383,6 +2403,7 @@ test('startup stop retains its lock until the failed listener actually closes', 
     // never become re-acquirable while that listener is still open with live sockets.
     assert.ok(!stopResolved || closed, 'stop must not resolve before the failed listener actually closes');
     assert.ok(!lockCanAcquire || closed, 'preparation lock must not be acquirable before the failed listener actually closes');
+    client.destroy();
     let deadline;
     const finishedInTime = await Promise.race([
       stopping.then(() => true),
@@ -2390,7 +2411,7 @@ test('startup stop retains its lock until the failed listener actually closes', 
     ]).finally(() => clearTimeout(deadline));
     assert.equal(finishedInTime, true, 'stop must finish within the fixture bound once the listener closes');
     assert.equal(closed, true, 'failed listener must actually close before stop resolves');
-    assert.equal(connections.size, 0, 'failed listener retains no accepted connection');
+    await waitForCondition(() => connections.size === 0, 'failed listener retains an accepted connection', 500);
     await stopping;
     await starting;
   } finally {
@@ -2574,4 +2595,20 @@ test('stop refuses a directory replacement without stranding it', { timeout: 800
   await channel.stop();
   const release = acquireSocketLock(socket);
   release();
+});
+
+test('quarantine refuses a FIFO replacement without moving it', { timeout: 8000 }, async t => {
+  const socket = socketPath(t);
+  await orphan(socket);
+  const expected = socketOwnership.socketPathIdentity(socket);
+  const original = `${socket}.old`;
+  fs.renameSync(socket, original);
+  const created = spawnSync('mkfifo', [socket], { timeout: 2000 });
+  assert.equal(created.status, 0, String(created.stderr));
+  const before = fs.readdirSync(path.dirname(socket)).sort();
+
+  assert.throws(() => socketOwnership.quarantineMismatchedSocket(socket, expected), /unsupported type/);
+  assert.equal(fs.lstatSync(socket).isFIFO(), true);
+  assert.equal(fs.lstatSync(original).isSocket(), true);
+  assert.deepEqual(fs.readdirSync(path.dirname(socket)).sort(), before);
 });

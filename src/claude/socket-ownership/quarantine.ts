@@ -9,10 +9,13 @@ type SocketIdentityRecord = {
   birthtimeNs: string;
 };
 
+type QuarantineEntryType = 'socket' | 'file' | 'symlink';
+
 type QuarantineManifest = {
   version: 1;
   endpoint: string;
   socket: SocketIdentityRecord;
+  entryType?: QuarantineEntryType;
 };
 
 export type QuarantineDependencies = {
@@ -61,6 +64,16 @@ function deserializeSocketIdentity(value: unknown): SocketIdentity | undefined {
   }
 }
 
+function isQuarantineEntryType(value: unknown): value is QuarantineEntryType {
+  return value === 'socket' || value === 'file' || value === 'symlink';
+}
+
+function matchesQuarantineEntry(stats: fs.Stats, entryType: QuarantineEntryType): boolean {
+  if (entryType === 'socket') return stats.isSocket() && !stats.isSymbolicLink();
+  if (entryType === 'file') return stats.isFile() && !stats.isSymbolicLink();
+  return stats.isSymbolicLink();
+}
+
 function isRegularFile(filePath: string): boolean {
   try {
     const stats = fs.lstatSync(filePath);
@@ -103,9 +116,10 @@ function readQuarantine(
   } catch {
     return undefined;
   }
+  const entryType = manifest.entryType ?? 'socket';
   if (!owner.generation || manifest.version !== 1 || typeof manifest.endpoint !== 'string' ||
     path.basename(manifest.endpoint) !== manifest.endpoint || !manifest.endpoint ||
-    !deserializeSocketIdentity(manifest.socket) || !isRegularFile(ownerPath)) return undefined;
+    !deserializeSocketIdentity(manifest.socket) || !isQuarantineEntryType(entryType) || !isRegularFile(ownerPath)) return undefined;
   const socketStats = (() => {
     try { return fs.lstatSync(socketPath); } catch { return undefined; }
   })();
@@ -117,7 +131,7 @@ function readQuarantine(
   const hasNotMovedSocket = entries.length === preRenameEntries.size && entries.every(entry => preRenameEntries.has(entry));
   if (!hasMovedSocket && !hasNotMovedSocket) return undefined;
   if (hasNotMovedSocket) return { owner, manifest, socketPath: undefined };
-  if (!socketStats || socketStats.isSymbolicLink() || !socketStats.isSocket()) return undefined;
+  if (!socketStats || !matchesQuarantineEntry(socketStats, entryType)) return undefined;
   const socketIdentity = deserializeSocketIdentity(manifest.socket)!;
   if (!deps.sameQuarantinedSocket(deps.socketIdentity(socketPath), socketIdentity)) return undefined;
   const socketOwner = (socketStats as fs.Stats).uid;
@@ -128,7 +142,28 @@ function readQuarantine(
   return { owner, manifest, socketPath };
 }
 
-export function restoreQuarantinedSocket(quarantinedPath: string, socketPath: string): boolean {
+export function restoreQuarantinedSocket(
+  quarantinedPath: string,
+  socketPath: string,
+  entryType: QuarantineEntryType = 'socket'
+): boolean {
+  if (entryType === 'symlink') {
+    let target: string;
+    try { target = fs.readlinkSync(quarantinedPath); } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return false;
+      throw error;
+    }
+    try {
+      fs.symlinkSync(target, socketPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST' || code === 'EPERM' || code === 'EOPNOTSUPP' || code === 'EXDEV') return false;
+      throw error;
+    }
+    fs.unlinkSync(quarantinedPath);
+    return true;
+  }
   try {
     fs.linkSync(quarantinedPath, socketPath);
   } catch (error) {
@@ -182,7 +217,7 @@ function clearOrphanSocketQuarantines(
       continue;
     }
     if (endpointExists) continue;
-    if (!restoreQuarantinedSocket(quarantine.socketPath, socketPath)) continue;
+    if (!restoreQuarantinedSocket(quarantine.socketPath, socketPath, quarantine.manifest.entryType ?? 'socket')) continue;
     removeSocketQuarantine(quarantineDirectory);
   }
 }
@@ -190,7 +225,8 @@ function clearOrphanSocketQuarantines(
 function createSocketQuarantine(
   socketPath: string,
   expected: SocketIdentity,
-  deps: QuarantineDependencies
+  deps: QuarantineDependencies,
+  entryType: QuarantineEntryType = 'socket'
 ): { directory: string; ownerPath: string } {
   const directory = fs.mkdtempSync(path.join(path.dirname(socketPath), staleQuarantinePrefix(deps)));
   const ownerPath = path.join(directory, 'owner');
@@ -200,7 +236,8 @@ function createSocketQuarantine(
     const manifest: QuarantineManifest = {
       version: 1,
       endpoint: path.basename(socketPath),
-      socket: serializeSocketIdentity(expected)
+      socket: serializeSocketIdentity(expected),
+      entryType
     };
     fs.writeFileSync(manifestPath, JSON.stringify(manifest), { mode: 0o600, flag: 'wx' });
     return { directory, ownerPath };
@@ -253,9 +290,10 @@ export function unlinkSocketIfOwned(
 export function prepareSocketQuarantine(
   socketPath: string,
   expected: SocketIdentity,
-  deps: QuarantineDependencies
+  deps: QuarantineDependencies,
+  entryType: QuarantineEntryType = 'socket'
 ): { directory: string; ownerPath: string } {
-  return createSocketQuarantine(socketPath, expected, deps);
+  return createSocketQuarantine(socketPath, expected, deps, entryType);
 }
 
 export function clearSocketQuarantines(

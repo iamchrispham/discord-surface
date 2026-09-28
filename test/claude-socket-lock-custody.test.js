@@ -30,7 +30,10 @@ function isolatedNamespaceRoot(t) {
   const root = fs.mkdtempSync('/tmp/dss-lock-root-');
   fs.chmodSync(root, 0o700);
   const userInfo = os.userInfo();
+  const realpathSync = fs.realpathSync;
   t.mock.method(os, 'userInfo', () => ({ ...userInfo, homedir: root }));
+  t.mock.method(fs, 'realpathSync', (target, ...options) =>
+    target === '/tmp' ? root : realpathSync(target, ...options));
   return fs.realpathSync(root);
 }
 
