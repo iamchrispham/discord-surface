@@ -39,10 +39,10 @@ function assertCommitted(result, carry, label) {
   assert.equal(result.child.carry, carry, `${label}: carry marker value`);
 }
 
-test('worker proof uses the canonical Codex registry by default', () => {
+test('worker proof uses the canonical conductor registry, with or without the Codex alias', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-home-'));
   try {
-    const expected = path.join(home, '.codex', 'work-control', 'workers');
+    const expected = path.join(home, '.agents', 'work-control', 'workers');
     fs.mkdirSync(expected, { recursive: true });
     const env = {
       ...process.env,
@@ -50,12 +50,25 @@ test('worker proof uses the canonical Codex registry by default', () => {
       PYTHONPATH: path.join(__dirname, '..', 'src')
     };
     delete env.CONDUCTOR_WORKERS_DIR;
-    const result = spawnSync(PYTHON, ['-c',
-      'import conductor_worker_proof as proof; print(proof.workers_root())'], {
-      env, encoding: 'utf8'
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), fs.realpathSync(expected));
+    function resolvedRoot() {
+      const result = spawnSync(PYTHON, ['-c',
+        'import conductor_worker_proof as proof; print(proof.workers_root())'], {
+        env, encoding: 'utf8'
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    }
+
+    assert.equal(resolvedRoot(), fs.realpathSync(expected));
+
+    fs.mkdirSync(path.join(home, '.codex'));
+    fs.symlinkSync(path.join(home, '.agents', 'work-control'), path.join(home, '.codex', 'work-control'));
+    assert.equal(resolvedRoot(), fs.realpathSync(expected));
+
+    const override = path.join(home, 'other-workers');
+    fs.mkdirSync(override);
+    env.CONDUCTOR_WORKERS_DIR = override;
+    assert.equal(resolvedRoot(), fs.realpathSync(override));
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

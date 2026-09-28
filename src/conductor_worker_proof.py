@@ -18,7 +18,7 @@ OWNER_CHANGE_VERBS = frozenset({'claim', 'release', 'steal', 'override', 'preemp
 FORCED_VERBS = frozenset({'steal', 'override', 'preempt'})
 PROOF_LIMIT = 1024 * 1024
 IDENTITY_ALIAS_KEYS = ('sessionId', 'fullUUID', 'fullUuid')
-DEFAULT_WORKERS_ROOT = '~/.codex/work-control/workers'
+DEFAULT_WORKERS_ROOT = '~/.agents/work-control/workers'
 
 
 class GateError(Exception):
