@@ -265,6 +265,33 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
   // still match. An absent author.bot is likewise accepted, while a present
   // non-boolean is rejected as malformed. Author identity is never inferred from
   // this field: replyContextFromAuthor derives isBotAuthor from the connected id.
+  function replyContextIntakeEligible(message, expectedBinding = null) {
+    if (!message?.reference?.messageId || message.author?.bot) return false;
+    try {
+      const input = eventToInput(message);
+      const config = state.requireConfig();
+      if (input.guildId !== config.guildId || input.authorId !== config.operatorId) return false;
+      if (typeof input.content !== 'string' || input.content.length > 10000 || !Array.isArray(input.attachments) ||
+        (input.content.length === 0 && input.attachments.length === 0)) return false;
+      const route = state.getMessageRoute(input.channelId);
+      const binding = route?.binding || state.getBinding(input.channelId);
+      if (!binding || !binding.active || binding.guildId !== input.guildId) return false;
+      if (expectedBinding && !bindingIdentityMatches(expectedBinding, binding)) return false;
+      if (state.ordinaryHandoffPauses?.has(binding.channelId)) return false;
+      if (route?.enrollment && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(route.enrollment.state)) return false;
+      if (state.getMessage(input.id)) return false;
+
+      const watermark = state.getIntakeWatermark(binding.channelId);
+      let cutoff = route?.enrollment?.recoveredThroughId || watermark?.recovered_through_id || null;
+      const handoffCutoff = route?.handoffCutoffId || null;
+      if (handoffCutoff && (!cutoff || compareDiscordIds(cutoff, handoffCutoff) < 0)) cutoff = handoffCutoff;
+      if (cutoff && (!/^\d+$/.test(input.id) || !/^\d+$/.test(cutoff) || compareDiscordIds(input.id, cutoff) <= 0)) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function rawReplyContextIsValid(raw, messageId, channelId, guildId) {
     if (!raw || typeof raw !== 'object') return false;
     if (raw.id !== messageId || raw.channel_id !== channelId) return false;
@@ -336,9 +363,10 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
 
   async function normalizeSurfaceMessage(message, options) {
     const input = eventToInput(message);
-    if (typeof input.content === 'string' && input.content.startsWith(WATCHER_NOTICE_PREFIX)) return input;
+    if (input.isBot && typeof input.content === 'string' && input.content.startsWith(WATCHER_NOTICE_PREFIX)) return input;
     const normalized = await normalizeAgentMessage(message, input, options);
-    if (message?.author?.bot) return normalized;
+    if (input.isBot) return normalized;
+    if (!replyContextIntakeEligible(message, options?.expectedBinding)) return normalized;
     const replyContext = await optionalReplyContext(message, options);
     return replyContext ? { ...normalized, replyContext } : normalized;
   }
@@ -965,7 +993,8 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
           fetchImpl: agentAttachmentFetch,
           signal,
           timeoutMs: agentAttachmentTimeoutMs,
-          botId: connectedBotId()
+          botId: connectedBotId(),
+          expectedBinding
         });
       const readyForLive = typeof readyForLiveIntake === 'function' ? readyForLiveIntake(message, expectedBinding) : true;
       const currentBinding = expectedBinding ? state.getBinding(expectedBinding.channelId) : null;
@@ -995,7 +1024,8 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
           signal,
           timeoutMs: agentAttachmentTimeoutMs,
           deadline,
-          botId: connectedBotId()
+          botId: connectedBotId(),
+          expectedBinding
         });
       const currentBinding = expectedBinding ? state.getBinding(expectedBinding.channelId) : null;
       const effectiveReady = !bypassBarrier && expectedBinding

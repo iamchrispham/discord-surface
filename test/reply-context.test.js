@@ -15,7 +15,7 @@ const { messageRequest, codexPrompt, claudeEvent } = require('../src/native');
 const { createSurfaceConsumer } = require('../src/discord');
 const { createMonitorMcp } = require('../src/claude-monitor');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
-const { createWatcherNotice } = require('../src/watcher-notice');
+const { WATCHER_NOTICE_PREFIX, createWatcherNotice } = require('../src/watcher-notice');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { Routes } = require('discord.js');
 
@@ -743,4 +743,57 @@ test('22: a mismatching guild_id or a non-boolean author.bot rejects the excerpt
   // One normal cache probe and exactly one REST attempt per rejected response,
   // with no retry or second lookup after the validator rejects.
   assert.equal(cacheCalls, 2);
+});
+
+test('23: rejected intake skips optional reply lookup before the transaction', async t => {
+  const { dir, state } = fixture();
+  t.after(() => cleanup(state, dir));
+  const consumer = consumerFor(state);
+  let restCalls = 0;
+
+  const unauthorized = await consumer.handleMessage(gm({
+    id: '1000', authorId: '901', reference: { messageId: '900' },
+    restGet: async () => { restCalls += 1; return validRaw('900'); }
+  }));
+  assert.equal(unauthorized.reason, 'unauthorized-sender');
+  assert.equal(restCalls, 0);
+
+  const binding = state.getBinding('101');
+  const staleBinding = { ...binding, generation: binding.generation + 1 };
+  const stale = await consumer.handleMessage(gm({
+    id: '1001', reference: { messageId: '901' },
+    restGet: async () => { restCalls += 1; return validRaw('901'); }
+  }), undefined, staleBinding);
+  assert.equal(stale.reason, 'stale-binding');
+  assert.equal(restCalls, 0);
+
+  const beforeCutoff = await consumer.handleMessage(gm({
+    id: '40', reference: { messageId: '902' },
+    restGet: async () => { restCalls += 1; return validRaw('902'); }
+  }));
+  assert.equal(beforeCutoff.reason, 'before-intake-cutoff');
+  assert.equal(restCalls, 0);
+
+  const accepted = await consumer.intakeMessage(gm({ id: '1002' }), true);
+  assertAccepted(accepted, state);
+  const duplicate = await consumer.intakeMessage(gm({
+    id: '1002', reference: { messageId: '903' },
+    restGet: async () => { restCalls += 1; return validRaw('903'); }
+  }), true);
+  assert.equal(duplicate.reason, 'duplicate-message');
+  assert.equal(restCalls, 0);
+});
+
+test('24: an authorized human watcher-looking reply keeps its context', async t => {
+  const { dir, state } = fixture();
+  t.after(() => cleanup(state, dir));
+  const consumer = consumerFor(state);
+  const result = await consumer.handleMessage(gm({
+    content: `${WATCHER_NOTICE_PREFIX}raw watcher payload`,
+    reference: { messageId: '900' },
+    cacheGet: id => cacheEntry(id, { content: 'quoted watcher discussion' }),
+    restGet: async () => { throw new Error('cache hit must not reach REST'); }
+  }));
+  assertAccepted(result, state);
+  assert.equal(state.getMessage('1000').replyContext.excerpt, 'quoted watcher discussion');
 });
