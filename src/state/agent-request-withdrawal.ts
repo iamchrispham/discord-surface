@@ -49,15 +49,17 @@ function sourceRouteMatches(route: ReturnType<WithdrawalState['getMessageRoute']
 }
 
 function resultSourceMatches(source: AgentAddress, target: AgentAddress, routingVersion: unknown,
-  frozenChildRoute: string | null = null): boolean {
+  frozenChildRoute: string | null = null, allowRouteLessParent = false, recordedTarget: unknown = null): boolean {
   if (frozenChildRoute) return sameAddress(source, { ...target, channelId: frozenChildRoute });
-  return routingVersion === AGENT_ROUTING_VERSION ? sameAddress(source, target) : sameOwner(source, target);
+  if (routingVersion !== AGENT_ROUTING_VERSION) return sameOwner(source, target);
+  return sameAddress(source, target) ||
+    (allowRouteLessParent && recordedTarget !== null && sameAddress(recordedTarget, target) && sameOwner(source, target));
 }
 
 function reverseResult(packet: AgentMessage, request: AgentMessage, routingVersion: unknown,
-  frozenChildRoute: string | null = null): boolean {
+  frozenChildRoute: string | null = null, allowRouteLessParent = false, recordedTarget: unknown = null): boolean {
   return packet.kind === KINDS.RESULT && packet.replyTo === request.id &&
-    resultSourceMatches(packet.source, request.target, routingVersion, frozenChildRoute) &&
+    resultSourceMatches(packet.source, request.target, routingVersion, frozenChildRoute, allowRouteLessParent, recordedTarget) &&
     sameAddress(packet.target, request.source);
 }
 
@@ -79,7 +81,8 @@ function withdrawnRequestForResult(state: WithdrawalState, packet: AgentMessage,
 }
 
 function resultCustody(state: WithdrawalState, request: AgentMessage, routingVersion: unknown,
-  parseJson: WithdrawalDependencies['parseJson'], frozenChildRoute: string | null = null): boolean {
+  parseJson: WithdrawalDependencies['parseJson'], frozenChildRoute: string | null = null,
+  allowRouteLessParent = false): boolean {
   const rows = state.db.prepare(`SELECT kind, detail FROM receipts
     WHERE kind IN ('agent-message', 'direct-post-attempt', 'direct-post-outcome')
       AND (json_extract(detail, '$.packet.replyTo')=?
@@ -88,8 +91,13 @@ function resultCustody(state: WithdrawalState, request: AgentMessage, routingVer
     .all(request.id, request.id, request.id);
   for (const row of rows) {
     const detail = parseJson(row.detail, null);
-    for (const candidate of [detail?.packet, detail?.agentPacket, detail?.legacyAgentPacket]) {
-      if (validPacket(candidate, KINDS.RESULT) && reverseResult(candidate, request, routingVersion, frozenChildRoute)) return true;
+    for (const { packet: candidate, recordedTarget } of [
+      { packet: detail?.packet, recordedTarget: null },
+      { packet: detail?.agentPacket, recordedTarget: detail?.agentRequestTarget },
+      { packet: detail?.legacyAgentPacket, recordedTarget: detail?.agentRequestTarget }
+    ]) {
+      if (validPacket(candidate, KINDS.RESULT) && reverseResult(candidate, request, routingVersion,
+        frozenChildRoute, allowRouteLessParent, recordedTarget)) return true;
     }
   }
   return false;
@@ -177,8 +185,9 @@ export function createAgentRequestWithdrawalHandlers(deps: WithdrawalDependencie
       }
       if (!state.hasNativeAcknowledgment(message)) throw new deps.BindingError('agent request withdrawal requires native acknowledgment');
       const routingVersion = original?.routingVersion === AGENT_ROUTING_VERSION ? AGENT_ROUTING_VERSION : null;
+      const allowRouteLessParent = packet.target.channelId === message.channelId;
       if (replyCustody(state, message) ||
-          resultCustody(state, packet, routingVersion, deps.parseJson, message.agentRoute || null)) {
+          resultCustody(state, packet, routingVersion, deps.parseJson, message.agentRoute || null, allowRouteLessParent)) {
         throw new deps.BindingError('agent request has reply or result custody');
       }
       const result = state.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')

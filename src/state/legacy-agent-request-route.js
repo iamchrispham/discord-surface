@@ -50,11 +50,13 @@ function legacyParentReconciliationChannel(previous, updated) {
   return typeof updated.parentChannelId === 'string' && updated.parentChannelId ? updated.parentChannelId : null;
 }
 
-function heldParentRequestIds(state, parentChannelIds) {
+function heldParentRequestIds(state, parentChannelIds, affectedThreadIds = null) {
+  const affected = affectedThreadIds ? new Set(affectedThreadIds) : null;
   const accepted = state.db.prepare("SELECT discord_id FROM messages WHERE channel_id=? AND state='accepted' ORDER BY created_at, rowid");
   return parentChannelIds.flatMap(channelId => accepted.all(channelId)
     .map(row => state.getMessage(row.discord_id))
-    .filter(message => isLegacyParentRequest(message) && !message.agentRoute)
+    .filter(message => isLegacyParentRequest(message) &&
+      (!message.agentRoute || (affected && affected.has(message.agentRoute))))
     .map(message => message.id));
 }
 

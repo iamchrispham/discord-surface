@@ -938,6 +938,12 @@ class SurfaceState {
     return threadEnrollmentHandlers.assertEnrollmentCoverage(this, parentChannelId, proof);
   }
 
+  _notifyThreadBoundaryTransition(previous, updated) {
+    if (previous && updated && previous.state !== updated.state) {
+      try { this.threadBoundaryObserver?.(previous, updated); } catch {}
+    }
+  }
+
   deactivateThreadEnrollments(parentChannelId, expectedBinding = null) {
     return threadEnrollmentHandlers.deactivateThreadEnrollments(this, parentChannelId, expectedBinding);
   }
@@ -953,18 +959,14 @@ class SurfaceState {
   markThreadBoundary(threadId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined, expectedEnrollment = undefined) {
     const previous = this.getThreadEnrollment(threadId);
     const updated = threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding, coverageId, lastSeenBaselineId, expectedEnrollment);
-    if (previous && updated && previous.state !== updated.state) {
-      try { this.threadBoundaryObserver?.(previous, updated); } catch {}
-    }
+    this._notifyThreadBoundaryTransition(previous, updated);
     return updated;
   }
 
   noteThreadMessage(threadId, messageId, accepted = false, coverageId = null) {
     const previous = this.getThreadEnrollment(threadId);
     const updated = threadEnrollmentHandlers.noteThreadMessage(this, threadId, messageId, accepted, coverageId);
-    if (previous && updated && previous.state !== updated.state) {
-      try { this.threadBoundaryObserver?.(previous, updated); } catch {}
-    }
+    this._notifyThreadBoundaryTransition(previous, updated);
     return updated;
   }
 

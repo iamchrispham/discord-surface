@@ -221,14 +221,16 @@ export function resolveAgentReplyRequestMatch(state: DirectPostState, replyTo: s
       try {
         const detail: unknown = JSON.parse(row.detail);
         const packet = detail && typeof detail === 'object' ? (detail as Record<string, unknown>).packet || null : null;
-        return packet ? { packet: packet as Record<string, unknown>, discordId: row.discord_id, legacy: isLegacyAgentReceipt(detail) } : null;
+        const frozenChildRoute = row.discord_id ? state.getMessage?.(row.discord_id)?.agentRoute || null : null;
+        return packet ? { packet: packet as Record<string, unknown>, discordId: row.discord_id,
+          legacy: isLegacyAgentReceipt(detail), frozenChildRoute } : null;
       } catch { return null; }
     })
-    .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; legacy: boolean } => candidate !== null &&
+    .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; legacy: boolean; frozenChildRoute: string | null } => candidate !== null &&
       candidate.packet.kind === KINDS.REQUEST &&
       (!requireLegacy || candidate.legacy) &&
       (target === null || sameAddress(candidate.packet.source, target)) &&
-      (sameAddress(candidate.packet.target, source) || (legacyParent !== null && candidate.legacy &&
+      (sameAddress(candidate.packet.target, source) || (legacyParent !== null && (candidate.legacy || Boolean(candidate.frozenChildRoute)) &&
         sameAddress(candidate.packet.target, legacyParent))));
   const identified = candidates.filter(candidate => candidate.discordId === replyTo || candidate.packet.id === replyTo);
   if (identified.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
@@ -237,10 +239,10 @@ export function resolveAgentReplyRequestMatch(state: DirectPostState, replyTo: s
   if (state.isAgentRequestWithdrawn(match.packet as unknown as AgentMessage)) {
     throw new BindingError('agent request was withdrawn');
   }
-  const frozenChildRoute = match.discordId ? state.getMessage?.(match.discordId)?.agentRoute || null : null;
-  if (requireFrozenChild && match.legacy && match.packet.target &&
+  const frozenChildRoute = match.frozenChildRoute;
+  if (requireFrozenChild && match.packet.target &&
       (frozenChildRoute ? frozenChildRoute !== source.channelId :
-        (match.packet.target as AgentAddress).channelId !== source.channelId)) {
+        (match.legacy && (match.packet.target as AgentAddress).channelId !== source.channelId))) {
     throw new BindingError('agent result source does not match the request frozen child route');
   }
   return {

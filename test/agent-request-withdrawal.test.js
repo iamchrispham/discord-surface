@@ -147,6 +147,43 @@ test('withdrawal ignores a sibling result when a legacy parent route is frozen',
   assert.equal(fixture.state.getMessage(messageId).state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
 });
 
+test('withdrawal preserves route-less stamped parent child result custody', t => {
+  const fixture = setup(t);
+  const sourceBinding = fixture.state.getBinding(requester.channelId);
+  const targetBinding = fixture.state.getBinding(recipient.channelId);
+  const sourceParent = { ...requester, generation: sourceBinding.generation };
+  const targetParent = { ...recipient, generation: targetBinding.generation };
+  const packet = { id: 'route-less-stamped-withdraw', kind: KINDS.REQUEST, source: sourceParent, target: targetParent,
+    replyTo: null, text: 'Route-less stamped parent request.' };
+  const messageId = '8111';
+  const timestamp = new Date().toISOString();
+  fixture.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    messageId, targetParent.guildId, targetParent.channelId, targetParent.channelId, '901', encodeAgentMessage(packet, token), '[]',
+    targetBinding.provider, targetBinding.nativeId, targetBinding.workspace, targetBinding.endpoint, targetBinding.conductorId,
+    targetBinding.repoKey, targetBinding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+  );
+  fixture.state.receipt(messageId, 'agent-message', { packet, authorId: '901', routingVersion: 2 });
+  fixture.state.receipt(messageId, 'accepted', { channelId: targetParent.channelId, generation: targetParent.generation, readiness: 'ready' });
+  fixture.state.enrollThread({ threadId: '105', parentChannelId: targetParent.channelId, guildId: '100', adoptionCutoff: '100' }, targetBinding);
+  fixture.state.markThreadBoundary('105', THREAD_STATES.READY, 'fixture second child ready', null, null, targetBinding);
+  assert.equal(fixture.state.claimDispatch(messageId).reason, 'legacy-agent-route-not-unique');
+  fixture.state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.SUBMITTED, messageId);
+  recordNativeAcknowledgment(fixture.state, { provider: targetParent.provider, messageId,
+    nativeId: targetParent.nativeId, generation: targetParent.generation });
+  const childResult = { id: 'route-less-stamped-child-result', kind: KINDS.RESULT,
+    source: { ...targetParent, channelId: '104' }, target: sourceParent, replyTo: packet.id,
+    routingVersion: 2, text: 'Child result already has immutable send custody.' };
+  fixture.state.receipt(null, 'direct-post-attempt', {
+    agentPacket: childResult, agentRequestTarget: targetParent
+  });
+  assert.throws(() => fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id,
+    provider: sourceParent.provider, nativeId: sourceParent.nativeId, generation: sourceParent.generation }),
+    /reply or result custody/);
+  assert.equal(fixture.state.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
+});
+
 test('legacy request custody still recognizes a child result from the same owner', t => {
   const fixture = setup(t);
   const row = fixture.state.db.prepare("SELECT id, detail FROM receipts WHERE discord_id=? AND kind='agent-message'")

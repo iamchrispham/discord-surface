@@ -136,6 +136,17 @@ test('frozen legacy parent rejects a parent-sourced result identity', t => {
     /frozen child route/);
 });
 
+test('stamped frozen parent rejects a parent-sourced result identity', t => {
+  const f = fixture(t);
+  enroll(f);
+  const request = acceptRequest(f, 'stamped-parent-source', true, source);
+  f.state.db.prepare("UPDATE receipts SET detail=json_set(detail, '$.routingVersion', ?) WHERE discord_id=? AND kind='agent-message'")
+    .run(AGENT_ROUTING_VERSION, 'stamped-parent-source');
+  assert.equal(f.state.claimDispatch('stamped-parent-source').claimed, true);
+  assert.throws(() => resolveAgentReplyRequestMatch(f.state, request.id, source, null, source, Error, false, true),
+    /frozen child route/);
+});
+
 test('frozen legacy route rejects a sibling result after enrollment changes', async t => {
   const f = fixture(t);
   enroll(f, '103');
@@ -586,6 +597,42 @@ test('legacy parent requests complete from a received child result without local
   assert.equal(completed.completed, true);
   assert.equal(completed.evidence.kind, 'received-result');
   assert.equal(completed.evidence.discordId, '9010');
+});
+
+test('stamped frozen parent requests accept a received child result', async t => {
+  const f = fixture(t);
+  const request = acceptRequest(f, '8111-stamped', true, source, 'stamped-frozen-shared-key');
+  f.state.db.prepare("UPDATE receipts SET detail=json_set(detail, '$.routingVersion', ?) WHERE discord_id=? AND kind='agent-message'")
+    .run(AGENT_ROUTING_VERSION, '8111-stamped');
+  enroll(f);
+  assert.equal(f.state.claimDispatch('8111-stamped').claimed, true);
+  f.state.markSubmitted('8111-stamped');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8111-stamped', nativeId: source.nativeId, generation: 1 });
+  const receivedPacket = { id: 'received-stamped-frozen-child-result', kind: KINDS.RESULT,
+    source: { ...source, channelId: '103' }, target, replyTo: request.id, routingVersion: AGENT_ROUTING_VERSION,
+    text: fs.readFileSync(f.textFile, 'utf8') };
+  const childBinding = f.state.getBinding(source.channelId);
+  const receivedTimestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    '9010-stamped', '100', '101', '103', '901', encodeAgentMessage(receivedPacket, token), '[]', childBinding.provider,
+    childBinding.nativeId, childBinding.workspace, childBinding.endpoint, childBinding.conductorId, childBinding.repoKey,
+    childBinding.generation, MESSAGE_STATES.ACCEPTED, receivedTimestamp, receivedTimestamp
+  );
+  f.state.receipt('9010-stamped', 'agent-message', { packet: receivedPacket });
+  f.state.receipt('9010-stamped', 'accepted', { channelId: '103', generation: childBinding.generation, readiness: 'ready' });
+  f.state.receipt(null, 'agent-message', {
+    packet: { ...request, target: { ...source, channelId: '104' } }, routingVersion: AGENT_ROUTING_VERSION
+  });
+  const completed = agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8111-stamped', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  });
+  assert.equal(completed.completed, true);
+  assert.equal(completed.evidence.kind, 'received-result');
+  assert.equal(completed.evidence.discordId, '9010-stamped');
 });
 
 test('legacy parent requests accept a normal intake baseline before later ready evidence', async t => {

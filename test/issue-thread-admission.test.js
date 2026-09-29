@@ -217,14 +217,44 @@ test('live intake demotion wakes an ambiguous legacy parent when one sibling rem
   f.gateway.ready = true;
   f.gateway.started = true;
   assert.equal(f.state.claimDispatch('legacy-live-demotion-parent').reason, 'legacy-agent-route-not-unique');
-  f.gateway.boundMessage(f.message('3001'));
-  await Promise.all([...f.gateway.inFlight]);
-  await f.gateway.consumer.waitForNativeWork();
+  f.state.noteThreadMessage(f.child.id, '3001');
   await new Promise(resolve => setImmediate(resolve));
+  await f.gateway.recoveryPromise;
   await f.gateway.consumer.waitForNativeWork();
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.PENDING);
   assert.equal(f.state.getMessage('legacy-live-demotion-parent').agentRoute, sibling.id);
   assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-live-demotion-parent']);
+});
+
+test('accepted frozen parent requeues when its child becomes ready again', async t => {
+  const f = fixture(t);
+  const binding = f.state.getBinding(f.parent.id);
+  insertLegacyParentRequest(f, 'legacy-frozen-retry');
+  const sibling = f.makeChannel('3000', ChannelType.PublicThread);
+  f.channels.set(sibling.id, sibling);
+  f.histories.set(sibling.id, []);
+  for (const threadId of [f.child.id, sibling.id]) {
+    f.state.enrollThread({ threadId, parentChannelId: f.parent.id, guildId: 'guild', adoptionCutoff: '0' }, binding);
+    f.state.setThreadBaseline(threadId, null, binding);
+    f.state.markThreadBoundary(threadId, THREAD_STATES.READY, 'fixture ready', null, null, binding);
+  }
+  f.gateway.ready = false;
+  f.gateway.started = false;
+  assert.equal(f.state.claimDispatch('legacy-frozen-retry').reason, 'legacy-agent-route-not-unique');
+  f.state.markThreadBoundary(sibling.id, THREAD_STATES.UNAVAILABLE, 'fixture sibling unavailable', null, null, binding);
+  assert.equal(f.state.claimDispatch('legacy-frozen-retry').claimed, true);
+  f.state.markNotSubmitted('legacy-frozen-retry', new Error('fixture retry'));
+  assert.equal(f.state.getMessage('legacy-frozen-retry').agentRoute, f.child.id);
+  f.gateway.ready = true;
+  f.gateway.started = true;
+  f.state.markThreadBoundary(f.child.id, THREAD_STATES.UNAVAILABLE, 'fixture child unavailable', null, null, binding);
+  await new Promise(resolve => setImmediate(resolve));
+  if (f.gateway.recoveryPromise) await f.gateway.recoveryPromise;
+  f.state.markThreadBoundary(f.child.id, THREAD_STATES.READY, 'fixture child ready again', null, null, binding);
+  await f.gateway.reconcilePending(undefined, { readyOnly: true, channelIds: [f.child.id], messageIds: ['legacy-frozen-retry'] });
+  await f.gateway.consumer.waitForNativeWork();
+  assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-frozen-retry']);
+  assert.equal(f.state.getMessage('legacy-frozen-retry').agentRoute, f.child.id);
 });
 
 test('startup defers live child demotion wake until Gateway start completes', async t => {
