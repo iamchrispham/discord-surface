@@ -696,7 +696,8 @@ repair, resume or replace a session.
   the caller. Each row reports binding readiness, child route and a reachability
   reason. Inactive and other-guild bindings are excluded. Listing does not send
   network requests or change custody. A ready binding without one ready child
-  is not reachable.
+  is not reachable for a new request. A correlated result uses the recorded
+  return route.
 - `peer_send({peer, text|text_file, dedupe_key})` resolves an exact
   `{repoKey, provider}`, `{conductorId}`, `{channelId}` or `{channelName}` at call time.
   Channel names come from the configured guild. Unknown or ambiguous peers and
