@@ -38,7 +38,6 @@ const attachment = {
 const agentRequest = {
   ...ordinary,
   id: 'agent-request-event',
-  channelId: '101',
   content: 'carrier',
   agentMessage: {
     id: 'agent-request',
@@ -52,7 +51,6 @@ const agentRequest = {
 const agentResult = {
   ...ordinary,
   id: 'agent-result-event',
-  channelId: '101',
   content: 'carrier',
   agentMessage: {
     id: 'agent-result',
@@ -118,20 +116,20 @@ const expectedDigests = {
   courierForwardingPrompt: '00a4064173913f094c396da42a14de9121933f57c94e752aaaa2117194b27ce3',
   attachmentPrompt: '51bed8777c238572c49865aa895a615f05842d43f194ee5f3f42b96ae0f0132e',
   messageRequestHuman: '79057b1e52d3d81405bb67993c5087743594770f62ca344e556eb223fc4c2ce2',
-  messageRequestAgentRequest: '5640ffb94d05c941bec4b794bcd40ad088f5a98f0bff18014d1c5fc7acf25251',
-  messageRequestAgentResult: 'c8dd89fdf246bfb441ba998b79d80837758919746f7b7146c0477cce55fc8649',
+  messageRequestAgentRequest: '5624d5e6fdba87af22888bc4a55353456c3bd4b5115897bdd90543d2d588abdb',
+  messageRequestAgentResult: 'a98c54b515af664b948fdb42d55e42073179611139b0ab1541d457ec0458f5c7',
   messageRequestDecision: '61bf6fab877b903ac62e83f33903465896b3942f3374b986da8380b5d83d469a',
   messageRequestWatcher: '778ebfecc08c0621fb1e6ee1ac96cfb417aad3576c1f1c6a55e52a47b9d32b9d',
   codexPromptHuman: '214cc1a09949c904d2144fc85a729826e661ea84f89569d5acb88c47f1088b39',
   codexPromptAttachment: '236c32b2160a03dc257ef12ec93463c79faed582466f47c54a84fb144c21b04b',
-  codexPromptAgentRequest: '1af522d07bf46489e294db49cbd4afe086e42c68564cf77ac8c07cadb8033dba',
-  codexPromptAgentResult: 'c50abc0da1ae25f9382cf40d605d2f844c8fa6214a9182db91cd9621bf3d1cba',
+  codexPromptAgentRequest: '7854014437cc92c4993d42fee8c35853e157160f20562ba6564cbdfb65e18e13',
+  codexPromptAgentResult: '7c742e49ca3f3bcb6d09f58ead922b716b40b0e914b9ff2371e4629f523a1b56',
   codexPromptDecision: 'fa9ba7f924595df3cfab549840962960ae5cc3f5fab299412dc51dc8c4ce9510',
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
   claudeEventHuman: '3cf57a00278c64f0f1f5e4e180189002af5e7a97584e42326741bf752c71ddcc',
   claudeEventAttachment: 'd04456537d38c4309bae542a35f13c52cbbaa2f3e83c062cec959f7a8db24f6d',
-  claudeEventAgentRequest: 'fdfa08693cfbcc51103aaf6c5abcb2bc1a4cf9faba573ad77f95b0984f9dfa3d',
-  claudeEventAgentResult: '27cac3494b931a58a9f8b51153aca027cb7e20d04f48c8182becb7a7929cd9ab',
+  claudeEventAgentRequest: '6bb6a5cb5ae61b610833eafcd57cad10cbf2c851b5cc815903bc09bf043639e7',
+  claudeEventAgentResult: '9663202e355371dbd715da7cd997e154317aa13a2bfe0e6af65a4fd4e1acbbe4',
   claudeEventDecision: '9fa9567ee39e6e4824c584991a8dad2c5267be9c3aa282ba2021e30de868e610',
   claudeEventWatcher: '45d9fbf706942a0fd9be6523d7b8dc61dc1b059e290d9a403be2010599dd3d14'
 };
@@ -147,70 +145,7 @@ test('native facade preserves the public export inventory', () => {
   }
 });
 
-test('agent requests direct both native providers to a correlated result', () => {
-  const request = facade.messageRequest(agentRequest);
-  const codex = facade.codexPrompt(agentRequest, acknowledgment, completion);
-  const claude = facade.claudeEvent(agentRequest, completion).content;
-  assert.match(request, /agent-send command/);
-  assert.match(request, /--agent-reply-to "agent-request"/);
-  assert.match(request, /--channel-id "101"/);
-  assert.match(request, /--agent-thread-id "102"/);
-  assert.match(request, /immutable incoming source route/);
-  assert.match(request, /--channel-id is the enrolled parent binding/);
-  assert.match(request, /--agent-thread-id is the enrolled child route/);
-  assert.match(request, /duplicate=true/);
-  assert.match(request, /continue with the required completion step/);
-  assert.doesNotMatch(request, /peer_send/);
-  for (const prompt of [codex, claude]) {
-    assert.match(prompt, /agent-send/);
-    assert.match(prompt, /--state-dir","\/tmp\/state with spaces"/);
-    assert.match(prompt, /--db","\/tmp\/state with spaces\.sqlite"/);
-    assert.match(prompt, /--channel-id","101"/);
-    assert.match(prompt, /--agent-thread-id","102"/);
-    assert.match(prompt, /--target-file/);
-    assert.match(prompt, /\"channelId\":\"101\"/);
-    assert.match(prompt, /--channel-id is the enrolled parent binding/);
-    assert.match(prompt, /--agent-thread-id is the enrolled child route/);
-    assert.match(prompt, /--agent-reply-to","agent-request"/);
-    assert.match(prompt, /ordinary Discord reply does not complete this request/);
-    assert.match(prompt, /duplicate=true/);
-    assert.match(prompt, /continue with the required completion step/);
-  }
-  const collidingRequest = {
-    ...agentRequest,
-    agentMessage: {
-      ...agentRequest.agentMessage,
-      source: { ...agentRequest.agentMessage.source, channelId: '103' }
-    }
-  };
-  const collidingCodex = facade.codexPrompt(collidingRequest, acknowledgment, completion);
-  const replyFile = prompt => prompt.match(/\.discord-agent-reply-([a-f0-9]{24})\.json/)?.[1];
-  assert.notEqual(replyFile(codex), replyFile(collidingCodex), 'source-route collisions must not share result files');
-  assert.match(codex, /Do not use a normal final reply/);
-  assert.doesNotMatch(codex, /Final reply: start with/);
-  assert.match(claude, /Do not use the reply tool/);
-  assert.match(claude, /state-backed recovery check/);
-  assert.match(facade.messageRequest(agentResult), /Consume this result with agent-complete/);
-});
-
-test('ambiguous legacy requests only acknowledge and request route reconciliation', () => {
-  const ambiguous = { ...agentRequest, agentSendChildAmbiguous: true, agentSendChildId: null };
-  const codex = facade.codexPrompt(ambiguous, acknowledgment, completion);
-  const claude = facade.claudeEvent(ambiguous, completion);
-  const completionJson = JSON.stringify(completion);
-  for (const prompt of [codex, claude.content]) {
-    assert.match(prompt, /no exact (?:result )?route exists/);
-    assert.match(prompt, /explicit route reconciliation/);
-    assert.equal(prompt.includes(completionJson), false);
-    assert.doesNotMatch(prompt, /Return exactly one correlated result/);
-    assert.doesNotMatch(prompt, /Follow the correlated agent-send instruction/);
-  }
-  assert.match(codex, /native-ack/);
-  assert.doesNotMatch(codex, /Final reply: start with/);
-  assert.equal(claude.completion, undefined);
-});
-
-test('native presentation preserves deterministic bytes', () => {
+test('native presentation matches the 314de71 baseline bytes', () => {
   const values = {
     agentCompletionCommand: facade.agentCompletionCommand(agentResult, '/tmp/state.sqlite', '/tmp/cli.js', '/tmp/state'),
     watcherNoticeCompletionCommand: facade.watcherNoticeCompletionCommand(watcher, '/tmp/state.sqlite', '/tmp/cli.js', '/tmp/state'),

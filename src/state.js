@@ -2152,14 +2152,7 @@ class SurfaceState {
     if (message) {
       message.replyParts = this.listReplyParts(messageId);
       const agent = message.content.startsWith(AGENT_PREFIX) ? this.getAgentMessage(messageId) : null;
-      if (agent) {
-        message.agentMessage = agent.packet;
-        if (agent.packet.target.channelId === message.channelId) {
-          const children = this.listThreadEnrollments(message.channelId).filter(enrollment => enrollment.active);
-          if (children.length === 1) message.agentSendChildId = children[0].threadId;
-          else message.agentSendChildAmbiguous = true;
-        }
-      }
+      if (agent) message.agentMessage = agent.packet;
       const notice = message.content.startsWith(WATCHER_NOTICE_PREFIX) ? this.getWatcherNotice(messageId) : null;
       if (notice) {
         message.watcherNotice = notice.packet;

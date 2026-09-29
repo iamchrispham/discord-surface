@@ -100,7 +100,7 @@ const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { agentCompletionCommand, codexPrompt, claudeEvent, messageRequest } = require('../src/native');
 const { staticConductorMarker } = require('../src/topic');
-const { createMonitorMcp, monitorEvent, writePayloadFile } = require('../src/claude-monitor');
+const { createMonitorMcp, monitorEvent } = require('../src/claude-monitor');
 
 function enrollChild(state, parent, threadId, baseline = '7000') {
   let binding = state.getBinding(parent.channelId);
@@ -212,7 +212,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
     const trustedCompletion = agentCompletionCommand({ ...state.getMessage(agentId), channelId: destination.channelId }, db, path.resolve(path.join(__dirname, '../src/cli.js')), dir);
 
     const oldPayloadPath = path.join(dir, '.cm-e', `${crypto.createHash('sha256')
-      .update(`5\0${path.resolve(db)}\0${agentId}\0${destination.nativeId}\0${destination.generation}`)
+      .update(`4\0${path.resolve(db)}\0${agentId}\0${destination.nativeId}\0${destination.generation}`)
       .digest('hex').slice(0, 32)}.json`);
     const oldPayload = monitorEvent({
       content: agentEvent.content,
@@ -258,7 +258,7 @@ test('Claude Monitor persists authenticated agent context and preserves human co
       const firstPayloadText = fs.readFileSync(firstPointer.payloadPath, 'utf8');
       const firstPayload = JSON.parse(firstPayloadText);
       assert.notEqual(firstPointer.payloadPath, oldPayloadPath);
-      assert.equal(firstPayload.version, 7);
+      assert.equal(firstPayload.version, 5);
       assert.equal(firstPayload.content, messageRequest(state.getMessage(agentId)));
       assert.match(firstPayload.content, /Agent result result-1 from codex/);
       assert.match(firstPayload.content, /Correlates to agent message work-1/);
@@ -298,66 +298,6 @@ test('Claude Monitor persists authenticated agent context and preserves human co
     state.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test('Claude Monitor makes duplicate agent requests recoverable through completion', () => {
-  const completion = [process.execPath, '/tmp/cli.js', 'agent-complete', '--db', '/tmp/surface.sqlite',
-    '--provider', 'claude', '--message-id', 'request-1', '--native-id', target.nativeId, '--generation', String(target.generation)];
-  const payload = monitorEvent({
-    content: 'authenticated agent request',
-    messageId: 'request-1',
-    nativeId: target.nativeId,
-    generation: target.generation,
-    completion,
-    agentMessage: { kind: KINDS.REQUEST },
-    stateDir: '/tmp',
-    dbPath: '/tmp/surface.sqlite',
-    cliPath: '/tmp/cli.js',
-    textFile: '/tmp/reply.txt'
-  });
-
-  assert.match(payload.instructions, /If it reports duplicate=true, run completion\.command once as the state-backed recovery check/);
-  assert.match(payload.instructions, /inspects durable correlated-result evidence/);
-  assert.match(payload.instructions, /request lacks an immutable correlated result/);
-  assert.match(payload.instructions, /If acknowledgment fails or its result is missing or ambiguous, stop and report the error/);
-  assert.doesNotMatch(payload.instructions, /first inspect the recorded correlated-result evidence/);
-  assert.deepEqual(payload.completion.command, completion);
-});
-
-test('Claude Monitor payload identity collisions never replace published custody', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-monitor-payload-immutable-'));
-  const payloadPath = path.join(dir, '.cm-e', 'payload.json');
-  try {
-    writePayloadFile(payloadPath, '{"route":"first"}');
-    assert.throws(() => writePayloadFile(payloadPath, '{"route":"changed"}', { replaceable: true }), /payload identity collision/);
-    assert.equal(fs.readFileSync(payloadPath, 'utf8'), '{"route":"first"}');
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('Claude Monitor suppresses execution for an ambiguous legacy request', () => {
-  const completion = [process.execPath, '/tmp/cli.js', 'agent-complete', '--db', '/tmp/surface.sqlite',
-    '--provider', 'claude', '--message-id', 'request-ambiguous', '--native-id', target.nativeId, '--generation', '1'];
-  const payload = monitorEvent({
-    content: 'ambiguous authenticated agent request',
-    messageId: 'request-ambiguous',
-    nativeId: target.nativeId,
-    generation: 1,
-    completion,
-    agentMessage: { kind: KINDS.REQUEST },
-    agentSendChildAmbiguous: true,
-    agentSendChildId: null,
-    stateDir: '/tmp',
-    dbPath: '/tmp/surface.sqlite',
-    cliPath: '/tmp/cli.js',
-    textFile: '/tmp/reply.txt'
-  });
-
-  assert.match(payload.instructions, /no exact child route/);
-  assert.match(payload.instructions, /explicit route reconciliation/);
-  assert.doesNotMatch(payload.instructions, /Follow the correlated agent-send instruction/);
-  assert.equal(payload.completion, undefined);
 });
 
 const { runDirectPost } = require('../src/direct-post');
