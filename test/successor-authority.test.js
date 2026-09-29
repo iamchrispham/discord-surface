@@ -74,7 +74,8 @@ test('deep transcript header refuses through the gate error boundary', () => {
       [transcript, CODEX_ID], { CONDUCTOR_CODEX_SESSIONS_DIR: root }
     );
     assert.equal(result.status, 2, result.stderr);
-    assert.match(result.stderr, /REFUSED: session transcript header is invalid/);
+    // Newer Python may parse this depth and reject the header by shape instead.
+    assert.match(result.stderr, /REFUSED: (session transcript header is invalid|Codex session transcript header is not a session_meta event)/);
     assert.doesNotMatch(result.stderr, /Traceback/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -89,7 +90,7 @@ test('deep lock command JSON refuses through the gate error boundary', () => {
       [path.resolve(__dirname, '../src/conductor-lock-gate.py'), lockScript]
     );
     assert.equal(result.status, 2, result.stderr);
-    assert.match(result.stderr, /REFUSED: conductor lock inspect returned invalid readback/);
+    assert.match(result.stderr, /REFUSED: conductor lock inspect returned (invalid|a non-object) readback/);
     assert.doesNotMatch(result.stderr, /Traceback/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
