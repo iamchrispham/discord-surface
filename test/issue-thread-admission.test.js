@@ -214,6 +214,30 @@ test('thread demotion wakes an ambiguous legacy parent when one sibling remains'
   assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-demotion-parent']);
 });
 
+test('bound message demotion wakes an ambiguous legacy parent when one sibling remains', async t => {
+  const f = fixture(t);
+  const binding = f.state.getBinding(f.parent.id);
+  insertLegacyParentRequest(f, 'legacy-bound-demotion-parent');
+  const sibling = f.makeChannel('3000', ChannelType.PublicThread);
+  f.channels.set(sibling.id, sibling);
+  f.histories.set(sibling.id, []);
+  for (const threadId of [f.child.id, sibling.id]) {
+    f.state.enrollThread({ threadId, parentChannelId: f.parent.id, guildId: 'guild', adoptionCutoff: '0' }, binding);
+    f.state.setThreadBaseline(threadId, null, binding);
+    f.state.markThreadBoundary(threadId, THREAD_STATES.READY, 'fixture ready', null, null, binding);
+  }
+  f.gateway.ready = true;
+  assert.equal(f.state.claimDispatch('legacy-bound-demotion-parent').reason, 'legacy-agent-route-not-unique');
+  f.child.locked = true;
+  f.gateway.boundMessage(f.message('legacy-bound-demotion-child'));
+  await new Promise(resolve => setImmediate(resolve));
+  await f.gateway.recoveryPromise;
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
+  assert.equal(f.state.getMessage('legacy-bound-demotion-parent').agentRoute, sibling.id);
+  assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-bound-demotion-parent']);
+});
+
 test('archived unlocked thread backfills after its own cursor without unarchive operation', async t => {
   const f = fixture(t); f.ready('100'); f.child.archived = true;
   f.child.setArchived = async () => assert.fail('discovery must not unarchive');

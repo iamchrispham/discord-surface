@@ -1076,6 +1076,7 @@ class DiscordGateway {
     this.receiptControllers = new Set();
     this.inFlight = new Set();
     this.stopping = false;
+    this.state.setThreadBoundaryObserver?.((previous, updated) => this.noteThreadBoundaryTransition(previous, updated));
     this.stopPromise = null;
     this.startPromise = null;
     this.starting = false;
@@ -1202,7 +1203,7 @@ class DiscordGateway {
       if (route?.enrollment) {
         try { assertPublicThread(message.channel, binding, route.deliveryChannelId, this.client.user); }
         catch (error) {
-          this.state.markThreadBoundary(route.deliveryChannelId, THREAD_STATES.UNAVAILABLE, error.message, null, null, binding);
+          this.markThreadBoundary(route.deliveryChannelId, THREAD_STATES.UNAVAILABLE, error.message, null, null, binding);
           return;
         }
       }
@@ -1402,6 +1403,37 @@ class DiscordGateway {
     return upsertGuildCsCommand(this.client.application?.commands, this.state.requireConfig().guildId);
   }
 
+  queueLegacyParentReconciliation(parentChannelId) {
+    if (this.stopping || typeof parentChannelId !== 'string') return;
+    const pending = this.pendingLegacyParentRecoveryChannels || new Set();
+    pending.add(parentChannelId);
+    this.pendingLegacyParentRecoveryChannels = pending;
+    if (this.pendingLegacyParentRecoveryQueued) return;
+    this.pendingLegacyParentRecoveryQueued = true;
+    queueMicrotask(() => {
+      this.pendingLegacyParentRecoveryQueued = false;
+      const channelIds = [...(this.pendingLegacyParentRecoveryChannels || [])];
+      this.pendingLegacyParentRecoveryChannels?.clear();
+      if (this.stopping || !channelIds.length) return;
+      void this.reconcilePending(undefined, {
+        allowPaused: true,
+        readyOnly: true,
+        channelIds
+      }).catch(recoveryError => {
+        this.logger(`legacy parent recovery after thread boundary failed: ${recoveryError.message}`);
+      });
+    });
+  }
+
+  noteThreadBoundaryTransition(previous, updated) {
+    if (!previous || !updated || previous.state !== THREAD_STATES.READY || updated.state === THREAD_STATES.READY) return;
+    this.queueLegacyParentReconciliation(updated.parentChannelId);
+  }
+
+  markThreadBoundary(...args) {
+    return this.state.markThreadBoundary(...args);
+  }
+
   createClient() {
     const { Client, GatewayIntentBits } = requireInstalled('discord.js');
     return new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
@@ -1421,21 +1453,8 @@ class DiscordGateway {
     const retryableFetch = isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
     if (['gap', 'unavailable'].includes(enrollment.state) && !retryableBoundary) return;
     const nextState = !enrollment.adoptedAt && retryableFetch ? THREAD_STATES.PENDING : THREAD_STATES.UNAVAILABLE;
-    const wasReady = enrollment.state === THREAD_STATES.READY;
-    const updated = this.state.markThreadBoundary(stored.deliveryChannelId, nextState,
+    this.markThreadBoundary(stored.deliveryChannelId, nextState,
       detail, null, null, binding, undefined, undefined, enrollment);
-    if (wasReady && updated?.state !== THREAD_STATES.READY && updated?.parentChannelId) {
-      queueMicrotask(() => {
-        if (this.stopping) return;
-        void this.reconcilePending(undefined, {
-          allowPaused: true,
-          readyOnly: true,
-          channelIds: [updated.parentChannelId]
-        }).catch(recoveryError => {
-          this.logger(`legacy parent recovery after thread demotion failed: ${recoveryError.message}`);
-        });
-      });
-    }
   }
 
   async threadDeliveryMessage(message) {
@@ -1892,7 +1911,7 @@ class DiscordGateway {
         verifiedEmptyCursor;
     const detail = `live attachment intake failed for ${message?.id || 'unknown message'}: ${String(error?.message || error).slice(0, 900)}`;
     const boundary = childDelivery
-      ? this.state.markThreadBoundary(intakeChannelId, THREAD_STATES.GAP, detail, gapFrom, message?.id || null, binding)
+      ? this.markThreadBoundary(intakeChannelId, THREAD_STATES.GAP, detail, gapFrom, message?.id || null, binding)
       : await this.recordBoundary(binding, null, 'gap', detail, gapFrom, message?.id || null, signal);
     if ((!childDelivery && !boundary?.watermark) || (childDelivery && !boundary) || signal?.aborted || this.stopping) return boundary;
     const recoveryTimer = setImmediate(() => {

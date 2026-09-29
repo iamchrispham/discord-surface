@@ -523,6 +523,7 @@ class SurfaceState {
     this.ordinary = createOrdinaryRepository({ state: this, assertOrdinaryIdentity, assertOrdinaryNativeIdentity });
     this.ordinaryHandoffPauses = new Set();
     this.ordinaryHandoffPauseSnapshots = new Map();
+    this.threadBoundaryObserver = null;
   }
 
   bindOrdinary(...args) { return this._bindOrdinary(...args); }
@@ -929,6 +930,10 @@ class SurfaceState {
     return threadEnrollmentHandlers.listThreadEnrollments(this, parentChannelId);
   }
 
+  setThreadBoundaryObserver(observer) {
+    this.threadBoundaryObserver = typeof observer === 'function' ? observer : null;
+  }
+
   assertThreadEnrollmentCoverage(parentChannelId, proof) {
     return threadEnrollmentHandlers.assertEnrollmentCoverage(this, parentChannelId, proof);
   }
@@ -946,7 +951,12 @@ class SurfaceState {
   }
 
   markThreadBoundary(threadId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined, expectedEnrollment = undefined) {
-    return threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding, coverageId, lastSeenBaselineId, expectedEnrollment);
+    const previous = this.getThreadEnrollment(threadId);
+    const updated = threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding, coverageId, lastSeenBaselineId, expectedEnrollment);
+    if (previous && updated && previous.state !== updated.state) {
+      try { this.threadBoundaryObserver?.(previous, updated); } catch {}
+    }
+    return updated;
   }
 
   checkpointThread(threadId, coverageId, expectedBinding = null, expectedEnrollment = undefined) {
