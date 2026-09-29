@@ -63,6 +63,12 @@ Claude uses `ordinary-claude-bind` with the exact current transcript and a short
 
 After the Gateway owner authorizes this host to consume the intended guild, use the public `start --state-dir <state>` entrypoint and inspect `status --state-dir <state>`. Do not start a second consumer as a workaround. Keep all Gateway-aware CLI paths on the same installed release.
 
+The peer MCP requires native caller identity on every invocation. A generic `codex mcp add` only saves server configuration; it does not prove that an already-running session loads the tools or passes its session identity to the MCP process. Do not add a static session UUID to that configuration. Use the installed `mcp --provider codex|claude --state-dir <state>` command only through a native integration that supplies the current caller identity and reloads the tools into that same session. If either capability is unavailable, leave peer MCP unregistered on that host.
+
+After a qualified integration loads the tools, call `peer_list()` in the bound native session. Every `peer_send` needs a ready caller with exactly one ready enrolled child. A new request also needs one ready child at its recipient; a result using `reply_to` follows the recorded return route. Registration and a transport `sent` receipt do not prove native pickup or a correlated result. See [README.md](README.md#authenticated-peer-mcp) for tool arguments and result evidence.
+
+Peer MCP registration does not steer an active Codex turn. The adapter's Codex intake uses `codex queue --thread`, which delivers a follow-up on a later turn. Active-turn steering needs a separately qualified route to the owning native app-server.
+
 Before a planned release cutover boots out the Gateway, inspect the active state with the same release's `status --state-dir <state>` entrypoint. Check `readiness.intakeWatermarks` and `readiness.threadEnrollments` for every state other than `ready`, including `pending`, `gap`, and `unavailable`. Record each affected channel or thread ID with its boundary detail and bounds, and distinguish retryable holds from terminal permission or identity failures. A non-ready route remains held and non-dispatchable after startup; do not clear it to make the cutover appear ready.
 
 ## Essential live check and return receipt

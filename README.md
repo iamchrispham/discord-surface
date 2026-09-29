@@ -680,9 +680,11 @@ Legacy known-unsent request retries require a freshly exported v2 child destinat
 
 `discord-surface mcp --provider codex|claude [--state-dir DIR] [--db FILE]`
 serves tools over stdio using the same binding database and outbound receipts as
-CLI sends. Register it with the native harness as a stdio MCP server. Use the
-installed Node and CLI paths for that release. Do not supply a bot token in tool
-arguments or copy a destination address file.
+CLI sends. Register it only through a native harness integration that passes the
+current session identity to the MCP process and loads the tools into that same
+session. A generic `codex mcp add` saves configuration but proves neither step.
+Use the installed Node and CLI paths for that release. Do not supply a bot token
+in tool arguments, a static session UUID, or a copied destination address file.
 
 The server derives the caller from the native Codex invocation identifiers or the
 existing Claude caller resolver on every call. The caller must have exactly one
@@ -694,7 +696,8 @@ repair, resume or replace a session.
   the caller. Each row reports binding readiness, child route and a reachability
   reason. Inactive and other-guild bindings are excluded. Listing does not send
   network requests or change custody. A ready binding without one ready child
-  is not reachable.
+  is not reachable for a new request. A correlated result uses the recorded
+  return route.
 - `peer_send({peer, text|text_file, dedupe_key})` resolves an exact
   `{repoKey, provider}`, `{conductorId}`, `{channelId}` or `{channelName}` at call time.
   Channel names come from the configured guild. Unknown or ambiguous peers and
