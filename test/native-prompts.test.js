@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 
 const facade = require('../src/native');
+const { monitorEvent } = require('../src/claude-monitor');
 const prompts = require('../dist/native/prompts.js');
 const { createWatcherNotice } = require('../src/watcher-notice');
 const { ENVELOPE_TYPE } = require('../dist/state/courier-route/constants.js');
@@ -38,6 +39,7 @@ const attachment = {
 const agentRequest = {
   ...ordinary,
   id: 'agent-request-event',
+  channelId: '103',
   content: 'carrier',
   agentMessage: {
     id: 'agent-request',
@@ -116,19 +118,19 @@ const expectedDigests = {
   courierForwardingPrompt: '00a4064173913f094c396da42a14de9121933f57c94e752aaaa2117194b27ce3',
   attachmentPrompt: '51bed8777c238572c49865aa895a615f05842d43f194ee5f3f42b96ae0f0132e',
   messageRequestHuman: '79057b1e52d3d81405bb67993c5087743594770f62ca344e556eb223fc4c2ce2',
-  messageRequestAgentRequest: '32b43ea820c9baaa1dd5f8e6ad46de267398d8b43e95f0dae7c864db65bb12b9',
+  messageRequestAgentRequest: '11edf96231becac9a713c2d769ba7c23d76848336e61a02b04bb24ee0f9be934',
   messageRequestAgentResult: '3d716e555095170db45917e68da407e44dca8ff7f16010dc86309bd0f2e1e80f',
   messageRequestDecision: '61bf6fab877b903ac62e83f33903465896b3942f3374b986da8380b5d83d469a',
   messageRequestWatcher: '778ebfecc08c0621fb1e6ee1ac96cfb417aad3576c1f1c6a55e52a47b9d32b9d',
   codexPromptHuman: '214cc1a09949c904d2144fc85a729826e661ea84f89569d5acb88c47f1088b39',
   codexPromptAttachment: '236c32b2160a03dc257ef12ec93463c79faed582466f47c54a84fb144c21b04b',
-  codexPromptAgentRequest: 'f88be9cbd8f9992529e72a7837a4a4f1c4fcd9236a3d2e75bfba01a184e32de9',
+  codexPromptAgentRequest: 'd6dfae5cd99475a1915cea569d4d0ac491efd972b7893469a0de1d5ef65a52ee',
   codexPromptAgentResult: 'f88215d73e2a267afba9c33a5cf2a32c814e35d31afcec3c20111245518accec',
   codexPromptDecision: 'fa9ba7f924595df3cfab549840962960ae5cc3f5fab299412dc51dc8c4ce9510',
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
   claudeEventHuman: '3cf57a00278c64f0f1f5e4e180189002af5e7a97584e42326741bf752c71ddcc',
   claudeEventAttachment: 'd04456537d38c4309bae542a35f13c52cbbaa2f3e83c062cec959f7a8db24f6d',
-  claudeEventAgentRequest: 'ca2735d786851d9b7acdc1edef74111a7078e560c4832437d5acbef56daa6be4',
+  claudeEventAgentRequest: '28e9bd4d38f09553a982f1c5c39acee9928a9cb393a19b594acca759185e148f',
   claudeEventAgentResult: '29ca2a9e852ee48191e8065d34736c92c7f8bf735cf067b904c7e519fbd40fa5',
   claudeEventDecision: '9fa9567ee39e6e4824c584991a8dad2c5267be9c3aa282ba2021e30de868e610',
   claudeEventWatcher: '45d9fbf706942a0fd9be6523d7b8dc61dc1b059e290d9a403be2010599dd3d14'
@@ -189,7 +191,7 @@ test('agent pickup requires a correlated result while human pickup keeps replies
   for (const prompt of [requestPrompt, directRequest]) {
     assert.match(prompt, /agent-send --agent-reply-to agent-request/);
     assert.match(prompt, /agent-complete/);
-    assert.match(prompt, /After agent-send reports sent/);
+    assert.match(prompt, /After it reports sent or duplicate/);
     assert.doesNotMatch(prompt, /Choose exactly one: normal final|either use the reply tool|Use the reply tool with messageId/);
   }
   for (const prompt of [resultPrompt, directResult]) {
@@ -201,4 +203,25 @@ test('agent pickup requires a correlated result while human pickup keeps replies
   assert.doesNotMatch(resultPrompt, /Final reply: start with/);
   assert.match(humanPrompt, /Final reply: start with/);
   assert.match(facade.claudeEvent(ordinary).content, /Use the reply tool with messageId/);
+});
+
+test('agent request pickup acknowledges first and uses the exact child result route', () => {
+  const prompt = facade.codexPrompt(agentRequest, acknowledgment, completion);
+  const ack = 'At pickup, acknowledge this exact message once';
+  assert.ok(prompt.indexOf(ack) < prompt.indexOf('Handle this authenticated agent packet'));
+  assert.match(prompt, /"agent-send","--state-dir","\/tmp\/state with spaces","--db","\/tmp\/state with spaces\.sqlite"/);
+  assert.match(prompt, /"--agent-thread-id","102"/);
+  assert.match(prompt, /"--text-file","\/tmp\/state with spaces\/agent-result-agent-request-event\.txt"/);
+  assert.match(prompt, /"--dedupe-key","agent-result-agent-request-event","--agent-reply-to","agent-request"/);
+  assert.doesNotMatch(prompt, /--target-file/);
+
+  const legacy = { ...agentRequest, channelId: agentRequest.agentMessage.target.channelId };
+  assert.match(facade.messageRequest(legacy, completion), /Keep it open for route reconciliation/);
+  assert.doesNotMatch(facade.codexPrompt(legacy, acknowledgment, completion), /Run this packet's completion command/);
+  assert.equal(facade.claudeEvent(legacy, completion).completion, undefined);
+  const monitor = monitorEvent({ content: facade.messageRequest(legacy, completion), messageId: legacy.id,
+    nativeId: legacy.nativeId, generation: legacy.generation, agentKind: 'request', legacyParentRequest: true,
+    completion, stateDir: '/tmp/state', dbPath: '/tmp/state.sqlite', cliPath: '/tmp/cli.js', textFile: '/tmp/result.txt' });
+  assert.equal(monitor.completion, undefined);
+  assert.match(monitor.instructions, /Keep it open for route reconciliation/);
 });

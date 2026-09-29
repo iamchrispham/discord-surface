@@ -102,13 +102,41 @@ function decisionRequest(message: NativeMessage): string | null {
   ].join('\n');
 }
 
-export function messageRequest(message: NativeMessage): string {
+function legacyParentRequest(message: NativeMessage): boolean {
+  return message.agentMessage?.kind === KINDS.REQUEST && message.agentMessage.target.channelId === message.channelId;
+}
+
+function agentResultInstruction(message: NativeMessage, completion: readonly string[] | null | undefined): string {
+  const agent = message.agentMessage!;
+  if (legacyParentRequest(message)) {
+    return 'This request has no exact enrolled child route. Do not execute it, send a result, or complete it. Keep it open for route reconciliation.';
+  }
+  if (!completion) return `Return one correlated result with agent-send --agent-reply-to ${agent.id}, then run agent-complete. Keep the request open if sending fails.`;
+  const flag = (name: string): string | undefined => {
+    const index = completion.indexOf(name);
+    return index < 0 ? undefined : completion[index + 1];
+  };
+  const stateDir = flag('--state-dir');
+  const dbPath = flag('--db');
+  if (!stateDir || !dbPath || !completion[0] || !completion[1]) {
+    return 'No exact agent-send route is available. Keep this request open for route reconciliation.';
+  }
+  const textFile = path.join(stateDir, `agent-result-${message.id}.txt`);
+  const send = [completion[0], completion[1], 'agent-send', '--state-dir', stateDir, '--db', dbPath,
+    '--provider', message.provider, '--channel-id', message.channelId,
+    '--agent-thread-id', agent.target.channelId, '--native-id', message.nativeId,
+    '--generation', String(message.generation), '--text-file', textFile,
+    '--dedupe-key', `agent-result-${message.id}`, '--agent-reply-to', agent.id];
+  return `Write one concise result to the owner-only file ${JSON.stringify(textFile)}. Run agent-send --agent-reply-to ${agent.id} with exact argv ${JSON.stringify(send)}. The recorded request supplies the destination. After it reports sent or duplicate, run the packet's agent-complete command once. If sending fails or is uncertain, keep the request open. Do not post an ordinary Discord reply.`;
+}
+
+export function messageRequest(message: NativeMessage, completion: readonly string[] | null | undefined = null): string {
   const decision = decisionRequest(message);
   if (decision) return decision;
   if (message.watcherNotice) return watcherNoticePrompt(message.watcherNotice);
   const agent = message.agentMessage;
   const agentHandling = agent?.kind === KINDS.REQUEST
-    ? `Return one correlated result with agent-send --agent-reply-to ${agent.id}. Use --provider ${message.provider}, --native-id ${message.nativeId}, --generation ${message.generation}, --channel-id ${message.channelId}, --agent-thread-id ${agent.target.channelId}, --text-file for the result, and a stable --dedupe-key. The result destination comes from the recorded request. After agent-send reports sent, run the packet's agent-complete command once. If sending is uncertain or fails, keep the request open. Do not use an ordinary Discord reply to complete this request.`
+    ? agentResultInstruction(message, completion)
     : 'Handle this result, then run the packet\'s agent-complete command once. Do not send another agent packet or post an ordinary Discord reply.';
   if (agent) return [
     `Agent ${agent.kind} ${agent.id} from ${agent.source.provider} session ${agent.source.nativeId}, generation ${agent.source.generation}.`,
@@ -149,7 +177,7 @@ export function codexPrompt(
   const marker = `[[discord-surface:${message.id}]]`;
   const isDecision = Boolean(message.decisionResult);
   const isAgent = Boolean(message.agentMessage);
-  const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
+  const completionInstruction = message.agentMessage && !legacyParentRequest(message) ? noPostCompletionInstruction(completion) : null;
   let handlingInstruction: string;
   if (isDecision) {
     handlingInstruction = 'Handle the saved canonical decision continuation using its exact identity and canonical answer. Preserve this session. Do not start another session or hand this work to another agent.';
@@ -169,9 +197,9 @@ export function codexPrompt(
     handlingInstruction,
     ...(completionInstruction ? [completionInstruction] : []),
     '',
-    messageRequest(message)
+    messageRequest(message, completion)
   ];
-  if (acknowledgment) prompt.splice(3, 0, `At pickup, acknowledge this exact message once with exact argv: ${JSON.stringify(acknowledgment)}. ACK means received, not completed. Then handle the request.`);
+  if (acknowledgment) prompt.splice(prompt.indexOf(handlingInstruction), 0, `At pickup, acknowledge this exact message once with exact argv: ${JSON.stringify(acknowledgment)}. ACK means received, not completed. Then handle the request.`);
   const attachments = attachmentPrompt(message);
   if (attachments) prompt.push('', attachments);
   return prompt.join('\n');
@@ -187,7 +215,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
   watcherNotice?: Pick<WatcherNotice, 'id' | 'armKey' | 'triggerKey' | 'source' | 'target'>;
 } {
   const isDecision = Boolean(message.decisionResult);
-  const completionInstruction = message.agentMessage
+  const completionInstruction = message.agentMessage && !legacyParentRequest(message)
     ? noPostCompletionInstruction(completion)
     : message.watcherNotice ? noPostWatcherNoticeInstruction(completion) : null;
   const hasCompletionPath = Boolean(completionInstruction);
@@ -214,7 +242,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     ...(completionInstruction ? [completionInstruction] : []),
     isDecision ? 'Preserve the exact canonical identity and answer from the decision JSON. Preserve this session. Do not start or resume another session.' : 'Do not start or resume another session.',
     '',
-    messageRequest(message)
+    messageRequest(message, completion)
   ];
   const attachments = attachmentPrompt(message);
   if (attachments) content.push('', attachments);
@@ -233,7 +261,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     content: content.join('\n')
   };
   if (message.attachments?.length) event.attachments = message.attachments;
-  if ((message.agentMessage || message.watcherNotice) && completion?.length) event.completion = [...completion];
+  if ((message.agentMessage || message.watcherNotice) && completion?.length && !legacyParentRequest(message)) event.completion = [...completion];
   if (message.watcherNotice) {
     const { id, armKey, triggerKey, source, target } = message.watcherNotice;
     event.watcherNotice = { id, armKey, triggerKey, source, target };
