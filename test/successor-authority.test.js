@@ -49,6 +49,51 @@ function assertCommitted(result, carry, label) {
   assert.equal(result.child.carry, carry, `${label}: carry marker value`);
 }
 
+function runPythonGate(body, args, env = {}) {
+  return spawnSync(PYTHON, ['-c', `
+import sys
+import conductor_worker_proof as proof
+try:
+    ${body}
+except proof.GateError as error:
+    print(f'REFUSED: {error}', file=sys.stderr)
+    sys.exit(2)
+`, ...args], {
+    encoding: 'utf8', timeout: 5000,
+    env: { ...process.env, PYTHONPATH: path.join(__dirname, '..', 'src'), ...env }
+  });
+}
+
+test('deep transcript header refuses through the gate error boundary', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-transcript-'));
+  try {
+    const transcript = path.join(root, `rollout-test-${CODEX_ID}.jsonl`);
+    fs.writeFileSync(transcript, `${'['.repeat(1500)}0${']'.repeat(1500)}\n`, { mode: 0o600 });
+    const result = runPythonGate(
+      "proof.verify_transcript(sys.argv[1], 'codex', sys.argv[2])",
+      [transcript, CODEX_ID], { CONDUCTOR_CODEX_SESSIONS_DIR: root }
+    );
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /REFUSED: session transcript header is invalid/);
+    assert.doesNotMatch(result.stderr, /Traceback/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('deep lock command JSON refuses through the gate error boundary', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deep-lock-readback-'));
+  try {
+    const lockScript = path.join(root, 'lock.sh');
+    fs.writeFileSync(lockScript, `#!/bin/sh\nprintf '%s\\n' '${'['.repeat(1500)}0${']'.repeat(1500)}'\n`, { mode: 0o700 });
+    const result = runPythonGate(
+      "__import__('runpy').run_path(sys.argv[1])['run_lock'](sys.argv[2], 'example/repo', 'codex', 'inspect')",
+      [path.resolve(__dirname, '../src/conductor-lock-gate.py'), lockScript]
+    );
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /REFUSED: conductor lock inspect returned invalid readback/);
+    assert.doesNotMatch(result.stderr, /Traceback/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('worker proof uses the canonical conductor registry, with or without the Codex alias', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-proof-home-'));
   try {

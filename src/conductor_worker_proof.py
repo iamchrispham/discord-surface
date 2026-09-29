@@ -147,7 +147,7 @@ def verify_transcript(path, provider, native_id):
         fail('session transcript header is absent')
     try:
         header = json.loads(first.decode('utf-8'))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         fail(f'session transcript header is invalid: {error}')
     if provider == 'claude':
         observed = header.get('sessionId') if isinstance(header, dict) else None

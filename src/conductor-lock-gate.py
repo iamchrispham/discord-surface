@@ -44,7 +44,7 @@ def run_lock(lock_script, repo, provider, verb):
         fail(f'conductor lock {verb} refused authority: {result.stderr.strip()}')
     try:
         value = json.loads(result.stdout.strip())
-    except (json.JSONDecodeError, TypeError) as error:
+    except (json.JSONDecodeError, TypeError, RecursionError) as error:
         fail(f'conductor lock {verb} returned invalid readback: {error}')
     if not isinstance(value, dict):
         fail(f'conductor lock {verb} returned a non-object readback')
