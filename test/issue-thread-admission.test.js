@@ -229,7 +229,6 @@ test('bound message demotion wakes an ambiguous legacy parent when one sibling r
   f.gateway.ready = true;
   assert.equal(f.state.claimDispatch('legacy-bound-demotion-parent').reason, 'legacy-agent-route-not-unique');
   f.child.locked = true;
-  f.state.setThreadBoundaryObserver(null);
   f.gateway.boundMessage(f.message('legacy-bound-demotion-child'));
   await new Promise(resolve => setImmediate(resolve));
   await f.gateway.recoveryPromise;
@@ -237,6 +236,27 @@ test('bound message demotion wakes an ambiguous legacy parent when one sibling r
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
   assert.equal(f.state.getMessage('legacy-bound-demotion-parent').agentRoute, sibling.id);
   assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-bound-demotion-parent']);
+});
+
+test('child demotion does not reconcile ordinary accepted parent custody', async t => {
+  const f = fixture(t);
+  const binding = f.state.getBinding(f.parent.id);
+  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild', adoptionCutoff: '0' }, binding);
+  f.state.setThreadBaseline(f.child.id, null, binding);
+  f.state.markThreadBoundary(f.child.id, THREAD_STATES.READY, 'fixture ready', null, null, binding);
+  f.state.acceptDiscordMessage({ id: '901', guildId: 'guild', channelId: f.parent.id, authorId: 'operator', isBot: false, content: 'ordinary parent' },
+    { ready: true, expectedBinding: binding });
+  f.gateway.ready = true;
+  let recoveryCalls = 0;
+  const reconcilePending = f.gateway.reconcilePending.bind(f.gateway);
+  f.gateway.reconcilePending = (...args) => {
+    recoveryCalls += 1;
+    return reconcilePending(...args);
+  };
+  f.state.markThreadBoundary(f.child.id, THREAD_STATES.UNAVAILABLE, 'child unavailable', null, null, binding);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(recoveryCalls, 0);
+  assert.equal(f.state.getMessage('901').state, MESSAGE_STATES.ACCEPTED);
 });
 
 test('archived unlocked thread backfills after its own cursor without unarchive operation', async t => {

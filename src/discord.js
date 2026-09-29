@@ -38,7 +38,7 @@ const {
   storeReconciliationSnapshot
 } = require('../dist/discord/reconciliation-lookups.js');
 const { THREAD_STATES } = require('./state/thread-enrollment');
-const { legacyParentReconciliationChannel } = require('./state/legacy-agent-request-route');
+const { heldParentRequestIds, legacyParentReconciliationChannel } = require('./state/legacy-agent-request-route');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer } = require('./discord/decision');
 const { cancelResponseBody, readRetryAfter, sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
@@ -1416,10 +1416,13 @@ class DiscordGateway {
       const channelIds = [...(this.pendingLegacyParentRecoveryChannels || [])];
       this.pendingLegacyParentRecoveryChannels?.clear();
       if (this.stopping || !channelIds.length) return;
+      const messageIds = heldParentRequestIds(this.state, channelIds);
+      if (!messageIds.length) return;
       void this.reconcilePending(undefined, {
         allowPaused: true,
         readyOnly: true,
-        channelIds
+        channelIds,
+        messageIds
       }).catch(recoveryError => {
         this.logger(`legacy parent recovery after thread boundary failed: ${recoveryError.message}`);
       });
@@ -1432,11 +1435,7 @@ class DiscordGateway {
   }
 
   markThreadBoundary(...args) {
-    const previous = this.state.getThreadEnrollment(args[0]);
-    const updated = this.state.markThreadBoundary(...args);
-    const parentChannelId = legacyParentReconciliationChannel(previous, updated);
-    if (parentChannelId) this.queueLegacyParentReconciliation(parentChannelId);
-    return updated;
+    return this.state.markThreadBoundary(...args);
   }
 
   createClient() {
