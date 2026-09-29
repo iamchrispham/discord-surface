@@ -1007,7 +1007,9 @@ const EXPECTED_FETCH_HISTORY = [
 const EXCLUDED_BINDS = new Set([
   'src/agent-attachment.ts|defaultFetch|fetchImpl',
   'src/discord/handoff-fence.ts|assertEnrolledThreadIntakeRange|client?.channels?.fetch',
-  'src/state/courier-route/index.ts|createCourierRouteHandlers|claimCourierForward'
+  'src/state/courier-route/index.ts|createCourierRouteHandlers|claimCourierForward',
+  'src/state/courier-route/index.ts|createCourierRouteHandlers|recoverCourierAttempt',
+  'src/state/courier-route/index.ts|createCourierRouteHandlers|getCourierDeliveryStatus'
 ]);
 
 const RECOGNIZED_BIND_RECEIVERS = new Set(['state', 'this']);
