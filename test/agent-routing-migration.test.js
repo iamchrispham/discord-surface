@@ -239,6 +239,55 @@ test('already submitted parent request completes from pre-upgrade sent child cus
   assert.equal(f.state.getMessage('8121').agentRoute, null);
 });
 
+test('route-less parent with stamped provenance keeps immutable sent child custody', async t => {
+  const f = fixture(t);
+  const request = acceptRequest(f, '8122', true, source);
+  f.state.db.prepare("UPDATE receipts SET detail=json_set(detail, '$.routingVersion', ?) WHERE discord_id=? AND kind='agent-message'")
+    .run(AGENT_ROUTING_VERSION, '8122');
+  alreadySubmittedLegacyRequest(f, '8122');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8122', nativeId: source.nativeId, generation: 1 });
+  enroll(f, '103');
+  const childResult = {
+    id: 'stamped-child-result',
+    kind: KINDS.RESULT,
+    source: { ...source, channelId: '103' },
+    target,
+    replyTo: request.id,
+    text: 'Saved before the route receipt was written.'
+  };
+  const binding = f.state.getBinding(source.channelId);
+  const meta = {
+    requestId: childResult.id,
+    inReplyTo: request.id,
+    attemptId: 'stamped-child-attempt',
+    sourcePath: f.textFile,
+    textHash: hash(JSON.stringify(childResult)),
+    operatorId: '900',
+    partHash: hash(encodeAgentMessage(childResult, token)),
+    ...source,
+    conductorId: binding.conductorId,
+    repoKey: binding.repoKey,
+    partIndex: 0,
+    partCount: 1,
+    nonce: 'stamped-child-nonce',
+    binding,
+    deliveryChannelId: target.channelId,
+    agentPacket: childResult,
+    agentRequestTarget: source,
+    presentation: 'legacy'
+  };
+  assert.equal(f.state.beginDirectPostPart(meta).claimed, true);
+  f.state.recordDirectPostOutcome(childResult.id, meta.attemptId, 'sent', { messageId: 'stamped-child-sent' });
+  const completed = agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8122', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  });
+  assert.equal(completed.completed, true);
+  assert.equal(completed.evidence.kind, 'sent-result');
+  assert.equal(f.state.getMessage('8122').agentRoute, null);
+});
+
 test('public agent-send refuses a null destination without becoming an ordinary parent post', async t => {
   const f = fixture(t);
   const targetFile = path.join(f.dir, 'target.json');

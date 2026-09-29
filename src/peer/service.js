@@ -229,9 +229,10 @@ function createPeerService(context) {
       if (source.channelId !== initial.channelId || canonicalNativeId(source.nativeId) !== canonicalNativeId(initial.nativeId) || source.generation !== initial.generation) {
         throw new Error('peer caller changed during resolution');
       }
-      const sourceRoute = input.reply_to === undefined
-        ? requireReadyPeer(state, source)
-        : frozenReplySourceRoute(state, input.reply_to, source) || requireReadyPeer(state, source);
+      const frozenSourceRoute = input.reply_to === undefined
+        ? null
+        : frozenReplySourceRoute(state, input.reply_to, source);
+      const sourceRoute = frozenSourceRoute || requireReadyPeer(state, source);
       const sourceReadiness = source.readiness;
       const sourceIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
       const sourceAddress = resolveAgentAddress(state, source, sourceRoute.childId);

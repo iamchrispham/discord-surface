@@ -229,6 +229,7 @@ test('bound message demotion wakes an ambiguous legacy parent when one sibling r
   f.gateway.ready = true;
   assert.equal(f.state.claimDispatch('legacy-bound-demotion-parent').reason, 'legacy-agent-route-not-unique');
   f.child.locked = true;
+  f.state.setThreadBoundaryObserver(null);
   f.gateway.boundMessage(f.message('legacy-bound-demotion-child'));
   await new Promise(resolve => setImmediate(resolve));
   await f.gateway.recoveryPromise;

@@ -45,4 +45,9 @@ function claimRoute(state, message) {
   return { ready: true };
 }
 
-module.exports = { claimRoute, frozenRoute };
+function legacyParentReconciliationChannel(previous, updated) {
+  if (!previous || !updated || previous.state !== 'ready' || updated.state === 'ready') return null;
+  return typeof updated.parentChannelId === 'string' && updated.parentChannelId ? updated.parentChannelId : null;
+}
+
+module.exports = { claimRoute, frozenRoute, legacyParentReconciliationChannel };

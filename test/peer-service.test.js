@@ -505,6 +505,8 @@ test('peer result resolves a frozen local child before sibling selection', async
   const result = await peer.send({ reply_to: request.id, text: 'result', dedupe_key: 'frozen-local-source-result' });
   assert.equal(result.status, 'sent');
   assert.match(postUrl, /channels\/201\/messages$/);
+  const attempt = f.state.directPostRows('frozen-local-source-result').find(row => row.kind === 'direct-post-attempt');
+  assert.equal(attempt.detail.agentPacket.source.channelId, '102');
 });
 
 test('correlated reply keeps a recorded child route when another child enrolls', async t => {

@@ -436,10 +436,13 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
         const frozenChildRoute = message.agentRoute || null;
         const legacyProvenance = isLegacyAgentReceipt(provenance);
         const allowLegacyChildSource = legacyProvenance && Boolean(frozenChildRoute);
+        const legacyParentRequest = packet.kind === KINDS.REQUEST && packet.target.channelId === message.channelId;
+        // Route-less compatibility is limited to immutable send custody, never a new received child result.
+        const allowLegacySentChildSource = legacyProvenance || (legacyParentRequest && !frozenChildRoute);
         const parentTarget = { ...target, channelId: binding.channelId };
         const provenanceReceiptId = requestProvenanceReceiptId(state, messageId);
         evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget, frozenChildRoute) ||
-          sentReplyEvidence(state, packet, message.channelId, deps, legacyProvenance, parentTarget, provenanceReceiptId, frozenChildRoute);
+          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacySentChildSource, parentTarget, provenanceReceiptId, frozenChildRoute);
         if (!evidence) throw new deps.BindingError('agent request lacks an immutable correlated result');
       }
       const detail = {

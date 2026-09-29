@@ -38,6 +38,7 @@ const {
   storeReconciliationSnapshot
 } = require('../dist/discord/reconciliation-lookups.js');
 const { THREAD_STATES } = require('./state/thread-enrollment');
+const { legacyParentReconciliationChannel } = require('./state/legacy-agent-request-route');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer } = require('./discord/decision');
 const { cancelResponseBody, readRetryAfter, sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
@@ -1426,12 +1427,16 @@ class DiscordGateway {
   }
 
   noteThreadBoundaryTransition(previous, updated) {
-    if (!previous || !updated || previous.state !== THREAD_STATES.READY || updated.state === THREAD_STATES.READY) return;
-    this.queueLegacyParentReconciliation(updated.parentChannelId);
+    const parentChannelId = legacyParentReconciliationChannel(previous, updated);
+    if (parentChannelId) this.queueLegacyParentReconciliation(parentChannelId);
   }
 
   markThreadBoundary(...args) {
-    return this.state.markThreadBoundary(...args);
+    const previous = this.state.getThreadEnrollment(args[0]);
+    const updated = this.state.markThreadBoundary(...args);
+    const parentChannelId = legacyParentReconciliationChannel(previous, updated);
+    if (parentChannelId) this.queueLegacyParentReconciliation(parentChannelId);
+    return updated;
   }
 
   createClient() {
