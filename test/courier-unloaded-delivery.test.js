@@ -138,10 +138,8 @@ test('unloaded courier automatically retires its submitted attempt and dispatche
     assert.ok(directCalls.some(call => call.nativeId === PARENT_NATIVE && call.messageId === '9000'), 'unloaded courier remained submitted');
     const original = directCalls.filter(call => call.messageId === '9000' && call.nativeId === PARENT_NATIVE);
     assert.equal(original.length, 1, 'original unloaded message was not dispatched to the parent exactly once');
-    const firstOriginalIndex = directCalls.findIndex(call => call.messageId === '9000' && call.nativeId === PARENT_NATIVE);
     const laterCalls = directCalls.filter(call => call.messageId === '9002');
-    assert.ok(laterCalls.every(call => directCalls.indexOf(call) > firstOriginalIndex),
-      'later same-owner direct dispatch preceded the original');
+    assert.equal(laterCalls.length, 0, 'later same-owner dispatch preceded native ACK');
   } finally {
     clearTimeout(watchdog);
     if (consumer) {
