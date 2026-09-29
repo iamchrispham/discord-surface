@@ -253,7 +253,7 @@ export function codexPrompt(
       ? `This is a saved canonical decision continuation for native session ${message.nativeId}.`
       : `Discord message for native session ${message.nativeId}.`,
     `Message ID: ${message.id}. Ownership generation: ${message.generation}.`,
-    ...(hasCompletionPath ? [] : [`Final reply: start with ${marker} on its own line. Transport removes it.`]),
+    ...(hasCompletionPath || ambiguousLegacyRequest ? [] : [`Final reply: start with ${marker} on its own line. Transport removes it.`]),
     handlingInstruction,
     ...(completionInstruction ? [completionInstruction] : []),
     '',

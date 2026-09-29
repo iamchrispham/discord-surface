@@ -206,6 +206,7 @@ test('ambiguous legacy requests only acknowledge and request route reconciliatio
     assert.doesNotMatch(prompt, /Follow the correlated agent-send instruction/);
   }
   assert.match(codex, /native-ack/);
+  assert.doesNotMatch(codex, /Final reply: start with/);
   assert.equal(claude.completion, undefined);
 });
 
