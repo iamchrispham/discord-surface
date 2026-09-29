@@ -127,7 +127,7 @@ function agentResultInstruction(message: NativeMessage, completion: readonly str
     '--agent-thread-id', agent.target.channelId, '--native-id', message.nativeId,
     '--generation', String(message.generation), '--text-file', textFile,
     '--dedupe-key', `agent-result-${message.id}`, '--agent-reply-to', agent.id];
-  return `Write one concise result to the owner-only file ${JSON.stringify(textFile)}. Run agent-send --agent-reply-to ${agent.id} with exact argv ${JSON.stringify(send)}. The recorded request supplies the destination. After it reports sent or duplicate, run the packet's agent-complete command once. If sending fails or is uncertain, keep the request open. Do not post an ordinary Discord reply.`;
+  return `Write one concise result to the owner-only file ${JSON.stringify(textFile)}. Run agent-send --agent-reply-to ${agent.id} with exact argv ${JSON.stringify(send)}. The recorded request supplies the destination. After it reports sent or duplicate, run the packet's agent-complete command once. If sending fails or is uncertain, keep the request open. On duplicate=true for this request, do not repeat side effects. Run the packet's agent-complete command first; completed or duplicate ends this pickup. If no correlated result exists, inspect prior work and the result file. Resume only known unfinished work. For a completed result, reuse the exact agent-send argv and dedupe key. Complete only after sent or duplicate; unknown, failed, stale, or uncertain custody stays open for reconciliation. Do not post an ordinary Discord reply.`;
 }
 
 export function messageRequest(message: NativeMessage, completion: readonly string[] | null | undefined = null): string {

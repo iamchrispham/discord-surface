@@ -238,6 +238,8 @@ test('agent request completion requires a full reversed result receipt', () => {
     assert.equal(state.claimDispatch(requestMessageId).claimed, true);
     state.markSubmitted(requestMessageId);
     recordNativeAcknowledgment(state, { provider: owners.target.provider, messageId: requestMessageId, nativeId: owners.target.nativeId, generation: owners.target.generation });
+    assert.equal(recordNativeAcknowledgment(state, { provider: owners.target.provider, messageId: requestMessageId,
+      nativeId: owners.target.nativeId, generation: owners.target.generation }).duplicate, true);
     assert.throws(() => state.completeAgentHandledWithoutPost({
       messageId: requestMessageId, provider: owners.target.provider, nativeId: owners.target.nativeId, generation: owners.target.generation
     }), /immutable correlated result/);
@@ -304,6 +306,12 @@ test('request completion accepts a Discord-id alias with nonce-only direct-resul
       } });
     assert.equal(result.status, 'unknown');
     assert.equal(state.directPostRows('a2-unknown-result').at(-1).detail.outcome, 'unknown');
+    const unknownRetry = await runDirectPost({ state, token, nativeId: owners.target.nativeId, generation: owners.target.generation,
+      channelId: owners.target.channelId, provider: owners.target.provider, agentThreadId: owners.targetChild.channelId,
+      textFile, dedupeKey: 'a2-unknown-result', agentTarget: issueAgentAddress(owners.source, token),
+      agentKind: KINDS.RESULT, agentReplyTo: messageId,
+      fetchImpl: async () => { throw new Error('unknown result must not be resent'); } });
+    assert.equal(unknownRetry.status, 'unknown');
     const attempt = state.directPostRows('a2-unknown-result').find(row => row.kind === 'direct-post-attempt');
     assert.equal(attempt.detail.agentPacket.replyTo, request.id);
     assert.throws(() => state.completeAgentHandledWithoutPost({ messageId,
@@ -382,6 +390,16 @@ test('agent-complete guards mutation on Gateway capability and requests a wake',
     assert.throws(unsupported, /does not support agent handled-without-post completion/);
     state = new SurfaceState(db);
     assert.equal(state.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
+    assert.equal(recordNativeAcknowledgment(state, { provider: owners.target.provider, messageId,
+      nativeId: owners.target.nativeId, generation: owners.target.generation }).duplicate, true);
+    const duplicateSend = await runDirectPost({
+      state, token, nativeId: owners.target.nativeId, generation: owners.target.generation,
+      channelId: owners.target.channelId, provider: owners.target.provider, agentThreadId: owners.targetChild.channelId, textFile: resultFile,
+      dedupeKey: 'a2-cli-result', agentTarget: issueAgentAddress(owners.source, token),
+      agentKind: KINDS.RESULT, agentReplyTo: request.id,
+      fetchImpl: async () => { throw new Error('persisted result must not be resent'); }
+    });
+    assert.equal(duplicateSend.duplicate, true);
     state.close();
     state = null;
 
