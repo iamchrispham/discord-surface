@@ -297,7 +297,7 @@ function createPeerService(context) {
               requireReadyPeer(state, currentDestination);
             }
             return currentPeerDestination(state, target, destination?.binding || null,
-              input.reply_to === undefined ? null : destination?.childId || null,
+              input.reply_to === undefined ? null : target?.channelId ?? null,
               Boolean(frozenSourceRoute));
           },
           textFile, dedupeKey: input.dedupe_key, custodyKey, signal, fetchImpl,
