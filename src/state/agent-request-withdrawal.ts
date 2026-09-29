@@ -53,7 +53,7 @@ function resultSourceMatches(source: AgentAddress, target: AgentAddress, routing
   if (frozenChildRoute) return sameAddress(source, { ...target, channelId: frozenChildRoute });
   if (routingVersion !== AGENT_ROUTING_VERSION) return sameOwner(source, target);
   return sameAddress(source, target) ||
-    (allowRouteLessParent && recordedTarget !== null && sameAddress(recordedTarget, target) && sameOwner(source, target));
+    (recordedTarget !== null && sameAddress(recordedTarget, target) && sameOwner(source, target));
 }
 
 function hasUniqueRequestTargetEvidence(state: WithdrawalState, request: AgentMessage,

@@ -69,12 +69,13 @@ function replySourceSelectors(state, destination) {
     guildId: binding.guildId, channelId: binding.channelId, provider: binding.provider,
     nativeId: binding.nativeId, generation: binding.generation
   };
+  const activeChildren = state.listThreadEnrollments(binding.channelId)
+    .filter(child => child.active && child.parentChannelId === binding.channelId &&
+      child.guildId === binding.guildId && (childId === null || child.threadId !== childId))
+    .map(child => resolveAgentAddress(state, binding, child.threadId));
   const children = childId === null
-    ? state.listThreadEnrollments(binding.channelId)
-      .filter(child => child.active && child.parentChannelId === binding.channelId &&
-        child.guildId === binding.guildId)
-      .map(child => resolveAgentAddress(state, binding, child.threadId))
-    : [resolveAgentAddress(state, binding, childId)];
+    ? activeChildren
+    : [resolveAgentAddress(state, binding, childId), ...activeChildren];
   return [...children, parent];
 }
 
