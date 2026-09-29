@@ -330,15 +330,19 @@ function sentReplyEvidence(
     if (!validAgentPacket(attemptPacket, KINDS.RESULT) || !validAgentPacket(candidate, KINDS.RESULT) ||
         !sameAgentPacket(candidate, attemptPacket)) continue;
     if (frozenChildRoute && candidate.source.channelId !== frozenChildRoute) continue;
-    const recordedTargetsMatch = [row.attemptDetail.agentRequestTarget, row.outcomeDetail.agentRequestTarget]
-      .every((target) => target == null || sameAddress(target, request.target));
+    const recordedTargets = [row.attemptDetail.agentRequestTarget, row.outcomeDetail.agentRequestTarget];
+    const recordedTargetsMatch = recordedTargets.every((target) => target == null || sameAddress(target, request.target));
+    const uniqueRequestTarget = hasUniqueRequestTarget(state, request, row.outcomeReceiptId, requestReceiptId);
+    const hasRecordedRequestTarget = recordedTargets.some((target) => target !== null && target !== undefined);
+    const routeLessParentChildSource = allowRouteLessParentChildSource &&
+      (uniqueRequestTarget || hasRecordedRequestTarget);
     const exact = sameReverseAddresses(candidate, request) &&
-      (hasUniqueRequestTarget(state, request, row.outcomeReceiptId, requestReceiptId) || recordedTargetsMatch);
+      (uniqueRequestTarget || recordedTargetsMatch);
     const attemptRequestTarget = row.attemptDetail.agentRequestTarget ??
-      (allowRouteLessParentChildSource ? request.target : null);
+      (routeLessParentChildSource ? request.target : null);
     const outcomeRequestTarget = row.outcomeDetail.agentRequestTarget ??
-      (allowRouteLessParentChildSource ? request.target : null);
-    const migrated = (allowLegacyChildSource || allowRouteLessParentChildSource) &&
+      (routeLessParentChildSource ? request.target : null);
+    const migrated = (allowLegacyChildSource || routeLessParentChildSource) &&
       isLegacyChildResult(candidate, request, parentTarget, true) &&
       isLegacyChildResult(candidate, request, attemptRequestTarget, true) &&
       isLegacyChildResult(candidate, request, outcomeRequestTarget, true);

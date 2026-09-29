@@ -72,7 +72,7 @@ function replySourceSelectors(state, destination) {
   const children = childId === null
     ? state.listThreadEnrollments(binding.channelId)
       .filter(child => child.active && child.parentChannelId === binding.channelId &&
-        child.guildId === binding.guildId && child.state === THREAD_STATES.READY)
+        child.guildId === binding.guildId)
       .map(child => resolveAgentAddress(state, binding, child.threadId))
     : [resolveAgentAddress(state, binding, childId)];
   return [...children, parent];
