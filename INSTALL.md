@@ -74,6 +74,8 @@ codex mcp get discord-surface-peer
 
 In the existing bound native session, call `peer_list()` first. It must identify the caller's binding, and the intended recipient must show a ready enrolled child before `peer_send` can reach it. If caller identity is unavailable, fix the native host integration; do not supply another session's UUID through MCP configuration. Registration and a transport `sent` receipt do not prove native pickup or a correlated result. Claude uses the same installed command with `--provider claude` in its native MCP configuration and must pass its existing caller-identity check. See [README.md](README.md#authenticated-peer-mcp) for tool arguments and result evidence.
 
+Peer MCP registration does not steer an active Codex turn. The adapter's Codex intake uses `codex queue --thread`, which delivers a follow-up on a later turn. Active-turn steering needs a separately qualified route to the owning native app-server.
+
 Before a planned release cutover boots out the Gateway, inspect the active state with the same release's `status --state-dir <state>` entrypoint. Check `readiness.intakeWatermarks` and `readiness.threadEnrollments` for every state other than `ready`, including `pending`, `gap`, and `unavailable`. Record each affected channel or thread ID with its boundary detail and bounds, and distinguish retryable holds from terminal permission or identity failures. A non-ready route remains held and non-dispatchable after startup; do not clear it to make the cutover appear ready.
 
 ## Essential live check and return receipt
