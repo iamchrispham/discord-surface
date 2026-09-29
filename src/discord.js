@@ -1,4 +1,5 @@
 const { createIntakeSerialization } = require('./discord/intake-serialization');
+const { createCourierPickupDeadline } = require('./discord/courier-pickup-deadline');
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const { WATCHER_NOTICE_PREFIX } = require('./watcher-notice');
 const path = require('node:path');
@@ -961,6 +962,9 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
         ? Promise.resolve({ status: COURIER_OUTCOMES.NOT_SUBMITTED, message: state.getMessage(message.id) })
         : startNativeWork(message, signal, async taskSignal => {
         let result;
+        const pickupDeadline = selected
+          ? createCourierPickupDeadline(state, message.id, taskSignal, observeOptions.timeoutMs)
+          : null;
         try {
           if (courierCustodyRequiresOwnerHold(message.id)) {
             ownerEntry.dispatchBlocked = true;
@@ -968,7 +972,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
           }
           result = await dispatchAndObserve(state, message.id, providers, {
             ...observeOptions,
-            signal: taskSignal,
+            signal: pickupDeadline?.signal || taskSignal,
             continueUntilFinal,
             ...(selected ? { dispatch: (dispatchMessage, parentProvider, dispatchOptions) => dispatchAtCourierBoundary(dispatchMessage, parentProvider, dispatchOptions, selected) } : {}),
             onDispatchOutcome: outcome => {
@@ -978,8 +982,24 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
               refreshDispatchBlock();
               settleDispatchOutcome?.(outcome);
             },
-            onSubmitted: submitted => settleHandoff?.({ status: 'observing', message: submitted })
+            onSubmitted: submitted => {
+              settleHandoff?.({ status: 'observing', message: submitted });
+              pickupDeadline?.arm();
+            }
           });
+          if (await pickupDeadline?.shouldDispatchParent()) {
+            result = await dispatchAndObserve(state, message.id, providers, {
+              ...observeOptions,
+              signal: taskSignal,
+              continueUntilFinal,
+              onDispatchOutcome: outcome => {
+                if (outcome?.status === 'not_submitted') {
+                  ownerEntry.dispatchBlocked = !hasCurrentNativeAcknowledgment(state.getMessage(message.id));
+                }
+                refreshDispatchBlock();
+              }
+            });
+          }
           const promoted = state.getMessage(message.id);
           if (promoted?.state === MESSAGE_STATES.REPLY_READY && result.message?.state !== MESSAGE_STATES.REPLY_READY) {
             result = { ...result, message: promoted };
@@ -993,6 +1013,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
             });
           }
         } finally {
+          pickupDeadline?.close();
           settleNative();
         }
         return deliverReply(message, result, taskSignal);
@@ -1098,10 +1119,27 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
       };
       const work = startNativeWork(message, signal, async taskSignal => {
         const provider = providers[message.provider];
+        const attempt = state.getCourierAttempt?.(message.id);
+        const pickupDeadline = attempt && !state.hasRetiredCourierAttempt?.(message.id, attempt.attempt.receiptId)
+          ? createCourierPickupDeadline(state, message.id, taskSignal, observeOptions.timeoutMs)
+          : null;
         let result;
         try {
-          result = await observeSubmitted(state, message, provider, { ...observeOptions, signal: taskSignal, continueUntilFinal });
+          pickupDeadline?.arm();
+          result = await observeSubmitted(state, message, provider, {
+            ...observeOptions,
+            signal: pickupDeadline?.signal || taskSignal,
+            continueUntilFinal
+          });
+          if (await pickupDeadline?.shouldDispatchParent()) {
+            result = await dispatchAndObserve(state, message.id, providers, {
+              ...observeOptions,
+              signal: taskSignal,
+              continueUntilFinal
+            });
+          }
         } finally {
+          pickupDeadline?.close();
           settleNative();
         }
         const holdReply = typeof deferReply === 'function' ? deferReply() : deferReply;
