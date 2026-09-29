@@ -260,7 +260,8 @@ function receivedReplyEvidence(
   requestMessageId: string,
   deps: AgentCompletionDependencies,
   allowLegacyChildSource: boolean,
-  parentTarget: AgentAddress
+  parentTarget: AgentAddress,
+  frozenChildRoute: string | null
 ): Record<string, unknown> | null {
   const candidateRows = state.db.prepare(`SELECT id, discord_id, detail FROM receipts
     WHERE kind='agent-message' AND json_extract(detail, '$.packet.kind')=?
@@ -285,6 +286,7 @@ function receivedReplyEvidence(
     const detail = deps.parseJson(candidateRow.detail, null);
     const candidate = detail?.packet;
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
+    if (frozenChildRoute && candidate.source.channelId !== frozenChildRoute) continue;
     const requestReceiptId = requestProvenanceReceiptId(state, requestMessageId);
     const uniqueRequestTarget = hasUniqueRequestTarget(state, request, Number(candidateRow.id), requestReceiptId);
     const exact = sameReverseAddresses(candidate, request);
@@ -310,7 +312,8 @@ function sentReplyEvidence(
   deps: AgentCompletionDependencies,
   allowLegacyChildSource: boolean,
   parentTarget: AgentAddress,
-  requestReceiptId: number
+  requestReceiptId: number,
+  frozenChildRoute: string | null
 ): Record<string, unknown> | null {
   const rows: SentAgentResultRow[] = querySentAgentResultRows({
     db: state.db,
@@ -325,6 +328,7 @@ function sentReplyEvidence(
     const candidate = row.outcomeDetail.agentPacket;
     if (!validAgentPacket(attemptPacket, KINDS.RESULT) || !validAgentPacket(candidate, KINDS.RESULT) ||
         !sameAgentPacket(candidate, attemptPacket)) continue;
+    if (frozenChildRoute && candidate.source.channelId !== frozenChildRoute) continue;
     const recordedTargetsMatch = [row.attemptDetail.agentRequestTarget, row.outcomeDetail.agentRequestTarget]
       .every((target) => target == null || sameAddress(target, request.target));
     const exact = sameReverseAddresses(candidate, request) &&
@@ -429,11 +433,12 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
       if (packet.kind === KINDS.RESULT) {
         evidence = receivedResultEvidence(state, messageId, packet);
       } else {
-        const allowLegacyChildSource = isLegacyAgentReceipt(provenance);
+        const frozenChildRoute = message.agentRoute || null;
+        const allowLegacyChildSource = isLegacyAgentReceipt(provenance) && Boolean(frozenChildRoute);
         const parentTarget = { ...target, channelId: binding.channelId };
         const provenanceReceiptId = requestProvenanceReceiptId(state, messageId);
-        evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget) ||
-          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacyChildSource, parentTarget, provenanceReceiptId);
+        evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget, frozenChildRoute) ||
+          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacyChildSource, parentTarget, provenanceReceiptId, frozenChildRoute);
         if (!evidence) throw new deps.BindingError('agent request lacks an immutable correlated result');
       }
       const detail = {

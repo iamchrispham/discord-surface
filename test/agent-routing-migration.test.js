@@ -10,6 +10,7 @@ const { AGENT_ROUTING_VERSION } = require('../src/state/agent-routing');
 const { runDirectPost } = require('../src/direct-post');
 const { main, agentComplete, agentSend } = require('../src/cli');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
+const { codexPrompt, claudeEvent } = require('../src/native');
 const { encodeAgentMessage, decodeAgentMessage, issueAgentAddress, KINDS } = require('../src/agent-message');
 
 const source = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
@@ -83,6 +84,111 @@ function acceptRequest(f, id, legacy, requestTarget = source, packetId = `reques
   }
   return packet;
 }
+
+function alreadySubmittedLegacyRequest(f, id) {
+  f.state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?')
+    .run(MESSAGE_STATES.SUBMITTED, id);
+}
+
+test('legacy parent request holds without one ready child and freezes the selected route', t => {
+  const f = fixture(t);
+  acceptRequest(f, 'legacy-route', true);
+  assert.equal(f.state.claimDispatch('legacy-route').reason, 'legacy-agent-route-not-unique');
+  assert.equal(f.state.getMessage('legacy-route').state, MESSAGE_STATES.ACCEPTED);
+  enroll(f, '103');
+  const claimed = f.state.claimDispatch('legacy-route');
+  assert.equal(claimed.claimed, true);
+  assert.equal(claimed.message.agentRoute, '103');
+  const completion = ['node', 'cli.js', 'agent-complete', '--state-dir', f.dir, '--db', f.db];
+  const firstPrompt = codexPrompt(claimed.message, null, completion);
+  assert.match(firstPrompt, /--agent-thread-id/);
+  assert.match(firstPrompt, /103/);
+  const firstClaude = claudeEvent(claimed.message, completion);
+  assert.match(firstClaude.content, /--agent-thread-id/);
+  enroll(f, '104');
+  assert.equal(f.state.getMessage('legacy-route').agentRoute, '103');
+  assert.equal(codexPrompt(f.state.getMessage('legacy-route'), null, completion), firstPrompt);
+  assert.deepEqual(claudeEvent(f.state.getMessage('legacy-route'), completion), firstClaude);
+});
+
+test('legacy parent route stays held when children are ambiguous or its frozen child is lost', t => {
+  const f = fixture(t);
+  acceptRequest(f, 'legacy-ambiguous', true);
+  enroll(f, '103');
+  enroll(f, '104');
+  assert.equal(f.state.claimDispatch('legacy-ambiguous').reason, 'legacy-agent-route-not-unique');
+  f.state.markThreadBoundary('104', THREAD_STATES.UNAVAILABLE, 'fixture unavailable', null, null, f.binding);
+  assert.equal(f.state.claimDispatch('legacy-ambiguous').claimed, true);
+  f.state.markNotSubmitted('legacy-ambiguous', new Error('native unavailable'));
+  f.state.markThreadBoundary('103', THREAD_STATES.UNAVAILABLE, 'fixture unavailable', null, null, f.binding);
+  f.state.markThreadBoundary('104', THREAD_STATES.READY, 'fixture ready again', null, null, f.binding);
+  assert.equal(f.state.claimDispatch('legacy-ambiguous').reason, 'legacy-agent-route-not-ready');
+  assert.equal(f.state.getMessage('legacy-ambiguous').agentRoute, '103');
+  assert.equal(f.state.getMessage('legacy-ambiguous').state, MESSAGE_STATES.ACCEPTED);
+});
+
+test('frozen legacy route rejects a sibling result after enrollment changes', async t => {
+  const f = fixture(t);
+  enroll(f, '103');
+  const request = acceptRequest(f, '8119', true);
+  assert.equal(f.state.claimDispatch('8119').claimed, true);
+  f.state.markSubmitted('8119');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8119', nativeId: source.nativeId, generation: 1 });
+  enroll(f, '104');
+  const receivedResult = (discordId, childId) => {
+    acceptRequest(f, discordId, false, { ...source, channelId: childId });
+    const packet = { id: `result-${discordId}`, kind: KINDS.RESULT,
+      source: { ...source, channelId: childId }, target, replyTo: request.id, text: 'Result.' };
+    f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+      .run(JSON.stringify({ packet }), discordId);
+  };
+  const complete = () => agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8119', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  });
+  receivedResult('9019', '104');
+  assert.throws(complete, /immutable correlated result/);
+  const sent = await runDirectPost(input(f, { agentThreadId: '104', dedupeKey: 'sibling-sent',
+    agentKind: KINDS.RESULT, agentReplyTo: request.id,
+    fetchImpl: async (_url, options) => ({ ok: true, status: 200,
+      json: async () => options.method === 'GET' ? { id: target.channelId, guild_id: target.guildId } : { id: 'sibling-sent-discord' } }) }));
+  assert.equal(sent.status, 'sent');
+  assert.throws(complete, /immutable correlated result/);
+  receivedResult('9020', '103');
+  assert.equal(complete().evidence.source.channelId, '103');
+});
+
+test('already submitted parent request without a frozen route rejects later child results', async t => {
+  const f = fixture(t);
+  const request = acceptRequest(f, '8120', true);
+  alreadySubmittedLegacyRequest(f, '8120');
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8120', nativeId: source.nativeId, generation: 1 });
+  const completion = ['node', 'cli.js', 'agent-complete', '--state-dir', f.dir, '--db', f.db];
+  const materializedPayload = codexPrompt(f.state.getMessage('8120'), null, completion);
+  enroll(f, '103');
+  enroll(f, '104');
+  assert.equal(codexPrompt(f.state.getMessage('8120'), null, completion), materializedPayload);
+  assert.equal(f.state.getMessage('8120').agentRoute, null);
+  const receivedPacket = { id: 'late-child-result', kind: KINDS.RESULT,
+    source: { ...source, channelId: '103' }, target, replyTo: request.id, text: 'Result.' };
+  acceptRequest(f, '9021', false, { ...source, channelId: '103' });
+  f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+    .run(JSON.stringify({ packet: receivedPacket }), '9021');
+  const complete = () => agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': '8120', provider: 'codex',
+    'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  });
+  assert.throws(complete, /immutable correlated result/);
+  const sent = await runDirectPost(input(f, { agentThreadId: '104', dedupeKey: 'late-sent',
+    agentKind: KINDS.RESULT, agentReplyTo: request.id,
+    fetchImpl: async (_url, options) => ({ ok: true, status: 200,
+      json: async () => options.method === 'GET' ? { id: target.channelId, guild_id: target.guildId } : { id: 'late-sent-discord' } }) }));
+  assert.equal(sent.status, 'sent');
+  assert.throws(complete, /immutable correlated result/);
+  assert.equal(f.state.getMessage('8120').state, MESSAGE_STATES.SUBMITTED);
+});
 
 test('public agent-send refuses a null destination without becoming an ordinary parent post', async t => {
   const f = fixture(t);
@@ -433,8 +539,7 @@ test('legacy parent requests reject a result received before child readiness', a
   const f = fixture(t);
   const request = acceptRequest(f, '8114', true);
   f.state.enrollThread({ threadId: '103', parentChannelId: '101', guildId: '100', adoptionCutoff: '100'}, f.binding);
-  assert.equal(f.state.claimDispatch('8114').claimed, true);
-  f.state.markSubmitted('8114');
+  alreadySubmittedLegacyRequest(f, '8114');
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8114', nativeId: source.nativeId, generation: 1 });
   const receivedPacket = { id: 'received-before-ready', kind: KINDS.RESULT, source: { ...source, channelId: '103' }, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };
@@ -588,8 +693,7 @@ test('previous child-result custody remains idempotent without migration metadat
 test('legacy parent requests reject received results from an unenrolled child', async t => {
   const f = fixture(t);
   const request = acceptRequest(f, '8113', true);
-  assert.equal(f.state.claimDispatch('8113').claimed, true);
-  f.state.markSubmitted('8113');
+  alreadySubmittedLegacyRequest(f, '8113');
   recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: '8113', nativeId: source.nativeId, generation: 1 });
   const receivedPacket = { id: 'unenrolled-child-result', kind: KINDS.RESULT, source: { ...source, channelId: '999' }, target,
     replyTo: request.id, text: fs.readFileSync(f.textFile, 'utf8') };

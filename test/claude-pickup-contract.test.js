@@ -370,6 +370,44 @@ test('real Monitor payloads carry the shared ACK branch for human, agent, and wa
   }
 });
 
+test('legacy request Monitor payload keeps its frozen child after another child enrolls', async () => {
+  const f = fixture();
+  try {
+    const id = '2201';
+    const packet = { id: 'legacy-2201', kind: KINDS.REQUEST,
+      source: { guildId: GUILD_ID, channelId: '201', provider: 'codex', nativeId: CODEX_ID, generation: 1 },
+      target: { guildId: GUILD_ID, channelId: OWNER_CHANNEL, provider: 'claude',
+        nativeId: CLAUDE_ID, generation: f.binding.generation }, replyTo: null, text: 'Legacy request.' };
+    const stamp = new Date().toISOString();
+    f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id,
+      content, attachments, provider, native_id, workspace, endpoint, generation, state, created_at, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      id, GUILD_ID, OWNER_CHANNEL, OWNER_CHANNEL, '901', encodeAgentMessage(packet, TOKEN), '[]',
+      'claude', CLAUDE_ID, f.dir, f.binding.endpoint, f.binding.generation, MESSAGE_STATES.ACCEPTED, stamp, stamp);
+    f.state.receipt(id, 'agent-message', { packet, authorId: '901' });
+    assert.equal(f.state.claimDispatch(id).message.agentRoute, CHILD_CHANNEL);
+    f.state.markSubmitted(id);
+    const emit = async () => {
+      const { stdout, pointers } = captureStdout();
+      const monitor = createMonitorMcp({ state: f.state, stateDir: f.dir, dbPath: f.db, stdout, cliPath: CLI_PATH });
+      try {
+        await monitor.notification({ method: 'notifications/claude/channel', params: {
+          content: 'ignored', meta: { messageId: id, nativeId: CLAUDE_ID, generation: String(f.binding.generation) }
+        } });
+      } finally { await monitor.close(); }
+      assert.equal(pointers.length, 1);
+      return fs.readFileSync(pointers[0].payloadPath, 'utf8');
+    };
+    const first = await emit();
+    assert.match(first, /--agent-thread-id/);
+    assert.match(first, /102/);
+    f.state.enrollThread({ threadId: '103', parentChannelId: OWNER_CHANNEL, guildId: GUILD_ID,
+      adoptionCutoff: '100' }, f.binding);
+    f.state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture ready', null, null, f.binding);
+    assert.equal(await emit(), first);
+  } finally { dispose(f); }
+});
+
 test('real direct MCP notification carries the shared ACK branch before per-kind work', async () => {
   const f = fixture();
   try {

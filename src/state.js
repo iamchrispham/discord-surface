@@ -4,6 +4,7 @@ const createTopicPublicationHandlers = (...args) => require('./state/topic-publi
 const createSchemaHandlers = (...args) => require('./state/schema').createSchemaHandlers(...args);
 const createConductorCustodyHandlers = (...args) => require('./state/conductor-custody').createConductorCustodyHandlers(...args);
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
+const legacyAgentRequestRoute = require('./state/legacy-agent-request-route');
 const { WATCHER_NOTICE_PREFIX, validateWatcherNotice } = require('./watcher-notice');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -1602,6 +1603,8 @@ class SurfaceState {
           });
           return { claimed: false, message, reason: 'binding-not-ready' };
         }
+        const agentRoute = legacyAgentRequestRoute.claimRoute(this, message);
+        if (!agentRoute.ready) return { claimed: false, message, reason: agentRoute.reason };
         this.db.prepare('UPDATE messages SET state=?, updated_at=? WHERE discord_id=? AND state=?')
           .run(MESSAGE_STATES.DISPATCHING, now(), messageId, MESSAGE_STATES.ACCEPTED);
         this.receipt(messageId, 'dispatching', { generation: message.generation });
@@ -2152,7 +2155,10 @@ class SurfaceState {
     if (message) {
       message.replyParts = this.listReplyParts(messageId);
       const agent = message.content.startsWith(AGENT_PREFIX) ? this.getAgentMessage(messageId) : null;
-      if (agent) message.agentMessage = agent.packet;
+      if (agent) {
+        message.agentMessage = agent.packet;
+        message.agentRoute = legacyAgentRequestRoute.frozenRoute(this, message);
+      }
       const notice = message.content.startsWith(WATCHER_NOTICE_PREFIX) ? this.getWatcherNotice(messageId) : null;
       if (notice) {
         message.watcherNotice = notice.packet;

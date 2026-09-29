@@ -228,7 +228,8 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
           content: messageRequest(message, completion),
           completion,
           watcherNotice,
-          legacyParentRequest: message.agentMessage?.kind === 'request' && message.agentMessage.target.channelId === message.channelId,
+          legacyParentRequest: message.agentMessage?.kind === 'request' &&
+            message.agentMessage.target.channelId === message.channelId && !message.agentRoute,
           agentKind: message.agentMessage?.kind ?? null,
           attachments: message.attachments,
           stateDir: path.resolve(stateDir),
