@@ -114,7 +114,7 @@ function frozenReplySourceRoute(state, replyTo, source, destination = null) {
   const matches = [];
   for (const selector of replySourceSelectors(state, destination)) {
     try {
-      const match = resolveAgentReplyRequestMatch(state, replyTo, sourceAddress, selector, sourceAddress, Error, true);
+      const match = resolveAgentReplyRequestMatch(state, replyTo, sourceAddress, selector, sourceAddress, Error, false);
       if (match.frozenChildRoute) matches.push(match);
     } catch (error) {
       if (error instanceof Error &&

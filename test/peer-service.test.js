@@ -554,6 +554,46 @@ test('peer result resolves a frozen local child before sibling selection', async
   assert.equal(attempt.detail.agentPacket.source.channelId, '102');
 });
 
+test('peer result resolves a stamped frozen parent route before sibling selection', async t => {
+  const f = fixture(t); f.enroll('102'); const recipient = addRecipient(f);
+  const binding = f.state.getBinding('101');
+  const request = {
+    id: 'stamped-frozen-local-source-request',
+    kind: 'request',
+    source: { guildId: '100', channelId: '201', provider: recipient.provider, nativeId: recipient.nativeId, generation: recipient.generation },
+    target: { guildId: '100', channelId: '101', provider: binding.provider, nativeId: binding.nativeId, generation: binding.generation },
+    replyTo: null,
+    routingVersion: 2,
+    text: 'stamped legacy parent request'
+  };
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'stamped-frozen-local-source-discord', '100', '101', '101', '900', encodeAgentMessage(request, 'fixture'), '[]', binding.provider,
+    binding.nativeId, binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED,
+    timestamp, timestamp
+  );
+  f.state.receipt('stamped-frozen-local-source-discord', 'agent-message', { packet: request, authorId: '900', routingVersion: 2 });
+  f.state.receipt('stamped-frozen-local-source-discord', 'accepted', { channelId: '101', generation: binding.generation, readiness: 'ready' });
+  assert.equal(f.state.claimDispatch('stamped-frozen-local-source-discord').claimed, true);
+  assert.equal(f.state.getMessage('stamped-frozen-local-source-discord').agentRoute, '102');
+  f.state.enrollThread({ threadId: '103', parentChannelId: '101', guildId: '100', adoptionCutoff: '100' }, binding);
+  f.state.setThreadBaseline('103', '100', binding);
+  f.state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture', null, null, binding);
+  let postUrl;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '201', guild_id: '100' }) };
+    postUrl = url;
+    return { ok: true, status: 200, json: async () => ({ id: 'stamped-frozen-local-source-result' }) };
+  } });
+  const result = await peer.send({ reply_to: request.id, text: 'result', dedupe_key: 'stamped-frozen-local-source-result' });
+  assert.equal(result.status, 'sent');
+  assert.match(postUrl, /channels\/201\/messages$/);
+  const attempt = f.state.directPostRows('stamped-frozen-local-source-result').find(row => row.kind === 'direct-post-attempt');
+  assert.equal(attempt.detail.agentPacket.source.channelId, '102');
+});
+
 test('peer-qualified legacy reply finds a child-sourced request and keeps its frozen local route', async t => {
   const f = fixture(t); f.enroll('102'); const recipient = addRecipient(f);
   const caller = f.state.getBinding('101');

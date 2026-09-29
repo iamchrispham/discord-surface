@@ -1409,13 +1409,18 @@ class DiscordGateway {
     const pending = this.pendingLegacyParentRecoveryChannels || new Set();
     pending.add(parentChannelId);
     this.pendingLegacyParentRecoveryChannels = pending;
-    if (this.pendingLegacyParentRecoveryQueued) return;
+    this.flushLegacyParentReconciliation();
+  }
+
+  flushLegacyParentReconciliation() {
+    if (this.stopping || !this.started || this.pendingLegacyParentRecoveryQueued) return;
     this.pendingLegacyParentRecoveryQueued = true;
     queueMicrotask(() => {
       this.pendingLegacyParentRecoveryQueued = false;
+      if (this.stopping || !this.started) return;
       const channelIds = [...(this.pendingLegacyParentRecoveryChannels || [])];
       this.pendingLegacyParentRecoveryChannels?.clear();
-      if (this.stopping || !channelIds.length) return;
+      if (!channelIds.length) return;
       const messageIds = heldParentRequestIds(this.state, channelIds);
       if (!messageIds.length) return;
       void this.reconcilePending(undefined, {
@@ -1751,6 +1756,7 @@ class DiscordGateway {
       if (hasEndpointUnavailableBinding) this.ready = true;
       this.transportReady = true;
       this.started = true;
+      this.flushLegacyParentReconciliation();
       this.resolveInteractionRecovery(true);
       this.schedulePendingHandoffRecoveryPoll();
       this.acknowledgments = watchAcknowledgments({
@@ -2182,9 +2188,16 @@ class DiscordGateway {
           const parentChannels = threads
             .map(channelId => this.state.getThreadEnrollment(channelId)?.parentChannelId)
             .filter(Boolean);
-          const recoveryChannels = [...new Set([...threads, ...parentChannels])];
           if (!controller.signal.aborted && this.isCurrentLifecycle(epoch)) {
-            await this.reconcilePending(undefined, { readyOnly: true, channelIds: recoveryChannels });
+            await this.reconcilePending(undefined, { readyOnly: true, channelIds: threads });
+            const parentRequestIds = heldParentRequestIds(this.state, [...new Set(parentChannels)]);
+            if (parentRequestIds.length && !controller.signal.aborted && this.isCurrentLifecycle(epoch)) {
+              await this.reconcilePending(undefined, {
+                readyOnly: true,
+                channelIds: [...new Set(parentChannels)],
+                messageIds: parentRequestIds
+              });
+            }
           }
         }
         return result;
@@ -3286,13 +3299,17 @@ class DiscordGateway {
     const passConnectionEpoch = this.connectionEpoch;
     const reconciliationConnection = { gateway: this, epoch: passConnectionEpoch };
     const selectedChannels = channelIds ? new Set(channelIds) : null;
-    if (selectedChannels) {
+    const selectedMessages = messageIds ? new Set(messageIds) : null;
+    if (selectedChannels && selectedMessages) {
       for (const channelId of [...selectedChannels]) {
         const enrollment = this.state.getThreadEnrollment(channelId);
-        if (enrollment?.active && enrollment.parentChannelId) selectedChannels.add(enrollment.parentChannelId);
+        if (!enrollment?.active || !enrollment.parentChannelId) continue;
+        const heldParentIds = heldParentRequestIds(this.state, [enrollment.parentChannelId]);
+        if (heldParentIds.some(messageId => selectedMessages.has(messageId))) {
+          selectedChannels.add(enrollment.parentChannelId);
+        }
       }
     }
-    const selectedMessages = messageIds ? new Set(messageIds) : null;
     this.consumer?.releaseHandledWithoutPost?.();
     const isHeldDurable = message => message.state === 'submitted' || message.state === 'reply_ready';
     const allowed = message => (!selectedMessages || selectedMessages.has(message.id)) &&
