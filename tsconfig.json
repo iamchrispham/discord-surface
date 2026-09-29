@@ -69,6 +69,7 @@
     "src/direct-post-file.ts",
     "src/state/agent-completion.ts",
     "src/state/agent-completion/contracts.ts",
+    "src/state/agent-request-target-evidence.ts",
     "src/state/agent-request-withdrawal.ts",
     "src/state/watcher-notice.ts",
     "src/state/watcher-notice/contracts.ts",

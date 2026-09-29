@@ -147,15 +147,14 @@ test('withdrawal ignores a sibling result when a legacy parent route is frozen',
   assert.equal(fixture.state.getMessage(messageId).state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
 });
 
-test('withdrawal preserves route-less stamped parent child result custody', t => {
+function routeLessStampedParent(t, messageId, packetId) {
   const fixture = setup(t);
   const sourceBinding = fixture.state.getBinding(requester.channelId);
   const targetBinding = fixture.state.getBinding(recipient.channelId);
   const sourceParent = { ...requester, generation: sourceBinding.generation };
   const targetParent = { ...recipient, generation: targetBinding.generation };
-  const packet = { id: 'route-less-stamped-withdraw', kind: KINDS.REQUEST, source: sourceParent, target: targetParent,
+  const packet = { id: packetId, kind: KINDS.REQUEST, source: sourceParent, target: targetParent,
     replyTo: null, text: 'Route-less stamped parent request.' };
-  const messageId = '8111';
   const timestamp = new Date().toISOString();
   fixture.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
     provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
@@ -172,14 +171,43 @@ test('withdrawal preserves route-less stamped parent child result custody', t =>
   fixture.state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.SUBMITTED, messageId);
   recordNativeAcknowledgment(fixture.state, { provider: targetParent.provider, messageId,
     nativeId: targetParent.nativeId, generation: targetParent.generation });
+  return { fixture, packet, sourceParent, targetParent, messageId };
+}
+
+test('withdrawal preserves route-less stamped parent child result custody', t => {
+  const { fixture, packet, sourceParent, targetParent, messageId } = routeLessStampedParent(t, '8111', 'route-less-stamped-withdraw');
   const childResult = { id: 'route-less-stamped-child-result', kind: KINDS.RESULT,
     source: { ...targetParent, channelId: '104' }, target: sourceParent, replyTo: packet.id,
     routingVersion: 2, text: 'Child result already has immutable send custody.' };
   fixture.state.receipt(null, 'direct-post-attempt', { agentPacket: childResult });
+  const laterSibling = { ...packet, target: { ...targetParent, channelId: '105' } };
+  assert.equal(fixture.state.acceptDiscordMessage({ id: '8112', guildId: '100', channelId: '105', authorId: '901',
+    isBot: true, attachments: [], content: encodeAgentMessage(laterSibling, token) }, { agentToken: token }).accepted, true);
   assert.throws(() => fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id,
     provider: sourceParent.provider, nativeId: sourceParent.nativeId, generation: sourceParent.generation }),
     /reply or result custody/);
   assert.equal(fixture.state.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
+});
+
+test('route-less withdrawal rejects a late child result without claiming a sibling', t => {
+  const { fixture, packet, sourceParent, targetParent, messageId } = routeLessStampedParent(t, '8113', 'route-less-late');
+  assert.equal(fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id,
+    provider: sourceParent.provider, nativeId: sourceParent.nativeId, generation: sourceParent.generation }).withdrawn, true);
+  const lateResult = { id: 'route-less-late-result', kind: KINDS.RESULT,
+    source: { ...targetParent, channelId: '104' }, target: sourceParent, replyTo: packet.id, text: 'Late child result.' };
+  const reopened = new SurfaceState(path.join(fixture.dir, 'surface.sqlite'));
+  try {
+    assert.equal(reopened.isAgentResultForWithdrawnRequest(lateResult), true);
+    const intake = reopened.acceptDiscordMessage({ id: '8114', guildId: '100', channelId: sourceParent.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(lateResult, token) }, { agentToken: token });
+    assert.equal(intake.reason, 'agent-request-withdrawn');
+    assert.equal(reopened.getMessage('8114'), null);
+    const siblingRequest = { ...packet, target: { ...targetParent, channelId: '105' } };
+    assert.equal(reopened.acceptDiscordMessage({ id: '8115', guildId: '100', channelId: '105', authorId: '901',
+      isBot: true, attachments: [], content: encodeAgentMessage(siblingRequest, token) }, { agentToken: token }).accepted, true);
+    assert.equal(reopened.isAgentResultForWithdrawnRequest({ ...lateResult,
+      id: 'route-less-sibling-result', source: siblingRequest.target }), false);
+  } finally { reopened.close(); }
 });
 
 test('legacy request custody still recognizes a child result from the same owner', t => {

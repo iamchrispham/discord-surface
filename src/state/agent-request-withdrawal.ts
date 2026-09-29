@@ -2,6 +2,7 @@ import { KINDS, sameAddress, validateAgentMessage, type AgentAddress, type Agent
 import type { CompletionState, CompletionMessage, ErrorConstructor } from './agent-completion/contracts';
 import { NATIVE_REPLY_FILE_PHASES } from './native-reply-file';
 import { AGENT_ROUTING_VERSION } from './agent-routing';
+import { hasUniqueRequestTarget } from './agent-request-target-evidence';
 
 export const AGENT_WITHDRAWAL_RECEIPTS = Object.freeze({ REQUEST_WITHDRAWN: 'agent-request-withdrawn' } as const);
 
@@ -49,31 +50,22 @@ function sourceRouteMatches(route: ReturnType<WithdrawalState['getMessageRoute']
 }
 
 function resultSourceMatches(source: AgentAddress, target: AgentAddress, routingVersion: unknown,
-  frozenChildRoute: string | null = null, allowRouteLessParent = false, recordedTarget: unknown = null): boolean {
+  frozenChildRoute: string | null = null, recordedTarget: unknown = null): boolean {
   if (frozenChildRoute) return sameAddress(source, { ...target, channelId: frozenChildRoute });
   if (routingVersion !== AGENT_ROUTING_VERSION) return sameOwner(source, target);
   return sameAddress(source, target) ||
     (recordedTarget !== null && sameAddress(recordedTarget, target) && sameOwner(source, target));
 }
 
-function hasUniqueRequestTargetEvidence(state: WithdrawalState, request: AgentMessage,
-  parseJson: WithdrawalDependencies['parseJson']): boolean {
-  const rows = state.db.prepare(`SELECT detail FROM receipts
-    WHERE kind='agent-message' AND json_extract(detail, '$.packet.id')=?`).all(request.id);
-  const targets: AgentAddress[] = [];
-  for (const row of rows) {
-    const packet = parseJson(row.detail, null)?.packet;
-    if (!validPacket(packet, KINDS.REQUEST) || !sameAddress(packet.source, request.source)) continue;
-    if (!targets.some(target => sameAddress(target, packet.target))) targets.push(packet.target);
-    if (targets.length > 1) return false;
-  }
-  return targets.length === 1 && sameAddress(targets[0], request.target);
+function latestReceiptId(state: WithdrawalState): number {
+  const row = state.db.prepare('SELECT MAX(id) AS id FROM receipts').get() as { id?: number } | undefined;
+  return Number.isSafeInteger(row?.id) ? Number(row?.id) : 0;
 }
 
 function reverseResult(packet: AgentMessage, request: AgentMessage, routingVersion: unknown,
-  frozenChildRoute: string | null = null, allowRouteLessParent = false, recordedTarget: unknown = null): boolean {
+  frozenChildRoute: string | null = null, recordedTarget: unknown = null): boolean {
   return packet.kind === KINDS.RESULT && packet.replyTo === request.id &&
-    resultSourceMatches(packet.source, request.target, routingVersion, frozenChildRoute, allowRouteLessParent, recordedTarget) &&
+    resultSourceMatches(packet.source, request.target, routingVersion, frozenChildRoute, recordedTarget) &&
     sameAddress(packet.target, request.source);
 }
 
@@ -83,21 +75,30 @@ function withdrawnRequestForResult(state: WithdrawalState, packet: AgentMessage,
   const rows = state.db.prepare(`SELECT detail FROM receipts
     WHERE kind=? AND json_extract(detail, '$.packetId')=? ORDER BY id DESC`)
     .all(AGENT_WITHDRAWAL_RECEIPTS.REQUEST_WITHDRAWN, packet.replyTo);
+  const candidateReceiptId = latestReceiptId(state);
   for (const row of rows) {
     const detail = parseJson(row.detail, null);
     const source = detail?.source;
     const target = detail?.target;
     const frozenChildRoute = typeof detail?.frozenChildRoute === 'string' ? detail.frozenChildRoute : null;
-    if (source && target && resultSourceMatches(packet.source, target as AgentAddress, detail.routingVersion, frozenChildRoute) &&
-        sameAddress(packet.target, source)) return detail;
+    if (!source || !target || !sameAddress(packet.target, source)) continue;
+    const request = { id: packet.replyTo, source: source as AgentAddress, target: target as AgentAddress };
+    const targetRoute = state.getMessageRoute(request.target.channelId);
+    const routeLessCandidate = detail.routeLessParent === true ||
+      (detail.routeLessParent === undefined && detail.routingVersion === AGENT_ROUTING_VERSION &&
+        frozenChildRoute === null && targetRoute?.binding.channelId === request.target.channelId);
+    const routeLessParent = routeLessCandidate && hasUniqueRequestTarget(state, request,
+      candidateReceiptId, Number(detail.provenanceReceiptId) || 0);
+    if (resultSourceMatches(packet.source, request.target, detail.routingVersion, frozenChildRoute,
+      routeLessParent ? request.target : null)) return detail;
   }
   return null;
 }
 
 function resultCustody(state: WithdrawalState, request: AgentMessage, routingVersion: unknown,
   parseJson: WithdrawalDependencies['parseJson'], frozenChildRoute: string | null = null,
-  allowRouteLessParent = false): boolean {
-  const rows = state.db.prepare(`SELECT kind, detail FROM receipts
+  routeLessParentCandidate = false, requestReceiptId = 0): boolean {
+  const rows = state.db.prepare(`SELECT id, kind, detail FROM receipts
     WHERE kind IN ('agent-message', 'direct-post-attempt', 'direct-post-outcome')
       AND (json_extract(detail, '$.packet.replyTo')=?
         OR json_extract(detail, '$.agentPacket.replyTo')=?
@@ -105,6 +106,8 @@ function resultCustody(state: WithdrawalState, request: AgentMessage, routingVer
     .all(request.id, request.id, request.id);
   for (const row of rows) {
     const detail = parseJson(row.detail, null);
+    const allowRouteLessParent = routeLessParentCandidate && hasUniqueRequestTarget(state, request,
+      Number(row.id), requestReceiptId);
     for (const { packet: candidate, recordedTarget } of [
       { packet: detail?.packet, recordedTarget: null },
       { packet: detail?.agentPacket,
@@ -113,7 +116,7 @@ function resultCustody(state: WithdrawalState, request: AgentMessage, routingVer
         recordedTarget: detail?.agentRequestTarget ?? (allowRouteLessParent && row.kind !== 'agent-message' ? request.target : null) }
     ]) {
       if (validPacket(candidate, KINDS.RESULT) && reverseResult(candidate, request, routingVersion,
-        frozenChildRoute, allowRouteLessParent, recordedTarget)) return true;
+        frozenChildRoute, recordedTarget)) return true;
     }
   }
   return false;
@@ -201,17 +204,21 @@ export function createAgentRequestWithdrawalHandlers(deps: WithdrawalDependencie
       }
       if (!state.hasNativeAcknowledgment(message)) throw new deps.BindingError('agent request withdrawal requires native acknowledgment');
       const routingVersion = original?.routingVersion === AGENT_ROUTING_VERSION ? AGENT_ROUTING_VERSION : null;
-      const allowRouteLessParent = packet.target.channelId === message.channelId &&
-        hasUniqueRequestTargetEvidence(state, packet, deps.parseJson);
+      const routeLessParentCandidate = routingVersion === AGENT_ROUTING_VERSION && !message.agentRoute &&
+        state.getMessageRoute(packet.target.channelId)?.binding.channelId === packet.target.channelId;
+      const requestReceiptId = Number(provenance[0]?.id);
       if (replyCustody(state, message) ||
-          resultCustody(state, packet, routingVersion, deps.parseJson, message.agentRoute || null, allowRouteLessParent)) {
+          resultCustody(state, packet, routingVersion, deps.parseJson, message.agentRoute || null,
+            routeLessParentCandidate, requestReceiptId)) {
         throw new deps.BindingError('agent request has reply or result custody');
       }
+      const routeLessParent = routeLessParentCandidate && hasUniqueRequestTarget(state, packet,
+        latestReceiptId(state), requestReceiptId);
       const result = state.db.prepare('UPDATE messages SET state=?, error=NULL, updated_at=? WHERE discord_id=? AND state=?')
         .run(deps.MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST, deps.now(), messageId, deps.MESSAGE_STATES.SUBMITTED);
       if (Number(result.changes) !== 1) throw new deps.StateCorruptError('agent request changed concurrently');
       const detail = { packetId: packet.id, source: packet.source, target: packet.target,
-        routingVersion,
+        routingVersion, routeLessParent,
         ...(message.agentRoute ? { frozenChildRoute: message.agentRoute } : {}),
         requester: { provider: input.provider, nativeId: input.nativeId, generation: input.generation },
         provenanceReceiptId: provenance[0]?.id };
