@@ -318,8 +318,9 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;
   let recorded = false;
+  const allowUnreadyAgentRoute = agentKind === KINDS.RESULT && address.channelId !== binding.channelId;
   const currentBinding = () => {
-    if (!watcherNotice) return state.directPostBindingCurrent(binding, operatorId, address.channelId);
+    if (!watcherNotice) return state.directPostBindingCurrent(binding, operatorId, address.channelId, allowUnreadyAgentRoute);
     try {
       state.authorizeWatcherNoticeSend?.(watcherNotice.packet);
       return true;

@@ -1938,7 +1938,7 @@ class SurfaceState {
     return recovered;
   }
 
-  directPostBindingCurrent(binding, operatorId = null, deliveryChannelId = null) {
+  directPostBindingCurrent(binding, operatorId = null, deliveryChannelId = null, allowUnreadyDelivery = false) {
     const config = this.requireConfig();
     const current = this.getBinding(binding?.channelId);
     const parentCurrent = Boolean(binding && current && bindingMatchesExpected(current, binding) && current.guildId === config.guildId &&
@@ -1948,7 +1948,7 @@ class SurfaceState {
     const route = this.getMessageRoute(deliveryChannelId);
     return Boolean(route?.enrollment?.active && route.enrollment.threadId === deliveryChannelId &&
       route.enrollment.parentChannelId === current.channelId && route.enrollment.guildId === config.guildId &&
-      route.binding.channelId === current.channelId && route.ready);
+      route.binding.channelId === current.channelId && (route.ready || allowUnreadyDelivery));
   }
 
   captureBoardRevision(target) {

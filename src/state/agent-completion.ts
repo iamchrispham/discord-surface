@@ -438,7 +438,7 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
         const legacyParentRequest = packet.kind === KINDS.REQUEST && packet.target.channelId === message.channelId;
         const allowLegacyChildSource = legacyParentRequest && Boolean(frozenChildRoute);
         // Route-less compatibility is limited to immutable send custody, never a new received child result.
-        const allowLegacySentChildSource = legacyProvenance || (legacyParentRequest && !frozenChildRoute);
+        const allowLegacySentChildSource = legacyProvenance || legacyParentRequest;
         const parentTarget = { ...target, channelId: binding.channelId };
         const provenanceReceiptId = requestProvenanceReceiptId(state, messageId);
         evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget, frozenChildRoute) ||
