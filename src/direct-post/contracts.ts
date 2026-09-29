@@ -111,6 +111,7 @@ export interface DirectPostState {
   getMessageRoute?(deliveryChannelId: string): DirectPostRoute | null;
   directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
   listReceipts(): DirectPostReceiptRow[];
+  getMessage?(messageId: string): { agentRoute?: string | null } | null;
   isAgentRequestWithdrawn(packet: AgentMessage): boolean;
   recoverDirectPostReceipts(): void;
   inspectDirectPostPart(meta: DirectPostPartMeta): DirectPostInspection | null;

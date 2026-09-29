@@ -206,7 +206,7 @@ function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | Le
 
 export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, source: AgentAddress,
   target: AgentAddress | null = null, legacyParent: AgentAddress | null = null,
-  BindingError: BindingErrorConstructor, requireLegacy = false): AgentMessage {
+  BindingError: BindingErrorConstructor, requireLegacy = false, requireFrozenChild = false): AgentMessage {
   const rows = state.listReceipts();
   const candidates = rows
     .filter(row => row.kind === 'agent-message')
@@ -229,6 +229,11 @@ export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string
   if (!match) throw new BindingError('agent reply target is unknown or does not match the active request');
   if (state.isAgentRequestWithdrawn(match.packet as unknown as AgentMessage)) {
     throw new BindingError('agent request was withdrawn');
+  }
+  if (requireFrozenChild && match.legacy && match.packet.target &&
+      (match.packet.target as AgentAddress).channelId !== source.channelId &&
+      (!match.discordId || state.getMessage?.(match.discordId)?.agentRoute !== source.channelId)) {
+    throw new BindingError('agent result source does not match the request frozen child route');
   }
   return match.packet as unknown as AgentMessage;
 }

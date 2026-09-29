@@ -444,7 +444,16 @@ test('peer result preserves current and rejects stale legacy parent destinations
     target: { guildId: '100', channelId: '201', provider: 'codex', nativeId: target.nativeId, generation: target.generation },
     replyTo: null, text: 'legacy request'
   };
-  f.state.receipt(null, 'agent-message', { packet: request });
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id,
+    content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation,
+    state, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'legacy-parent-discord', '100', '201', '201', '901', encodeAgentMessage(request, 'fixture'), '[]',
+    target.provider, target.nativeId, target.workspace, target.endpoint, target.conductorId, target.repoKey,
+    target.generation, 'accepted', timestamp, timestamp);
+  f.state.receipt('legacy-parent-discord', 'agent-message', { packet: request, authorId: '901' });
+  f.state.receipt('legacy-parent-discord', 'accepted', { channelId: '201', generation: target.generation, readiness: 'ready' });
+  assert.equal(f.state.claimDispatch('legacy-parent-discord').claimed, true);
   const calls = [];
   const recipient = createPeerService({ state: f.state, provider: 'codex', token: 'fixture',
     callerDependencies: { environment: { CODEX_THREAD_ID: target.nativeId } },

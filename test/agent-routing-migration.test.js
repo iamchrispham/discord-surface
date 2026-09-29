@@ -149,11 +149,12 @@ test('frozen legacy route rejects a sibling result after enrollment changes', as
   });
   receivedResult('9019', '104');
   assert.throws(complete, /immutable correlated result/);
-  const sent = await runDirectPost(input(f, { agentThreadId: '104', dedupeKey: 'sibling-sent',
+  let networkCalls = 0;
+  await assert.rejects(runDirectPost(input(f, { agentThreadId: '104', dedupeKey: 'sibling-sent',
     agentKind: KINDS.RESULT, agentReplyTo: request.id,
-    fetchImpl: async (_url, options) => ({ ok: true, status: 200,
-      json: async () => options.method === 'GET' ? { id: target.channelId, guild_id: target.guildId } : { id: 'sibling-sent-discord' } }) }));
-  assert.equal(sent.status, 'sent');
+    fetchImpl: async () => { networkCalls++; throw new Error('unexpected network call'); } })), /frozen child route/);
+  assert.equal(networkCalls, 0);
+  assert.deepEqual(f.state.directPostRows('sibling-sent'), []);
   assert.throws(complete, /immutable correlated result/);
   receivedResult('9020', '103');
   assert.equal(complete().evidence.source.channelId, '103');
@@ -181,11 +182,12 @@ test('already submitted parent request without a frozen route rejects later chil
     requestGatewayRecovery: () => ({ requested: false }), print: () => {}
   });
   assert.throws(complete, /immutable correlated result/);
-  const sent = await runDirectPost(input(f, { agentThreadId: '104', dedupeKey: 'late-sent',
+  let networkCalls = 0;
+  await assert.rejects(runDirectPost(input(f, { agentThreadId: '104', dedupeKey: 'late-sent',
     agentKind: KINDS.RESULT, agentReplyTo: request.id,
-    fetchImpl: async (_url, options) => ({ ok: true, status: 200,
-      json: async () => options.method === 'GET' ? { id: target.channelId, guild_id: target.guildId } : { id: 'late-sent-discord' } }) }));
-  assert.equal(sent.status, 'sent');
+    fetchImpl: async () => { networkCalls++; throw new Error('unexpected network call'); } })), /frozen child route/);
+  assert.equal(networkCalls, 0);
+  assert.deepEqual(f.state.directPostRows('late-sent'), []);
   assert.throws(complete, /immutable correlated result/);
   assert.equal(f.state.getMessage('8120').state, MESSAGE_STATES.SUBMITTED);
 });
@@ -806,6 +808,16 @@ for (const targetedChild of [false, true]) {
     const request = acceptRequest(sender, '9200', true, requestTarget);
     const original = legacyPost(sender, 'not_sent', { id: 'result-migration', kind: KINDS.RESULT,
       source: requestTarget, target, replyTo: request.id, text: fs.readFileSync(sender.textFile, 'utf8') });
+    if (!targetedChild) {
+      const before = sender.state.directPostRows(original.id);
+      let networkCalls = 0;
+      await assert.rejects(runDirectPost(input(sender, { dedupeKey: original.id, agentKind: KINDS.RESULT,
+        agentReplyTo: request.id, agentTarget: null,
+        fetchImpl: async () => { networkCalls++; throw new Error('unexpected network call'); } })), /frozen child route/);
+      assert.equal(networkCalls, 0);
+      assert.deepEqual(sender.state.directPostRows(original.id), before);
+      return;
+    }
     const receiver = fixture(t);
     receiver.state.bind({ ...target, workspace: receiver.dir, endpoint: '/tmp/legacy-result-fixture.sock', conductorId: 'receiver', repoKey: 'receiver' }, { intakeCutoff: '100' });
     receiver.state.receipt(null, 'direct-post-outcome', { outcome: 'sent', agentPacket: request });
