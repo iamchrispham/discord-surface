@@ -1,15 +1,5 @@
-// Issue #146 RED lifecycle fixture.
-//
-// An unloaded courier is a message whose `codex queue` admission reported
-// `submitted` (a durable courier attempt exists) but which never received native
-// pickup (no forward claim and no native acknowledgment). Today nothing retires
-// that submitted attempt when a later same-owner message arrives, so the parent
-// is never dispatched directly. Test 1 pins the missing automatic behavior and
-// intentionally fails at the current head; test 2 pins the negative space: an
-// in-flight forward claim must keep its submitted attempt.
-//
-// Only two test cases live here. The disposable fixture is inlined (mirroring
-// test/courier-retirement-order.test.js) so no shared helper is imported for it.
+// A queue-admitted courier without a forward claim must not hold its parent
+// indefinitely. A claimed attempt must never be retired by the pickup deadline.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -25,7 +15,7 @@ const PARENT_NATIVE = '11111111-1111-1111-1111-111111111111';
 const SOURCE_NATIVE = '22222222-2222-2222-2222-222222222222';
 const COURIER_NATIVE = '33333333-3333-3333-3333-333333333333';
 
-test('unloaded courier automatically retires its submitted attempt and dispatches the parent once', { timeout: 5000 }, async t => {
+async function unloadedCourierCase(t, { restart = false } = {}) {
   const watchdog = setTimeout(() => { console.error('issue146 fixture watchdog'); process.exit(70); }, 8000);
   watchdog.unref();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'courier-unloaded-146-'));
@@ -84,7 +74,7 @@ test('unloaded courier automatically retires its submitted attempt and dispatche
     let enteredResolve;
     const entered = new Promise(resolve => { enteredResolve = resolve; });
     const directCalls = [];
-    consumer = createSurfaceConsumer({
+    const makeConsumer = () => createSurfaceConsumer({
       state,
       courierRoute: { routeId: route.routeId },
       providers: {
@@ -111,12 +101,21 @@ test('unloaded courier automatically retires its submitted attempt and dispatche
       sendTransportReceipt: async () => ({ id: 'receipt' }),
       observeOptions: { timeoutMs: 25 }
     });
+    consumer = makeConsumer();
 
-    const first = consumer.processAccepted(state.getMessage('9000'), undefined, { continueUntilFinal: true });
+    let first = consumer.processAccepted(state.getMessage('9000'), undefined, { continueUntilFinal: true });
     started.push(first);
     await entered;
     assert.equal(state.getMessage('9000').state, 'submitted', 'courier attempt was not admitted as submitted');
     assert.ok(state.getCourierAttempt('9000'), 'courier attempt was not persisted');
+    if (restart) {
+      consumer.abortNativeWork();
+      await consumer.waitForNativeWork();
+      await new Promise(resolve => setTimeout(resolve, 60));
+      consumer = makeConsumer();
+      first = consumer.resumeSubmitted(state.getMessage('9000'), undefined, { continueUntilFinal: true });
+      started.push(first);
+    }
 
     const siblingAccepted = state.acceptDiscordMessage({
       id: '9002',
@@ -150,7 +149,10 @@ test('unloaded courier automatically retires its submitted attempt and dispatche
     if (state) { try { state.close(); } catch {} }
     fs.rmSync(dir, { recursive: true, force: true });
   }
-});
+}
+
+test('unloaded courier automatically retires its submitted attempt and dispatches the parent once', { timeout: 5000 }, unloadedCourierCase);
+test('restart uses the durable courier deadline and dispatches the parent once', { timeout: 5000 }, t => unloadedCourierCase(t, { restart: true }));
 
 test('a courier forward claim keeps its submitted attempt', { timeout: 5000 }, async t => {
   const watchdog = setTimeout(() => { console.error('issue146 fixture watchdog'); process.exit(70); }, 8000);
