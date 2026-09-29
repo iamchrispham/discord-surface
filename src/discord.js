@@ -2143,8 +2143,12 @@ class DiscordGateway {
         advancedChannels = result instanceof Set ? result : new Set();
         const threads = [...advancedChannels].filter(channelId => this.state.getThreadEnrollment(channelId)?.active);
         if (threads.length) {
+          const parentChannels = threads
+            .map(channelId => this.state.getThreadEnrollment(channelId)?.parentChannelId)
+            .filter(Boolean);
+          const recoveryChannels = [...new Set([...threads, ...parentChannels])];
           if (!controller.signal.aborted && this.isCurrentLifecycle(epoch)) {
-            await this.reconcilePending(undefined, { readyOnly: true, channelIds: threads });
+            await this.reconcilePending(undefined, { readyOnly: true, channelIds: recoveryChannels });
           }
         }
         return result;
