@@ -25,7 +25,7 @@ function samePeerBinding(left, right) {
     (left.repoKey ?? null) === (right.repoKey ?? null);
 }
 
-function currentPeerDestination(state, target, expectedBinding = null, expectedChildId = null) {
+function currentPeerDestination(state, target, expectedBinding = null, expectedChildId = null, allowUnreadyChild = false) {
   if (!target || typeof target !== 'object') return false;
   const { guildId } = state.requireConfig();
   const candidates = state.listBindings().filter(binding =>
@@ -40,7 +40,7 @@ function currentPeerDestination(state, target, expectedBinding = null, expectedC
     const watermark = state.getIntakeWatermark(binding.channelId);
     const parentRoute = binding.channelId === target.channelId &&
       (!expectedBinding || samePeerBinding(binding, expectedBinding));
-    const childRoute = children.some(child => child.state === THREAD_STATES.READY &&
+    const childRoute = children.some(child => (allowUnreadyChild || child.state === THREAD_STATES.READY) &&
       child.threadId === target.channelId &&
       (expectedChildId === null || expectedChildId === child.threadId));
     return binding.readiness === READINESS.READY &&
@@ -238,16 +238,20 @@ function createPeerService(context) {
       }
       let agentTarget = null;
       let destination = null;
+      let destinationBinding = null;
       if (input.peer !== undefined) {
-        const destinationBinding = resolvePeerBinding(state, input.peer, channels);
+        destinationBinding = resolvePeerBinding(state, input.peer, channels);
+      }
+      const frozenSourceRoute = input.reply_to === undefined
+        ? null
+        : frozenReplySourceRoute(state, input.reply_to, source,
+          destinationBinding ? { binding: destinationBinding, childId: null } : null);
+      const sourceRoute = frozenSourceRoute || requireReadyPeer(state, source);
+      if (destinationBinding) {
         destination = input.reply_to === undefined
           ? requireReadyPeer(state, destinationBinding)
           : requireReadyReplyPeer(state, destinationBinding);
       }
-      const frozenSourceRoute = input.reply_to === undefined
-        ? null
-        : frozenReplySourceRoute(state, input.reply_to, source, destination);
-      const sourceRoute = frozenSourceRoute || requireReadyPeer(state, source);
       const sourceReadiness = source.readiness;
       const sourceIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
       const sourceAddress = resolveAgentAddress(state, source, sourceRoute.childId);
@@ -283,7 +287,8 @@ function createPeerService(context) {
               requireReadyPeer(state, currentSource);
             } else {
               const currentSourceRoute = state.getMessageRoute?.(sourceRoute.childId);
-              if (!currentSourceRoute || !samePeerBinding(currentSourceRoute.binding, currentSource)) return false;
+              if (!currentSourceRoute || !samePeerBinding(currentSourceRoute.binding, currentSource) ||
+                  (!frozenSourceRoute && !currentSourceRoute.ready)) return false;
             }
             if (input.reply_to === undefined && destination?.binding) {
               const currentDestination = state.getBinding(destination.binding.channelId);
@@ -291,7 +296,8 @@ function createPeerService(context) {
               requireReadyPeer(state, currentDestination);
             }
             return currentPeerDestination(state, target, destination?.binding || null,
-              input.reply_to === undefined ? null : destination?.childId || null);
+              input.reply_to === undefined ? null : destination?.childId || null,
+              Boolean(frozenSourceRoute));
           },
           textFile, dedupeKey: input.dedupe_key, custodyKey, signal, fetchImpl,
           ...(fileSource === null ? {} : { preparedTextSource: fileSource }) });

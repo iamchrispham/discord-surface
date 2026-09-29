@@ -660,6 +660,41 @@ test('correlated reply keeps a recorded child route when another child enrolls',
   assert.match(postUrl, /channels\/202\/messages$/);
 });
 
+test('correlated reply keeps a remote child route after destination demotion', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
+  const caller = f.state.getBinding('101');
+  const request = {
+    id: 'remote-child-demotion-request', kind: 'request',
+    source: { guildId: target.guildId, channelId: '202', provider: target.provider,
+      nativeId: target.nativeId, generation: target.generation },
+    target: { guildId: caller.guildId, channelId: caller.channelId, provider: caller.provider,
+      nativeId: caller.nativeId, generation: caller.generation },
+    replyTo: null, text: 'remote child request'
+  };
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content,
+    attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'remote-child-demotion-discord', caller.guildId, caller.channelId, caller.channelId, '900', encodeAgentMessage(request, 'fixture'), '[]',
+    caller.provider, caller.nativeId, caller.workspace, caller.endpoint, caller.conductorId, caller.repoKey, caller.generation,
+    MESSAGE_STATES.ACCEPTED, timestamp, timestamp);
+  f.state.receipt('remote-child-demotion-discord', 'agent-message', { packet: request, authorId: '900' });
+  f.state.receipt('remote-child-demotion-discord', 'accepted', { channelId: caller.channelId, generation: caller.generation, readiness: 'ready' });
+  assert.equal(f.state.claimDispatch('remote-child-demotion-discord').claimed, true);
+  let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      f.state.markThreadBoundary('202', THREAD_STATES.UNAVAILABLE, 'remote child demoted during verification', null, null, target);
+      return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    }
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: 'remote-child-demotion-result' }) };
+  } });
+  const result = await peer.send({ reply_to: request.id, text: 'result', dedupe_key: 'remote-child-demotion-result' });
+  assert.equal(result.status, 'sent');
+  assert.equal(posts, 1);
+});
+
 test('peer-qualified reply keeps the recorded child when the peer has multiple ready children', async t => {
   const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
   f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100', adoptionCutoff: '100' }, target);

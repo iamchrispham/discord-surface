@@ -313,7 +313,8 @@ function sentReplyEvidence(
   allowLegacyChildSource: boolean,
   parentTarget: AgentAddress,
   requestReceiptId: number,
-  frozenChildRoute: string | null
+  frozenChildRoute: string | null,
+  allowRouteLessParentChildSource = false
 ): Record<string, unknown> | null {
   const rows: SentAgentResultRow[] = querySentAgentResultRows({
     db: state.db,
@@ -333,10 +334,14 @@ function sentReplyEvidence(
       .every((target) => target == null || sameAddress(target, request.target));
     const exact = sameReverseAddresses(candidate, request) &&
       (hasUniqueRequestTarget(state, request, row.outcomeReceiptId, requestReceiptId) || recordedTargetsMatch);
-    const migrated = allowLegacyChildSource &&
+    const attemptRequestTarget = row.attemptDetail.agentRequestTarget ??
+      (allowRouteLessParentChildSource ? request.target : null);
+    const outcomeRequestTarget = row.outcomeDetail.agentRequestTarget ??
+      (allowRouteLessParentChildSource ? request.target : null);
+    const migrated = (allowLegacyChildSource || allowRouteLessParentChildSource) &&
       isLegacyChildResult(candidate, request, parentTarget, true) &&
-      isLegacyChildResult(candidate, request, row.attemptDetail.agentRequestTarget, true) &&
-      isLegacyChildResult(candidate, request, row.outcomeDetail.agentRequestTarget, true);
+      isLegacyChildResult(candidate, request, attemptRequestTarget, true) &&
+      isLegacyChildResult(candidate, request, outcomeRequestTarget, true);
     if (!exact && !migrated) continue;
     return {
       kind: 'sent-result',
@@ -442,7 +447,8 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
         const parentTarget = { ...target, channelId: binding.channelId };
         const provenanceReceiptId = requestProvenanceReceiptId(state, messageId);
         evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget, frozenChildRoute) ||
-          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacySentChildSource, parentTarget, provenanceReceiptId, frozenChildRoute);
+          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacySentChildSource, parentTarget, provenanceReceiptId,
+            frozenChildRoute, legacyParentRequest && !frozenChildRoute);
         if (!evidence) throw new deps.BindingError('agent request lacks an immutable correlated result');
       }
       const detail = {

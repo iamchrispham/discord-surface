@@ -228,7 +228,8 @@ export function resolveAgentReplyRequestMatch(state: DirectPostState, replyTo: s
     })
     .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; legacy: boolean; frozenChildRoute: string | null } => {
       if (candidate === null || candidate.packet.kind !== KINDS.REQUEST ||
-          (requireLegacy && !candidate.legacy) || (target !== null && !sameAddress(candidate.packet.source, target))) return false;
+          (requireLegacy && !candidate.legacy && candidate.frozenChildRoute === null) ||
+          (target !== null && !sameAddress(candidate.packet.source, target))) return false;
       const directTargetMatch = sameAddress(candidate.packet.target, source);
       const parentTargetMatch = legacyParent !== null && sameAddress(candidate.packet.target, legacyParent);
       const frozenChildTargetMatch = candidate.frozenChildRoute !== null;

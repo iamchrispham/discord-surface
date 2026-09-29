@@ -93,8 +93,10 @@ function resultCustody(state: WithdrawalState, request: AgentMessage, routingVer
     const detail = parseJson(row.detail, null);
     for (const { packet: candidate, recordedTarget } of [
       { packet: detail?.packet, recordedTarget: null },
-      { packet: detail?.agentPacket, recordedTarget: detail?.agentRequestTarget },
-      { packet: detail?.legacyAgentPacket, recordedTarget: detail?.agentRequestTarget }
+      { packet: detail?.agentPacket,
+        recordedTarget: detail?.agentRequestTarget ?? (allowRouteLessParent && row.kind !== 'agent-message' ? request.target : null) },
+      { packet: detail?.legacyAgentPacket,
+        recordedTarget: detail?.agentRequestTarget ?? (allowRouteLessParent && row.kind !== 'agent-message' ? request.target : null) }
     ]) {
       if (validPacket(candidate, KINDS.RESULT) && reverseResult(candidate, request, routingVersion,
         frozenChildRoute, allowRouteLessParent, recordedTarget)) return true;

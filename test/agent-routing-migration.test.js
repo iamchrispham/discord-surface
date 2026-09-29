@@ -244,7 +244,6 @@ test('already submitted parent request completes from pre-upgrade sent child cus
     binding,
     deliveryChannelId: target.channelId,
     agentPacket: childResult,
-    agentRequestTarget: source,
     presentation: 'legacy'
   };
   assert.equal(f.state.beginDirectPostPart(meta).claimed, true);
@@ -293,7 +292,6 @@ test('route-less parent with stamped provenance keeps immutable sent child custo
     binding,
     deliveryChannelId: target.channelId,
     agentPacket: childResult,
-    agentRequestTarget: source,
     presentation: 'legacy'
   };
   assert.equal(f.state.beginDirectPostPart(meta).claimed, true);

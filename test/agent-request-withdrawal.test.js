@@ -175,9 +175,7 @@ test('withdrawal preserves route-less stamped parent child result custody', t =>
   const childResult = { id: 'route-less-stamped-child-result', kind: KINDS.RESULT,
     source: { ...targetParent, channelId: '104' }, target: sourceParent, replyTo: packet.id,
     routingVersion: 2, text: 'Child result already has immutable send custody.' };
-  fixture.state.receipt(null, 'direct-post-attempt', {
-    agentPacket: childResult, agentRequestTarget: targetParent
-  });
+  fixture.state.receipt(null, 'direct-post-attempt', { agentPacket: childResult });
   assert.throws(() => fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id,
     provider: sourceParent.provider, nativeId: sourceParent.nativeId, generation: sourceParent.generation }),
     /reply or result custody/);
