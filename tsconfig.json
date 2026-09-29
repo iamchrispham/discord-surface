@@ -41,6 +41,7 @@
     "src/acknowledgment/pickup.ts",
     "src/claude-channel.ts",
     "src/claude/channel-contracts.ts",
+    "src/claude/default-mcp.ts",
     "src/claude/socket-ownership.ts",
     "src/claude/socket-ownership/bound-identity.ts",
     "src/claude/socket-ownership/path.ts",
