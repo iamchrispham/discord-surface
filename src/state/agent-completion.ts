@@ -434,11 +434,12 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
         evidence = receivedResultEvidence(state, messageId, packet);
       } else {
         const frozenChildRoute = message.agentRoute || null;
-        const allowLegacyChildSource = isLegacyAgentReceipt(provenance) && Boolean(frozenChildRoute);
+        const legacyProvenance = isLegacyAgentReceipt(provenance);
+        const allowLegacyChildSource = legacyProvenance && Boolean(frozenChildRoute);
         const parentTarget = { ...target, channelId: binding.channelId };
         const provenanceReceiptId = requestProvenanceReceiptId(state, messageId);
         evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget, frozenChildRoute) ||
-          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacyChildSource, parentTarget, provenanceReceiptId, frozenChildRoute);
+          sentReplyEvidence(state, packet, message.channelId, deps, legacyProvenance, parentTarget, provenanceReceiptId, frozenChildRoute);
         if (!evidence) throw new deps.BindingError('agent request lacks an immutable correlated result');
       }
       const detail = {

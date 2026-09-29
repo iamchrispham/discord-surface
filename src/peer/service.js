@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { resolvePeerCaller } = require('./caller');
 const { resolvePeerBinding, validatePeerSelector, requireReadyPeer } = require('../../dist/peer/resolution');
-const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest } = require('../../dist/state/agent-routing');
+const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest, resolveAgentReplyRequestMatch } = require('../../dist/state/agent-routing');
 const { readTextFile, resolveAgentAddress, runDirectPost } = require('../direct-post');
 const { postByRole } = require('./post');
 const { inspectPeerResult, validPeerId } = require('./result');
@@ -90,6 +90,23 @@ function custodyKeyFor(state, packetId, source, binding) {
   return rows.length > 0 ? callerCustodyKey(packetId, source, binding) : undefined;
 }
 
+function frozenReplySourceRoute(state, replyTo, source) {
+  const sourceAddress = {
+    guildId: source.guildId, channelId: source.channelId, provider: source.provider,
+    nativeId: source.nativeId, generation: source.generation
+  };
+  try {
+    const match = resolveAgentReplyRequestMatch(state, replyTo, sourceAddress, null, sourceAddress, Error, true);
+    return match.frozenChildRoute ? { binding: source, childId: match.frozenChildRoute } : null;
+  } catch (error) {
+    if (error instanceof Error &&
+        ['agent reply target is unknown or does not match the active request', 'agent request was withdrawn'].includes(error.message)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 function assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token }) {
   const kind = input.reply_to === undefined ? KINDS.REQUEST : KINDS.RESULT;
   const callerAddress = {
@@ -117,7 +134,7 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
     const matches = [];
     for (const selector of selectors) {
       try {
-        matches.push(resolveAgentReplyRequest(state, input.reply_to, sourceAddress, selector, callerAddress, Error).source);
+        matches.push(resolveAgentReplyRequest(state, input.reply_to, sourceAddress, selector, callerAddress, Error, false, true).source);
       } catch (error) {
         if (error instanceof Error && error.message === 'agent request was withdrawn') {
           withdrawalError = error;
@@ -212,7 +229,9 @@ function createPeerService(context) {
       if (source.channelId !== initial.channelId || canonicalNativeId(source.nativeId) !== canonicalNativeId(initial.nativeId) || source.generation !== initial.generation) {
         throw new Error('peer caller changed during resolution');
       }
-      const sourceRoute = requireReadyPeer(state, source);
+      const sourceRoute = input.reply_to === undefined
+        ? requireReadyPeer(state, source)
+        : frozenReplySourceRoute(state, input.reply_to, source) || requireReadyPeer(state, source);
       const sourceReadiness = source.readiness;
       const sourceIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
       const sourceAddress = resolveAgentAddress(state, source, sourceRoute.childId);
@@ -252,7 +271,12 @@ function createPeerService(context) {
             const currentSource = state.getBinding(source.channelId);
             const currentIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
             if (!currentSource || currentSource.readiness !== sourceReadiness || currentIntakeState !== sourceIntakeState) return false;
-            requireReadyPeer(state, currentSource);
+            if (input.reply_to === undefined) {
+              requireReadyPeer(state, currentSource);
+            } else {
+              const currentSourceRoute = state.getMessageRoute?.(sourceRoute.childId);
+              if (!currentSourceRoute?.ready || !samePeerBinding(currentSourceRoute.binding, currentSource)) return false;
+            }
             if (input.reply_to === undefined && destination?.binding) {
               const currentDestination = state.getBinding(destination.binding.channelId);
               if (!currentDestination || !samePeerBinding(currentDestination, destination.binding)) return false;

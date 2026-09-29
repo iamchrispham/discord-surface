@@ -10,7 +10,30 @@ const { DiscordGateway, waitForRecoveryOperation } = require('../src/discord');
 const { enrollPublicThread, recoverThread, AdoptionRefusalError, ADOPTION_REFUSAL_DETAILS } = require('../src/discord/thread-enrollment');
 const { GATEWAY_CAPABILITIES, gatewayProcessStatus, main, pathsFor, threadEnroll } = require('../src/cli');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
+const { PREFIX } = require('../src/agent-message');
 const { startReconciliationLookup } = require('../dist/discord/reconciliation-lookups');
+
+function insertLegacyParentRequest(f, id) {
+  const binding = f.state.getBinding(f.parent.id);
+  const packet = {
+    id: `legacy-${id}`,
+    kind: 'request',
+    source: { guildId: f.parent.guildId, channelId: '3000', provider: 'claude', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 },
+    target: { guildId: f.parent.guildId, channelId: f.parent.id, provider: binding.provider, nativeId: binding.nativeId, generation: binding.generation },
+    replyTo: null,
+    text: 'legacy parent request'
+  };
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    id, f.parent.guildId, f.parent.id, f.parent.id, 'operator', `${PREFIX}legacy`, '[]', binding.provider, binding.nativeId,
+    binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED,
+    timestamp, timestamp
+  );
+  f.state.receipt(id, 'agent-message', { packet, authorId: 'operator' });
+  f.state.receipt(id, 'accepted', { channelId: f.parent.id, generation: binding.generation, readiness: 'ready' });
+}
 const { fixture, NATIVE, SUCCESSOR } = require('./issue-thread-fixture');
 test('public enrollment command keeps parent owner and pending child until Gateway recovery', async t => {
   const f = fixture(t);
@@ -127,6 +150,68 @@ test('pending child holds live work, recovery deduplicates it and replies after 
   assert.equal(f.state.getMessage('100').state, MESSAGE_STATES.REPLIED);
   assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
   assert.equal(f.state.getBinding(f.parent.id).readiness, READINESS.READY);
+});
+
+test('live checkpoint wakes a legacy parent request held before child readiness', async t => {
+  const f = fixture(t);
+  const binding = f.state.getBinding(f.parent.id);
+  insertLegacyParentRequest(f, 'legacy-checkpoint-parent');
+  assert.equal(f.state.claimDispatch('legacy-checkpoint-parent').reason, 'legacy-agent-route-not-unique');
+  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild', adoptionCutoff: '0' }, binding);
+  f.gateway.ready = true;
+  f.histories.set(f.child.id, []);
+  f.gateway.beginLiveCheckpoint(new Map([[f.child.id, 1]]));
+  await f.gateway.liveCheckpointPromise;
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.READY);
+  assert.equal(f.state.getMessage('legacy-checkpoint-parent').agentRoute, f.child.id);
+  assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-checkpoint-parent']);
+});
+
+test('child-scoped reconciliation includes its legacy parent custody', async t => {
+  const f = fixture(t);
+  const binding = f.state.getBinding(f.parent.id);
+  insertLegacyParentRequest(f, 'legacy-child-scope-parent');
+  assert.equal(f.state.claimDispatch('legacy-child-scope-parent').reason, 'legacy-agent-route-not-unique');
+  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild', adoptionCutoff: '0' }, binding);
+  f.state.setThreadBaseline(f.child.id, null, binding);
+  f.state.markThreadBoundary(f.child.id, THREAD_STATES.READY, 'fixture ready', null, null, binding);
+  f.gateway.ready = true;
+  await f.gateway.reconcilePending(undefined, { readyOnly: true, channelIds: [f.child.id] });
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getMessage('legacy-child-scope-parent').agentRoute, f.child.id);
+  assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-child-scope-parent']);
+});
+
+test('thread demotion wakes an ambiguous legacy parent when one sibling remains', async t => {
+  const f = fixture(t);
+  const binding = f.state.getBinding(f.parent.id);
+  insertLegacyParentRequest(f, 'legacy-demotion-parent');
+  const sibling = f.makeChannel('3000', ChannelType.PublicThread);
+  f.channels.set(sibling.id, sibling);
+  f.histories.set(sibling.id, []);
+  for (const threadId of [f.child.id, sibling.id]) {
+    f.state.enrollThread({ threadId, parentChannelId: f.parent.id, guildId: 'guild', adoptionCutoff: '0' }, binding);
+    f.state.setThreadBaseline(threadId, null, binding);
+    f.state.markThreadBoundary(threadId, THREAD_STATES.READY, 'fixture ready', null, null, binding);
+  }
+  f.gateway.ready = true;
+  assert.equal(f.state.claimDispatch('legacy-demotion-parent').reason, 'legacy-agent-route-not-unique');
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'legacy-demotion-probe', f.parent.guildId, f.parent.id, f.child.id, 'operator', 'probe', '[]', binding.provider,
+    binding.nativeId, binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation,
+    MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+  );
+  f.gateway.markThreadDeliveryUnavailable(f.state.getMessage('legacy-demotion-probe'), new Error('child fetch failed'));
+  await new Promise(resolve => setImmediate(resolve));
+  await f.gateway.recoveryPromise;
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.UNAVAILABLE);
+  assert.equal(f.state.getMessage('legacy-demotion-parent').agentRoute, sibling.id);
+  assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-demotion-parent']);
 });
 
 test('archived unlocked thread backfills after its own cursor without unarchive operation', async t => {

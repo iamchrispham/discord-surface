@@ -1421,8 +1421,21 @@ class DiscordGateway {
     const retryableFetch = isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
     if (['gap', 'unavailable'].includes(enrollment.state) && !retryableBoundary) return;
     const nextState = !enrollment.adoptedAt && retryableFetch ? THREAD_STATES.PENDING : THREAD_STATES.UNAVAILABLE;
-    this.state.markThreadBoundary(stored.deliveryChannelId, nextState,
+    const wasReady = enrollment.state === THREAD_STATES.READY;
+    const updated = this.state.markThreadBoundary(stored.deliveryChannelId, nextState,
       detail, null, null, binding, undefined, undefined, enrollment);
+    if (wasReady && updated?.state !== THREAD_STATES.READY && updated?.parentChannelId) {
+      queueMicrotask(() => {
+        if (this.stopping) return;
+        void this.reconcilePending(undefined, {
+          allowPaused: true,
+          readyOnly: true,
+          channelIds: [updated.parentChannelId]
+        }).catch(recoveryError => {
+          this.logger(`legacy parent recovery after thread demotion failed: ${recoveryError.message}`);
+        });
+      });
+    }
   }
 
   async threadDeliveryMessage(message) {
@@ -3250,6 +3263,12 @@ class DiscordGateway {
     const passConnectionEpoch = this.connectionEpoch;
     const reconciliationConnection = { gateway: this, epoch: passConnectionEpoch };
     const selectedChannels = channelIds ? new Set(channelIds) : null;
+    if (selectedChannels) {
+      for (const channelId of [...selectedChannels]) {
+        const enrollment = this.state.getThreadEnrollment(channelId);
+        if (enrollment?.active && enrollment.parentChannelId) selectedChannels.add(enrollment.parentChannelId);
+      }
+    }
     const selectedMessages = messageIds ? new Set(messageIds) : null;
     this.consumer?.releaseHandledWithoutPost?.();
     const isHeldDurable = message => message.state === 'submitted' || message.state === 'reply_ready';

@@ -51,6 +51,13 @@ export function isLegacyChildResult(packet: AgentMessage, request: AgentMessage,
 
 type BindingErrorConstructor = new (message?: string) => Error;
 
+export interface AgentReplyRequestMatch {
+  packet: AgentMessage;
+  discordId: string | null;
+  legacy: boolean;
+  frozenChildRoute: string | null;
+}
+
 export interface LegacyParentSourcedReceipt {
   attempt: Record<string, unknown>;
   detail: Record<string, unknown>;
@@ -204,9 +211,9 @@ function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | Le
   return agentTarget as AgentAddress;
 }
 
-export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, source: AgentAddress,
+export function resolveAgentReplyRequestMatch(state: DirectPostState, replyTo: string, source: AgentAddress,
   target: AgentAddress | null = null, legacyParent: AgentAddress | null = null,
-  BindingError: BindingErrorConstructor, requireLegacy = false, requireFrozenChild = false): AgentMessage {
+  BindingError: BindingErrorConstructor, requireLegacy = false, requireFrozenChild = false): AgentReplyRequestMatch {
   const rows = state.listReceipts();
   const candidates = rows
     .filter(row => row.kind === 'agent-message')
@@ -235,7 +242,18 @@ export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string
       (!match.discordId || state.getMessage?.(match.discordId)?.agentRoute !== source.channelId)) {
     throw new BindingError('agent result source does not match the request frozen child route');
   }
-  return match.packet as unknown as AgentMessage;
+  return {
+    packet: match.packet as unknown as AgentMessage,
+    discordId: match.discordId,
+    legacy: match.legacy,
+    frozenChildRoute: match.discordId ? state.getMessage?.(match.discordId)?.agentRoute || null : null
+  };
+}
+
+export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, source: AgentAddress,
+  target: AgentAddress | null = null, legacyParent: AgentAddress | null = null,
+  BindingError: BindingErrorConstructor, requireLegacy = false, requireFrozenChild = false): AgentMessage {
+  return resolveAgentReplyRequestMatch(state, replyTo, source, target, legacyParent, BindingError, requireLegacy, requireFrozenChild).packet;
 }
 
 export function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, packet, sourceText, agentKind,
