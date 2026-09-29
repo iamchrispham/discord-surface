@@ -73,27 +73,30 @@ function submitHuman(f, id, content = 'Ordinary human pickup request.') {
   return f.state.getMessage(id);
 }
 
-function submitAgentResult(f, id) {
+function submitAgent(f, id, kind) {
   const packet = {
-    id: `contract-result-${id}`,
-    kind: KINDS.RESULT,
+    id: `contract-${kind}-${id}`,
+    kind,
     source: { guildId: GUILD_ID, channelId: '201', provider: 'codex', nativeId: CODEX_ID, generation: 1 },
     target: {
       guildId: GUILD_ID, channelId: CHILD_CHANNEL, provider: 'claude',
       nativeId: CLAUDE_ID, generation: f.binding.generation
     },
-    replyTo: 'contract-remote-request',
+    replyTo: kind === KINDS.RESULT ? 'contract-remote-request' : null,
     text: 'Authenticated agent completion body.'
   };
   const accepted = f.state.acceptDiscordMessage({
     id, guildId: GUILD_ID, channelId: CHILD_CHANNEL, authorId: '901', isBot: true,
     attachments: [], content: encodeAgentMessage(packet, TOKEN)
   }, { agentToken: TOKEN });
-  assert.equal(accepted.accepted, true, `agent result intake rejected: ${accepted.reason}`);
+  assert.equal(accepted.accepted, true, `agent ${kind} intake rejected: ${accepted.reason}`);
   assert.equal(f.state.claimDispatch(id).claimed, true);
   f.state.markSubmitted(id);
   return f.state.getMessage(id);
 }
+
+const submitAgentResult = (f, id) => submitAgent(f, id, KINDS.RESULT);
+const submitAgentRequest = (f, id) => submitAgent(f, id, KINDS.REQUEST);
 
 async function submitWatcherNotice(f, id) {
   const armKey = `pickup-contract-arm-${id}`;
@@ -288,11 +291,12 @@ test('real default MCP handshake exposes the shared ACK branch and delegates pos
   }
 });
 
-test('real Monitor payloads carry the shared ACK branch for human, agent completion, and watcher notice', async () => {
+test('real Monitor payloads carry the shared ACK branch for human, agent, and watcher notice', async () => {
   const f = fixture();
   try {
     const human = submitHuman(f, '2002');
     const agent = submitAgentResult(f, '2003');
+    const request = submitAgentRequest(f, '2006');
     const watcher = await submitWatcherNotice(f, '2004');
 
     const { stdout, pointers } = captureStdout();
@@ -307,12 +311,13 @@ test('real Monitor payloads carry the shared ACK branch for human, agent complet
     try {
       await notify(human.id);
       await notify(agent.id);
+      await notify(request.id);
       await notify(watcher.id);
     } finally {
       await monitor.close();
     }
 
-    assert.equal(pointers.length, 3);
+    assert.equal(pointers.length, 4);
     const payloadFor = id => {
       const pointer = pointers.find(candidate => candidate.meta.messageId === id);
       assert.ok(pointer, `missing pointer for ${id}`);
@@ -333,12 +338,21 @@ test('real Monitor payloads carry the shared ACK branch for human, agent complet
 
     const agentPayload = payloadFor(agent.id);
     assertPointerDelegates(agentPayload.pointer, agentPayload.payload);
-    assertSharedBranchInstruction(agentPayload.payload.instructions, 'If no Discord reply is needed, run completion.command exactly once');
+    assertSharedBranchInstruction(agentPayload.payload.instructions, 'Follow the agent result instruction in content');
     assertAcknowledgmentCommand(agentPayload.payload, agent, f);
     assert.ok(agentPayload.payload.completion, 'agent completion branch must expose completion');
     assert.equal(agentPayload.payload.completion.command[2], 'agent-complete');
     assert.equal(agentPayload.payload.completion.messageId, agent.id);
-    assert.equal(agentPayload.payload.reply.messageId, agent.id);
+    assert.equal(agentPayload.payload.reply, undefined);
+
+    const requestPayload = payloadFor(request.id);
+    assertPointerDelegates(requestPayload.pointer, requestPayload.payload);
+    assertSharedBranchInstruction(requestPayload.payload.instructions, 'Follow the agent request instruction in content');
+    assertAcknowledgmentCommand(requestPayload.payload, request, f);
+    assert.match(requestPayload.payload.content, /agent-send --agent-reply-to contract-request-2006/);
+    assert.equal(requestPayload.payload.reply, undefined);
+    assert.equal(requestPayload.payload.completion.command[2], 'agent-complete');
+    assert.equal(requestPayload.payload.version, 6);
 
     const watcherPayload = payloadFor(watcher.id);
     assertPointerDelegates(watcherPayload.pointer, watcherPayload.payload);
@@ -360,6 +374,7 @@ test('real direct MCP notification carries the shared ACK branch before per-kind
   try {
     const human = submitHuman(f, '2101', 'Direct human pickup request.');
     const agent = submitAgentResult(f, '2102');
+    const request = submitAgentRequest(f, '2104');
     const watcher = await submitWatcherNotice(f, '2103');
 
     const completionFor = message => {
@@ -368,12 +383,12 @@ test('real direct MCP notification carries the shared ACK branch before per-kind
       return null;
     };
     const { received, posted, outcomes } = await captureDirectNotifications(
-      f, [human, agent, watcher], completionFor
+      f, [human, agent, request, watcher], completionFor
     );
 
-    assert.deepEqual(outcomes.map(outcome => outcome.status), ['submitted', 'submitted', 'submitted']);
+    assert.deepEqual(outcomes.map(outcome => outcome.status), ['submitted', 'submitted', 'submitted', 'submitted']);
     // Real notifications/claude/channel notifications delivered through the MCP client.
-    assert.equal(received.length, 3);
+    assert.equal(received.length, 4);
     for (const notification of received) assert.equal(notification.method, 'notifications/claude/channel');
     assert.deepEqual(posted.map(body => body.content), received.map(notification => notification.params.content));
     assert.deepEqual(received.map(notification => notification.params.meta), posted.map(body => ({
@@ -392,10 +407,15 @@ test('real direct MCP notification carries the shared ACK branch before per-kind
     assert.ok(humanContent.includes(`Use the reply tool with messageId "${human.id}" and generation ${human.generation}`));
 
     const agentContent = contentFor(agent.id);
-    assertDirectEventAcknowledgment(agentContent, agent.id, agent.generation, 'either use the reply tool');
-    assert.ok(agentContent.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT) < agentContent.indexOf('either use the reply tool'), 'agent work instruction must follow the shared condition');
-    assert.ok(agentContent.includes(`or run the exact no-post completion command below`));
+    assertDirectEventAcknowledgment(agentContent, agent.id, agent.generation, 'After handling this agent packet');
+    assert.doesNotMatch(agentContent, /either use the reply tool|Use the reply tool with messageId/);
     assert.ok(agentContent.includes(JSON.stringify(completionFor(f.state.getMessage(agent.id)))));
+
+    const requestContent = contentFor(request.id);
+    assertDirectEventAcknowledgment(requestContent, request.id, request.generation, 'After handling this agent packet');
+    assert.match(requestContent, /agent-send --agent-reply-to contract-request-2104/);
+    assert.doesNotMatch(requestContent, /either use the reply tool|Use the reply tool with messageId/);
+    assert.ok(requestContent.includes(JSON.stringify(completionFor(f.state.getMessage(request.id)))));
 
     const watcherContent = contentFor(watcher.id);
     assertDirectEventAcknowledgment(watcherContent, watcher.id, watcher.generation, 'run the exact consume command below');

@@ -116,20 +116,20 @@ const expectedDigests = {
   courierForwardingPrompt: '00a4064173913f094c396da42a14de9121933f57c94e752aaaa2117194b27ce3',
   attachmentPrompt: '51bed8777c238572c49865aa895a615f05842d43f194ee5f3f42b96ae0f0132e',
   messageRequestHuman: '79057b1e52d3d81405bb67993c5087743594770f62ca344e556eb223fc4c2ce2',
-  messageRequestAgentRequest: '5624d5e6fdba87af22888bc4a55353456c3bd4b5115897bdd90543d2d588abdb',
-  messageRequestAgentResult: 'a98c54b515af664b948fdb42d55e42073179611139b0ab1541d457ec0458f5c7',
+  messageRequestAgentRequest: '32b43ea820c9baaa1dd5f8e6ad46de267398d8b43e95f0dae7c864db65bb12b9',
+  messageRequestAgentResult: '3d716e555095170db45917e68da407e44dca8ff7f16010dc86309bd0f2e1e80f',
   messageRequestDecision: '61bf6fab877b903ac62e83f33903465896b3942f3374b986da8380b5d83d469a',
   messageRequestWatcher: '778ebfecc08c0621fb1e6ee1ac96cfb417aad3576c1f1c6a55e52a47b9d32b9d',
   codexPromptHuman: '214cc1a09949c904d2144fc85a729826e661ea84f89569d5acb88c47f1088b39',
   codexPromptAttachment: '236c32b2160a03dc257ef12ec93463c79faed582466f47c54a84fb144c21b04b',
-  codexPromptAgentRequest: '7854014437cc92c4993d42fee8c35853e157160f20562ba6564cbdfb65e18e13',
-  codexPromptAgentResult: '7c742e49ca3f3bcb6d09f58ead922b716b40b0e914b9ff2371e4629f523a1b56',
+  codexPromptAgentRequest: 'f88be9cbd8f9992529e72a7837a4a4f1c4fcd9236a3d2e75bfba01a184e32de9',
+  codexPromptAgentResult: 'f88215d73e2a267afba9c33a5cf2a32c814e35d31afcec3c20111245518accec',
   codexPromptDecision: 'fa9ba7f924595df3cfab549840962960ae5cc3f5fab299412dc51dc8c4ce9510',
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
   claudeEventHuman: '3cf57a00278c64f0f1f5e4e180189002af5e7a97584e42326741bf752c71ddcc',
   claudeEventAttachment: 'd04456537d38c4309bae542a35f13c52cbbaa2f3e83c062cec959f7a8db24f6d',
-  claudeEventAgentRequest: '6bb6a5cb5ae61b610833eafcd57cad10cbf2c851b5cc815903bc09bf043639e7',
-  claudeEventAgentResult: '9663202e355371dbd715da7cd997e154317aa13a2bfe0e6af65a4fd4e1acbbe4',
+  claudeEventAgentRequest: 'ca2735d786851d9b7acdc1edef74111a7078e560c4832437d5acbef56daa6be4',
+  claudeEventAgentResult: '29ca2a9e852ee48191e8065d34736c92c7f8bf735cf067b904c7e519fbd40fa5',
   claudeEventDecision: '9fa9567ee39e6e4824c584991a8dad2c5267be9c3aa282ba2021e30de868e610',
   claudeEventWatcher: '45d9fbf706942a0fd9be6523d7b8dc61dc1b059e290d9a403be2010599dd3d14'
 };
@@ -177,4 +177,28 @@ test('default completion commands resolve the packaged source CLI', () => {
   const cliPath = path.join(repoRoot, 'src', 'cli.js');
   assert.equal(path.resolve(facade.agentCompletionCommand(ordinary, '/tmp/state.sqlite')[1]), cliPath);
   assert.equal(path.resolve(facade.watcherNoticeCompletionCommand(watcher, '/tmp/state.sqlite')[1]), cliPath);
+});
+
+test('agent pickup requires a correlated result while human pickup keeps replies', () => {
+  const requestPrompt = facade.codexPrompt(agentRequest, acknowledgment, completion);
+  const resultPrompt = facade.codexPrompt(agentResult, acknowledgment, completion);
+  const humanPrompt = facade.codexPrompt(ordinary, acknowledgment);
+  const directRequest = facade.claudeEvent(agentRequest, completion).content;
+  const directResult = facade.claudeEvent(agentResult, completion).content;
+
+  for (const prompt of [requestPrompt, directRequest]) {
+    assert.match(prompt, /agent-send --agent-reply-to agent-request/);
+    assert.match(prompt, /agent-complete/);
+    assert.match(prompt, /After agent-send reports sent/);
+    assert.doesNotMatch(prompt, /Choose exactly one: normal final|either use the reply tool|Use the reply tool with messageId/);
+  }
+  for (const prompt of [resultPrompt, directResult]) {
+    assert.match(prompt, /agent-complete/);
+    assert.match(prompt, /Do not send another agent packet or post an ordinary Discord reply/);
+    assert.doesNotMatch(prompt, /Choose exactly one: normal final|either use the reply tool|Use the reply tool with messageId/);
+  }
+  assert.doesNotMatch(requestPrompt, /Final reply: start with/);
+  assert.doesNotMatch(resultPrompt, /Final reply: start with/);
+  assert.match(humanPrompt, /Final reply: start with/);
+  assert.match(facade.claudeEvent(ordinary).content, /Use the reply tool with messageId/);
 });

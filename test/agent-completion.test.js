@@ -35,13 +35,13 @@ test('native owners receive the exact no-post completion command', () => {
 
   const acknowledgment = acknowledgmentCommand(message, '/custom/state with spaces/surface.sqlite', '/custom/cli=entry.js');
   const prompt = codexPrompt(message, acknowledgment, completion);
-  const commands = [...prompt.matchAll(/exact argv: (\[.*\])/g)].map(match => JSON.parse(match[1]));
+  const commands = [...prompt.matchAll(/(?:exact argv|preserving argument boundaries): (\[.*\])/g)].map(match => JSON.parse(match[1]));
   assert.deepEqual(commands, [acknowledgment, completion]);
-  assert.ok(prompt.includes(`Final reply: start with [[discord-surface:${message.id}]] on its own line.`));
+  assert.ok(!prompt.includes(`Final reply: start with [[discord-surface:${message.id}]] on its own line.`));
   assert.match(prompt, /ACK means received, not completed/);
-  assert.match(prompt, /Choose exactly one:/);
-  assert.match(prompt, /If fully handled without a Discord reply, run once/);
-  assert.match(prompt, /Then no normal final response/);
+  assert.doesNotMatch(prompt, /Choose exactly one:/);
+  assert.match(prompt, /Run this packet's completion command once when its handling condition is met/);
+  assert.match(prompt, /Do not produce a normal final response/);
   assert.ok(prompt.indexOf(JSON.stringify(acknowledgment)) < prompt.indexOf(message.agentMessage.text));
 });
 
