@@ -36,8 +36,8 @@ const CLI_PATH = path.resolve(__dirname, '../src/cli.js');
 
 // Exact mandated sentence sequence; the production owner must emit this verbatim.
 const SHARED_CONDITION =
-  'Proceed with this notification only if acknowledgment returns recorded=true. ' +
-  'If duplicate=true, stop handling this notification without executing its request or posting or completing it again. ' +
+  'If acknowledgment returns recorded=true, handle this notification normally. ' +
+  'If duplicate=true, do not repeat work: only an agent request may follow its duplicate-recovery instruction; all other notifications stop without posting or completing again. ' +
   'If acknowledgment fails or its result is missing or ambiguous, stop and report the error without executing the request. ' +
   'Acknowledgment records receipt, not completed work. It never authorizes retrying interrupted work.';
 
@@ -350,9 +350,10 @@ test('real Monitor payloads carry the shared ACK branch for human, agent, and wa
     assertSharedBranchInstruction(requestPayload.payload.instructions, 'Follow the agent request instruction in content');
     assertAcknowledgmentCommand(requestPayload.payload, request, f);
     assert.match(requestPayload.payload.content, /agent-send --agent-reply-to contract-request-2006/);
+    assert.match(requestPayload.payload.content, /On duplicate=true for this request/);
     assert.equal(requestPayload.payload.reply, undefined);
     assert.equal(requestPayload.payload.completion.command[2], 'agent-complete');
-    assert.equal(requestPayload.payload.version, 6);
+    assert.equal(requestPayload.payload.version, 7);
 
     const watcherPayload = payloadFor(watcher.id);
     assertPointerDelegates(watcherPayload.pointer, watcherPayload.payload);
@@ -412,7 +413,7 @@ test('real direct MCP notification carries the shared ACK branch before per-kind
     assert.ok(agentContent.includes(JSON.stringify(completionFor(f.state.getMessage(agent.id)))));
 
     const requestContent = contentFor(request.id);
-    assertDirectEventAcknowledgment(requestContent, request.id, request.generation, 'After handling this agent packet');
+    assertDirectEventAcknowledgment(requestContent, request.id, request.generation, 'On duplicate=true, run the exact completion command below');
     assert.match(requestContent, /agent-send --agent-reply-to contract-request-2104/);
     assert.doesNotMatch(requestContent, /either use the reply tool|Use the reply tool with messageId/);
     assert.ok(requestContent.includes(JSON.stringify(completionFor(f.state.getMessage(request.id)))));

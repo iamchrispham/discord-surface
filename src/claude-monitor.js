@@ -6,7 +6,7 @@ const { ClaudeChannel, CLAUDE_PICKUP_ACKNOWLEDGMENT } = require('./claude-channe
 const { agentCompletionCommand, watcherNoticeCompletionCommand, messageRequest } = require('./native');
 const { MESSAGE_STATES, normalizeAttachments } = require('./state');
 
-const PAYLOAD_SCHEMA_VERSION = 6;
+const PAYLOAD_SCHEMA_VERSION = 7;
 const MONITOR_DEDUPE_CLEANUP_INTERVAL_MS = 1000;
 const MONITOR_DEDUPE_STATES = new Set([MESSAGE_STATES.DISPATCHING, MESSAGE_STATES.SUBMITTED]);
 
@@ -102,7 +102,7 @@ function monitorEvent({ content, messageId, nativeId, generation, attachments = 
   } else if (agent) {
     instructions = legacyParentRequest
       ? `At pickup run acknowledgment.command once with argument boundaries preserved. ${CLAUDE_PICKUP_ACKNOWLEDGMENT} This request has no exact child route. Keep it open for route reconciliation; do not execute it or use completion.command or reply.command.`
-      : `At pickup run acknowledgment.command once with argument boundaries preserved. ${CLAUDE_PICKUP_ACKNOWLEDGMENT} Follow the agent ${agentKind} instruction in content, then run completion.command exactly once when its handling condition is met. Do not use reply.command or post an ordinary Discord reply.`;
+      : `At pickup run acknowledgment.command once with argument boundaries preserved. ${CLAUDE_PICKUP_ACKNOWLEDGMENT} Follow the agent ${agentKind} instruction in content and run completion.command only when its handling condition is met. Do not use reply.command or post an ordinary Discord reply.`;
   } else if (completion) {
     instructions = `At pickup run acknowledgment.command once with argument boundaries preserved. ${CLAUDE_PICKUP_ACKNOWLEDGMENT} If no Discord reply is needed, run completion.command exactly once. Otherwise create reply.directory owner-only if needed, write the final answer to reply.textFile, and run reply.command.`;
   } else {
