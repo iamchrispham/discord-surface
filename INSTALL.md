@@ -63,16 +63,9 @@ Claude uses `ordinary-claude-bind` with the exact current transcript and a short
 
 After the Gateway owner authorizes this host to consume the intended guild, use the public `start --state-dir <state>` entrypoint and inspect `status --state-dir <state>`. Do not start a second consumer as a workaround. Keep all Gateway-aware CLI paths on the same installed release.
 
-To use the authenticated peer tools from Codex, register the installed stdio server on this host. Replace both absolute paths with the Node executable and CLI from this release:
+The peer MCP requires native caller identity on every invocation. A generic `codex mcp add` only saves server configuration; it does not prove that an already-running session loads the tools or passes its session identity to the MCP process. Do not add a static session UUID to that configuration. Use the installed `mcp --provider codex|claude --state-dir <state>` command only through a native integration that supplies the current caller identity and reloads the tools into that same session. If either capability is unavailable, leave peer MCP unregistered on that host.
 
-```sh
-codex mcp add discord-surface-peer -- \
-  /absolute/path/to/node /absolute-prefix/node_modules/discord-surface/src/cli.js \
-  mcp --provider codex --state-dir "$HOME/.config/discord-surface"
-codex mcp get discord-surface-peer
-```
-
-In the existing bound native session, call `peer_list()` first. It must identify the caller's binding, and the intended recipient must show a ready enrolled child before `peer_send` can reach it. If caller identity is unavailable, fix the native host integration; do not supply another session's UUID through MCP configuration. Registration and a transport `sent` receipt do not prove native pickup or a correlated result. Claude uses the same installed command with `--provider claude` in its native MCP configuration and must pass its existing caller-identity check. See [README.md](README.md#authenticated-peer-mcp) for tool arguments and result evidence.
+After a qualified integration loads the tools, call `peer_list()` in the bound native session. Both the caller and intended recipient must have ready bindings and exactly one ready enrolled child before `peer_send` can work. Registration and a transport `sent` receipt do not prove native pickup or a correlated result. See [README.md](README.md#authenticated-peer-mcp) for tool arguments and result evidence.
 
 Peer MCP registration does not steer an active Codex turn. The adapter's Codex intake uses `codex queue --thread`, which delivers a follow-up on a later turn. Active-turn steering needs a separately qualified route to the owning native app-server.
 
