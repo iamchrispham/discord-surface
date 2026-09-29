@@ -237,16 +237,17 @@ export function resolveAgentReplyRequestMatch(state: DirectPostState, replyTo: s
   if (state.isAgentRequestWithdrawn(match.packet as unknown as AgentMessage)) {
     throw new BindingError('agent request was withdrawn');
   }
+  const frozenChildRoute = match.discordId ? state.getMessage?.(match.discordId)?.agentRoute || null : null;
   if (requireFrozenChild && match.legacy && match.packet.target &&
-      (match.packet.target as AgentAddress).channelId !== source.channelId &&
-      (!match.discordId || state.getMessage?.(match.discordId)?.agentRoute !== source.channelId)) {
+      (frozenChildRoute ? frozenChildRoute !== source.channelId :
+        (match.packet.target as AgentAddress).channelId !== source.channelId)) {
     throw new BindingError('agent result source does not match the request frozen child route');
   }
   return {
     packet: match.packet as unknown as AgentMessage,
     discordId: match.discordId,
     legacy: match.legacy,
-    frozenChildRoute: match.discordId ? state.getMessage?.(match.discordId)?.agentRoute || null : null
+    frozenChildRoute
   };
 }
 

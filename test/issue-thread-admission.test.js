@@ -183,6 +183,32 @@ test('child-scoped reconciliation includes its legacy parent custody', async t =
   assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-child-scope-parent']);
 });
 
+test('live intake demotion wakes an ambiguous legacy parent when one sibling remains', async t => {
+  const f = fixture(t);
+  const binding = f.state.getBinding(f.parent.id);
+  insertLegacyParentRequest(f, 'legacy-live-demotion-parent');
+  const sibling = f.makeChannel('3000', ChannelType.PublicThread);
+  f.channels.set(sibling.id, sibling);
+  f.histories.set(sibling.id, []);
+  f.state.enrollThread({ threadId: f.child.id, parentChannelId: f.parent.id, guildId: 'guild', adoptionCutoff: '0' }, binding);
+  f.state.db.prepare('UPDATE thread_enrollments SET adopted_through_id=NULL, recovered_through_id=NULL WHERE thread_id=?')
+    .run(f.child.id);
+  f.state.markThreadBoundary(f.child.id, THREAD_STATES.READY, 'fixture empty child ready', null, null, binding);
+  f.state.enrollThread({ threadId: sibling.id, parentChannelId: f.parent.id, guildId: 'guild', adoptionCutoff: '0' }, binding);
+  f.state.setThreadBaseline(sibling.id, '0', binding);
+  f.state.markThreadBoundary(sibling.id, THREAD_STATES.READY, 'fixture sibling ready', null, null, binding);
+  f.gateway.ready = true;
+  assert.equal(f.state.claimDispatch('legacy-live-demotion-parent').reason, 'legacy-agent-route-not-unique');
+  f.gateway.boundMessage(f.message('3001'));
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForNativeWork();
+  await new Promise(resolve => setImmediate(resolve));
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getThreadEnrollment(f.child.id).state, THREAD_STATES.PENDING);
+  assert.equal(f.state.getMessage('legacy-live-demotion-parent').agentRoute, sibling.id);
+  assert.deepEqual(f.dispatched.map(message => message.id), ['legacy-live-demotion-parent']);
+});
+
 test('thread demotion wakes an ambiguous legacy parent when one sibling remains', async t => {
   const f = fixture(t);
   const binding = f.state.getBinding(f.parent.id);

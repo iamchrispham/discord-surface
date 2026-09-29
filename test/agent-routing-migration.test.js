@@ -6,7 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { SurfaceState, READINESS, MESSAGE_STATES } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
-const { AGENT_ROUTING_VERSION } = require('../src/state/agent-routing');
+const { AGENT_ROUTING_VERSION, resolveAgentReplyRequestMatch } = require('../src/state/agent-routing');
 const { runDirectPost } = require('../src/direct-post');
 const { main, agentComplete, agentSend } = require('../src/cli');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
@@ -125,6 +125,15 @@ test('legacy parent route stays held when children are ambiguous or its frozen c
   assert.equal(f.state.claimDispatch('legacy-ambiguous').reason, 'legacy-agent-route-not-ready');
   assert.equal(f.state.getMessage('legacy-ambiguous').agentRoute, '103');
   assert.equal(f.state.getMessage('legacy-ambiguous').state, MESSAGE_STATES.ACCEPTED);
+});
+
+test('frozen legacy parent rejects a parent-sourced result identity', t => {
+  const f = fixture(t);
+  enroll(f);
+  const request = acceptRequest(f, 'legacy-parent-source', true);
+  assert.equal(f.state.claimDispatch('legacy-parent-source').claimed, true);
+  assert.throws(() => resolveAgentReplyRequestMatch(f.state, request.id, source, null, source, Error, true, true),
+    /frozen child route/);
 });
 
 test('frozen legacy route rejects a sibling result after enrollment changes', async t => {

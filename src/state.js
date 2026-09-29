@@ -959,6 +959,15 @@ class SurfaceState {
     return updated;
   }
 
+  noteThreadMessage(threadId, messageId, accepted = false, coverageId = null) {
+    const previous = this.getThreadEnrollment(threadId);
+    const updated = threadEnrollmentHandlers.noteThreadMessage(this, threadId, messageId, accepted, coverageId);
+    if (previous && updated && previous.state !== updated.state) {
+      try { this.threadBoundaryObserver?.(previous, updated); } catch {}
+    }
+    return updated;
+  }
+
   checkpointThread(threadId, coverageId, expectedBinding = null, expectedEnrollment = undefined) {
     return threadEnrollmentHandlers.checkpointThread(this, threadId, coverageId, expectedBinding, expectedEnrollment);
   }

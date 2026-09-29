@@ -8,7 +8,7 @@ const { intakeCutoffDecision } = require('./intake');
 const { WATCHER_NOTICE_RECEIPTS, WATCHER_NOTICE_JOURNAL, WATCHER_NOTICE_AUTHORITY, WATCHER_NOTICE_PUBLICATION_SOURCE } = require('./watcher-notice');
 
 function createMessageIntakeHandlers({
-  assertText, bindingMatchesExpected, INTAKE_BOUNDARY_DETAILS, threadEnrollmentHandlers,
+  assertText, bindingMatchesExpected, INTAKE_BOUNDARY_DETAILS,
   compareDiscordIds, watcherNoticeHandlers, BindingError, MESSAGE_STATES, now
 }) {
   return {
@@ -33,7 +33,7 @@ function createMessageIntakeHandlers({
           const authorityChannelId = binding?.channelId || event.channelId;
           if (!bindingMatchesExpected(binding, expectedBinding)) return { accepted: false, stale: true, reason: 'stale-binding' };
           if (this.ordinaryHandoffPauses.has(authorityChannelId) || this.getIntakeWatermark(authorityChannelId)?.detail === INTAKE_BOUNDARY_DETAILS.ORDINARY_HANDOFF) {
-            if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, false);
+            if (enrollment) this.noteThreadMessage(enrollment.threadId, event.id, false);
             else this.upsertIntakeWatermark(event, false, null);
             this.receipt(null, 'intake-rejected', {
               discordId: event.id, channelId: authorityChannelId,
@@ -42,7 +42,7 @@ function createMessageIntakeHandlers({
             });
             return this.reject('handoff-intake-paused');
           }
-          if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, false, coverageId);
+          if (enrollment) this.noteThreadMessage(enrollment.threadId, event.id, false, coverageId);
           else this.upsertIntakeWatermark(event, ready, coverageId);
           this.receipt(null, 'intake-rejected', {
             discordId: event.id, channelId: authorityChannelId,
@@ -85,7 +85,7 @@ function createMessageIntakeHandlers({
       if (enrollment && parentCutoff && (!intakeCutoff || compareDiscordIds(intakeCutoff, parentCutoff) < 0)) {
         intakeCutoff = parentCutoff;
       }
-      if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, false, coverageId);
+      if (enrollment) this.noteThreadMessage(enrollment.threadId, event.id, false, coverageId);
       else this.upsertIntakeWatermark(event, ready, coverageId);
       let agent = null;
       let invalidAgent = false;
@@ -235,7 +235,7 @@ function createMessageIntakeHandlers({
         event.id, event.guildId, authorityChannelId, event.channelId, event.authorId, event.content, JSON.stringify(attachments), binding.provider, binding.nativeId,
         binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
       );
-      if (enrollment) threadEnrollmentHandlers.noteThreadMessage(this, enrollment.threadId, event.id, true);
+      if (enrollment) this.noteThreadMessage(enrollment.threadId, event.id, true);
       else {
         const watermark = this.getIntakeWatermark(authorityChannelId);
         if (!watermark?.last_accepted_id || compareDiscordIds(watermark.last_accepted_id, event.id) < 0) {
