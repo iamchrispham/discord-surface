@@ -324,6 +324,30 @@ test('Claude Monitor makes duplicate agent requests recoverable through completi
   assert.deepEqual(payload.completion.command, completion);
 });
 
+test('Claude Monitor suppresses execution for an ambiguous legacy request', () => {
+  const completion = [process.execPath, '/tmp/cli.js', 'agent-complete', '--db', '/tmp/surface.sqlite',
+    '--provider', 'claude', '--message-id', 'request-ambiguous', '--native-id', target.nativeId, '--generation', '1'];
+  const payload = monitorEvent({
+    content: 'ambiguous authenticated agent request',
+    messageId: 'request-ambiguous',
+    nativeId: target.nativeId,
+    generation: 1,
+    completion,
+    agentMessage: { kind: KINDS.REQUEST },
+    agentSendChildAmbiguous: true,
+    agentSendChildId: null,
+    stateDir: '/tmp',
+    dbPath: '/tmp/surface.sqlite',
+    cliPath: '/tmp/cli.js',
+    textFile: '/tmp/reply.txt'
+  });
+
+  assert.match(payload.instructions, /no exact child route/);
+  assert.match(payload.instructions, /explicit route reconciliation/);
+  assert.doesNotMatch(payload.instructions, /Follow the correlated agent-send instruction/);
+  assert.equal(payload.completion, undefined);
+});
+
 const { runDirectPost } = require('../src/direct-post');
 const { agentSend } = require('../src/cli');
 

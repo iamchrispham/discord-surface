@@ -10,7 +10,7 @@ const { acknowledgmentCommand, recordNativeAcknowledgment } = require('../src/ac
 const { agentComplete, GATEWAY_CAPABILITIES } = require('../src/cli');
 const { agentCompletionCommand, claudeEvent, codexPrompt } = require('../src/native');
 const { runDirectPost } = require('../src/direct-post');
-const { createSurfaceConsumer } = require('../src/discord');
+const { createSurfaceConsumer, DiscordGateway } = require('../src/discord');
 
 const source = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
 const target = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222', generation: 2 };
@@ -493,6 +493,55 @@ test('handled completion leaves later accepted owner work recoverable after rest
     state = new SurfaceState(db);
     assert.deepEqual(state.recoveryCandidates().map(message => message.id), ['1011']);
   } finally { state?.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Codex restart recovery completes an acknowledged inbound result before observing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-result-recovery-'));
+  const db = path.join(dir, 'surface.sqlite');
+  let state = new SurfaceState(db);
+  try {
+    state.setConfig({ operatorId: '900', guildId: source.guildId, secretFile: path.join(dir, 'secret') });
+    const owners = bindAgentOwners(state, dir);
+    const messageId = '1012';
+    const packet = {
+      id: 'codex-restart-result', kind: KINDS.RESULT, source: owners.targetChild, target: owners.sourceChild,
+      replyTo: 'remote-request', text: 'Result handled before the native session stopped.'
+    };
+    assert.equal(state.acceptDiscordMessage({ id: messageId, guildId: owners.sourceChild.guildId,
+      channelId: owners.sourceChild.channelId, authorId: '901', isBot: true, attachments: [],
+      content: encodeAgentMessage(packet, token) }, { agentToken: token }).accepted, true);
+    assert.equal(state.claimDispatch(messageId).claimed, true);
+    state.markSubmitted(messageId);
+    recordNativeAcknowledgment(state, { provider: owners.source.provider, messageId,
+      nativeId: owners.source.nativeId, generation: owners.source.generation });
+    state.close();
+    state = new SurfaceState(db);
+    state.recoverAfterRestart();
+
+    let observations = 0;
+    const channel = {
+      permissionsFor: () => ({ has: () => true }),
+      messages: { fetch: async () => ({ react: async () => {} }) },
+      send: async () => { throw new Error('inbound result recovery must not post a Discord reply'); }
+    };
+    const gateway = new DiscordGateway({
+      state,
+      providers: {
+        codex: {
+          async observe() {
+            observations += 1;
+            return { text: 'unexpected native observation' };
+          }
+        }
+      },
+      client: { user: { id: 'bot-1' }, on() {}, off() {}, channels: { fetch: async () => channel }, async destroy() {} }
+    });
+    gateway.ready = true;
+    await gateway.reconcilePending();
+    assert.equal(state.getMessage(messageId).state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
+    assert.equal(observations, 0);
+    await gateway.stop();
+  } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 

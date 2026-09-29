@@ -193,6 +193,22 @@ test('agent requests direct both native providers to a correlated result', () =>
   assert.match(facade.messageRequest(agentResult), /Consume this result with agent-complete/);
 });
 
+test('ambiguous legacy requests only acknowledge and request route reconciliation', () => {
+  const ambiguous = { ...agentRequest, agentSendChildAmbiguous: true, agentSendChildId: null };
+  const codex = facade.codexPrompt(ambiguous, acknowledgment, completion);
+  const claude = facade.claudeEvent(ambiguous, completion);
+  const completionJson = JSON.stringify(completion);
+  for (const prompt of [codex, claude.content]) {
+    assert.match(prompt, /no exact (?:result )?route exists/);
+    assert.match(prompt, /explicit route reconciliation/);
+    assert.equal(prompt.includes(completionJson), false);
+    assert.doesNotMatch(prompt, /Return exactly one correlated result/);
+    assert.doesNotMatch(prompt, /Follow the correlated agent-send instruction/);
+  }
+  assert.match(codex, /native-ack/);
+  assert.equal(claude.completion, undefined);
+});
+
 test('native presentation preserves deterministic bytes', () => {
   const values = {
     agentCompletionCommand: facade.agentCompletionCommand(agentResult, '/tmp/state.sqlite', '/tmp/cli.js', '/tmp/state'),

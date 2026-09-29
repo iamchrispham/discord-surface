@@ -3347,6 +3347,25 @@ class DiscordGateway {
       (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
       (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready ||
         isHeldDurable(message));
+    const recoverCodexAgentResult = message => {
+      const current = this.state.getMessage(message.id);
+      const eligible = current?.provider === 'codex' && current.agentMessage?.kind === 'result' &&
+        current.state === MESSAGE_STATES.SUBMITTED && this.state.hasNativeAcknowledgment?.(current);
+      if (!eligible || typeof this.state.completeAgentHandledWithoutPost !== 'function') return false;
+      try {
+        this.state.completeAgentHandledWithoutPost({
+          messageId: current.id,
+          provider: current.provider,
+          nativeId: current.nativeId,
+          generation: current.generation
+        });
+        this.consumer?.releaseHandledWithoutPost?.(current.id);
+        return true;
+      } catch (error) {
+        this.logger(`Codex agent result completion recovery deferred for ${current.id}: ${error.message}`);
+        return true;
+      }
+    };
     this.startDecisionRecovery(signal, selectedChannels);
     const candidates = this.state.recoveryCandidates(before).filter(allowed);
     const retryOrder = messageIds ? new Map(messageIds.map((messageId, index) => [messageId, index])) : null;
@@ -3451,6 +3470,7 @@ class DiscordGateway {
     for (const message of ordered) {
       if (signal?.aborted) break;
       if (message.state !== 'submitted') continue;
+      if (recoverCodexAgentResult(message)) continue;
       const storedMessage = storedMessageFor(message);
       try {
         const admitted = this.consumer.resumeSubmitted(storedMessage, signal, {
@@ -3655,7 +3675,7 @@ class DiscordGateway {
           }
         } else if (message.state === 'submitted') {
           const current = this.state.getMessage(message.id);
-          if (current?.state === 'reply_ready') {
+          if (!recoverCodexAgentResult(message) && current?.state === 'reply_ready') {
             this.state.recoverNativeReplyAcknowledgment(message.id);
             recoveryOperationStarted = false;
             result = await deliverReplyWithinRecovery(storedMessage, { status: current.state, message: current });

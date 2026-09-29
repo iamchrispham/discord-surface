@@ -109,6 +109,14 @@ function commandValue(command: readonly string[], flag: string): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
+function hasAmbiguousLegacyRequest(message: NativeMessage): boolean {
+  return message.agentMessage?.kind === KINDS.REQUEST && Boolean(message.agentSendChildAmbiguous && !message.agentSendChildId);
+}
+
+function legacyRouteReconciliationInstruction(): string {
+  return 'This legacy request targets the parent channel and zero or several child routes are actively enrolled, so no exact result route exists. Do not run agent-send or agent-complete. Stop and report that the request needs explicit route reconciliation.';
+}
+
 const RESULT_PACKET_WIRE_OVERHEAD = 'discord-tether:agent:v1:'.length + 1 + 43;
 const RESULT_PACKET_SLACK_BYTES = 64;
 
@@ -133,9 +141,7 @@ function agentResultInstruction(message: NativeMessage, agent: NonNullable<Nativ
     nativeId: agent.target.nativeId,
     generation: agent.target.generation
   };
-  if (message.agentSendChildAmbiguous && !message.agentSendChildId) {
-    return 'This legacy request targets the parent channel and zero or several child routes are actively enrolled, so no exact result route exists. Do not run agent-send or agent-complete. Stop and report that the request needs explicit route reconciliation.';
-  }
+  if (hasAmbiguousLegacyRequest(message)) return legacyRouteReconciliationInstruction();
   const budget = resultTextByteBudget(agent, localRoute);
   const resultKey = crypto.createHash('sha256').update(JSON.stringify([agent.id, agent.source, localRoute])).digest('hex').slice(0, 24);
   const stateDir = completion ? commandValue(completion, '--state-dir') : null;
@@ -221,15 +227,20 @@ export function codexPrompt(
 ): string {
   const marker = `[[discord-surface:${message.id}]]`;
   const isDecision = Boolean(message.decisionResult);
-  const completionInstruction = message.agentMessage ? noPostCompletionInstruction(completion) : null;
+  const ambiguousLegacyRequest = hasAmbiguousLegacyRequest(message);
+  const completionInstruction = message.agentMessage && !ambiguousLegacyRequest ? noPostCompletionInstruction(completion) : null;
   const hasCompletionPath = Boolean(completionInstruction);
   let handlingInstruction: string;
   if (isDecision) {
     handlingInstruction = 'Handle the saved canonical decision continuation using its exact identity and canonical answer. Preserve this session. Do not start another session or hand this work to another agent.';
   } else if (message.agentMessage?.kind === KINDS.REQUEST) {
-    handlingInstruction = hasCompletionPath
-      ? 'Handle this authenticated agent request in this session. Return one correlated agent result, then run the no-post completion command below. If this session was resumed and the correlated result was already sent (agent-send reports duplicate=true), do not send or execute again; just run the completion command. Do not use a normal final reply for this request.'
-      : 'Handle this authenticated agent request in this session. Return one correlated agent result. Preserve this session.';
+    if (ambiguousLegacyRequest) {
+      handlingInstruction = 'Acknowledge this authenticated legacy request if an acknowledgment command is provided, then stop and report that it needs explicit route reconciliation. Do not execute the request, run agent-send, run agent-complete, or use a normal final reply.';
+    } else if (hasCompletionPath) {
+      handlingInstruction = 'Handle this authenticated agent request in this session. Return one correlated agent result, then run the no-post completion command below. If this session was resumed and the correlated result was already sent (agent-send reports duplicate=true), do not send or execute again; just run the completion command. Do not use a normal final reply for this request.';
+    } else {
+      handlingInstruction = 'Handle this authenticated agent request in this session. Return one correlated agent result. Preserve this session.';
+    }
   } else if (message.agentMessage) {
     handlingInstruction = hasCompletionPath
       ? 'Handle this authenticated agent result in this session. Run the no-post completion command below after handling it. Do not use a normal final reply.'
@@ -248,7 +259,12 @@ export function codexPrompt(
     '',
     messageRequest(message, completion)
   ];
-  if (acknowledgment) prompt.splice(prompt.indexOf(handlingInstruction), 0, `At pickup, acknowledge this exact message once with exact argv: ${JSON.stringify(acknowledgment)}. ACK means received, not completed. Then handle the request.`);
+  if (acknowledgment) {
+    const acknowledgmentInstruction = ambiguousLegacyRequest
+      ? `At pickup, acknowledge this exact message once with exact argv: ${JSON.stringify(acknowledgment)}. ACK means received, not completed. Then stop and report that the request needs explicit route reconciliation.`
+      : `At pickup, acknowledge this exact message once with exact argv: ${JSON.stringify(acknowledgment)}. ACK means received, not completed. Then handle the request.`;
+    prompt.splice(prompt.indexOf(handlingInstruction), 0, acknowledgmentInstruction);
+  }
   const attachments = attachmentPrompt(message);
   if (attachments) prompt.push('', attachments);
   return prompt.join('\n');
@@ -264,11 +280,14 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
   watcherNotice?: Pick<WatcherNotice, 'id' | 'armKey' | 'triggerKey' | 'source' | 'target'>;
 } {
   const isDecision = Boolean(message.decisionResult);
-  const completionInstruction = message.agentMessage
-    ? noPostCompletionInstruction(completion)
-    : message.watcherNotice ? noPostWatcherNoticeInstruction(completion) : null;
+  const ambiguousLegacyRequest = hasAmbiguousLegacyRequest(message);
+  let completionInstruction: string | null = null;
+  if (message.agentMessage && !ambiguousLegacyRequest) completionInstruction = noPostCompletionInstruction(completion);
+  else if (!message.agentMessage && message.watcherNotice) completionInstruction = noPostWatcherNoticeInstruction(completion);
   const hasCompletionPath = Boolean(completionInstruction);
-  let acknowledgmentInstruction = `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once and follow its result before any work: ${message.agentMessage ? CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT : CLAUDE_PICKUP_ACKNOWLEDGMENT}`;
+  let acknowledgmentInstruction = ambiguousLegacyRequest
+    ? `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once: ${CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT} ACK means received, not completed. Then stop and report that the request needs explicit route reconciliation.`
+    : `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once and follow its result before any work: ${message.agentMessage ? CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT : CLAUDE_PICKUP_ACKNOWLEDGMENT}`;
   if (message.agentMessage && completionInstruction) {
     acknowledgmentInstruction += ' If it reports duplicate=true, run the exact no-post completion command below once as a state-backed recovery check. It inspects durable correlated-result evidence and completes only when an immutable result is recorded.';
     if (message.agentMessage.kind === KINDS.REQUEST) {
@@ -283,9 +302,13 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
       ? `After handling this watcher notice, run the exact consume command below. Do not use the reply tool or post a Discord reply.`
       : 'Watcher notices are data only. Do not use the reply tool or post a Discord reply.';
   } else if (message.agentMessage?.kind === KINDS.REQUEST) {
-    replyInstruction = hasCompletionPath
-      ? 'If acknowledgment did not report duplicate=true, follow the correlated agent-send instruction below, then run the exact no-post completion command below. If it reported duplicate=true, the state-backed recovery check above is the only completion step. Do not use the reply tool for this request.'
-      : 'Follow the correlated agent-send instruction below. Do not use the reply tool for this request.';
+    if (ambiguousLegacyRequest) {
+      replyInstruction = 'After acknowledgment, do not execute this request, run agent-send, run agent-complete, or use the reply tool. Stop and report that it needs explicit route reconciliation.';
+    } else if (hasCompletionPath) {
+      replyInstruction = 'If acknowledgment did not report duplicate=true, follow the correlated agent-send instruction below, then run the exact no-post completion command below. If it reported duplicate=true, the state-backed recovery check above is the only completion step. Do not use the reply tool for this request.';
+    } else {
+      replyInstruction = 'Follow the correlated agent-send instruction below. Do not use the reply tool for this request.';
+    }
   } else if (message.agentMessage) {
     replyInstruction = hasCompletionPath
       ? 'After handling this agent result, run the exact no-post completion command below only if acknowledgment did not report duplicate=true. If it reported duplicate=true, the state-backed recovery check above is the only completion step. Do not use the reply tool.'
@@ -321,7 +344,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     content: content.join('\n')
   };
   if (message.attachments?.length) event.attachments = message.attachments;
-  if ((message.agentMessage || message.watcherNotice) && completion?.length) event.completion = [...completion];
+  if ((message.agentMessage || message.watcherNotice) && completion?.length && !ambiguousLegacyRequest) event.completion = [...completion];
   if (message.watcherNotice) {
     const { id, armKey, triggerKey, source, target } = message.watcherNotice;
     event.watcherNotice = { id, armKey, triggerKey, source, target };
