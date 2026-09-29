@@ -124,13 +124,13 @@ const expectedDigests = {
   messageRequestWatcher: '778ebfecc08c0621fb1e6ee1ac96cfb417aad3576c1f1c6a55e52a47b9d32b9d',
   codexPromptHuman: '214cc1a09949c904d2144fc85a729826e661ea84f89569d5acb88c47f1088b39',
   codexPromptAttachment: '236c32b2160a03dc257ef12ec93463c79faed582466f47c54a84fb144c21b04b',
-  codexPromptAgentRequest: '65aa1b29c3b8bc7399e1e421c4e0f29a13fca7e00ac2c1daea5abf44bb0da03a',
+  codexPromptAgentRequest: 'd11920ce583470ba710b2989e741076d633914b0d443d02e4c71d9e0292db895',
   codexPromptAgentResult: 'f88215d73e2a267afba9c33a5cf2a32c814e35d31afcec3c20111245518accec',
   codexPromptDecision: 'fa9ba7f924595df3cfab549840962960ae5cc3f5fab299412dc51dc8c4ce9510',
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
   claudeEventHuman: '911abc7b2fa1a150eaa9aca8ac98095cd53f4f73ea81c18ee5c6b67a5ac75f4c',
   claudeEventAttachment: '22eb3473721966977f21e52d12f95b3119d69be2dda0df03496129f25fafc5bf',
-  claudeEventAgentRequest: '54d579154f02038ee0573d6c87b9165a477b30fa961e9ac90f53e2ef0126fda6',
+  claudeEventAgentRequest: 'e957e4d0b76c8923ea691f99db9736b6e279f387b2fcf4bb7e790dc960e81f09',
   claudeEventAgentResult: '06200d8e2398583fa24d6457dd9ffa9b3e289ccbd4d97068b2552f529a366be6',
   claudeEventDecision: '013e49f8486367da8108864033bfa960ede92a9881183986d0721e0f841b8ff4',
   claudeEventWatcher: '450bba4f711e01e1c173517032984718d5d9d03edbfe74aa40f9d1b796b4ea5c'
@@ -195,6 +195,8 @@ test('agent pickup requires a correlated result while human pickup keeps replies
     assert.match(prompt, /On duplicate=true for this request/);
     assert.match(prompt, /Run the packet's agent-complete command first/);
     assert.match(prompt, /reuse the exact agent-send argv and dedupe key/);
+    assert.match(prompt, /On duplicate=true, run the .*completion command.* before request work/);
+    assert.match(prompt, /On recorded=true, handle .*request and complete only after a confirmed result/);
     assert.doesNotMatch(prompt, /Choose exactly one: normal final|either use the reply tool|Use the reply tool with messageId/);
   }
   for (const prompt of [resultPrompt, directResult]) {
@@ -211,7 +213,7 @@ test('agent pickup requires a correlated result while human pickup keeps replies
 test('agent request pickup acknowledges first and uses the exact child result route', () => {
   const prompt = facade.codexPrompt(agentRequest, acknowledgment, completion);
   const ack = 'At pickup, acknowledge this exact message once';
-  assert.ok(prompt.indexOf(ack) < prompt.indexOf('Handle this authenticated agent packet'));
+  assert.ok(prompt.indexOf(ack) < prompt.indexOf('On duplicate=true, run the completion command'));
   assert.match(prompt, /"agent-send","--state-dir","\/tmp\/state with spaces","--db","\/tmp\/state with spaces\.sqlite"/);
   assert.match(prompt, /"--agent-thread-id","102"/);
   assert.match(prompt, /"--text-file","\/tmp\/state with spaces\/agent-result-agent-request-event\.txt"/);

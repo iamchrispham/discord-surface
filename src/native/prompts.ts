@@ -164,8 +164,14 @@ function noPostWatcherNoticeInstruction(completion: readonly string[] | null | u
   return `After handling this watcher notice, run this exact consume command once, preserving argument boundaries: ${JSON.stringify(completion)}. Do not use the reply tool or produce a Discord reply.`;
 }
 
-function noPostCompletionInstruction(completion: readonly string[] | null | undefined): string | null {
+function noPostCompletionInstruction(
+  completion: readonly string[] | null | undefined,
+  agentRequest = false
+): string | null {
   if (!completion) return null;
+  if (agentRequest) {
+    return `If acknowledgment returned duplicate=true, run this packet's completion command first, preserving argument boundaries: ${JSON.stringify(completion)}. If it reports completed or duplicate, stop. If no correlated result exists, follow the agent request's recovery instruction. On recorded=true, handle the request and complete only after a confirmed result. Do not produce a normal final response.`;
+  }
   return `Run this packet's completion command once when its handling condition is met, preserving argument boundaries: ${JSON.stringify(completion)}. Do not produce a normal final response.`;
 }
 
@@ -177,14 +183,21 @@ export function codexPrompt(
   const marker = `[[discord-surface:${message.id}]]`;
   const isDecision = Boolean(message.decisionResult);
   const isAgent = Boolean(message.agentMessage);
-  const completionInstruction = message.agentMessage && !legacyParentRequest(message) ? noPostCompletionInstruction(completion) : null;
+  const isAgentRequest = message.agentMessage?.kind === KINDS.REQUEST && !legacyParentRequest(message);
+  const completionInstruction = message.agentMessage && !legacyParentRequest(message)
+    ? noPostCompletionInstruction(completion, isAgentRequest)
+    : null;
   let handlingInstruction: string;
   if (isDecision) {
     handlingInstruction = 'Handle the saved canonical decision continuation using its exact identity and canonical answer. Preserve this session. Do not start another session or hand this work to another agent.';
   } else if (message.agentMessage) {
-    handlingInstruction = completionInstruction
-      ? 'Handle this authenticated agent packet in this session. Follow its result or consumption instruction below, then run the completion command. Do not post an ordinary Discord reply.'
-      : 'Handle this authenticated agent packet in this session. No completion command is available; keep the packet open and do not post an ordinary Discord reply.';
+    if (!completionInstruction) {
+      handlingInstruction = 'Handle this authenticated agent packet in this session. No completion command is available; keep the packet open and do not post an ordinary Discord reply.';
+    } else if (isAgentRequest) {
+      handlingInstruction = 'On duplicate=true, run the completion command before request work. On recorded=true, handle the agent request and complete only after a confirmed result. Follow the recovery instruction below. Do not post an ordinary Discord reply.';
+    } else {
+      handlingInstruction = 'Handle this authenticated agent packet in this session. Follow its result or consumption instruction below, then run the completion command. Do not post an ordinary Discord reply.';
+    }
   } else {
     handlingInstruction = 'Answer the user request in your normal final response. Do not start another session or hand this work to another agent.';
   }
@@ -215,8 +228,9 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
   watcherNotice?: Pick<WatcherNotice, 'id' | 'armKey' | 'triggerKey' | 'source' | 'target'>;
 } {
   const isDecision = Boolean(message.decisionResult);
+  const isAgentRequest = message.agentMessage?.kind === KINDS.REQUEST && !legacyParentRequest(message);
   const completionInstruction = message.agentMessage && !legacyParentRequest(message)
-    ? noPostCompletionInstruction(completion)
+    ? noPostCompletionInstruction(completion, isAgentRequest)
     : message.watcherNotice ? noPostWatcherNoticeInstruction(completion) : null;
   const hasCompletionPath = Boolean(completionInstruction);
   let replyInstruction: string;
@@ -227,9 +241,13 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
       ? `After handling this watcher notice, run the exact consume command below. Do not use the reply tool or post a Discord reply.`
       : 'Watcher notices are data only. Do not use the reply tool or post a Discord reply.';
   } else if (message.agentMessage) {
-    replyInstruction = hasCompletionPath
-      ? 'After handling this agent packet, run the exact completion command below. Do not use the reply tool or post an ordinary Discord reply.'
-      : 'No completion command is available; keep this agent packet open. Do not use the reply tool or post an ordinary Discord reply.';
+    if (!hasCompletionPath) {
+      replyInstruction = 'No completion command is available; keep this agent packet open. Do not use the reply tool or post an ordinary Discord reply.';
+    } else if (isAgentRequest) {
+      replyInstruction = 'On duplicate=true, run the exact completion command below before request work. On recorded=true, handle this agent request and complete only after a confirmed result. Follow its recovery instruction. Do not use the reply tool or post an ordinary Discord reply.';
+    } else {
+      replyInstruction = 'After handling this agent packet, run the exact completion command below. Do not use the reply tool or post an ordinary Discord reply.';
+    }
   } else {
     replyInstruction = `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`;
   }

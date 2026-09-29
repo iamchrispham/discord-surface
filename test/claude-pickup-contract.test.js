@@ -413,7 +413,7 @@ test('real direct MCP notification carries the shared ACK branch before per-kind
     assert.ok(agentContent.includes(JSON.stringify(completionFor(f.state.getMessage(agent.id)))));
 
     const requestContent = contentFor(request.id);
-    assertDirectEventAcknowledgment(requestContent, request.id, request.generation, 'After handling this agent packet');
+    assertDirectEventAcknowledgment(requestContent, request.id, request.generation, 'On duplicate=true, run the exact completion command below');
     assert.match(requestContent, /agent-send --agent-reply-to contract-request-2104/);
     assert.doesNotMatch(requestContent, /either use the reply tool|Use the reply tool with messageId/);
     assert.ok(requestContent.includes(JSON.stringify(completionFor(f.state.getMessage(request.id)))));
