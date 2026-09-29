@@ -7,7 +7,7 @@ import type {
 import type { Attachment } from './attachments';
 import type { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CLAUDE_PICKUP_ACKNOWLEDGMENT } from './acknowledgment/pickup';
-export { CLAUDE_PICKUP_ACKNOWLEDGMENT } from './acknowledgment/pickup';
+export { CLAUDE_PICKUP_ACKNOWLEDGMENT, CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT } from './acknowledgment/pickup';
 
 const { recordNativeAcknowledgment } = require('./acknowledgment') as typeof import('./acknowledgment');
 
@@ -150,6 +150,7 @@ export function createDefaultMcp({ nativeId, state }: { nativeId: string; state:
       capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
       instructions: 'This channel is explicitly opted in by the native Claude session. For each event, call acknowledge at pickup. ' +
         `${CLAUDE_PICKUP_ACKNOWLEDGMENT} ` +
+        'For agent request and result events, the event-specific instructions define duplicate=true recovery and take precedence over the duplicate stop rule. ' +
         "After the acknowledgment branch, follow the event's kind-specific instructions exactly. Do not assume a reply, completion, or consume action from this initialization text. Do not attach, resume, or start another session."
     }
   );

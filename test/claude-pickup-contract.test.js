@@ -19,7 +19,7 @@ const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { KINDS, encodeAgentMessage } = require('../src/agent-message');
 const { runWatcherNoticePost } = require('../src/direct-post');
-const { createDefaultMcp, CLAUDE_PICKUP_ACKNOWLEDGMENT } = require('../src/claude-channel');
+const { createDefaultMcp, CLAUDE_PICKUP_ACKNOWLEDGMENT, CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT } = require('../src/claude-channel');
 const { createMonitorMcp } = require('../src/claude-monitor');
 const { ClaudeChannel } = require('../src/claude-channel');
 const { ClaudeProvider, agentCompletionCommand, watcherNoticeCompletionCommand } = require('../src/native');
@@ -180,10 +180,10 @@ function assertAcknowledgmentCommand(payload, message, f) {
   ]);
 }
 
-function assertSharedBranchInstruction(instructions, workMarker) {
-  assert.ok(instructions.includes(SHARED_CONDITION), `shared condition missing from: ${instructions}`);
+function assertSharedBranchInstruction(instructions, workMarker, condition = SHARED_CONDITION) {
+  assert.ok(instructions.includes(condition), `shared condition missing from: ${instructions}`);
   const ackIndex = instructions.indexOf('acknowledgment.command');
-  const conditionIndex = instructions.indexOf(SHARED_CONDITION);
+  const conditionIndex = instructions.indexOf(condition);
   const workIndex = instructions.indexOf(workMarker);
   assert.ok(ackIndex >= 0, `ack step missing from: ${instructions}`);
   assert.ok(workIndex >= 0, `work marker ${JSON.stringify(workMarker)} missing from: ${instructions}`);
@@ -199,6 +199,8 @@ function assertAgentRequestRecoveryInstruction(instructions) {
   assert.ok(ackIndex >= 0, `ack step missing from: ${instructions}`);
   assert.ok(recoveryIndex >= 0, `duplicate recovery step missing from: ${instructions}`);
   assert.ok(workIndex >= 0, `work marker missing from: ${instructions}`);
+  assert.ok(instructions.includes(CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT), 'agent ACK sentence missing');
+  assert.ok(!instructions.includes(CLAUDE_PICKUP_ACKNOWLEDGMENT), 'agent request must not carry the duplicate-stop rule');
   assert.ok(ackIndex < recoveryIndex, 'ACK step must precede duplicate recovery');
   assert.ok(recoveryIndex < workIndex, 'duplicate recovery must precede the request work instruction');
 }
@@ -222,17 +224,17 @@ function assertPointerDelegates(pointer, payload) {
 
 // F2: share one extraction of the ACK tool step so the direct event assertion
 // pins the exact tool name and argument boundaries, not just the sentence.
-function assertDirectEventAcknowledgment(content, messageId, generation, workMarker) {
+function assertDirectEventAcknowledgment(content, messageId, generation, workMarker, ack = CLAUDE_PICKUP_ACKNOWLEDGMENT) {
   const ackStep = content.split('\n').find(line => line.startsWith('At pickup, call acknowledge with messageId'));
   assert.ok(ackStep, `direct event ACK tool step missing from: ${content}`);
   assert.ok(ackStep.includes(`messageId "${messageId}"`), `ACK tool step must carry the exact messageId: ${ackStep}`);
   assert.ok(ackStep.includes(`generation ${generation}`), `ACK tool step must carry the exact generation: ${ackStep}`);
-  assert.ok(ackStep.includes(CLAUDE_PICKUP_ACKNOWLEDGMENT), `ACK tool step must carry the exact shared condition: ${ackStep}`);
+  assert.ok(ackStep.includes(ack), `ACK tool step must carry the exact shared condition: ${ackStep}`);
   const ackIndex = content.indexOf('At pickup, call acknowledge with messageId');
-  const conditionIndex = content.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT);
-  const workIndex = content.indexOf(workMarker);
+  const conditionIndex = content.indexOf(ack);
+  const workIndex = content.indexOf(workMarker, ack = CLAUDE_PICKUP_ACKNOWLEDGMENT);
   assert.ok(conditionIndex >= 0, 'shared condition missing from direct event');
-  assert.ok(workIndex >= 0, `per-kind work marker ${JSON.stringify(workMarker)} missing from direct event: ${content}`);
+  assert.ok(workIndex >= 0, `per-kind work marker ${JSON.stringify(workMarker, ack = CLAUDE_PICKUP_ACKNOWLEDGMENT)} missing from direct event: ${content}`);
   assert.ok(ackIndex < conditionIndex, 'ACK tool step must precede the shared condition');
   assert.ok(conditionIndex < workIndex, 'per-kind work instruction must follow the shared condition');
 }
@@ -385,7 +387,7 @@ test('real Monitor payloads carry the shared ACK branch for human, agent request
 
     const agentPayload = payloadFor(agent.id);
     assertPointerDelegates(agentPayload.pointer, agentPayload.payload);
-    assertSharedBranchInstruction(agentPayload.payload.instructions, 'Handle this agent result');
+    assertSharedBranchInstruction(agentPayload.payload.instructions, 'Handle this agent result', CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT);
     assertAcknowledgmentCommand(agentPayload.payload, agent, f);
     assert.deepEqual(agentPayload.payload.agent, { kind: KINDS.RESULT });
     assert.match(agentPayload.payload.instructions, /Do not use reply\.command or produce a Discord reply/);
@@ -448,8 +450,8 @@ test('real direct MCP notification carries the shared ACK branch before per-kind
     assert.ok(humanContent.includes(`Use the reply tool with messageId "${human.id}" and generation ${human.generation}`));
 
     const agentContent = contentFor(agent.id);
-    assertDirectEventAcknowledgment(agentContent, agent.id, agent.generation, 'After handling this agent result');
-    assert.ok(agentContent.indexOf(CLAUDE_PICKUP_ACKNOWLEDGMENT) < agentContent.indexOf('After handling this agent result'), 'agent work instruction must follow the shared condition');
+    assertDirectEventAcknowledgment(agentContent, agent.id, agent.generation, 'After handling this agent result', CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT);
+    assert.ok(agentContent.indexOf(CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT) < agentContent.indexOf('After handling this agent result'), 'agent work instruction must follow the shared condition');
     assert.ok(agentContent.includes('Do not use the reply tool.'));
     assert.ok(agentContent.includes(JSON.stringify(completionFor(f.state.getMessage(agent.id)))));
 

@@ -2,7 +2,7 @@ import * as crypto from 'node:crypto';
 import * as path from 'node:path';
 import type { Attachment } from '../attachments';
 import { watcherNoticePrompt, type WatcherNotice } from '../watcher-notice';
-import { CLAUDE_PICKUP_ACKNOWLEDGMENT } from '../acknowledgment/pickup';
+import { CLAUDE_PICKUP_ACKNOWLEDGMENT, CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT } from '../acknowledgment/pickup';
 import { ENVELOPE_TYPE, PROMPT_PREFIX } from '../state/courier-route/constants';
 import type { CourierDispatchEnvelope, NativeMessage } from '../native';
 import { normalizeReplyContext } from '../reply-context';
@@ -128,7 +128,7 @@ function agentResultInstruction(message: NativeMessage, agent: NonNullable<Nativ
     return [
       'Return exactly one correlated result through the agent-send command.',
       `Write this exact JSON to an owner-only target file: ${JSON.stringify(agent.source)}. The target file preserves the immutable incoming source route and is the exact source selector, not a route inferred from the packet ID.`,
-      `Use --agent-reply-to ${JSON.stringify(agent.id)}, --channel-id ${JSON.stringify(localParentChannelId)}, --agent-thread-id ${JSON.stringify(localChildChannelId)}, --native-id ${JSON.stringify(agent.target.nativeId)}, --generation ${JSON.stringify(String(agent.target.generation))}, --target-file <owner-only target file>, and --text-file <owner-only result file>.`,
+      `Use --agent-reply-to ${JSON.stringify(agent.id)}, --channel-id ${JSON.stringify(localParentChannelId)}, --agent-thread-id ${JSON.stringify(localChildChannelId)}, --native-id ${JSON.stringify(agent.target.nativeId)}, --generation ${JSON.stringify(String(agent.target.generation))}, --target-file <owner-only target file>, and --text-file <owner-only result file>. Keep the result text short (under 800 characters): the signed agent packet is capped at 2000 characters including route metadata, and an oversized result is rejected before it is recorded.`,
       `The local send route is ${JSON.stringify(localRoute)}. --channel-id is the enrolled parent binding and --agent-thread-id is the enrolled child route.`,
       `Use a stable dedupe key such as ${JSON.stringify(`agent-result-${resultKey}`)} and preserve the receiving agent route ${JSON.stringify(agent.target)}.`,
       'If agent-send reports duplicate=true, the immutable result is already recorded. Do not send another result or stop; continue with the required completion step. Then run agent-complete. Do not use an ordinary Discord reply. An ordinary Discord reply does not complete this request.'
@@ -153,7 +153,7 @@ function agentResultInstruction(message: NativeMessage, agent: NonNullable<Nativ
   return [
     'Return exactly one correlated result with this exact routed CLI invocation.',
     `Write this exact JSON to the owner-only target file ${JSON.stringify(targetFile)} before running it: ${JSON.stringify(agent.source)}. The target file preserves the immutable incoming source route and is the exact source selector, not a route inferred from the packet ID.`,
-    `Write the result text to the owner-only text file ${JSON.stringify(textFile)}.`,
+    `Write the result text to the owner-only text file ${JSON.stringify(textFile)}. Keep the result text short (under 800 characters): the signed agent packet is capped at 2000 characters including route metadata, and an oversized result is rejected before it is recorded.`,
     `Command argv: ${JSON.stringify(command)}.`,
     `The local send route is ${JSON.stringify(localRoute)}. --channel-id is the enrolled parent binding and --agent-thread-id is the enrolled child route.`,
     'If agent-send reports duplicate=true, the immutable result is already recorded. Do not send another result or stop; continue with the required completion step. Then run agent-complete. Do not use an ordinary Discord reply. An ordinary Discord reply does not complete this request.'
@@ -231,7 +231,7 @@ export function codexPrompt(
     '',
     messageRequest(message, completion)
   ];
-  if (acknowledgment) prompt.splice(3, 0, `At pickup, acknowledge this exact message once with exact argv: ${JSON.stringify(acknowledgment)}. ACK means received, not completed. Then handle the request.`);
+  if (acknowledgment) prompt.splice(prompt.indexOf(handlingInstruction), 0, `At pickup, acknowledge this exact message once with exact argv: ${JSON.stringify(acknowledgment)}. ACK means received, not completed. Then handle the request.`);
   const attachments = attachmentPrompt(message);
   if (attachments) prompt.push('', attachments);
   return prompt.join('\n');
@@ -251,7 +251,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     ? noPostCompletionInstruction(completion)
     : message.watcherNotice ? noPostWatcherNoticeInstruction(completion) : null;
   const hasCompletionPath = Boolean(completionInstruction);
-  let acknowledgmentInstruction = `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once and follow its result before any work: ${CLAUDE_PICKUP_ACKNOWLEDGMENT}`;
+  let acknowledgmentInstruction = `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once and follow its result before any work: ${message.agentMessage ? CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT : CLAUDE_PICKUP_ACKNOWLEDGMENT}`;
   if (message.agentMessage && completionInstruction) {
     acknowledgmentInstruction += ' If it reports duplicate=true, run the exact no-post completion command below once as a state-backed recovery check. It inspects durable correlated-result evidence and completes only when an immutable result is recorded.';
     if (message.agentMessage.kind === KINDS.REQUEST) {
