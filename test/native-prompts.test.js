@@ -130,8 +130,8 @@ const expectedDigests = {
   codexPromptWatcher: '1543b2feeb6703bad23cee4311317ac4c1c7967711796b99194b38c58f268f34',
   claudeEventHuman: '3cf57a00278c64f0f1f5e4e180189002af5e7a97584e42326741bf752c71ddcc',
   claudeEventAttachment: 'd04456537d38c4309bae542a35f13c52cbbaa2f3e83c062cec959f7a8db24f6d',
-  claudeEventAgentRequest: '91030033b379b674be76021ac2eab5f7de8872e075ccbcb238c0b113bc79293d',
-  claudeEventAgentResult: '76dedacfce993ddf605fba6650af0b8a3bd4912097594934f225e7a1945fc798',
+  claudeEventAgentRequest: '350a8726ac0ea30208cdc801bb504f66638fb85d432e5214b3abbb6a34dfdd0e',
+  claudeEventAgentResult: '03044373ea88a411a32e88a45f7e1e2fc7e2bfd4f12213d04589970f1f10c63c',
   claudeEventDecision: '9fa9567ee39e6e4824c584991a8dad2c5267be9c3aa282ba2021e30de868e610',
   claudeEventWatcher: '45d9fbf706942a0fd9be6523d7b8dc61dc1b059e290d9a403be2010599dd3d14'
 };

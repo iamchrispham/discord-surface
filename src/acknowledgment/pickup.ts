@@ -16,7 +16,7 @@ export const CLAUDE_PICKUP_ACKNOWLEDGMENT: string =
 // Agent packets recover interrupted pickups through the state-backed completion check, so
 // the duplicate=true branch is defined by the per-kind instruction, not a stop rule.
 export const CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT: string =
-  'Proceed with this notification only if acknowledgment returns recorded=true. ' +
+  'Proceed with this notification if acknowledgment returns recorded=true or duplicate=true. ' +
   'If duplicate=true, do not execute its request or post again; follow only the duplicate recovery step below. ' +
   'If acknowledgment fails or its result is missing or ambiguous, stop and report the error without executing the request. ' +
   'Acknowledgment records receipt, not completed work. It never authorizes retrying interrupted work.';

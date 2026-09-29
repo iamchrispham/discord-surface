@@ -56,6 +56,8 @@ export interface NativeMessage {
   content: string;
   attachments?: readonly Attachment[] | null;
   agentMessage?: AgentMessage | null;
+  // Enrolled child route for a legacy request whose persisted target is the parent channel.
+  agentSendChildId?: string | null;
   watcherNotice?: WatcherNotice | null;
   watcherNoticeProvenance?: unknown;
   decisionResult?: DecisionResult | null;

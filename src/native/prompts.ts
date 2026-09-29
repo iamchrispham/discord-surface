@@ -111,7 +111,7 @@ function commandValue(command: readonly string[], flag: string): string | null {
 
 function agentResultInstruction(message: NativeMessage, agent: NonNullable<NativeMessage['agentMessage']>, completion: readonly string[] | null | undefined): string {
   const localParentChannelId = message.channelId;
-  const localChildChannelId = agent.target.channelId;
+  const localChildChannelId = message.agentSendChildId || agent.target.channelId;
   const localRoute = {
     guildId: agent.target.guildId,
     parentChannelId: localParentChannelId,

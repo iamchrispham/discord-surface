@@ -11,6 +11,7 @@ const { runDirectPost } = require('../src/direct-post');
 const { main, agentComplete, agentSend } = require('../src/cli');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { encodeAgentMessage, decodeAgentMessage, issueAgentAddress, KINDS } = require('../src/agent-message');
+const { messageRequest } = require('../src/native');
 
 const source = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
 const target = { guildId: '100', channelId: '202', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222', generation: 1 };
@@ -279,6 +280,19 @@ test('legacy parent requests complete through agent-complete regardless of earli
       assert.equal(f.state.getMessage('8102').state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
     });
   }
+});
+
+test('legacy parent request pickup sends from the enrolled child', t => {
+  const f = fixture(t);
+  acceptRequest(f, '8112', true);
+  enroll(f);
+  const message = f.state.getMessage('8112');
+  const unresolved = messageRequest({ ...message, agentSendChildId: null });
+  assert.match(unresolved, /--agent-thread-id "101"/, 'without resolved child, the old route is wrong');
+  const prompt = messageRequest(message);
+  assert.match(prompt, /--channel-id "101"/);
+  assert.match(prompt, /--agent-thread-id "103"/);
+  assert.doesNotMatch(prompt, /--agent-thread-id "101"/);
 });
 
 test('newer attemptless terminal legacy custody controls retry', async t => {
