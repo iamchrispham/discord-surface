@@ -64,7 +64,7 @@ test('both native vendors receive the same exact decision payload', { timeout: 1
   assert.deepEqual(decisionJson(claude.content), decisionResult);
 });
 
-test('ordinary and agent messages keep their existing native routing', { timeout: 120_000 }, () => {
+test('ordinary messages retain replies while agent messages use no-post routing', { timeout: 120_000 }, () => {
   const ordinary = baseMessage({ decisionResult: undefined, content: 'ordinary request' });
   assert.equal(messageRequest(ordinary), 'ordinary request');
   assert.match(codexPrompt(ordinary), /Answer the user request in your normal final response\./);
@@ -96,7 +96,7 @@ test('ordinary and agent messages keep their existing native routing', { timeout
     }
   });
   assert.match(messageRequest(agent), /^Agent result agent-message-1 from codex session 22222222-2222-2222-2222-222222222222/);
-  assert.match(codexPrompt(agent), /Handle the agent context in your normal final response\./);
+  assert.match(codexPrompt(agent), /keep the packet open and do not post an ordinary Discord reply/);
   assert.match(claudeEvent(agent).content, /^Inbound Discord message transport-message-1/);
   assert.match(claudeEvent(agent).content, /agent task context/);
   const completion = agentCompletionCommand(agent, '/tmp/surface.sqlite', '/tmp/discord-surface-cli.js');
