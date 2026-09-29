@@ -56,6 +56,20 @@ function resultSourceMatches(source: AgentAddress, target: AgentAddress, routing
     (allowRouteLessParent && recordedTarget !== null && sameAddress(recordedTarget, target) && sameOwner(source, target));
 }
 
+function hasUniqueRequestTargetEvidence(state: WithdrawalState, request: AgentMessage,
+  parseJson: WithdrawalDependencies['parseJson']): boolean {
+  const rows = state.db.prepare(`SELECT detail FROM receipts
+    WHERE kind='agent-message' AND json_extract(detail, '$.packet.id')=?`).all(request.id);
+  const targets: AgentAddress[] = [];
+  for (const row of rows) {
+    const packet = parseJson(row.detail, null)?.packet;
+    if (!validPacket(packet, KINDS.REQUEST) || !sameAddress(packet.source, request.source)) continue;
+    if (!targets.some(target => sameAddress(target, packet.target))) targets.push(packet.target);
+    if (targets.length > 1) return false;
+  }
+  return targets.length === 1 && sameAddress(targets[0], request.target);
+}
+
 function reverseResult(packet: AgentMessage, request: AgentMessage, routingVersion: unknown,
   frozenChildRoute: string | null = null, allowRouteLessParent = false, recordedTarget: unknown = null): boolean {
   return packet.kind === KINDS.RESULT && packet.replyTo === request.id &&
@@ -187,7 +201,8 @@ export function createAgentRequestWithdrawalHandlers(deps: WithdrawalDependencie
       }
       if (!state.hasNativeAcknowledgment(message)) throw new deps.BindingError('agent request withdrawal requires native acknowledgment');
       const routingVersion = original?.routingVersion === AGENT_ROUTING_VERSION ? AGENT_ROUTING_VERSION : null;
-      const allowRouteLessParent = packet.target.channelId === message.channelId;
+      const allowRouteLessParent = packet.target.channelId === message.channelId &&
+        hasUniqueRequestTargetEvidence(state, packet, deps.parseJson);
       if (replyCustody(state, message) ||
           resultCustody(state, packet, routingVersion, deps.parseJson, message.agentRoute || null, allowRouteLessParent)) {
         throw new deps.BindingError('agent request has reply or result custody');
