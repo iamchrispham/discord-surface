@@ -495,7 +495,7 @@ test('handled completion leaves later accepted owner work recoverable after rest
   } finally { state?.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('Codex restart recovery completes an acknowledged inbound result before observing', async () => {
+test('Codex restart recovery preserves an acknowledged inbound result for reconciliation', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-result-recovery-'));
   const db = path.join(dir, 'surface.sqlite');
   let state = new SurfaceState(db);
@@ -530,7 +530,7 @@ test('Codex restart recovery completes an acknowledged inbound result before obs
         codex: {
           async observe() {
             observations += 1;
-            return { text: 'unexpected native observation' };
+            return { stopped: true };
           }
         }
       },
@@ -538,8 +538,8 @@ test('Codex restart recovery completes an acknowledged inbound result before obs
     });
     gateway.ready = true;
     await gateway.reconcilePending();
-    assert.equal(state.getMessage(messageId).state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
-    assert.equal(observations, 0);
+    assert.equal(state.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
+    assert.equal(observations, 1);
     await gateway.stop();
   } finally { state.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

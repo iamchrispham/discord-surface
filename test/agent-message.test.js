@@ -100,7 +100,7 @@ const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { agentCompletionCommand, codexPrompt, claudeEvent, messageRequest } = require('../src/native');
 const { staticConductorMarker } = require('../src/topic');
-const { createMonitorMcp, monitorEvent } = require('../src/claude-monitor');
+const { createMonitorMcp, monitorEvent, writePayloadFile } = require('../src/claude-monitor');
 
 function enrollChild(state, parent, threadId, baseline = '7000') {
   let binding = state.getBinding(parent.channelId);
@@ -322,6 +322,18 @@ test('Claude Monitor makes duplicate agent requests recoverable through completi
   assert.match(payload.instructions, /If acknowledgment fails or its result is missing or ambiguous, stop and report the error/);
   assert.doesNotMatch(payload.instructions, /first inspect the recorded correlated-result evidence/);
   assert.deepEqual(payload.completion.command, completion);
+});
+
+test('Claude Monitor payload identity collisions never replace published custody', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-monitor-payload-immutable-'));
+  const payloadPath = path.join(dir, '.cm-e', 'payload.json');
+  try {
+    writePayloadFile(payloadPath, '{"route":"first"}');
+    assert.throws(() => writePayloadFile(payloadPath, '{"route":"changed"}', { replaceable: true }), /payload identity collision/);
+    assert.equal(fs.readFileSync(payloadPath, 'utf8'), '{"route":"first"}');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('Claude Monitor suppresses execution for an ambiguous legacy request', () => {

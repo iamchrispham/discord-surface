@@ -27,7 +27,7 @@ function payloadFileFor(directory, messageId, nativeId, generation, dbPath) {
   return path.join(path.resolve(directory), '.cm-e', `${key}.json`);
 }
 
-function writePayloadFile(payloadPath, payload, { replaceable = false } = {}) {
+function writePayloadFile(payloadPath, payload) {
   const directory = path.dirname(payloadPath);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const directoryStat = fs.lstatSync(directory);
@@ -36,8 +36,7 @@ function writePayloadFile(payloadPath, payload, { replaceable = false } = {}) {
     const existing = fs.lstatSync(payloadPath);
     if (!existing.isFile() || (existing.mode & 0o077)) throw new Error('Claude Monitor payload path is not an owner-only file');
     if (fs.readFileSync(payloadPath, 'utf8') === payload) return;
-    // Agent routes are derived from live enrollments, so the prompt may change; other payloads are immutable.
-    if (!replaceable) throw new Error('Claude Monitor payload identity collision');
+    throw new Error('Claude Monitor payload identity collision');
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
@@ -112,7 +111,7 @@ function monitorEvent({ content, messageId, nativeId, generation, attachments = 
     } else if (agentRequest) {
       instructions = `At pickup run acknowledgment.command once with argument boundaries preserved. ${CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT} If it reports duplicate=true, run completion.command once as the state-backed recovery check. It inspects durable correlated-result evidence and completes only when an immutable result is recorded. If it reports that the request lacks an immutable correlated result, the request was already picked up and may not have run: do not execute it or run agent-send, and do not post a Discord reply; stop and report that it needs explicit reconciliation. Otherwise: Follow the correlated agent-send instruction in content, then run completion.command exactly once after handling this agent request. Do not use reply.command or produce a Discord reply.`;
     } else {
-      instructions = `At pickup run acknowledgment.command once with argument boundaries preserved. ${CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT} If it reports duplicate=true, run completion.command once as the state-backed recovery check. It inspects durable correlated-result evidence and completes only when an immutable result is recorded. Otherwise: Handle this agent result, then run completion.command exactly once. Do not use reply.command or produce a Discord reply.`;
+      instructions = `At pickup run acknowledgment.command once with argument boundaries preserved. ${CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT} If it reports duplicate=true, do not run completion.command; stop and report that same-session reconciliation is required because pickup acknowledgment alone is not handling evidence. Otherwise: Handle this agent result, then run completion.command exactly once. Do not use reply.command or produce a Discord reply.`;
     }
   } else if (completion) {
     instructions = `At pickup run acknowledgment.command once with argument boundaries preserved. ${CLAUDE_PICKUP_ACKNOWLEDGMENT} If no Discord reply is needed, run completion.command exactly once. Otherwise create reply.directory owner-only if needed, write the final answer to reply.textFile, and run reply.command.`;
@@ -249,7 +248,7 @@ function createMonitorMcp({ state, stateDir, dbPath = path.join(path.resolve(sta
           cliPath: path.resolve(cliPath),
           textFile
         });
-        writePayloadFile(payloadPath, JSON.stringify(payload), { replaceable: Boolean(message.agentMessage) });
+        writePayloadFile(payloadPath, JSON.stringify(payload));
       } catch (error) {
         error.potentiallyDelivered = false;
         throw error;

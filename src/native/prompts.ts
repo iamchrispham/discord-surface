@@ -289,7 +289,11 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     ? `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once: ${CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT} ACK means received, not completed. Then stop and report that the request needs explicit route reconciliation.`
     : `At pickup, call acknowledge with messageId "${message.id}" and generation ${message.generation} once and follow its result before any work: ${message.agentMessage ? CLAUDE_AGENT_PICKUP_ACKNOWLEDGMENT : CLAUDE_PICKUP_ACKNOWLEDGMENT}`;
   if (message.agentMessage && completionInstruction) {
-    acknowledgmentInstruction += ' If it reports duplicate=true, run the exact no-post completion command below once as a state-backed recovery check. It inspects durable correlated-result evidence and completes only when an immutable result is recorded.';
+    if (message.agentMessage.kind === KINDS.RESULT) {
+      acknowledgmentInstruction += ' If it reports duplicate=true, do not run the no-post completion command. Stop and report that same-session reconciliation is required; pickup acknowledgment alone is not handling evidence.';
+    } else {
+      acknowledgmentInstruction += ' If it reports duplicate=true, run the exact no-post completion command below once as a state-backed recovery check. It inspects durable correlated-result evidence and completes only when an immutable result is recorded.';
+    }
     if (message.agentMessage.kind === KINDS.REQUEST) {
       acknowledgmentInstruction += ' If it reports duplicate=true and that no immutable correlated result exists, the request was already picked up and may not have run: do not execute it or run agent-send; stop and report that it needs explicit reconciliation. Only if acknowledgment did not report duplicate=true, follow the correlated agent-send instruction below, then run the exact no-post completion command once.';
     }
@@ -311,7 +315,7 @@ export function claudeEvent(message: NativeMessage, completion: readonly string[
     }
   } else if (message.agentMessage) {
     replyInstruction = hasCompletionPath
-      ? 'After handling this agent result, run the exact no-post completion command below only if acknowledgment did not report duplicate=true. If it reported duplicate=true, the state-backed recovery check above is the only completion step. Do not use the reply tool.'
+      ? 'If acknowledgment reports duplicate=true, do not run the no-post completion command. Stop and report that same-session reconciliation is required. Otherwise: After handling this agent result, run the exact no-post completion command below. Do not use the reply tool.'
       : 'Handle this agent result. Do not use the reply tool.';
   } else {
     replyInstruction = `Use the reply tool with messageId "${message.id}" and generation ${message.generation} after you have answered.`;

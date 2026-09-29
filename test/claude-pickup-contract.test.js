@@ -391,8 +391,9 @@ test('real Monitor payloads carry the shared ACK branch for human, agent request
     assertAcknowledgmentCommand(agentPayload.payload, agent, f);
     assert.deepEqual(agentPayload.payload.agent, { kind: KINDS.RESULT });
     assert.match(agentPayload.payload.instructions, /Do not use reply\.command or produce a Discord reply/);
-    assert.match(agentPayload.payload.instructions, /If it reports duplicate=true, run completion\.command once as the state-backed recovery check/);
-    assert.match(agentPayload.payload.instructions, /inspects durable correlated-result evidence/);
+    assert.match(agentPayload.payload.instructions, /If it reports duplicate=true, do not run completion\.command/);
+    assert.match(agentPayload.payload.instructions, /same-session reconciliation is required/);
+    assert.match(agentPayload.payload.instructions, /pickup acknowledgment alone is not handling evidence/);
     assert.ok(agentPayload.payload.completion, 'agent completion branch must expose completion');
     assert.equal(agentPayload.payload.completion.command[2], 'agent-complete');
     assert.equal(agentPayload.payload.completion.messageId, agent.id);

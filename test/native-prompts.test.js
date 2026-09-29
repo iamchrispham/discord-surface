@@ -131,7 +131,7 @@ const expectedDigests = {
   claudeEventHuman: '3cf57a00278c64f0f1f5e4e180189002af5e7a97584e42326741bf752c71ddcc',
   claudeEventAttachment: 'd04456537d38c4309bae542a35f13c52cbbaa2f3e83c062cec959f7a8db24f6d',
   claudeEventAgentRequest: 'fdfa08693cfbcc51103aaf6c5abcb2bc1a4cf9faba573ad77f95b0984f9dfa3d',
-  claudeEventAgentResult: '03044373ea88a411a32e88a45f7e1e2fc7e2bfd4f12213d04589970f1f10c63c',
+  claudeEventAgentResult: '27cac3494b931a58a9f8b51153aca027cb7e20d04f48c8182becb7a7929cd9ab',
   claudeEventDecision: '9fa9567ee39e6e4824c584991a8dad2c5267be9c3aa282ba2021e30de868e610',
   claudeEventWatcher: '45d9fbf706942a0fd9be6523d7b8dc61dc1b059e290d9a403be2010599dd3d14'
 };
