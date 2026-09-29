@@ -58,7 +58,7 @@ export interface NativeMessage {
   agentMessage?: AgentMessage | null;
   // Enrolled child route for a legacy request whose persisted target is the parent channel.
   agentSendChildId?: string | null;
-  // Legacy parent-targeted request with several active child enrollments: no exact route.
+  // Legacy parent-targeted request without exactly one active child enrollment: no exact route.
   agentSendChildAmbiguous?: boolean;
   watcherNotice?: WatcherNotice | null;
   watcherNoticeProvenance?: unknown;

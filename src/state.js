@@ -2157,7 +2157,7 @@ class SurfaceState {
         if (agent.packet.target.channelId === message.channelId) {
           const children = this.listThreadEnrollments(message.channelId).filter(enrollment => enrollment.active);
           if (children.length === 1) message.agentSendChildId = children[0].threadId;
-          else if (children.length > 1) message.agentSendChildAmbiguous = true;
+          else message.agentSendChildAmbiguous = true;
         }
       }
       const notice = message.content.startsWith(WATCHER_NOTICE_PREFIX) ? this.getWatcherNotice(messageId) : null;

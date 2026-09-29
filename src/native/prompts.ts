@@ -134,7 +134,7 @@ function agentResultInstruction(message: NativeMessage, agent: NonNullable<Nativ
     generation: agent.target.generation
   };
   if (message.agentSendChildAmbiguous && !message.agentSendChildId) {
-    return 'This legacy request targets the parent channel and more than one child route is actively enrolled, so no exact result route exists. Do not run agent-send or agent-complete. Stop and report that the request needs explicit route reconciliation.';
+    return 'This legacy request targets the parent channel and zero or several child routes are actively enrolled, so no exact result route exists. Do not run agent-send or agent-complete. Stop and report that the request needs explicit route reconciliation.';
   }
   const budget = resultTextByteBudget(agent, localRoute);
   const resultKey = crypto.createHash('sha256').update(JSON.stringify([agent.id, agent.source, localRoute])).digest('hex').slice(0, 24);
