@@ -4,7 +4,7 @@ This guide is for the agent performing installation. Preserve the host's existin
 
 ## Release and prerequisites
 
-Use the exact release commit or package supplied by the release owner. Record its full commit and package SHA-256. Do not substitute the latest branch while following a frozen handoff. The starting release for this guide is `22f1a3f81e035ffd993c53e79259254b0346f028`.
+Use the exact release commit or package supplied by the release owner. Record its full commit and package SHA-256. Do not substitute the latest branch while following a frozen handoff. This guide has no default release.
 
 Required: Git, npm, Node >=22.13.0 and <23, access to this private repository or its release package, and an existing authenticated native Codex or Claude session. Runtime dependencies are pinned by `package-lock.json`. No globally installed compiler is needed at runtime.
 
@@ -12,21 +12,20 @@ Before runtime setup obtain the intended guild, operator, category and channel I
 
 ## Build and inspect the package
 
-In a new checkout, select the frozen commit:
+In a new checkout, replace `RELEASE_COMMIT` with the full commit supplied by the release owner, then select it:
 
 ```sh
 git clone https://github.com/iamchrispham/discord-surface.git
 cd discord-surface
-git checkout --detach 22f1a3f81e035ffd993c53e79259254b0346f028
+git checkout --detach RELEASE_COMMIT
 node --version
 npm ci
-npm run build
-npm run typecheck
+npm test
 npm run package-smoke
 npm pack
 ```
 
-These commands can be entered separately in a POSIX shell or PowerShell. Stop on the first nonzero exit and save the exact command and redacted error. `package-smoke` creates an isolated installation and imports the package without starting the Gateway. Passing it proves packaging on that host, not native transport support.
+These commands can be entered separately in a POSIX shell or PowerShell. Stop on the first nonzero exit and save the exact command and redacted error. `npm test` runs the registered build, typecheck and test suite. `package-smoke` creates an isolated installation and imports the package without starting the Gateway. Passing it proves packaging on that host, not native transport support.
 
 Install the resulting tarball into a dedicated prefix with `npm install --prefix <absolute-prefix> <absolute-tarball>`. The CLI is `<absolute-prefix>/node_modules/discord-surface/src/cli.js`. Resolve that absolute path and use it consistently for all callers on this host. Compare the installed package with the frozen artifact before configuring it.
 
@@ -68,7 +67,7 @@ Before a planned release cutover boots out the Gateway, inspect the active state
 
 ## Essential live check and return receipt
 
-1. Send one real instruction to the bound channel. Record its Discord ID, actual native pickup and acknowledgment.
+1. Send one real instruction to the bound channel. Record its Discord ID, actual native pickup and acknowledgment. A transport receipt alone does not prove pickup.
 2. Reply through the received wrapper's exact reply path. Verify the reply in Discord and its source-message correlation.
 3. Post one requested milestone from that same native owner using a stable dedupe key. Verify the visible message and receipt.
 
