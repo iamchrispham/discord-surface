@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 const { SurfaceState, READINESS, MESSAGE_STATES } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { AGENT_ROUTING_VERSION, resolveAgentReplyRequestMatch } = require('../src/state/agent-routing');
+const { legacyParentReconciliationChannel } = require('../src/state/legacy-agent-request-route');
 const { runDirectPost } = require('../src/direct-post');
 const { main, agentComplete, agentSend } = require('../src/cli');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
@@ -125,6 +126,21 @@ test('legacy parent route stays held when children are ambiguous or its frozen c
   assert.equal(f.state.claimDispatch('legacy-ambiguous').reason, 'legacy-agent-route-not-ready');
   assert.equal(f.state.getMessage('legacy-ambiguous').agentRoute, '103');
   assert.equal(f.state.getMessage('legacy-ambiguous').state, MESSAGE_STATES.ACCEPTED);
+});
+
+test('legacy parent reconciliation wakes when a child becomes ready', () => {
+  assert.equal(legacyParentReconciliationChannel(
+    { state: THREAD_STATES.PENDING },
+    { state: THREAD_STATES.READY, parentChannelId: '101', threadId: '103' }
+  ), '101');
+  assert.equal(legacyParentReconciliationChannel(
+    { state: THREAD_STATES.READY },
+    { state: THREAD_STATES.UNAVAILABLE, parentChannelId: '101', threadId: '103' }
+  ), '101');
+  assert.equal(legacyParentReconciliationChannel(
+    { state: THREAD_STATES.PENDING },
+    { state: THREAD_STATES.PENDING, parentChannelId: '101', threadId: '103' }
+  ), null);
 });
 
 test('frozen legacy parent rejects a parent-sourced result identity', t => {

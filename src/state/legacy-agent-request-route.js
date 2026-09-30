@@ -46,7 +46,10 @@ function claimRoute(state, message) {
 }
 
 function legacyParentReconciliationChannel(previous, updated) {
-  if (!previous || !updated || previous.state !== 'ready' || updated.state === 'ready') return null;
+  if (!previous || !updated) return null;
+  const becameReady = previous.state !== 'ready' && updated.state === 'ready';
+  const stoppedBeingReady = previous.state === 'ready' && updated.state !== 'ready';
+  if (!becameReady && !stoppedBeingReady) return null;
   return typeof updated.parentChannelId === 'string' && updated.parentChannelId ? updated.parentChannelId : null;
 }
 
