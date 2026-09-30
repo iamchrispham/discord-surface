@@ -296,7 +296,7 @@ function createPeerService(context) {
             }
             return currentPeerDestination(state, target, destination?.binding || null,
               input.reply_to === undefined ? null : target?.channelId ?? null,
-              Boolean(frozenSourceRoute));
+              input.reply_to !== undefined);
           },
           textFile, dedupeKey: input.dedupe_key, custodyKey, signal, fetchImpl,
           ...(fileSource === null ? {} : { preparedTextSource: fileSource }) });

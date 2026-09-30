@@ -696,30 +696,35 @@ test('correlated reply keeps a remote child route after destination demotion', a
 });
 
 test('peer-qualified reply keeps the recorded child when the peer has multiple ready children', async t => {
-  const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
-  f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100', adoptionCutoff: '100' }, target);
-  f.state.setThreadBaseline('203', '100', target);
-  f.state.markThreadBoundary('203', THREAD_STATES.READY, 'fixture', null, null, target);
-  const caller = f.state.getBinding('101');
-  const requestPacket = {
-    id: 'multi-child-request', kind: 'request',
-    source: { guildId: target.guildId, channelId: '202', provider: target.provider,
-      nativeId: target.nativeId, generation: target.generation },
-    target: { guildId: caller.guildId, channelId: '102', provider: caller.provider,
-      nativeId: caller.nativeId, generation: caller.generation },
-    replyTo: null, routingVersion: 2, text: 'hello'
-  };
-  f.state.receipt(null, 'agent-message', { packet: requestPacket });
-  let postUrl;
-  const peer = service(f, { fetchImpl: async (url, options) => {
-    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
-    postUrl = url;
-    return { ok: true, status: 200, json: async () => ({ id: '10003' }) };
-  } });
-  const result = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: requestPacket.id,
-    text: 'child result', dedupe_key: 'multi-child-result' });
-  assert.equal(result.status, 'sent');
-  assert.match(postUrl, /channels\/202\/messages$/);
+  for (const demoted of [false, true]) {
+    await t.test(demoted ? 'recorded child unavailable' : 'recorded child ready', async child => {
+      const f = fixture(child); f.enroll('102'); const target = addRecipient(f);
+      f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100', adoptionCutoff: '100' }, target);
+      f.state.setThreadBaseline('203', '100', target);
+      f.state.markThreadBoundary('203', THREAD_STATES.READY, 'fixture', null, null, target);
+      const caller = f.state.getBinding('101');
+      const requestPacket = {
+        id: 'multi-child-request', kind: 'request',
+        source: { guildId: target.guildId, channelId: '202', provider: target.provider,
+          nativeId: target.nativeId, generation: target.generation },
+        target: { guildId: caller.guildId, channelId: '102', provider: caller.provider,
+          nativeId: caller.nativeId, generation: caller.generation },
+        replyTo: null, routingVersion: 2, text: 'hello'
+      };
+      f.state.receipt(null, 'agent-message', { packet: requestPacket });
+      if (demoted) f.state.markThreadBoundary('202', THREAD_STATES.UNAVAILABLE, 'fixture', null, null, target);
+      let postUrl;
+      const peer = service(f, { fetchImpl: async (url, options) => {
+        if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+        postUrl = url;
+        return { ok: true, status: 200, json: async () => ({ id: '10003' }) };
+      } });
+      const result = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: requestPacket.id,
+        text: 'child result', dedupe_key: 'multi-child-result' });
+      assert.equal(result.status, 'sent');
+      assert.match(postUrl, /channels\/202\/messages$/);
+    });
+  }
 });
 
 test('new peer request refuses publication after destination child ambiguity appears during verification', async t => {
