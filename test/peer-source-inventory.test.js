@@ -23,7 +23,7 @@ const READ_TEXT_FILE_SITES = new Map([
 
 const RUN_DIRECT_POST_SITES = new Map([
   ['peer/service.js\u0000send', 1],
-  ['cli.js\u0000directPost', 1],
+  ['cli/direct-post-commands.js\u0000directPost', 1],
   ['peer/post.js\u0000postByRole', 1],
   ['direct-post.ts\u0000runWatcherNoticePost', 1]
 ]);
