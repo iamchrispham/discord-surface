@@ -6,6 +6,7 @@ const {
   path,
   GATEWAY_CAPABILITIES,
   ordinaryBind,
+  ordinaryBindModule,
   unbind,
   sessionRoot,
   validateCodexSessionIdentity,
@@ -17,6 +18,23 @@ const {
   fixture,
   ordinary
 } = require('./ordinary-codex-fixture');
+
+test('ordinary Codex binding has one owner behind both public facades', () => {
+  assert.equal(ordinaryBind, ordinaryBindModule);
+  const sourceRoot = path.join(__dirname, '..', 'src');
+  const ownerPattern = /(?:async\s+)?function\s+ordinaryBind\s*\(|(?:const|let|var)\s+ordinaryBind\s*=/;
+  const files = [sourceRoot];
+  const owners = [];
+  while (files.length > 0) {
+    const file = files.pop();
+    if (fs.statSync(file).isDirectory()) {
+      files.push(...fs.readdirSync(file).map(name => path.join(file, name)));
+    } else if (file.endsWith('.js') && ownerPattern.test(fs.readFileSync(file, 'utf8'))) {
+      owners.push(path.relative(sourceRoot, file));
+    }
+  }
+  assert.deepEqual(owners, ['ordinary-bind/codex.js']);
+});
 
 test('ordinary bind rejects ownership loss while recording native proof', async t => {
   const f = fixture(t);
