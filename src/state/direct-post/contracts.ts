@@ -81,7 +81,7 @@ export interface DirectPostState {
   transaction<T>(operation: () => T): T;
   directPostRows(requestId?: string | null, channelId?: string | null, relatedChannelIds?: readonly string[]): DirectPostReceiptRow[];
   listThreadEnrollments(parentChannelId?: string | null): Array<{ threadId: string; parentChannelId: string; active: boolean }>;
-  directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null, deliveryChannelId?: string | null): boolean;
+  directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null, deliveryChannelId?: string | null, allowUnreadyDelivery?: boolean): boolean;
   directPostOwnerIdentity(pid: number): DirectPostOwnerIdentity | null;
   directPostOwnerAlive(pid: number, expectedIdentity: DirectPostOwnerIdentity): boolean;
   receipt(discordId: string | null, kind: string, detail: Record<string, unknown>): void;

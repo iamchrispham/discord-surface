@@ -111,12 +111,13 @@ export interface DirectPostState {
   getMessageRoute?(deliveryChannelId: string): DirectPostRoute | null;
   directPostRows(requestId?: string | null, channelId?: string | null): DirectPostReceiptRow[];
   listReceipts(): DirectPostReceiptRow[];
+  getMessage?(messageId: string): { agentRoute?: string | null } | null;
   isAgentRequestWithdrawn(packet: AgentMessage): boolean;
   recoverDirectPostReceipts(): void;
   inspectDirectPostPart(meta: DirectPostPartMeta): DirectPostInspection | null;
   recordDirectPostPreflight(meta: DirectPostPartMeta, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostReceiptDetail;
   beginDirectPostPart(meta: DirectPostPartMeta): DirectPostClaim;
-  directPostBindingCurrent(binding: DirectPostBinding, operatorId: string, deliveryChannelId?: string | null): boolean;
+  directPostBindingCurrent(binding: DirectPostBinding, operatorId: string, deliveryChannelId?: string | null, allowUnreadyDelivery?: boolean): boolean;
   directPostOwnerIdentity(pid: number): { ownerPid: number; ownerStartTime: string | null; ownerCommand: string | null } | null;
   recordDirectPostOutcome(requestId: string, attemptId: string, outcome: DirectPostOutcome, detail?: Record<string, unknown>): DirectPostReceiptDetail;
   directPostFilePreparation?(requestId: string): DirectPostFilePreparation | null;

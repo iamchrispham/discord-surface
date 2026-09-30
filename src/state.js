@@ -4,6 +4,7 @@ const createTopicPublicationHandlers = (...args) => require('./state/topic-publi
 const createSchemaHandlers = (...args) => require('./state/schema').createSchemaHandlers(...args);
 const createConductorCustodyHandlers = (...args) => require('./state/conductor-custody').createConductorCustodyHandlers(...args);
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
+const legacyAgentRequestRoute = require('./state/legacy-agent-request-route');
 const { WATCHER_NOTICE_PREFIX, validateWatcherNotice } = require('./watcher-notice');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -522,6 +523,7 @@ class SurfaceState {
     this.ordinary = createOrdinaryRepository({ state: this, assertOrdinaryIdentity, assertOrdinaryNativeIdentity });
     this.ordinaryHandoffPauses = new Set();
     this.ordinaryHandoffPauseSnapshots = new Map();
+    this.threadBoundaryObserver = null;
   }
 
   bindOrdinary(...args) { return this._bindOrdinary(...args); }
@@ -928,8 +930,18 @@ class SurfaceState {
     return threadEnrollmentHandlers.listThreadEnrollments(this, parentChannelId);
   }
 
+  setThreadBoundaryObserver(observer) {
+    this.threadBoundaryObserver = typeof observer === 'function' ? observer : null;
+  }
+
   assertThreadEnrollmentCoverage(parentChannelId, proof) {
     return threadEnrollmentHandlers.assertEnrollmentCoverage(this, parentChannelId, proof);
+  }
+
+  _notifyThreadBoundaryTransition(previous, updated) {
+    if (previous && updated && previous.state !== updated.state) {
+      try { this.threadBoundaryObserver?.(previous, updated); } catch {}
+    }
   }
 
   deactivateThreadEnrollments(parentChannelId, expectedBinding = null) {
@@ -945,7 +957,17 @@ class SurfaceState {
   }
 
   markThreadBoundary(threadId, state, detail = null, gapFrom = null, gapTo = null, expectedBinding = null, coverageId = undefined, lastSeenBaselineId = undefined, expectedEnrollment = undefined) {
-    return threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding, coverageId, lastSeenBaselineId, expectedEnrollment);
+    const previous = this.getThreadEnrollment(threadId);
+    const updated = threadEnrollmentHandlers.markThreadBoundary(this, threadId, state, detail, gapFrom, gapTo, expectedBinding, coverageId, lastSeenBaselineId, expectedEnrollment);
+    this._notifyThreadBoundaryTransition(previous, updated);
+    return updated;
+  }
+
+  noteThreadMessage(threadId, messageId, accepted = false, coverageId = null) {
+    const previous = this.getThreadEnrollment(threadId);
+    const updated = threadEnrollmentHandlers.noteThreadMessage(this, threadId, messageId, accepted, coverageId);
+    this._notifyThreadBoundaryTransition(previous, updated);
+    return updated;
   }
 
   checkpointThread(threadId, coverageId, expectedBinding = null, expectedEnrollment = undefined) {
@@ -1602,6 +1624,8 @@ class SurfaceState {
           });
           return { claimed: false, message, reason: 'binding-not-ready' };
         }
+        const agentRoute = legacyAgentRequestRoute.claimRoute(this, message);
+        if (!agentRoute.ready) return { claimed: false, message, reason: agentRoute.reason };
         this.db.prepare('UPDATE messages SET state=?, updated_at=? WHERE discord_id=? AND state=?')
           .run(MESSAGE_STATES.DISPATCHING, now(), messageId, MESSAGE_STATES.ACCEPTED);
         this.receipt(messageId, 'dispatching', { generation: message.generation });
@@ -1914,7 +1938,7 @@ class SurfaceState {
     return recovered;
   }
 
-  directPostBindingCurrent(binding, operatorId = null, deliveryChannelId = null) {
+  directPostBindingCurrent(binding, operatorId = null, deliveryChannelId = null, allowUnreadyDelivery = false) {
     const config = this.requireConfig();
     const current = this.getBinding(binding?.channelId);
     const parentCurrent = Boolean(binding && current && bindingMatchesExpected(current, binding) && current.guildId === config.guildId &&
@@ -1924,7 +1948,7 @@ class SurfaceState {
     const route = this.getMessageRoute(deliveryChannelId);
     return Boolean(route?.enrollment?.active && route.enrollment.threadId === deliveryChannelId &&
       route.enrollment.parentChannelId === current.channelId && route.enrollment.guildId === config.guildId &&
-      route.binding.channelId === current.channelId && route.ready);
+      route.binding.channelId === current.channelId && (route.ready || allowUnreadyDelivery));
   }
 
   captureBoardRevision(target) {
@@ -2152,7 +2176,10 @@ class SurfaceState {
     if (message) {
       message.replyParts = this.listReplyParts(messageId);
       const agent = message.content.startsWith(AGENT_PREFIX) ? this.getAgentMessage(messageId) : null;
-      if (agent) message.agentMessage = agent.packet;
+      if (agent) {
+        message.agentMessage = agent.packet;
+        message.agentRoute = legacyAgentRequestRoute.frozenRoute(this, message);
+      }
       const notice = message.content.startsWith(WATCHER_NOTICE_PREFIX) ? this.getWatcherNotice(messageId) : null;
       if (notice) {
         message.watcherNotice = notice.packet;

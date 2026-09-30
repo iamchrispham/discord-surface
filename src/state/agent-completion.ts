@@ -1,4 +1,5 @@
 import { isLegacyAgentReceipt, isLegacyChildResult } from './agent-routing';
+import { hasExactRequestTargetThrough, hasUniqueRequestTarget } from './agent-request-target-evidence';
 import {
   KINDS,
   sameAddress,
@@ -72,36 +73,6 @@ function requestProvenanceReceiptId(state: CompletionState, messageId: string): 
   const row = state.db.prepare("SELECT MIN(id) AS id FROM receipts WHERE kind='agent-message' AND discord_id=?")
     .get(messageId) as { id?: number } | undefined;
   return row && Number.isSafeInteger(row.id) ? Number(row.id) : 0;
-}
-
-function hasUniqueRequestTarget(
-  state: CompletionState,
-  request: AgentMessage,
-  candidateReceiptId: number,
-  requestReceiptId: number
-): boolean {
-  // A reused packet id cannot safely promote a child result across routes.
-  const row = state.db.prepare(`SELECT COUNT(DISTINCT json_extract(detail, '$.packet.target.channelId')) AS count
-    FROM receipts
-    WHERE kind='agent-message'
-      AND json_extract(detail, '$.packet.kind')=?
-      AND json_extract(detail, '$.packet.id')=?
-      AND json_extract(detail, '$.packet.source.guildId')=?
-      AND json_extract(detail, '$.packet.source.channelId')=?
-      AND json_extract(detail, '$.packet.source.provider')=?
-      AND json_extract(detail, '$.packet.source.nativeId')=?
-      AND json_extract(detail, '$.packet.source.generation')=?
-      AND json_extract(detail, '$.packet.target.guildId')=?
-      AND json_extract(detail, '$.packet.target.provider')=?
-      AND json_extract(detail, '$.packet.target.nativeId')=?
-      AND json_extract(detail, '$.packet.target.generation')=?
-      AND (id <= ? OR id = ?)`).get(
-    KINDS.REQUEST, request.id,
-    request.source.guildId, request.source.channelId, request.source.provider, request.source.nativeId, request.source.generation,
-    request.target.guildId, request.target.provider, request.target.nativeId, request.target.generation,
-    candidateReceiptId, requestReceiptId
-  ) as { count?: number } | undefined;
-  return Number(row?.count) === 1;
 }
 
 function hasReadyLegacyChildAtReceipt(
@@ -260,7 +231,8 @@ function receivedReplyEvidence(
   requestMessageId: string,
   deps: AgentCompletionDependencies,
   allowLegacyChildSource: boolean,
-  parentTarget: AgentAddress
+  parentTarget: AgentAddress,
+  frozenChildRoute: string | null
 ): Record<string, unknown> | null {
   const candidateRows = state.db.prepare(`SELECT id, discord_id, detail FROM receipts
     WHERE kind='agent-message' AND json_extract(detail, '$.packet.kind')=?
@@ -285,8 +257,11 @@ function receivedReplyEvidence(
     const detail = deps.parseJson(candidateRow.detail, null);
     const candidate = detail?.packet;
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
+    if (frozenChildRoute && candidate.source.channelId !== frozenChildRoute) continue;
     const requestReceiptId = requestProvenanceReceiptId(state, requestMessageId);
-    const uniqueRequestTarget = hasUniqueRequestTarget(state, request, Number(candidateRow.id), requestReceiptId);
+    const uniqueRequestTarget = frozenChildRoute === null
+      ? hasUniqueRequestTarget(state, request, Number(candidateRow.id), requestReceiptId)
+      : !hasExactRequestTargetThrough(state, request, candidate.source, Number(candidateRow.id));
     const exact = sameReverseAddresses(candidate, request);
     const migrated = allowLegacyChildSource && uniqueRequestTarget &&
       isLegacyChildResult(candidate, request, parentTarget,
@@ -310,7 +285,9 @@ function sentReplyEvidence(
   deps: AgentCompletionDependencies,
   allowLegacyChildSource: boolean,
   parentTarget: AgentAddress,
-  requestReceiptId: number
+  requestReceiptId: number,
+  frozenChildRoute: string | null,
+  allowRouteLessParentChildSource = false
 ): Record<string, unknown> | null {
   const rows: SentAgentResultRow[] = querySentAgentResultRows({
     db: state.db,
@@ -325,14 +302,23 @@ function sentReplyEvidence(
     const candidate = row.outcomeDetail.agentPacket;
     if (!validAgentPacket(attemptPacket, KINDS.RESULT) || !validAgentPacket(candidate, KINDS.RESULT) ||
         !sameAgentPacket(candidate, attemptPacket)) continue;
-    const recordedTargetsMatch = [row.attemptDetail.agentRequestTarget, row.outcomeDetail.agentRequestTarget]
-      .every((target) => target == null || sameAddress(target, request.target));
+    if (frozenChildRoute && candidate.source.channelId !== frozenChildRoute) continue;
+    const recordedTargets = [row.attemptDetail.agentRequestTarget, row.outcomeDetail.agentRequestTarget];
+    const recordedTargetsMatch = recordedTargets.every((target) => target == null || sameAddress(target, request.target));
+    const uniqueRequestTarget = hasUniqueRequestTarget(state, request, row.outcomeReceiptId, requestReceiptId);
+    const hasRecordedRequestTarget = recordedTargets.some((target) => target !== null && target !== undefined);
+    const routeLessParentChildSource = allowRouteLessParentChildSource &&
+      (uniqueRequestTarget || (hasRecordedRequestTarget && recordedTargetsMatch));
     const exact = sameReverseAddresses(candidate, request) &&
-      (hasUniqueRequestTarget(state, request, row.outcomeReceiptId, requestReceiptId) || recordedTargetsMatch);
-    const migrated = allowLegacyChildSource &&
+      (uniqueRequestTarget || recordedTargetsMatch);
+    const attemptRequestTarget = row.attemptDetail.agentRequestTarget ??
+      (routeLessParentChildSource ? request.target : null);
+    const outcomeRequestTarget = row.outcomeDetail.agentRequestTarget ??
+      (routeLessParentChildSource ? request.target : null);
+    const migrated = (allowLegacyChildSource || routeLessParentChildSource) &&
       isLegacyChildResult(candidate, request, parentTarget, true) &&
-      isLegacyChildResult(candidate, request, row.attemptDetail.agentRequestTarget, true) &&
-      isLegacyChildResult(candidate, request, row.outcomeDetail.agentRequestTarget, true);
+      isLegacyChildResult(candidate, request, attemptRequestTarget, true) &&
+      isLegacyChildResult(candidate, request, outcomeRequestTarget, true);
     if (!exact && !migrated) continue;
     return {
       kind: 'sent-result',
@@ -429,11 +415,17 @@ export function createAgentCompletionHandlers(deps: AgentCompletionDependencies)
       if (packet.kind === KINDS.RESULT) {
         evidence = receivedResultEvidence(state, messageId, packet);
       } else {
-        const allowLegacyChildSource = isLegacyAgentReceipt(provenance);
+        const frozenChildRoute = message.agentRoute || null;
+        const legacyProvenance = isLegacyAgentReceipt(provenance);
+        const legacyParentRequest = packet.kind === KINDS.REQUEST && packet.target.channelId === message.channelId;
+        const allowLegacyChildSource = legacyParentRequest && Boolean(frozenChildRoute);
+        // Route-less compatibility is limited to immutable send custody, never a new received child result.
+        const allowLegacySentChildSource = legacyProvenance || legacyParentRequest;
         const parentTarget = { ...target, channelId: binding.channelId };
         const provenanceReceiptId = requestProvenanceReceiptId(state, messageId);
-        evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget) ||
-          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacyChildSource, parentTarget, provenanceReceiptId);
+        evidence = receivedReplyEvidence(state, packet, messageId, deps, allowLegacyChildSource, parentTarget, frozenChildRoute) ||
+          sentReplyEvidence(state, packet, message.channelId, deps, allowLegacySentChildSource, parentTarget, provenanceReceiptId,
+            frozenChildRoute, legacyParentRequest && !frozenChildRoute);
         if (!evidence) throw new deps.BindingError('agent request lacks an immutable correlated result');
       }
       const detail = {

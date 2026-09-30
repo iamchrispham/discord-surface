@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { resolvePeerCaller } = require('./caller');
 const { resolvePeerBinding, validatePeerSelector, requireReadyPeer } = require('../../dist/peer/resolution');
-const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest } = require('../../dist/state/agent-routing');
+const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest, resolveAgentReplyRequestMatch } = require('../../dist/state/agent-routing');
 const { readTextFile, resolveAgentAddress, runDirectPost } = require('../direct-post');
 const { postByRole } = require('./post');
 const { inspectPeerResult, validPeerId } = require('./result');
@@ -25,7 +25,7 @@ function samePeerBinding(left, right) {
     (left.repoKey ?? null) === (right.repoKey ?? null);
 }
 
-function currentPeerDestination(state, target, expectedBinding = null, expectedChildId = null) {
+function currentPeerDestination(state, target, expectedBinding = null, expectedChildId = null, allowUnreadyChild = false) {
   if (!target || typeof target !== 'object') return false;
   const { guildId } = state.requireConfig();
   const candidates = state.listBindings().filter(binding =>
@@ -40,7 +40,7 @@ function currentPeerDestination(state, target, expectedBinding = null, expectedC
     const watermark = state.getIntakeWatermark(binding.channelId);
     const parentRoute = binding.channelId === target.channelId &&
       (!expectedBinding || samePeerBinding(binding, expectedBinding));
-    const childRoute = children.some(child => child.state === THREAD_STATES.READY &&
+    const childRoute = children.some(child => (allowUnreadyChild || child.state === THREAD_STATES.READY) &&
       child.threadId === target.channelId &&
       (expectedChildId === null || expectedChildId === child.threadId));
     return binding.readiness === READINESS.READY &&
@@ -60,6 +60,23 @@ function requireReadyReplyPeer(state, binding) {
     }
     throw error;
   }
+}
+
+function replySourceSelectors(state, destination) {
+  if (destination === null) return [null];
+  const { binding, childId } = destination;
+  const parent = {
+    guildId: binding.guildId, channelId: binding.channelId, provider: binding.provider,
+    nativeId: binding.nativeId, generation: binding.generation
+  };
+  const activeChildren = state.listThreadEnrollments(binding.channelId)
+    .filter(child => child.active && child.parentChannelId === binding.channelId &&
+      child.guildId === binding.guildId && (childId === null || child.threadId !== childId))
+    .map(child => resolveAgentAddress(state, binding, child.threadId));
+  const children = childId === null
+    ? activeChildren
+    : [resolveAgentAddress(state, binding, childId), ...activeChildren];
+  return [...children, parent];
 }
 
 function samePeerSource(detail, source, binding) {
@@ -90,6 +107,28 @@ function custodyKeyFor(state, packetId, source, binding) {
   return rows.length > 0 ? callerCustodyKey(packetId, source, binding) : undefined;
 }
 
+function frozenReplySourceRoute(state, replyTo, source, destination = null) {
+  const sourceAddress = {
+    guildId: source.guildId, channelId: source.channelId, provider: source.provider,
+    nativeId: source.nativeId, generation: source.generation
+  };
+  const matches = [];
+  for (const selector of replySourceSelectors(state, destination)) {
+    try {
+      const match = resolveAgentReplyRequestMatch(state, replyTo, sourceAddress, selector, sourceAddress, Error, false);
+      if (match.frozenChildRoute) matches.push(match);
+    } catch (error) {
+      if (error instanceof Error &&
+          ['agent reply target is unknown or does not match the active request', 'agent request was withdrawn'].includes(error.message)) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (matches.length > 1) throw new Error('agent reply target is ambiguous across parent and child routes');
+  return matches.length === 1 ? { binding: source, childId: matches[0].frozenChildRoute } : null;
+}
+
 function assertPeerPacketFits({ state, source, sourceAddress, destination, input, text, token }) {
   const kind = input.reply_to === undefined ? KINDS.REQUEST : KINDS.RESULT;
   const callerAddress = {
@@ -98,26 +137,12 @@ function assertPeerPacketFits({ state, source, sourceAddress, destination, input
   };
   let target;
   if (kind === KINDS.RESULT) {
-    const parentSelector = destination === null ? null : {
-      guildId: destination.binding.guildId, channelId: destination.binding.channelId,
-      provider: destination.binding.provider, nativeId: destination.binding.nativeId,
-      generation: destination.binding.generation
-    };
-    const selectors = destination === null ? [null] : destination.childId === null
-      ? [
-        ...state.listThreadEnrollments(destination.binding.channelId)
-          .filter(child => child.active && child.parentChannelId === destination.binding.channelId &&
-            child.guildId === destination.binding.guildId && child.state === THREAD_STATES.READY)
-          .map(child => resolveAgentAddress(state, destination.binding, child.threadId)),
-        parentSelector
-      ]
-      : [resolveAgentAddress(state, destination.binding, destination.childId), parentSelector];
     let lastError;
     let withdrawalError;
     const matches = [];
-    for (const selector of selectors) {
+    for (const selector of replySourceSelectors(state, destination)) {
       try {
-        matches.push(resolveAgentReplyRequest(state, input.reply_to, sourceAddress, selector, callerAddress, Error).source);
+        matches.push(resolveAgentReplyRequest(state, input.reply_to, sourceAddress, selector, callerAddress, Error, false, true).source);
       } catch (error) {
         if (error instanceof Error && error.message === 'agent request was withdrawn') {
           withdrawalError = error;
@@ -212,20 +237,25 @@ function createPeerService(context) {
       if (source.channelId !== initial.channelId || canonicalNativeId(source.nativeId) !== canonicalNativeId(initial.nativeId) || source.generation !== initial.generation) {
         throw new Error('peer caller changed during resolution');
       }
-      const sourceRoute = requireReadyPeer(state, source);
-      const sourceReadiness = source.readiness;
-      const sourceIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
-      const sourceAddress = resolveAgentAddress(state, source, sourceRoute.childId);
       let agentTarget = null;
       let destination = null;
+      let destinationBinding = null;
       if (input.peer !== undefined) {
-        const destinationBinding = resolvePeerBinding(state, input.peer, channels);
+        destinationBinding = resolvePeerBinding(state, input.peer, channels);
         destination = input.reply_to === undefined
           ? requireReadyPeer(state, destinationBinding)
           : requireReadyReplyPeer(state, destinationBinding);
-        if (input.reply_to === undefined) {
-          agentTarget = issueAgentAddress(resolveAgentAddress(state, destination.binding, destination.childId), token);
-        }
+      }
+      const frozenSourceRoute = input.reply_to === undefined
+        ? null
+        : frozenReplySourceRoute(state, input.reply_to, source,
+          destination);
+      const sourceRoute = frozenSourceRoute || requireReadyPeer(state, source);
+      const sourceReadiness = source.readiness;
+      const sourceIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
+      const sourceAddress = resolveAgentAddress(state, source, sourceRoute.childId);
+      if (input.reply_to === undefined && destination !== null) {
+        agentTarget = issueAgentAddress(resolveAgentAddress(state, destination.binding, destination.childId), token);
       }
       const fileSource = input.text_file === undefined ? null : readTextFile(input.text_file);
       const text = fileSource === null ? input.text : fileSource.text;
@@ -252,14 +282,21 @@ function createPeerService(context) {
             const currentSource = state.getBinding(source.channelId);
             const currentIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
             if (!currentSource || currentSource.readiness !== sourceReadiness || currentIntakeState !== sourceIntakeState) return false;
-            requireReadyPeer(state, currentSource);
+            if (input.reply_to === undefined) {
+              requireReadyPeer(state, currentSource);
+            } else {
+              const currentSourceRoute = state.getMessageRoute?.(sourceRoute.childId);
+              if (!currentSourceRoute || !samePeerBinding(currentSourceRoute.binding, currentSource) ||
+                  (!frozenSourceRoute && !currentSourceRoute.ready)) return false;
+            }
             if (input.reply_to === undefined && destination?.binding) {
               const currentDestination = state.getBinding(destination.binding.channelId);
               if (!currentDestination || !samePeerBinding(currentDestination, destination.binding)) return false;
               requireReadyPeer(state, currentDestination);
             }
             return currentPeerDestination(state, target, destination?.binding || null,
-              input.reply_to === undefined ? null : destination?.childId || null);
+              input.reply_to === undefined ? null : target?.channelId ?? null,
+              Boolean(frozenSourceRoute));
           },
           textFile, dedupeKey: input.dedupe_key, custodyKey, signal, fetchImpl,
           ...(fileSource === null ? {} : { preparedTextSource: fileSource }) });

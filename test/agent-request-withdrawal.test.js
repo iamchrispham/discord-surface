@@ -113,6 +113,202 @@ test('withdrawal leaves a sibling child result with the same request id untouche
   assert.equal(fixture.state.getMessage('8102').state, MESSAGE_STATES.ACCEPTED);
 });
 
+test('withdrawal ignores a sibling result when a legacy parent route is frozen', t => {
+  const fixture = setup(t);
+  const sourceBinding = fixture.state.getBinding(requester.channelId);
+  const targetBinding = fixture.state.getBinding(recipient.channelId);
+  const sourceParent = { ...requester, generation: sourceBinding.generation };
+  const targetParent = { ...recipient, generation: targetBinding.generation };
+  const packet = { id: 'legacy-parent-withdraw', kind: KINDS.REQUEST, source: sourceParent, target: targetParent,
+    replyTo: null, text: 'Legacy parent request.' };
+  const messageId = '8110';
+  const timestamp = new Date().toISOString();
+  fixture.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    messageId, targetParent.guildId, targetParent.channelId, targetParent.channelId, '901', encodeAgentMessage(packet, token), '[]',
+    targetBinding.provider, targetBinding.nativeId, targetBinding.workspace, targetBinding.endpoint, targetBinding.conductorId,
+    targetBinding.repoKey, targetBinding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+  );
+  fixture.state.receipt(messageId, 'agent-message', { packet, authorId: '901' });
+  fixture.state.receipt(messageId, 'accepted', { channelId: targetParent.channelId, generation: targetParent.generation, readiness: 'ready' });
+  assert.equal(fixture.state.claimDispatch(messageId).claimed, true);
+  assert.equal(fixture.state.getMessage(messageId).agentRoute, '104');
+  fixture.state.markSubmitted(messageId);
+  recordNativeAcknowledgment(fixture.state, { provider: targetParent.provider, messageId,
+    nativeId: targetParent.nativeId, generation: targetParent.generation });
+  const siblingResult = { id: 'legacy-parent-sibling-result', kind: KINDS.RESULT,
+    source: { ...targetParent, channelId: '105' }, target: sourceParent, replyTo: packet.id, text: 'Sibling result.' };
+  fixture.state.receipt(null, 'direct-post-attempt', { agentPacket: siblingResult });
+  const result = fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id, provider: sourceParent.provider,
+    nativeId: sourceParent.nativeId, generation: sourceParent.generation });
+  assert.equal(result.withdrawn, true);
+  assert.equal(fixture.state.isAgentResultForWithdrawnRequest(siblingResult), false);
+  assert.equal(fixture.state.getMessage(messageId).state, MESSAGE_STATES.AGENT_HANDLED_WITHOUT_POST);
+});
+
+test('withdrawal disambiguates a frozen-child result from a reused packet id', t => {
+  const fixture = setup(t);
+  const sourceBinding = fixture.state.getBinding(requester.channelId);
+  const targetBinding = fixture.state.getBinding(recipient.channelId);
+  const sourceParent = { ...requester, generation: sourceBinding.generation };
+  const targetParent = { ...recipient, generation: targetBinding.generation };
+  const packet = { id: 'legacy-parent-frozen-child-collision', kind: KINDS.REQUEST, source: sourceParent, target: targetParent,
+    replyTo: null, text: 'Legacy parent request.' };
+  const messageId = '8118';
+  const timestamp = new Date().toISOString();
+  fixture.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    messageId, targetParent.guildId, targetParent.channelId, targetParent.channelId, '901', encodeAgentMessage(packet, token), '[]',
+    targetBinding.provider, targetBinding.nativeId, targetBinding.workspace, targetBinding.endpoint, targetBinding.conductorId,
+    targetBinding.repoKey, targetBinding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+  );
+  fixture.state.receipt(messageId, 'agent-message', { packet, authorId: '901' });
+  fixture.state.receipt(messageId, 'accepted', { channelId: targetParent.channelId, generation: targetParent.generation, readiness: 'ready' });
+  assert.equal(fixture.state.claimDispatch(messageId).claimed, true);
+  fixture.state.markSubmitted(messageId);
+  recordNativeAcknowledgment(fixture.state, { provider: targetParent.provider, messageId,
+    nativeId: targetParent.nativeId, generation: targetParent.generation });
+  const childTarget = { ...targetParent, channelId: '104' };
+  const childRequest = { ...packet, target: childTarget };
+  assert.equal(fixture.state.acceptDiscordMessage({ id: '8119', guildId: '100', channelId: childTarget.channelId,
+    authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(childRequest, token) },
+  { agentToken: token }).accepted, true);
+  const childResult = { id: 'legacy-parent-frozen-child-result', kind: KINDS.RESULT,
+    source: childTarget, target: sourceParent, replyTo: packet.id, text: 'Child result.' };
+  fixture.state.receipt(null, 'direct-post-attempt', { agentPacket: childResult });
+  assert.equal(fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id, provider: sourceParent.provider,
+    nativeId: sourceParent.nativeId, generation: sourceParent.generation }).withdrawn, true);
+});
+
+test('withdrawal preserves frozen child custody after unrelated sibling packet reuse', t => {
+  const fixture = setup(t);
+  const sourceBinding = fixture.state.getBinding(requester.channelId);
+  const targetBinding = fixture.state.getBinding(recipient.channelId);
+  const sourceParent = { ...requester, generation: sourceBinding.generation };
+  const targetParent = { ...recipient, generation: targetBinding.generation };
+  const packet = { id: 'legacy-parent-frozen-child-sibling', kind: KINDS.REQUEST,
+    source: sourceParent, target: targetParent, replyTo: null, text: 'Legacy parent request.' };
+  const messageId = '8120';
+  const timestamp = new Date().toISOString();
+  fixture.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    messageId, targetParent.guildId, targetParent.channelId, targetParent.channelId, '901', encodeAgentMessage(packet, token), '[]',
+    targetBinding.provider, targetBinding.nativeId, targetBinding.workspace, targetBinding.endpoint, targetBinding.conductorId,
+    targetBinding.repoKey, targetBinding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+  );
+  fixture.state.receipt(messageId, 'agent-message', { packet, authorId: '901' });
+  fixture.state.receipt(messageId, 'accepted', { channelId: targetParent.channelId, generation: targetParent.generation, readiness: 'ready' });
+  assert.equal(fixture.state.claimDispatch(messageId).claimed, true);
+  assert.equal(fixture.state.getMessage(messageId).agentRoute, '104');
+  fixture.state.markSubmitted(messageId);
+  recordNativeAcknowledgment(fixture.state, { provider: targetParent.provider, messageId,
+    nativeId: targetParent.nativeId, generation: targetParent.generation });
+  assert.equal(fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id, provider: sourceParent.provider,
+    nativeId: sourceParent.nativeId, generation: sourceParent.generation }).withdrawn, true);
+
+  fixture.state.enrollThread({ threadId: '105', parentChannelId: targetParent.channelId, guildId: '100', adoptionCutoff: '100' }, targetBinding);
+  fixture.state.markThreadBoundary('105', THREAD_STATES.READY, 'fixture sibling ready', null, null, targetBinding);
+  const siblingRequest = { ...packet, target: { ...targetParent, channelId: '105' } };
+  assert.equal(fixture.state.acceptDiscordMessage({ id: '8121', guildId: '100', channelId: '105', authorId: '901',
+    isBot: true, attachments: [], content: encodeAgentMessage(siblingRequest, token) }, { agentToken: token }).accepted, true);
+
+  const lateResult = { id: 'legacy-parent-frozen-child-sibling-result', kind: KINDS.RESULT,
+    source: { ...targetParent, channelId: '104' }, target: sourceParent, replyTo: packet.id, text: 'Late original child result.' };
+  const siblingResult = { ...lateResult, id: 'legacy-parent-frozen-child-sibling-result-2', source: siblingRequest.target };
+  const reopened = new SurfaceState(path.join(fixture.dir, 'surface.sqlite'));
+  try {
+    assert.equal(reopened.isAgentResultForWithdrawnRequest(lateResult), true);
+    assert.equal(reopened.isAgentResultForWithdrawnRequest(siblingResult), false);
+    const intake = reopened.acceptDiscordMessage({ id: '8122', guildId: '100', channelId: sourceParent.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(lateResult, token) }, { agentToken: token });
+    assert.equal(intake.accepted, false);
+    assert.equal(intake.reason, 'agent-request-withdrawn');
+  } finally { reopened.close(); }
+});
+
+function routeLessStampedParent(t, messageId, packetId) {
+  const fixture = setup(t);
+  const sourceBinding = fixture.state.getBinding(requester.channelId);
+  const targetBinding = fixture.state.getBinding(recipient.channelId);
+  const sourceParent = { ...requester, generation: sourceBinding.generation };
+  const targetParent = { ...recipient, generation: targetBinding.generation };
+  const packet = { id: packetId, kind: KINDS.REQUEST, source: sourceParent, target: targetParent,
+    replyTo: null, text: 'Route-less stamped parent request.' };
+  const timestamp = new Date().toISOString();
+  fixture.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    messageId, targetParent.guildId, targetParent.channelId, targetParent.channelId, '901', encodeAgentMessage(packet, token), '[]',
+    targetBinding.provider, targetBinding.nativeId, targetBinding.workspace, targetBinding.endpoint, targetBinding.conductorId,
+    targetBinding.repoKey, targetBinding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+  );
+  fixture.state.receipt(messageId, 'agent-message', { packet, authorId: '901', routingVersion: 2 });
+  fixture.state.receipt(messageId, 'accepted', { channelId: targetParent.channelId, generation: targetParent.generation, readiness: 'ready' });
+  fixture.state.enrollThread({ threadId: '105', parentChannelId: targetParent.channelId, guildId: '100', adoptionCutoff: '100' }, targetBinding);
+  fixture.state.markThreadBoundary('105', THREAD_STATES.READY, 'fixture second child ready', null, null, targetBinding);
+  assert.equal(fixture.state.claimDispatch(messageId).reason, 'legacy-agent-route-not-unique');
+  fixture.state.db.prepare('UPDATE messages SET state=? WHERE discord_id=?').run(MESSAGE_STATES.SUBMITTED, messageId);
+  recordNativeAcknowledgment(fixture.state, { provider: targetParent.provider, messageId,
+    nativeId: targetParent.nativeId, generation: targetParent.generation });
+  return { fixture, packet, sourceParent, targetParent, messageId };
+}
+
+test('withdrawal preserves route-less stamped parent child result custody', t => {
+  const { fixture, packet, sourceParent, targetParent, messageId } = routeLessStampedParent(t, '8111', 'route-less-stamped-withdraw');
+  const childResult = { id: 'route-less-stamped-child-result', kind: KINDS.RESULT,
+    source: { ...targetParent, channelId: '104' }, target: sourceParent, replyTo: packet.id,
+    routingVersion: 2, text: 'Child result already has immutable send custody.' };
+  fixture.state.receipt(null, 'direct-post-attempt', { agentPacket: childResult });
+  const laterSibling = { ...packet, target: { ...targetParent, channelId: '105' } };
+  assert.equal(fixture.state.acceptDiscordMessage({ id: '8112', guildId: '100', channelId: '105', authorId: '901',
+    isBot: true, attachments: [], content: encodeAgentMessage(laterSibling, token) }, { agentToken: token }).accepted, true);
+  assert.throws(() => fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id,
+    provider: sourceParent.provider, nativeId: sourceParent.nativeId, generation: sourceParent.generation }),
+    /reply or result custody/);
+  assert.equal(fixture.state.getMessage(messageId).state, MESSAGE_STATES.SUBMITTED);
+});
+
+test('route-less withdrawal rejects a late child result without claiming a sibling', t => {
+  const { fixture, packet, sourceParent, targetParent, messageId } = routeLessStampedParent(t, '8113', 'route-less-late');
+  assert.equal(fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id,
+    provider: sourceParent.provider, nativeId: sourceParent.nativeId, generation: sourceParent.generation }).withdrawn, true);
+  const lateResult = { id: 'route-less-late-result', kind: KINDS.RESULT,
+    source: { ...targetParent, channelId: '104' }, target: sourceParent, replyTo: packet.id, text: 'Late child result.' };
+  const reopened = new SurfaceState(path.join(fixture.dir, 'surface.sqlite'));
+  try {
+    assert.equal(reopened.isAgentResultForWithdrawnRequest(lateResult), true);
+    const intake = reopened.acceptDiscordMessage({ id: '8114', guildId: '100', channelId: sourceParent.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(lateResult, token) }, { agentToken: token });
+    assert.equal(intake.reason, 'agent-request-withdrawn');
+    assert.equal(reopened.getMessage('8114'), null);
+    const siblingRequest = { ...packet, target: { ...targetParent, channelId: '105' } };
+    assert.equal(reopened.acceptDiscordMessage({ id: '8115', guildId: '100', channelId: '105', authorId: '901',
+      isBot: true, attachments: [], content: encodeAgentMessage(siblingRequest, token) }, { agentToken: token }).accepted, true);
+    assert.equal(reopened.isAgentResultForWithdrawnRequest({ ...lateResult,
+      id: 'route-less-sibling-result', source: siblingRequest.target }), false);
+  } finally { reopened.close(); }
+});
+
+test('route-less withdrawal keeps saved child custody after sibling packet reuse', t => {
+  const { fixture, packet, sourceParent, targetParent, messageId } = routeLessStampedParent(t, '8116', 'route-less-reused-late');
+  assert.equal(fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id,
+    provider: sourceParent.provider, nativeId: sourceParent.nativeId, generation: sourceParent.generation }).withdrawn, true);
+  const siblingRequest = { ...packet, target: { ...targetParent, channelId: '105' } };
+  assert.equal(fixture.state.acceptDiscordMessage({ id: '8117', guildId: '100', channelId: '105', authorId: '901',
+    isBot: true, attachments: [], content: encodeAgentMessage(siblingRequest, token) }, { agentToken: token }).accepted, true);
+  const lateResult = { id: 'route-less-reused-late-result', kind: KINDS.RESULT,
+    source: { ...targetParent, channelId: '104' }, target: sourceParent, replyTo: packet.id, text: 'Late original child result.' };
+  const siblingResult = { ...lateResult, id: 'route-less-reused-sibling-result', source: siblingRequest.target };
+  const reopened = new SurfaceState(path.join(fixture.dir, 'surface.sqlite'));
+  try {
+    assert.equal(reopened.isAgentResultForWithdrawnRequest(lateResult), true);
+    assert.equal(reopened.isAgentResultForWithdrawnRequest(siblingResult), false);
+  } finally { reopened.close(); }
+});
+
 test('legacy request custody still recognizes a child result from the same owner', t => {
   const fixture = setup(t);
   const row = fixture.state.db.prepare("SELECT id, detail FROM receipts WHERE discord_id=? AND kind='agent-message'")

@@ -38,6 +38,7 @@ const {
   storeReconciliationSnapshot
 } = require('../dist/discord/reconciliation-lookups.js');
 const { THREAD_STATES } = require('./state/thread-enrollment');
+const { heldParentRequestIds, legacyParentReconciliationChannel } = require('./state/legacy-agent-request-route');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer } = require('./discord/decision');
 const { cancelResponseBody, readRetryAfter, sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
@@ -1076,6 +1077,7 @@ class DiscordGateway {
     this.receiptControllers = new Set();
     this.inFlight = new Set();
     this.stopping = false;
+    this.state.setThreadBoundaryObserver?.((previous, updated) => this.noteThreadBoundaryTransition(previous, updated));
     this.stopPromise = null;
     this.startPromise = null;
     this.starting = false;
@@ -1202,7 +1204,7 @@ class DiscordGateway {
       if (route?.enrollment) {
         try { assertPublicThread(message.channel, binding, route.deliveryChannelId, this.client.user); }
         catch (error) {
-          this.state.markThreadBoundary(route.deliveryChannelId, THREAD_STATES.UNAVAILABLE, error.message, null, null, binding);
+          this.markThreadBoundary(route.deliveryChannelId, THREAD_STATES.UNAVAILABLE, error.message, null, null, binding);
           return;
         }
       }
@@ -1402,6 +1404,55 @@ class DiscordGateway {
     return upsertGuildCsCommand(this.client.application?.commands, this.state.requireConfig().guildId);
   }
 
+  queueLegacyParentReconciliation(parentChannelId, threadId = null) {
+    if (this.stopping || typeof parentChannelId !== 'string') return;
+    const pending = this.pendingLegacyParentRecoveryChannels || new Set();
+    pending.add(parentChannelId);
+    this.pendingLegacyParentRecoveryChannels = pending;
+    if (typeof threadId === 'string' && threadId) {
+      const pendingThreads = this.pendingLegacyParentRecoveryThreads || new Map();
+      const threads = pendingThreads.get(parentChannelId) || new Set();
+      threads.add(threadId);
+      pendingThreads.set(parentChannelId, threads);
+      this.pendingLegacyParentRecoveryThreads = pendingThreads;
+    }
+    this.flushLegacyParentReconciliation();
+  }
+
+  flushLegacyParentReconciliation() {
+    if (this.stopping || !this.started || this.pendingLegacyParentRecoveryQueued) return;
+    this.pendingLegacyParentRecoveryQueued = true;
+    queueMicrotask(() => {
+      this.pendingLegacyParentRecoveryQueued = false;
+      if (this.stopping || !this.started) return;
+      const channelIds = [...(this.pendingLegacyParentRecoveryChannels || [])];
+      this.pendingLegacyParentRecoveryChannels?.clear();
+      if (!channelIds.length) return;
+      const affectedThreadIds = channelIds.flatMap(channelId =>
+        [...(this.pendingLegacyParentRecoveryThreads?.get(channelId) || [])]);
+      channelIds.forEach(channelId => this.pendingLegacyParentRecoveryThreads?.delete(channelId));
+      const messageIds = heldParentRequestIds(this.state, channelIds, affectedThreadIds);
+      if (!messageIds.length) return;
+      void this.reconcilePending(undefined, {
+        allowPaused: true,
+        readyOnly: true,
+        channelIds,
+        messageIds
+      }).catch(recoveryError => {
+        this.logger(`legacy parent recovery after thread boundary failed: ${recoveryError.message}`);
+      });
+    });
+  }
+
+  noteThreadBoundaryTransition(previous, updated) {
+    const parentChannelId = legacyParentReconciliationChannel(previous, updated);
+    if (parentChannelId) this.queueLegacyParentReconciliation(parentChannelId, updated.threadId);
+  }
+
+  markThreadBoundary(...args) {
+    return this.state.markThreadBoundary(...args);
+  }
+
   createClient() {
     const { Client, GatewayIntentBits } = requireInstalled('discord.js');
     return new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
@@ -1421,7 +1472,7 @@ class DiscordGateway {
     const retryableFetch = isRetryableFetchBoundary(THREAD_STATES.UNAVAILABLE, detail);
     if (['gap', 'unavailable'].includes(enrollment.state) && !retryableBoundary) return;
     const nextState = !enrollment.adoptedAt && retryableFetch ? THREAD_STATES.PENDING : THREAD_STATES.UNAVAILABLE;
-    this.state.markThreadBoundary(stored.deliveryChannelId, nextState,
+    this.markThreadBoundary(stored.deliveryChannelId, nextState,
       detail, null, null, binding, undefined, undefined, enrollment);
   }
 
@@ -1715,6 +1766,7 @@ class DiscordGateway {
       if (hasEndpointUnavailableBinding) this.ready = true;
       this.transportReady = true;
       this.started = true;
+      this.flushLegacyParentReconciliation();
       this.resolveInteractionRecovery(true);
       this.schedulePendingHandoffRecoveryPoll();
       this.acknowledgments = watchAcknowledgments({
@@ -1879,7 +1931,7 @@ class DiscordGateway {
         verifiedEmptyCursor;
     const detail = `live attachment intake failed for ${message?.id || 'unknown message'}: ${String(error?.message || error).slice(0, 900)}`;
     const boundary = childDelivery
-      ? this.state.markThreadBoundary(intakeChannelId, THREAD_STATES.GAP, detail, gapFrom, message?.id || null, binding)
+      ? this.markThreadBoundary(intakeChannelId, THREAD_STATES.GAP, detail, gapFrom, message?.id || null, binding)
       : await this.recordBoundary(binding, null, 'gap', detail, gapFrom, message?.id || null, signal);
     if ((!childDelivery && !boundary?.watermark) || (childDelivery && !boundary) || signal?.aborted || this.stopping) return boundary;
     const recoveryTimer = setImmediate(() => {
@@ -2143,8 +2195,19 @@ class DiscordGateway {
         advancedChannels = result instanceof Set ? result : new Set();
         const threads = [...advancedChannels].filter(channelId => this.state.getThreadEnrollment(channelId)?.active);
         if (threads.length) {
+          const parentChannels = threads
+            .map(channelId => this.state.getThreadEnrollment(channelId)?.parentChannelId)
+            .filter(Boolean);
           if (!controller.signal.aborted && this.isCurrentLifecycle(epoch)) {
             await this.reconcilePending(undefined, { readyOnly: true, channelIds: threads });
+            const parentRequestIds = heldParentRequestIds(this.state, [...new Set(parentChannels)], threads);
+            if (parentRequestIds.length && !controller.signal.aborted && this.isCurrentLifecycle(epoch)) {
+              await this.reconcilePending(undefined, {
+                readyOnly: true,
+                channelIds: [...new Set(parentChannels)],
+                messageIds: parentRequestIds
+              });
+            }
           }
         }
         return result;
@@ -3247,6 +3310,16 @@ class DiscordGateway {
     const reconciliationConnection = { gateway: this, epoch: passConnectionEpoch };
     const selectedChannels = channelIds ? new Set(channelIds) : null;
     const selectedMessages = messageIds ? new Set(messageIds) : null;
+    if (selectedChannels && selectedMessages) {
+      for (const channelId of [...selectedChannels]) {
+        const enrollment = this.state.getThreadEnrollment(channelId);
+        if (!enrollment?.active || !enrollment.parentChannelId) continue;
+        const heldParentIds = heldParentRequestIds(this.state, [enrollment.parentChannelId], [channelId]);
+        if (heldParentIds.some(messageId => selectedMessages.has(messageId))) {
+          selectedChannels.add(enrollment.parentChannelId);
+        }
+      }
+    }
     this.consumer?.releaseHandledWithoutPost?.();
     const isHeldDurable = message => message.state === 'submitted' || message.state === 'reply_ready';
     const allowed = message => (!selectedMessages || selectedMessages.has(message.id)) &&

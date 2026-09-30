@@ -43,7 +43,7 @@ export type {
 } from './direct-post/contracts';
 import { createHash } from 'node:crypto';
 import { AGENT_ROUTING_VERSION, isAgentSourcePromotion } from './agent-routing';
-import { sameAddress, type AgentAddress, type AgentMessage, type AgentProvider } from '../agent-message';
+import { KINDS, sameAddress, type AgentAddress, type AgentMessage, type AgentProvider } from '../agent-message';
 import type { WatcherNotice } from '../watcher-notice';
 import { DIRECT_POST_FILE_LIMITS, DIRECT_POST_FILE_PHASES, stagedDirectPostFilePath } from '../direct-post-file';
 import type { DirectPostFileManifest, DirectPostFilePreparation } from '../direct-post-file';
@@ -354,8 +354,11 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     const assertParentCurrent = (): void => {
       if (!state.directPostBindingCurrent(meta.binding, meta.operatorId)) throw new StaleGenerationError('direct post binding is stale');
     };
+    const allowUnreadyAgentRoute = meta.agentPacket?.kind === KINDS.RESULT &&
+      meta.agentPacket.source.channelId !== meta.binding.channelId;
     const assertRouteCurrent = (): void => {
-      if (!state.directPostBindingCurrent(meta.binding, meta.operatorId, meta.agentPacket?.source.channelId)) {
+      if (!state.directPostBindingCurrent(meta.binding, meta.operatorId, meta.agentPacket?.source.channelId,
+        allowUnreadyAgentRoute)) {
         throw new StaleGenerationError('direct post binding is stale');
       }
     };

@@ -5,9 +5,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { fixture, service, addRecipient } = require('./fixtures/peer-fixture');
 const { createPeerService } = require('../src/peer/service');
-const { READINESS } = require('../src/state');
+const { READINESS, MESSAGE_STATES } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
-const { decodeAgentMessage, encodeAgentMessage } = require('../src/agent-message');
+const { decodeAgentMessage, encodeAgentMessage, PREFIX } = require('../src/agent-message');
 const id = '11111111-1111-1111-1111-111111111111';
 function addOrdinaryRecipient(f) {
   f.state.bind({ guildId: '100', channelId: '301', provider: 'codex', nativeId: '33333333-3333-3333-3333-333333333333',
@@ -373,6 +373,47 @@ test('reply_to can select a colliding legacy parent request through its peer', a
   assert.equal(posts, 1);
 });
 
+test('peer reply uses the selected peer to recover a frozen local route amid collisions', async t => {
+  const f = fixture(t); f.enroll('102');
+  const first = addRecipient(f);
+  const second = addSecondRecipient(f);
+  const caller = f.state.getBinding('101');
+  const callerAddress = { guildId: caller.guildId, channelId: caller.channelId, provider: caller.provider,
+    nativeId: caller.nativeId, generation: caller.generation };
+  const acceptLegacyParent = (binding, discordId) => {
+    const packet = {
+      id: 'frozen-collision-request', kind: 'request',
+      source: { guildId: binding.guildId, channelId: binding.channelId, provider: binding.provider,
+        nativeId: binding.nativeId, generation: binding.generation },
+      target: callerAddress, replyTo: null, text: 'hello'
+    };
+    const timestamp = new Date().toISOString();
+    f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+      provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      discordId, caller.guildId, caller.channelId, caller.channelId, '901', encodeAgentMessage(packet, 'fixture'), '[]',
+      caller.provider, caller.nativeId, caller.workspace, caller.endpoint, caller.conductorId, caller.repoKey,
+      caller.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+    );
+    f.state.receipt(discordId, 'agent-message', { packet, authorId: '901' });
+    f.state.receipt(discordId, 'accepted', { channelId: caller.channelId, generation: caller.generation, readiness: 'ready' });
+    assert.equal(f.state.claimDispatch(discordId).claimed, true);
+  };
+  acceptLegacyParent(first, '8105');
+  acceptLegacyParent(second, '8106');
+  f.enroll('103');
+  let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '201', guild_id: '100' }) };
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: '10001' }) };
+  } });
+  const result = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: 'frozen-collision-request',
+    text: 'reply', dedupe_key: 'frozen-collision-result' });
+  assert.equal(result.status, 'sent');
+  assert.equal(posts, 1);
+});
+
 test('reply_to continues past a withdrawn child route to an active parent request', async t => {
   const f = fixture(t); f.enroll('102');
   const target = addRecipient(f);
@@ -444,7 +485,16 @@ test('peer result preserves current and rejects stale legacy parent destinations
     target: { guildId: '100', channelId: '201', provider: 'codex', nativeId: target.nativeId, generation: target.generation },
     replyTo: null, text: 'legacy request'
   };
-  f.state.receipt(null, 'agent-message', { packet: request });
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id,
+    content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation,
+    state, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'legacy-parent-discord', '100', '201', '201', '901', encodeAgentMessage(request, 'fixture'), '[]',
+    target.provider, target.nativeId, target.workspace, target.endpoint, target.conductorId, target.repoKey,
+    target.generation, 'accepted', timestamp, timestamp);
+  f.state.receipt('legacy-parent-discord', 'agent-message', { packet: request, authorId: '901' });
+  f.state.receipt('legacy-parent-discord', 'accepted', { channelId: '201', generation: target.generation, readiness: 'ready' });
+  assert.equal(f.state.claimDispatch('legacy-parent-discord').claimed, true);
   const calls = [];
   const recipient = createPeerService({ state: f.state, provider: 'codex', token: 'fixture',
     callerDependencies: { environment: { CODEX_THREAD_ID: target.nativeId } },
@@ -460,6 +510,128 @@ test('peer result preserves current and rejects stale legacy parent destinations
   f.state.db.prepare("UPDATE bindings SET generation=generation+1 WHERE channel_id='101'").run();
   const stale = await recipient.send({ reply_to: request.id, text: 'stale result', dedupe_key: 'legacy-parent-stale' });
   assert.equal(stale.status, 'stale');
+});
+
+test('peer result resolves a frozen local child before sibling selection', async t => {
+  const f = fixture(t); f.enroll('102'); const recipient = addRecipient(f);
+  const binding = f.state.getBinding('101');
+  const request = {
+    id: 'frozen-local-source-request',
+    kind: 'request',
+    source: { guildId: '100', channelId: '201', provider: recipient.provider, nativeId: recipient.nativeId, generation: recipient.generation },
+    target: { guildId: '100', channelId: '101', provider: binding.provider, nativeId: binding.nativeId, generation: binding.generation },
+    replyTo: null,
+    text: 'legacy parent request'
+  };
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'frozen-local-source-discord', '100', '101', '101', '900', `${PREFIX}legacy`, '[]', binding.provider, binding.nativeId,
+    binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED,
+    timestamp, timestamp
+  );
+  f.state.receipt('frozen-local-source-discord', 'agent-message', { packet: request, authorId: '900' });
+  f.state.receipt('frozen-local-source-discord', 'accepted', { channelId: '101', generation: binding.generation, readiness: 'ready' });
+  assert.equal(f.state.claimDispatch('frozen-local-source-discord').claimed, true);
+  f.state.enrollThread({ threadId: '103', parentChannelId: '101', guildId: '100', adoptionCutoff: '100' }, binding);
+  f.state.setThreadBaseline('103', '100', binding);
+  f.state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture', null, null, binding);
+  let postUrl;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      f.state.markThreadBoundary('103', THREAD_STATES.UNAVAILABLE, 'fixture child demoted during verification', null, null, binding);
+      return { ok: true, status: 200, json: async () => ({ id: '201', guild_id: '100' }) };
+    }
+    postUrl = url;
+    return { ok: true, status: 200, json: async () => ({ id: 'frozen-local-source-result' }) };
+  } });
+  const result = await peer.send({ reply_to: request.id, text: 'result', dedupe_key: 'frozen-local-source-result' });
+  assert.equal(result.status, 'sent');
+  assert.equal(f.state.getThreadEnrollment('103').state, THREAD_STATES.UNAVAILABLE);
+  assert.match(postUrl, /channels\/201\/messages$/);
+  const attempt = f.state.directPostRows('frozen-local-source-result').find(row => row.kind === 'direct-post-attempt');
+  assert.equal(attempt.detail.agentPacket.source.channelId, '102');
+});
+
+test('peer result resolves a stamped frozen parent route before sibling selection', async t => {
+  const f = fixture(t); f.enroll('102'); const recipient = addRecipient(f);
+  const binding = f.state.getBinding('101');
+  const request = {
+    id: 'stamped-frozen-local-source-request',
+    kind: 'request',
+    source: { guildId: '100', channelId: '201', provider: recipient.provider, nativeId: recipient.nativeId, generation: recipient.generation },
+    target: { guildId: '100', channelId: '101', provider: binding.provider, nativeId: binding.nativeId, generation: binding.generation },
+    replyTo: null,
+    routingVersion: 2,
+    text: 'stamped legacy parent request'
+  };
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'stamped-frozen-local-source-discord', '100', '101', '101', '900', encodeAgentMessage(request, 'fixture'), '[]', binding.provider,
+    binding.nativeId, binding.workspace, binding.endpoint, binding.conductorId, binding.repoKey, binding.generation, MESSAGE_STATES.ACCEPTED,
+    timestamp, timestamp
+  );
+  f.state.receipt('stamped-frozen-local-source-discord', 'agent-message', { packet: request, authorId: '900', routingVersion: 2 });
+  f.state.receipt('stamped-frozen-local-source-discord', 'accepted', { channelId: '101', generation: binding.generation, readiness: 'ready' });
+  assert.equal(f.state.claimDispatch('stamped-frozen-local-source-discord').claimed, true);
+  assert.equal(f.state.getMessage('stamped-frozen-local-source-discord').agentRoute, '102');
+  f.state.enrollThread({ threadId: '103', parentChannelId: '101', guildId: '100', adoptionCutoff: '100' }, binding);
+  f.state.setThreadBaseline('103', '100', binding);
+  f.state.markThreadBoundary('103', THREAD_STATES.READY, 'fixture', null, null, binding);
+  let postUrl;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '201', guild_id: '100' }) };
+    postUrl = url;
+    return { ok: true, status: 200, json: async () => ({ id: 'stamped-frozen-local-source-result' }) };
+  } });
+  const result = await peer.send({ reply_to: request.id, text: 'result', dedupe_key: 'stamped-frozen-local-source-result' });
+  assert.equal(result.status, 'sent');
+  assert.match(postUrl, /channels\/201\/messages$/);
+  const attempt = f.state.directPostRows('stamped-frozen-local-source-result').find(row => row.kind === 'direct-post-attempt');
+  assert.equal(attempt.detail.agentPacket.source.channelId, '102');
+});
+
+test('peer-qualified legacy reply finds a child-sourced request and keeps its frozen local route', async t => {
+  const f = fixture(t); f.enroll('102'); const recipient = addRecipient(f);
+  const caller = f.state.getBinding('101');
+  const request = {
+    id: 'child-sourced-legacy-request', kind: 'request',
+    source: { guildId: recipient.guildId, channelId: '202', provider: recipient.provider,
+      nativeId: recipient.nativeId, generation: recipient.generation },
+    target: { guildId: caller.guildId, channelId: caller.channelId, provider: caller.provider,
+      nativeId: caller.nativeId, generation: caller.generation },
+    replyTo: null, text: 'legacy child source'
+  };
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content,
+    attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'child-sourced-legacy-discord', '100', '101', '101', '900', encodeAgentMessage(request, 'fixture'), '[]',
+    caller.provider, caller.nativeId, caller.workspace, caller.endpoint, caller.conductorId, caller.repoKey,
+    caller.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+  );
+  f.state.receipt('child-sourced-legacy-discord', 'agent-message', { packet: request, authorId: '900' });
+  assert.equal(f.state.claimDispatch('child-sourced-legacy-discord').claimed, true);
+  assert.equal(f.state.getMessage('child-sourced-legacy-discord').agentRoute, '102');
+  f.enroll('103');
+  f.state.enrollThread({ threadId: '203', parentChannelId: '201', guildId: '100', adoptionCutoff: '100' }, recipient);
+  f.state.setThreadBaseline('203', '100', recipient);
+  f.state.markThreadBoundary('203', THREAD_STATES.READY, 'fixture', null, null, recipient);
+  let postUrl;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    postUrl = url;
+    return { ok: true, status: 200, json: async () => ({ id: 'child-sourced-legacy-result' }) };
+  } });
+  const result = await peer.send({ peer: { conductorId: 'recipient' }, reply_to: request.id,
+    text: 'result', dedupe_key: 'child-sourced-legacy-result' });
+  assert.equal(result.status, 'sent');
+  assert.match(postUrl, /channels\/202\/messages$/);
+  const attempt = f.state.directPostRows('child-sourced-legacy-result').find(row => row.kind === 'direct-post-attempt');
+  assert.equal(attempt.detail.agentPacket.source.channelId, '102');
 });
 
 test('correlated reply keeps a recorded child route when another child enrolls', async t => {
@@ -486,6 +658,41 @@ test('correlated reply keeps a recorded child route when another child enrolls',
   const result = await peer.send({ reply_to: request.id, text: 'child result', dedupe_key: 'child-route-result' });
   assert.equal(result.status, 'sent');
   assert.match(postUrl, /channels\/202\/messages$/);
+});
+
+test('correlated reply keeps a remote child route after destination demotion', async t => {
+  const f = fixture(t); f.enroll('102'); const target = addRecipient(f);
+  const caller = f.state.getBinding('101');
+  const request = {
+    id: 'remote-child-demotion-request', kind: 'request',
+    source: { guildId: target.guildId, channelId: '202', provider: target.provider,
+      nativeId: target.nativeId, generation: target.generation },
+    target: { guildId: caller.guildId, channelId: caller.channelId, provider: caller.provider,
+      nativeId: caller.nativeId, generation: caller.generation },
+    replyTo: null, text: 'remote child request'
+  };
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content,
+    attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'remote-child-demotion-discord', caller.guildId, caller.channelId, caller.channelId, '900', encodeAgentMessage(request, 'fixture'), '[]',
+    caller.provider, caller.nativeId, caller.workspace, caller.endpoint, caller.conductorId, caller.repoKey, caller.generation,
+    MESSAGE_STATES.ACCEPTED, timestamp, timestamp);
+  f.state.receipt('remote-child-demotion-discord', 'agent-message', { packet: request, authorId: '900' });
+  f.state.receipt('remote-child-demotion-discord', 'accepted', { channelId: caller.channelId, generation: caller.generation, readiness: 'ready' });
+  assert.equal(f.state.claimDispatch('remote-child-demotion-discord').claimed, true);
+  let posts = 0;
+  const peer = service(f, { fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      f.state.markThreadBoundary('202', THREAD_STATES.UNAVAILABLE, 'remote child demoted during verification', null, null, target);
+      return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
+    }
+    posts += 1;
+    return { ok: true, status: 200, json: async () => ({ id: 'remote-child-demotion-result' }) };
+  } });
+  const result = await peer.send({ reply_to: request.id, text: 'result', dedupe_key: 'remote-child-demotion-result' });
+  assert.equal(result.status, 'sent');
+  assert.equal(posts, 1);
 });
 
 test('peer-qualified reply keeps the recorded child when the peer has multiple ready children', async t => {

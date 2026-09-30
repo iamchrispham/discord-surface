@@ -51,6 +51,13 @@ export function isLegacyChildResult(packet: AgentMessage, request: AgentMessage,
 
 type BindingErrorConstructor = new (message?: string) => Error;
 
+export interface AgentReplyRequestMatch {
+  packet: AgentMessage;
+  discordId: string | null;
+  legacy: boolean;
+  frozenChildRoute: string | null;
+}
+
 export interface LegacyParentSourcedReceipt {
   attempt: Record<string, unknown>;
   detail: Record<string, unknown>;
@@ -204,9 +211,9 @@ function legacyAgentTarget(agentTarget: AgentAddress | AgentAddressEnvelope | Le
   return agentTarget as AgentAddress;
 }
 
-export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, source: AgentAddress,
+export function resolveAgentReplyRequestMatch(state: DirectPostState, replyTo: string, source: AgentAddress,
   target: AgentAddress | null = null, legacyParent: AgentAddress | null = null,
-  BindingError: BindingErrorConstructor, requireLegacy = false): AgentMessage {
+  BindingError: BindingErrorConstructor, requireLegacy = false, requireFrozenChild = false): AgentReplyRequestMatch {
   const rows = state.listReceipts();
   const candidates = rows
     .filter(row => row.kind === 'agent-message')
@@ -214,15 +221,20 @@ export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string
       try {
         const detail: unknown = JSON.parse(row.detail);
         const packet = detail && typeof detail === 'object' ? (detail as Record<string, unknown>).packet || null : null;
-        return packet ? { packet: packet as Record<string, unknown>, discordId: row.discord_id, legacy: isLegacyAgentReceipt(detail) } : null;
+        const frozenChildRoute = row.discord_id ? state.getMessage?.(row.discord_id)?.agentRoute || null : null;
+        return packet ? { packet: packet as Record<string, unknown>, discordId: row.discord_id,
+          legacy: isLegacyAgentReceipt(detail), frozenChildRoute } : null;
       } catch { return null; }
     })
-    .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; legacy: boolean } => candidate !== null &&
-      candidate.packet.kind === KINDS.REQUEST &&
-      (!requireLegacy || candidate.legacy) &&
-      (target === null || sameAddress(candidate.packet.source, target)) &&
-      (sameAddress(candidate.packet.target, source) || (legacyParent !== null && candidate.legacy &&
-        sameAddress(candidate.packet.target, legacyParent))));
+    .filter((candidate): candidate is { packet: Record<string, unknown>; discordId: string | null; legacy: boolean; frozenChildRoute: string | null } => {
+      if (candidate === null || candidate.packet.kind !== KINDS.REQUEST ||
+          (requireLegacy && !candidate.legacy && candidate.frozenChildRoute === null) ||
+          (target !== null && !sameAddress(candidate.packet.source, target))) return false;
+      const directTargetMatch = sameAddress(candidate.packet.target, source);
+      const parentTargetMatch = legacyParent !== null && sameAddress(candidate.packet.target, legacyParent);
+      const frozenChildTargetMatch = candidate.frozenChildRoute !== null;
+      return directTargetMatch || (parentTargetMatch && (candidate.legacy || frozenChildTargetMatch));
+    });
   const identified = candidates.filter(candidate => candidate.discordId === replyTo || candidate.packet.id === replyTo);
   if (identified.length !== 1) throw new BindingError('agent reply target is unknown or does not match the active request');
   const match = identified[0];
@@ -230,7 +242,24 @@ export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string
   if (state.isAgentRequestWithdrawn(match.packet as unknown as AgentMessage)) {
     throw new BindingError('agent request was withdrawn');
   }
-  return match.packet as unknown as AgentMessage;
+  const frozenChildRoute = match.frozenChildRoute;
+  if (requireFrozenChild && match.packet.target &&
+      (frozenChildRoute ? frozenChildRoute !== source.channelId :
+        (match.legacy && (match.packet.target as AgentAddress).channelId !== source.channelId))) {
+    throw new BindingError('agent result source does not match the request frozen child route');
+  }
+  return {
+    packet: match.packet as unknown as AgentMessage,
+    discordId: match.discordId,
+    legacy: match.legacy,
+    frozenChildRoute
+  };
+}
+
+export function resolveAgentReplyRequest(state: DirectPostState, replyTo: string, source: AgentAddress,
+  target: AgentAddress | null = null, legacyParent: AgentAddress | null = null,
+  BindingError: BindingErrorConstructor, requireLegacy = false, requireFrozenChild = false): AgentMessage {
+  return resolveAgentReplyRequestMatch(state, replyTo, source, target, legacyParent, BindingError, requireLegacy, requireFrozenChild).packet;
 }
 
 export function assertLegacyParentSourcedIdentity({ state, binding, token, requestId, packet, sourceText, agentKind,

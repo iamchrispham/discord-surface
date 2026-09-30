@@ -66,6 +66,8 @@ test('results can answer a parent-targeted request accepted before child routing
     state.receipt('8102', 'agent-message', { packet: request, authorId: '901' });
     state.receipt('8102', 'accepted', { channelId: source.channelId, conductorId: binding.conductorId, generation: binding.generation, readiness: 'ready' });
     const sourceChild = enrollChild(state, source, '103');
+    assert.equal(state.claimDispatch('8102').claimed, true);
+    assert.equal(state.getMessage('8102').agentRoute, sourceChild.channelId);
     const textFile = path.join(dir, 'result.txt');
     fs.writeFileSync(textFile, 'Legacy result');
     const calls = [];

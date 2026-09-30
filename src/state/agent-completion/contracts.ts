@@ -20,6 +20,7 @@ export interface CompletionMessage {
   guildId: string;
   channelId: string;
   deliveryChannelId?: string | null;
+  agentRoute?: string | null;
   provider: string;
   nativeId: string;
   generation: number;

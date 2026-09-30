@@ -56,6 +56,7 @@ export interface NativeMessage {
   content: string;
   attachments?: readonly Attachment[] | null;
   agentMessage?: AgentMessage | null;
+  agentRoute?: string | null;
   watcherNotice?: WatcherNotice | null;
   watcherNoticeProvenance?: unknown;
   decisionResult?: DecisionResult | null;

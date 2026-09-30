@@ -257,7 +257,8 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       ? { ...legacyPacket, source: address, routingVersion: AGENT_ROUTING_VERSION, sourceParentChannelId: binding.channelId }
       : { ...legacyPacket, source: address };
     if (legacyPacket.kind === KINDS.RESULT) {
-      const request = resolveAgentReplyRequest(state, legacyPacket.replyTo, legacyPacket.source, legacyPacket.target, null, BindingError);
+      const request = resolveAgentReplyRequest(state, legacyPacket.replyTo, address, legacyPacket.target,
+        canonicalAddress(binding), BindingError, false, true);
       agentRequestTarget = sameAddress(request.target, address) ? null : request.target;
     }
     const wire = encodeAgentMessage(agentPacket, token);
@@ -281,7 +282,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       if (legacyTargetEnvelope !== null) resolvedTarget = verifyLegacyAgentAddress(legacyTargetEnvelope, token);
       else if (hasProof) resolvedTarget = verifyAgentAddress(agentTarget, token);
       const request = resolveAgentReplyRequest(state, replyTo, address,
-        resolvedTarget, canonicalAddress(binding), BindingError, legacyTargetEnvelope !== null);
+        resolvedTarget, canonicalAddress(binding), BindingError, legacyTargetEnvelope !== null, true);
       agentTarget = resolvedTarget;
       agentRequestTarget = sameAddress(request.target, address) ? null : request.target;
       deliveryTarget = request.source;
@@ -317,8 +318,9 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;
   let recorded = false;
+  const allowUnreadyAgentRoute = agentKind === KINDS.RESULT && address.channelId !== binding.channelId;
   const currentBinding = () => {
-    if (!watcherNotice) return state.directPostBindingCurrent(binding, operatorId, address.channelId);
+    if (!watcherNotice) return state.directPostBindingCurrent(binding, operatorId, address.channelId, allowUnreadyAgentRoute);
     try {
       state.authorizeWatcherNoticeSend?.(watcherNotice.packet);
       return true;
