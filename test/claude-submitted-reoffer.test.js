@@ -100,6 +100,71 @@ test('a newly verified Claude listener re-offers an unacknowledged submitted row
   assert.deepEqual(posts, ['102', '102'], 'a native ACK excludes later re-offers');
 });
 
+test('a deferred later row does not repeat an earlier row for the same listener', async t => {
+  const dir = fs.mkdtempSync('/tmp/claude-reoffer-deferred-row-');
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  t.after(() => {
+    state.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  state.setConfig({ operatorId: '900', guildId: '100', secretFile: path.join(dir, 'secret') });
+  const endpoint = path.join(dir, 'listener.sock');
+  const bound = state.bind({
+    channelId: '101', guildId: '100', provider: 'claude', nativeId: NATIVE_ID,
+    workspace: dir, endpoint
+  }, { intakeCutoff: '100' });
+  state.setBindingReadiness('101', READINESS.READY, 'listener ready', bound);
+  const submit = id => {
+    state.acceptDiscordMessage({
+      id, guildId: '100', channelId: '101', authorId: '900', isBot: false,
+      attachments: [], content: `Please handle request ${id}.`
+    });
+    state.claimDispatch(id);
+    state.markSubmitted(id);
+  };
+  submit('102');
+  submit('103');
+
+  const posts = [];
+  const gateway = {
+    state,
+    providers: { claude: { async dispatch(message) {
+      posts.push(message.id);
+      if (message.id === '102') {
+        state.setBindingReadiness('101', READINESS.PENDING, 'listener pending', state.getBinding('101'));
+      }
+      return { status: 'submitted' };
+    } } },
+    pauseLiveDispatch() {},
+    async recoverTransport() { return { ready: true, state: 'ready' }; },
+    async reconcilePending() {}
+  };
+  const wake = createBindingWakeController({
+    getGateway: () => gateway,
+    isReady: () => true,
+    isTransportReady: () => true,
+    isStopping: () => false,
+    probeClaudeChannel: async (socketPath, expected) => {
+      assert.equal(socketPath, endpoint);
+      assert.equal(expected.nativeId, NATIVE_ID);
+      assert.equal(expected.generation, bound.generation);
+      return { listenerInstanceId: FIRST_INSTANCE, ...expected };
+    }
+  });
+  const trigger = async () => { wake.request(); await wake.wait(); };
+
+  await trigger();
+  assert.deepEqual(posts, ['102'], 'the first row posts before the second row defers');
+  assert.equal(state.getMessage('102').state, 'submitted');
+  assert.equal(state.getMessage('103').state, 'submitted');
+
+  state.setBindingReadiness('101', READINESS.READY, 'listener ready', state.getBinding('101'));
+  await trigger();
+  assert.deepEqual(posts, ['102', '103'], 'the deferred row posts without repeating the earlier row');
+  assert.equal(state.getMessage('102').state, 'submitted');
+  assert.equal(state.getMessage('103').state, 'submitted');
+});
+
 test('a re-offer skips submitted rows whose owner or generation is no longer current', async t => {
   const dir = fs.mkdtempSync('/tmp/claude-reoffer-wrong-owner-');
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
