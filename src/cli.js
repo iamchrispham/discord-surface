@@ -19,6 +19,7 @@ if (require.main === module && startup.command === 'courier-guard' && startup.ar
 
 const { createGatewayProcessInspection } = require('./cli/gateway-process');
 const { createOrdinaryHandoff } = require('./cli/ordinary-handoff');
+const { createConductorHandoff } = require('./cli/conductor-handoff');
 const { gatewayProcessStatus, pidMatches, waitForExit } = createGatewayProcessInspection(__filename);
 const createClaudeListeners = require('./cli/claude-listeners');
 const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, issueAgentAddress } = require('./agent-message');
@@ -39,25 +40,16 @@ const {
 } = require('./discord/handoff-fence');
 const {
   createOrdinaryClaudeRequest,
-  createOrdinaryCodexRequestFromEnvironment,
-  ordinaryBindingDecision,
-  ORDINARY_BINDING_DECISIONS,
   resolveExistingChannel,
   resolveInvocationIdentity
 } = require('./ordinary-codex');
-const { CODEX_VALIDATION_KINDS, sessionRoot: codexSessionRoot, validateClaudeSessionIdentity, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('./native');
-const { ordinaryBind: runOrdinaryBind, ordinaryClaudeBind: runOrdinaryClaudeBind, reconcileProofUnavailableIntake } = require('./ordinary-bind');
-const { assertGatewayWakeCompatible } = require('./ordinary-bind/gateway-capability');
+const { validateClaudeSessionIdentity, validateCodexSessionIdentity, validateCodexSessionIdentityAsync } = require('./native');
+const { ordinaryBind, ordinaryBindingArgs, NATIVE_PROOF_STATUSES, ORDINARY_CODEX_RUNTIME_PID_ENV } = require('./ordinary-bind/codex');
+const { ordinaryClaudeBind: runOrdinaryClaudeBind } = require('./ordinary-bind');
 const { GATEWAY_CAPABILITIES } = require('./ordinary-bind/constants');
 
 const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID';
-const ORDINARY_CODEX_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CODEX_RUNTIME_PID';
 const LOCK_CONTENTION_EXIT = 75;
-const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
-const NATIVE_PROOF_STATUSES = Object.freeze({
-  PENDING: 'pending',
-  VERIFIED: 'verified'
-});
 const { runLiaisonDraft } = require('./liaison');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
 const { parseLegacyConductorMarker, staticConductorMarker } = require('./topic');
@@ -320,26 +312,6 @@ async function bind(args, rebind = false) {
   }
 }
 
-function ordinaryBindingArgs(args, environment = process.env, channelId = null, guildId = null, workspace = undefined, sessionRoot = undefined) {
-  return createOrdinaryCodexRequestFromEnvironment({
-    channelId: channelId || required(args, 'channel-id'),
-    guildId: guildId || required(args, 'guild-id'),
-    nativeId: args['native-id'],
-    workspace: workspace ?? (args.workspace ? path.resolve(args.workspace) : undefined),
-    sessionRoot,
-    environment
-  });
-}
-
-function bindingIdentityMatches(binding, expected) {
-  return Boolean(binding) && Boolean(expected) && binding.active === expected.active &&
-    binding.channelId === expected.channelId && binding.guildId === expected.guildId &&
-    binding.provider === expected.provider && binding.nativeId === expected.nativeId &&
-    binding.generation === expected.generation &&
-    (binding.sessionRoot || null) === (expected.sessionRoot || null) &&
-    binding.conductorId === expected.conductorId && binding.repoKey === expected.repoKey;
-}
-
 async function threadEnroll(args, dependencies = {}) {
   const { paths, state } = openState(args);
   const install = dependencies.requireInstalled || requireInstalled;
@@ -400,208 +372,6 @@ function requestGatewayRecovery(paths, {
     return { requested: true, pid: runtime.pid, signal: 'SIGUSR2' };
   } catch (error) {
     return { requested: false, pid: runtime.pid, state: runtime.state, reason: 'gateway-wake-failed', error: error.message };
-  }
-}
-
-async function ordinaryBind(args, dependencies = {}) {
-  const { paths, state } = openState(args);
-  const environment = dependencies.environment || process.env;
-  const install = dependencies.requireInstalled || requireInstalled;
-  const read = dependencies.readSecret || readSecret;
-  const validate = dependencies.validateCodexSessionIdentity || validateCodexSessionIdentityAsync;
-  const output = dependencies.print || print;
-  let client;
-  let adoptionFence;
-  try {
-    const config = state.requireConfig();
-    const channelSelection = args.channel || args['channel-id'];
-    if (!channelSelection || typeof channelSelection !== 'string') throw new Error('missing --channel or --channel-id');
-    const invocation = resolveInvocationIdentity(environment, args.workspace ? path.resolve(args.workspace) : undefined);
-    const sessionRoot = args['session-root'] ? path.resolve(args['session-root']) : undefined;
-    let nativeProofDetail = null;
-    let nativeProofError = null;
-    let resolvedWorkspace = invocation.workspace;
-    const validateNativeProof = async root => {
-      let detail = null;
-      let error = null;
-      try {
-        detail = await validate(invocation.sessionId, undefined, root);
-        if (!detail || typeof detail.workspace !== 'string' || !path.isAbsolute(detail.workspace)) {
-          throw new Error('Codex transcript workspace is unavailable');
-        }
-      } catch (caught) {
-        if (caught?.recoveryKind === CODEX_VALIDATION_KINDS.UNSUPPORTED_ROOT) throw caught;
-        error = caught;
-        if (!invocation.workspace) throw new Error(`Codex transcript workspace is required: ${caught.message}`);
-      }
-      if (detail && invocation.workspace && path.resolve(detail.workspace) !== invocation.workspace) {
-        throw new Error('Codex transcript workspace does not match the supplied workspace');
-      }
-      return { detail, error, workspace: detail?.workspace || invocation.workspace };
-    };
-    if (sessionRoot) {
-      const proof = await validateNativeProof(sessionRoot);
-      nativeProofDetail = proof.detail;
-      nativeProofError = proof.error;
-      resolvedWorkspace = proof.workspace;
-    }
-    const { Client, GatewayIntentBits } = install('discord.js');
-    client = new Client({ intents: [GatewayIntentBits.Guilds] });
-    await client.login(read(config.secretFile));
-    const guild = await client.guilds.fetch(config.guildId);
-    const mentionId = channelSelection.match(/^<#([^>]+)>$/)?.[1] || (/^\d+$/.test(channelSelection) ? channelSelection : null);
-    let fetchedChannels;
-    let fetchedChannelObjects;
-    if (mentionId) {
-      const channel = await guild.channels.fetch(mentionId);
-      fetchedChannelObjects = channel ? [channel] : [];
-      fetchedChannels = channel ? [{ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
-        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }] : [];
-    } else {
-      const fetched = await guild.channels.fetch();
-      const values = Array.isArray(fetched) ? fetched : typeof fetched?.values === 'function' ? [...fetched.values()] : [];
-      fetchedChannelObjects = values;
-      fetchedChannels = values.map(channel => ({ id: channel.id, guildId: channel.guildId || '', name: channel.name || null,
-        messageCapable: typeof channel.isTextBased === 'function' && channel.isTextBased() }));
-    }
-    const channel = resolveExistingChannel(channelSelection, config.guildId, fetchedChannels);
-    if (args.channel && args['channel-id']) {
-      const namedChannel = resolveExistingChannel(args.channel, config.guildId, fetchedChannels);
-      const idChannel = resolveExistingChannel(args['channel-id'], config.guildId, fetchedChannels);
-      if (namedChannel.id !== idChannel.id) throw new Error('--channel and --channel-id must identify the same channel');
-    }
-    const discordChannel = fetchedChannelObjects.find(candidate => candidate?.id === channel.id);
-    const existing = state.getBinding(channel.id);
-    if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
-      throw new Error('channel is already bound to another owner; use explicit handoff');
-    }
-    let validationRoot = sessionRoot ?? existing?.sessionRoot ?? (dependencies.codexSessionRoot || codexSessionRoot)();
-    if (!sessionRoot) {
-      const proof = await validateNativeProof(validationRoot);
-      nativeProofDetail = proof.detail;
-      nativeProofError = proof.error;
-      resolvedWorkspace = proof.workspace;
-    }
-    const request = ordinaryBindingArgs(args, environment, channel.id, config.guildId, resolvedWorkspace, validationRoot);
-    if (request.guildId !== config.guildId) throw new Error('ordinary binding guild is not the configured guild');
-    const gatewayStatus = dependencies.gatewayProcessStatus || gatewayProcessStatus;
-    const expectedRuntimePid = environment[ORDINARY_CODEX_RUNTIME_PID_ENV];
-    const assertGatewayCompatible = runtime => {
-      const snapshot = assertGatewayWakeCompatible(paths, gatewayStatus, runtime);
-      if (expectedRuntimePid !== undefined &&
-        (snapshot?.state !== 'running' || String(snapshot.pid) !== expectedRuntimePid ||
-          !snapshot.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock))) {
-        throw new Error('running Gateway changed while binding ordinary Codex session');
-      }
-      return snapshot;
-    };
-    assertGatewayCompatible();
-    const nativeProofEvidence = nativeProofDetail ? { ...nativeProofDetail, sessionRoot: validationRoot } : null;
-    let decision = ordinaryBindingDecision(existing, request, existing ? state.isOrdinaryBindingRecord(existing) : false, nativeProofEvidence);
-    let adoptionCutoff = null;
-    if (decision !== ORDINARY_BINDING_DECISIONS.REUSE && !existing?.active) {
-      if (typeof discordChannel?.send === 'function') {
-        // The server fence message is real evidence (case 11's accepted producer).
-        adoptionFence = await createHandoffFence(discordChannel, 'ordinary binding adoption');
-        adoptionCutoff = adoptionFence.id;
-      } else {
-        // No fence channel available: acquire the boundary from a permission-qualified
-        // history read. A channel-id-derived value is never a coverage producer.
-        adoptionCutoff = await readAdoptionCutoff(discordChannel, channel.id, client.user);
-      }
-    }
-    let binding;
-    if (decision === ORDINARY_BINDING_DECISIONS.REUSE) binding = existing;
-    else if (decision === ORDINARY_BINDING_DECISIONS.REBIND) {
-      try {
-        binding = state.rebindOrdinary(request, request.identity, nativeProofEvidence, adoptionCutoff, {
-          beforeMutation: assertGatewayCompatible
-        });
-      } catch (error) {
-        const raced = state.getBinding(request.channelId);
-        const racedDecision = raced
-          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
-          : null;
-        if (racedDecision !== ORDINARY_BINDING_DECISIONS.REUSE) throw error;
-        decision = ORDINARY_BINDING_DECISIONS.REUSE;
-        binding = raced;
-      }
-    }
-    else {
-      try {
-        binding = state.bindOrdinary(request, request.identity, adoptionCutoff, {
-          beforeMutation: assertGatewayCompatible
-        });
-      } catch (error) {
-        const raced = state.getBinding(request.channelId);
-        const racedDecision = raced
-          ? ordinaryBindingDecision(raced, request, state.isOrdinaryBindingRecord(raced), nativeProofEvidence)
-          : null;
-        if (racedDecision !== ORDINARY_BINDING_DECISIONS.REUSE) throw error;
-        decision = ORDINARY_BINDING_DECISIONS.REUSE;
-        binding = raced;
-      }
-    }
-    let nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: 'Codex transcript proof is pending' };
-    if (nativeProofError) {
-      const detail = `${ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX} ${nativeProofError.message}`;
-      const unavailable = state.setBindingReadiness(binding.channelId, READINESS.UNAVAILABLE, detail, binding);
-      if (unavailable) binding = unavailable;
-      nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: nativeProofError.message };
-    } else if (state.hasOrdinaryPreflight(binding)) {
-      const verifiedBinding = state.transaction(() => {
-        const current = state.getBinding(binding.channelId);
-        if (!bindingIdentityMatches(current, binding) || !state.hasOrdinaryPreflight(current)) return null;
-        return current;
-      });
-      if (!verifiedBinding) throw new Error('ordinary binding changed before native preflight proof was reused');
-      binding = verifiedBinding;
-      nativeProof = { status: NATIVE_PROOF_STATUSES.VERIFIED, reason: 'Codex transcript proof already recorded' };
-    } else if (nativeProofDetail) {
-      let recordedBinding;
-      let preflightError;
-      try {
-        recordedBinding = state.recordOrdinaryPreflight(binding, {
-          file: nativeProofDetail.file,
-          sessionId: nativeProofDetail.sessionId,
-          threadId: nativeProofDetail.threadId,
-          workspace: nativeProofDetail.workspace
-        });
-      } catch (error) {
-        preflightError = error;
-      }
-      if (preflightError) {
-        nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: preflightError.message };
-      } else if (!recordedBinding) {
-        throw new Error('ordinary binding changed before native proof was recorded');
-      } else {
-        binding = recordedBinding;
-        nativeProof = { status: NATIVE_PROOF_STATUSES.VERIFIED, file: nativeProofDetail.file, workspace: nativeProofDetail.workspace };
-      }
-    } else {
-      nativeProof = { status: NATIVE_PROOF_STATUSES.PENDING, reason: nativeProofError?.message || 'Codex transcript proof is pending' };
-    }
-    binding = reconcileProofUnavailableIntake(state, binding, {
-      reused: decision === ORDINARY_BINDING_DECISIONS.REUSE,
-      nativeProofVerified: nativeProof.status === NATIVE_PROOF_STATUSES.VERIFIED,
-      nativeProofDetail,
-      nativeProofError
-    });
-    const gatewayWake = requestGatewayRecovery(paths, {
-      status: gatewayStatus,
-      kill: dependencies.killProcess || process.kill,
-      expectedPid: expectedRuntimePid
-    });
-    const resultBinding = state.transaction(() => {
-      const current = state.getBinding(binding.channelId);
-      return bindingIdentityMatches(current, binding) ? current : null;
-    });
-    if (!resultBinding) throw new Error('ordinary binding changed before bind result was returned');
-    output({ bound: true, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE, binding: resultBinding, nativeProof, gatewayWake });
-    return { binding: resultBinding, nativeProof, gatewayWake, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE };
-  } finally {
-    await deleteHandoffFence(adoptionFence);
-    try { await client?.destroy(); } finally { state.close(); }
   }
 }
 
@@ -1039,188 +809,7 @@ function provision(args) {
   process.exitCode = result.status ?? 1;
 }
 
-async function handoffInternal(args, dependencies = {}) {
-  const ordinaryRequested = args.ordinary === true || args.ordinary === 'true';
-  if (fromLockRequested(args)) {
-    if (ordinaryRequested) throw new Error('ordinary handoff cannot use --from-lock');
-    return handoffFromLockInternal(args);
-  }
-  if (ordinaryRequested) return ordinaryHandoffInternal(args, dependencies);
-  const provider = required(args, 'provider');
-  const conductorId = required(args, 'conductor-id');
-  const repoKey = required(args, 'repo-key');
-  const fromNativeId = required(args, 'from-native-id');
-  const nativeId = required(args, 'native-id');
-  validateNativeId(fromNativeId);
-  validateNativeId(nativeId);
-  const fromGeneration = Number(required(args, 'from-generation'));
-  const endpoint = args.endpoint ? path.resolve(args.endpoint) : undefined;
-  if (provider === PROVIDERS.CLAUDE && !endpoint) throw new Error('Claude handoff requires --endpoint');
-  const workspace = path.resolve(required(args, 'workspace'));
-  const channelId = required(args, 'channel-id');
-  const handoffId = required(args, 'handoff-id');
-  const { state } = openState(args);
-  let client;
-  let handoffFence;
-  let enrollmentProof = null;
-  try {
-    const config = state.requireConfig();
-    const categoryId = categoryFor(provider, args, config);
-    const { Client, GatewayIntentBits } = requireInstalled('discord.js');
-    client = new Client({ intents: [GatewayIntentBits.Guilds] });
-    await client.login(readSecret(config.secretFile));
-    const guild = await client.guilds.fetch(config.guildId);
-    const channel = await guild.channels.fetch(channelId);
-    if (!channel || channel.parentId !== categoryId) throw new Error('handoff channel is outside the configured vendor category');
-    const current = state.getBinding(channelId);
-    const expectedMarker = current && staticConductorMarker({ provider, conductorId, repoKey });
-    const legacy = current && (parseLegacyConductorMarker(channel.topic) || legacyAdoptionTopic(channel.topic, provider, current.nativeId));
-    if (legacy) throw new Error('legacy channel topic requires explicit --migrate-legacy-topic --channel-id before handoff');
-    if (!current || current.provider !== provider || current.conductorId !== conductorId || current.repoKey !== repoKey || channel.topic !== expectedMarker) {
-      throw new Error('handoff channel topic does not match the locally bound conductor address');
-    }
-    const previous = state.findConductorHandoff(handoffId);
-    const hasActiveThreads = state.listThreadEnrollments(channelId).some(enrollment => enrollment.active);
-    if (!previous && hasActiveThreads) {
-      handoffFence = await createHandoffFence(channel, 'conductor handoff');
-      enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'conductor handoff');
-    }
-    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId,
-      intakeCutoff: handoffFence?.id || null, enrollmentProof });
-    print({ handedOff: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
-  } finally {
-    await deleteHandoffFence(handoffFence);
-    await client?.destroy();
-    state.close();
-  }
-}
-
-function handoff(args) {
-  const { stateDir, provisionLock } = pathsFor(args);
-  if (process.env.DISCORD_SURFACE_PROVISION_LOCK_HELD === '1') return handoffInternal(args);
-  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const forwarded = Object.entries(args).flatMap(([key, value]) => value === true ? [`--${key}`] : [`--${key}`, String(value)]);
-  const result = spawnSync('lockf', ['-t', '0', '-k', provisionLock, process.execPath, __filename, 'handoff-run', ...forwarded], {
-    stdio: 'inherit',
-    env: { ...process.env, DISCORD_SURFACE_PROVISION_LOCK_HELD: '1' }
-  });
-  if (result.error) throw result.error;
-  process.exitCode = result.status ?? 1;
-}
-
-function fromLockRequested(args) {
-  return args['from-lock'] === true || args['from-lock'] === 'true';
-}
-
-function conductorLockScript() {
-  return path.resolve(process.env.DISCORD_SURFACE_LOCK_SCRIPT || path.join(os.homedir(), '.claude', 'skills', 'conductor-handoff', 'scripts', 'conductor-lock.sh'));
-}
-
-function localHandoff(args) {
-  if (process.env.DISCORD_SURFACE_HANDOFF_GATE_HELD !== '1') throw new Error('handoff-local is internal; use handoff --from-lock');
-  const provider = required(args, 'provider');
-  const conductorId = required(args, 'conductor-id');
-  const repoKey = required(args, 'repo-key');
-  const channelId = required(args, 'channel-id');
-  const nativeId = required(args, 'native-id');
-  validateNativeId(nativeId);
-  const fromNativeId = required(args, 'from-native-id');
-  validateNativeId(fromNativeId);
-  const fromGeneration = Number(required(args, 'from-generation'));
-  const workspace = path.resolve(required(args, 'workspace'));
-  const endpoint = args.endpoint ? path.resolve(args.endpoint) : undefined;
-  if (provider === PROVIDERS.CLAUDE && !endpoint) throw new Error('Claude handoff requires --endpoint');
-  const reuse = args.reuse === true || args.reuse === 'true';
-  const handoffId = reuse ? null : required(args, 'handoff-id');
-  const intakeCutoff = args['intake-cutoff'] || null;
-  let enrollmentProof = null;
-  if (args['enrollment-proof']) {
-    try { enrollmentProof = JSON.parse(args['enrollment-proof']); } catch { throw new Error('invalid --enrollment-proof JSON'); }
-  }
-  const { state } = openState(args);
-  try {
-    const config = state.requireConfig();
-    const current = state.findConductorBinding(conductorId, provider);
-    if (!current || !current.active || current.channelId !== channelId || current.repoKey !== repoKey) throw new Error('local handoff binding no longer matches the verified conductor');
-    if (reuse) {
-      if (current.nativeId !== nativeId || current.generation !== fromGeneration || current.workspace !== workspace || current.endpoint !== (endpoint || null)) throw new Error('local handoff reuse target no longer matches the verified native binding');
-      print({ handedOff: false, reused: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding: current, readiness: current.readiness });
-      return;
-    }
-    const carryAcceptedHuman = process.env.DISCORD_SURFACE_HANDOFF_CARRY_ACCEPTED_HUMAN === '1';
-    const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff, enrollmentProof, carryAcceptedHuman });
-    print({ handedOff: true, reused: false, conductorId, repoKey, channelId, handoffId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
-  } finally { state.close(); }
-}
-
-function handoffGate(args, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff = null, enrollmentProof = null }) {
-  const paths = pathsFor(args);
-  const helperArgs = [
-    path.join(__dirname, 'conductor-lock-gate.py'),
-    '--lock-script', conductorLockScript(), '--repo', required(args, 'repo'), '--repo-key', required(args, 'repo-key'),
-    '--provider', current.provider, '--conductor-id', current.conductorId, '--channel-id', current.channelId,
-    '--from-native-id', current.nativeId, '--from-generation', String(current.generation), '--native-id', required(args, 'native-id'),
-    '--from-workspace', current.workspace, '--workspace', workspace, '--session-file', sessionFile, '--worker-file', workerFile,
-    '--node-path', process.execPath, '--cli-path', __filename, '--state-dir', paths.stateDir, '--db', paths.db
-  ];
-  if (current.endpoint) helperArgs.push('--from-endpoint', current.endpoint);
-  if (endpoint) helperArgs.push('--endpoint', endpoint);
-  if (intakeCutoff) helperArgs.push('--intake-cutoff', intakeCutoff);
-  if (enrollmentProof) helperArgs.push('--enrollment-proof', JSON.stringify(enrollmentProof));
-  if (reuse) helperArgs.push('--reuse');
-  const result = spawnSync(process.env.DISCORD_SURFACE_PYTHON || 'python3', helperArgs, {
-    encoding: 'utf8', timeout: 35000, env: { ...process.env }
-  });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error((result.stderr || result.stdout || 'lock-gated handoff failed').trim());
-  if (result.stdout) process.stdout.write(result.stdout);
-  return result.stdout;
-}
-
-async function handoffFromLockInternal(args) {
-  const provider = required(args, 'provider');
-  const conductorId = required(args, 'conductor-id');
-  const repoKey = required(args, 'repo-key');
-  const repo = required(args, 'repo');
-  const nativeId = required(args, 'native-id');
-  validateNativeId(nativeId);
-  const endpoint = args.endpoint ? path.resolve(args.endpoint) : undefined;
-  if (provider === PROVIDERS.CLAUDE && !endpoint) throw new Error('Claude handoff requires --endpoint');
-  const workspace = path.resolve(required(args, 'workspace'));
-  const sessionFile = path.resolve(required(args, 'session-file'));
-  const workerFile = path.resolve(required(args, 'worker-file'));
-  if (args['channel-id'] || args['from-native-id'] || args['from-generation'] || args['handoff-id']) throw new Error('--from-lock derives the existing binding and handoff authority');
-  let state = openState(args).state;
-  let client;
-  let handoffFence;
-  let enrollmentProof = null;
-  try {
-    const config = state.requireConfig();
-    const current = state.findConductorBinding(conductorId, provider);
-    if (!current || !current.active || current.repoKey !== repoKey) throw new Error('no active local binding matches the requested conductor and repository');
-    const categoryId = categoryFor(provider, args, config);
-    const { Client, GatewayIntentBits } = requireInstalled('discord.js');
-    client = new Client({ intents: [GatewayIntentBits.Guilds] });
-    await client.login(readSecret(config.secretFile));
-    const guild = await client.guilds.fetch(config.guildId);
-    const channel = await guild.channels.fetch(current.channelId);
-    const marker = staticConductorMarker({ provider, conductorId, repoKey });
-    if (!channel || channel.id !== current.channelId || channel.parentId !== categoryId || channel.topic !== marker) throw new Error('handoff channel does not match the static conductor address');
-    const reuse = current.nativeId === nativeId;
-    if (!reuse && state.listThreadEnrollments(current.channelId).some(enrollment => enrollment.active)) {
-      handoffFence = await createHandoffFence(channel, 'conductor handoff');
-      enrollmentProof = await assertHandoffIntakeCoverage(channel, client, state, current, handoffFence.id, 'conductor handoff');
-    }
-    state.close();
-    state = null;
-    handoffGate({ ...args, repo }, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff: handoffFence?.id || null, enrollmentProof });
-    return;
-  } finally {
-    await deleteHandoffFence(handoffFence);
-    await client?.destroy();
-    state?.close();
-  }
-}
+const { handoffInternal, handoff, localHandoff } = createConductorHandoff({ required, openState, print, pathsFor, categoryFor, ordinaryHandoffInternal, cliPath: __filename });
 
 function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
   fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
