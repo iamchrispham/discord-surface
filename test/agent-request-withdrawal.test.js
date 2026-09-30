@@ -182,6 +182,53 @@ test('withdrawal disambiguates a frozen-child result from a reused packet id', t
     nativeId: sourceParent.nativeId, generation: sourceParent.generation }).withdrawn, true);
 });
 
+test('withdrawal preserves frozen child custody after unrelated sibling packet reuse', t => {
+  const fixture = setup(t);
+  const sourceBinding = fixture.state.getBinding(requester.channelId);
+  const targetBinding = fixture.state.getBinding(recipient.channelId);
+  const sourceParent = { ...requester, generation: sourceBinding.generation };
+  const targetParent = { ...recipient, generation: targetBinding.generation };
+  const packet = { id: 'legacy-parent-frozen-child-sibling', kind: KINDS.REQUEST,
+    source: sourceParent, target: targetParent, replyTo: null, text: 'Legacy parent request.' };
+  const messageId = '8120';
+  const timestamp = new Date().toISOString();
+  fixture.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id, content, attachments,
+    provider, native_id, workspace, endpoint, conductor_id, repo_key, generation, state, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    messageId, targetParent.guildId, targetParent.channelId, targetParent.channelId, '901', encodeAgentMessage(packet, token), '[]',
+    targetBinding.provider, targetBinding.nativeId, targetBinding.workspace, targetBinding.endpoint, targetBinding.conductorId,
+    targetBinding.repoKey, targetBinding.generation, MESSAGE_STATES.ACCEPTED, timestamp, timestamp
+  );
+  fixture.state.receipt(messageId, 'agent-message', { packet, authorId: '901' });
+  fixture.state.receipt(messageId, 'accepted', { channelId: targetParent.channelId, generation: targetParent.generation, readiness: 'ready' });
+  assert.equal(fixture.state.claimDispatch(messageId).claimed, true);
+  assert.equal(fixture.state.getMessage(messageId).agentRoute, '104');
+  fixture.state.markSubmitted(messageId);
+  recordNativeAcknowledgment(fixture.state, { provider: targetParent.provider, messageId,
+    nativeId: targetParent.nativeId, generation: targetParent.generation });
+  assert.equal(fixture.state.withdrawAgentRequest({ messageId, packetId: packet.id, provider: sourceParent.provider,
+    nativeId: sourceParent.nativeId, generation: sourceParent.generation }).withdrawn, true);
+
+  fixture.state.enrollThread({ threadId: '105', parentChannelId: targetParent.channelId, guildId: '100', adoptionCutoff: '100' }, targetBinding);
+  fixture.state.markThreadBoundary('105', THREAD_STATES.READY, 'fixture sibling ready', null, null, targetBinding);
+  const siblingRequest = { ...packet, target: { ...targetParent, channelId: '105' } };
+  assert.equal(fixture.state.acceptDiscordMessage({ id: '8121', guildId: '100', channelId: '105', authorId: '901',
+    isBot: true, attachments: [], content: encodeAgentMessage(siblingRequest, token) }, { agentToken: token }).accepted, true);
+
+  const lateResult = { id: 'legacy-parent-frozen-child-sibling-result', kind: KINDS.RESULT,
+    source: { ...targetParent, channelId: '104' }, target: sourceParent, replyTo: packet.id, text: 'Late original child result.' };
+  const siblingResult = { ...lateResult, id: 'legacy-parent-frozen-child-sibling-result-2', source: siblingRequest.target };
+  const reopened = new SurfaceState(path.join(fixture.dir, 'surface.sqlite'));
+  try {
+    assert.equal(reopened.isAgentResultForWithdrawnRequest(lateResult), true);
+    assert.equal(reopened.isAgentResultForWithdrawnRequest(siblingResult), false);
+    const intake = reopened.acceptDiscordMessage({ id: '8122', guildId: '100', channelId: sourceParent.channelId,
+      authorId: '901', isBot: true, attachments: [], content: encodeAgentMessage(lateResult, token) }, { agentToken: token });
+    assert.equal(intake.accepted, false);
+    assert.equal(intake.reason, 'agent-request-withdrawn');
+  } finally { reopened.close(); }
+});
+
 function routeLessStampedParent(t, messageId, packetId) {
   const fixture = setup(t);
   const sourceBinding = fixture.state.getBinding(requester.channelId);
