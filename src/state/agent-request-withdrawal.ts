@@ -2,7 +2,7 @@ import { KINDS, sameAddress, validateAgentMessage, type AgentAddress, type Agent
 import type { CompletionState, CompletionMessage, ErrorConstructor } from './agent-completion/contracts';
 import { NATIVE_REPLY_FILE_PHASES } from './native-reply-file';
 import { AGENT_ROUTING_VERSION } from './agent-routing';
-import { hasUniqueRequestTarget } from './agent-request-target-evidence';
+import { hasLaterExactRequestTarget, hasUniqueRequestTarget } from './agent-request-target-evidence';
 
 export const AGENT_WITHDRAWAL_RECEIPTS = Object.freeze({ REQUEST_WITHDRAWN: 'agent-request-withdrawn' } as const);
 
@@ -64,33 +64,6 @@ function latestReceiptId(state: WithdrawalState): number {
   return Number.isSafeInteger(row?.id) ? Number(row?.id) : 0;
 }
 
-function hasLaterExactRequestTarget(state: WithdrawalState, request: Pick<AgentMessage, 'id' | 'source' | 'target'>,
-  target: AgentAddress,
-  withdrawalReceiptId: number, candidateReceiptId: number): boolean {
-  if (!Number.isSafeInteger(withdrawalReceiptId) || !Number.isSafeInteger(candidateReceiptId) ||
-      candidateReceiptId <= withdrawalReceiptId) return false;
-  const row = state.db.prepare(`SELECT 1 FROM receipts
-    WHERE kind='agent-message' AND id>? AND id<=?
-      AND json_extract(detail, '$.packet.kind')=?
-      AND json_extract(detail, '$.packet.id')=?
-      AND json_extract(detail, '$.packet.source.guildId')=?
-      AND json_extract(detail, '$.packet.source.channelId')=?
-      AND json_extract(detail, '$.packet.source.provider')=?
-      AND json_extract(detail, '$.packet.source.nativeId')=?
-      AND json_extract(detail, '$.packet.source.generation')=?
-      AND json_extract(detail, '$.packet.target.guildId')=?
-      AND json_extract(detail, '$.packet.target.channelId')=?
-      AND json_extract(detail, '$.packet.target.provider')=?
-      AND json_extract(detail, '$.packet.target.nativeId')=?
-      AND json_extract(detail, '$.packet.target.generation')=? LIMIT 1`).get(
-    withdrawalReceiptId, candidateReceiptId, KINDS.REQUEST, request.id,
-    request.source.guildId, request.source.channelId, request.source.provider, request.source.nativeId,
-    request.source.generation, target.guildId, target.channelId, target.provider, target.nativeId,
-    target.generation
-  );
-  return row != null;
-}
-
 function reverseResult(packet: AgentMessage, request: AgentMessage, routingVersion: unknown,
   frozenChildRoute: string | null = null, recordedTarget: unknown = null,
   frozenRouteCompatible = true): boolean {
@@ -125,8 +98,10 @@ function withdrawnRequestForResult(state: WithdrawalState, packet: AgentMessage,
       Number(row.id) || 0, candidateReceiptId)) continue;
     const frozenRouteCompatible = frozenChildRoute === null || hasUniqueRequestTarget(state, request,
       Number(row.id) || 0, Number(detail.provenanceReceiptId) || 0) ||
-      !hasLaterExactRequestTarget(state, request, packet.source,
-        Number(row.id) || 0, candidateReceiptId);
+      (!hasLaterExactRequestTarget(state, request, packet.source,
+        Number(row.id) || 0, candidateReceiptId) &&
+       !hasLaterExactRequestTarget(state, request, packet.source,
+         0, Number(row.id) || 0));
     if (resultSourceMatches(packet.source, request.target, detail.routingVersion, frozenChildRoute,
       routeLessParent ? request.target : null, frozenRouteCompatible)) return detail;
   }

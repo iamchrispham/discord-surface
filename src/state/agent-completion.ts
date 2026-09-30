@@ -1,5 +1,5 @@
 import { isLegacyAgentReceipt, isLegacyChildResult } from './agent-routing';
-import { hasUniqueRequestTarget } from './agent-request-target-evidence';
+import { hasLaterExactRequestTarget, hasUniqueRequestTarget } from './agent-request-target-evidence';
 import {
   KINDS,
   sameAddress,
@@ -259,7 +259,10 @@ function receivedReplyEvidence(
     if (!validAgentPacket(candidate, KINDS.RESULT)) continue;
     if (frozenChildRoute && candidate.source.channelId !== frozenChildRoute) continue;
     const requestReceiptId = requestProvenanceReceiptId(state, requestMessageId);
-    const uniqueRequestTarget = hasUniqueRequestTarget(state, request, Number(candidateRow.id), requestReceiptId);
+    const uniqueRequestTarget = frozenChildRoute === null
+      ? hasUniqueRequestTarget(state, request, Number(candidateRow.id), requestReceiptId)
+      : !hasLaterExactRequestTarget(state, request, candidate.source, requestReceiptId,
+        Number(candidateRow.id));
     const exact = sameReverseAddresses(candidate, request);
     const migrated = allowLegacyChildSource && uniqueRequestTarget &&
       isLegacyChildResult(candidate, request, parentTarget,
