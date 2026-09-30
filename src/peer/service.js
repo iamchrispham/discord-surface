@@ -242,17 +242,15 @@ function createPeerService(context) {
       let destinationBinding = null;
       if (input.peer !== undefined) {
         destinationBinding = resolvePeerBinding(state, input.peer, channels);
-      }
-      const frozenSourceRoute = input.reply_to === undefined
-        ? null
-        : frozenReplySourceRoute(state, input.reply_to, source,
-          destinationBinding ? { binding: destinationBinding, childId: null } : null);
-      const sourceRoute = frozenSourceRoute || requireReadyPeer(state, source);
-      if (destinationBinding) {
         destination = input.reply_to === undefined
           ? requireReadyPeer(state, destinationBinding)
           : requireReadyReplyPeer(state, destinationBinding);
       }
+      const frozenSourceRoute = input.reply_to === undefined
+        ? null
+        : frozenReplySourceRoute(state, input.reply_to, source,
+          destination);
+      const sourceRoute = frozenSourceRoute || requireReadyPeer(state, source);
       const sourceReadiness = source.readiness;
       const sourceIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
       const sourceAddress = resolveAgentAddress(state, source, sourceRoute.childId);

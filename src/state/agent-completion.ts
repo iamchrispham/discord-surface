@@ -306,7 +306,7 @@ function sentReplyEvidence(
     const uniqueRequestTarget = hasUniqueRequestTarget(state, request, row.outcomeReceiptId, requestReceiptId);
     const hasRecordedRequestTarget = recordedTargets.some((target) => target !== null && target !== undefined);
     const routeLessParentChildSource = allowRouteLessParentChildSource &&
-      (uniqueRequestTarget || hasRecordedRequestTarget);
+      (uniqueRequestTarget || (hasRecordedRequestTarget && recordedTargetsMatch));
     const exact = sameReverseAddresses(candidate, request) &&
       (uniqueRequestTarget || recordedTargetsMatch);
     const attemptRequestTarget = row.attemptDetail.agentRequestTarget ??

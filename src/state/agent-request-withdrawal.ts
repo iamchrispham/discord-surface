@@ -124,7 +124,7 @@ function withdrawnRequestForResult(state: WithdrawalState, packet: AgentMessage,
     if (savedRouteLessParent && hasLaterExactRequestTarget(state, request, packet.source,
       Number(row.id) || 0, candidateReceiptId)) continue;
     const frozenRouteCompatible = frozenChildRoute === null || hasUniqueRequestTarget(state, request,
-      candidateReceiptId, Number(detail.provenanceReceiptId) || 0) ||
+      Number(row.id) || 0, Number(detail.provenanceReceiptId) || 0) ||
       !hasLaterExactRequestTarget(state, request, packet.source,
         Number(row.id) || 0, candidateReceiptId);
     if (resultSourceMatches(packet.source, request.target, detail.routingVersion, frozenChildRoute,
