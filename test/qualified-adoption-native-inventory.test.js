@@ -115,10 +115,9 @@ test('prospective covered native-proof retry retains its historical bound', { ti
 
 const EXPECTED_CREATORS = [
   'src/cli.js|bind|state|bind',
-  'src/cli.js|ordinaryBind|state|bindOrdinary',
   'src/cli.js|provisionInternal|state|bind',
   'src/discord/thread-enrollment.ts|enrollPublicThread|state|enrollThread',
-  'src/ordinary-bind/index.js|ordinaryBind|state|bindOrdinary',
+  'src/ordinary-bind/codex.js|ordinaryBind|state|bindOrdinary',
   'src/ordinary-bind/index.js|ordinaryClaudeBind|state|bindOrdinaryClaude',
   'src/ordinary/index.js|bindOrdinary|state|_bindOrdinary',
   'src/ordinary/index.js|bindOrdinaryClaude|state|_bindOrdinaryClaude',
@@ -279,7 +278,7 @@ test('adoption owner inventory rejects an added private creator or history reade
   const real = scanInventory(entries);
   assert.deepEqual(real.unclassifiedBinds, [], 'an unrecognized bind() receiver is a failure');
   assert.deepEqual(real.creators, EXPECTED_CREATORS.slice().sort(),
-    'creator multiset must match exactly the fourteen production tuples');
+    'creator multiset must match exactly the thirteen production tuples');
   assert.deepEqual(real.messagesFetch, EXPECTED_MESSAGES_FETCH.slice().sort(),
     'direct messages.fetch multiset must match exactly the seven accepted entries');
   assert.deepEqual(real.fetchHistory, EXPECTED_FETCH_HISTORY.slice().sort(),
