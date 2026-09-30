@@ -511,8 +511,10 @@ const bindingLifecycleHandlers = createBindingLifecycleHandlers({
   assertText,
   assertUuid,
   bindingMatchesExpected,
+  conductorCustodyHandlers,
   now,
   ordinaryBindingHandlers,
+  parseJson,
   persistenceRefusal,
   qualifiedCoverageId,
   rowBinding,
@@ -867,49 +869,13 @@ class SurfaceState {
     return courierRouteHandlers.getCourierDeliveryStatus(this, ...args);
   }
 
-  findNativeBinding(nativeId, provider = null) {
-    assertUuid(nativeId);
-    if (provider) assertProvider(provider);
-    const row = provider
-      ? this.db.prepare('SELECT * FROM bindings WHERE native_id=? AND provider=? ORDER BY active DESC, generation DESC LIMIT 1').get(nativeId, provider)
-      : this.db.prepare('SELECT * FROM bindings WHERE native_id=? ORDER BY active DESC, generation DESC LIMIT 1').get(nativeId);
-    return rowBinding(row);
-  }
+  findNativeBinding(nativeId, provider = null) { return bindingLifecycleHandlers.findNativeBinding.apply(this, arguments); }
 
-  findConductorBinding(conductorId, provider) {
-    assertConductorId(conductorId);
-    assertProvider(provider);
-    return rowBinding(this.db.prepare('SELECT * FROM bindings WHERE conductor_id=? AND provider=? ORDER BY active DESC, generation DESC LIMIT 1').get(conductorId, provider));
-  }
+  findConductorBinding(conductorId, provider) { return bindingLifecycleHandlers.findConductorBinding.apply(this, arguments); }
 
-  setBindingReadiness(channelId, readiness, detail = null, expectedBinding = null) {
-    assertText(channelId, 'channelId', 128);
-    if (!Object.values(READINESS).includes(readiness)) throw new BindingError('invalid binding readiness');
-    return this.transaction(() => {
-      const binding = this.getBinding(channelId);
-      if (!binding) throw new BindingError('channel is not bound');
-      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
-      if (readiness === READINESS.READY && this._isOrdinaryBinding(binding) && !this._hasOrdinaryPreflight(binding)) {
-        throw new BindingError(`ordinary ${binding.provider} native preflight is required before READY`);
-      }
-      if (readiness === READINESS.READY) this.assertLegacyMigrationSafe(channelId);
-      this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=?').run(readiness, now(), channelId);
-      this.receipt(null, 'binding-readiness', { channelId, conductorId: binding.conductorId,
-        guildId: binding.guildId, provider: binding.provider, nativeId: binding.nativeId,
-        generation: binding.generation, readiness, detail: detail || undefined });
-      return this.getBinding(channelId);
-    });
-  }
+  setBindingReadiness(channelId, readiness, detail = null, expectedBinding = null) { return bindingLifecycleHandlers.setBindingReadiness.apply(this, arguments); }
 
-  findConductorHandoff(handoffId) {
-    assertText(handoffId, 'handoffId', 256);
-    const rows = this.db.prepare("SELECT detail FROM receipts WHERE kind='conductor-handoff' ORDER BY id DESC").all();
-    for (const row of rows) {
-      const detail = parseJson(row.detail, {});
-      if (detail.handoffId === handoffId) return detail;
-    }
-    return null;
-  }
+  findConductorHandoff(handoffId) { return bindingLifecycleHandlers.findConductorHandoff.apply(this, arguments); }
 
   _findOrdinaryHandoff(handoffId) {
     assertText(handoffId, 'handoffId', 256);
@@ -921,102 +887,17 @@ class SurfaceState {
     return null;
   }
 
-  hasUnboundReceipt(channelId, generation) {
-    const rows = this.db.prepare("SELECT detail FROM receipts WHERE kind='unbound' ORDER BY id DESC").all();
-    return rows.some(row => {
-      const detail = parseJson(row.detail, {});
-      return detail.channelId === channelId && detail.generation === generation;
-    });
-  }
+  hasUnboundReceipt(channelId, generation) { return bindingLifecycleHandlers.hasUnboundReceipt.apply(this, arguments); }
 
   _handoffOrdinary(input) {
     return ordinaryBindingHandlers.handoffOrdinary(this, input);
   }
 
-  handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff = null, enrollmentProof = null, carryAcceptedHuman = false }) {
-    assertUuid(fromNativeId, 'fromNativeId');
-    if (!Number.isInteger(fromGeneration) || fromGeneration < 1) throw new BindingError('fromGeneration must be a positive integer');
-    assertText(handoffId, 'handoffId', 256);
-    if (intakeCutoff !== null) assertText(intakeCutoff, 'lastSeenId', 128);
-    const existing = this.getBinding(channelId);
-    if (!existing || !existing.active) throw new BindingError('channel is not actively bound');
-    const input = this.bindingInput({ channelId, provider, conductorId, repoKey, nativeId, workspace, endpoint }, existing);
-    const previous = this.findConductorHandoff(handoffId);
-    if (previous) {
-      const sameRequest = previous.channelId === channelId && previous.provider === provider && previous.conductorId === conductorId &&
-        previous.repoKey === repoKey && previous.fromNativeId === fromNativeId && previous.fromGeneration === fromGeneration &&
-        previous.nativeId === nativeId && previous.generation === existing.generation && existing.nativeId === nativeId &&
-        existing.generation === fromGeneration + 1 && existing.workspace === input.workspace && existing.endpoint === input.endpoint;
-      if (!sameRequest) throw new BindingError('handoff ID is already used for a different successor');
-      return this.transaction(() => {
-        this.assertTopicPublicationSettled(channelId);
-        this.receipt(null, 'conductor-handoff-retry', { channelId, conductorId, provider, handoffId, nativeId, generation: existing.generation });
-        return { ...existing, handoffReconciled: true };
-      });
-    }
-    if (existing.provider !== provider || existing.conductorId !== conductorId || existing.repoKey !== repoKey || existing.nativeId !== fromNativeId || existing.generation !== fromGeneration) {
-      throw new StaleGenerationError('handoff source identity is stale');
-    }
-    if (this._hasActiveThreadEnrollments(channelId) && intakeCutoff === null) {
-      throw new BindingError('active thread enrollments require an observed intake cutoff');
-    }
-    if (nativeId === fromNativeId) throw new BindingError('successor handoff requires a different native session UUID');
-    const custodyRequest = {
-      channelId, provider, conductorId, repoKey, handoffId,
-      fromNativeId, fromGeneration,
-      nativeId: input.nativeId, workspace: input.workspace, endpoint: input.endpoint,
-      expectedGeneration: existing.generation + 1
-    };
-    // Carry mode computes eligibility and the deterministic evidence snapshot
-    // before opening the transaction. The companion refuses the whole operation
-    // when any active row on the channel does not qualify.
-    const custodySnapshot = carryAcceptedHuman === true
-      ? conductorCustodyHandlers.snapshotEligibleCustody(this, custodyRequest)
-      : null;
-    if (carryAcceptedHuman !== true && (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId))) {
-      throw new UnresolvedWorkError('cannot handoff while work is unresolved');
-    }
-    this.assertNativeOwnerFree(provider, nativeId, channelId);
-    return this.transaction(() => {
-      const current = this.getBinding(channelId);
-      if (!bindingMatchesExpected(current, existing)) throw new StaleGenerationError('handoff source identity is stale');
-      if (carryAcceptedHuman !== true && (this.hasUnresolved(channelId) || this.hasUnresolvedBindingPost(channelId))) {
-        throw new UnresolvedWorkError('cannot handoff while work is unresolved');
-      }
-      if (this._hasActiveThreadEnrollments(channelId) && intakeCutoff === null) {
-        throw new BindingError('active thread enrollments require an observed intake cutoff');
-      }
-      this.assertLegacyMigrationSafe(channelId);
-      if (enrollmentProof) this.assertThreadEnrollmentCoverage(channelId, enrollmentProof);
-      const generation = existing.generation + 1;
-      const updatedAt = now();
-      if (intakeCutoff !== null) {
-        this.setIntakeCutoffInTransaction(channelId, current.guildId, intakeCutoff, 'conductor handoff intake fence', current);
-        ordinaryBindingHandlers.advanceEnrolledThreadCutoffs(this, channelId, intakeCutoff, updatedAt);
-      }
-      this.db.prepare(`UPDATE bindings SET native_id=?, workspace=?, session_root=?, endpoint=?, readiness=?, generation=?, updated_at=? WHERE channel_id=? AND provider=? AND conductor_id=? AND generation=? AND native_id=?`)
-        .run(input.nativeId, input.workspace, input.sessionRoot, input.endpoint, READINESS.PENDING, generation, updatedAt, channelId, provider, conductorId, fromGeneration, fromNativeId);
-      if (custodySnapshot) {
-        conductorCustodyHandlers.verifySnapshotAndTransfer(this, custodySnapshot, custodyRequest, updatedAt);
-      }
-      this.receipt(null, 'conductor-handoff', {
-        channelId, conductorId, repoKey, provider, handoffId,
-        fromNativeId, fromGeneration, nativeId: input.nativeId, generation, intakeCutoff: intakeCutoff || undefined
-      });
-      return this.getBinding(channelId);
-    });
-  }
+  handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff = null, enrollmentProof = null, carryAcceptedHuman = false }) { return bindingLifecycleHandlers.handoffConductor.apply(this, arguments); }
 
-  assertNativeOwnerFree(provider, nativeId, channelId = null) {
-    const row = this.db.prepare('SELECT channel_id, provider FROM bindings WHERE provider=? AND native_id=? AND active=1').get(provider, nativeId);
-    if (row && row.channel_id !== channelId) throw new BindingError('native session is already owned by another channel for this provider');
-  }
+  assertNativeOwnerFree(provider, nativeId, channelId = null) { return bindingLifecycleHandlers.assertNativeOwnerFree.apply(this, arguments); }
 
-  assertConductorOwnerFree(provider, conductorId, channelId = null) {
-    if (!conductorId) return;
-    const row = this.db.prepare('SELECT channel_id FROM bindings WHERE provider=? AND conductor_id=? AND active=1').get(provider, conductorId);
-    if (row && row.channel_id !== channelId) throw new BindingError('conductor identity is already bound to another channel for this provider');
-  }
+  assertConductorOwnerFree(provider, conductorId, channelId = null) { return bindingLifecycleHandlers.assertConductorOwnerFree.apply(this, arguments); }
 
   hasUnresolved(channelId) {
     const states = [...ACTIVE_STATES];
