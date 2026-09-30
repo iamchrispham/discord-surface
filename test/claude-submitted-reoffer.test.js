@@ -52,12 +52,14 @@ test('a newly verified Claude listener re-offers an unacknowledged submitted row
     async recoverTransport() { return { ready: true, state: 'ready' }; },
     async reconcilePending() {}
   };
+  let probeCalls = 0;
   const wake = createBindingWakeController({
     getGateway: () => gateway,
     isReady: () => true,
     isTransportReady: () => true,
     isStopping: () => false,
     probeClaudeChannel: async (socketPath, expected) => {
+      probeCalls += 1;
       assert.equal(socketPath, endpoint);
       assert.equal(expected.nativeId, NATIVE_ID);
       assert.equal(expected.generation, bound.generation);
@@ -67,6 +69,7 @@ test('a newly verified Claude listener re-offers an unacknowledged submitted row
   const trigger = async () => { wake.request(); await wake.wait(); };
 
   await trigger();
+  assert.equal(probeCalls, 1, 'the pending route probes the attached listener');
   assert.deepEqual(posts, [], 'a not-ready route defers the listener instance');
 
   state.setBindingReadiness('101', READINESS.READY, 'listener ready', state.getBinding('101'));
