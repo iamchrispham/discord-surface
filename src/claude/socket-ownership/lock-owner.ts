@@ -4,6 +4,10 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { FileGeneration, FileIdentity, OwnerMarkerSnapshot, OwnerRecord } from './types';
 
+export function effectiveUserId(): number | undefined {
+  return process.geteuid?.() ?? process.getuid?.();
+}
+
 const linuxBootId = readLinuxBootId();
 export const ownerIdentity = processIdentity(process.pid);
 
