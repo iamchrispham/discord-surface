@@ -176,6 +176,7 @@ export function probeClaudeChannel(
             endpoint?: unknown;
             workspace?: unknown;
             channelReady?: unknown;
+            listenerInstanceId?: unknown;
           };
           try { identity = JSON.parse(output); }
           catch { finish(new Error('Claude channel identity response is invalid JSON')); return; }
@@ -185,7 +186,13 @@ export function probeClaudeChannel(
             finish(new Error('Claude channel identity does not match the ordinary binding'));
             return;
           }
-          finish(null, {
+          if (identity.listenerInstanceId !== undefined &&
+            (typeof identity.listenerInstanceId !== 'string' ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(identity.listenerInstanceId))) {
+            finish(new Error('Claude channel identity listener instance is invalid'));
+            return;
+          }
+          const proof: ClaudeChannelIdentity = {
             file: socketPath,
             sessionId: expected.nativeId,
             threadId: expected.nativeId,
@@ -194,7 +201,9 @@ export function probeClaudeChannel(
             harness: 'claude-code',
             generation: expected.generation,
             channelReady: true
-          });
+          };
+          if (identity.listenerInstanceId !== undefined) proof.listenerInstanceId = identity.listenerInstanceId;
+          finish(null, proof);
         });
       });
       request.once('error', (error: Error) => finish(error));
