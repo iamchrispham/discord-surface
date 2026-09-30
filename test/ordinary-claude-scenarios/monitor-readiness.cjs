@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const test = require('node:test');
+const { ClaudeChannel } = require('../../src/claude-channel');
 const { DiscordGateway } = require('../../src/discord');
 const { probeClaudeChannel, probeUnixSocket } = require('../../src/native');
 const { MESSAGE_STATES, READINESS } = require('../../src/state');
@@ -95,6 +96,7 @@ test('Claude identity probe settles success, no-response, and transport-error pa
   });
   const proof = await probeClaudeChannel(f.socketPath, expected, { timeoutMs: 100 });
   assert.equal(proof.channelReady, true);
+  assert.equal(proof.listenerInstanceId, undefined);
   await new Promise((resolve, reject) => successListener.close(error => error ? reject(error) : resolve()));
 
   const noResponseListener = http.createServer(() => {});
@@ -106,4 +108,25 @@ test('Claude identity probe settles success, no-response, and transport-error pa
   await new Promise((resolve, reject) => noResponseListener.close(error => error ? reject(error) : resolve()));
 
   await assert.rejects(() => probeClaudeChannel(f.socketPath, expected, { timeoutMs: 100 }), /ENOENT|connect|socket/i);
+});
+
+test('Claude channel identity reports a distinct listener instance across stop and restart', async t => {
+  const f = fixture(t);
+  const channel = new ClaudeChannel({
+    state: f.state, nativeId: CLAUDE, socketPath: f.socketPath, mcp: { notification: async () => {} }
+  });
+  t.after(async () => { try { await channel.stop(); } catch {} });
+  const expected = { nativeId: CLAUDE, generation: f.binding.generation, workspace: f.dir, endpoint: f.socketPath };
+  const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  await channel.start();
+  const first = await probeClaudeChannel(f.socketPath, expected, { timeoutMs: 100 });
+  const repeated = await probeClaudeChannel(f.socketPath, expected, { timeoutMs: 100 });
+  assert.match(first.listenerInstanceId, uuidV4);
+  assert.equal(repeated.listenerInstanceId, first.listenerInstanceId);
+  await channel.stop();
+  await channel.start();
+  const restarted = await probeClaudeChannel(f.socketPath, expected, { timeoutMs: 100 });
+  assert.match(restarted.listenerInstanceId, uuidV4);
+  assert.notEqual(restarted.listenerInstanceId, first.listenerInstanceId);
+  await channel.stop();
 });

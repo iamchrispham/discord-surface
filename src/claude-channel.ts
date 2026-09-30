@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import * as socketOwnership from './claude/socket-ownership';
 import type {
   MessageState
@@ -150,6 +151,7 @@ export class ClaudeChannel<
   declare startupCleanupPending: boolean;
   declare ready: boolean;
   declare transportClosed: boolean;
+  private declare listenerInstanceId: string | null;
   declare beforeTransportClose: (() => void | Promise<void>) | null;
   declare onTransportClose: (() => void) | null;
   declare logger: (message: string) => void;
@@ -189,6 +191,7 @@ export class ClaudeChannel<
     this.startupCleanupPending = false;
     this.ready = false;
     this.transportClosed = false;
+    this.listenerInstanceId = null;
     this.beforeTransportClose = typeof beforeTransportClose === 'function' ? beforeTransportClose : null;
     this.onTransportClose = typeof onTransportClose === 'function' ? onTransportClose : null;
     this.logger = logger;
@@ -354,7 +357,8 @@ export class ClaudeChannel<
             generation: this.bindingIdentity.generation,
             endpoint: this.socketPath,
             workspace: this.bindingIdentity.workspace,
-            channelReady: true
+            channelReady: true,
+            listenerInstanceId: this.listenerInstanceId
           }));
           return;
         }
@@ -449,10 +453,12 @@ export class ClaudeChannel<
       await Promise.race([listenerStartup, startupCancellation]);
       if (this.transportClosed) throw new Error('Claude channel transport closed during startup');
       listenerStartup = null;
+      this.listenerInstanceId = randomUUID();
       this.ready = true;
       this.started = true;
     } catch (error) {
       this.ready = false;
+      this.listenerInstanceId = null;
       if (listenerStartup) {
         try { await listenerStartup; } catch {}
         listenerStartup = null;
@@ -491,6 +497,7 @@ export class ClaudeChannel<
     this.startupAbort?.();
     this.stopPromise = (async () => {
       this.ready = false;
+      this.listenerInstanceId = null;
       const errors: unknown[] = [];
       try { await (this.mcp as unknown as ClaudeRuntimeMcp).close?.(); } catch (error) { errors.push(error); }
       if (startup) {
