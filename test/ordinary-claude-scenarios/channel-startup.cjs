@@ -124,26 +124,39 @@ test('an ordinary listener refuses to attach when its binding changed during sta
 
 test('every CLI listener that serves a Claude binding routes through the ordinary lifecycle owner', () => {
   const source = fs.readFileSync(CLI_PATH, 'utf8');
+  const ownerPath = path.resolve(__dirname, '../../src/cli/claude-listeners.js');
+  const owner = fs.readFileSync(ownerPath, 'utf8');
   const commands = [...source.matchAll(/case '([a-z-]+)': return (\w+)\(args\)/g)].map(match => ({ command: match[1], fn: match[2] }));
   assert.ok(commands.length > 10, 'CLI command table must be readable');
-  const constructions = /new ClaudeChannel\(|createClaudeMonitor\(/g;
-  const listeners = [];
-  let claimed = 0;
-  for (const { command, fn } of commands) {
+  const constructions = /new\s+ClaudeChannel\s*\(|createClaudeMonitor\s*\(/g;
+  const cliConstructions = source.match(constructions)?.length || 0;
+  const ownerConstructions = owner.match(constructions)?.length || 0;
+  assert.equal(cliConstructions, 0, 'listener construction must live in the ordinary lifecycle owner');
+  assert.equal(ownerConstructions, 2, 'the ordinary lifecycle owner must build exactly two listeners');
+  const functionBody = (text, fn) => {
     const start = ['async function', 'function']
-      .map(keyword => source.indexOf(`\n${keyword} ${fn}(args`))
+      .map(keyword => text.indexOf(`\n${keyword} ${fn}(args`))
       .find(index => index >= 0);
-    if (start === undefined) continue;
-    const body = source.slice(start, source.indexOf('\n}\n', start));
+    return start === undefined ? null : text.slice(start, text.indexOf('\n}\n', start));
+  };
+  const listeners = [];
+  let examined = 0;
+  for (const { command, fn } of commands) {
+    const body = functionBody(owner, fn);
+    if (!body) continue;
     const found = body.match(constructions)?.length || 0;
     if (!found) continue;
-    claimed += found;
+    examined += found;
     listeners.push(command);
     assert.match(body, /attachOrdinaryListener\(/, `${command} must attach through the ordinary lifecycle owner`);
     assert.match(body, /detachOrdinaryListener\(/, `${command} must detach through the ordinary lifecycle owner`);
     if (command === 'claude-channel') assert.match(body, /beforeTransportClose: detach/, `${command} must revoke before transport close releases its socket`);
   }
   assert.deepEqual(listeners.sort(), ['claude-channel', 'claude-monitor']);
-  // A listener built anywhere but a command function would escape the check above.
-  assert.equal(claimed, source.match(constructions)?.length || 0, 'every listener must be built by a CLI command function');
+  assert.match(functionBody(owner, 'claudeChannel'), /new ClaudeChannel\(/, 'claude-channel must build ClaudeChannel');
+  assert.doesNotMatch(functionBody(owner, 'claudeChannel'), /createClaudeMonitor\(/, 'claude-channel must not build ClaudeMonitor');
+  assert.match(functionBody(owner, 'claudeMonitor'), /createClaudeMonitor\(/, 'claude-monitor must build ClaudeMonitor');
+  assert.doesNotMatch(functionBody(owner, 'claudeMonitor'), /new ClaudeChannel\(/, 'claude-monitor must not build ClaudeChannel');
+  // A listener built anywhere but the examined command functions would escape the checks above.
+  assert.equal(examined, cliConstructions + ownerConstructions, 'every listener must be built by an examined CLI command function');
 });
