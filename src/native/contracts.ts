@@ -254,6 +254,7 @@ export interface ClaudeChannelIdentity extends ClaudeSessionIdentity {
   harness: 'claude-code';
   generation: number;
   channelReady: true;
+  listenerInstanceId?: string;
 }
 
 export interface UnixJsonResponse {
