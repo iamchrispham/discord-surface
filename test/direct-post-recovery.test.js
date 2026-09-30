@@ -1,0 +1,258 @@
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const { SurfaceState, READINESS, DIRECT_POST_OUTCOMES: stateOutcomes } = require('../src/state');
+const { THREAD_STATES } = require('../src/state/thread-enrollment');
+const { createSurfaceConsumer } = require('../src/discord');
+const { runDirectPost } = require('../src/direct-post');
+const { decodeAgentMessage, encodeAgentMessage, issueAgentAddress, KINDS } = require('../src/agent-message');
+const { fixture, response, fetchRecorder, CODEX, CLAUDE } = require('./direct-post-fixture');
+
+test('direct post bot echo is excluded from native intake by message ID or bot nonce', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'saved milestone');
+  const recorder = fetchRecorder();
+  await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl });
+  const outcome = f.state.listReceipts().find(row => row.kind === 'direct-post-outcome');
+  const detail = JSON.parse(outcome.detail);
+  const body = recorder.calls[0].body;
+  const byId = f.state.acceptDiscordMessage({ id: 'direct-1', guildId: 'guild', channelId: 'channel', authorId: 'operator', content: body.content, isBot: false, nonce: null });
+  assert.equal(byId.accepted, false);
+  assert.equal(byId.reason, 'automatic-publication');
+  const byNonce = f.state.acceptDiscordMessage({ id: 'foreign-id', guildId: 'guild', channelId: 'channel', authorId: 'operator', content: body.content, isBot: true, nonce: detail.nonce });
+  assert.equal(byNonce.accepted, false);
+  assert.equal(byNonce.reason, 'automatic-publication');
+  let nativeCalls = 0;
+  const consumer = createSurfaceConsumer({ state: f.state, providers: { codex: { submit: async () => { nativeCalls += 1; } } }, sendReply: async () => { throw new Error('no reply'); } });
+  await consumer.handleMessage({ id: 'native-replay', guildId: 'guild', channelId: 'channel', authorId: 'operator', content: body.content, isBot: false, nonce: null });
+  assert.equal(nativeCalls, 0);
+});
+
+test('restart marks a dead direct-post attempt unknown before any retry', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'crashed milestone');
+  const sourceHash = crypto.createHash('sha256').update(JSON.stringify('crashed milestone')).digest('hex');
+  const requestId = 'crashed-request';
+  f.state.receipt(null, 'direct-post-attempt', {
+    journal: 'direct-post-v1', requestId, attemptId: 'dead-attempt', ownerPid: 999999, sourcePath: f.textFile, textHash: sourceHash, operatorId: 'operator',
+    partHash: sourceHash, channelId: 'channel', guildId: 'guild', provider: 'codex', nativeId: f.nativeId, generation: 1,
+    conductorId: 'conductor', repoKey: 'repo:fixture', partIndex: 0, partCount: 1, nonce: 'ds-dead-attempt', status: 'attempted'
+  });
+  const recorder = fetchRecorder();
+  const result = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, requestId, fetchImpl: recorder.fetchImpl });
+  assert.equal(result.parts[0].status, 'unknown');
+  assert.equal(recorder.calls.length, 0);
+});
+
+test('HTTP 500 is unknown and a reopened SQLite state does not resend it', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'server failure');
+  const recorder = fetchRecorder({ responses: [response('ignored', 500)] });
+  const first = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl, requestId: 'server-failure' });
+  f.state.close();
+  const reopened = new (require('../src/state').SurfaceState)(path.join(f.dir, 'surface.sqlite'));
+  t.after(() => reopened.close());
+  const second = await runDirectPost({ state: reopened, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl, requestId: 'server-failure' });
+  assert.equal(recorder.calls.length, 1);
+  assert.equal(first.status, 'unknown');
+  assert.equal(second.status, 'unknown');
+});
+
+test('a confirmed direct post survives SQLite reopen without a duplicate send', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'confirmed milestone');
+  const recorder = fetchRecorder();
+  const first = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl, requestId: 'confirmed-request' });
+  assert.equal(first.status, 'sent');
+  assert.equal(first.recorded, true);
+  assert.equal(first.duplicate, false);
+  f.state.close();
+  const reopened = new (require('../src/state').SurfaceState)(path.join(f.dir, 'surface.sqlite'));
+  t.after(() => reopened.close());
+  const second = await runDirectPost({ state: reopened, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl, requestId: 'confirmed-request' });
+  assert.equal(second.status, 'sent');
+  assert.equal(second.recorded, false);
+  assert.equal(second.duplicate, true);
+  assert.equal(recorder.calls.length, 1);
+  assert.deepEqual(second.messageIds, first.messageIds);
+});
+
+test('historic receipts without reply metadata normalize to null', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'historic receipt');
+  const recorder = fetchRecorder();
+  const first = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile,
+    requestId: 'historic-request', fetchImpl: recorder.fetchImpl });
+  assert.equal(first.status, 'sent');
+  const rows = f.state.db.prepare("SELECT id, detail FROM receipts WHERE discord_id IS NULL AND kind IN ('direct-post-attempt', 'direct-post-outcome')").all();
+  for (const row of rows) {
+    const detail = JSON.parse(row.detail);
+    delete detail.inReplyTo;
+    f.state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(JSON.stringify(detail), row.id);
+  }
+  const second = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile,
+    requestId: 'historic-request', fetchImpl: recorder.fetchImpl });
+  assert.equal(second.duplicate, true);
+  assert.equal(recorder.calls.length, 1);
+  assert.ok(f.state.directPostRows('historic-request').every(row => row.detail.inReplyTo === null));
+});
+
+test('rebind refuses while a multipart publication is unresolved without failing the transport', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, `${'a'.repeat(2000)}${'b'.repeat(2000)}`);
+  const recorder = fetchRecorder();
+  const originalFetch = recorder.fetchImpl;
+  const fetchImpl = async (...args) => {
+    const result = await originalFetch(...args);
+    if (recorder.calls.length === 1) {
+      const before = f.state.getBinding('channel');
+      assert.throws(() => f.state.rebind({
+        ...before, nativeId: '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b'
+      }), /publication is unresolved/, 'retirement refuses while the admitted publication is unresolved');
+      assert.deepEqual(f.state.getBinding('channel'), before, 'refused rebind leaves binding identity unchanged');
+    }
+    return result;
+  };
+  const result = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl });
+  assert.equal(recorder.calls.length, 2, 'the refused rebind does not turn into a transport failure');
+  assert.equal(result.status, 'sent');
+  assert.deepEqual(result.messageIds, ['direct-1', 'direct-2']);
+});
+
+test('operator revocation stops before the next multipart network request', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, `${'a'.repeat(2000)}${'b'.repeat(2000)}`);
+  const recorder = fetchRecorder();
+  const originalFetch = recorder.fetchImpl;
+  const fetchImpl = async (...args) => {
+    const result = await originalFetch(...args);
+    if (recorder.calls.length === 1) f.state.setConfig({ operatorId: 'another-operator' });
+    return result;
+  };
+  const result = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl });
+  assert.equal(recorder.calls.length, 1);
+  assert.equal(result.status, 'stale');
+  assert.deepEqual(result.messageIds, ['direct-1']);
+});
+
+
+test('trailing file newline is preserved without sending a blank part', async t => {
+  const f = fixture(t);
+  const text = 'a'.repeat(2000) + '\n';
+  fs.writeFileSync(f.textFile, text);
+  const recorder = fetchRecorder();
+  const result = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl });
+  const contents = recorder.calls.map(call => call.body.content);
+  assert.ok(contents.every(content => content.trim() && content.length <= 2000));
+  assert.equal(contents.join(''), text);
+  assert.equal(result.status, 'sent');
+});
+
+test('impossible whitespace-only parts are refused before any network request', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, ' '.repeat(4000) + 'milestone');
+  const recorder = fetchRecorder();
+  await assert.rejects(runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1, textFile: f.textFile, fetchImpl: recorder.fetchImpl }), /blank Discord/);
+  assert.equal(recorder.calls.length, 0);
+  assert.equal(f.state.directPostRows().length, 0);
+});
+
+test('actual CLI repeats safely, refuses stale owners and exits nonzero for uncertainty without native work', t => {
+  const { spawnSync } = require('node:child_process');
+  const f = fixture(t, 'claude');
+  fs.writeFileSync(f.textFile, 'executable milestone');
+  const calls = path.join(f.dir, 'http-calls.ndjson');
+  const preload = path.join(f.dir, 'network-fixture.cjs');
+  fs.writeFileSync(preload, `
+    const fs = require('node:fs');
+    const cp = require('node:child_process');
+    for (const name of ['spawn','spawnSync','exec','execSync','execFile','execFileSync']) cp[name] = () => { throw new Error('unexpected native work'); };
+    globalThis.fetch = async (url, options) => {
+      if (url !== 'https://discord.com/api/v10/channels/channel/messages') throw new Error('wrong destination');
+      fs.appendFileSync(${JSON.stringify(calls)}, options.body+'\\n');
+      const status = Number(process.env.POST_FIXTURE_STATUS || 200);
+      return { ok: status === 200, status, body: { cancel() {} }, json: async () => ({id:'executable-message'}) };
+    };
+  `);
+  const cli = path.resolve(__dirname, '../src/cli.js');
+  const args = ['--require', preload, cli, 'claude-post', '--state-dir', f.dir, '--db', path.join(f.dir, 'surface.sqlite'),
+    '--native-id', f.nativeId, '--generation', '1', '--text-file', f.textFile, '--dedupe-key', 'cli-executable-key',
+    '--in-reply-to', 'prior-executable-message'];
+  const run = (argv = args, status = 200) => spawnSync(process.execPath, argv, {
+    encoding: 'utf8', timeout: 5000, env: { ...process.env, POST_FIXTURE_STATUS: String(status) }
+  });
+  const first = run(); assert.equal(first.status, 0, first.stderr);
+  const second = run(); assert.equal(second.status, 0, second.stderr);
+  assert.equal(fs.readFileSync(calls, 'utf8').trim().split('\n').length, 1);
+  assert.deepEqual(JSON.parse(second.stdout).messageIds, JSON.parse(first.stdout).messageIds);
+  assert.equal(JSON.parse(first.stdout).recorded, true);
+  assert.equal(JSON.parse(first.stdout).duplicate, false);
+  assert.equal(JSON.parse(second.stdout).recorded, false);
+  assert.equal(JSON.parse(second.stdout).duplicate, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(calls, 'utf8').trim()).message_reference, {
+    message_id: 'prior-executable-message', channel_id: 'channel', fail_if_not_exists: true
+  });
+  const stale = args.slice(); stale[stale.indexOf('--generation') + 1] = '2';
+  assert.equal(run(stale).status, 1);
+  assert.equal(fs.readFileSync(calls, 'utf8').trim().split('\n').length, 1);
+  fs.writeFileSync(f.textFile, 'another milestone');
+  const unknownArgs = args.slice(); unknownArgs[unknownArgs.indexOf('--dedupe-key') + 1] = 'cli-unknown-key';
+  const unknown = run(unknownArgs, 500); assert.equal(unknown.status, 1, unknown.stderr);
+  const retry = run(unknownArgs); assert.equal(retry.status, 1, retry.stderr);
+  assert.equal(fs.readFileSync(calls, 'utf8').trim().split('\n').length, 2);
+  assert.equal(JSON.parse(unknown.stdout).status, 'unknown');
+  assert.equal(JSON.parse(retry.stdout).status, 'unknown');
+  assert.equal(f.state.listMessages().length, 0);
+});
+
+test('agent reply can correlate by accepted Discord message ID across duplicate request keys', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-reply-correlation-'));
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  const token = 'fixture-token';
+  const local = { guildId: '123', channelId: '456', provider: 'codex', nativeId: CODEX, generation: 1 };
+  const sourceA = { guildId: '123', channelId: '901', provider: 'claude', nativeId: CLAUDE, generation: 1 };
+  const sourceB = { guildId: '123', channelId: '902', provider: 'codex', nativeId: 'd6d5bd73-17e0-4d87-9eb7-84544b93b4f1', generation: 1 };
+  state.setConfig({ operatorId: 'operator', guildId: local.guildId, secretFile: path.join(dir, 'discord.env') });
+  fs.writeFileSync(path.join(dir, 'discord.env'), 'DISCORD_TOKEN=fixture-token\n', { mode: 0o600 });
+  state.bind({ ...local, workspace: dir, conductorId: 'conductor', repoKey: 'repo:fixture' }, { intakeCutoff: '100' });
+  let localBinding = state.getBinding(local.channelId);
+  localBinding = state.setBindingReadiness(local.channelId, READINESS.READY, 'fixture ready', localBinding);
+  state.enrollThread({ threadId: '457', parentChannelId: local.channelId, guildId: local.guildId, adoptionCutoff: '1000'}, localBinding);
+  state.setThreadBaseline('457', '1000', localBinding);
+  state.markThreadBoundary('457', THREAD_STATES.READY, 'fixture adoption', null, null, localBinding);
+  const localChild = { ...local, channelId: '457', generation: localBinding.generation };
+  const textFile = path.join(dir, 'reply.txt');
+  fs.writeFileSync(textFile, 'reply');
+  t.after(() => { state.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+
+  const accept = (id, source, key = 'shared-key') => state.acceptDiscordMessage({
+    id, guildId: local.guildId, channelId: localChild.channelId, authorId: 'discord-bot', isBot: true,
+    content: encodeAgentMessage({ id: key, kind: KINDS.REQUEST, source, target: localChild, replyTo: null, text: 'request' }, token)
+  }, { agentToken: token });
+  assert.equal(accept('1001', sourceA).accepted, true);
+  assert.equal(accept('1002', sourceB).accepted, true);
+
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    if (options.method === 'GET') return { ok: true, status: 200, body: { cancel() {} }, json: async () => ({ id: sourceA.channelId, guild_id: sourceA.guildId }) };
+    return response('reply-1');
+  };
+  const result = await runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
+    agentThreadId: localChild.channelId, textFile, dedupeKey: 'result-key', agentKind: KINDS.RESULT, agentReplyTo: '1001', fetchImpl });
+  assert.equal(result.parts[0].status, 'sent');
+  assert.match(calls[0].url, /\/channels\/901$/);
+  const packet = decodeAgentMessage(JSON.parse(calls[1].options.body).content, token, sourceA);
+  assert.equal(packet.target.channelId, sourceA.channelId);
+  assert.equal(packet.replyTo, 'shared-key');
+  await assert.rejects(runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
+    agentThreadId: localChild.channelId, textFile, dedupeKey: 'result-key-ambiguous', agentKind: KINDS.RESULT, agentReplyTo: 'shared-key', fetchImpl }), /unknown or does not match/);
+  assert.equal(accept('1003', sourceB, '1001').accepted, true);
+  const priorCalls = calls.length;
+  await assert.rejects(runDirectPost({ state, token, nativeId: local.nativeId, generation: local.generation,
+    agentThreadId: localChild.channelId, textFile, dedupeKey: 'result-key-cross-collision', agentKind: KINDS.RESULT, agentReplyTo: '1001', fetchImpl }), /unknown or does not match/);
+  assert.equal(calls.length, priorCalls);
+});
