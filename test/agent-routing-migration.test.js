@@ -196,6 +196,31 @@ test('frozen legacy route rejects a sibling result after enrollment changes', as
   assert.equal(complete().evidence.source.channelId, '103');
 });
 
+test('frozen legacy parent rejects an earlier exact child-target request result', t => {
+  const f = fixture(t);
+  enroll(f, '103');
+  const childTarget = { ...source, channelId: '103' };
+  const parentRequestId = '8123';
+  const packetId = 'reused-before-parent-freeze';
+  acceptRequest(f, '9023', false, childTarget, packetId);
+  const parentRequest = acceptRequest(f, parentRequestId, true, source, packetId);
+  assert.equal(f.state.claimDispatch(parentRequestId).claimed, true);
+  f.state.markSubmitted(parentRequestId);
+  recordNativeAcknowledgment(f.state, { provider: 'codex', messageId: parentRequestId,
+    nativeId: source.nativeId, generation: 1 });
+  const receivedPacket = { id: 'earlier-child-result', kind: KINDS.RESULT,
+    source: childTarget, target, replyTo: parentRequest.id, text: 'Result from the earlier child request.' };
+  acceptRequest(f, '9024', false, childTarget, 'result-envelope');
+  f.state.db.prepare("UPDATE receipts SET detail=? WHERE discord_id=? AND kind='agent-message'")
+    .run(JSON.stringify({ packet: receivedPacket }), '9024');
+  assert.throws(() => agentComplete({ db: f.db, 'state-dir': f.dir, 'message-id': parentRequestId,
+    provider: 'codex', 'native-id': source.nativeId, generation: '1' }, {
+    gatewayProcessStatus: () => ({ state: 'stopped', pid: null }),
+    requestGatewayRecovery: () => ({ requested: false }), print: () => {}
+  }), /immutable correlated result/);
+  assert.equal(f.state.getMessage(parentRequestId).state, MESSAGE_STATES.SUBMITTED);
+});
+
 test('already submitted parent request without a frozen route rejects later child results', async t => {
   const f = fixture(t);
   const request = acceptRequest(f, '8120', true);
