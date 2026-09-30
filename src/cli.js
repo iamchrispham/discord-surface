@@ -22,6 +22,7 @@ const { createOrdinaryHandoff } = require('./cli/ordinary-handoff');
 const { createConductorHandoff } = require('./cli/conductor-handoff');
 const { gatewayProcessStatus, pidMatches, waitForExit } = createGatewayProcessInspection(__filename);
 const createClaudeListeners = require('./cli/claude-listeners');
+const { createClaudeSubmittedReoffer } = require('./cli/claude-submitted-reoffer');
 const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, issueAgentAddress } = require('./agent-message');
 const { resolveAgentAddress, resolveDedupeKey, resolveDirectBinding, runDirectPost, runWatcherNoticePost } = require('./direct-post');
 const { runBoardRefresh } = require('./board-refresh');
@@ -912,10 +913,14 @@ async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
   return null;
 }
 
-function createBindingWakeController({ getGateway, isReady, isTransportReady = isReady, isStopping,
+function createBindingWakeController({ getGateway, isReady, isTransportReady = isReady, isStopping, probeClaudeChannel = require('./native').probeClaudeChannel,
   logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
   let wakePromise = null;
   let wakeRequested = false;
+  const reoffer = createClaudeSubmittedReoffer({
+    probeClaudeChannel,
+    logger: error => logger(new Error(`Claude re-offer failed: ${error.message}`, { cause: error }))
+  });
   const request = () => {
     wakeRequested = true;
     const gateway = getGateway?.();
@@ -941,6 +946,7 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
             await currentGateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
           }
         }
+        if (!isStopping?.()) await reoffer.run({ gateway: currentGateway, isStopping });
       }
     })().catch(logger).finally(() => {
       wakePromise = null;
