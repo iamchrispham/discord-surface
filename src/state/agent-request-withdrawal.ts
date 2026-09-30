@@ -52,7 +52,8 @@ function sourceRouteMatches(route: ReturnType<WithdrawalState['getMessageRoute']
 function resultSourceMatches(source: AgentAddress, target: AgentAddress, routingVersion: unknown,
   frozenChildRoute: string | null = null, recordedTarget: unknown = null,
   frozenRouteCompatible = true): boolean {
-  if (frozenChildRoute) return frozenRouteCompatible &&
+  if (frozenChildRoute) return (frozenRouteCompatible ||
+    (recordedTarget !== null && sameAddress(recordedTarget, target))) &&
     sameAddress(source, { ...target, channelId: frozenChildRoute });
   if (routingVersion !== AGENT_ROUTING_VERSION) return sameOwner(source, target);
   return sameAddress(source, target) ||
