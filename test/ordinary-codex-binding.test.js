@@ -70,6 +70,8 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-cli-'));
   const db = path.join(dir, 'surface.sqlite');
   const defaultRoot = path.join(dir, 'default-sessions');
+  const environment = { CODEX_HOME: path.join(dir, 'codex-home'), CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: dir };
+  let resolverEnvironment;
   const setup = new SurfaceState(db);
   setup.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(dir, 'discord.env') });
   setup.close();
@@ -100,14 +102,17 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
     async destroy() {}
   }
   const dependencies = {
-    environment: { CODEX_SESSION_ID: CODEX, CODEX_THREAD_ID: CODEX, PWD: dir },
+    environment,
     requireInstalled: () => ({ Client: FakeClient, GatewayIntentBits: { Guilds: 1 } }),
     readSecret: () => 'fixture-token',
     validateCodexSessionIdentity: (...args) => {
       validationRoots.push(args[2]);
       return { file: path.join(dir, 'session.jsonl'), sessionId: CODEX, threadId: CODEX, workspace: dir };
     },
-    codexSessionRoot: () => defaultRoot,
+    codexSessionRoot: suppliedEnvironment => {
+      resolverEnvironment = suppliedEnvironment;
+      return defaultRoot;
+    },
     gatewayProcessStatus: () => ({ state: 'running', pid: 4242, capabilities: [GATEWAY_CAPABILITIES.ordinaryBindWake] }),
     killProcess: (pid, signal) => wakeSignals.push({ pid, signal }),
     print: () => {}
@@ -115,6 +120,7 @@ test('ordinary bind reuses the exact owner and wakes an already-running Gateway'
   const args = { 'state-dir': dir, channel: '#dev', workspace: dir };
   const first = await ordinaryBind(args, dependencies);
   const second = await ordinaryBind(args, dependencies);
+  assert.deepEqual(resolverEnvironment, environment);
   assert.equal(first.reused, false);
   assert.equal(second.reused, true);
   assert.equal(first.binding.generation, 1);

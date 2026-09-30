@@ -135,7 +135,7 @@ async function ordinaryBind(args, dependencies = {}) {
     if (existing && state.isOrdinaryBindingRecord(existing) && invocation.sessionId !== existing.nativeId) {
       throw new Error('channel is already bound to another owner; use explicit handoff');
     }
-    let validationRoot = sessionRoot ?? existing?.sessionRoot ?? (dependencies.codexSessionRoot || codexSessionRoot)();
+    let validationRoot = sessionRoot ?? existing?.sessionRoot ?? (dependencies.codexSessionRoot || codexSessionRoot)(environment);
     if (!sessionRoot) {
       const proof = await validateNativeProof(validationRoot);
       nativeProofDetail = proof.detail;
