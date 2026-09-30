@@ -28,7 +28,6 @@ test('a newly verified Claude listener re-offers an unacknowledged submitted row
     workspace: dir, endpoint
   }, { intakeCutoff: '100' });
   const bound = state.getBinding('101');
-  state.setBindingReadiness('101', READINESS.READY, 'listener ready', bound);
   const accepted = state.acceptDiscordMessage({
     id: '102', guildId: '100', channelId: '101', authorId: '900', isBot: false,
     attachments: [], content: 'Please handle this request.'
@@ -36,9 +35,10 @@ test('a newly verified Claude listener re-offers an unacknowledged submitted row
   assert.equal(accepted.accepted, true);
   assert.equal(state.claimDispatch('102').claimed, true);
   assert.equal(state.markSubmitted('102').state, 'submitted');
+  state.setBindingReadiness('101', READINESS.PENDING, 'listener pending', bound);
   const route = state.currentMessageBinding(state.getMessage('102'));
   assert.equal(route.current, true);
-  assert.equal(route.ready, true);
+  assert.equal(route.ready, false);
 
   const posts = [];
   let instance = FIRST_INSTANCE;
@@ -66,6 +66,10 @@ test('a newly verified Claude listener re-offers an unacknowledged submitted row
   });
   const trigger = async () => { wake.request(); await wake.wait(); };
 
+  await trigger();
+  assert.deepEqual(posts, [], 'a not-ready route defers the listener instance');
+
+  state.setBindingReadiness('101', READINESS.READY, 'listener ready', state.getBinding('101'));
   await trigger();
   assert.deepEqual(posts, ['102']);
   assert.equal(state.getMessage('102').state, 'submitted');
