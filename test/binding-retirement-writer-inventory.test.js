@@ -15,12 +15,11 @@ const ts = require('typescript');
 const SRC_ROOT = path.resolve(__dirname, '..', 'src');
 
 // Owners that retire or relocate a binding and must consult the in-transaction
-// classifier. Two live in ordinary-binding.ts, two in binding-lifecycle.js,
-// and one in state.js.
+// classifier. Two live in ordinary-binding.ts and three in binding-lifecycle.js.
 const RETIRING_OWNERS = new Map([
   ['state/binding-lifecycle.js\u0000rebind', 1],
   ['state/binding-lifecycle.js\u0000unbind', 1],
-  ['state.js\u0000handoffConductor', 1],
+  ['state/binding-lifecycle.js\u0000handoffConductor', 1],
   ['state/ordinary-binding.ts\u0000rebindOrdinary', 1],
   ['state/ordinary-binding.ts\u0000handoffOrdinary', 1]
 ]);
@@ -33,7 +32,7 @@ const FIRST_BIND_OWNERS = new Map([
 
 // Readiness-only writes keep their existing authority and receive no hold.
 const READINESS_OWNERS = new Map([
-  ['state.js\u0000setBindingReadiness', 1],
+  ['state/binding-lifecycle.js\u0000setBindingReadiness', 1],
   ['state.js\u0000upsertIntakeWatermark', 1],
   ['state/intake.js\u0000markIntakeBoundary', 1],
   ['state/intake.js\u0000reconcileIntake', 1],
