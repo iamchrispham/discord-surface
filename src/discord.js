@@ -2565,22 +2565,20 @@ class DiscordGateway {
   async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
     const overallDeadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
-    const callerScope = channelIds !== null && channelIds !== undefined
-      ? new Set(channelIds)
-      : reason === 'ordinary-bind'
-        // An unscoped ordinary-bind wake is a completion nudge, not a full refresh:
-        // select only active routes that are not already ready so a ready binding
-        // with a ready watermark, or a ready enrolled child, is never demoted.
-        ? new Set([
-          ...this.state.listBindings()
-            .filter(binding => binding.active && (binding.readiness !== READINESS.READY ||
-              this.state.getIntakeWatermark(binding.channelId)?.state !== READINESS.READY))
-            .map(binding => binding.channelId),
-          ...this.state.listThreadEnrollments()
-            .filter(enrollment => enrollment.active && enrollment.state !== THREAD_STATES.READY)
-            .map(enrollment => enrollment.threadId)
-        ])
-        : null;
+    let callerScope = null;
+    if (channelIds !== null && channelIds !== undefined) {
+      callerScope = new Set(channelIds);
+    } else if (reason === 'ordinary-bind') {
+      callerScope = new Set([
+        ...this.state.listBindings()
+          .filter(binding => binding.active && (binding.readiness !== READINESS.READY ||
+            this.state.getIntakeWatermark(binding.channelId)?.state !== READINESS.READY))
+          .map(binding => binding.channelId),
+        ...this.state.listThreadEnrollments()
+          .filter(enrollment => enrollment.active && enrollment.state !== THREAD_STATES.READY)
+          .map(enrollment => enrollment.threadId)
+      ]);
+    }
     const expandScope = scope => {
       if (scope === null) return null;
       const expanded = new Set(scope);
