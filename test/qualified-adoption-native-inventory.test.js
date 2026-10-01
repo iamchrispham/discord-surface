@@ -115,7 +115,7 @@ test('prospective covered native-proof retry retains its historical bound', { ti
 
 const EXPECTED_CREATORS = [
   'src/cli.js|bind|state|bind',
-  'src/cli.js|provisionInternal|state|bind',
+  'src/cli/provision-commands.js|provisionInternal|state|bind',
   'src/discord/thread-enrollment.ts|enrollPublicThread|state|enrollThread',
   'src/ordinary-bind/codex.js|ordinaryBind|state|bindOrdinary',
   'src/ordinary-bind/index.js|ordinaryClaudeBind|state|bindOrdinaryClaude',
