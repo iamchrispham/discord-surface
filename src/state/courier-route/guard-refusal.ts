@@ -14,19 +14,25 @@ const GUARD_REFUSAL_REASONS = [
 ] as const;
 
 const FORWARDING_AUTHORIZATION_PREFIX = 'courier forwarding authorization ' as const;
+const FORWARDING_AUTHORIZATION_STATUSES = [
+  COURIER_RESULT_STATUSES.NO_ROUTE,
+  COURIER_RESULT_STATUSES.STALE,
+  COURIER_RESULT_STATUSES.HELD,
+  COURIER_RESULT_STATUSES.CONFLICT
+] as const;
+
+export type CourierGuardRefusalReason =
+  | (typeof GUARD_REFUSAL_REASONS)[number]
+  | `${typeof FORWARDING_AUTHORIZATION_PREFIX}${(typeof FORWARDING_AUTHORIZATION_STATUSES)[number]}`;
+
 const FORWARDING_AUTHORIZATION_REASONS = new Set(
-  [
-    COURIER_RESULT_STATUSES.NO_ROUTE,
-    COURIER_RESULT_STATUSES.STALE,
-    COURIER_RESULT_STATUSES.HELD,
-    COURIER_RESULT_STATUSES.CONFLICT
-  ].map(status => `${FORWARDING_AUTHORIZATION_PREFIX}${status}`)
+  FORWARDING_AUTHORIZATION_STATUSES.map(status => `${FORWARDING_AUTHORIZATION_PREFIX}${status}`)
 );
 
 // True only for a reason the pre-host guard actually refuses with: one of the
 // three fixed refusal reasons, or a forwarding-authorization refusal carrying
 // the guard's status suffix. The stable marker is deliberately not accepted.
-export function isCourierGuardRefusalReason(reason: unknown): boolean {
+export function isCourierGuardRefusalReason(reason: unknown): reason is CourierGuardRefusalReason {
   return typeof reason === 'string' &&
     ((GUARD_REFUSAL_REASONS as readonly string[]).includes(reason) ||
       FORWARDING_AUTHORIZATION_REASONS.has(reason));

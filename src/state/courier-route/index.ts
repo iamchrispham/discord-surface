@@ -74,3 +74,4 @@ export {
 
 export * from './types';
 export type { RouteMatch } from './route';
+export type { CourierGuardRefusalReason } from './guard-refusal';
