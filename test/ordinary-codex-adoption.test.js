@@ -19,6 +19,7 @@ const {
   ordinary,
   transcript
 } = require('./ordinary-codex-fixture');
+const { fixture: recoveryFixture } = require('./helpers/intake-recovery-fixture');
 
 test('ordinary bind uses the server fence as its adoption cutoff', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-empty-cutoff-'));
@@ -296,4 +297,46 @@ test('binding wake starts when reconnect transport is ready after partial recove
   wake.request();
   await wake.wait();
   assert.deepEqual(calls, ['recover:ordinary-bind', 'reconcile']);
+});
+
+test('ready completion wake does not demote an unrelated healthy route', { timeout: 5000, todo: 'issue #195: completion wake demotes a healthy route' }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  const changes = [];
+  const original = f.state.setBindingReadiness.bind(f.state);
+  t.mock.method(f.state, 'setBindingReadiness', (...args) => {
+    changes.push({ channelId: args[0], readiness: args[1] });
+    return original(...args);
+  });
+  const wake = createBindingWakeController({
+    getGateway: () => f.gateway,
+    isReady: () => f.gateway.ready,
+    isTransportReady: () => f.gateway.transportReady,
+    isStopping: () => f.gateway.stopping
+  });
+  wake.request();
+  await wake.wait();
+  assert.equal(f.state.getBinding('1000').readiness, 'ready');
+  assert.equal(f.boundary('2000').state, 'ready');
+  assert.equal(changes.some(change => change.channelId === '1000' && change.readiness === 'recovering'), false,
+    'completion-only wake must not temporarily hold a healthy route');
+});
+
+test('a pending route is still recovered by the public binding wake', { timeout: 5000 }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  f.state.setBindingReadiness('1000', 'pending', 'fixture pending', f.state.getBinding('1000'));
+  const wake = createBindingWakeController({
+    getGateway: () => f.gateway,
+    isReady: () => f.gateway.ready,
+    isTransportReady: () => f.gateway.transportReady,
+    isStopping: () => f.gateway.stopping
+  });
+  wake.request();
+  await wake.wait();
+  assert.equal(f.state.getBinding('1000').readiness, 'ready');
+  assert.equal(f.boundary('2000').state, 'ready');
+  assert.ok(f.calls.some(call => call.id === '1000' && call.kind === 'history'));
 });
