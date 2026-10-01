@@ -176,7 +176,7 @@ function preparedInput(f, message) {
   return {
     routeId: f.route.routeId,
     prompt: parentPrompt(f.state, message),
-    observerCursor: readInitialCursor(message.nativeId, f.sessionRoot)
+    observerCursor: readInitialCursor(message.nativeId, f.sessionFile)
   };
 }
 
