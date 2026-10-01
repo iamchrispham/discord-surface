@@ -4,15 +4,13 @@ const MAX_HOOK_BYTES = 1024 * 1024;
 
 function persistGuardRefusal(state, routeId, event, reason) {
   if (!state || typeof routeId !== 'string' || !event || typeof event !== 'object') return false;
-  if (reason !== 'courier hook caller or route is not current' &&
-      reason !== 'courier message is not eligible for forwarding' &&
-      reason !== 'courier attempt changed after admission' &&
-      !reason.startsWith('courier forwarding authorization ')) return false;
+  const { COURIER_OUTCOME_REASONS, canonicalWorkspace, isCourierGuardRefusalReason, matchesFixedRecipient } =
+    require('./state/courier-route');
+  if (!isCourierGuardRefusalReason(reason)) return false;
   const input = event.tool_input;
   if (!input || typeof input !== 'object' || typeof input.prompt !== 'string' || typeof event.session_id !== 'string' ||
       typeof event.cwd !== 'string') return false;
   const { COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, MESSAGE_STATES } = require('./state');
-  const { canonicalWorkspace, matchesFixedRecipient } = require('./state/courier-route');
   return state.transaction(() => {
     const rows = state.db.prepare(`SELECT id, discord_id, detail FROM receipts WHERE kind=?
       AND json_extract(detail, '$.route.routeId')=?
@@ -47,7 +45,7 @@ function persistGuardRefusal(state, routeId, event, reason) {
     state.receipt(messageId, COURIER_RECEIPT_KINDS.OUTCOME, {
       attemptId,
       outcome: COURIER_OUTCOMES.NOT_SUBMITTED,
-      reason: 'courier guard refused before host call',
+      reason: COURIER_OUTCOME_REASONS.GUARD_REFUSED_BEFORE_HOST_CALL,
       guardReason: reason
     });
     return true;

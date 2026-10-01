@@ -27,6 +27,12 @@ export const COURIER_OUTCOMES = Object.freeze({
   UNCERTAIN: 'uncertain'
 } as const);
 
+// The stable pre-host refusal reason persisted on a guard-refusal outcome
+// receipt. These bytes are persisted evidence: do not reword or reformat.
+export const COURIER_OUTCOME_REASONS = Object.freeze({
+  GUARD_REFUSED_BEFORE_HOST_CALL: 'courier guard refused before host call'
+} as const);
+
 export const COURIER_RESULT_STATUSES = Object.freeze({
   CLAIMED: 'claimed',
   DUPLICATE: 'duplicate',
@@ -45,6 +51,7 @@ export const COURIER_DELIVERY_STATUSES = Object.freeze({
   FORWARD_CLAIMED: 'forward_claimed',
   NATIVE_ACKNOWLEDGED: 'native_acknowledged',
   RETIRED: 'retired',
+  GUARD_REFUSED: 'guard_refused',
   NOT_APPLICABLE: 'not_applicable'
 } as const);
 

@@ -9,13 +9,17 @@ import {
   type CourierDependencies,
   type CourierDispatchInput,
   type CourierEnvelope,
+  type CourierGuardRefusalReason,
   type CourierIdentity,
   type CourierMessage,
   type CourierOutcome,
+  type CourierOutcomeRecord,
   type CourierResultStatus,
   type CourierRoute,
   type RouteMatch,
-  type CourierState
+  type CourierState,
+  isConfirmedCourierGuardRefusal,
+  isCourierGuardRefusalReason
 } from '../src/state/courier-route';
 import { readCourierInput } from '../src/state/courier-route/input';
 import type { ForwardState } from '../src/state/courier-route/forward';
@@ -97,10 +101,24 @@ const attempt: CourierAttempt = {
 const outcome: CourierOutcome = COURIER_OUTCOMES.SUBMITTED;
 const resultStatus: CourierResultStatus = 'claimed';
 const routeMatch: RouteMatch = { status: null, route };
+const guardReasonClassifier: (reason: unknown) => boolean = isCourierGuardRefusalReason;
+const confirmedGuardRefusalClassifier: (
+  outcome: CourierOutcomeRecord | null
+) => boolean = isConfirmedCourierGuardRefusal;
+const guardRefusalReason = guardReasonClassifier('courier forwarding authorization stale');
+const typedGuardRefusalReason: CourierGuardRefusalReason = 'courier forwarding authorization stale';
+const unknownGuardReason: unknown = typedGuardRefusalReason;
+if (isCourierGuardRefusalReason(unknownGuardReason)) {
+  const narrowedGuardReason: CourierGuardRefusalReason = unknownGuardReason;
+  void narrowedGuardReason;
+}
+// @ts-expect-error authorization reasons must use a status the guard emits
+const invalidGuardRefusalReason: CourierGuardRefusalReason = 'courier forwarding authorization bogus';
 const record: CourierAttemptRecord = {
   attempt,
   outcome: { attemptId: attempt.attemptId, outcome }
 };
+const confirmedGuardRefusal = confirmedGuardRefusalClassifier(record.outcome);
 const state = null as unknown as CourierState;
 const forwardState = null as unknown as ForwardState;
 const dependencies = null as unknown as CourierDependencies;
@@ -121,4 +139,10 @@ const invalidCourier: CourierIdentity = { ...courier, provider: 'spark' };
 void record;
 void resultStatus;
 void routeMatch;
+void guardRefusalReason;
+void typedGuardRefusalReason;
+void invalidGuardRefusalReason;
+void confirmedGuardRefusal;
+void guardReasonClassifier;
+void confirmedGuardRefusalClassifier;
 void invalidCourier;
