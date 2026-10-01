@@ -800,6 +800,10 @@ class SurfaceState {
     return courierRouteHandlers.claimCourierForward(this, ...args);
   }
 
+  readCourierInput(...args) {
+    return courierRouteHandlers.readCourierInput(this, ...args);
+  }
+
   hasCourierForwardClaim(...args) {
     return courierRouteHandlers.hasCourierForwardClaim(this, ...args);
   }

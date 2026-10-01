@@ -6,6 +6,7 @@ import { KINDS } from '../agent-message';
 import { ENVELOPE_TYPE, PROMPT_PREFIX } from '../state/courier-route/constants';
 import type { CourierDispatchEnvelope, NativeMessage } from '../native';
 import { normalizeReplyContext } from '../reply-context';
+import { courierProgramInstructions } from './courier-program';
 
 export function agentCompletionCommand(
   message: Pick<NativeMessage, 'id' | 'provider' | 'nativeId' | 'generation'>,
@@ -29,7 +30,7 @@ export function watcherNoticeCompletionCommand(
     '--native-id', message.nativeId, '--generation', String(message.generation)];
 }
 
-export function courierForwardingPrompt(envelope: CourierDispatchEnvelope): string {
+export function courierForwardingPrompt(envelope: CourierDispatchEnvelope, argv?: readonly string[] | null): string {
   if (envelope.type !== ENVELOPE_TYPE) throw new Error('courier envelope type is invalid');
   if (typeof envelope.attemptId !== 'string' || envelope.attemptId.length === 0) throw new Error('courier attempt is missing');
   if (typeof envelope.messageId !== 'string' || envelope.messageId.length === 0) throw new Error('courier message is missing');
@@ -45,6 +46,7 @@ export function courierForwardingPrompt(envelope: CourierDispatchEnvelope): stri
   if (envelope.recipient.threadId !== envelope.parent?.nativeId) {
     throw new Error('courier recipient must match parent native identity');
   }
+  if (argv !== undefined && argv !== null) return courierProgramInstructions(argv);
   const toolInput: { threadId: string; prompt: string; hostId?: string } = {
     threadId: envelope.recipient.threadId,
     prompt: envelope.prompt

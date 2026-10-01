@@ -684,7 +684,28 @@ class DiscordGateway {
     this.providers = providers || {
       codex: new CodexProvider({
         acknowledgmentFor: message => acknowledgmentCommand(message, state.dbPath),
-        completionFor
+        completionFor,
+        courierInputFor: envelope => {
+          const routeId = envelope?.route?.routeId;
+          const messageId = envelope?.messageId;
+          const attemptId = envelope?.attemptId;
+          const nativeId = envelope?.courier?.nativeId;
+          if (typeof routeId !== 'string' || routeId.length === 0 ||
+            typeof messageId !== 'string' || messageId.length === 0 ||
+            typeof attemptId !== 'string' || attemptId.length === 0 ||
+            typeof nativeId !== 'string' || nativeId.length === 0) return null;
+          return [
+            process.execPath,
+            '--disable-warning=ExperimentalWarning',
+            path.join(__dirname, 'cli.js'),
+            'courier-input',
+            '--db', state.dbPath,
+            '--courier-route-id', routeId,
+            '--message-id', messageId,
+            '--attempt-id', attemptId,
+            '--native-id', nativeId
+          ];
+        }
       }),
       claude: new ClaudeProvider({
         waitForReply: (id, options) => waitForReply(state, id, options),

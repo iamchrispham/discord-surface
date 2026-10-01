@@ -1241,6 +1241,7 @@ async function main() {
   if (command === 'help' || args.help === true) return printUsage(command === 'help' ? subcommand : command);
   switch (command) {
     case 'courier-guard': return require('./courier-guard').courierGuard(args, pathsFor);
+    case 'courier-input': return require('./courier-input').courierInput(args);
     case 'mcp': return require('./peer/server').startPeerMcp(args);
     case 'configure': return configure(args);
     case 'bind': return bind(args);

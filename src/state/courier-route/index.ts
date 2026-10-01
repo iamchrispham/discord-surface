@@ -1,5 +1,13 @@
 import { createCourierAttemptHandlers } from './attempt';
-import { canonicalWorkspace, claimCourierForward, hasCourierForwardClaim, hasRetiredCourierAttempt, matchesFixedRecipient } from './forward';
+import {
+  canonicalWorkspace,
+  claimCourierForward,
+  hasCourierForwardClaim,
+  hasRetiredCourierAttempt,
+  matchesFixedRecipient
+} from './forward';
+import { readCourierInput } from './input';
+import type { ForwardState } from './forward';
 import {
   COURIER_ATTEMPT_STATES,
   COURIER_DELIVERY_STATUSES,
@@ -22,6 +30,8 @@ export function createCourierRouteHandlers(deps: CourierDependencies) {
   const attempts = createCourierAttemptHandlers(deps);
   return {
     claimCourierForward: claimCourierForward.bind(null, deps),
+    readCourierInput: (state: CourierState, routeId: string, messageId: string, attemptId: string, nativeId: string, workspace: string) =>
+      readCourierInput(deps, state as ForwardState, routeId, messageId, attemptId, nativeId, workspace),
     hasCourierForwardClaim,
     hasRetiredCourierAttempt,
     beginCourierAttempt: attempts.beginCourierAttempt,

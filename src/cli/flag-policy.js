@@ -90,7 +90,8 @@ const COMMAND_FLAGS = Object.freeze({
   'post-file-cleanup': ['preparation-id'],
   'native-reply-file-cleanup': ['message-id', 'preparation-id', 'part-index'],
   liaison: ['receipt-id'],
-  'courier-guard': ['courier-route-id']
+  'courier-guard': ['courier-route-id'],
+  'courier-input': ['courier-route-id', 'message-id', 'attempt-id', 'native-id']
 });
 
 // Subcommand-scoped policies. A subcommand that is not listed falls back to the

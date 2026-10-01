@@ -50,25 +50,29 @@ export class CodexProvider implements NativeProvider {
   private readonly run: (command: string, args: readonly string[], options?: CodexRunOptions) => Promise<CodexRunResult>;
   private readonly acknowledgmentFor: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
   private readonly completionFor: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
+  private readonly courierInputFor: ((envelope: CourierDispatchEnvelope) => readonly string[] | null | undefined) | null;
 
   constructor({
     command = 'codex',
     root = sessionRoot(),
     run = runCodex,
     acknowledgmentFor = null,
-    completionFor = null
+    completionFor = null,
+    courierInputFor = null
   }: {
     command?: string;
     root?: string;
     run?: (command: string, args: readonly string[], options?: CodexRunOptions) => Promise<CodexRunResult>;
     acknowledgmentFor?: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
     completionFor?: ((message: NativeMessage) => readonly string[] | null | undefined) | null;
+    courierInputFor?: ((envelope: CourierDispatchEnvelope) => readonly string[] | null | undefined) | null;
   } = {}) {
     this.command = command;
     this.root = root;
     this.run = run;
     this.acknowledgmentFor = acknowledgmentFor;
     this.completionFor = completionFor;
+    this.courierInputFor = courierInputFor;
   }
 
   async dispatch(message: NativeMessage, { onCursor }: DispatchOptions = {}): Promise<DispatchOutcome> {
@@ -103,7 +107,10 @@ export class CodexProvider implements NativeProvider {
       return { status: DISPATCH_STATUSES.NOT_SUBMITTED, error: new Error('courier workspace must be absolute') };
     }
     let forwardingPrompt;
-    try { forwardingPrompt = courierForwardingPrompt(envelope); } catch (error) {
+    try {
+      const courierInput = this.courierInputFor ? this.courierInputFor(envelope) : null;
+      forwardingPrompt = courierInput ? courierForwardingPrompt(envelope, courierInput) : courierForwardingPrompt(envelope);
+    } catch (error) {
       return { status: DISPATCH_STATUSES.NOT_SUBMITTED, error: asNativeError(error) };
     }
     const root = envelope.courier.sessionRoot || this.root;

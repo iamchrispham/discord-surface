@@ -3,7 +3,14 @@ import * as os from 'node:os';
 import { COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_ROUTE_STATES } from './constants';
 import { attemptId, attemptKey, createEnvelope, payloadHash } from './envelope';
 import { findMatchingRoute, getRoute } from './route';
-import type { CourierAttemptRecord, CourierDependencies, CourierMessage, CourierState } from './types';
+import type {
+  CourierAttemptRecord,
+  CourierDependencies,
+  CourierEnvelope,
+  CourierMessage,
+  CourierRoute,
+  CourierState
+} from './types';
 
 export interface ForwardState extends CourierState {
   getCourierAttempt(messageId: string, id: string): CourierAttemptRecord | null;
@@ -50,6 +57,69 @@ export function hasRetiredCourierAttempt(state: Pick<ForwardState, 'db'>, messag
   return Boolean(state.db.prepare(`SELECT id FROM receipts WHERE kind=?
     AND discord_id=? AND id>? LIMIT 1`)
     .get(COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, messageId, attemptReceiptId));
+}
+
+export interface PersistedForwardEligibility {
+  routeId: string;
+  workspace: string;
+  messageId: string;
+  attemptId: string;
+  attemptReceiptId: number;
+  prompt: string;
+  message: CourierMessage;
+  current: CourierAttemptRecord;
+  routeError: string;
+}
+
+// Shared post-queue eligibility validator. Both the public hook claim
+// (claimCourierForward) and the persisted-input reader use this one function so
+// the two paths cannot drift on route currency, workspace identity, message
+// custody, retirement, prior claims or persisted attempt geometry.
+export function validatePersistedForwardEligibility(
+  deps: CourierDependencies,
+  state: ForwardState,
+  {
+    routeId,
+    workspace,
+    messageId,
+    attemptId: id,
+    attemptReceiptId,
+    prompt,
+    message,
+    current,
+    routeError
+  }: PersistedForwardEligibility
+): { route: CourierRoute; hash: string; envelope: CourierEnvelope } {
+  const route = getRoute(deps, state, routeId);
+  const routeWorkspace = route ? canonicalWorkspace(route.courier.workspace) : null;
+  const resolvedWorkspace = canonicalWorkspace(workspace);
+  if (!route || route.status !== COURIER_ROUTE_STATES.ACTIVE || routeWorkspace === null ||
+      resolvedWorkspace === null || resolvedWorkspace !== routeWorkspace) {
+    throw new deps.BindingError(routeError);
+  }
+  const eligible = [deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.UNCERTAIN];
+  const reconciledNotSubmitted = hasRetiredCourierAttempt(state, messageId, attemptReceiptId);
+  if (!eligible.includes(message.state) || state.hasNativeAcknowledgment(message)) {
+    throw new deps.BindingError('courier message is not eligible for forwarding');
+  }
+  const match = findMatchingRoute(deps, state, message, routeId);
+  if (match.status) throw new deps.BindingError(`courier forwarding authorization ${match.status}`);
+  if (reconciledNotSubmitted || current.outcome?.outcome === COURIER_OUTCOMES.NOT_SUBMITTED) {
+    throw new deps.BindingError('courier queue submission was refused');
+  }
+
+  const dispatch = { routeId, prompt, observerCursor: current.attempt.observerCursor };
+  const hash = payloadHash(message, dispatch);
+  const key = attemptKey(message, route, hash);
+  const envelope = createEnvelope(message, route, id, hash, dispatch);
+  if (id !== attemptId(key) || key !== current.attempt.attemptKey || hash !== current.attempt.payloadHash ||
+      JSON.stringify(envelope) !== JSON.stringify(current.attempt.envelope)) {
+    throw new deps.BindingError('courier attempt changed after admission');
+  }
+  if (hasCourierForwardClaim(state, messageId, id)) {
+    throw new deps.BindingError('courier forwarding attempt is already claimed');
+  }
+  return { route, hash, envelope };
 }
 
 export function hasCourierForwardClaim(state: Pick<ForwardState, 'db'>, messageId: string, attemptId: string | null = null): boolean {
@@ -99,34 +169,23 @@ export function claimCourierForward(deps: CourierDependencies, state: ForwardSta
     if (!matchesFixedRecipient(persistedRecipient, input)) {
       throw new deps.BindingError('courier hook tool input differs from the fixed recipient');
     }
-    const eligible = [deps.MESSAGE_STATES.DISPATCHING, deps.MESSAGE_STATES.SUBMITTED, deps.MESSAGE_STATES.UNCERTAIN];
-    const reconciledNotSubmitted = hasRetiredCourierAttempt(state, messageId, attemptReceiptId);
-    if (!eligible.includes(message.state) || state.hasNativeAcknowledgment(message)) {
-      throw new deps.BindingError('courier message is not eligible for forwarding');
-    }
-    const match = findMatchingRoute(deps, state, message, routeId);
-    if (match.status) throw new deps.BindingError(`courier forwarding authorization ${match.status}`);
-    if (reconciledNotSubmitted || current.outcome?.outcome === COURIER_OUTCOMES.NOT_SUBMITTED) {
-      throw new deps.BindingError('courier queue submission was refused');
-    }
-
-    const dispatch = { routeId, prompt, observerCursor: current.attempt.observerCursor };
-    const hash = payloadHash(message, dispatch);
-    const key = attemptKey(message, route, hash);
-    const envelope = createEnvelope(message, route, id, hash, dispatch);
-    if (id !== attemptId(key) || key !== current.attempt.attemptKey || hash !== current.attempt.payloadHash ||
-        JSON.stringify(envelope) !== JSON.stringify(current.attempt.envelope)) {
-      throw new deps.BindingError('courier attempt changed after admission');
-    }
-    if (hasCourierForwardClaim(state, messageId, id)) {
-      throw new deps.BindingError('courier forwarding attempt is already claimed');
-    }
+    const { envelope } = validatePersistedForwardEligibility(deps, state, {
+      routeId,
+      workspace: eventWorkspace as string,
+      messageId,
+      attemptId: id,
+      attemptReceiptId,
+      prompt,
+      message,
+      current,
+      routeError: 'courier hook caller or route is not current'
+    });
 
     // Commit before the host call. An interrupted or uncertain call never regains permission.
     state.receipt(messageId, COURIER_RECEIPT_KINDS.FORWARD_CLAIM, {
       attemptId: id, routeId, routeGeneration: route.routeGeneration,
       callerSessionId: route.courier.nativeId, recipient: envelope.recipient,
-      generation: message.generation, payloadHash: hash,
+      generation: message.generation, payloadHash: envelope.payloadHash,
       toolUseId: typeof event.tool_use_id === 'string' ? event.tool_use_id : null,
       turnId: typeof event.turn_id === 'string' ? event.turn_id : null
     });
