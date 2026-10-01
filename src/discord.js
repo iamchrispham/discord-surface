@@ -45,6 +45,7 @@ const { cancelResponseBody, readRetryAfter, sendDiscordMessage, fetchDiscordChan
 const { createTransportReceiptDelivery } = require('./discord/transport-receipts');
 const { createOwnerAdmission } = require('./discord/owner-admission');
 const { optionalReplyContext } = require('./discord/reply-context-fetch');
+const { createReplyDelivery } = require('./discord/reply-delivery');
 
 const requireInstalled = require;
 const DEFERRED_HANDOFF_RECOVERY_INITIAL_DELAY_MS = 100;
@@ -201,6 +202,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
   const { issueTransportReceipt, launchTransportReceipt, waitForReceipts } = createTransportReceiptDelivery({ state, sendTransportReceipt, trackReceipt });
   const { abortNativeWork, courierCustodyRequiresOwnerHold, enqueueOwnerWork, existingNativeWork, hasCurrentNativeAcknowledgment, refreshCourierCustodyBlock, refreshNativeWorkChannel, releaseAcknowledged, releaseHandledWithoutPost, startNativeWork, waitForNativeWork, retryRetiredCourierWork } = createOwnerAdmission({ state, compareDiscordIds });
   const { serializeIntake, releaseIntake } = createIntakeSerialization({ recoveryKind, recoveryError });
+  const deliverReply = createReplyDelivery({ state, sendReply, prepareReply, ACK_WAITING, MESSAGE_STATES, classifyReplyError });
 
   function rejectEnrolledChildBot(message, expectedBinding, ready, coverageId = null) {
     const route = state.getMessageRoute(message?.channelId);
@@ -265,59 +267,6 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     if (!replyContextStillEligible) return normalized;
     const replyContext = await optionalReplyContext(message, options);
     return replyContext ? { ...normalized, replyContext } : normalized;
-  }
-
-  async function deliverReply(message, result, signal) {
-    if (result.message?.state !== 'reply_ready') return result;
-    if (prepareReply) {
-      try {
-        const preparation = prepareReply(result.message.id, signal);
-        const prepared = preparation ? await preparation : preparation;
-        if (prepared === ACK_WAITING) return { ...result, message: state.getMessage(result.message.id) };
-      }
-      catch (error) { return { ...result, message: state.getMessage(result.message.id), error }; }
-      if (signal?.aborted) return { ...result, message: state.getMessage(result.message.id) };
-    }
-    let ready;
-    try {
-      ready = state.beginReply(result.message.id);
-    } catch (error) {
-      return { ...result, message: state.getMessage(result.message.id), error };
-    }
-    if (ready.sent) return { ...result, message: ready.message };
-    const parts = ready.message.replyParts?.length ? ready.message.replyParts : [{ index: 0, content: ready.message.replyText, nonce: ready.message.replyNonce, state: 'sending' }];
-    for (const part of parts) {
-      if (part.state === 'sent') continue;
-      if (signal?.aborted) return { ...result, message: state.markReplyFailure(ready.message.id, new Error('reply delivery stopped'), true, part.index) };
-      try {
-        state.assertMessageCurrent(ready.message.id, 'reply-send');
-        if (!part.content.trim() && !part.fileManifest) {
-          const skipped = state.markReplyPartSkipped(ready.message.id, part.index);
-          if (skipped.state === 'replied') return { ...result, message: skipped };
-          continue;
-        }
-        if (part.content.length > 2000) throw new Error('Discord reply part exceeds 2000 characters');
-        const sent = await sendReply(message, { ...ready.message, replyText: part.content, replyNonce: part.nonce, replyPart: part });
-        const replyId = sent?.id || sent?.messageId;
-        if (!replyId) throw new Error('Discord did not return a message id');
-        let saved;
-        try {
-          saved = state.markReplyPartSent(ready.message.id, part.index, replyId);
-        } catch (error) {
-          const current = state.getMessage(ready.message.id);
-          if (current?.state !== MESSAGE_STATES.REPLY_UNKNOWN || typeof state.reconcileReplyDelivery !== 'function') throw error;
-          saved = state.reconcileReplyDelivery(ready.message.id, 'sent', {
-            partIndex: part.index,
-            replyMessageId: replyId
-          });
-        }
-        if (saved.state === 'replied') return { ...result, message: saved };
-      } catch (error) {
-        const unknown = classifyReplyError(error) === 'unknown';
-        return { ...result, message: state.markReplyFailure(ready.message.id, error, unknown, part.index), error };
-      }
-    }
-    return { ...result, message: state.getMessage(ready.message.id) };
   }
 
   function courierDispatchStatus(result) {
