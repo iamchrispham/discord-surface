@@ -762,13 +762,13 @@ test('issue196 recovery permits exactly one fresh delivery after guard refusal',
   const dispatch = [];
   const consumer = directConsumer(f, { courier, dispatch });
   try {
-    const first = await consumer.processAccepted(f.state.getMessage(f.messageId));
-    const second = await consumer.processAccepted(f.state.getMessage(f.messageId));
+    await consumer.processAccepted(f.state.getMessage(f.messageId));
+    assert.deepEqual(dispatch, [f.messageId]);
+    assert.deepEqual(courier, []);
 
-    assert.equal(courier.length, 1, 'guard-refused custody was delivered more than once');
-    assert.equal(first.status, COURIER_OUTCOMES.SUBMITTED);
-    assert.equal(dispatch.length, 0, 'duplicate host delivery occurred');
-    assert.ok(second, 'second processing never settled');
+    await consumer.processAccepted(f.state.getMessage(f.messageId));
+    assert.deepEqual(dispatch, [f.messageId], 'repeat processing dispatched twice');
+    assert.deepEqual(courier, []);
   } finally {
     consumer.abortNativeWork();
     await consumer.waitForNativeWork();
