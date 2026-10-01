@@ -10,6 +10,15 @@ function required(args, key) {
   return value;
 }
 
+function authenticatedNativeId(environment) {
+  const threadId = environment.CODEX_THREAD_ID;
+  const sessionId = environment.CODEX_SESSION_ID || threadId;
+  if (typeof threadId !== 'string' || threadId.length === 0 || sessionId !== threadId) {
+    throw new Error('courier native session is not authenticated');
+  }
+  return threadId;
+}
+
 // Reads the exact persisted tool input for one admitted courier attempt and
 // prints it as JSON so a native host can forward the parsed object instead of a
 // model-transcribed copy. This command never claims forwarding permission and
@@ -20,6 +29,7 @@ function courierInput(args, dependencies = {}) {
   const workspace = dependencies.workspace || process.cwd;
   const stdout = dependencies.stdout || process.stdout;
   const State = dependencies.SurfaceState || require('./state').SurfaceState;
+  const environment = dependencies.environment || process.env;
 
   // Validate every flag before any filesystem or database work, so a malformed
   // invocation can never create a database file.
@@ -28,6 +38,9 @@ function courierInput(args, dependencies = {}) {
   const messageId = requiredFlag(options, 'message-id');
   const attemptId = requiredFlag(options, 'attempt-id');
   const nativeId = requiredFlag(options, 'native-id');
+  if (nativeId !== authenticatedNativeId(environment)) {
+    throw new Error('courier native session does not match the requested identity');
+  }
 
   // A relative database path would silently depend on the caller's cwd; refuse it
   // rather than resolving it.
@@ -37,7 +50,7 @@ function courierInput(args, dependencies = {}) {
 
   let state;
   try {
-    state = new State(db, { requireCurrentSchema: true });
+    state = new State(db, { requireCurrentSchema: true, readOnly: true });
     const result = state.readCourierInput(routeId, messageId, attemptId, nativeId, workspace());
     stdout.write(`${JSON.stringify(result)}\n`);
     return result;

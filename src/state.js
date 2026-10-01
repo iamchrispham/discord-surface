@@ -476,19 +476,20 @@ class SurfaceState {
   constructor(dbPath, options = {}) {
     if (!path.isAbsolute(dbPath)) throw new TypeError('dbPath must be absolute');
     const existed = fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0;
-    if (options.requireCurrentSchema && !existed) throw new StateCorruptError('state database is missing');
-    ensurePrivateDir(path.dirname(dbPath));
+    const readOnly = options.readOnly === true;
+    if ((options.requireCurrentSchema || readOnly) && !existed) throw new StateCorruptError('state database is missing');
+    if (!readOnly) ensurePrivateDir(path.dirname(dbPath));
     try {
-      this.db = new DatabaseSync(dbPath);
+      this.db = readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
       this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;');
       if (existed) {
-        if (!options.requireCurrentSchema) this.migrateSchema();
+        if (!readOnly && !options.requireCurrentSchema) this.migrateSchema();
         this.assertSchema();
       } else {
         this.createSchema();
         this.assertSchema();
       }
-      fs.chmodSync(dbPath, 0o600);
+      if (!readOnly) fs.chmodSync(dbPath, 0o600);
     } catch (error) {
       try { this.db?.close(); } catch {}
       throw new StateCorruptError(`state database is not usable: ${error.message}`);

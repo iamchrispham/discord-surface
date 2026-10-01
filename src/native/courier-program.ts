@@ -20,7 +20,7 @@ function programBody(argv: readonly string[]): string {
   const command = argv.map(shellQuote).join(' ');
   return [
     `const command = ${JSON.stringify(command)};`,
-    `const result = await tools.${EXEC_COMMAND}({ cmd: command, yield_time_ms: 10000, max_output_tokens: 32000 });`,
+    `const result = await tools.${EXEC_COMMAND}({ cmd: command, yield_time_ms: 10000, max_output_tokens: 100000 });`,
     "if (!result || result.exit_code !== 0 || result.session_id != null || result.running === true || (result.status !== undefined && result.status !== 'completed')) {",
     "  throw new Error('courier input reader did not complete');",
     '}',

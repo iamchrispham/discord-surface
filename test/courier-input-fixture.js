@@ -138,9 +138,20 @@ function readArgvFor(f, { messageId, attemptId, nativeId = COURIER_NATIVE } = {}
   ];
 }
 
-function runCourierInput(f, { cwd = f.workspace, ...selection } = {}) {
+function runCourierInput(f, { cwd = f.workspace, env = {}, ...selection } = {}) {
   const argv = readArgvFor(f, selection);
-  return spawnSync(argv[0], argv.slice(1), { cwd, encoding: 'utf8', timeout: TIMEOUT_MS, maxBuffer: MAX_BUFFER });
+  return spawnSync(argv[0], argv.slice(1), {
+    cwd,
+    env: {
+      ...process.env,
+      CODEX_SESSION_ID: COURIER_NATIVE,
+      CODEX_THREAD_ID: COURIER_NATIVE,
+      ...env
+    },
+    encoding: 'utf8',
+    timeout: TIMEOUT_MS,
+    maxBuffer: MAX_BUFFER
+  });
 }
 
 module.exports = {
