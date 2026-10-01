@@ -193,14 +193,36 @@ test('courier program forwards parsed persisted input without transcription', as
   assert.deepEqual(malformed.calls, ['exec_command', 1000000], 'malformed exec stdout must not send');
 
   const serialized = JSON.stringify(expectedInput);
+  const ambiguous = await run({ session_id: 'reader-1', exit_code: 0, output: serialized });
+  assert.deepEqual(ambiguous.calls, ['exec_command', 1000000], 'completed reader with a retained session must not send');
+  assert.deepEqual(ambiguous.sends, []);
+
   const midpoint = Math.floor(serialized.length / 2);
   const yielded = await run(
     { session_id: 'reader-1', output: serialized.slice(0, midpoint) },
-    { session_id: 'reader-1', exit_code: 0, output: serialized.slice(midpoint) }
+    { exit_code: 0, output: serialized.slice(midpoint) }
   );
   assert.deepEqual(yielded.calls, ['exec_command', 1000000, 'write_stdin', 'send_message_to_thread'],
     'yielded reader output must be completed before sending');
   assert.deepEqual(yielded.sends, [expectedInput]);
+
+  const receiptsBeforeExpiry = f.state.listReceipts();
+  const realNow = Date.now;
+  const clock = [0, 0, 60000];
+  Date.now = () => clock.shift() ?? 60000;
+  let expired;
+  try {
+    expired = await run(
+      { session_id: 'reader-1', output: '' },
+      { session_id: 'reader-1', output: '' }
+    );
+  } finally {
+    Date.now = realNow;
+  }
+  assert.deepEqual(expired.calls, ['exec_command', 1000000, 'write_stdin'],
+    'expired reader must make finite drain calls without retrying');
+  assert.deepEqual(expired.sends, [], 'expired reader must not send');
+  assert.deepEqual(f.state.listReceipts(), receiptsBeforeExpiry, 'expired reader must not mutate custody');
 });
 
 test('courier input refuses revoked route without mutation', t => {
