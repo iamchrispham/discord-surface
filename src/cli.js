@@ -22,14 +22,15 @@ const { createOrdinaryHandoff } = require('./cli/ordinary-handoff');
 const { createConductorHandoff } = require('./cli/conductor-handoff');
 const { createDirectPostCommands } = require('./cli/direct-post-commands');
 const { createWatcherCommands } = require('./cli/watcher-commands');
+const { writePid, acquireHeldLockUntilAvailable } = require('./cli/runtime-custody');
 const { gatewayProcessStatus, pidMatches, waitForExit } = createGatewayProcessInspection(__filename);
 const createClaudeListeners = require('./cli/claude-listeners');
 const { createClaudeSubmittedReoffer } = require('./cli/claude-submitted-reoffer');
 const { AGENT_MESSAGE_MAX_ENCODED_LENGTH } = require('./agent-message');
 const { resolveDedupeKey, resolveDirectBinding } = require('./direct-post');
 const { runBoardRefresh } = require('./board-refresh');
-const { execFileSync, spawn, spawnSync } = require('node:child_process');
-const { once } = require('node:events');
+const { execFileSync, spawnSync } = require('node:child_process');
+
 const { pathToFileURL } = require('node:url');
 const { SurfaceState, BindingError, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
 const { DiscordGateway, discordIdAfter, readSecret, requireInstalled, waitForRecoveryOperation } = require('./discord');
@@ -52,7 +53,7 @@ const { ordinaryClaudeBind: runOrdinaryClaudeBind } = require('./ordinary-bind')
 const { GATEWAY_CAPABILITIES } = require('./ordinary-bind/constants');
 
 const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID';
-const LOCK_CONTENTION_EXIT = 75;
+
 const { runLiaisonDraft } = require('./liaison');
 const { recordNativeAcknowledgment } = require('./acknowledgment');
 const { parseLegacyConductorMarker, staticConductorMarker } = require('./topic');
@@ -815,107 +816,6 @@ function provision(args) {
 const { handoffInternal, handoff, localHandoff } = createConductorHandoff({ required, openState, print, pathsFor, categoryFor, ordinaryHandoffInternal, cliPath: __filename });
 const { agentSend, assertOrdinaryPostCaller, directPost, directPostFileCleanup } = createDirectPostCommands({ required, openState, print, resolveCurrentClaudeCaller });
 const { watcherArm, watcherSend, watcherConsume } = createWatcherCommands({ openState, required, print, resolveCurrentClaudeCaller, gatewayProcessStatus, requestGatewayRecovery });
-
-function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
-  fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(pidFile, JSON.stringify({
-    pid: process.pid,
-    guildId,
-    stateDir,
-    db,
-    command: 'run',
-    courierRouteId,
-    startedAt: new Date().toISOString(),
-    capabilities: [
-      GATEWAY_CAPABILITIES.ordinaryBindWake,
-      GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake,
-      GATEWAY_CAPABILITIES.runtimeBindLock,
-      GATEWAY_CAPABILITIES.ordinaryClaudeBind,
-      GATEWAY_CAPABILITIES.agentHandledWithoutPost,
-      GATEWAY_CAPABILITIES.agentRequestWithdrawal,
-      GATEWAY_CAPABILITIES.watcherNoticeIngress,
-      GATEWAY_CAPABILITIES.courierRecovery
-    ]
-  }), { mode: 0o600 });
-  fs.chmodSync(pidFile, 0o600);
-}
-
-function acquireHeldLock(lockPath) {
-  const parentPid = String(process.pid);
-  const holderScript = [
-    "const parentPid = Number(process.env.DISCORD_SURFACE_LOCK_PARENT_PID);",
-    "process.stdout.write('locked\\n');",
-    "process.stdin.resume();",
-    "process.stdin.once('end', () => process.exit(0));",
-    "setInterval(() => { try { process.kill(parentPid, 0); } catch { process.exit(0); } }, 100);"
-  ].join('');
-  const holder = spawn('lockf', ['-t', '1', '-k', lockPath, process.execPath, '-e', holderScript], {
-    stdio: ['pipe', 'pipe', 'inherit'],
-    env: { ...process.env, DISCORD_SURFACE_LOCK_PARENT_PID: parentPid }
-  });
-  let ready = false;
-  let settled = false;
-  let output = '';
-  const acquired = new Promise((resolve, reject) => {
-    const fail = error => {
-      if (settled) return;
-      settled = true;
-      reject(error);
-    };
-    holder.stdout.setEncoding('utf8');
-    holder.stdout.on('data', chunk => {
-      if (ready) return;
-      output += String(chunk);
-      if (!output.includes('locked')) return;
-      ready = true;
-      settled = true;
-      resolve();
-    });
-    holder.once('error', fail);
-    holder.once('exit', (code, signal) => {
-      if (ready) return;
-      const error = new Error(`could not acquire runtime bind lock${signal ? ` (${signal})` : ` (exit ${code})`}`);
-      if (!signal && code === LOCK_CONTENTION_EXIT) error.code = 'RUNTIME_BIND_LOCK_BUSY';
-      fail(error);
-    });
-  });
-  return acquired.then(() => {
-    let released = false;
-    return {
-      async release() {
-        if (released) return;
-        released = true;
-        try { holder.stdin.end(); } catch {}
-        if (holder.exitCode === null && holder.signalCode === null) await once(holder, 'exit');
-      }
-    };
-  });
-}
-
-async function acquireHeldLockUntilAvailable(lockPath, isStopping) {
-  let reportedContention = false;
-  while (!isStopping?.()) {
-    try {
-      const lock = await acquireHeldLock(lockPath);
-      const stopping = isStopping?.();
-      if (stopping) {
-        await lock.release();
-        return null;
-      }
-      return lock;
-    }
-    catch (error) {
-      if (error.code !== 'RUNTIME_BIND_LOCK_BUSY') throw error;
-      if (!reportedContention) {
-        reportedContention = true;
-        process.stderr.write('discord-surface: runtime bind lock is busy; waiting for the holder to release it\n');
-      }
-      if (isStopping?.()) return null;
-      await new Promise(resolve => setTimeout(resolve, 50));
-    }
-  }
-  return null;
-}
 
 function createBindingWakeController({ getGateway, isReady, isTransportReady = isReady, isStopping, probeClaudeChannel = require('./native').probeClaudeChannel,
   logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {
