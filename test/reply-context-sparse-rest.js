@@ -138,4 +138,3 @@ test('22: a mismatching guild_id or a non-boolean author.bot rejects the excerpt
   // with no retry or second lookup after the validator rejects.
   assert.equal(cacheCalls, 2);
 });
-

@@ -114,4 +114,3 @@ test('9: excerpt truncates on code-point boundaries and bot authorship needs the
   assert.doesNotMatch(context.excerpt, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
   assert.equal(context.isBotAuthor, false);
 });
-

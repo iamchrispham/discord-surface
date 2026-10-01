@@ -171,4 +171,3 @@ test('18: both entrypoints preserve context, and a stale expected binding refuse
   assert.equal(state.getMessage('1003'), null);
   assert.equal(state.listMessages().length, 2);
 });
-

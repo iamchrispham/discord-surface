@@ -180,4 +180,3 @@ test('14: an invalid reference id and non-positive or non-finite budgets make no
   assert.equal(restCalls, 0);
   for (const id of ['1001', '1002', '1003']) assert.equal(state.getMessage(id).replyContext.excerpt, '');
 });
-

@@ -130,4 +130,3 @@ test('4: REST fallback context round-trips across a close and reopen of the same
     reopened.close();
   }
 });
-
