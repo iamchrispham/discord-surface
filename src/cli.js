@@ -33,7 +33,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 
 const { pathToFileURL } = require('node:url');
 const { SurfaceState, BindingError, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
-const { DiscordGateway, discordIdAfter, readSecret, requireInstalled, waitForRecoveryOperation } = require('./discord');
+const { DiscordGateway, RECOVERY_POLICIES, discordIdAfter, readSecret, requireInstalled, waitForRecoveryOperation } = require('./discord');
 const { enrollPublicThread } = require('./discord/thread-enrollment');
 const { readAdoptionCutoff } = require('./discord/history-access');
 const {
@@ -836,7 +836,9 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
         if (!currentGateway || !isTransportReady?.()) return;
         const joinedRecovery = Boolean(currentGateway.recoveryPromise);
         currentGateway.pauseLiveDispatch?.();
-        const recovery = await currentGateway.recoverTransport('ordinary-bind');
+        const recovery = await currentGateway.recoverTransport('ordinary-bind', undefined, undefined, undefined, {
+          recoveryPolicy: RECOVERY_POLICIES.UNRESOLVED
+        });
         if (joinedRecovery) {
           wakeRequested = true;
           continue;

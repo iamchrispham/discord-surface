@@ -56,6 +56,10 @@ const PENDING_HANDOFF_RECOVERY_POLL_MS = 100;
 const INTERACTION_CALLBACK_TIMEOUT_MS = 2500;
 const RECOVERY_WAITER_DEADLINE_GRACE_MS = 250;
 const CLOSING_CUSTODY_DETAIL = 'live Discord custody arrived while recovery readiness was closing';
+const RECOVERY_POLICIES = Object.freeze({
+  FULL: 'full',
+  UNRESOLVED: 'unresolved'
+});
 const INTERACTION_REJECTION_MESSAGES = Object.freeze({
   'inactive-binding': 'This channel is not connected to an active status session.',
   'binding-not-ready': 'The status session is still recovering. Try again shortly.',
@@ -2562,13 +2566,14 @@ class DiscordGateway {
     return failure || { ready: true, state: 'ready' };
   }
 
-  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null) {
+  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null,
+    { recoveryPolicy = RECOVERY_POLICIES.FULL } = {}) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
     const overallDeadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
     let callerScope = null;
     if (channelIds !== null && channelIds !== undefined) {
       callerScope = new Set(channelIds);
-    } else if (reason === 'ordinary-bind') {
+    } else if (recoveryPolicy === RECOVERY_POLICIES.UNRESOLVED) {
       callerScope = new Set([
         ...this.state.listBindings()
           .filter(binding => binding.active && (binding.readiness !== READINESS.READY ||
@@ -3338,6 +3343,7 @@ class DiscordGateway {
 
 module.exports = {
   DiscordGateway,
+  RECOVERY_POLICIES,
   classifyReplyError,
   createSurfaceConsumer,
   discordIdAfter,
