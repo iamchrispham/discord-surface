@@ -71,6 +71,36 @@ test('persisted courier input checks invocation identity consistency', t => {
   assert.equal(successfulRead(result.stdout), null, result.stdout);
 });
 
+test('persisted courier input accepts dash-prefixed route ids', t => {
+  const f = createCourierFixture(t, { routeId: '--dash-route' });
+  const attempt = persistedSubmittedAttempt(f);
+  const result = runCourierInput(f, { messageId: attempt.messageId, attemptId: attempt.attemptId });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    threadId: attempt.envelope.recipient.threadId,
+    prompt: attempt.envelope.prompt,
+    hostId: f.hostId
+  });
+});
+
+test('persisted courier input compares UUID native ids canonically', t => {
+  const courierNative = 'ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF';
+  const f = createCourierFixture(t, { courierNative });
+  const attempt = persistedSubmittedAttempt(f);
+  const lowerNative = courierNative.toLowerCase();
+  const result = runCourierInput(f, {
+    messageId: attempt.messageId,
+    attemptId: attempt.attemptId,
+    env: { CODEX_SESSION_ID: lowerNative, CODEX_THREAD_ID: lowerNative }
+  });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    threadId: attempt.envelope.recipient.threadId,
+    prompt: attempt.envelope.prompt,
+    hostId: f.hostId
+  });
+});
+
 test('persisted courier input opens the database read-only', t => {
   const f = createCourierFixture(t);
   const attempt = persistedSubmittedAttempt(f);
@@ -113,7 +143,7 @@ test('courier program forwards parsed persisted input without transcription', as
   if (attempt.envelope.recipient.hostId) expectedInput.hostId = attempt.envelope.recipient.hostId;
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
-  const run = async exit => {
+  const run = async (exit, settled = null) => {
     const calls = [];
     const sends = [];
     const known = {
@@ -126,6 +156,11 @@ test('courier program forwards parsed persisted input without transcription', as
         calls.push('send_message_to_thread');
         sends.push(input);
         return { status: 'sent' };
+      },
+      write_stdin: async input => {
+        calls.push('write_stdin');
+        assert.equal(input.session_id, 'reader-1');
+        return settled;
       }
     };
     const tools = new Proxy(known, {
@@ -156,6 +191,16 @@ test('courier program forwards parsed persisted input without transcription', as
 
   const malformed = await run({ exit_code: 0, output: '{not json' });
   assert.deepEqual(malformed.calls, ['exec_command', 1000000], 'malformed exec stdout must not send');
+
+  const serialized = JSON.stringify(expectedInput);
+  const midpoint = Math.floor(serialized.length / 2);
+  const yielded = await run(
+    { session_id: 'reader-1', output: serialized.slice(0, midpoint) },
+    { session_id: 'reader-1', exit_code: 0, output: serialized.slice(midpoint) }
+  );
+  assert.deepEqual(yielded.calls, ['exec_command', 1000000, 'write_stdin', 'send_message_to_thread'],
+    'yielded reader output must be completed before sending');
+  assert.deepEqual(yielded.sends, [expectedInput]);
 });
 
 test('courier input refuses revoked route without mutation', t => {

@@ -700,7 +700,7 @@ class DiscordGateway {
             path.join(__dirname, 'cli.js'),
             'courier-input',
             '--db', state.dbPath,
-            '--courier-route-id', routeId,
+            `--courier-route-id=${routeId}`,
             '--message-id', messageId,
             '--attempt-id', attemptId,
             '--native-id', nativeId

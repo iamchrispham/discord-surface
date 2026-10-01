@@ -21,7 +21,13 @@ const CLI_PATH = path.resolve(__dirname, '..', 'src', 'cli.js');
 const TIMEOUT_MS = 5000;
 const MAX_BUFFER = 1024 * 1024;
 
-function createCourierFixture(t, { hostId = 'host-local', dbDirName = null, prompt = 'forward this prepared parent instruction' } = {}) {
+function createCourierFixture(t, {
+  hostId = 'host-local',
+  dbDirName = null,
+  prompt = 'forward this prepared parent instruction',
+  routeId = 'route-1',
+  courierNative = COURIER_NATIVE
+} = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-courier-input-'));
   let state = null;
   t.after(() => {
@@ -59,7 +65,7 @@ function createCourierFixture(t, { hostId = 'host-local', dbDirName = null, prom
   assert.equal(accepted.accepted, true, `fixture message refused: ${accepted.reason}`);
 
   const route = {
-    routeId: 'route-1',
+    routeId,
     routeGeneration: 1,
     guildId: '100',
     parentChannelId: '1000',
@@ -67,7 +73,7 @@ function createCourierFixture(t, { hostId = 'host-local', dbDirName = null, prom
     target: { guildId: '100', channelId: '2000', provider: 'codex', nativeId: PARENT_NATIVE, generation: binding.generation },
     courier: {
       provider: 'codex',
-      nativeId: COURIER_NATIVE,
+      nativeId: courierNative,
       workspace: dir,
       sessionRoot,
       recipientThreadId: RECIPIENT_THREAD,
@@ -124,14 +130,14 @@ function snapshotAllTables(state) {
   return snapshot;
 }
 
-function readArgvFor(f, { messageId, attemptId, nativeId = COURIER_NATIVE } = {}) {
+function readArgvFor(f, { messageId, attemptId, nativeId = f.route.courier.nativeId } = {}) {
   return [
     process.execPath,
     '--disable-warning=ExperimentalWarning',
     CLI_PATH,
     'courier-input',
     '--db', f.dbPath,
-    '--courier-route-id', f.route.routeId,
+    `--courier-route-id=${f.route.routeId}`,
     '--message-id', messageId,
     '--attempt-id', attemptId,
     '--native-id', nativeId
@@ -144,8 +150,8 @@ function runCourierInput(f, { cwd = f.workspace, env = {}, ...selection } = {}) 
     cwd,
     env: {
       ...process.env,
-      CODEX_SESSION_ID: COURIER_NATIVE,
-      CODEX_THREAD_ID: COURIER_NATIVE,
+      CODEX_SESSION_ID: f.route.courier.nativeId,
+      CODEX_THREAD_ID: f.route.courier.nativeId,
       ...env
     },
     encoding: 'utf8',

@@ -103,7 +103,7 @@ test('default Gateway provider uses current package input reader', async t => {
       CLI_PATH,
       'courier-input',
       '--db', f.dbPath,
-      '--courier-route-id', f.route.routeId,
+      `--courier-route-id=${f.route.routeId}`,
       '--message-id', attempt.messageId,
       '--attempt-id', attempt.attemptId,
       '--native-id', COURIER_NATIVE

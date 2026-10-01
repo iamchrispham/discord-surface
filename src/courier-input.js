@@ -11,6 +11,12 @@ function required(args, key) {
   return value;
 }
 
+function canonicalNativeId(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+    ? value.toLowerCase()
+    : value;
+}
+
 // Reads the exact persisted tool input for one admitted courier attempt and
 // prints it as JSON so a native host can forward the parsed object instead of a
 // model-transcribed copy. This command never claims forwarding permission and
@@ -32,7 +38,7 @@ function courierInput(args, dependencies = {}) {
   const attemptId = requiredFlag(options, 'attempt-id');
   const nativeId = requiredFlag(options, 'native-id');
   const invocation = resolveIdentity(environment);
-  if (nativeId !== invocation.sessionId) {
+  if (canonicalNativeId(nativeId) !== canonicalNativeId(invocation.sessionId)) {
     throw new Error('courier native id does not match the invocation identity');
   }
 
