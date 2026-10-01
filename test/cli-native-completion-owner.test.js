@@ -74,7 +74,17 @@ test('native completion command ownership', () => {
   const factories = functionDeclarations(companionSource, new Set([FACTORY_NAME]));
   assert.equal(factories.length, 1, `expected exactly one ${FACTORY_NAME} declaration`);
   const factory = factories[0];
-  const nested = functionDeclarations(factory, new Set(HANDLER_NAMES));
+  const nested = factory.body.statements.filter(ts.isFunctionDeclaration)
+    .filter(declaration => HANDLER_NAMES.includes(declaration.name?.text));
+  assert.deepEqual(functionDeclarations(companionSource, new Set(HANDLER_NAMES)), nested,
+    'handlers must occur only directly inside the factory');
+  for (const relativePath of fs.readdirSync(SRC_ROOT, { recursive: true })) {
+    if (!/\.(?:js|ts)$/.test(relativePath)) continue;
+    const sourcePath = path.join(SRC_ROOT, relativePath);
+    if (sourcePath === COMPANION_PATH) continue;
+    assert.equal(functionDeclarations(parseFile(sourcePath), new Set(HANDLER_NAMES)).length, 0,
+      `native completion handlers must not be declared in ${relativePath}`);
+  }
   assert.deepEqual(nested.map(declaration => declaration.name.text), HANDLER_NAMES,
     'companion must nest one declaration of each handler in order');
 
