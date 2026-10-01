@@ -20,6 +20,7 @@ const {
   transcript
 } = require('./ordinary-codex-fixture');
 const { fixture: recoveryFixture } = require('./helpers/intake-recovery-fixture');
+const { ChannelType } = require('discord.js');
 
 test('ordinary bind uses the server fence as its adoption cutoff', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-bind-empty-cutoff-'));
@@ -299,7 +300,7 @@ test('binding wake starts when reconnect transport is ready after partial recove
   assert.deepEqual(calls, ['recover:ordinary-bind', 'reconcile']);
 });
 
-test('ready completion wake does not demote an unrelated healthy route', { timeout: 5000, todo: 'issue #195: completion wake demotes a healthy route' }, async t => {
+test('ready completion wake does not demote an unrelated healthy route', { timeout: 5000 }, async t => {
   const f = recoveryFixture(t);
   f.gateway.ready = true;
   f.gateway.transportReady = true;
@@ -339,4 +340,140 @@ test('a pending route is still recovered by the public binding wake', { timeout:
   assert.equal(f.state.getBinding('1000').readiness, 'ready');
   assert.equal(f.boundary('2000').state, 'ready');
   assert.ok(f.calls.some(call => call.id === '1000' && call.kind === 'history'));
+});
+
+function observeReadiness(f, t) {
+  const changes = [];
+  const original = f.state.setBindingReadiness.bind(f.state);
+  t.mock.method(f.state, 'setBindingReadiness', (...args) => {
+    changes.push({ channelId: args[0], readiness: args[1] });
+    return original(...args);
+  });
+  return changes;
+}
+
+function completionWake(f) {
+  return createBindingWakeController({
+    getGateway: () => f.gateway,
+    isReady: () => f.gateway.ready,
+    isTransportReady: () => f.gateway.transportReady,
+    isStopping: () => f.gateway.stopping
+  });
+}
+
+test('ordinary-bind wake recovers a pending child without touching its ready parent', { timeout: 5000 }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  f.state.markThreadBoundary('2000', 'pending', 'fixture pending child');
+  const changes = observeReadiness(f, t);
+  const wake = completionWake(f);
+  wake.request();
+  await wake.wait();
+  assert.equal(f.state.getThreadEnrollment('2000').state, 'ready');
+  assert.ok(f.calls.some(call => call.id === '2000' && call.kind === 'history'),
+    'the pending child must be recovered');
+  assert.equal(f.calls.some(call => call.id === '1000'), false,
+    'the ready parent must not be re-fetched by a completion wake');
+  assert.equal(changes.some(change => change.channelId === '1000'), false,
+    'the ready parent must not be demoted by a completion wake');
+  assert.equal(f.state.getBinding('1000').readiness, 'ready');
+});
+
+test('ordinary-bind wake recovers only a pending second parent beside ready parent and child', { timeout: 5000 }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  const secondParent = {
+    id: '3000', guildId: 'guild', type: ChannelType.GuildText, parentId: null, isThread: () => false,
+    permissionsFor: () => ({ has: () => true }),
+    async send() { return { id: 'reply-3000' }; },
+    messages: { async fetch() { return { async react() {} }; } }
+  };
+  f.channels.set('3000', secondParent);
+  f.history.set('3000', []);
+  f.state.bind({
+    channelId: '3000', guildId: 'guild', provider: PROVIDERS.CODEX,
+    nativeId: '22222222-2222-2222-2222-222222222222', workspace: f.state.getBinding('1000').workspace,
+    readiness: 'pending'
+  }, { intakeCutoff: '100' });
+  f.state.setIntakeBaseline('3000', '100', 'fixture second parent');
+  const changes = observeReadiness(f, t);
+  const wake = completionWake(f);
+  wake.request();
+  await wake.wait();
+  assert.equal(f.state.getBinding('3000').readiness, 'ready');
+  assert.equal(f.state.getIntakeWatermark('3000').state, 'ready');
+  assert.ok(f.calls.some(call => call.id === '3000' && call.kind === 'history'),
+    'the pending second parent must be recovered');
+  assert.equal(f.calls.some(call => call.id === '1000'), false,
+    'the ready first parent must not be re-fetched');
+  assert.equal(f.calls.some(call => call.id === '2000'), false,
+    'the ready enrolled child must not be re-fetched');
+  assert.deepEqual(changes, [{ channelId: '3000', readiness: 'recovering' }]);
+});
+
+test('startup recovery still performs a full fresh pass over ready routes', { timeout: 5000 }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  const wake = completionWake(f);
+  wake.request();
+  await wake.wait();
+  assert.deepEqual(f.calls, [], 'a completion wake must not re-fetch already-ready routes');
+  const result = await f.gateway.recoverTransport('startup');
+  assert.equal(result.ready, true);
+  assert.ok(f.calls.some(call => call.id === '1000' && call.kind === 'history'),
+    'startup must refresh the ready parent');
+  assert.ok(f.calls.some(call => call.id === '2000' && call.kind === 'history'),
+    'startup must refresh the ready enrolled child');
+});
+
+test('reconnect recovery still performs a full fresh pass over ready routes', { timeout: 5000 }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  await f.reopen();
+  const result = await f.gateway.recoverTransport('reconnect');
+  assert.equal(result.ready, true);
+  assert.ok(f.calls.some(call => call.id === '1000' && call.kind === 'history'),
+    'reconnect must refresh the ready parent');
+  assert.ok(f.calls.some(call => call.id === '2000' && call.kind === 'history'),
+    'reconnect must refresh the ready enrolled child');
+  assert.equal(f.state.getBinding('1000').readiness, 'ready');
+  assert.equal(f.state.getThreadEnrollment('2000').state, 'ready');
+});
+
+test('explicit ordinary-bind scope still recovers an already-ready parent', { timeout: 5000 }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  const changes = observeReadiness(f, t);
+  const result = await f.gateway.recoverTransport('ordinary-bind', f.gateway.lifecycleEpoch, new Set(['1000']));
+  assert.equal(result.ready, true);
+  assert.ok(f.calls.some(call => call.id === '1000' && call.kind === 'history'),
+    'an explicit scope must still recover the ready parent');
+  assert.ok(changes.some(change => change.channelId === '1000' && change.readiness === 'recovering'),
+    'an explicit scope must re-run the readiness transition');
+  assert.equal(f.state.getBinding('1000').readiness, 'ready');
+});
+
+test('ordinary-bind wake recovers a ready parent whose watermark is unknown', { timeout: 5000 }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  f.state.db.prepare('DELETE FROM intake_watermarks WHERE channel_id=?').run('1000');
+  assert.equal(f.state.getIntakeWatermark('1000'), null);
+  const changes = observeReadiness(f, t);
+  const wake = completionWake(f);
+  wake.request();
+  await wake.wait();
+  assert.ok(f.calls.some(call => call.id === '1000' && call.kind === 'channel'),
+    'an unknown watermark must still be selected for recovery');
+  assert.ok(changes.some(change => change.channelId === '1000' && change.readiness === 'recovering'),
+    'an unknown watermark must re-run the readiness transition');
+  assert.equal(f.state.getIntakeWatermark('1000').state, 'pending',
+    'an unknown watermark without a qualified cursor must be held pending, not silently ready');
+  assert.equal(f.calls.some(call => call.id === '2000'), false,
+    'the ready enrolled child must not be re-fetched once its parent is held');
 });
