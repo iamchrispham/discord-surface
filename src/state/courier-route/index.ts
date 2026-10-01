@@ -12,6 +12,7 @@ import {
   COURIER_ATTEMPT_STATES,
   COURIER_DELIVERY_STATUSES,
   COURIER_OUTCOMES,
+  COURIER_OUTCOME_REASONS,
   COURIER_RECEIPT_KINDS,
   COURIER_RECOVERY_REASONS,
   COURIER_RECOVERY_SOURCES,
@@ -22,6 +23,7 @@ import {
   PROMPT_PREFIX
 } from './constants';
 import { createEnvelope } from './envelope';
+import { isConfirmedCourierGuardRefusal, isCourierGuardRefusalReason } from './guard-refusal';
 import { getCourierDeliveryStatus, recoverCourierAttempt } from './recovery';
 import { getRoute, isCourierOriginAllowed, listRoutes, registerRoute, revokeRoute } from './route';
 import type { CourierDependencies, CourierState } from './types';
@@ -53,6 +55,7 @@ export {
   COURIER_ATTEMPT_STATES,
   COURIER_DELIVERY_STATUSES,
   COURIER_OUTCOMES,
+  COURIER_OUTCOME_REASONS,
   COURIER_RECEIPT_KINDS,
   COURIER_RECOVERY_REASONS,
   COURIER_RECOVERY_SOURCES,
@@ -63,9 +66,12 @@ export {
   PROMPT_PREFIX,
   canonicalWorkspace,
   createEnvelope,
+  isConfirmedCourierGuardRefusal,
+  isCourierGuardRefusalReason,
   isCourierOriginAllowed,
   matchesFixedRecipient
 };
 
 export * from './types';
 export type { RouteMatch } from './route';
+export type { CourierGuardRefusalReason } from './guard-refusal';

@@ -21,6 +21,7 @@ const {
   TOKEN,
   addSyntheticAttempt,
   createFixture,
+  directConsumer,
   forwardEvent,
   markSubmitted,
   rowsFor,
@@ -53,31 +54,6 @@ function deferred() {
   let resolve;
   const promise = new Promise(settle => { resolve = settle; });
   return { promise, resolve };
-}
-
-function directConsumer(fixture, { dispatch = [], observe = [], courier = [] } = {}) {
-  return createSurfaceConsumer({
-    state: fixture.state,
-    courierRoute: { routeId: fixture.route.routeId },
-    providers: {
-      codex: {
-        async dispatchCourier(envelope) {
-          courier.push(envelope.packet.id);
-          return { status: COURIER_OUTCOMES.SUBMITTED };
-        },
-        async dispatch(message) {
-          dispatch.push(message.id);
-          return { status: COURIER_OUTCOMES.SUBMITTED };
-        },
-        async observe(message) {
-          observe.push(message.id);
-          return { text: `answer for ${message.id}` };
-        }
-      }
-    },
-    sendReply: async () => ({ id: 'reply' }),
-    sendTransportReceipt: async () => ({ id: 'receipt' })
-  });
 }
 
 test('eligible recovery retires the attempt and leaves every unrelated row byte-identical', t => {
