@@ -6,10 +6,17 @@ const os = require('node:os');
 const path = require('node:path');
 const { gatewayProcessStatus, GATEWAY_CAPABILITIES, createBindingWakeController, ordinaryBind, pathsFor, requestGatewayRecovery } = require('../src/cli');
 const { SurfaceState, PROVIDERS, READINESS } = require('../src/state');
+const { RECOVERY_POLICIES } = require('../src/discord');
 const { fixture: recoveryFixture } = require('./helpers/intake-recovery-fixture');
 const { ChannelType } = require('discord.js');
 
 const CODEX = '9caa5d21-2169-429d-918b-5f08651b5dbd';
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(finish => { resolve = finish; });
+  return { promise, resolve };
+}
 
 test('ordinary binding wake reaches runtime recovery and refuses disabled wake capability', async t => {
   const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-registered-wake-'));
@@ -287,6 +294,62 @@ test('ready completion wake does not demote an unrelated healthy route', { timeo
   assert.equal(f.boundary('2000').state, 'ready');
   assert.equal(changes.some(change => change.channelId === '1000' && change.readiness === 'recovering'), false,
     'completion-only wake must not temporarily hold a healthy route');
+});
+
+test('scoped completion wake keeps a healthy route live during selected recovery', { timeout: 5000 }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  f.enableDelivery();
+  const secondParent = {
+    id: '3000', guildId: 'guild', type: ChannelType.GuildText, parentId: null, isThread: () => false,
+    permissionsFor: () => ({ has: () => true }),
+    async send() { return { id: 'reply-3000' }; },
+    messages: { async fetch() { return { async react() {} }; } }
+  };
+  f.channels.set('3000', secondParent);
+  f.history.set('3000', []);
+  f.state.bind({
+    channelId: '3000', guildId: 'guild', provider: PROVIDERS.CODEX,
+    nativeId: '22222222-2222-2222-2222-222222222222', workspace: f.state.getBinding('1000').workspace,
+    readiness: READINESS.PENDING
+  }, { intakeCutoff: '100' });
+  f.state.setIntakeBaseline('3000', '100', 'fixture second parent');
+  const entered = deferred();
+  const release = deferred();
+  const originalFetchHistory = f.gateway.fetchHistory.bind(f.gateway);
+  f.gateway.fetchHistory = async (channel, options) => {
+    if (channel.id === '3000') {
+      entered.resolve();
+      await release.promise;
+    }
+    return originalFetchHistory(channel, options);
+  };
+  const wake = completionWake(f);
+  wake.request();
+  await entered.promise;
+  f.gateway.boundMessage(f.message('101', '1000'));
+  await Promise.all([...f.gateway.inFlight]);
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getMessage('101').state, 'replied',
+    'a healthy route must dispatch while the selected route recovers');
+  release.resolve();
+  await wake.wait();
+  assert.equal(f.state.getBinding('3000').readiness, READINESS.READY);
+});
+
+test('empty unresolved recovery stays paused after a disconnect', { timeout: 5000 }, async t => {
+  const f = recoveryFixture(t);
+  f.gateway.ready = true;
+  f.gateway.transportReady = true;
+  const recovery = f.gateway.recoverTransport('ordinary-bind', f.gateway.lifecycleEpoch, null, null, {
+    recoveryPolicy: RECOVERY_POLICIES.UNRESOLVED
+  });
+  f.gateway.pauseConnection('fixture disconnect');
+  const result = await recovery;
+  assert.equal(result.state, 'stopped');
+  assert.equal(f.gateway.ready, false);
+  assert.equal(f.gateway.transportReady, false);
 });
 
 test('a pending route is still recovered by the public binding wake', { timeout: 5000 }, async t => {

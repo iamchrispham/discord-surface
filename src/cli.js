@@ -835,7 +835,6 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
         const currentGateway = getGateway?.();
         if (!currentGateway || !isTransportReady?.()) return;
         const joinedRecovery = Boolean(currentGateway.recoveryPromise);
-        currentGateway.pauseLiveDispatch?.();
         const recovery = await currentGateway.recoverTransport('ordinary-bind', undefined, undefined, undefined, {
           recoveryPolicy: RECOVERY_POLICIES.UNRESOLVED
         });
@@ -844,15 +843,15 @@ function createBindingWakeController({ getGateway, isReady, isTransportReady = i
           continue;
         }
         if (!isStopping?.()) {
-          if (isReady?.()) {
+          if (isReady?.() && isTransportReady?.()) {
             if (recovery?.ready) await currentGateway.reconcilePending();
-            else await currentGateway.reconcilePending(undefined, { readyOnly: true });
+            else await currentGateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
           }
-          else if (['gap', 'unavailable'].includes(recovery?.state)) {
+          else if (isTransportReady?.() && ['gap', 'unavailable'].includes(recovery?.state)) {
             await currentGateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
           }
         }
-        if (!isStopping?.()) await reoffer.run({ gateway: currentGateway, isStopping });
+        if (!isStopping?.() && isTransportReady?.()) await reoffer.run({ gateway: currentGateway, isStopping });
       }
     })().catch(logger).finally(() => {
       wakePromise = null;

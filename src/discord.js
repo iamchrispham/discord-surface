@@ -1993,6 +1993,7 @@ class DiscordGateway {
   }
 
   async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null) {
+    if (signal?.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
     const deadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
     let baseReason = String(reason || '');
     let previousReason;
@@ -2715,6 +2716,7 @@ class DiscordGateway {
       this.recoveryActiveWaiters = new Set(activeWaiters.filter(waiter => !waiter.settled));
       this.recoveryController = new AbortController();
       const controller = this.recoveryController;
+      const connectionEpoch = this.connectionEpoch;
       let resolvePass;
       let rejectPass;
       const activeRecovery = new Promise((resolve, reject) => {
@@ -2726,11 +2728,11 @@ class DiscordGateway {
         try {
           const result = await this.recoverInbound(controller.signal, passReason, passLifecycle,
             scope === null ? null : new Set(scope), deadline);
-          const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
-          if (!this.isCurrentLifecycle(passLifecycle)) {
+          if (controller.signal.aborted || connectionEpoch !== this.connectionEpoch || !this.isCurrentLifecycle(passLifecycle)) {
             resolvePass({ ready: false, state: 'stopped' });
             return;
           }
+          const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
           this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
           resolvePass(result);
         } catch (error) {
