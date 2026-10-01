@@ -88,7 +88,7 @@ async function runSharedBudget(slowFirst) {
       assert.equal(state.getIntakeWatermark('1000').recovered_through_id, '100');
       assert.equal(second.ready, false);
     } else {
-      assert.deepEqual(preflights.slice(before), channels);
+      assert.deepEqual(preflights.slice(before), []);
       assert.equal(second.ready, true);
     }
     assert.equal(state.getMessage('102').state, 'accepted');
