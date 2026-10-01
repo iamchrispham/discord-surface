@@ -222,6 +222,36 @@ test('incomplete or unqualified guard outcomes remain refused', t => {
       }
     },
     {
+      name: 'bare forwarding authorization prefix',
+      custody: 'accepted',
+      prepare(f, claim) {
+        f.state.recordCourierOutcome(f.messageId, claim.attempt.attemptId, COURIER_OUTCOMES.NOT_SUBMITTED, {
+          reason: MARKER,
+          guardReason: 'courier forwarding authorization '
+        });
+      }
+    },
+    {
+      name: 'unknown forwarding authorization status',
+      custody: 'accepted',
+      prepare(f, claim) {
+        f.state.recordCourierOutcome(f.messageId, claim.attempt.attemptId, COURIER_OUTCOMES.NOT_SUBMITTED, {
+          reason: MARKER,
+          guardReason: 'courier forwarding authorization bogus'
+        });
+      }
+    },
+    ...['claimed', 'duplicate', 'settled'].map(status => ({
+      name: `authorization status not emitted by the guard: ${status}`,
+      custody: 'accepted',
+      prepare(f, claim) {
+        f.state.recordCourierOutcome(f.messageId, claim.attempt.attemptId, COURIER_OUTCOMES.NOT_SUBMITTED, {
+          reason: MARKER,
+          guardReason: `courier forwarding authorization ${status}`
+        });
+      }
+    })),
+    {
       name: 'generic NOT_SUBMITTED',
       custody: 'accepted',
       prepare(f, claim) {

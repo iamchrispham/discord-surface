@@ -15,7 +15,9 @@ import {
   type CourierResultStatus,
   type CourierRoute,
   type RouteMatch,
-  type CourierState
+  type CourierState,
+  isConfirmedCourierGuardRefusal,
+  isCourierGuardRefusalReason
 } from '../src/state/courier-route';
 import { readCourierInput } from '../src/state/courier-route/input';
 import type { ForwardState } from '../src/state/courier-route/forward';
@@ -97,10 +99,12 @@ const attempt: CourierAttempt = {
 const outcome: CourierOutcome = COURIER_OUTCOMES.SUBMITTED;
 const resultStatus: CourierResultStatus = 'claimed';
 const routeMatch: RouteMatch = { status: null, route };
+const guardRefusalReason = isCourierGuardRefusalReason('courier forwarding authorization stale');
 const record: CourierAttemptRecord = {
   attempt,
   outcome: { attemptId: attempt.attemptId, outcome }
 };
+const confirmedGuardRefusal = isConfirmedCourierGuardRefusal(record.outcome);
 const state = null as unknown as CourierState;
 const forwardState = null as unknown as ForwardState;
 const dependencies = null as unknown as CourierDependencies;
@@ -121,4 +125,6 @@ const invalidCourier: CourierIdentity = { ...courier, provider: 'spark' };
 void record;
 void resultStatus;
 void routeMatch;
+void guardRefusalReason;
+void confirmedGuardRefusal;
 void invalidCourier;

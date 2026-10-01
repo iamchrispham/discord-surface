@@ -1,4 +1,4 @@
-import { COURIER_OUTCOMES, COURIER_OUTCOME_REASONS } from './constants';
+import { COURIER_OUTCOMES, COURIER_OUTCOME_REASONS, COURIER_RESULT_STATUSES } from './constants';
 import type { CourierOutcomeRecord } from './types';
 
 // Issue196 pre-host guard-refusal evidence. The guard producer in
@@ -14,6 +14,14 @@ const GUARD_REFUSAL_REASONS = [
 ] as const;
 
 const FORWARDING_AUTHORIZATION_PREFIX = 'courier forwarding authorization ' as const;
+const FORWARDING_AUTHORIZATION_REASONS = new Set(
+  [
+    COURIER_RESULT_STATUSES.NO_ROUTE,
+    COURIER_RESULT_STATUSES.STALE,
+    COURIER_RESULT_STATUSES.HELD,
+    COURIER_RESULT_STATUSES.CONFLICT
+  ].map(status => `${FORWARDING_AUTHORIZATION_PREFIX}${status}`)
+);
 
 // True only for a reason the pre-host guard actually refuses with: one of the
 // three fixed refusal reasons, or a forwarding-authorization refusal carrying
@@ -21,7 +29,7 @@ const FORWARDING_AUTHORIZATION_PREFIX = 'courier forwarding authorization ' as c
 export function isCourierGuardRefusalReason(reason: unknown): boolean {
   return typeof reason === 'string' &&
     ((GUARD_REFUSAL_REASONS as readonly string[]).includes(reason) ||
-      reason.startsWith(FORWARDING_AUTHORIZATION_PREFIX));
+      FORWARDING_AUTHORIZATION_REASONS.has(reason));
 }
 
 // True only for a persisted outcome record that proves the guard refused before
