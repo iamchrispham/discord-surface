@@ -18,6 +18,17 @@ const {
 const { createSurfaceConsumer } = require('../src/discord');
 const { persistGuardRefusal } = require('../src/courier-guard');
 const { TOKEN, PARENT_NATIVE, SOURCE_NATIVE, COURIER_NATIVE, RECIPIENT_THREAD, WRONG_RECIPIENT_THREAD, fixture, humanMessage, interactionMessage, materializedDecisionMessage, parentPrompt, preparedInput, consumerFor } = require('./courier-route-fixture');
+test('courier fixture captures its populated transcript cursor', t => {
+  const f = fixture(t);
+  fs.appendFileSync(f.sessionFile, 'partial transcript ☃');
+  const cursor = preparedInput(f, f.message).observerCursor;
+  const transcript = fs.readFileSync(f.sessionFile);
+  assert.equal(cursor.file, f.sessionFile);
+  assert.equal(cursor.offset, transcript.length);
+  const tail = transcript.subarray(transcript.lastIndexOf(0x0a) + 1);
+  assert.equal(cursor.tail, tail.toString('utf8'));
+  assert.equal(cursor.tailBytes, tail.toString('base64'));
+});
 test('courier route registration rejects a Claude parent', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-courier-claude-route-'));
   const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
