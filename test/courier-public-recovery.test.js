@@ -8,7 +8,6 @@ const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const { encodeAgentMessage } = require('../src/agent-message');
 const { codexPrompt } = require('../src/native');
 const { recoverCourier } = require('../src/cli');
-const { persistGuardRefusal } = require('../src/courier-guard');
 const { createSurfaceConsumer } = require('../src/discord');
 const {
   COURIER_DELIVERY_STATUSES,
@@ -22,6 +21,7 @@ const {
   TOKEN,
   addSyntheticAttempt,
   createFixture,
+  directConsumer,
   forwardEvent,
   markSubmitted,
   rowsFor,
@@ -54,31 +54,6 @@ function deferred() {
   let resolve;
   const promise = new Promise(settle => { resolve = settle; });
   return { promise, resolve };
-}
-
-function directConsumer(fixture, { dispatch = [], observe = [], courier = [] } = {}) {
-  return createSurfaceConsumer({
-    state: fixture.state,
-    courierRoute: { routeId: fixture.route.routeId },
-    providers: {
-      codex: {
-        async dispatchCourier(envelope) {
-          courier.push(envelope.packet.id);
-          return { status: COURIER_OUTCOMES.SUBMITTED };
-        },
-        async dispatch(message) {
-          dispatch.push(message.id);
-          return { status: COURIER_OUTCOMES.SUBMITTED };
-        },
-        async observe(message) {
-          observe.push(message.id);
-          return { text: `answer for ${message.id}` };
-        }
-      }
-    },
-    sendReply: async () => ({ id: 'reply' }),
-    sendTransportReceipt: async () => ({ id: 'receipt' })
-  });
 }
 
 test('eligible recovery retires the attempt and leaves every unrelated row byte-identical', t => {
@@ -702,75 +677,4 @@ test('eligibility never depends on elapsed time and idempotence never follows a 
   );
   assert.deepEqual(rowsFor(f.state, 'SELECT * FROM receipts ORDER BY id'), before);
   assert.ok(f.state.getCourierAttempt(f.messageId).attempt.attemptId === newer);
-});
-
-test('issue196 confirmed guard refusal can retire once without rewriting custody history', { timeout: 5000, todo: 'issue196 guard-refused custody recovery' }, t => {
-  const f = createFixture(t);
-  const claim = submitCourierAttempt(f);
-  markSubmitted(f);
-
-  const refused = persistGuardRefusal(
-    f.state,
-    f.route.routeId,
-    forwardEvent(f),
-    'courier forwarding authorization held'
-  );
-
-  assert.equal(refused, true);
-  assert.equal(f.state.getMessage(f.messageId).state, 'accepted');
-  assert.equal(f.state.getCourierAttempt(f.messageId).outcome.outcome, COURIER_OUTCOMES.NOT_SUBMITTED);
-  assert.equal(f.state.hasNativeAcknowledgment(f.state.getMessage(f.messageId)), false);
-
-  const before = rowsFor(f.state, 'SELECT * FROM receipts ORDER BY id');
-  const result = f.state.recoverCourierAttempt(f.messageId, claim.attempt.attemptId);
-
-  assert.equal(result.retired, true);
-  assert.equal(result.duplicate, false);
-  assert.equal(result.message.state, 'accepted');
-
-  const after = rowsFor(f.state, 'SELECT * FROM receipts ORDER BY id');
-  assert.equal(recoveryReceipts(f.state, f.messageId).length, 1);
-  assert.equal(after.length, before.length + 1);
-  assert.deepEqual(after.slice(0, before.length), before, 'custody history was rewritten');
-
-  const repeat = f.state.recoverCourierAttempt(f.messageId, claim.attempt.attemptId);
-  assert.equal(repeat.duplicate, true);
-  assert.deepEqual(rowsFor(f.state, 'SELECT * FROM receipts ORDER BY id'), after, 'repeat wrote receipts');
-});
-
-test('issue196 recovery permits exactly one fresh delivery after guard refusal', { timeout: 5000, todo: 'issue196 guard-refused custody recovery' }, async t => {
-  const f = createFixture(t);
-  const claim = submitCourierAttempt(f);
-  markSubmitted(f);
-
-  const refused = persistGuardRefusal(
-    f.state,
-    f.route.routeId,
-    forwardEvent(f),
-    'courier forwarding authorization held'
-  );
-
-  assert.equal(refused, true);
-  assert.equal(f.state.getMessage(f.messageId).state, 'accepted');
-
-  const retired = f.state.recoverCourierAttempt(f.messageId, claim.attempt.attemptId);
-  assert.equal(retired.retired, true);
-  assert.equal(retired.duplicate, false);
-  assert.equal(retired.message.state, 'accepted');
-
-  const courier = [];
-  const dispatch = [];
-  const consumer = directConsumer(f, { courier, dispatch });
-  try {
-    await consumer.processAccepted(f.state.getMessage(f.messageId));
-    assert.deepEqual(dispatch, [f.messageId]);
-    assert.deepEqual(courier, []);
-
-    await consumer.processAccepted(f.state.getMessage(f.messageId));
-    assert.deepEqual(dispatch, [f.messageId], 'repeat processing dispatched twice');
-    assert.deepEqual(courier, []);
-  } finally {
-    consumer.abortNativeWork();
-    await consumer.waitForNativeWork();
-  }
 });

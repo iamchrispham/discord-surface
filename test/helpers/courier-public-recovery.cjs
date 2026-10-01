@@ -1,8 +1,9 @@
 'use strict';
 
-// Shared disposable fixture for test/courier-public-recovery.test.js. Every
-// fixture uses a mkdtemp SQLite file and a temp transcript root; nothing here
-// opens a socket, a live database, Discord, or a Gateway process.
+// Shared disposable fixture for the courier public-recovery suites
+// (test/courier-public-recovery.test.js, test/courier-guard-recovery.test.js).
+// Every fixture uses a mkdtemp SQLite file and a temp transcript root; nothing
+// here opens a socket, a live database, Discord, or a Gateway process.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -10,6 +11,7 @@ const path = require('node:path');
 const { SurfaceState, THREAD_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS } = require('../../src/state');
 const { encodeAgentMessage, KINDS } = require('../../src/agent-message');
 const { codexPrompt } = require('../../src/native');
+const { createSurfaceConsumer } = require('../../src/discord');
 
 const TOKEN = 'courier-public-recovery-token';
 const PARENT_NATIVE = '11111111-1111-1111-1111-111111111111';
@@ -136,6 +138,33 @@ function rowsFor(state, sql, ...params) {
   return JSON.parse(JSON.stringify(state.db.prepare(sql).all(...params)));
 }
 
+// Direct consumer over the fixture route. It records courier queue dispatches,
+// direct native dispatches and observations without touching a real transport.
+function directConsumer(fixture, { dispatch = [], observe = [], courier = [] } = {}) {
+  return createSurfaceConsumer({
+    state: fixture.state,
+    courierRoute: { routeId: fixture.route.routeId },
+    providers: {
+      codex: {
+        async dispatchCourier(envelope) {
+          courier.push(envelope.packet.id);
+          return { status: COURIER_OUTCOMES.SUBMITTED };
+        },
+        async dispatch(message) {
+          dispatch.push(message.id);
+          return { status: COURIER_OUTCOMES.SUBMITTED };
+        },
+        async observe(message) {
+          observe.push(message.id);
+          return { text: `answer for ${message.id}` };
+        }
+      }
+    },
+    sendReply: async () => ({ id: 'reply' }),
+    sendTransportReceipt: async () => ({ id: 'receipt' })
+  });
+}
+
 module.exports = {
   COURIER_NATIVE,
   PARENT_NATIVE,
@@ -143,6 +172,7 @@ module.exports = {
   TOKEN,
   addSyntheticAttempt,
   createFixture,
+  directConsumer,
   forwardEvent,
   markSubmitted,
   receiptCount,
