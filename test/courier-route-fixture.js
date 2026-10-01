@@ -80,6 +80,7 @@ function fixture(t, { packetKind = KINDS.REQUEST, includeInitialAgent = true } =
   });
   return {
     dir,
+    sessionRoot,
     sessionFile,
     dbPath: path.join(dir, 'surface.sqlite'),
     get state() { return state; },
@@ -176,7 +177,7 @@ function preparedInput(f, message) {
   return {
     routeId: f.route.routeId,
     prompt: parentPrompt(f.state, message),
-    observerCursor: readInitialCursor(message.nativeId, f.sessionFile)
+    observerCursor: readInitialCursor(message.nativeId, f.sessionRoot)
   };
 }
 
