@@ -36,7 +36,6 @@ function programBody(argv: readonly string[]): string {
     `  result = await tools.write_stdin({ session_id: result.session_id, chars: '', yield_time_ms: Math.min(10000, remaining), max_output_tokens: ${MAX_READER_OUTPUT_TOKENS} });`,
     "  output += result?.output ?? '';",
     '}',
-    'if (deadline - Date.now() <= 0) timeout();',
     "if (!result || result.exit_code !== 0 || result.session_id != null || result.running === true || (result.status !== undefined && result.status !== 'completed')) {",
     "  throw new Error('courier input reader did not complete');",
     '}',
@@ -58,6 +57,7 @@ function programBody(argv: readonly string[]): string {
     "    throw new Error('courier input has an unexpected key');",
     '  }',
     '}',
+    'if (deadline - Date.now() <= 0) timeout();',
     `await tools.${SEND_COMMAND}(parsed);`
   ].join('\n');
 }

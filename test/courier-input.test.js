@@ -206,6 +206,28 @@ test('courier program forwards parsed persisted input without transcription', as
     'yielded reader output must be completed before sending');
   assert.deepEqual(yielded.sends, [expectedInput]);
 
+  const receiptsBeforeLateParse = f.state.listReceipts();
+  const realDateNow = Date.now;
+  const realJsonParse = JSON.parse;
+  let lateParse;
+  try {
+    Date.now = () => 0;
+    JSON.parse = text => {
+      const parsed = realJsonParse(text);
+      Date.now = () => 60000;
+      return parsed;
+    };
+    lateParse = await run({ exit_code: 0, output: serialized });
+  } finally {
+    JSON.parse = realJsonParse;
+    Date.now = realDateNow;
+  }
+  assert.deepEqual(lateParse.calls, ['exec_command', 1000000],
+    'deadline reached during parsing must not send');
+  assert.deepEqual(lateParse.sends, [], 'late parse must not send');
+  assert.deepEqual(f.state.listReceipts(), receiptsBeforeLateParse,
+    'late parse must not mutate custody');
+
   const receiptsBeforeExpiry = f.state.listReceipts();
   const realNow = Date.now;
   const clock = [0, 0, 60000];
