@@ -446,6 +446,17 @@ test('guard refusal eligibility has one shared evidence owner', t => {
     path.join(sourceRoot, 'state', 'courier-route', 'guard-refusal.ts'), 'utf8');
   const guardSource = fs.readFileSync(path.join(sourceRoot, 'courier-guard.js'), 'utf8');
 
+  const markerOwners = fs.readdirSync(sourceRoot, { recursive: true })
+    .filter(file => /\.(?:js|ts)$/.test(file))
+    .filter(file => /COURIER_OUTCOME_REASONS\.GUARD_REFUSED_BEFORE_HOST_CALL|['"]courier guard refused before host call['"]/.test(
+      fs.readFileSync(path.join(sourceRoot, file), 'utf8')))
+    .sort();
+  assert.deepEqual(markerOwners, [
+    'courier-guard.js',
+    'state/courier-route/constants.ts',
+    'state/courier-route/guard-refusal.ts',
+  ], 'new private guard evidence owner must use the shared classifier');
+
   const mutationStart = recoverySource.indexOf('export function recoverCourierAttempt');
   const projectionStart = recoverySource.indexOf('export function getCourierDeliveryStatus');
   const projectedStart = recoverySource.indexOf('function projectedStatus');
@@ -456,7 +467,6 @@ test('guard refusal eligibility has one shared evidence owner', t => {
   const projectionBody = recoverySource.slice(projectionStart);
   const projectedBody = recoverySource.slice(projectedStart, refusalStart);
 
-  // Both consumers delegate eligibility to the one recoveryReason owner.
   assert.equal((recoverySource.match(/recoveryReason\(/g) || []).length, 3,
     'expected one recoveryReason definition and exactly two consumers');
   assert.match(mutationBody, /recoveryReason\(deps, state, message, latest, attemptId\)/,
@@ -464,20 +474,16 @@ test('guard refusal eligibility has one shared evidence owner', t => {
   assert.match(projectionBody, /recoveryReason\(deps, state, message, attempt,/,
     'projection must call the shared recoveryReason owner');
 
-  // The mutation copies no eligibility or guard-evidence decision of its own.
   assert.doesNotMatch(mutationBody, /isConfirmedCourierGuardRefusal/,
     'mutation duplicated the guard-evidence check');
   assert.doesNotMatch(mutationBody, /COURIER_OUTCOMES\.SUBMITTED/,
     'mutation duplicated the submitted-outcome check');
 
-  // Guard evidence is classified only at the two decision sites, and the status
-  // projection uses the same shared classifier as eligibility.
   assert.match(projectedBody, /isConfirmedCourierGuardRefusal\(attempt\.outcome\)/,
     'projectedStatus must use the shared guard-evidence classifier');
   assert.equal((recoverySource.match(/isConfirmedCourierGuardRefusal\(/g) || []).length, 2,
     'guard evidence must be classified once per decision site, never duplicated inline');
 
-  // Recovery and the guard producer import the same guard-evidence classifier.
   assert.match(recoverySource, /import \{ isConfirmedCourierGuardRefusal \} from '\.\/guard-refusal'/,
     'recovery does not import the shared classifier');
   assert.match(guardRefusalSource, /export function isCourierGuardRefusalReason/);
