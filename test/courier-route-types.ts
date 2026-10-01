@@ -17,6 +17,8 @@ import {
   type RouteMatch,
   type CourierState
 } from '../src/state/courier-route';
+import { readCourierInput } from '../src/state/courier-route/input';
+import type { ForwardState } from '../src/state/courier-route/forward';
 
 const parentNativeId = '11111111-1111-1111-1111-111111111111';
 const courierNativeId = '22222222-2222-2222-2222-222222222222';
@@ -100,6 +102,7 @@ const record: CourierAttemptRecord = {
   outcome: { attemptId: attempt.attemptId, outcome }
 };
 const state = null as unknown as CourierState;
+const forwardState = null as unknown as ForwardState;
 const dependencies = null as unknown as CourierDependencies;
 const handlers = createCourierRouteHandlers(dependencies);
 handlers.beginCourierAttempt(state, message.id, input);
@@ -110,6 +113,7 @@ handlers.listCourierRoutes(state);
 handlers.registerCourierRoute(state, route);
 handlers.revokeCourierRoute(state, route.routeId);
 handlers.getCourierRoute(state, route.routeId);
+readCourierInput(dependencies, forwardState, route.routeId, message.id, attempt.attemptId, courier.nativeId, courier.workspace);
 
 // @ts-expect-error courier identities use the shared AgentProvider vocabulary
 const invalidCourier: CourierIdentity = { ...courier, provider: 'spark' };
