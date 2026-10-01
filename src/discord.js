@@ -56,6 +56,10 @@ const PENDING_HANDOFF_RECOVERY_POLL_MS = 100;
 const INTERACTION_CALLBACK_TIMEOUT_MS = 2500;
 const RECOVERY_WAITER_DEADLINE_GRACE_MS = 250;
 const CLOSING_CUSTODY_DETAIL = 'live Discord custody arrived while recovery readiness was closing';
+const RECOVERY_POLICIES = Object.freeze({
+  FULL: 'full',
+  UNRESOLVED: 'unresolved'
+});
 const INTERACTION_REJECTION_MESSAGES = Object.freeze({
   'inactive-binding': 'This channel is not connected to an active status session.',
   'binding-not-ready': 'The status session is still recovering. Try again shortly.',
@@ -1989,6 +1993,7 @@ class DiscordGateway {
   }
 
   async recoverInbound(signal, reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null) {
+    if (signal?.aborted || !this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
     const deadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
     let baseReason = String(reason || '');
     let previousReason;
@@ -2562,10 +2567,24 @@ class DiscordGateway {
     return failure || { ready: true, state: 'ready' };
   }
 
-  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null) {
+  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null,
+    { recoveryPolicy = RECOVERY_POLICIES.FULL } = {}) {
     if (!this.isCurrentLifecycle(lifecycleEpoch)) return { ready: false, state: 'stopped' };
     const overallDeadline = recoveryDeadline ?? (Date.now() + this.recoveryTimeoutMs);
-    const callerScope = channelIds === null || channelIds === undefined ? null : new Set(channelIds);
+    let callerScope = null;
+    if (channelIds !== null && channelIds !== undefined) {
+      callerScope = new Set(channelIds);
+    } else if (recoveryPolicy === RECOVERY_POLICIES.UNRESOLVED) {
+      callerScope = new Set([
+        ...this.state.listBindings()
+          .filter(binding => binding.active && (binding.readiness !== READINESS.READY ||
+            this.state.getIntakeWatermark(binding.channelId)?.state !== READINESS.READY))
+          .map(binding => binding.channelId),
+        ...this.state.listThreadEnrollments()
+          .filter(enrollment => enrollment.active && enrollment.state !== THREAD_STATES.READY)
+          .map(enrollment => enrollment.threadId)
+      ]);
+    }
     const expandScope = scope => {
       if (scope === null) return null;
       const expanded = new Set(scope);
@@ -2697,6 +2716,7 @@ class DiscordGateway {
       this.recoveryActiveWaiters = new Set(activeWaiters.filter(waiter => !waiter.settled));
       this.recoveryController = new AbortController();
       const controller = this.recoveryController;
+      const connectionEpoch = this.connectionEpoch;
       let resolvePass;
       let rejectPass;
       const activeRecovery = new Promise((resolve, reject) => {
@@ -2708,11 +2728,11 @@ class DiscordGateway {
         try {
           const result = await this.recoverInbound(controller.signal, passReason, passLifecycle,
             scope === null ? null : new Set(scope), deadline);
-          const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
-          if (!this.isCurrentLifecycle(passLifecycle)) {
+          if (controller.signal.aborted || connectionEpoch !== this.connectionEpoch || !this.isCurrentLifecycle(passLifecycle)) {
             resolvePass({ ready: false, state: 'stopped' });
             return;
           }
+          const hasReadyBinding = this.state.listBindings().some(binding => binding.active && binding.readiness === READINESS.READY);
           this.ready = result.ready || (result.state !== 'stopped' && hasReadyBinding);
           resolvePass(result);
         } catch (error) {
@@ -3325,6 +3345,7 @@ class DiscordGateway {
 
 module.exports = {
   DiscordGateway,
+  RECOVERY_POLICIES,
   classifyReplyError,
   createSurfaceConsumer,
   discordIdAfter,

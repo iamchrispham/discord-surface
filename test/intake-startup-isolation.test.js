@@ -119,7 +119,7 @@ test('R3: active history deadline stays retryable and a later pass recovers cust
 
     let held;
     try {
-      const first = await f.gateway.recoverTransport('ordinary-bind');
+      const first = await f.gateway.recoverTransport('ordinary-bind', f.gateway.lifecycleEpoch, new Set(['1000']));
       assert.equal(first.ready, false);
       assert.equal(f.state.getMessage('101').state, 'accepted');
       held = f.boundary('1000');
