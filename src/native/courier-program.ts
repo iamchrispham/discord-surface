@@ -9,6 +9,9 @@ const INSTRUCTION = 'Run this program once with functions.exec. Do not transcrib
 
 const EXEC_COMMAND = 'exec_command';
 const SEND_COMMAND = 'mcp__codex_app__send_message_to_thread';
+// A 100,000-code-unit prompt can expand sixfold when JSON.stringify escapes
+// control characters. Keep the stdout budget above that serialized worst case.
+const MAX_READER_OUTPUT_TOKENS = 1_000_000;
 
 // POSIX single-quote shell quoting: every byte is literal and each apostrophe is
 // closed, escaped and reopened. The assembled command is passed as one argument.
@@ -20,7 +23,7 @@ function programBody(argv: readonly string[]): string {
   const command = argv.map(shellQuote).join(' ');
   return [
     `const command = ${JSON.stringify(command)};`,
-    `const result = await tools.${EXEC_COMMAND}({ cmd: command, yield_time_ms: 10000, max_output_tokens: 100000 });`,
+    `const result = await tools.${EXEC_COMMAND}({ cmd: command, yield_time_ms: 10000, max_output_tokens: ${MAX_READER_OUTPUT_TOKENS} });`,
     "if (!result || result.exit_code !== 0 || result.session_id != null || result.running === true || (result.status !== undefined && result.status !== 'completed')) {",
     "  throw new Error('courier input reader did not complete');",
     '}',

@@ -1,6 +1,7 @@
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
+const { resolveInvocationIdentity } = require('./ordinary-codex');
 
 const REQUIRED_FLAGS = ['db', 'courier-route-id', 'message-id', 'attempt-id', 'native-id'];
 
@@ -8,15 +9,6 @@ function required(args, key) {
   const value = args[key];
   if (typeof value !== 'string' || value.length === 0) throw new Error(`missing --${key}`);
   return value;
-}
-
-function authenticatedNativeId(environment) {
-  const threadId = environment.CODEX_THREAD_ID;
-  const sessionId = environment.CODEX_SESSION_ID || threadId;
-  if (typeof threadId !== 'string' || threadId.length === 0 || sessionId !== threadId) {
-    throw new Error('courier native session is not authenticated');
-  }
-  return threadId;
 }
 
 // Reads the exact persisted tool input for one admitted courier attempt and
@@ -30,6 +22,7 @@ function courierInput(args, dependencies = {}) {
   const stdout = dependencies.stdout || process.stdout;
   const State = dependencies.SurfaceState || require('./state').SurfaceState;
   const environment = dependencies.environment || process.env;
+  const resolveIdentity = dependencies.resolveInvocationIdentity || resolveInvocationIdentity;
 
   // Validate every flag before any filesystem or database work, so a malformed
   // invocation can never create a database file.
@@ -38,8 +31,9 @@ function courierInput(args, dependencies = {}) {
   const messageId = requiredFlag(options, 'message-id');
   const attemptId = requiredFlag(options, 'attempt-id');
   const nativeId = requiredFlag(options, 'native-id');
-  if (nativeId !== authenticatedNativeId(environment)) {
-    throw new Error('courier native session does not match the requested identity');
+  const invocation = resolveIdentity(environment);
+  if (nativeId !== invocation.sessionId) {
+    throw new Error('courier native id does not match the invocation identity');
   }
 
   // A relative database path would silently depend on the caller's cwd; refuse it

@@ -59,7 +59,7 @@ test('persisted courier input reads exact Unicode bytes without claiming', t => 
   assert.deepEqual(snapshotAllTables(f.state), before);
 });
 
-test('persisted courier input authenticates the current native session', t => {
+test('persisted courier input checks invocation identity consistency', t => {
   const f = createCourierFixture(t);
   const attempt = persistedSubmittedAttempt(f);
   const result = runCourierInput(f, {
@@ -145,17 +145,17 @@ test('courier program forwards parsed persisted input without transcription', as
   };
 
   const success = await run({ exit_code: 0, output: JSON.stringify(expectedInput) });
-  assert.deepEqual(success.calls, ['exec_command', 100000, 'send_message_to_thread'], 'one exec_command then one send, no other tool');
+  assert.deepEqual(success.calls, ['exec_command', 1000000, 'send_message_to_thread'], 'one exec_command then one send, no other tool');
   assert.equal(success.sends.length, 1);
   assert.deepEqual(success.sends[0], expectedInput);
   assert.equal(success.sends[0].prompt, attempt.envelope.prompt, 'exact prompt bytes');
   assert.equal(success.sends[0].threadId, attempt.envelope.recipient.threadId, 'exact recipient');
 
   const nonzero = await run({ exit_code: 1, output: 'refused' });
-  assert.deepEqual(nonzero.calls, ['exec_command', 100000], 'nonzero exec exit must not send');
+  assert.deepEqual(nonzero.calls, ['exec_command', 1000000], 'nonzero exec exit must not send');
 
   const malformed = await run({ exit_code: 0, output: '{not json' });
-  assert.deepEqual(malformed.calls, ['exec_command', 100000], 'malformed exec stdout must not send');
+  assert.deepEqual(malformed.calls, ['exec_command', 1000000], 'malformed exec stdout must not send');
 });
 
 test('courier input refuses revoked route without mutation', t => {
