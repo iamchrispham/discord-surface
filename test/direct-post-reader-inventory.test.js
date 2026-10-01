@@ -24,7 +24,7 @@ const ADOPTING_OWNERS = new Map([
   ['state/direct-post.ts\u0000hasUnresolvedBindingPost', 1]
 ]);
 const EXCLUDED_OWNERS = new Map([
-  ['state/direct-post.ts\u0000releaseDirectPostFilePreparation', 2],
+  ['state/direct-post/file-preparation.ts\u0000releaseDirectPostFilePreparation', 2],
   ['state/direct-post.ts\u0000recordDirectPostOutcome', 1],
   ['state/direct-post.ts\u0000reconcileDirectPostOutcome', 1],
   ['state.js\u0000recoverDirectPostReceiptsInternal', 1],
