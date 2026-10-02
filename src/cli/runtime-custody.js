@@ -25,6 +25,7 @@ function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
       GATEWAY_CAPABILITIES.agentHandledWithoutPost,
       GATEWAY_CAPABILITIES.agentRequestWithdrawal,
       GATEWAY_CAPABILITIES.watcherNoticeIngress,
+      GATEWAY_CAPABILITIES.codexWatcherNoticeIngress,
       GATEWAY_CAPABILITIES.courierRecovery
     ]
   }), { mode: 0o600 });

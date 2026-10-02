@@ -16,11 +16,28 @@ function positiveNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
 
-async function resolveCurrentCodexWatcherCaller(nativeId) {
+function codexSessionPaths(home, persistedSessionRoot) {
+  if (persistedSessionRoot == null) {
+    return {
+      sessionsRoot: path.join(home, '.codex', 'sessions'),
+      sessionIndexFile: path.join(home, '.codex', 'session_index.jsonl')
+    };
+  }
+  if (typeof persistedSessionRoot !== 'string' || !path.isAbsolute(persistedSessionRoot)) {
+    throw new Error('codex caller session root is invalid');
+  }
+  return {
+    sessionsRoot: persistedSessionRoot,
+    sessionIndexFile: path.join(path.dirname(persistedSessionRoot), 'session_index.jsonl')
+  };
+}
+
+async function resolveCurrentCodexWatcherCaller(nativeId, options = {}) {
   if (process.env.NODE_OPTIONS || process.execArgv.length || Object.keys(process.env).some(key => key.startsWith('DYLD_'))) {
     throw new Error('codex caller environment refused');
   }
   const home = os.userInfo().homedir;
+  const sessionPaths = codexSessionPaths(home, options.sessionRoot);
   const authority = await import(pathToFileURL(path.join(home, ...AUTHORITY_MODULE)).href);
   const bindings = await import(pathToFileURL(path.join(home, ...BINDING_MODULE)).href);
   if (typeof authority.verifySealedCodexMcpOwner !== 'function' || typeof bindings.trustedCodexActiveParentBinding !== 'function') {
@@ -29,8 +46,7 @@ async function resolveCurrentCodexWatcherCaller(nativeId) {
   const seal = authority.verifySealedCodexMcpOwner(process.ppid);
   const binding = bindings.trustedCodexActiveParentBinding(nativeId, {
     workersDir: path.join(home, '.agents', 'work-control', 'workers'),
-    sessionsRoot: path.join(home, '.codex', 'sessions'),
-    sessionIndexFile: path.join(home, '.codex', 'session_index.jsonl'),
+    ...sessionPaths,
     observeProcessStart
   });
   if (!binding || binding.sessionId !== nativeId || binding.harness !== 'codex') {

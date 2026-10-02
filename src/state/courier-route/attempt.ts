@@ -86,7 +86,7 @@ function normalizeInput(deps: CourierDependencies, input: CourierDispatchInput |
 
 function courierMessage(message: CourierMessage, state: CourierState): boolean {
   if (!isCourierOriginAllowed(state, message)) return false;
-  if (message.agentMessage) return true;
+  if (message.agentMessage || message.watcherNotice) return true;
   return message.authorId === state.requireConfig().operatorId;
 }
 

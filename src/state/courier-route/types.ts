@@ -1,5 +1,6 @@
 import type { Attachment } from '../../attachments';
 import type { AgentAddress, AgentMessage, AgentProvider } from '../../agent-message';
+import type { WatcherNotice } from '../../watcher-notice';
 import type {
   COURIER_ATTEMPT_STATES,
   COURIER_DELIVERY_STATUSES,
@@ -58,7 +59,14 @@ export interface CourierHumanSource {
   attachments: readonly Attachment[];
 }
 
-export type CourierSource = CourierAgentSource | CourierHumanSource;
+export interface CourierWatcherSource {
+  kind: typeof COURIER_SOURCE_KINDS.WATCHER_NOTICE;
+  authorId: string;
+  packet: WatcherNotice;
+  wire: string;
+}
+
+export type CourierSource = CourierAgentSource | CourierHumanSource | CourierWatcherSource;
 
 export interface CourierMessage {
   id: string;
@@ -71,6 +79,8 @@ export interface CourierMessage {
   content: string;
   attachments?: readonly Attachment[] | null;
   agentMessage?: AgentMessage | null;
+  watcherNotice?: WatcherNotice | null;
+  watcherNoticeProvenance?: { packet: WatcherNotice; authorId: string } | null;
   state: string;
   authorId?: string;
   decisionResult?: unknown;
@@ -184,6 +194,7 @@ export interface CourierState {
   getMessage(messageId: string): CourierMessage | null;
   getMessageRoute(deliveryChannelId: string): any;
   currentMessageBinding(message: CourierMessage): any;
+  getWatcherNoticeArm?(armKey: string): any;
   isInteractionMessage(messageId: string): boolean;
   requireConfig(): Record<string, string>;
 }

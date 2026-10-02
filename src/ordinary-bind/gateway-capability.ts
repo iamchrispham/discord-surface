@@ -4,6 +4,7 @@ const { GATEWAY_CAPABILITIES } = require('../../src/ordinary-bind/constants') as
     agentHandledWithoutPost: string;
     agentRequestWithdrawal: string;
     watcherNoticeIngress: string;
+    codexWatcherNoticeIngress: string;
   };
 };
 

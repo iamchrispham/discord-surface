@@ -95,12 +95,12 @@ async function withOwners(setup, run) {
   }
 }
 
-function watcherFixture(provider) {
+function watcherFixture(provider, sessionRoot = null) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-watcher-caller-'));
   const db = path.join(dir, 'surface.sqlite');
   const state = new SurfaceState(db);
   state.setConfig({ operatorId: '900', guildId: '100', secretFile: path.join(dir, 'secret') });
-  state.bind({ guildId: '100', channelId: '101', provider, nativeId, generation: 1, workspace: dir, endpoint: provider === 'claude' ? path.join(dir, 'claude.sock') : null,
+  state.bind({ guildId: '100', channelId: '101', provider, nativeId, generation: 1, workspace: dir, sessionRoot, endpoint: provider === 'claude' ? path.join(dir, 'claude.sock') : null,
     conductorId: 'watcher-conductor', repoKey: 'repo:watcher' }, { intakeCutoff: '100' });
   let binding = state.getBinding('101');
   binding = state.setBindingReadiness('101', READINESS.READY, 'caller fixture ready', binding);
@@ -121,13 +121,13 @@ const required = (args, name) => {
 
 function commands(overrides) {
   const printed = [];
-  const calls = { claude: [], codex: [] };
+  const calls = { claude: [], codex: [], codexOptions: [] };
   const api = createWatcherCommands({
     openState: () => { throw new Error('openState not configured'); },
     required,
     print: value => printed.push(value),
     resolveCurrentClaudeCaller: async () => { calls.claude.push(true); return { harness: 'claude-code', sessionId: nativeId, threadId: nativeId }; },
-    resolveCurrentCodexWatcherCaller: async id => { calls.codex.push(id); return { harness: 'codex', sessionId: id, threadId: id }; },
+    resolveCurrentCodexWatcherCaller: async (id, options) => { calls.codex.push(id); calls.codexOptions.push(options); return { harness: 'codex', sessionId: id, threadId: id }; },
     gatewayProcessStatus: () => ({ state: 'stopped' }),
     requestGatewayRecovery: () => ({}),
     ...overrides
@@ -155,6 +155,20 @@ test('Codex caller imports authority from passwd home', async () => {
     assert.equal(options.sessionIndexFile, path.join(home, '.codex', 'session_index.jsonl'));
     assert.deepEqual(exec, [['/bin/ps', ['-o', 'lstart=', '-p', String(PARENT_PID)], { encoding: 'utf8', timeout: 2000 }]]);
     assert.equal(fixture.observed, Date.parse('Thu Oct  1 20:18:00 2026') / 1000);
+  });
+});
+
+test('Codex caller uses the persisted non-default session root', async () => {
+  await withOwners(null, async ({ home, fixture }) => {
+    const sessionRoot = path.join(home, 'alternate-codex', 'sessions');
+    const caller = await resolveCurrentCodexWatcherCaller(nativeId, { sessionRoot });
+    assert.equal(caller.sessionId, nativeId);
+    const [, options] = fixture.binding[0];
+    assert.equal(options.sessionsRoot, sessionRoot);
+    assert.equal(options.sessionIndexFile, path.join(home, 'alternate-codex', 'session_index.jsonl'));
+
+    fixture.bindingResult = () => bindingFor(siblingNativeId);
+    await assert.rejects(resolveCurrentCodexWatcherCaller(nativeId, { sessionRoot }), /does not identify the requested session/);
   });
 });
 
@@ -248,6 +262,21 @@ test('watcher arm selects the Codex caller', async () => {
   } finally {
     f.state.close();
     fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('watcher arm passes the owner binding session root to the Codex caller', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-watcher-caller-root-'));
+  const sessionRoot = path.join(dir, 'sessions');
+  const f = watcherFixture('codex', sessionRoot);
+  try {
+    const { api, calls } = commands({ openState: () => ({ state: new SurfaceState(f.db) }) });
+    await api.watcherArm(armArgs('codex'));
+    assert.deepEqual(calls.codexOptions, [{ sessionRoot }]);
+  } finally {
+    f.state.close();
+    fs.rmSync(f.dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

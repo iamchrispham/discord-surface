@@ -287,6 +287,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     if (!selected || selected.parentChannelId !== message.channelId || selected.guildId !== message.guildId) return false;
     if (message.provider !== 'codex') return false;
     if (message.agentMessage) return selected.deliveryChannelId === message.deliveryChannelId;
+    if (message.watcherNotice) return selected.deliveryChannelId === message.deliveryChannelId;
     const config = state.requireConfig();
     return message.authorId === config.operatorId && (
       message.channelId === message.deliveryChannelId || selected.deliveryChannelId === message.deliveryChannelId
@@ -300,7 +301,9 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
   async function dispatchAtCourierBoundary(message, _parentProvider, dispatchOptions, selected) {
     const binding = state.currentMessageBinding(message)?.binding;
     const observerCursor = readInitialCursor(message.nativeId, binding?.sessionRoot || undefined);
-    const completion = message.agentMessage ? agentCompletionCommand(message, state.dbPath, undefined, stateDir) : null;
+    const completion = message.watcherNotice
+      ? watcherNoticeCompletionCommand(message, state.dbPath, undefined, stateDir)
+      : message.agentMessage ? agentCompletionCommand(message, state.dbPath, undefined, stateDir) : null;
     const prompt = codexPrompt(message, acknowledgmentCommand(message, state.dbPath), completion);
     const input = { routeId: selected.routeId, prompt, observerCursor };
     const claimed = state.beginCourierAttempt(message.id, input);

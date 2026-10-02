@@ -21,6 +21,7 @@ const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { runWatcherNoticePost } = require('../src/direct-post');
 const { codexPrompt, watcherNoticeCompletionCommand } = require('../src/native');
 const { recordNativeAcknowledgment } = require('../src/acknowledgment');
+const { GATEWAY_CAPABILITIES, watcherSend } = require('../src/cli');
 
 const token = 'codex-watcher-fixture-token';
 const nativeId = '22222222-2222-2222-2222-222222222222';
@@ -234,4 +235,35 @@ test('Codex watcher pickup requires consume and suppresses ordinary reply', () =
   assert.doesNotMatch(open, /\[\[discord-surface:/);
   assert.doesNotMatch(open, /Final reply: start with|Answer the user request/);
   assert.doesNotMatch(open, /watcher-consume/);
+});
+
+test('Codex watcher send refuses the Claude-only capability before network or trigger custody', async () => {
+  const f = codexFixture();
+  const textFile = path.join(f.dir, 'notice.txt');
+  fs.writeFileSync(textFile, 'Codex watcher capability gate.');
+  try {
+    assert.equal(f.state.armWatcherNotice(armInput(f.armKey)).armed, true);
+    let fetchCalls = 0;
+    await assert.rejects(watcherSend({
+      'state-dir': f.dir,
+      db: path.join(f.dir, 'surface.sqlite'),
+      'arm-key': f.armKey,
+      'trigger-key': 'capability-gate',
+      'text-file': textFile
+    }, {
+      gatewayProcessStatus: () => ({
+        state: 'running',
+        pid: 7101,
+        capabilities: [GATEWAY_CAPABILITIES.watcherNoticeIngress]
+      }),
+      fetchImpl: async () => { fetchCalls += 1; throw new Error('network should not be reached'); },
+      print: () => {}
+    }), /watcher notice ingress/);
+    assert.equal(fetchCalls, 0);
+    assert.equal(f.state.findWatcherNotice(f.armKey, 'capability-gate'), null);
+    assert.equal(f.state.listReceipts().filter(row => row.kind === 'watcher-notice-trigger').length, 0);
+  } finally {
+    f.state.close();
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
 });
