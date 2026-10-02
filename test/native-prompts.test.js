@@ -104,6 +104,7 @@ const expectedExports = [
   'CODEX_VALIDATION_KINDS', 'ClaudeProvider', 'CodexProvider', 'DISPATCH_STATUSES',
   'agentCompletionCommand', 'attachmentPrompt', 'claudeEvent', 'codexPrompt',
   'courierForwardingPrompt', 'dispatchAndObserve', 'finalText', 'findCodexSessionFile',
+  'isCodexWatcherNotice',
   'messageRequest', 'observeCodexReply', 'observeSubmitted', 'postUnixJson',
   'probeClaudeChannel', 'probeUnixSocket', 'readClaudeSessionIdentity',
   'readCodexSessionIdentity', 'readCodexSessionIdentityAsync', 'readInitialCursor',
