@@ -1133,7 +1133,7 @@ class SurfaceState {
 
   getTransportReceipt(messageId, transport = null) { return transportReceiptHandlers.getTransportReceipt.apply(this, arguments); }
 
-  beginTransportReceipt(messageId, { transport = null, ownerPid = null, ownerIdentity = null, inTransaction = false } = {}) { return transportReceiptHandlers.beginTransportReceipt.apply(this, arguments); }
+  beginTransportReceipt(messageId, options = {}) { return transportReceiptHandlers.beginTransportReceipt.apply(this, arguments); }
 
   authorizeTransportReceipt(messageId, expectedBinding) { return transportReceiptHandlers.authorizeTransportReceipt.apply(this, arguments); }
 

@@ -15,7 +15,6 @@ const DEPENDENCIES = [
 ];
 const OWNER_STATES = ['preloaded', 'absent'];
 
-// Loads a fresh State module whose transport-receipt owner is a sentinel factory.
 // Cache entries are replaced, never mutated, and restored exactly as found.
 function withSentinelOwner(ownerState, run) {
   const hadState = Object.prototype.hasOwnProperty.call(require.cache, STATE_PATH);
@@ -101,6 +100,32 @@ test('beginTransportReceipt', () => {
       assert.deepEqual(empty, {});
     });
   }
+  const { SurfaceState } = require(STATE_PATH);
+  const receiver = Object.create(SurfaceState.prototype);
+  const existing = { attempt: { nonce: 'existing' } };
+  const lookups = [];
+  receiver.getTransportReceipt = (messageId, transport) => {
+    lookups.push([messageId, transport]);
+    return existing;
+  };
+  receiver.transaction = run => run();
+  const reads = Object.fromEntries(['transport', 'ownerPid', 'ownerIdentity', 'inTransaction'].map(key => [key, 0]));
+  const options = Object.fromEntries(Object.keys(reads).map(key => [key, undefined]));
+  for (const key of Object.keys(reads)) Object.defineProperty(options, key, {
+    get() { reads[key] += 1; return key === 'transport' ? `transport-${reads[key]}` : undefined; }
+  });
+  assert.equal(receiver.beginTransportReceipt.length, 1);
+  assert.equal(receiver.beginTransportReceipt('message-id', options).started, false);
+  assert.deepEqual(reads, { transport: 1, ownerPid: 1, ownerIdentity: 1, inTransaction: 1 });
+  assert.deepEqual(lookups, [['message-id', 'transport-1']]);
+  for (const args of [['message-id'], ['message-id', undefined]]) {
+    lookups.length = 0;
+    assert.equal(receiver.beginTransportReceipt(...args).started, false);
+    assert.deepEqual(lookups, [['message-id', null]]);
+  }
+  lookups.length = 0;
+  assert.throws(() => receiver.beginTransportReceipt('message-id', null), TypeError);
+  assert.deepEqual(lookups, []);
 });
 
 test('authorizeTransportReceipt', () => {
