@@ -16,6 +16,7 @@ const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('../ordinary/constants');
 const { readAdoptionCutoff } = require('../discord/history-access');
 const { reconcileProofUnavailableIntake } = require('./proof-recovery');
 const { ordinaryBind } = require('./codex');
+const { completeCommandCleanup } = require('../cli/command-cleanup');
 
 const ORDINARY_CLAUDE_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CLAUDE_RUNTIME_PID';
 
@@ -61,6 +62,7 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
   const validate = dependencies.validateClaudeSessionIdentity || validateClaudeSessionIdentity;
   const output = dependencies.print || print;
   let client;
+  let hadBodyFailure = false;
   try {
     const config = state.requireConfig();
     const channelSelection = args.channel || args['channel-id'];
@@ -182,8 +184,14 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
     });
     output({ bound: true, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE, binding: state.getBinding(binding.channelId), nativeProof, monitor: { status: 'pending' }, gatewayWake });
     return { binding: state.getBinding(binding.channelId), nativeProof, monitor: { status: 'pending' }, gatewayWake, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE };
+  } catch (error) {
+    hadBodyFailure = true;
+    throw error;
   } finally {
-    try { await client?.destroy(); } finally { state.close(); }
+    await completeCommandCleanup([
+      () => client?.destroy(),
+      () => state.close()
+    ], hadBodyFailure);
   }
 }
 

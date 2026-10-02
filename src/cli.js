@@ -22,6 +22,7 @@ const { createOrdinaryHandoff } = require('./cli/ordinary-handoff');
 const { createConductorHandoff } = require('./cli/conductor-handoff');
 const { createDirectPostCommands } = require('./cli/direct-post-commands');
 const { createProvisionCommands } = require('./cli/provision-commands');
+const { completeCommandCleanup } = require('./cli/command-cleanup');
 const { createNativeCompletionCommands } = require('./cli/native-completion-commands');
 const { createWatcherCommands } = require('./cli/watcher-commands');
 const { resolveCurrentCodexWatcherCaller } = require('./cli/codex-watcher-caller');
@@ -279,6 +280,7 @@ async function bind(args, rebind = false) {
   let client;
   let handoffFence;
   let enrollmentProof = null;
+  let hadBodyFailure = false;
   try {
     const input = bindingArgs(args);
     if (!rebind && state.getBinding(input.channelId)) {
@@ -312,10 +314,15 @@ async function bind(args, rebind = false) {
       intakeCutoff = await readAdoptionCutoff(channel, input.channelId, client.user);
     }
     print(rebind ? state.rebind(input, { intakeCutoff, enrollmentProof }) : state.bind(input, { intakeCutoff, intakeCutoffDetail: 'parent binding adoption cutoff' }));
+  } catch (error) {
+    hadBodyFailure = true;
+    throw error;
   } finally {
-    await deleteHandoffFence(handoffFence);
-    await client?.destroy();
-    state.close();
+    await completeCommandCleanup([
+      () => deleteHandoffFence(handoffFence),
+      () => client?.destroy(),
+      () => state.close()
+    ], hadBodyFailure);
   }
 }
 
@@ -325,6 +332,7 @@ async function threadEnroll(args, dependencies = {}) {
   const controller = new AbortController();
   const stop = () => controller.abort();
   let client;
+  let hadBodyFailure = false;
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   try {
@@ -344,11 +352,17 @@ async function threadEnroll(args, dependencies = {}) {
     const result = { enrollment, gatewayWake };
     (dependencies.print || print)(result);
     return result;
+  } catch (error) {
+    hadBodyFailure = true;
+    throw error;
   } finally {
-    controller.abort();
-    process.off('SIGINT', stop);
-    process.off('SIGTERM', stop);
-    try { await client?.destroy(); } finally { state.close(); }
+    await completeCommandCleanup([
+      () => controller.abort(),
+      () => process.off('SIGINT', stop),
+      () => process.off('SIGTERM', stop),
+      () => client?.destroy(),
+      () => state.close()
+    ], hadBodyFailure);
   }
 }
 
@@ -442,8 +456,8 @@ async function ordinaryClaudeBind(args, dependencies = {}) {
 }
 
 async function unbind(args, dependencies = {}) {
-  const { paths, state } = openState(args);
   const channelId = required(args, 'channel-id');
+  const { paths, state } = openState(args);
   const install = dependencies.requireInstalled || requireInstalled;
   const read = dependencies.readSecret || readSecret;
   const wake = dependencies.requestGatewayRecovery || requestGatewayRecovery;
@@ -452,6 +466,7 @@ async function unbind(args, dependencies = {}) {
   let fence;
   let intakePaused = false;
   let binding = null;
+  let hadBodyFailure = false;
   try {
     binding = state.getBinding(channelId);
     if (!binding || !binding.active || !state.isOrdinaryBindingRecord(binding)) {
@@ -487,24 +502,31 @@ async function unbind(args, dependencies = {}) {
     intakePaused = false;
     output({ unbound: result });
     return { unbound: result };
+  } catch (error) {
+    hadBodyFailure = true;
+    throw error;
   } finally {
-    if (intakePaused) {
-      try {
-        const restored = state.restoreOrdinaryHandoffIntake(channelId, binding);
-        if (restored) {
-          wake(paths, {
-            status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
-            kill: dependencies.killProcess || process.kill
+    await completeCommandCleanup([
+      () => {
+        if (!intakePaused) return;
+        try {
+          const restored = state.restoreOrdinaryHandoffIntake(channelId, binding);
+          if (restored) {
+            wake(paths, {
+              status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+              kill: dependencies.killProcess || process.kill
+            });
+          }
+        } catch (error) {
+          state.auditReceipt(null, 'ordinary-unbind-intake-restore-failed', {
+            channelId, generation: binding?.generation, error: error.message
           });
         }
-      } catch (error) {
-        state.auditReceipt(null, 'ordinary-unbind-intake-restore-failed', {
-          channelId, generation: binding?.generation, error: error.message
-        });
-      }
-    }
-    await deleteHandoffFence(fence);
-    try { await client?.destroy(); } finally { state.close(); }
+      },
+      () => deleteHandoffFence(fence),
+      () => client?.destroy(),
+      () => state.close()
+    ], hadBodyFailure);
   }
 }
 
