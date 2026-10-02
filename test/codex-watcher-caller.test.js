@@ -337,9 +337,9 @@ function mentionsProvider(root) {
 
 test('watcher provider consumers use the shared owner', () => {
   const srcRoot = path.resolve(__dirname, '..', 'src');
-  const watcherFiles = walk(srcRoot).filter(file => file.endsWith('.ts') && !file.endsWith('.d.ts') &&
+  const watcherFiles = walk(srcRoot).filter(file => /\.(?:js|ts)$/.test(file) && !file.endsWith('.d.ts') &&
     path.relative(srcRoot, file).split(path.sep).some(part => part.includes('watcher')));
-  const required = ['watcher-notice.ts', path.join('state', 'watcher-notice.ts')].map(name => path.join(srcRoot, name));
+  const required = ['watcher-notice.ts', path.join('state', 'watcher-notice.ts'), path.join('cli', 'watcher-commands.js')].map(name => path.join(srcRoot, name));
   for (const file of required) assert.ok(watcherFiles.includes(file), `${file} is in the scanned inventory`);
 
   const problems = [];
