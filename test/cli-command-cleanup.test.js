@@ -151,7 +151,7 @@ test('login failure closes state after client shutdown', async () => {
   assert.deepEqual(result.events, ['destroy', 'close']);
 });
 
-test('rejected shutdown still closes command state', { todo: 'issue201: shutdown rejection skips state.close' }, async () => {
+test('rejected shutdown still closes command state', async () => {
   const cleanupError = new Error('shutdown rejected');
   const result = await invokeProvisionInternal({ destroy: 'reject' }, cleanupError);
   assert.equal(result.closes, 1);
@@ -159,7 +159,7 @@ test('rejected shutdown still closes command state', { todo: 'issue201: shutdown
   assert.equal(result.error, cleanupError);
 });
 
-test('command failure survives rejected shutdown', { todo: 'issue201: shutdown masks primary failure' }, async () => {
+test('command failure survives rejected shutdown', async () => {
   const bodyError = new Error('login failed');
   const cleanupError = new Error('shutdown rejected');
   const result = await invokeProvisionInternal({ loginError: bodyError, destroy: 'reject' }, cleanupError);
@@ -168,7 +168,7 @@ test('command failure survives rejected shutdown', { todo: 'issue201: shutdown m
   assert.equal(result.destroys, 1);
 });
 
-test('throwing shutdown still closes command state', { todo: 'issue201: synchronous shutdown skips state.close' }, async () => {
+test('throwing shutdown still closes command state', async () => {
   const cleanupError = new Error('shutdown threw');
   const result = await invokeProvisionInternal({ destroy: 'throw' }, cleanupError);
   assert.equal(result.closes, 1);
