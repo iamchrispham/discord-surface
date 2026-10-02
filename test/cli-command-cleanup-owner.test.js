@@ -162,7 +162,7 @@ test('close failure retains its value after successful preceding steps', async (
 });
 
 function sourceFileFor(relative) {
-  return ts.createSourceFile(relative, fs.readFileSync(path.join(ROOT, relative), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  return ts.createSourceFile(relative, fs.readFileSync(path.join(ROOT, relative), 'utf8'), ts.ScriptTarget.Latest, true, relative.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS);
 }
 
 function walk(node, visit) {
@@ -186,7 +186,7 @@ function sourceFiles(directory) {
   return fs.readdirSync(path.join(ROOT, directory), { withFileTypes: true }).flatMap(entry => {
     const relative = path.join(directory, entry.name);
     if (entry.isDirectory()) return sourceFiles(relative);
-    return entry.name.endsWith('.js') ? [relative] : [];
+    return /\.(?:js|ts)$/.test(entry.name) ? [relative] : [];
   });
 }
 
@@ -277,6 +277,47 @@ test('unbind missing channel does not leak acquired command state', async () => 
     assert.equal(installed, 0);
     assert.deepEqual(fs.readdirSync(directory), []);
   } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
+test('thread enrollment cleanup failure still closes state once', async () => {
+  const { threadEnroll } = require('../src/cli');
+  const { SurfaceState } = require('../src/state');
+  const originalController = global.AbortController;
+  const originalClose = SurfaceState.prototype.close;
+  const interruptListeners = process.listeners('SIGINT');
+  const terminateListeners = process.listeners('SIGTERM');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-command-cleanup-thread-'));
+  const cleanupFailure = new Error('abort cleanup failed');
+  let closes = 0;
+  let installed = 0;
+  let aborts = 0;
+  try {
+    global.AbortController = class FixtureController {
+      abort() { aborts += 1; throw cleanupFailure; }
+    };
+    SurfaceState.prototype.close = function fixtureClose() {
+      closes += 1;
+      return originalClose.call(this);
+    };
+    const outcome = await captureOutcome(() => threadEnroll({ 'state-dir': directory }, {
+      requireInstalled() { installed += 1; throw new Error('Discord must not load'); }
+    }));
+    assert.equal(outcome.threw, true);
+    assert.match(outcome.error.message, /missing --channel-id/);
+    assert.notEqual(outcome.error, cleanupFailure);
+    assert.equal(aborts, 1);
+    assert.equal(closes, 1);
+    assert.equal(installed, 0);
+    assert.deepEqual(process.listeners('SIGINT'), interruptListeners);
+    assert.deepEqual(process.listeners('SIGTERM'), terminateListeners);
+  } finally {
+    global.AbortController = originalController;
+    SurfaceState.prototype.close = originalClose;
+    for (const listener of process.listeners('SIGINT')) if (!interruptListeners.includes(listener)) process.off('SIGINT', listener);
+    for (const listener of process.listeners('SIGTERM')) if (!terminateListeners.includes(listener)) process.off('SIGTERM', listener);
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
