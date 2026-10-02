@@ -6,6 +6,7 @@ const { requireInstalled, readSecret } = require('../discord');
 const { staticConductorMarker } = require('../topic');
 const { validateLegacyMetadata, migrateLegacyTopic, ensureProvisionedChannel } = require('../discord/channel-provisioning');
 const { readAdoptionCutoff } = require('../discord/history-access');
+const { completeCommandCleanup } = require('./command-cleanup');
 
 function createProvisionCommands({ required, openState, pathsFor, print, cliPath }) {
 function migrationRequested(args) {
@@ -34,6 +35,7 @@ async function provisionInternal(args) {
   const endpoint = args.endpoint ? path.resolve(args.endpoint) : undefined;
   const { state } = openState(args);
   let client;
+  let hadBodyFailure = false;
   try {
     const config = state.requireConfig();
     const categoryId = categoryFor(provider, args, config);
@@ -108,9 +110,14 @@ async function provisionInternal(args) {
     if (legacyMetadata) await migrateLegacyTopic({ state, channel: result.channel, binding, token });
     print({ created: result.created, adopted: result.adopted, legacy: Boolean(legacyMetadata), migrated: Boolean(legacyMetadata), bound: true, marker: result.channel.topic, conductorId, repoKey, channelId: result.channel.id,
       url: `https://discord.com/channels/${config.guildId}/${result.channel.id}`, binding: state.getBinding(result.channel.id), intent });
+  } catch (error) {
+    hadBodyFailure = true;
+    throw error;
   } finally {
-    await client?.destroy();
-    state.close();
+    await completeCommandCleanup([
+      () => client?.destroy(),
+      () => state.close()
+    ], hadBodyFailure);
   }
 }
 
