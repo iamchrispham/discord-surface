@@ -5,6 +5,19 @@ const { runWatcherNoticePost } = require('../direct-post');
 
 const { WATCHER_NOTICE_PROVIDERS, isWatcherNoticeProvider } = require('../watcher-notice');
 
+function hasMatchingCodexCourierRoute(state, runtime, arm) {
+  if (arm?.provider !== WATCHER_NOTICE_PROVIDERS.CODEX || runtime?.state !== 'running' || !runtime.pid ||
+      typeof runtime.courierRouteId !== 'string' || runtime.courierRouteId.length === 0 ||
+      typeof state.getCourierRoute !== 'function') return false;
+  const route = state.getCourierRoute(runtime.courierRouteId);
+  return route?.status === 'active' && route.guildId === arm.source.guildId &&
+    route.parentChannelId === arm.source.channelId && route.deliveryChannelId === arm.target.channelId &&
+    route.target?.provider === WATCHER_NOTICE_PROVIDERS.CODEX &&
+    route.target?.nativeId === arm.target.nativeId && route.target?.generation === arm.target.generation &&
+    route.courier?.provider === WATCHER_NOTICE_PROVIDERS.CODEX &&
+    route.courier?.recipientThreadId === arm.source.nativeId;
+}
+
 function createWatcherCommands({ openState, required, print, resolveCurrentClaudeCaller, resolveCurrentCodexWatcherCaller, gatewayProcessStatus, requestGatewayRecovery }) {
 async function watcherArm(args, dependencies = {}) {
   const { state } = openState(args);
@@ -62,6 +75,9 @@ async function watcherSend(args, dependencies = {}) {
     const requiredCapability = arm?.provider === WATCHER_NOTICE_PROVIDERS.CODEX
       ? GATEWAY_CAPABILITIES.codexWatcherNoticeIngress
       : GATEWAY_CAPABILITIES.watcherNoticeIngress;
+    if (arm?.provider === WATCHER_NOTICE_PROVIDERS.CODEX && !hasMatchingCodexCourierRoute(state, runtime, arm)) {
+      throw new Error('Codex watcher notice ingress requires a running Gateway with the matching courier route');
+    }
     if (runtime.state === 'running' && (!runtime.pid || !runtime.capabilities?.includes(requiredCapability))) {
       throw new Error('running Gateway does not support watcher notice ingress; stop or upgrade it before watcher notice send');
     }

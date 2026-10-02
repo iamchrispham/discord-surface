@@ -237,6 +237,12 @@ test('Codex watcher pickup requires consume and suppresses ordinary reply', () =
   assert.doesNotMatch(open, /watcher-consume/);
 });
 
+test('native facade keeps the Codex watcher classifier enumerable for fixture copies', () => {
+  const native = require('../src/native');
+  assert.equal(typeof native.isCodexWatcherNotice, 'function');
+  assert.equal(typeof { ...native }.isCodexWatcherNotice, 'function');
+});
+
 test('Codex watcher send refuses the Claude-only capability before network or trigger custody', async () => {
   const f = codexFixture();
   const textFile = path.join(f.dir, 'notice.txt');

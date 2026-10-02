@@ -153,6 +153,100 @@ test('authenticated Codex watcher notices use courier custody and the one-consum
   assert.equal(courierCalls.length, 1);
 });
 
+test('expired signed Codex watcher custody never falls back to the parent queue', { timeout: 3000 }, async t => {
+  const f = fixture(t, { includeInitialAgent: false });
+  const parentCalls = [];
+  const courierCalls = [];
+  const source = { guildId: '100', channelId: '1000', provider: 'codex', nativeId: PARENT_NATIVE, generation: f.binding.generation };
+  const target = { ...f.route.target };
+  const createWatcherMessage = (fixtureForMessage, id) => {
+    const armKey = `watcher-expiry-arm-${id}`;
+    const messageSource = { ...source, generation: fixtureForMessage.binding.generation };
+    const messageTarget = { ...target, generation: fixtureForMessage.binding.generation };
+    const armed = fixtureForMessage.state.armWatcherNotice({
+      armKey,
+      parentChannelId: messageSource.channelId,
+      childChannelId: messageTarget.channelId,
+      provider: 'codex',
+      nativeId: messageSource.nativeId,
+      generation: messageSource.generation,
+      caller: { harness: 'codex', sessionId: messageSource.nativeId, threadId: messageSource.nativeId }
+    });
+    assert.equal(armed.armed, true);
+    const packet = createWatcherNotice({
+      armKey,
+      triggerKey: `watcher-expiry-trigger-${id}`,
+      source: messageSource,
+      target: messageTarget,
+      text: `Watcher expiry ${id}`
+    });
+    const accepted = fixtureForMessage.state.acceptDiscordMessage({
+      id,
+      guildId: messageTarget.guildId,
+      channelId: messageTarget.channelId,
+      authorId: 'watcher-bot',
+      isBot: true,
+      attachments: [],
+      content: encodeWatcherNotice(packet, TOKEN)
+    }, { ready: true, expectedBinding: fixtureForMessage.binding, agentToken: TOKEN });
+    assert.equal(accepted.accepted, true);
+    return fixtureForMessage.state.getMessage(id);
+  };
+  const makeConsumer = fixtureForConsumer => createSurfaceConsumer({
+    state: fixtureForConsumer.state,
+    courierRoute: { routeId: fixtureForConsumer.route.routeId },
+    observeOptions: { timeoutMs: 20 },
+    providers: {
+      codex: {
+        async dispatchCourier(envelope) {
+          courierCalls.push(envelope);
+          return { status: COURIER_OUTCOMES.SUBMITTED };
+        },
+        async dispatch(message) {
+          parentCalls.push(message.id);
+          return { status: COURIER_OUTCOMES.SUBMITTED };
+        },
+        async observe(_message, _outcome, options) {
+          if (options.signal.aborted) return { stopped: true };
+          await new Promise(resolve => {
+            const timer = setTimeout(resolve, 250);
+            options.signal.addEventListener('abort', () => {
+              clearTimeout(timer);
+              resolve();
+            }, { once: true });
+          });
+          return { stopped: true };
+        }
+      }
+    },
+    sendReply: async () => ({ id: 'reply' }),
+    sendTransportReceipt: async () => ({ id: 'receipt' })
+  });
+
+  const initial = createWatcherMessage(f, '9015');
+  await makeConsumer(f).processAccepted(initial);
+  const initialAttempt = f.state.getCourierAttempt(initial.id);
+  assert.equal(courierCalls.length, 1);
+  assert.equal(parentCalls.length, 0);
+  assert.equal(f.state.getMessage(initial.id).state, 'accepted');
+  assert.equal(f.state.hasRetiredCourierAttempt(initial.id, initialAttempt.attempt.receiptId), true);
+  const resumedFixture = fixture(t, { includeInitialAgent: false });
+  const resumed = createWatcherMessage(resumedFixture, '9016');
+  const input = { routeId: resumedFixture.route.routeId, prompt: 'watcher expiry resume', observerCursor: null };
+  const begun = resumedFixture.state.beginCourierAttempt(resumed.id, input);
+  assert.equal(begun.accepted, true);
+  const authorized = resumedFixture.state.authorizeCourierAttempt(resumed.id, begun.attempt.attemptId, input);
+  assert.equal(authorized.authorized, true);
+  resumedFixture.state.recordCourierOutcome(resumed.id, begun.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+  assert.equal(resumedFixture.state.claimDispatch(resumed.id).claimed, true);
+  resumedFixture.state.markSubmitted(resumed.id);
+  await makeConsumer(resumedFixture).resumeSubmitted(resumedFixture.state.getMessage(resumed.id));
+  const resumedAttempt = resumedFixture.state.getCourierAttempt(resumed.id);
+  assert.equal(parentCalls.length, 0);
+  assert.equal(resumedFixture.state.getMessage(resumed.id).state, 'accepted');
+  assert.equal(resumedFixture.state.hasRetiredCourierAttempt(resumed.id, resumedAttempt.attempt.receiptId), true);
+});
+
 test('unproved Codex watcher provenance cannot enter courier custody', async t => {
   const f = fixture(t, { includeInitialAgent: false });
   const armKey = 'courier-watcher-refusal-arm';

@@ -12,7 +12,7 @@ const {
 } = require('./agent-attachment');
 const fs = require('node:fs');
 const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
-const { CODEX_VALIDATION_KINDS, codexPrompt, dispatchAndObserve, agentCompletionCommand, watcherNoticeCompletionCommand, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, readInitialCursor, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
+const { CODEX_VALIDATION_KINDS, codexPrompt, dispatchAndObserve, agentCompletionCommand, isCodexWatcherNotice, watcherNoticeCompletionCommand, ClaudeProvider, CodexProvider, observeSubmitted, probeClaudeChannel, readInitialCursor, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
 const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { COURIER_OUTCOMES, COURIER_RESULT_STATUSES, isCourierOriginAllowed } = require('./state/courier-route');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
@@ -389,6 +389,16 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
     const selected = !retiredCourierAttempt && selectedCourierRoute(durable)
       ? { routeId: courierRoute.routeId }
       : null;
+    let dispatchOverride = null;
+    if (selected) {
+      dispatchOverride = (dispatchMessage, parentProvider, dispatchOptions) =>
+        dispatchAtCourierBoundary(dispatchMessage, parentProvider, dispatchOptions, selected);
+    } else if (isCodexWatcherNotice(durable)) {
+      dispatchOverride = async () => ({
+        status: COURIER_OUTCOMES.NOT_SUBMITTED,
+        error: new Error('Codex watcher notice requires a matching courier route')
+      });
+    }
     return enqueueOwnerWork(message, signal, (onNativeSettled, ownerEntry) => {
       let settleHandoff;
       let rejectHandoff;
@@ -431,7 +441,7 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
             ...observeOptions,
             signal: pickupDeadline?.signal || taskSignal,
             continueUntilFinal,
-            ...(selected ? { dispatch: (dispatchMessage, parentProvider, dispatchOptions) => dispatchAtCourierBoundary(dispatchMessage, parentProvider, dispatchOptions, selected) } : {}),
+            ...(dispatchOverride ? { dispatch: dispatchOverride } : {}),
             onDispatchOutcome: outcome => {
               if (outcome?.status === 'not_submitted') {
                 ownerEntry.dispatchBlocked = !hasCurrentNativeAcknowledgment(state.getMessage(message.id));
@@ -445,17 +455,25 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
             }
           });
           if (await pickupDeadline?.shouldDispatchParent()) {
-            result = await dispatchAndObserve(state, message.id, providers, {
-              ...observeOptions,
-              signal: taskSignal,
-              continueUntilFinal,
-              onDispatchOutcome: outcome => {
-                if (outcome?.status === 'not_submitted') {
-                  ownerEntry.dispatchBlocked = !hasCurrentNativeAcknowledgment(state.getMessage(message.id));
+            if (isCodexWatcherNotice(message)) {
+              result = {
+                status: COURIER_OUTCOMES.NOT_SUBMITTED,
+                message: state.getMessage(message.id),
+                error: new Error('Codex watcher notice requires a matching courier route')
+              };
+            } else {
+              result = await dispatchAndObserve(state, message.id, providers, {
+                ...observeOptions,
+                signal: taskSignal,
+                continueUntilFinal,
+                onDispatchOutcome: outcome => {
+                  if (outcome?.status === 'not_submitted') {
+                    ownerEntry.dispatchBlocked = !hasCurrentNativeAcknowledgment(state.getMessage(message.id));
+                  }
+                  refreshDispatchBlock();
                 }
-                refreshDispatchBlock();
-              }
-            });
+              });
+            }
           }
           const promoted = state.getMessage(message.id);
           if (promoted?.state === MESSAGE_STATES.REPLY_READY && result.message?.state !== MESSAGE_STATES.REPLY_READY) {
@@ -589,11 +607,19 @@ function createSurfaceConsumer({ state, stateDir = path.dirname(state.dbPath), p
             continueUntilFinal
           });
           if (await pickupDeadline?.shouldDispatchParent()) {
-            result = await dispatchAndObserve(state, message.id, providers, {
-              ...observeOptions,
-              signal: taskSignal,
-              continueUntilFinal
-            });
+            if (isCodexWatcherNotice(message)) {
+              result = {
+                status: COURIER_OUTCOMES.NOT_SUBMITTED,
+                message: state.getMessage(message.id),
+                error: new Error('Codex watcher notice requires a matching courier route')
+              };
+            } else {
+              result = await dispatchAndObserve(state, message.id, providers, {
+                ...observeOptions,
+                signal: taskSignal,
+                continueUntilFinal
+              });
+            }
           }
         } finally {
           pickupDeadline?.close();
