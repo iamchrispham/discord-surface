@@ -6,6 +6,7 @@ const { resolveInvocationIdentity, resolveExistingChannel } = require('../ordina
 const { sessionRoot: codexSessionRoot, validateCodexSessionIdentityAsync } = require('../native');
 const { assertGatewayWakeCompatible } = require('../ordinary-bind/gateway-capability');
 const { GATEWAY_CAPABILITIES } = require('../ordinary-bind/constants');
+const { completeCommandCleanup } = require('./command-cleanup');
 
 function createOrdinaryHandoff({ required, openState, requestGatewayRecovery, print, gatewayProcessStatus, acquireHeldLockUntilAvailable }) {
   return async function ordinaryHandoffInternal(args, dependencies = {}) {
@@ -39,6 +40,7 @@ function createOrdinaryHandoff({ required, openState, requestGatewayRecovery, pr
     let enrollmentProof = null;
     let sourceBinding = null;
     let handoffCommitted = false;
+    let hadBodyFailure = false;
     try {
       const runtime = gatewayStatus(paths);
       const supportsBindLock = runtime?.state === 'running' && runtime.pid && runtime.capabilities?.includes(GATEWAY_CAPABILITIES.runtimeBindLock);
@@ -149,28 +151,34 @@ function createOrdinaryHandoff({ required, openState, requestGatewayRecovery, pr
         url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding,
         readiness: binding.readiness, gatewayWake });
       return { binding, gatewayWake, handoffReconciled: Boolean(binding.handoffReconciled) };
+    } catch (error) {
+      hadBodyFailure = true;
+      throw error;
     } finally {
-      process.removeListener('SIGINT', handleSignal);
-      process.removeListener('SIGTERM', handleSignal);
-      if (!handoffCommitted && sourceBinding) {
-        try {
-          const restored = state.restoreOrdinaryHandoffIntake(channelId, sourceBinding);
-          if (restored) {
-            wake(paths, {
-              status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
-              kill: dependencies.killProcess || process.kill
+      await completeCommandCleanup([
+        () => process.removeListener('SIGINT', handleSignal),
+        () => process.removeListener('SIGTERM', handleSignal),
+        () => {
+          if (handoffCommitted || !sourceBinding) return;
+          try {
+            const restored = state.restoreOrdinaryHandoffIntake(channelId, sourceBinding);
+            if (restored) {
+              wake(paths, {
+                status: dependencies.gatewayProcessStatus || gatewayProcessStatus,
+                kill: dependencies.killProcess || process.kill
+              });
+            }
+          } catch (error) {
+            state.auditReceipt(null, 'ordinary-handoff-intake-restore-failed', {
+              channelId, generation: sourceBinding.generation, error: error.message
             });
           }
-        } catch (error) {
-          state.auditReceipt(null, 'ordinary-handoff-intake-restore-failed', {
-            channelId, generation: sourceBinding.generation, error: error.message
-          });
-        }
-      }
-      await deleteHandoffFence(handoffFence);
-      await runtimeInterlock?.release();
-      await client?.destroy();
-      state.close();
+        },
+        () => deleteHandoffFence(handoffFence),
+        () => runtimeInterlock?.release(),
+        () => client?.destroy(),
+        () => state.close()
+      ], hadBodyFailure);
     }
   };
 }

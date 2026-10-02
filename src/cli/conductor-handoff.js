@@ -7,6 +7,7 @@ const { readSecret, requireInstalled } = require('../discord');
 const { assertHandoffIntakeCoverage, createHandoffFence, deleteHandoffFence } = require('../discord/handoff-fence');
 const { parseLegacyConductorMarker, staticConductorMarker } = require('../topic');
 const { legacyAdoptionTopic } = require('../discord/channel-provisioning');
+const { completeCommandCleanup } = require('./command-cleanup');
 
 function createConductorHandoff({ required, openState, print, pathsFor, categoryFor, ordinaryHandoffInternal, cliPath }) {
   async function handoffInternal(args, dependencies = {}) {
@@ -33,6 +34,7 @@ function createConductorHandoff({ required, openState, print, pathsFor, category
     let client;
     let handoffFence;
     let enrollmentProof = null;
+    let hadBodyFailure = false;
     try {
       const config = state.requireConfig();
       const categoryId = categoryFor(provider, args, config);
@@ -58,10 +60,15 @@ function createConductorHandoff({ required, openState, print, pathsFor, category
       const binding = state.handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId,
         intakeCutoff: handoffFence?.id || null, enrollmentProof });
       print({ handedOff: true, conductorId, repoKey, channelId, url: `https://discord.com/channels/${config.guildId}/${channelId}`, binding, readiness: binding.readiness });
+    } catch (error) {
+      hadBodyFailure = true;
+      throw error;
     } finally {
-      await deleteHandoffFence(handoffFence);
-      await client?.destroy();
-      state.close();
+      await completeCommandCleanup([
+        () => deleteHandoffFence(handoffFence),
+        () => client?.destroy(),
+        () => state.close()
+      ], hadBodyFailure);
     }
   }
 
@@ -164,6 +171,7 @@ function createConductorHandoff({ required, openState, print, pathsFor, category
     let client;
     let handoffFence;
     let enrollmentProof = null;
+    let hadBodyFailure = false;
     try {
       const config = state.requireConfig();
       const current = state.findConductorBinding(conductorId, provider);
@@ -185,10 +193,15 @@ function createConductorHandoff({ required, openState, print, pathsFor, category
       state = null;
       handoffGate({ ...args, repo }, current, { reuse, sessionFile, workerFile, workspace, endpoint, intakeCutoff: handoffFence?.id || null, enrollmentProof });
       return;
+    } catch (error) {
+      hadBodyFailure = true;
+      throw error;
     } finally {
-      await deleteHandoffFence(handoffFence);
-      await client?.destroy();
-      state?.close();
+      await completeCommandCleanup([
+        () => deleteHandoffFence(handoffFence),
+        () => client?.destroy(),
+        () => state?.close()
+      ], hadBodyFailure);
     }
   }
 
