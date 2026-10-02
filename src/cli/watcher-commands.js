@@ -3,19 +3,26 @@ const { readSecret } = require('../discord');
 const { GATEWAY_CAPABILITIES } = require('../ordinary-bind/constants');
 const { runWatcherNoticePost } = require('../direct-post');
 
-function createWatcherCommands({ openState, required, print, resolveCurrentClaudeCaller, gatewayProcessStatus, requestGatewayRecovery }) {
+const { WATCHER_NOTICE_PROVIDERS, isWatcherNoticeProvider } = require('../watcher-notice');
+
+function createWatcherCommands({ openState, required, print, resolveCurrentClaudeCaller, resolveCurrentCodexWatcherCaller, gatewayProcessStatus, requestGatewayRecovery }) {
 async function watcherArm(args, dependencies = {}) {
   const { state } = openState(args);
   const output = dependencies.print || print;
   try {
-    const resolveCaller = dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies));
+    const provider = required(args, 'provider');
+    const nativeId = required(args, 'native-id');
+    if (!isWatcherNoticeProvider(provider)) throw new Error('watcher notices require a supported owner provider');
+    const resolveCaller = provider === WATCHER_NOTICE_PROVIDERS.CODEX
+      ? () => resolveCurrentCodexWatcherCaller(nativeId)
+      : dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies));
     const caller = await resolveCaller();
     const result = state.armWatcherNotice({
       armKey: required(args, 'arm-key'),
       parentChannelId: required(args, 'channel-id'),
       childChannelId: required(args, 'agent-thread-id'),
-      provider: required(args, 'provider'),
-      nativeId: required(args, 'native-id'),
+      provider,
+      nativeId,
       generation: Number(required(args, 'generation')),
       caller
     });

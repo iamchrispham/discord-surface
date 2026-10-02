@@ -1,4 +1,4 @@
-import type { WatcherAddress, WatcherNotice, WATCHER_NOTICE_PROVIDERS } from '../../watcher-notice';
+import type { WatcherAddress, WatcherNotice, WatcherNoticeProvider } from '../../watcher-notice';
 import type { NativeReplyFilePhase } from '../native-reply-file';
 import type { WATCHER_NOTICE_AUTHORITY } from '../watcher-notice';
 
@@ -44,7 +44,7 @@ export interface WatcherRoute {
 export interface WatcherNoticeArm {
   armKey: string;
   authority: typeof WATCHER_NOTICE_AUTHORITY.NOTICE_ONLY;
-  provider: typeof WATCHER_NOTICE_PROVIDERS.CLAUDE;
+  provider: WatcherNoticeProvider;
   operatorId: string;
   source: WatcherAddress;
   target: WatcherAddress;

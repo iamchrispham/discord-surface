@@ -25,7 +25,6 @@ const { recordNativeAcknowledgment } = require('../src/acknowledgment');
 const token = 'codex-watcher-fixture-token';
 const nativeId = '22222222-2222-2222-2222-222222222222';
 const siblingNativeId = '33333333-3333-3333-3333-333333333333';
-const TODO = { todo: 'issue202 Codex watcher route unsupported' };
 
 const claudeOwner = { guildId: '100', channelId: '101', provider: 'claude', nativeId, generation: 1 };
 const claudeChild = { ...claudeOwner, channelId: '102' };
@@ -77,7 +76,7 @@ test('Claude watcher codec retains signed target compatibility', () => {
   assert.throws(() => decodeWatcherNotice(wire, token, { ...claudeChild, generation: 2 }), /stale or mismatched/);
 });
 
-test('Codex watcher codec binds signed provider and target', TODO, () => {
+test('Codex watcher codec binds signed provider and target', () => {
   const packet = createWatcherNotice({
     armKey: 'codex-arm', triggerKey: 'codex-trigger', source: codexOwner, target: codexChild, text: 'Codex notice body'
   });
@@ -96,7 +95,7 @@ test('Codex watcher codec binds signed provider and target', TODO, () => {
   }), /invalid watcher notice/);
 });
 
-test('Codex watcher arm freezes authenticated owner and rejects route changes', TODO, () => {
+test('Codex watcher arm freezes authenticated owner and rejects route changes', () => {
   const f = codexFixture();
   try {
     const armed = f.state.armWatcherNotice(armInput(f.armKey));
@@ -132,7 +131,7 @@ test('Codex watcher arm freezes authenticated owner and rejects route changes', 
   }
 });
 
-test('Codex watcher publication reaches enrolled custody and consumes only after ACK', TODO, async () => {
+test('Codex watcher publication reaches enrolled custody and consumes only after ACK', async () => {
   const f = codexFixture();
   const textFile = path.join(f.dir, 'notice.txt');
   fs.writeFileSync(textFile, 'Codex watcher result: review is complete.');
@@ -195,7 +194,7 @@ test('Codex watcher publication reaches enrolled custody and consumes only after
   }
 });
 
-test('Codex watcher pickup requires consume and suppresses ordinary reply', TODO, () => {
+test('Codex watcher pickup requires consume and suppresses ordinary reply', () => {
   const watcherNotice = createWatcherNotice({
     armKey: 'codex-pickup-arm', triggerKey: 'codex-pickup-trigger', source: codexOwner, target: codexChild,
     text: 'Codex watcher pickup body.'

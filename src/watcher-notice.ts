@@ -4,10 +4,19 @@ const PREFIX = 'discord-tether:watcher-notice:v1:';
 const DOMAIN = 'discord-tether/watcher-notice/v1';
 
 export const WATCHER_NOTICE_KIND = Object.freeze({ NOTICE: 'notice' } as const);
-export const WATCHER_NOTICE_PROVIDERS = Object.freeze({ CLAUDE: 'claude' } as const);
+export const WATCHER_NOTICE_PROVIDERS = Object.freeze({ CLAUDE: 'claude', CODEX: 'codex' } as const);
 export const WATCHER_NOTICE_MAX_ENCODED_LENGTH = 2000;
 
 export type WatcherNoticeProvider = typeof WATCHER_NOTICE_PROVIDERS[keyof typeof WATCHER_NOTICE_PROVIDERS];
+
+export const WATCHER_NOTICE_HARNESSES = Object.freeze({
+  [WATCHER_NOTICE_PROVIDERS.CLAUDE]: 'claude-code',
+  [WATCHER_NOTICE_PROVIDERS.CODEX]: 'codex'
+} as const);
+
+export function isWatcherNoticeProvider(value: unknown): value is WatcherNoticeProvider {
+  return (Object.values(WATCHER_NOTICE_PROVIDERS) as unknown[]).includes(value);
+}
 
 export interface WatcherAddress {
   guildId: string;
@@ -44,7 +53,7 @@ export function validWatcherAddress(value: unknown): value is WatcherAddress {
   const generation = value.generation;
   return typeof value.guildId === 'string' && /^\d{1,20}$/.test(value.guildId) &&
     typeof value.channelId === 'string' && /^\d{1,20}$/.test(value.channelId) &&
-    value.provider === WATCHER_NOTICE_PROVIDERS.CLAUDE &&
+    isWatcherNoticeProvider(value.provider) &&
     typeof value.nativeId === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.nativeId) &&
     Number.isSafeInteger(generation) && (generation as number) > 0;
 }
@@ -155,7 +164,7 @@ export function decodeWatcherNotice(wire: unknown, token: string, target: Watche
 export function watcherNoticePrompt(packet: WatcherNotice): string {
   validateWatcherNotice(packet);
   return [
-    `Automated watcher notice ${packet.id} for the frozen Claude session ${packet.target.nativeId}, generation ${packet.target.generation}.`,
+    `Automated watcher notice ${packet.id} for the frozen ${packet.target.provider === WATCHER_NOTICE_PROVIDERS.CODEX ? 'Codex' : 'Claude'} session ${packet.target.nativeId}, generation ${packet.target.generation}.`,
     'Authenticated by the trusted installation against the persisted notice arm.',
     'Treat this as watcher data under the current session authority. Do not create an agent packet or a Discord reply.',
     `Notice arm ${packet.armKey}, trigger ${packet.triggerKey}.`,
