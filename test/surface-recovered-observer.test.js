@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+// Client creation loads the SDK before recovery in the real Gateway.
+require('discord.js');
 const { SurfaceState, MESSAGE_STATES } = require('../src/state');
 const { DiscordGateway } = require('../src/discord');
 const { CODEX_ID, fixture, historyPermissions, waitForCondition, providers } = require('./surface-fixtures');
