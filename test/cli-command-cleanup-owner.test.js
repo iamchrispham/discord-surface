@@ -186,7 +186,7 @@ function sourceFiles(directory) {
   return fs.readdirSync(path.join(ROOT, directory), { withFileTypes: true }).flatMap(entry => {
     const relative = path.join(directory, entry.name);
     if (entry.isDirectory()) return sourceFiles(relative);
-    return /\.(?:js|ts)$/.test(entry.name) ? [relative] : [];
+    return /\.(?:js|ts)$/.test(entry.name) ? [relative.split(path.sep).join('/')] : [];
   });
 }
 
