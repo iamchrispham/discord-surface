@@ -14,6 +14,7 @@ const { CODEX_VALIDATION_KINDS, sessionRoot: codexSessionRoot, validateCodexSess
 const { assertGatewayWakeCompatible } = require('./gateway-capability');
 const { GATEWAY_CAPABILITIES } = require('./constants');
 const { reconcileProofUnavailableIntake } = require('./proof-recovery');
+const { completeCommandCleanup } = require('../cli/command-cleanup');
 
 const ORDINARY_NATIVE_PROOF_UNAVAILABLE_PREFIX = 'Codex transcript proof unavailable before event write:';
 const ORDINARY_CODEX_RUNTIME_PID_ENV = 'DISCORD_SURFACE_ORDINARY_CODEX_RUNTIME_PID';
@@ -72,6 +73,7 @@ async function ordinaryBind(args, dependencies = {}) {
   const output = dependencies.print || print;
   let client;
   let adoptionFence;
+  let hadBodyFailure = false;
   try {
     const config = state.requireConfig();
     const channelSelection = args.channel || args['channel-id'];
@@ -259,9 +261,15 @@ async function ordinaryBind(args, dependencies = {}) {
     if (!resultBinding) throw new Error('ordinary binding changed before bind result was returned');
     output({ bound: true, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE, binding: resultBinding, nativeProof, gatewayWake });
     return { binding: resultBinding, nativeProof, gatewayWake, reused: decision === ORDINARY_BINDING_DECISIONS.REUSE };
+  } catch (error) {
+    hadBodyFailure = true;
+    throw error;
   } finally {
-    await deleteHandoffFence(adoptionFence);
-    try { await client?.destroy(); } finally { state.close(); }
+    await completeCommandCleanup([
+      () => deleteHandoffFence(adoptionFence),
+      () => client?.destroy(),
+      () => state.close()
+    ], hadBodyFailure);
   }
 }
 
