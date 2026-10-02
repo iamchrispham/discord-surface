@@ -61,11 +61,11 @@ const { encodeAgentMessage, isLegacyAgentAddressEnvelope, sameAddress, verifyAge
   verifyLegacyAgentAddress: (envelope: unknown, token: string) => AgentAddress;
   KINDS: Readonly<{ REQUEST: 'request'; RESULT: 'result' }>;
 };
-const { createWatcherNotice, encodeWatcherNotice, sameWatcherAddress, WATCHER_NOTICE_PROVIDERS } = require('../src/watcher-notice') as {
+const { createWatcherNotice, encodeWatcherNotice, isWatcherNoticeProvider, sameWatcherAddress } = require('../src/watcher-notice') as {
   createWatcherNotice: (input: { armKey: string; triggerKey: string; source: WatcherAddress; target: WatcherAddress; text: string }) => WatcherNotice;
   encodeWatcherNotice: (packet: WatcherNotice, token: string) => string;
   sameWatcherAddress: (left: unknown, right: unknown) => boolean;
-  WATCHER_NOTICE_PROVIDERS: Readonly<{ CLAUDE: 'claude' }>;
+  isWatcherNoticeProvider: (value: unknown) => boolean;
 };
 const { AGENT_PRESENTATIONS, agentMessagePreview } = require('../src/agent-presentation') as {
   AGENT_PRESENTATIONS: Readonly<{ LEGACY: 'legacy'; ATTACHMENT: 'attachment-v1' }>;
@@ -125,7 +125,9 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     ? watcherNotice.binding
     : resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
   if (watcherNotice) {
-    if (provider !== null && provider !== WATCHER_NOTICE_PROVIDERS.CLAUDE) throw new BindingError('watcher notice provider is fixed to Claude');
+    if (!isWatcherNoticeProvider(watcherNotice.binding.provider) || (provider !== null && provider !== watcherNotice.binding.provider)) {
+      throw new BindingError('watcher notice provider does not match its frozen arm');
+    }
     if (nativeId !== binding.nativeId || Number(generation) !== binding.generation ||
         !sameWatcherAddress(watcherNotice.packet.source, canonicalAddress(binding))) {
       throw new BindingError('watcher notice does not match its frozen arm');

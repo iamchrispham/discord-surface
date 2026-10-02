@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import { sameAddress, validAddress, type AgentAddress } from '../../agent-message';
+import { sameWatcherAddress, sameWatcherNotice, validateWatcherNotice } from '../../watcher-notice';
 import { COURIER_RECEIPT_KINDS, COURIER_RESULT_STATUSES, COURIER_ROUTE_STATES } from './constants';
 import type { CourierDependencies, CourierMessage, CourierRoute, CourierState, SqlRow } from './types';
 
@@ -154,10 +155,46 @@ function isHumanMessage(state: CourierState, message: CourierMessage): boolean {
   return !message.agentMessage && message.authorId === state.requireConfig().operatorId;
 }
 
+function isWatcherNoticeMessage(state: CourierState, message: CourierMessage): boolean {
+  const notice = message.watcherNotice;
+  const provenance = message.watcherNoticeProvenance;
+  if (!notice || message.agentMessage || notice.target.provider !== 'codex' ||
+      typeof provenance?.authorId !== 'string' || provenance.authorId.length === 0 ||
+      provenance.authorId !== message.authorId || !sameWatcherNotice(provenance.packet, notice)) return false;
+  try { validateWatcherNotice(notice); } catch { return false; }
+  const check = state.currentMessageBinding(message);
+  const binding = check?.binding;
+  if (!check?.identity || !check.current || !binding) return false;
+  const source = {
+    guildId: binding.guildId,
+    channelId: binding.channelId,
+    provider: binding.provider,
+    nativeId: binding.nativeId,
+    generation: binding.generation
+  };
+  const target = {
+    guildId: binding.guildId,
+    channelId: check.deliveryChannelId || message.deliveryChannelId || message.channelId,
+    provider: binding.provider,
+    nativeId: binding.nativeId,
+    generation: binding.generation
+  };
+  if (!sameWatcherAddress(notice.source, source) || !sameWatcherAddress(notice.target, target)) return false;
+  const arm = state.getWatcherNoticeArm?.(notice.armKey);
+  if (!arm || arm.provider !== 'codex' || !sameWatcherAddress(arm.source, notice.source) ||
+      !sameWatcherAddress(arm.target, notice.target) || arm.workspace !== binding.workspace ||
+      (arm.sessionRoot || null) !== (binding.sessionRoot || null) ||
+      (arm.endpoint || null) !== (binding.endpoint || null) ||
+      (arm.conductorId || null) !== (binding.conductorId || null) ||
+      (arm.repoKey || null) !== (binding.repoKey || null)) return false;
+  return true;
+}
+
 export function isCourierOriginAllowed(state: CourierState, message: CourierMessage): boolean {
   if (message.decisionResult != null) return false;
   try {
-    return !state.isInteractionMessage(message.id);
+    if (state.isInteractionMessage(message.id)) return false;
+    return message.watcherNotice ? isWatcherNoticeMessage(state, message) : true;
   } catch {
     return false;
   }
@@ -172,12 +209,13 @@ function childRouteReady(deps: CourierDependencies, state: CourierState, route: 
 export function findMatchingRoute(deps: CourierDependencies, state: CourierState, message: CourierMessage, routeId: string | null = null): RouteMatch {
   if (!isCourierOriginAllowed(state, message)) return { status: COURIER_RESULT_STATUSES.NO_ROUTE, route: null };
   const human = isHumanMessage(state, message);
+  const watcher = Boolean(message.watcherNotice);
   const allRoutes = listRoutes(deps, state).filter(route => {
     if ((routeId && route.routeId !== routeId) || route.guildId !== message.guildId || route.parentChannelId !== message.channelId) return false;
     return (human && message.deliveryChannelId === message.channelId) || route.deliveryChannelId === message.deliveryChannelId;
   });
   const routes = allRoutes.filter(route => route.status === COURIER_ROUTE_STATES.ACTIVE && route.courier.provider === 'codex' &&
-    (human || sameAddress(route.target, message.agentMessage?.target)));
+    (human || watcher || sameAddress(route.target, message.agentMessage?.target)));
   if (routes.length !== 1) {
     if (routes.length === 0 && allRoutes.length === 1) {
       const status = allRoutes[0].status === COURIER_ROUTE_STATES.REVOKED

@@ -18,7 +18,8 @@ export const COURIER_ATTEMPT_STATES = Object.freeze({
 
 export const COURIER_SOURCE_KINDS = Object.freeze({
   AGENT: 'agent',
-  HUMAN: 'human'
+  HUMAN: 'human',
+  WATCHER_NOTICE: 'watcher-notice'
 } as const);
 
 export const COURIER_OUTCOMES = Object.freeze({

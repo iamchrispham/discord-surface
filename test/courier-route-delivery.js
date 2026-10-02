@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
+const { createWatcherNotice, encodeWatcherNotice } = require('../src/watcher-notice');
 const { acknowledgmentCommand } = require('../src/acknowledgment');
 const { agentCompletionCommand, codexPrompt, readInitialCursor, CodexProvider } = require('../src/native');
 const { parseArgs, resolveCourierRoute, start } = require('../src/cli');
@@ -15,6 +16,7 @@ const {
   SurfaceState,
   THREAD_STATES
 } = require('../src/state');
+const { isCourierOriginAllowed } = require('../src/state/courier-route');
 const { createSurfaceConsumer } = require('../src/discord');
 const { persistGuardRefusal } = require('../src/courier-guard');
 const { TOKEN, PARENT_NATIVE, SOURCE_NATIVE, COURIER_NATIVE, RECIPIENT_THREAD, WRONG_RECIPIENT_THREAD, fixture, humanMessage, interactionMessage, materializedDecisionMessage, parentPrompt, preparedInput, consumerFor } = require('./courier-route-fixture');
@@ -112,6 +114,174 @@ test('ordinary agent and human origins remain courier-eligible', async t => {
   assert.equal(parentCalls.length, 0);
   assert.equal(f.state.getCourierAttempt(f.message.id).outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
   assert.equal(f.state.getCourierAttempt(human.id).outcome.outcome, COURIER_OUTCOMES.SUBMITTED);
+});
+
+test('authenticated Codex watcher notices use courier custody and the one-consume command', async t => {
+  const f = fixture(t, { includeInitialAgent: false });
+  const armKey = 'courier-watcher-arm';
+  const target = { ...f.route.target, channelId: '2000' };
+  f.state.armWatcherNotice({
+    armKey,
+    parentChannelId: f.route.parentChannelId,
+    childChannelId: f.route.deliveryChannelId,
+    provider: 'codex',
+    nativeId: PARENT_NATIVE,
+    generation: f.binding.generation,
+    caller: { harness: 'codex', sessionId: PARENT_NATIVE, threadId: PARENT_NATIVE }
+  });
+  const packet = createWatcherNotice({
+    armKey,
+    triggerKey: 'courier-trigger',
+    source: { guildId: '100', channelId: f.route.parentChannelId, provider: 'codex', nativeId: PARENT_NATIVE, generation: f.binding.generation },
+    target,
+    text: 'Watcher completion is ready.'
+  });
+  const accepted = f.state.acceptDiscordMessage({
+    id: '9013', guildId: '100', channelId: f.route.deliveryChannelId, authorId: 'watcher-bot', isBot: true,
+    attachments: [], content: encodeWatcherNotice(packet, TOKEN)
+  }, { ready: true, expectedBinding: f.binding, agentToken: TOKEN });
+  assert.equal(accepted.accepted, true);
+  const message = f.state.getMessage('9013');
+  const courierCalls = [];
+  const consumer = consumerFor(f, { courierCalls });
+  await consumer.processAccepted(message);
+  assert.equal(courierCalls.length, 1);
+  assert.equal(courierCalls[0].envelope.source.kind, COURIER_SOURCE_KINDS.WATCHER_NOTICE);
+  assert.deepEqual(courierCalls[0].envelope.source.packet, packet);
+  assert.match(courierCalls[0].envelope.prompt, /watcher-consume/);
+  await consumer.processAccepted(f.state.getMessage('9013'));
+  assert.equal(courierCalls.length, 1);
+});
+
+test('expired signed Codex watcher custody never falls back to the parent queue', { timeout: 3000 }, async t => {
+  const f = fixture(t, { includeInitialAgent: false });
+  const parentCalls = [];
+  const courierCalls = [];
+  const source = { guildId: '100', channelId: '1000', provider: 'codex', nativeId: PARENT_NATIVE, generation: f.binding.generation };
+  const target = { ...f.route.target };
+  const createWatcherMessage = (fixtureForMessage, id) => {
+    const armKey = `watcher-expiry-arm-${id}`;
+    const messageSource = { ...source, generation: fixtureForMessage.binding.generation };
+    const messageTarget = { ...target, generation: fixtureForMessage.binding.generation };
+    const armed = fixtureForMessage.state.armWatcherNotice({
+      armKey,
+      parentChannelId: messageSource.channelId,
+      childChannelId: messageTarget.channelId,
+      provider: 'codex',
+      nativeId: messageSource.nativeId,
+      generation: messageSource.generation,
+      caller: { harness: 'codex', sessionId: messageSource.nativeId, threadId: messageSource.nativeId }
+    });
+    assert.equal(armed.armed, true);
+    const packet = createWatcherNotice({
+      armKey,
+      triggerKey: `watcher-expiry-trigger-${id}`,
+      source: messageSource,
+      target: messageTarget,
+      text: `Watcher expiry ${id}`
+    });
+    const accepted = fixtureForMessage.state.acceptDiscordMessage({
+      id,
+      guildId: messageTarget.guildId,
+      channelId: messageTarget.channelId,
+      authorId: 'watcher-bot',
+      isBot: true,
+      attachments: [],
+      content: encodeWatcherNotice(packet, TOKEN)
+    }, { ready: true, expectedBinding: fixtureForMessage.binding, agentToken: TOKEN });
+    assert.equal(accepted.accepted, true);
+    return fixtureForMessage.state.getMessage(id);
+  };
+  const makeConsumer = fixtureForConsumer => createSurfaceConsumer({
+    state: fixtureForConsumer.state,
+    courierRoute: { routeId: fixtureForConsumer.route.routeId },
+    observeOptions: { timeoutMs: 20 },
+    providers: {
+      codex: {
+        async dispatchCourier(envelope) {
+          courierCalls.push(envelope);
+          return { status: COURIER_OUTCOMES.SUBMITTED };
+        },
+        async dispatch(message) {
+          parentCalls.push(message.id);
+          return { status: COURIER_OUTCOMES.SUBMITTED };
+        },
+        async observe(_message, _outcome, options) {
+          if (options.signal.aborted) return { stopped: true };
+          await new Promise(resolve => {
+            const timer = setTimeout(resolve, 250);
+            options.signal.addEventListener('abort', () => {
+              clearTimeout(timer);
+              resolve();
+            }, { once: true });
+          });
+          return { stopped: true };
+        }
+      }
+    },
+    sendReply: async () => ({ id: 'reply' }),
+    sendTransportReceipt: async () => ({ id: 'receipt' })
+  });
+
+  const initial = createWatcherMessage(f, '9015');
+  await makeConsumer(f).processAccepted(initial);
+  const initialAttempt = f.state.getCourierAttempt(initial.id);
+  assert.equal(courierCalls.length, 1);
+  assert.equal(parentCalls.length, 0);
+  assert.equal(f.state.getMessage(initial.id).state, 'accepted');
+  assert.equal(f.state.hasRetiredCourierAttempt(initial.id, initialAttempt.attempt.receiptId), true);
+  const resumedFixture = fixture(t, { includeInitialAgent: false });
+  const resumed = createWatcherMessage(resumedFixture, '9016');
+  const input = { routeId: resumedFixture.route.routeId, prompt: 'watcher expiry resume', observerCursor: null };
+  const begun = resumedFixture.state.beginCourierAttempt(resumed.id, input);
+  assert.equal(begun.accepted, true);
+  const authorized = resumedFixture.state.authorizeCourierAttempt(resumed.id, begun.attempt.attemptId, input);
+  assert.equal(authorized.authorized, true);
+  resumedFixture.state.recordCourierOutcome(resumed.id, begun.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+  assert.equal(resumedFixture.state.claimDispatch(resumed.id).claimed, true);
+  resumedFixture.state.markSubmitted(resumed.id);
+  await makeConsumer(resumedFixture).resumeSubmitted(resumedFixture.state.getMessage(resumed.id));
+  const resumedAttempt = resumedFixture.state.getCourierAttempt(resumed.id);
+  assert.equal(parentCalls.length, 0);
+  assert.equal(resumedFixture.state.getMessage(resumed.id).state, 'accepted');
+  assert.equal(resumedFixture.state.hasRetiredCourierAttempt(resumed.id, resumedAttempt.attempt.receiptId), true);
+});
+
+test('unproved Codex watcher provenance cannot enter courier custody', async t => {
+  const f = fixture(t, { includeInitialAgent: false });
+  const armKey = 'courier-watcher-refusal-arm';
+  f.state.armWatcherNotice({
+    armKey,
+    parentChannelId: f.route.parentChannelId,
+    childChannelId: f.route.deliveryChannelId,
+    provider: 'codex',
+    nativeId: PARENT_NATIVE,
+    generation: f.binding.generation,
+    caller: { harness: 'codex', sessionId: PARENT_NATIVE, threadId: PARENT_NATIVE }
+  });
+  const packet = createWatcherNotice({
+    armKey,
+    triggerKey: 'courier-refusal-trigger',
+    source: { guildId: '100', channelId: f.route.parentChannelId, provider: 'codex', nativeId: PARENT_NATIVE, generation: f.binding.generation },
+    target: { ...f.route.target, channelId: f.route.deliveryChannelId },
+    text: 'Unproved watcher data.'
+  });
+  const accepted = f.state.acceptDiscordMessage({
+    id: '9014', guildId: '100', channelId: f.route.deliveryChannelId, authorId: 'watcher-bot', isBot: true,
+    attachments: [], content: encodeWatcherNotice(packet, TOKEN)
+  }, { ready: true, expectedBinding: f.binding, agentToken: TOKEN });
+  assert.equal(accepted.accepted, true);
+  const message = f.state.getMessage('9014');
+  assert.equal(isCourierOriginAllowed(f.state, { ...message, watcherNoticeProvenance: null }), false);
+  f.state.db.prepare("DELETE FROM receipts WHERE discord_id=? AND kind='watcher-notice'").run('9014');
+  const unproved = f.state.getMessage('9014');
+  assert.equal(f.state.beginCourierAttempt('9014', {
+    routeId: f.route.routeId,
+    prompt: 'unproved watcher prompt',
+    observerCursor: null
+  }).accepted, false);
+  assert.equal(unproved.watcherNotice, undefined);
+  assert.equal(f.state.getCourierAttempt('9014'), null);
 });
 
 test('interaction-origin and materialized decision messages cannot mint courier custody', async t => {

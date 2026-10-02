@@ -3,19 +3,46 @@ const { readSecret } = require('../discord');
 const { GATEWAY_CAPABILITIES } = require('../ordinary-bind/constants');
 const { runWatcherNoticePost } = require('../direct-post');
 
-function createWatcherCommands({ openState, required, print, resolveCurrentClaudeCaller, gatewayProcessStatus, requestGatewayRecovery }) {
+const { WATCHER_NOTICE_PROVIDERS, isWatcherNoticeProvider } = require('../watcher-notice');
+
+function hasMatchingCodexCourierRoute(state, runtime, arm) {
+  if (arm?.provider !== WATCHER_NOTICE_PROVIDERS.CODEX || runtime?.state !== 'running' || !runtime.pid ||
+      typeof runtime.courierRouteId !== 'string' || runtime.courierRouteId.length === 0 ||
+      typeof state.getCourierRoute !== 'function') return false;
+  const route = state.getCourierRoute(runtime.courierRouteId);
+  return route?.status === 'active' && route.guildId === arm.source.guildId &&
+    route.parentChannelId === arm.source.channelId && route.deliveryChannelId === arm.target.channelId &&
+    route.target?.provider === WATCHER_NOTICE_PROVIDERS.CODEX &&
+    route.target?.nativeId === arm.target.nativeId && route.target?.generation === arm.target.generation &&
+    route.courier?.provider === WATCHER_NOTICE_PROVIDERS.CODEX &&
+    route.courier?.recipientThreadId === arm.source.nativeId;
+}
+
+function createWatcherCommands({ openState, required, print, resolveCurrentClaudeCaller, resolveCurrentCodexWatcherCaller, gatewayProcessStatus, requestGatewayRecovery }) {
 async function watcherArm(args, dependencies = {}) {
   const { state } = openState(args);
   const output = dependencies.print || print;
   try {
-    const resolveCaller = dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies));
+    const provider = required(args, 'provider');
+    const parentChannelId = required(args, 'channel-id');
+    const nativeId = required(args, 'native-id');
+    if (!isWatcherNoticeProvider(provider)) throw new Error('watcher notices require a supported owner provider');
+    const ownerBinding = typeof state.getBinding === 'function' ? state.getBinding(parentChannelId) : null;
+    const callerOptions = provider === WATCHER_NOTICE_PROVIDERS.CODEX && ownerBinding?.sessionRoot
+      ? { sessionRoot: ownerBinding.sessionRoot }
+      : null;
+    const resolveCaller = provider === WATCHER_NOTICE_PROVIDERS.CODEX
+      ? () => callerOptions
+        ? resolveCurrentCodexWatcherCaller(nativeId, callerOptions)
+        : resolveCurrentCodexWatcherCaller(nativeId)
+      : dependencies.resolveClaudeCaller || (() => resolveCurrentClaudeCaller(dependencies));
     const caller = await resolveCaller();
     const result = state.armWatcherNotice({
       armKey: required(args, 'arm-key'),
-      parentChannelId: required(args, 'channel-id'),
+      parentChannelId,
       childChannelId: required(args, 'agent-thread-id'),
-      provider: required(args, 'provider'),
-      nativeId: required(args, 'native-id'),
+      provider,
+      nativeId,
       generation: Number(required(args, 'generation')),
       caller
     });
@@ -42,7 +69,16 @@ async function watcherSend(args, dependencies = {}) {
     if (!runtime || !['running', 'stopped', 'stale'].includes(runtime.state)) {
       throw new Error('Gateway status is unknown; stop or upgrade it before watcher notice send');
     }
-    if (runtime.state === 'running' && (!runtime.pid || !runtime.capabilities?.includes(GATEWAY_CAPABILITIES.watcherNoticeIngress))) {
+    const arm = typeof state.getWatcherNoticeArm === 'function'
+      ? state.getWatcherNoticeArm(required(args, 'arm-key'))
+      : null;
+    const requiredCapability = arm?.provider === WATCHER_NOTICE_PROVIDERS.CODEX
+      ? GATEWAY_CAPABILITIES.codexWatcherNoticeIngress
+      : GATEWAY_CAPABILITIES.watcherNoticeIngress;
+    if (arm?.provider === WATCHER_NOTICE_PROVIDERS.CODEX && !hasMatchingCodexCourierRoute(state, runtime, arm)) {
+      throw new Error('Codex watcher notice ingress requires a running Gateway with the matching courier route');
+    }
+    if (runtime.state === 'running' && (!runtime.pid || !runtime.capabilities?.includes(requiredCapability))) {
       throw new Error('running Gateway does not support watcher notice ingress; stop or upgrade it before watcher notice send');
     }
     const config = state.requireConfig();

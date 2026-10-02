@@ -69,6 +69,7 @@ import {
   claudeEvent,
   codexPrompt,
   courierForwardingPrompt,
+  isCodexWatcherNotice,
   messageRequest,
   watcherNoticeCompletionCommand
 } from './native/prompts';
@@ -91,6 +92,7 @@ export {
   claudeEvent,
   codexPrompt,
   courierForwardingPrompt,
+  isCodexWatcherNotice,
   messageRequest,
   watcherNoticeCompletionCommand
 };
@@ -215,9 +217,16 @@ export async function dispatchAndObserve(
       signal: options.signal,
       onCursor: (cursor: ObserverCursor) => state.setObserverCursor(message.id, cursor, marker)
     };
-    outcome = options.dispatch
-      ? await options.dispatch(dispatchMessage, provider, dispatchOptions)
-      : await provider.dispatch(dispatchMessage, dispatchOptions);
+    if (options.dispatch) {
+      outcome = await options.dispatch(dispatchMessage, provider, dispatchOptions);
+    } else if (isCodexWatcherNotice(dispatchMessage)) {
+      outcome = {
+        status: DISPATCH_STATUSES.NOT_SUBMITTED,
+        error: new Error('Codex watcher notice requires a matching courier route')
+      };
+    } else {
+      outcome = await provider.dispatch(dispatchMessage, dispatchOptions);
+    }
   } catch (error) {
     state.markUncertain(message.id, error);
     return reportOutcome({ status: DISPATCH_STATUSES.UNCERTAIN, message: state.getMessage(message.id), error });

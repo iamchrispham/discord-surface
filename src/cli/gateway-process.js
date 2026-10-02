@@ -68,6 +68,7 @@ function createGatewayProcessInspection(cliFilename) {
       guildId: value.guildId,
       stateDir: value.stateDir,
       db: value.db,
+      courierRouteId: typeof value.courierRouteId === 'string' ? value.courierRouteId : null,
       startedAt: value.startedAt,
       capabilities: Array.isArray(value.capabilities) ? value.capabilities : []
     };

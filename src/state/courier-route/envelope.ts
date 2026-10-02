@@ -1,5 +1,6 @@
 import * as crypto from 'node:crypto';
 import { KINDS } from '../../agent-message';
+import { sameWatcherNotice } from '../../watcher-notice';
 import { COURIER_SOURCE_KINDS, ENVELOPE_TYPE } from './constants';
 import type {
   CourierDispatchInput,
@@ -10,6 +11,19 @@ import type {
 } from './types';
 
 function sourceFor(message: CourierMessage): CourierSource {
+  if (message.watcherNotice) {
+    const provenance = message.watcherNoticeProvenance;
+    if (!provenance || typeof provenance.authorId !== 'string' || provenance.authorId.length === 0 ||
+        !sameWatcherNotice(provenance.packet, message.watcherNotice)) {
+      throw new Error('courier watcher notice provenance is invalid');
+    }
+    return {
+      kind: COURIER_SOURCE_KINDS.WATCHER_NOTICE,
+      authorId: provenance.authorId,
+      packet: { ...message.watcherNotice },
+      wire: message.content
+    };
+  }
   if (message.agentMessage) {
     return {
       kind: COURIER_SOURCE_KINDS.AGENT,
@@ -51,13 +65,14 @@ export function payloadHash(message: CourierMessage, input: CourierDispatchInput
 }
 
 export function attemptKey(message: CourierMessage, route: CourierRoute, hash: string): string {
+  const watcherSource = message.watcherNotice ? sourceFor(message) : null;
   return JSON.stringify({
     messageId: message.id,
     routeId: route.routeId,
     routeGeneration: route.routeGeneration,
     payloadHash: hash,
-    sourceKind: message.agentMessage ? COURIER_SOURCE_KINDS.AGENT : COURIER_SOURCE_KINDS.HUMAN,
-    source: message.agentMessage?.source || { authorId: message.authorId, channelId: message.deliveryChannelId },
+    sourceKind: watcherSource?.kind || (message.agentMessage ? COURIER_SOURCE_KINDS.AGENT : COURIER_SOURCE_KINDS.HUMAN),
+    source: watcherSource || message.agentMessage?.source || { authorId: message.authorId, channelId: message.deliveryChannelId },
     target: message.agentMessage?.target || null,
     destination: sourceDestination(message)
   });

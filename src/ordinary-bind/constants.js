@@ -6,6 +6,7 @@ const GATEWAY_CAPABILITIES = Object.freeze({
   agentHandledWithoutPost: 'agent-handled-without-post-v1',
   agentRequestWithdrawal: 'agent-request-withdrawal-v1',
   watcherNoticeIngress: 'watcher-notice-ingress-v1',
+  codexWatcherNoticeIngress: 'codex-watcher-notice-ingress-v1',
   courierRecovery: 'courier-recovery-v1'
 });
 

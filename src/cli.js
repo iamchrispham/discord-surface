@@ -25,6 +25,7 @@ const { createProvisionCommands } = require('./cli/provision-commands');
 const { completeCommandCleanup } = require('./cli/command-cleanup');
 const { createNativeCompletionCommands } = require('./cli/native-completion-commands');
 const { createWatcherCommands } = require('./cli/watcher-commands');
+const { resolveCurrentCodexWatcherCaller } = require('./cli/codex-watcher-caller');
 const { writePid, acquireHeldLockUntilAvailable } = require('./cli/runtime-custody');
 const { gatewayProcessStatus, pidMatches, waitForExit } = createGatewayProcessInspection(__filename);
 const createClaudeListeners = require('./cli/claude-listeners');
@@ -201,10 +202,10 @@ const AGENT_WITHDRAW_USAGE = `Usage: discord-surface agent-withdraw --provider P
 Withdraws one acknowledged outstanding agent request from its current requester session. Preserves the signed request and acknowledgment, and records a distinct withdrawal receipt.
 `;
 
-const WATCHER_ARM_USAGE = `Usage: discord-surface watcher-arm --arm-key ARM_KEY --provider claude --channel-id PARENT_CHANNEL_ID \\
+const WATCHER_ARM_USAGE = `Usage: discord-surface watcher-arm --arm-key ARM_KEY --provider codex|claude --channel-id PARENT_CHANNEL_ID \\
   --agent-thread-id CHILD_CHANNEL_ID --native-id NATIVE_UUID --generation GENERATION
 
-Arms a notice-only Claude owner after checking the current Claude caller and enrolled child route.
+Arms a notice-only owner after checking the current caller and enrolled child route.
 `;
 
 const WATCHER_SEND_USAGE = `Usage: discord-surface watcher-send --arm-key ARM_KEY --trigger-key TRIGGER_KEY \\
@@ -213,7 +214,7 @@ const WATCHER_SEND_USAGE = `Usage: discord-surface watcher-send --arm-key ARM_KE
 Publishes one signed notice using the frozen arm and deterministic trigger identity.
 `;
 
-const WATCHER_CONSUME_USAGE = `Usage: discord-surface watcher-consume --message-id MESSAGE_ID --provider claude \\
+const WATCHER_CONSUME_USAGE = `Usage: discord-surface watcher-consume --message-id MESSAGE_ID --provider codex|claude \\
   --native-id NATIVE_UUID --generation GENERATION [--channel-id CHANNEL_ID]
 
 Consumes an acknowledged watcher notice without posting a Discord reply.
@@ -722,7 +723,7 @@ const { migrationRequested, categoryFor, provisionInternal, provision } = create
 const { handoffInternal, handoff, localHandoff } = createConductorHandoff({ required, openState, print, pathsFor, categoryFor, ordinaryHandoffInternal, cliPath: __filename });
 const { agentSend, assertOrdinaryPostCaller, directPost, directPostFileCleanup } = createDirectPostCommands({ required, openState, print, resolveCurrentClaudeCaller });
 const { nativeReply, claudeReply, agentComplete, agentWithdraw } = createNativeCompletionCommands({ required, openState, pathsFor, print, resolveCurrentClaudeCaller, gatewayProcessStatus, requestGatewayRecovery });
-const { watcherArm, watcherSend, watcherConsume } = createWatcherCommands({ openState, required, print, resolveCurrentClaudeCaller, gatewayProcessStatus, requestGatewayRecovery });
+const { watcherArm, watcherSend, watcherConsume } = createWatcherCommands({ openState, required, print, resolveCurrentClaudeCaller, resolveCurrentCodexWatcherCaller, gatewayProcessStatus, requestGatewayRecovery });
 
 function createBindingWakeController({ getGateway, isReady, isTransportReady = isReady, isStopping, probeClaudeChannel = require('./native').probeClaudeChannel,
   logger = error => process.stderr.write(`discord-surface: ordinary binding recovery failed: ${error.message}\n`) } = {}) {

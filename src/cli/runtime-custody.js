@@ -9,6 +9,19 @@ const LOCK_CONTENTION_EXIT = 75;
 
 function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
   fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
+  const capabilities = [
+    GATEWAY_CAPABILITIES.ordinaryBindWake,
+    GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake,
+    GATEWAY_CAPABILITIES.runtimeBindLock,
+    GATEWAY_CAPABILITIES.ordinaryClaudeBind,
+    GATEWAY_CAPABILITIES.agentHandledWithoutPost,
+    GATEWAY_CAPABILITIES.agentRequestWithdrawal,
+    GATEWAY_CAPABILITIES.watcherNoticeIngress,
+    GATEWAY_CAPABILITIES.courierRecovery
+  ];
+  if (typeof courierRouteId === 'string' && courierRouteId.length > 0) {
+    capabilities.push(GATEWAY_CAPABILITIES.codexWatcherNoticeIngress);
+  }
   fs.writeFileSync(pidFile, JSON.stringify({
     pid: process.pid,
     guildId,
@@ -17,16 +30,7 @@ function writePid(pidFile, guildId, stateDir, db, courierRouteId = null) {
     command: 'run',
     courierRouteId,
     startedAt: new Date().toISOString(),
-    capabilities: [
-      GATEWAY_CAPABILITIES.ordinaryBindWake,
-      GATEWAY_CAPABILITIES.threadEnrollmentRecoveryWake,
-      GATEWAY_CAPABILITIES.runtimeBindLock,
-      GATEWAY_CAPABILITIES.ordinaryClaudeBind,
-      GATEWAY_CAPABILITIES.agentHandledWithoutPost,
-      GATEWAY_CAPABILITIES.agentRequestWithdrawal,
-      GATEWAY_CAPABILITIES.watcherNoticeIngress,
-      GATEWAY_CAPABILITIES.courierRecovery
-    ]
+    capabilities
   }), { mode: 0o600 });
   fs.chmodSync(pidFile, 0o600);
 }

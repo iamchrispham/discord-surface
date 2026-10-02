@@ -2,13 +2,16 @@ import type { SqlRow, SqlStatement, WatcherDatabase, WatcherBinding, WatcherEnro
 export type { WatcherNoticeArm, WatcherNoticeCaller, WatcherNoticeArmInput, WatcherNoticeDependencies, WatcherNoticePublicationEvent, WatcherNoticeConsumeInput } from './watcher-notice/contracts';
 import {
   WATCHER_NOTICE_KIND,
+  WATCHER_NOTICE_HARNESSES,
   WATCHER_NOTICE_PROVIDERS,
+  isWatcherNoticeProvider,
   sameWatcherAddress,
   sameWatcherNotice,
   validWatcherAddress,
   validateWatcherNotice,
   type WatcherAddress,
-  type WatcherNotice
+  type WatcherNotice,
+  type WatcherNoticeProvider
 } from '../watcher-notice';
 
 export const WATCHER_NOTICE_RECEIPTS = Object.freeze({
@@ -49,7 +52,7 @@ function addressFromBinding(binding: WatcherBinding): WatcherAddress {
   return {
     guildId: binding.guildId,
     channelId: binding.channelId,
-    provider: WATCHER_NOTICE_PROVIDERS.CLAUDE,
+    provider: binding.provider as WatcherNoticeProvider,
     nativeId: binding.nativeId,
     generation: binding.generation
   };
@@ -59,7 +62,7 @@ function readArmRow(row: SqlRow | undefined, deps: WatcherNoticeDependencies): W
   if (!row) return null;
   const detail = parseDetail(row.detail);
   if (!detail || detail.journal !== WATCHER_NOTICE_JOURNAL || detail.authority !== WATCHER_NOTICE_AUTHORITY.NOTICE_ONLY ||
-      detail.provider !== WATCHER_NOTICE_PROVIDERS.CLAUDE || typeof detail.armKey !== 'string' ||
+      !isWatcherNoticeProvider(detail.provider) || typeof detail.armKey !== 'string' ||
       !detail.source || !detail.target || typeof detail.operatorId !== 'string' || typeof detail.workspace !== 'string' ||
       typeof detail.generation !== 'number' || !Number.isSafeInteger(detail.generation)) {
     throw new deps.StateCorruptError('watcher notice arm receipt is malformed');
@@ -72,7 +75,7 @@ function readArmRow(row: SqlRow | undefined, deps: WatcherNoticeDependencies): W
   return {
     armKey: detail.armKey,
     authority: WATCHER_NOTICE_AUTHORITY.NOTICE_ONLY,
-    provider: WATCHER_NOTICE_PROVIDERS.CLAUDE,
+    provider: detail.provider,
     operatorId: detail.operatorId,
     source,
     target,
@@ -220,16 +223,17 @@ export function createWatcherNoticeHandlers(deps: WatcherNoticeDependencies) {
     deps.assertText(input.parentChannelId, 'parentChannelId', 128);
     deps.assertText(input.childChannelId, 'childChannelId', 128);
     deps.assertUuid(input.nativeId);
-    if (input.provider !== WATCHER_NOTICE_PROVIDERS.CLAUDE) throw new deps.BindingError('watcher notices require a Claude owner');
+    if (!isWatcherNoticeProvider(input.provider)) throw new deps.BindingError('watcher notices require a supported owner provider');
+    const provider: WatcherNoticeProvider = input.provider;
     if (!Number.isSafeInteger(input.generation) || input.generation < 1) throw new deps.StaleGenerationError('invalid watcher notice generation');
-    if (!input.caller || input.caller.harness !== 'claude-code' || input.caller.sessionId !== input.nativeId ||
+    if (!input.caller || input.caller.harness !== WATCHER_NOTICE_HARNESSES[provider] || input.caller.sessionId !== input.nativeId ||
         (input.caller.threadId !== undefined && input.caller.threadId !== input.nativeId)) {
-      throw new deps.AuthorizationError('watcher notice arm requires the current Claude caller identity');
+      throw new deps.AuthorizationError(`watcher notice arm requires the current ${provider === WATCHER_NOTICE_PROVIDERS.CODEX ? 'Codex' : 'Claude'} caller identity`);
     }
     const config = state.requireConfig();
     return state.transaction(() => {
       const binding = state.getBinding(input.parentChannelId);
-      if (!binding || !binding.active || binding.provider !== WATCHER_NOTICE_PROVIDERS.CLAUDE || binding.guildId !== config.guildId ||
+      if (!binding || !binding.active || binding.provider !== provider || binding.guildId !== config.guildId ||
           binding.nativeId !== input.nativeId || binding.generation !== input.generation) {
         throw new deps.StaleGenerationError('watcher notice arm owner is stale');
       }
@@ -240,7 +244,7 @@ export function createWatcherNoticeHandlers(deps: WatcherNoticeDependencies) {
           !sameBinding(route.binding, {
             armKey: input.armKey,
             authority: WATCHER_NOTICE_AUTHORITY.NOTICE_ONLY,
-            provider: WATCHER_NOTICE_PROVIDERS.CLAUDE,
+            provider,
             operatorId: config.operatorId,
             source,
             target: { ...source, channelId: input.childChannelId },
@@ -258,7 +262,7 @@ export function createWatcherNoticeHandlers(deps: WatcherNoticeDependencies) {
       const arm: WatcherNoticeArm = {
         armKey: input.armKey,
         authority: WATCHER_NOTICE_AUTHORITY.NOTICE_ONLY,
-        provider: WATCHER_NOTICE_PROVIDERS.CLAUDE,
+        provider,
         operatorId: config.operatorId,
         source,
         target,
@@ -278,7 +282,7 @@ export function createWatcherNoticeHandlers(deps: WatcherNoticeDependencies) {
       state.receipt(null, WATCHER_NOTICE_RECEIPTS.ARM, {
         journal: WATCHER_NOTICE_JOURNAL,
         authority: WATCHER_NOTICE_AUTHORITY.NOTICE_ONLY,
-        provider: WATCHER_NOTICE_PROVIDERS.CLAUDE,
+        provider,
         armKey: arm.armKey,
         operatorId: arm.operatorId,
         source: arm.source,
@@ -289,7 +293,7 @@ export function createWatcherNoticeHandlers(deps: WatcherNoticeDependencies) {
         conductorId: arm.conductorId,
         repoKey: arm.repoKey,
         generation: arm.generation,
-        caller: { harness: 'claude-code', sessionId: input.caller.sessionId }
+        caller: { harness: WATCHER_NOTICE_HARNESSES[provider], sessionId: input.caller.sessionId }
       });
       return { armed: true, duplicate: false, arm: getArm(state, input.armKey, deps) };
     });
@@ -351,7 +355,7 @@ export function createWatcherNoticeHandlers(deps: WatcherNoticeDependencies) {
   function consumeWatcherNotice(state: WatcherState, input: WatcherNoticeConsumeInput): Record<string, unknown> {
     deps.assertText(input.messageId, 'messageId', 128);
     deps.assertUuid(input.nativeId);
-    if (input.provider !== WATCHER_NOTICE_PROVIDERS.CLAUDE) throw new deps.BindingError('watcher notice consumption requires Claude');
+    if (!isWatcherNoticeProvider(input.provider)) throw new deps.BindingError('watcher notice consumption requires a supported owner provider');
     if (!Number.isSafeInteger(input.generation) || input.generation < 1) throw new deps.StaleGenerationError('invalid watcher notice generation');
     if (input.channelId !== undefined && input.channelId !== null) deps.assertText(input.channelId, 'channelId', 128);
     return state.transaction(() => {
@@ -377,7 +381,7 @@ export function createWatcherNoticeHandlers(deps: WatcherNoticeDependencies) {
       const target = {
         guildId: binding.guildId,
         channelId: check.deliveryChannelId || message.deliveryChannelId || message.channelId,
-        provider: WATCHER_NOTICE_PROVIDERS.CLAUDE,
+        provider: binding.provider as WatcherNoticeProvider,
         nativeId: binding.nativeId,
         generation: binding.generation
       } as WatcherAddress;
