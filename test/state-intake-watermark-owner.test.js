@@ -12,6 +12,7 @@ const INTAKE_PATH = path.resolve(__dirname, '..', 'src', 'state', 'intake.js');
 function withFixtureIntakeOwner(names, run) {
   const savedState = require.cache[STATE_PATH];
   const savedIntake = require.cache[INTAKE_PATH];
+  const savedIntakeExports = savedIntake?.exports;
   const realIntake = require(INTAKE_PATH);
   const calls = [];
   const handlers = Object.fromEntries(names.map(name => [name, (...args) => {
@@ -26,8 +27,10 @@ function withFixtureIntakeOwner(names, run) {
   } finally {
     delete require.cache[STATE_PATH];
     if (savedState) require.cache[STATE_PATH] = savedState;
-    if (savedIntake) require.cache[INTAKE_PATH] = savedIntake;
-    else delete require.cache[INTAKE_PATH];
+    if (savedIntake) {
+      savedIntake.exports = savedIntakeExports;
+      require.cache[INTAKE_PATH] = savedIntake;
+    } else delete require.cache[INTAKE_PATH];
   }
 }
 
@@ -55,4 +58,27 @@ test('getIntakeWatermark', () => {
 
 test('setIntakeBaseline', () => {
   assertForwarded('setIntakeBaseline', ['channelId', 'lastSeenId', 'detail', 'expectedBinding', 'expectedBoundary', 'expectedReadiness']);
+});
+
+test('restores preloaded intake exports after fixture cleanup', () => {
+  const savedState = require.cache[STATE_PATH];
+  const savedIntake = require.cache[INTAKE_PATH];
+  const originalExports = require(INTAKE_PATH);
+  const preloadedIntake = require.cache[INTAKE_PATH];
+  try {
+    assert.throws(
+      () => withFixtureIntakeOwner(['getIntakeWatermark'], () => {
+        throw new Error('fixture callback failed');
+      }),
+      /fixture callback failed/
+    );
+    assert.equal(require.cache[STATE_PATH], savedState);
+    assert.equal(require.cache[INTAKE_PATH], preloadedIntake);
+    assert.equal(require.cache[INTAKE_PATH].exports, originalExports);
+  } finally {
+    if (savedState) require.cache[STATE_PATH] = savedState;
+    else delete require.cache[STATE_PATH];
+    if (savedIntake) require.cache[INTAKE_PATH] = savedIntake;
+    else delete require.cache[INTAKE_PATH];
+  }
 });
