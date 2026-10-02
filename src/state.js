@@ -895,39 +895,11 @@ class SurfaceState {
   }
 
   upsertIntakeWatermark(event, ready, coverageId = null) {
-    const existing = this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(event.channelId);
-    const lastSeen = existing?.last_seen_id && compareDiscordIds(existing.last_seen_id, event.id) >= 0 ? existing.last_seen_id : event.id;
-    const confirmedCoverageId = coverageId;
-    const verifiedEmptyCoverage = existing?.state === READINESS.READY &&
-      !existing.last_seen_id && !existing.recovered_through_id;
-    const qualifyingEmptyCoverage = verifiedEmptyCoverage && !confirmedCoverageId;
-    const recoveredThrough = confirmedCoverageId && (!existing?.recovered_through_id || compareDiscordIds(existing.recovered_through_id, confirmedCoverageId) < 0)
-      ? confirmedCoverageId
-      : existing?.recovered_through_id || (verifiedEmptyCoverage ? '0' : null);
-    const state = existing?.state === READINESS.GAP ? 'gap' : existing?.state === READINESS.UNAVAILABLE ? 'unavailable' : qualifyingEmptyCoverage || !ready ? READINESS.PENDING : READINESS.READY;
-    if (existing) {
-      this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, updated_at=? WHERE channel_id=?')
-        .run(event.guildId, lastSeen, recoveredThrough, state, now(), event.channelId);
-    } else {
-      this.db.prepare('INSERT INTO intake_watermarks(channel_id, guild_id, last_seen_id, recovered_through_id, state, updated_at) VALUES(?, ?, ?, ?, ?, ?)')
-        .run(event.channelId, event.guildId, lastSeen, recoveredThrough, state, now());
-    }
-    if (!ready || qualifyingEmptyCoverage) {
-      const binding = this.getBinding(event.channelId);
-      if (binding?.active && binding.guildId === event.guildId) {
-        const readiness = qualifyingEmptyCoverage ? READINESS.PENDING : READINESS.RECOVERING;
-        const updated = this.db.prepare('UPDATE bindings SET readiness=?, updated_at=? WHERE channel_id=? AND active=1 AND readiness=?')
-          .run(readiness, now(), event.channelId, READINESS.READY);
-        if (Number(updated.changes) === 1) {
-          this.receipt(null, 'binding-readiness', { channelId: event.channelId, readiness });
-        }
-      }
-    }
+    return intakeHandlers.upsertIntakeWatermark(this, event, ready, coverageId);
   }
 
   getIntakeWatermark(channelId) {
-    assertText(channelId, 'channelId', 128);
-    return this.db.prepare('SELECT * FROM intake_watermarks WHERE channel_id=?').get(channelId) || null;
+    return intakeHandlers.getIntakeWatermark(this, channelId);
   }
 
   hasIntakeEvidence(discordId) {
@@ -939,37 +911,7 @@ class SurfaceState {
   }
 
   setIntakeBaseline(channelId, lastSeenId, detail, expectedBinding = null, expectedBoundary = undefined, expectedReadiness = undefined) {
-    assertText(channelId, 'channelId', 128);
-    assertText(lastSeenId, 'lastSeenId', 128);
-    return this.transaction(() => {
-      const binding = this.getBinding(channelId);
-      if (!binding) throw new BindingError('intake channel is unknown');
-      if (!bindingMatchesExpected(binding, expectedBinding)) return null;
-      const existing = this.getIntakeWatermark(channelId);
-      if (!intakeBoundaryMatches(existing, expectedBoundary, binding, expectedReadiness)) return null;
-      // Observation (last_seen_id) and covered coverage are separate facts. A newest
-      // observed history row must never be promoted into the covered cursor, so an
-      // owned watermark without an already-qualified recovered_through_id refuses.
-      if (!existing) throw persistenceRefusal(BindingError, PERSISTENCE_REFUSAL_DETAILS.PARENT_COVERAGE);
-      const legacyEmptyReady = existing.state === READINESS.READY &&
-        !existing.last_seen_id && !existing.recovered_through_id && lastSeenId === '0';
-      if (legacyEmptyReady) {
-        const detailText = String(detail || '').slice(0, 1000) || null;
-        this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, recovered_through_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
-          .run(binding.guildId, '0', '0', READINESS.PENDING, detailText, now(), channelId);
-        this.receipt(null, 'intake-baseline', { channelId, lastSeenId: '0', detail: detailText });
-        return this.getIntakeWatermark(channelId);
-      }
-      const coveredCursor = qualifiedCoverageId(existing.recovered_through_id);
-      if (!coveredCursor) throw persistenceRefusal(BindingError, PERSISTENCE_REFUSAL_DETAILS.PARENT_COVERAGE);
-      const retainedLastSeen = existing.last_seen_id && compareDiscordIds(existing.last_seen_id, lastSeenId) > 0
-        ? existing.last_seen_id
-        : lastSeenId;
-      this.db.prepare('UPDATE intake_watermarks SET guild_id=?, last_seen_id=?, state=?, detail=?, gap_from=NULL, gap_to=NULL, updated_at=? WHERE channel_id=?')
-        .run(binding.guildId, retainedLastSeen, 'pending', String(detail || '').slice(0, 1000) || null, now(), channelId);
-      this.receipt(null, 'intake-baseline', { channelId, lastSeenId: retainedLastSeen, detail });
-      return this.getIntakeWatermark(channelId);
-    });
+    return intakeHandlers.setIntakeBaseline(this, channelId, lastSeenId, detail, expectedBinding, expectedBoundary, expectedReadiness);
   }
 
   setIntakeCutoff(channelId, guildId, lastSeenId, detail, expectedBinding = undefined) {

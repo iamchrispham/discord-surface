@@ -33,7 +33,7 @@ const FIRST_BIND_OWNERS = new Map([
 // Readiness-only writes keep their existing authority and receive no hold.
 const READINESS_OWNERS = new Map([
   ['state/binding-lifecycle.js\u0000setBindingReadiness', 1],
-  ['state.js\u0000upsertIntakeWatermark', 1],
+  ['state/intake.js\u0000upsertIntakeWatermark', 1],
   ['state/intake.js\u0000markIntakeBoundary', 1],
   ['state/intake.js\u0000reconcileIntake', 1],
   ['state/topic-publication.js\u0000beginTopicPublication', 1],
