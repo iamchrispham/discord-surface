@@ -1,5 +1,5 @@
 import { DIRECT_POST_OUTCOMES, DIRECT_POST_PART_STATUSES, TOWN_HALL_PUBLICATION_EVENTS, TOWN_HALL_PUBLICATION_RECEIPTS } from './types';
-import type { TownHallPublication, TownHallPublicationOwner, TownHallPublicationSet, TownHallPublicationStatus } from './types';
+import type { TownHallPublication, TownHallPublicationOwner, TownHallPublicationPartId, TownHallPublicationSet, TownHallPublicationStatus } from './types';
 import { TOWN_HALL_JOURNAL_STATES } from '../town-hall-journal/types';
 
 export interface PublicationEvent {
@@ -154,7 +154,7 @@ export function freezePublication(
 export interface PlannedPublicationPart {
   readonly index: number;
   readonly total: number;
-  readonly partId: string;
+  readonly partId: TownHallPublicationPartId;
   readonly content: string;
   readonly publication: TownHallPublication;
 }

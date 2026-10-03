@@ -56,6 +56,7 @@ export interface TownHallPublicationStart {
 }
 
 export interface TownHallPublicationPart extends TownHallRoomPart {
+  readonly partId: TownHallPublicationPartId;
   readonly publication: TownHallPublication;
 }
 

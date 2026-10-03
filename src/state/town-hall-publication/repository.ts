@@ -11,6 +11,7 @@ import {
   type TownHallPublicationConfirmationEvidence,
   type TownHallPublicationEvent,
   type TownHallPublicationOwner,
+  type TownHallPublicationPartId,
   type TownHallPublicationStateStore,
   type TownHallPublicationSet
 } from './types';
@@ -524,9 +525,14 @@ function readRowsByPrefix(
   state: TownHallPublicationStateStore,
   prefix: string
 ): ReceiptRow[] {
+  let pattern = '';
+  for (const character of prefix) {
+    if (character === '*' || character === '?' || character === '[') pattern += `[${character}]`;
+    else pattern += character;
+  }
   return state.db.prepare(
-    'SELECT id, kind, detail, discord_id FROM receipts WHERE substr(kind,1,length(?)) = ? COLLATE BINARY ORDER BY id'
-  ).all(prefix, prefix).map((row: SqlRow) => {
+    'SELECT id, kind, detail, discord_id FROM receipts WHERE kind GLOB ? COLLATE BINARY ORDER BY id'
+  ).all(`${pattern}*`).filter((row: SqlRow) => String(row.kind).startsWith(prefix)).map((row: SqlRow) => {
     if (row.discord_id !== null) return reject(deps);
     return { id: Number(row.id), kind: String(row.kind), detail: String(row.detail), discord_id: null };
   });
@@ -558,7 +564,7 @@ export function getTownHallPublicationSet(
       const part: PlannedPublicationPart = {
         index: entry.part.index,
         total: entry.part.total,
-        partId: entry.part.partId,
+        partId: entry.part.partId as TownHallPublicationPartId,
         content: entry.part.content,
         publication: publicationOf(entry.context, decoded.projection)
       };

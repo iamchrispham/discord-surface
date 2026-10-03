@@ -33,6 +33,7 @@ const partProjection: TownHallPublication = handlers.getTownHallPublication(stat
 const set: TownHallPublicationSet = handlers.getTownHallPublicationSet(state, journalKey);
 const parts: readonly TownHallPublicationPart[] = set.parts;
 const part: TownHallPublicationPart = parts[0];
+const partReservation = handlers.reserveTownHallPublication(state, journalKey, part.partId);
 const complete: boolean = set.complete;
 const anchorMessageId: string | null = set.anchorMessageId;
 const setJournalKey: string = set.journalKey;
@@ -66,6 +67,7 @@ part.publication.status = 'published';
 void projection;
 void partProjection;
 void parts;
+void partReservation;
 void complete;
 void anchorMessageId;
 void setJournalKey;

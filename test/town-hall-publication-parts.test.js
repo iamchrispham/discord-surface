@@ -2,10 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
 
 const { SurfaceState, BindingError, StateCorruptError, discordNonce } = require('../src/state');
 const {
@@ -23,7 +23,8 @@ const INVALID_KEY = 'invalid town-hall journal key';
 const MISSING_JOURNAL = 'town-hall publication requires an existing journal';
 const INVALID_PART = 'invalid town-hall publication part';
 const PROJECT_ROOT = path.resolve(__dirname, '..');
-const BASE_COMMIT = '497d75cff6922a2f8cf37d7a01df35aa616711d2';
+// This checked-in digest keeps the registration-order contract independent of Git history.
+const EXPECTED_PRE_EXISTING_TEST_COMMAND_SHA256 = 'e8679a08139d24258e8ecaf75e6b124771010a76128be05dcc0ab6aee60f9d88';
 
 const SOURCE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const CODEX_ID = '11111111-1111-4111-8111-aabbccddeeff';
@@ -1038,12 +1039,11 @@ test('publication part suite and readonly types are registered once', () => {
   assert.equal(tokens[tokens.length - 1], roomSuite, 'room parts remains the final registered entry');
   assert.equal(tokens[tokens.length - 2], newSuite, 'the new suite is registered immediately before room parts');
 
-  const base = spawnSync('git', ['show', `${BASE_COMMIT}:package.json`], { cwd: PROJECT_ROOT, encoding: 'utf8' });
-  assert.equal(base.status, 0, `git show failed: ${base.stderr}`);
-  const baseTokens = JSON.parse(base.stdout).scripts.test.trim().split(/\s+/);
-  assert.deepEqual(
-    tokens.filter(entry => entry !== newSuite),
-    baseTokens,
+  const preExistingTokens = tokens.filter(entry => entry !== newSuite);
+  const preExistingDigest = crypto.createHash('sha256').update(preExistingTokens.join('\n')).digest('hex');
+  assert.equal(
+    preExistingDigest,
+    EXPECTED_PRE_EXISTING_TEST_COMMAND_SHA256,
     'all pre-existing test paths keep their original relative order'
   );
 
