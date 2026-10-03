@@ -341,7 +341,11 @@ test('recovery fetch inventory stays covered by parent, child and delivery lifec
     const count = (fs.readFileSync(path.join(source, relative), 'utf8').match(/\brecoveryFetch\(/g) || []).length;
     if (count) consumers[relative.split(path.sep).join('/')] = count;
   }
-  assert.deepEqual(consumers, { 'discord.js': 4, 'discord/thread-enrollment.ts': 2 },
+  assert.deepEqual(consumers, {
+    'discord.js': 3,
+    'discord/pending-reconciliation.js': 1,
+    'discord/thread-enrollment.ts': 2
+  },
     'map each new recovery fetch to deadline, concurrent-boundary and delivery custody cases');
 });
 
