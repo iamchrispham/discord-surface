@@ -99,7 +99,7 @@ function snapshotOwnData(
   const snapshot: Record<string, unknown> = {};
   for (const name of names) {
     const descriptor = descriptors[name] as PropertyDescriptor | undefined;
-    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) return null;
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) return null;
     snapshot[name] = descriptor.value;
   }
   const required = typeof keys === 'function' ? keys(snapshot) : keys;
