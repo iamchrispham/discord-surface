@@ -53,8 +53,13 @@ function messageLimitError(encodedLength: number): Error {
 }
 
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) &&
-    Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).length !== keys.length) return false;
+  return keys.every(key => {
+    if (!Object.hasOwn(value, key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && Object.hasOwn(descriptor, 'value');
+  });
 }
 
 export function validAddress(value: unknown): value is AgentAddress {

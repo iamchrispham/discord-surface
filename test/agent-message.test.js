@@ -95,6 +95,38 @@ test('agent address IDs reject non-string values without coercion', () => {
     for (const value of [Symbol('invalid'), coercible, 100, null, undefined]) {
       assert.equal(validAddress({ ...target, [field]: value }), false);
     }
+
+    let throwingGetterCalls = 0;
+    const throwingGetterAddress = { ...target };
+    Object.defineProperty(throwingGetterAddress, field, {
+      enumerable: true,
+      get() {
+        throwingGetterCalls += 1;
+        throw new Error('unexpected getter access');
+      }
+    });
+    assert.equal(validAddress(throwingGetterAddress), false);
+    assert.equal(throwingGetterCalls, 0);
+
+    let accessorReads = 0;
+    let accessorCoercions = 0;
+    const accessorCoercible = {
+      [Symbol.toPrimitive]() {
+        accessorCoercions += 1;
+        return '103';
+      }
+    };
+    const coercibleAccessorAddress = { ...target };
+    Object.defineProperty(coercibleAccessorAddress, field, {
+      enumerable: true,
+      get() {
+        accessorReads += 1;
+        return accessorReads === 1 ? '103' : accessorCoercible;
+      }
+    });
+    assert.equal(validAddress(coercibleAccessorAddress), false);
+    assert.equal(accessorReads, 0);
+    assert.equal(accessorCoercions, 0);
   }
   assert.equal(coercions, 0);
   assert.equal(validAddress(target), true);
