@@ -555,6 +555,9 @@ test('deadline policy inventory has no direct deadline-to-gap decision outside i
 });
 
 test('pre-adoption retry classifier sites stay in the audited owners', () => {
+  const registered = JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json'), 'utf8')).scripts.test.split(/\s+/);
+  assert.equal(registered.filter(value => value === 'test/intake-recovery-boundaries.test.js').length, 1,
+    'the retry-classifier inventory must execute exactly once in npm test');
   const sourceRoot = path.join(__dirname, '../src');
   const collect = directory => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
     const absolute = path.join(directory, entry.name);
