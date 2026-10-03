@@ -13,9 +13,9 @@ const { completeCommandCleanup } = require('../src/cli/command-cleanup');
 const ROOT = path.join(__dirname, '..');
 const OWNER_MODULE = path.join(ROOT, 'src', 'cli', 'command-cleanup');
 const CLIENT_COMMANDS = [
-  { file: 'src/cli.js', name: 'bind' },
-  { file: 'src/cli.js', name: 'threadEnroll' },
-  { file: 'src/cli.js', name: 'unbind' },
+  { file: 'src/cli/binding-commands.js', name: 'bind' },
+  { file: 'src/cli/binding-commands.js', name: 'threadEnroll' },
+  { file: 'src/cli/binding-commands.js', name: 'unbind' },
   { file: 'src/cli/provision-commands.js', name: 'provisionInternal' },
   { file: 'src/cli/conductor-handoff.js', name: 'handoffInternal' },
   { file: 'src/cli/conductor-handoff.js', name: 'handoffFromLockInternal' },
