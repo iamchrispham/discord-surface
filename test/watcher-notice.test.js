@@ -473,3 +473,75 @@ test('watcher codec binds stable identity and exact target', () => {
   }
   assert.equal(validWatcherAddress(owner), true);
 });
+
+test('watcher packet rejects required field accessors before reads', { todo: 'issue225' }, () => {
+  const notice = {
+    id: watcherNoticeId('arm', 'trigger'), kind: 'notice', armKey: 'arm', triggerKey: 'trigger',
+    source: owner, target: child, text: 'notice body'
+  };
+  assert.deepEqual(decodeWatcherNotice(encodeWatcherNotice(notice, token), token, child), notice);
+
+  const failures = [];
+  for (const field of Object.keys(notice)) {
+    for (const variant of ['throwing', 'changing', 'inherited']) {
+      const copy = { ...notice };
+      const original = notice[field];
+      let reads = 0;
+      let coercions = 0;
+      const sentinel = {
+        [Symbol.toPrimitive]() {
+          coercions += 1;
+          return '';
+        }
+      };
+      const fixtureError = new Error('issue225 fixture getter executed');
+      if (variant === 'throwing') {
+        Object.defineProperty(copy, field, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            reads += 1;
+            throw fixtureError;
+          }
+        });
+      } else if (variant === 'changing') {
+        Object.defineProperty(copy, field, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            reads += 1;
+            return reads === 1 ? original : sentinel;
+          }
+        });
+      } else {
+        delete copy[field];
+        const proto = {};
+        Object.defineProperty(proto, field, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            reads += 1;
+            return original;
+          }
+        });
+        Object.setPrototypeOf(copy, proto);
+      }
+      try {
+        assert.throws(() => encodeWatcherNotice(copy, token), /invalid watcher notice/);
+      } catch (error) {
+        failures.push(`${field}/${variant}: ${error.message.split('\n')[0]}`);
+      }
+      try {
+        assert.equal(reads, 0);
+      } catch (error) {
+        failures.push(`${field}/${variant}: ${error.message.split('\n')[0]}`);
+      }
+      try {
+        assert.equal(coercions, 0);
+      } catch (error) {
+        failures.push(`${field}/${variant}: ${error.message.split('\n')[0]}`);
+      }
+    }
+  }
+  assert.deepEqual(failures, []);
+});
