@@ -1,4 +1,5 @@
 import { createFilePreparationHandlers, assertFilePreparationClaim } from './direct-post/file-preparation';
+import { createDirectPostRecoveryHandlers } from './direct-post/recovery';
 import { projectNewestDirectPostAttempt } from './direct-post/receipt-queries';
 export { queryDirectPostRows, querySentAgentResultRows, projectNewestDirectPostAttempt } from './direct-post/receipt-queries';
 import { DIRECT_POST_OUTCOMES } from './direct-post/contracts';
@@ -310,7 +311,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
         assertFilePreparationClaim(state, meta, BindingError, DIRECT_POST_FILE_PREPARATION, parseJson, StateCorruptError);
         const ownerIdentity = state.directPostOwnerIdentity(process.pid);
         state.receipt(null, DIRECT_POST_ATTEMPT, {
-          journal: 'direct-post-v1', ...meta, ...ownerIdentity, status: 'attempted'
+          journal: 'direct-post-v1', ...meta, ...ownerIdentity, ownerPid: process.pid, status: 'attempted'
         });
         return { claimed: true, status: 'claimed', attemptId: meta.attemptId, nonce: meta.nonce };
       });
@@ -410,6 +411,8 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
       if (this.directPostOutcomeMatches(state, event as DirectPostMatchEvent, 'messageId', event.id)) return true;
       return Boolean(event.isBot && typeof event.nonce === 'string' && this.directPostOutcomeMatches(state, event as DirectPostMatchEvent, 'nonce', event.nonce));
     },
+
+    ...createDirectPostRecoveryHandlers({ DIRECT_POST_ATTEMPT, DIRECT_POST_OUTCOME }),
 
     ...createFilePreparationHandlers(dependencies)
   };

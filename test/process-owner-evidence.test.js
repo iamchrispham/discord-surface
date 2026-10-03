@@ -93,6 +93,12 @@ test('classifier table proves absence, denial, unreadability and identity compar
   const failed = probeDeps({ probeErrorThrown: probeError('EIO') });
   assert.deepEqual(classifyProcessOwner(FAKE_PID, null, failed.deps), { status: 'indeterminate', reason: 'probe-error' });
 
+  const unreadableCode = probeDeps({ probeErrorThrown: Object.defineProperty({}, 'code', {
+    get() { throw new Error('unreadable probe code'); }
+  }) });
+  assert.deepEqual(classifyProcessOwner(FAKE_PID, null, unreadableCode.deps), { status: 'indeterminate', reason: 'probe-error' });
+  assert.equal(unreadableCode.calls.capture, 0);
+
   const nonError = probeDeps();
   nonError.deps.probePid = () => { throw 'fixture non-error throw'; };
   assert.deepEqual(classifyProcessOwner(FAKE_PID, { ownerStartTime: 'start' }, nonError.deps), { status: 'indeterminate', reason: 'probe-error' });
@@ -721,12 +727,26 @@ test('admitted-file cleanup still enforces sent-part and resolved-network-outcom
 // Test 11: structural inventory
 // ---------------------------------------------------------------------------
 
+test('attempts retain a known producer PID when optional identity capture fails', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.textFile, 'capture unavailable');
+  f.state.directPostOwnerIdentity = () => null;
+  const result = await runDirectPost({ state: f.state, token: 'fixture', nativeId: f.nativeId,
+    generation: 1, textFile: f.textFile, dedupeKey: 'known-pid-without-identity',
+    fetchImpl: async () => response('uncertain', 500) });
+  assert.equal(result.status, 'unknown');
+  const row = f.state.directPostRows('known-pid-without-identity').find(item => item.kind === 'direct-post-attempt');
+  assert.ok(row);
+  assert.equal(row.detail.ownerPid, process.pid);
+});
+
 const PRESERVED_PROBES = new Map([
   ['state/intake.js\u0000processAlive', 'independent EPERM-hold sibling probe, deferred from this class fix'],
   ['claude/socket-ownership/lock-owner.ts\u0000isSocketLockOwnerAlive', 'socket lock-owner liveness, distinct lock domain'],
   ['cli/gateway-process.js\u0000gatewayProcessStatus', 'gateway runtime supervision'],
   ['cli/gateway-process.js\u0000waitForExit', 'gateway runtime exit wait'],
   ['cli/runtime-lifecycle.js\u0000stop', 'runtime shutdown'],
+  ['cli/runtime-custody.js\u0000acquireHeldLock', 'generated lock guardian, distinct existing supervision domain'],
   ['state.js\u0000probePid', 'injected probe dependency feeding the typed process-owner classifier']
 ]);
 
@@ -762,28 +782,62 @@ function enclosingOwner(node) {
   return null;
 }
 
-function isNumericZero(node) {
-  return ts.isNumericLiteral(node) && node.text === '0';
-}
-
-function parseOwnerSites(fileName, text) {
+function parseOwnerSites(fileName, text, generatedOwner = null) {
   const kind = fileName.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS;
-  const sourceFile = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, kind);
+  const virtualPath = path.resolve(fileName);
+  const options = { noLib: true, noResolve: true, allowJs: true };
+  const sourceFile = ts.createSourceFile(virtualPath, text, ts.ScriptTarget.Latest, true, kind);
+  const host = ts.createCompilerHost(options);
+  host.getSourceFile = name => path.resolve(name) === virtualPath ? sourceFile : undefined;
+  const program = ts.createProgram([virtualPath], options, host);
+  const checker = program.getTypeChecker();
   const kills = [];
   const legacyCalls = [];
+
+  function staticValue(node, seen = new Set()) {
+    if (!node || seen.has(node)) return null;
+    seen = new Set(seen).add(node);
+    if (ts.isParenthesizedExpression(node)) return staticValue(node.expression, seen);
+    if (ts.isNumericLiteral(node)) return Number(node.text);
+    if (ts.isStringLiteral(node)) return node.text;
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const name = ts.isPropertyAccessExpression(node) ? node.name.text : staticValue(node.argumentExpression, seen);
+      if (name === 'directPostOwnerAlive') return 'legacy-owner';
+      if (name === 'kill' && staticValue(node.expression, seen) === 'process-object') return 'pid-probe';
+      return null;
+    }
+    if (!ts.isIdentifier(node)) return null;
+    const symbol = checker.getSymbolAtLocation(node);
+    const declaration = symbol && symbol.valueDeclaration;
+    if (!declaration) return node.text === 'process' ? 'process-object'
+      : node.text === 'directPostOwnerAlive' ? 'legacy-owner' : null;
+    if (ts.isVariableDeclaration(declaration) &&
+        (declaration.parent.flags & ts.NodeFlags.Const)) {
+      return staticValue(declaration.initializer, seen);
+    }
+    if (ts.isBindingElement(declaration) && ts.isObjectBindingPattern(declaration.parent)) {
+      const variable = declaration.parent.parent;
+      if (!ts.isVariableDeclaration(variable) || !(variable.parent.flags & ts.NodeFlags.Const)) return null;
+      const name = declaration.propertyName ? declaration.propertyName.getText(sourceFile) : declaration.name.getText(sourceFile);
+      if (name === 'directPostOwnerAlive') return 'legacy-owner';
+      if (name === 'kill' && staticValue(variable.initializer, seen) === 'process-object') return 'pid-probe';
+    }
+    return null;
+  }
+
   const visit = node => {
     if (ts.isCallExpression(node)) {
-      const expression = node.expression;
-      const callee = ts.isIdentifier(expression) ? expression.text
-        : (ts.isPropertyAccessExpression(expression) ? expression.name.text : null);
-      if (callee === 'kill' && ts.isPropertyAccessExpression(expression) &&
-          expression.expression.getText() === 'process' && node.arguments.length >= 2 &&
-          isNumericZero(node.arguments[1])) {
-        kills.push({ file: fileName, owner: enclosingOwner(node) });
+      const callee = staticValue(node.expression);
+      const owner = generatedOwner || enclosingOwner(node);
+      if (callee === 'pid-probe' && node.arguments.length >= 2 && staticValue(node.arguments[1]) === 0) {
+        kills.push({ file: fileName, owner });
       }
-      if (callee === 'directPostOwnerAlive') {
-        legacyCalls.push({ file: fileName, owner: enclosingOwner(node) });
-      }
+      if (callee === 'legacy-owner') legacyCalls.push({ file: fileName, owner });
+    }
+    if (!generatedOwner && ts.isStringLiteral(node) && node.text.includes('process.kill')) {
+      const nested = parseOwnerSites(fileName, node.text, enclosingOwner(node));
+      kills.push(...nested.kills);
+      legacyCalls.push(...nested.legacyCalls);
     }
     ts.forEachChild(node, visit);
   };
@@ -819,6 +873,7 @@ test('structural inventory accounts for every PID probe and leaves no legacy des
     'cli/gateway-process.js\u0000gatewayProcessStatus',
     'cli/gateway-process.js\u0000waitForExit',
     'cli/runtime-lifecycle.js\u0000stop',
+    'cli/runtime-custody.js\u0000acquireHeldLock',
     'state.js\u0000probePid',
     'state.js\u0000probePid',
     'state/intake.js\u0000processAlive'
@@ -857,6 +912,21 @@ test('inventory goes red for a new private PID probe and a legacy-false destruct
       },
       /unclassified process probe src\/state\/new-probe.js:privateOwnerProbe/
     );
+
+    const siblings = [
+      "function newProbe(pid) { process['kill'](pid, 0); }",
+      'const signal = 0; function newProbe(pid) { process.kill(pid, signal); }',
+      'const probe = process.kill; function newProbe(pid) { probe(pid, 0); }',
+      'const proc = process; function newProbe(pid) { proc.kill(pid, 0); }',
+      'const {kill} = process; function newProbe(pid) { kill(pid, 0); }',
+      "function newCleanup(state,pid,identity) { return state['directPostOwnerAlive'](pid,identity); }"
+    ];
+    for (const [index, code] of siblings.entries()) {
+      const siblingRoot = path.join(tmpRoot, `sibling-${index}`);
+      fs.mkdirSync(siblingRoot);
+      fs.writeFileSync(path.join(siblingRoot, 'new-owner.js'), code);
+      assert.equal(inventoryProcessOwnerSites(siblingRoot).violations.length, 1, code);
+    }
 
     const legacyRoot = path.join(tmpRoot, 'legacy-cleanup');
     fs.mkdirSync(path.join(legacyRoot, 'src', 'state'), { recursive: true });

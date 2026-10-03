@@ -89,6 +89,26 @@ export interface DirectPostState {
   receipt(discordId: string | null, kind: string, detail: Record<string, unknown>): void;
 }
 
+export type DirectPostRecoveryOwnerAlive = (pid: unknown, detail: DirectPostReceiptDetail) => ProcessOwnerEvidence | boolean;
+
+export interface DirectPostRecoveryState {
+  transaction<T>(operation: () => T): T;
+  directPostRows(requestId?: string | null, channelId?: string | null, relatedChannelIds?: readonly string[]): DirectPostReceiptRow[];
+  directPostOwnerEvidence(pid: unknown, expectedIdentity: DirectPostReceiptDetail): ProcessOwnerEvidence;
+  recoverDirectPostReceiptsInternal(ownerAlive?: DirectPostRecoveryOwnerAlive): number;
+  receipt(discordId: string | null, kind: string, detail: Record<string, unknown>): void;
+}
+
+export interface DirectPostRecoveryHandlers {
+  recoverDirectPostReceipts(state: DirectPostRecoveryState, ownerAlive?: DirectPostRecoveryOwnerAlive): number;
+  recoverDirectPostReceiptsInternal(state: DirectPostRecoveryState, ownerAlive?: DirectPostRecoveryOwnerAlive): number;
+}
+
+export interface DirectPostRecoveryDependencies {
+  DIRECT_POST_ATTEMPT: string;
+  DIRECT_POST_OUTCOME: string;
+}
+
 export interface DirectPostFilePreparationSeed {
   preparationId: string;
   requestId: string;
@@ -166,7 +186,7 @@ export interface DirectPostOutcomeRecord extends DirectPostReceiptDetail {
   outcome: DirectPostOutcome;
 }
 
-export interface DirectPostHandlers {
+export interface DirectPostHandlers extends DirectPostRecoveryHandlers {
   hasUnresolvedBindingPost(state: DirectPostState, channelId: string): boolean;
   hasUnresolvedOrdinaryPost(state: DirectPostState, channelId: string): boolean;
   inspectDirectPostPart(state: DirectPostState, meta: DirectPostPartMeta): DirectPostInspection | null;

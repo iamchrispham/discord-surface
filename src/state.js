@@ -873,6 +873,10 @@ class SurfaceState {
     return townHallPublicationHandlers.getTownHallPublication(this, ...args);
   }
 
+  getTownHallPublicationSet(...args) {
+    return townHallPublicationHandlers.getTownHallPublicationSet(this, ...args);
+  }
+
   markTownHallPublicationInFlight(...args) {
     return townHallPublicationHandlers.markTownHallPublicationInFlight(this, ...args);
   }
@@ -1288,25 +1292,12 @@ class SurfaceState {
     return this.directPostOwnerEvidence(pid, expectedIdentity).status === OWNER_EVIDENCE.MATCHING_LIVE;
   }
 
-  recoverDirectPostReceipts(ownerAlive = (pid, expectedIdentity) => this.directPostOwnerEvidence(pid, expectedIdentity)) {
-    return this.transaction(() => this.recoverDirectPostReceiptsInternal(ownerAlive));
+  recoverDirectPostReceipts(ownerAlive = undefined) {
+    return directPostHandlers.recoverDirectPostReceipts(this, ownerAlive);
   }
 
-  recoverDirectPostReceiptsInternal(ownerAlive = (pid, expectedIdentity) => this.directPostOwnerEvidence(pid, expectedIdentity)) {
-    const rows = this.directPostRows();
-    const outcomes = new Set(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail?.attemptId).map(row => row.detail.attemptId));
-    let recovered = 0;
-    for (const row of rows.filter(item => item.kind === DIRECT_POST_ATTEMPT)) {
-      if (outcomes.has(row.detail.attemptId)) continue;
-      if (normalizeOwnerEvidence(ownerAlive(row.detail.ownerPid, row.detail)).status !== OWNER_EVIDENCE.ABSENT) continue;
-      this.receipt(null, DIRECT_POST_OUTCOME, {
-        ...row.detail,
-        outcome: 'unknown',
-        reason: 'process stopped before direct post outcome'
-      });
-      recovered += 1;
-    }
-    return recovered;
+  recoverDirectPostReceiptsInternal(ownerAlive = undefined) {
+    return directPostHandlers.recoverDirectPostReceiptsInternal(this, ownerAlive);
   }
 
   directPostBindingCurrent(binding, operatorId = null, deliveryChannelId = null, allowUnreadyDelivery = false) {

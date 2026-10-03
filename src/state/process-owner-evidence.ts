@@ -119,7 +119,12 @@ function readActualIdentity(value: object): ActualIdentity | null {
 }
 
 function probeFailure(error: unknown): ProcessOwnerEvidence {
-  const code = error !== null && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  let code: unknown;
+  try {
+    code = error !== null && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  } catch {
+    return evidence(OWNER_EVIDENCE.INDETERMINATE, OWNER_EVIDENCE_REASON.PROBE_ERROR);
+  }
   if (code === 'ESRCH') return evidence(OWNER_EVIDENCE.ABSENT, OWNER_EVIDENCE_REASON.PROBE_ABSENT);
   if (code === 'EPERM') return evidence(OWNER_EVIDENCE.INDETERMINATE, OWNER_EVIDENCE_REASON.PROBE_DENIED);
   return evidence(OWNER_EVIDENCE.INDETERMINATE, OWNER_EVIDENCE_REASON.PROBE_ERROR);

@@ -63,6 +63,7 @@
     "src/board-refresh.ts",
     "src/state/direct-post.ts",
     "src/state/direct-post/contracts.ts",
+    "src/state/direct-post/recovery.ts",
     "src/state/direct-post/receipt-queries.ts",
     "src/state/direct-post/file-preparation.ts",
     "src/state/direct-post/outcome-identity.ts",
@@ -153,6 +154,8 @@
     "src/state/town-hall-publication/types.ts",
     "src/state/town-hall-publication/projection.ts",
     "src/state/town-hall-publication/repository.ts",
-    "test/types/town-hall-publication-types.ts"
+    "src/state/town-hall-publication/context.ts",
+    "test/types/town-hall-publication-types.ts",
+    "test/types/town-hall-publication-parts-types.ts"
   ]
 }

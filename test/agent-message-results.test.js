@@ -189,6 +189,9 @@ test('an interrupted v1 retry recovers before v2 validation without posting', as
   const secret = path.join(dir, 'secret');
   const textFile = path.join(dir, 'gone.txt');
   const destination = path.join(dir, 'destination.json');
+  const deadOwner = require('node:child_process').spawnSync(process.execPath, ['-e', 'process.exit(0)'], { timeout: 2000 });
+  assert.equal(deadOwner.status, 0);
+  assert.throws(() => process.kill(deadOwner.pid, 0), { code: 'ESRCH' });
   const state = new SurfaceState(db);
   try {
     fs.writeFileSync(secret, `DISCORD_TOKEN=${token}\n`, { mode: 0o600 });
@@ -197,7 +200,7 @@ test('an interrupted v1 retry recovers before v2 validation without posting', as
     const requestId = 'cli-legacy-interrupted';
     const legacyPacket = { ...packet, id: requestId, source, target };
     state.receipt(null, 'direct-post-attempt', {
-      journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, sourcePath: textFile,
+      journal: 'direct-post-v1', requestId, attemptId: `${requestId}-attempt`, ownerPid: deadOwner.pid, sourcePath: textFile,
       textHash: crypto.createHash('sha256').update(JSON.stringify(legacyPacket)).digest('hex'), operatorId: '900',
       partHash: 'legacy-part-hash', channelId: source.channelId, guildId: source.guildId, provider: source.provider,
       nativeId: source.nativeId, generation: source.generation, conductorId: 'fixture', repoKey: 'repo:fixture',
