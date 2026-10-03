@@ -100,6 +100,7 @@
     "src/discord/recovery-fetch.ts",
     "src/state/agent-routing.ts",
     "src/peer/resolution.ts",
+    "src/peer/town-hall-plan.ts",
     "src/discord/reconciliation-lookups.ts",
     "src/discord/native-proof-recovery.ts",
     "src/state/courier-route/attempt.ts",
