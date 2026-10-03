@@ -2,6 +2,21 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fixture } = require('./helpers/intake-recovery-fixture');
 
+test('pending facade preserves the original rejection settlement order', async () => {
+  const { DiscordGateway } = require('../src/discord.js');
+  const method = DiscordGateway.prototype._reconcilePending;
+  const receiver = { get recoveryTimeoutMs() { throw new Error('deadline getter failed'); } };
+  const events = [];
+  let operation;
+  assert.doesNotThrow(() => { operation = method.call(receiver, undefined, null); });
+  operation.catch(() => events.push('rejected'));
+  queueMicrotask(() => events.push('queued'));
+  await assert.rejects(operation, /deadline getter failed/);
+  await Promise.resolve();
+  assert.equal(method.length, 2);
+  assert.deepEqual(events, ['rejected', 'queued']);
+});
+
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const settle = async operation => {
   let timer;
