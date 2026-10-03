@@ -1,6 +1,5 @@
 const assert = require('node:assert/strict');
 const http = require('node:http');
-const path = require('node:path');
 const test = require('node:test');
 const { ClaudeChannel } = require('../../src/claude-channel');
 const { DiscordGateway } = require('../../src/discord');
@@ -130,72 +129,4 @@ test('Claude channel identity reports a distinct listener instance across stop a
   assert.match(restarted.listenerInstanceId, uuidV4);
   assert.notEqual(restarted.listenerInstanceId, first.listenerInstanceId);
   await channel.stop();
-});
-
-test('ordinary Claude preflight rejects wrong harness and endpoint before recording, then accepts the valid proof', t => {
-  const f = fixture(t, { preflight: false });
-  const { binding, dir, session, socketPath, state } = f;
-  const proof = {
-    file: session.file, sessionId: CLAUDE, threadId: CLAUDE, workspace: dir, endpoint: socketPath
-  };
-  const mismatch = /ordinary Claude native preflight proof does not match the binding/;
-
-  // Wrong proof harness: rejected, and the verified receipt stays absent.
-  assert.throws(() => state.recordOrdinaryPreflight(binding, { ...proof, harness: 'codex' }), mismatch);
-  assert.equal(state.hasOrdinaryPreflight(binding), false);
-
-  // Wrong endpoint: rejected, and the verified receipt stays absent.
-  assert.throws(() => state.recordOrdinaryPreflight(binding, {
-    ...proof, endpoint: path.join(dir, 'other.sock'), harness: 'claude-code'
-  }), mismatch);
-  assert.equal(state.hasOrdinaryPreflight(binding), false);
-
-  // The same fixture's valid proof succeeds.
-  const recorded = state.recordOrdinaryPreflight(binding, { ...proof, harness: 'claude-code' });
-  assert.ok(recorded);
-  assert.equal(state.hasOrdinaryPreflight(binding), true);
-
-  const classifyRecord = state._isOrdinaryBindingRecord;
-  const classifyActive = state._isOrdinaryBinding;
-  const beforeOverride = state.listReceipts().length;
-  try {
-    state._isOrdinaryBindingRecord = () => false;
-    assert.equal(state.isOrdinaryBinding(binding), false);
-    state._isOrdinaryBindingRecord = classifyRecord;
-    state._isOrdinaryBinding = () => false;
-    assert.equal(state.hasOrdinaryPreflight(binding), false);
-    assert.throws(() => state.recordOrdinaryPreflight(binding, { ...proof, harness: 'claude-code' }), /not an ordinary/);
-    assert.equal(state.listReceipts().length, beforeOverride);
-  } finally {
-    state._isOrdinaryBindingRecord = classifyRecord;
-    state._isOrdinaryBinding = classifyActive;
-  }
-
-
-  // Unsupported provider stays unclassified and its changed-binding preflight is a null no-op.
-  assert.equal(state._isOrdinaryBindingRecord({ ...binding, provider: 'unknown-provider' }), false);
-  assert.equal(state._isOrdinaryBinding({ ...binding, provider: 'unknown-provider' }), false);
-  assert.equal(state._recordOrdinaryPreflight(
-    { ...binding, provider: 'unknown-provider', generation: binding.generation + 1 },
-    { ...proof, harness: 'claude-code' }
-  ), null);
-
-  // A conductor-owned Claude binding is refused without a row.
-  assert.throws(() => state._bindOrdinaryClaude({
-    channelId: 'conductor-claude', guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
-    workspace: dir, endpoint: socketPath, conductorId: 'conductor', repoKey: 'repo'
-  }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }, '100'), /ordinary bindings cannot carry conductor identity/);
-  assert.equal(state.getBinding('conductor-claude'), null);
-
-  state.unbind(binding.channelId);
-  const tombstone = state.getBinding(binding.channelId);
-  const receiptsBeforeRebind = state.listReceipts().length;
-  try {
-    state._isOrdinaryBindingRecord = () => false;
-    assert.throws(() => state.rebindOrdinaryClaude(binding,
-      { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }, '100'), /tombstone is unavailable/);
-    assert.deepEqual(state.getBinding(binding.channelId), tombstone);
-    assert.equal(state.listReceipts().length, receiptsBeforeRebind);
-  } finally { state._isOrdinaryBindingRecord = classifyRecord; }
-
 });

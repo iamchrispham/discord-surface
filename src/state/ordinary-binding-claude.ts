@@ -12,36 +12,41 @@ import type {
   OrdinaryRebindHandlerOptions
 } from './ordinary-binding/contracts';
 
-export type ClaudeOrdinaryBindingIdentity = OrdinaryBindingIdentity & { harness: 'claude-code' };
+export const CLAUDE_PROVIDERS = { CLAUDE: 'claude' } as const;
+export type ClaudeProvider = typeof CLAUDE_PROVIDERS[keyof typeof CLAUDE_PROVIDERS];
+export const CLAUDE_HARNESSES = { CODE: 'claude-code' } as const;
+export type ClaudeHarness = typeof CLAUDE_HARNESSES[keyof typeof CLAUDE_HARNESSES];
+
+export type ClaudeOrdinaryBindingIdentity = OrdinaryBindingIdentity & { harness: ClaudeHarness };
 
 // OrdinaryBindingInput declares a string index signature, so Omit<..., 'provider'>
 // collapses its named keys to unknown; intersect the narrowed provider instead.
 export type ClaudeOrdinaryBindingInput = OrdinaryBindingInput & {
-  provider: 'claude';
-  endpoint?: string | null;
+  provider: ClaudeProvider;
+  endpoint: string;
 };
 
 export type ClaudeOrdinaryBindingRecord = OrdinaryBindingRecord & {
-  provider: 'claude';
-  endpoint?: string | null;
+  provider: ClaudeProvider;
+  endpoint: string;
 };
 
 export type ClaudeOrdinaryPreflightDetail = OrdinaryNativeProof & {
-  harness: 'claude-code';
-  endpoint?: string | null;
+  harness: ClaudeHarness;
+  endpoint: string;
 };
 
 export type ClaudeOrdinaryBindingState = Pick<
   OrdinaryBindingState,
   'db' | 'bind' | 'rebind' | 'getBinding' | 'transaction' | 'receipt'
 > & {
-  _isOrdinaryBindingRecord(binding: OrdinaryBindingRecord | null): binding is ClaudeOrdinaryBindingRecord;
-  _isOrdinaryBinding(binding: OrdinaryBindingRecord | null): binding is ClaudeOrdinaryBindingRecord;
+  _isOrdinaryBindingRecord(binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
+  _isOrdinaryBinding(binding: OrdinaryBindingRecord | null): binding is OrdinaryBindingRecord;
 };
 
 export interface ClaudeOrdinaryBindingDependencies {
   BindingError: OrdinaryBindingDependencies['BindingError'];
-  PROVIDERS: { CLAUDE: 'claude' };
+  PROVIDERS: { CLAUDE: ClaudeProvider };
   READINESS: { PENDING: 'pending' };
   assertOrdinaryIdentity(provider: string, identity: ClaudeOrdinaryBindingIdentity): ClaudeOrdinaryBindingIdentity;
   assertOrdinaryNativeIdentity(provider: string, nativeId: string, identity: ClaudeOrdinaryBindingIdentity): void;
@@ -69,11 +74,11 @@ export interface ClaudeOrdinaryBindingHandlers {
   isOrdinaryBindingRecord(
     state: ClaudeOrdinaryBindingState,
     binding: OrdinaryBindingRecord | null
-  ): binding is ClaudeOrdinaryBindingRecord;
+  ): binding is OrdinaryBindingRecord;
   isOrdinaryBinding(
     state: ClaudeOrdinaryBindingState,
     binding: OrdinaryBindingRecord | null
-  ): binding is ClaudeOrdinaryBindingRecord;
+  ): binding is OrdinaryBindingRecord;
   hasOrdinaryPreflight(state: ClaudeOrdinaryBindingState, binding: OrdinaryBindingRecord | null): boolean;
   recordOrdinaryPreflight(
     state: ClaudeOrdinaryBindingState,
@@ -122,12 +127,12 @@ export function createOrdinaryClaudeBindingHandlers(
       });
     },
 
-    isOrdinaryBindingRecord(state, binding): binding is ClaudeOrdinaryBindingRecord {
+    isOrdinaryBindingRecord(state, binding): binding is OrdinaryBindingRecord {
       if (!binding || binding.provider !== PROVIDERS.CLAUDE || binding.conductorId || binding.repoKey) return false;
       return hasOrdinaryBindingReceipt(state, binding);
     },
 
-    isOrdinaryBinding(state, binding): binding is ClaudeOrdinaryBindingRecord {
+    isOrdinaryBinding(state, binding): binding is OrdinaryBindingRecord {
       if (!binding?.active) return false;
       return state._isOrdinaryBindingRecord(binding);
     },
@@ -141,14 +146,15 @@ export function createOrdinaryClaudeBindingHandlers(
       return state.transaction(() => {
         const current = state.getBinding(binding?.channelId);
         if (!bindingMatchesExpected(current, binding)) return null;
-        if (!state._isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${current?.provider || 'native'} binding`);
+        const currentProvider = current?.provider || 'native';
+        if (!state._isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${currentProvider} binding`);
         if (!detail || typeof detail !== 'object' || typeof detail.file !== 'string' || !path.isAbsolute(detail.file) ||
           detail.sessionId !== current.nativeId ||
           detail.threadId !== current.nativeId ||
           detail.workspace !== current.workspace) {
           throw new BindingError(`ordinary ${current.provider} native preflight proof does not match the binding`);
         }
-        if (detail.harness !== 'claude-code' || detail.endpoint !== current.endpoint) {
+        if (detail.harness !== CLAUDE_HARNESSES.CODE || detail.endpoint !== current.endpoint) {
           throw new BindingError('ordinary Claude native preflight proof does not match the binding');
         }
         state.receipt(null, ORDINARY_RECEIPT_KINDS.NATIVE_PREFLIGHT, {
