@@ -67,6 +67,10 @@ The peer MCP requires native caller identity on every invocation. A generic `cod
 
 After a qualified integration loads the tools, call `peer_list()` in the bound native session. Every `peer_send` needs a ready caller with exactly one ready enrolled child. A new request also needs one ready child at its recipient; a result using `reply_to` follows the recorded return route. Registration and a transport `sent` receipt do not prove native pickup or a correlated result. See [README.md](README.md#authenticated-peer-mcp) for tool arguments and result evidence.
 
+Verify peer adoption in the bound native session. Updating a launcher does not refresh an existing MCP server set, and a long-lived shell may retain an old launcher function. Before the next normal resume, open a fresh shell or reload the launcher's documented initialization. Do not restart solely to pass an adoption check or hand-edit generated configuration as a durable fix.
+
+At that attachment, verify the generated configuration uses the intended installed peer CLI. Confirm `peer_list`, `peer_send` and `peer_result` are exposed in the same session. Record the caller identity, generation and child route from `peer_list()`, then prove a signed request and correlated result through an existing recipient. A ready listener or working ad-hoc CLI does not prove peer adoption.
+
 Peer MCP registration does not steer an active Codex turn. The adapter's Codex intake uses `codex queue --thread`, which delivers a follow-up on a later turn. Active-turn steering needs a separately qualified route to the owning native app-server.
 
 Before a planned release cutover boots out the Gateway, inspect the active state with the same release's `status --state-dir <state>` entrypoint. Check `readiness.intakeWatermarks` and `readiness.threadEnrollments` for every state other than `ready`, including `pending`, `gap`, and `unavailable`. Record each affected channel or thread ID with its boundary detail and bounds, and distinguish retryable holds from terminal permission or identity failures. A non-ready route remains held and non-dispatchable after startup; do not clear it to make the cutover appear ready.
