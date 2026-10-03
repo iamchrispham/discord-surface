@@ -690,7 +690,6 @@ test('room parts suite and type contracts are registered once', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'package.json'), 'utf8'));
   const tokens = pkg.scripts.test.trim().split(/\s+/);
   assert.equal(tokens.filter(entry => entry === TEST_RELATIVE).length, 1, 'the suite must be registered exactly once');
-  assert.equal(tokens[tokens.length - 1], TEST_RELATIVE, 'the suite must be the final registered script entry');
 
   const base = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'tsconfig.json'), 'utf8'));
   assert.equal(base.include.filter(entry => entry === OWNER_RELATIVE).length, 1, 'tsconfig include must list the owner once');

@@ -833,6 +833,10 @@ class SurfaceState {
     return townHallPublicationHandlers.getTownHallPublication(this, ...args);
   }
 
+  getTownHallPublicationSet(...args) {
+    return townHallPublicationHandlers.getTownHallPublicationSet(this, ...args);
+  }
+
   markTownHallPublicationInFlight(...args) {
     return townHallPublicationHandlers.markTownHallPublicationInFlight(this, ...args);
   }
