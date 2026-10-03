@@ -25,6 +25,10 @@ function visit(node, callback) {
 
 function parseSource(file) {
   const text = fs.readFileSync(path.join(ROOT, file), 'utf8');
+  return parseSourceText(file, text);
+}
+
+function parseSourceText(file, text) {
   const kind = file.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS;
   return ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
 }
@@ -85,6 +89,35 @@ function exactKeysDeclarations(inventory, file) {
   return entry ? declarationsNamed(entry.sourceFile, 'exactKeys') : [];
 }
 
+function assertExactKeysOwnerPin(inventory) {
+  const exactKeysByFile = OWNER_FILES
+    .map(file => ({ file, count: exactKeysDeclarations(inventory, file).length }))
+    .filter(entry => entry.count > 0);
+  assert.equal(exactKeysByFile.reduce((total, entry) => total + entry.count, 0), 2,
+    'exactly two exactKeys declarations in the codec owners');
+  assert.deepEqual(exactKeysByFile.map(entry => entry.file).sort(), [...OWNER_FILES].sort(),
+    'exactKeys is declared only in the two codec owners');
+}
+
+test('exactKeys ownership pin ignores unrelated helpers but rejects codec duplicates', () => {
+  const codecInventory = productionInventory().filter(item => OWNER_FILES.includes(item.file));
+  const unrelated = {
+    file: 'src/unrelated-helper.ts',
+    sourceFile: parseSourceText('src/unrelated-helper.ts', 'const exactKeys = () => true;')
+  };
+  assert.doesNotThrow(() => assertExactKeysOwnerPin([...codecInventory, unrelated]));
+
+  const duplicateAgent = {
+    file: AGENT_OWNER,
+    sourceFile: parseSourceText(AGENT_OWNER,
+      `${fs.readFileSync(path.join(ROOT, AGENT_OWNER), 'utf8')}\nconst exactKeys = () => true;`)
+  };
+  assert.throws(() => assertExactKeysOwnerPin([
+    duplicateAgent,
+    codecInventory.find(item => item.file === WATCHER_OWNER)
+  ]), /exactly two exactKeys/);
+});
+
 test('required packet field checks use one data-property owner', () => {
   const inventory = productionInventory();
   const files = inventory.map(item => item.file);
@@ -94,14 +127,8 @@ test('required packet field checks use one data-property owner', () => {
   assert.ok(files.includes(WATCHER_OWNER), 'inventory includes the watcher codec owner');
   assert.ok(inventory.every(item => item.sourceFile.text.length > 0), 'every inventoried source is non-empty');
 
-  // (b) exactKeys exists exactly twice in all of src: once per codec owner.
-  const exactKeysByFile = inventory
-    .map(item => ({ file: item.file, count: declarationsNamed(item.sourceFile, 'exactKeys').length }))
-    .filter(entry => entry.count > 0);
-  assert.equal(exactKeysByFile.reduce((total, entry) => total + entry.count, 0), 2,
-    'exactly two exactKeys declarations in src');
-  assert.deepEqual(exactKeysByFile.map(entry => entry.file).sort(), [...OWNER_FILES].sort(),
-    'exactKeys is declared only in the two codec owners');
+  // (b) exactKeys exists exactly twice in the codec owners: once per owner.
+  assertExactKeysOwnerPin(inventory);
 
   // (c) Exactly one ownDataProperty owner, scoped to the two codec files. The
   // unrelated private ownDataProperty in src/peer/town-hall-plan.ts is ignored.
