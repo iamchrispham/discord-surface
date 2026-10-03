@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import { sameAddress, validAddress, type AgentAddress } from '../../agent-message';
+import { sameAddress, sameAgentSession, validAddress, type AgentAddress } from '../../agent-message';
 import { sameWatcherAddress, sameWatcherNotice, validateWatcherNotice } from '../../watcher-notice';
 import { COURIER_RECEIPT_KINDS, COURIER_RESULT_STATUSES, COURIER_ROUTE_STATES } from './constants';
 import type { CourierDependencies, CourierMessage, CourierRoute, CourierState, SqlRow } from './types';
@@ -30,7 +30,7 @@ function routeInput(deps: CourierDependencies, input: unknown): CourierRoute {
   if (sessionRoot !== null && path.basename(sessionRoot) !== 'sessions') throw new deps.BindingError('courier.sessionRoot must end in sessions');
   const recipientThreadId = deps.assertUuid(rawCourier.recipientThreadId || rawCourier.destinationThreadId, 'courier.recipientThreadId');
   const hostId = rawCourier.hostId == null ? null : deps.assertText(rawCourier.hostId, 'courier.hostId', 128);
-  if (provider === target.provider && nativeId === target.nativeId) {
+  if (sameAgentSession({ provider, nativeId }, target)) {
     throw new deps.BindingError('courier identity must differ from parent native identity');
   }
   return {
