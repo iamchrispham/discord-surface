@@ -121,6 +121,7 @@
     "src/state/town-hall-publication/index.ts",
     "src/state/town-hall-publication/types.ts",
     "src/state/town-hall-publication/projection.ts",
-    "src/state/town-hall-publication/repository.ts"
+    "src/state/town-hall-publication/repository.ts",
+    "src/town-hall-child.ts"
   ]
 }
