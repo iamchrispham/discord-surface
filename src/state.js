@@ -1250,31 +1250,12 @@ class SurfaceState {
     );
   }
 
-  recoverDirectPostReceipts(ownerAlive = (pid, expectedIdentity) => {
-    if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
-    return this.directPostOwnerAlive(pid, expectedIdentity);
-  }) {
-    return this.transaction(() => this.recoverDirectPostReceiptsInternal(ownerAlive));
+  recoverDirectPostReceipts(ownerAlive = undefined) {
+    return directPostHandlers.recoverDirectPostReceipts(this, ownerAlive);
   }
 
-  recoverDirectPostReceiptsInternal(ownerAlive = (pid, expectedIdentity) => {
-    if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
-    return this.directPostOwnerAlive(pid, expectedIdentity);
-  }) {
-    const rows = this.directPostRows();
-    const outcomes = new Set(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail?.attemptId).map(row => row.detail.attemptId));
-    let recovered = 0;
-    for (const row of rows.filter(item => item.kind === DIRECT_POST_ATTEMPT)) {
-      if (outcomes.has(row.detail.attemptId)) continue;
-      if (ownerAlive(row.detail.ownerPid, row.detail)) continue;
-      this.receipt(null, DIRECT_POST_OUTCOME, {
-        ...row.detail,
-        outcome: 'unknown',
-        reason: 'process stopped before direct post outcome'
-      });
-      recovered += 1;
-    }
-    return recovered;
+  recoverDirectPostReceiptsInternal(ownerAlive = undefined) {
+    return directPostHandlers.recoverDirectPostReceiptsInternal(this, ownerAlive);
   }
 
   directPostBindingCurrent(binding, operatorId = null, deliveryChannelId = null, allowUnreadyDelivery = false) {
