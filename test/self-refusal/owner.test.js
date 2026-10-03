@@ -284,14 +284,11 @@ test('self-refusal is delegated to one shared sameAgentSession owner in current 
   const plannerSource = sources.find(candidate => candidate.file === PLANNER_OWNER).sourceFile;
   const childSource = sources.find(candidate => candidate.file === CHILD_OWNER).sourceFile;
 
-  // (a) Both current consumers route their self refusal through the owner.
   assertDelegatedSelfRefusal(agentSource, 'validateAgentMessage');
   assertDelegatedSelfRefusal(childSource, 'snapshotPacket');
   assertDelegatedSelfRefusal(plannerSource, 'planTownHallBroadcast',
     { forbiddenIdentifiers: ['sourceIdentity'] });
 
-  // (a2) A new production file with an inline comparator must fail the same
-  // inventory, while the two delegated consumers above pass it.
   const thirdFileInlineBypass = parseSourceText('src/peer/third-self-refusal.ts', `
 export function rejectThirdAgentMessage(packet: unknown): void {
   const source = packet.source;
