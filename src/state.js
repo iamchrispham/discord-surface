@@ -86,6 +86,9 @@ const {
   TOWN_HALL_JOURNAL_RECEIPTS,
   TOWN_HALL_JOURNAL_STATES
 } = require('./state/town-hall-journal');
+const {
+  createTownHallPublicationHandlers
+} = require('./state/town-hall-publication');
 
 const SCHEMA_VERSION = '1.8';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -282,6 +285,13 @@ const courierRouteHandlers = createCourierRouteHandlers({
 const townHallJournalHandlers = createTownHallJournalHandlers({
   BindingError,
   StateCorruptError
+});
+
+const townHallPublicationHandlers = createTownHallPublicationHandlers({
+  BindingError,
+  StateCorruptError,
+  discordNonce,
+  probePid: pid => process.kill(pid, 0)
 });
 
 const replyLifecycleHandlers = createReplyLifecycleHandlers({ assertProvider, assertText, assertUuid, StaleGenerationError, assertNativeReplyFileManifest, BindingError, REPLY_LIMIT, AuthorizationError, NATIVE_ACK_RECEIPT, MESSAGE_STATES, now, NATIVE_REPLY_FILE_PHASES, splitReply, discordNonce, safeDetail, REPLY_COMPLETED_WITHOUT_POST, rowReplyPart });
@@ -852,6 +862,30 @@ class SurfaceState {
 
   listTownHallBroadcasts(...args) {
     return townHallJournalHandlers.listTownHallBroadcasts(this, ...args);
+  }
+
+  reserveTownHallPublication(...args) {
+    return townHallPublicationHandlers.reserveTownHallPublication(this, ...args);
+  }
+
+  getTownHallPublication(...args) {
+    return townHallPublicationHandlers.getTownHallPublication(this, ...args);
+  }
+
+  markTownHallPublicationInFlight(...args) {
+    return townHallPublicationHandlers.markTownHallPublicationInFlight(this, ...args);
+  }
+
+  recordTownHallPublicationOutcome(...args) {
+    return townHallPublicationHandlers.recordTownHallPublicationOutcome(this, ...args);
+  }
+
+  recoverTownHallPublication(...args) {
+    return townHallPublicationHandlers.recoverTownHallPublication(this, ...args);
+  }
+
+  confirmTownHallPublication(...args) {
+    return townHallPublicationHandlers.confirmTownHallPublication(this, ...args);
   }
 
   findNativeBinding(nativeId, provider = null) { return bindingLifecycleHandlers.findNativeBinding.apply(this, arguments); }
