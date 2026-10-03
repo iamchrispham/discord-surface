@@ -2,7 +2,7 @@ function createMessageRecoveryHandlers({ boardRefreshHandlers, topicPublicationH
   return {
   recoverAfterRestart(ownerAlive = null) {
     return this.transaction(() => {
-      boardRefreshHandlers.recoverBoardRefreshReceipts(this, ownerAlive || ((pid, identity) => this.directPostOwnerAlive(pid, identity)), true);
+      boardRefreshHandlers.recoverBoardRefreshReceipts(this, ownerAlive || ((pid, identity) => typeof this.directPostOwnerEvidence === 'function' ? this.directPostOwnerEvidence(pid, identity) : null), true);
       this.recoverDirectPostReceiptsInternal();
       topicPublicationHandlers.recoverTopicPublications.call(this);
       const transportAttempts = this.db.prepare(`

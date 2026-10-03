@@ -11,6 +11,7 @@ const { agentComplete, GATEWAY_CAPABILITIES } = require('../src/cli');
 const { agentCompletionCommand, claudeEvent, codexPrompt } = require('../src/native');
 const { runDirectPost } = require('../src/direct-post');
 const { createSurfaceConsumer } = require('../src/discord');
+const { OWNER_EVIDENCE, OWNER_EVIDENCE_REASON } = require('../src/state/process-owner-evidence');
 
 const source = { guildId: '100', channelId: '101', provider: 'codex', nativeId: '11111111-1111-1111-1111-111111111111', generation: 1 };
 const target = { guildId: '100', channelId: '102', provider: 'claude', nativeId: '22222222-2222-2222-2222-222222222222', generation: 2 };
@@ -554,7 +555,7 @@ test('agent completion stays eligible after newest capacity refusal cleanup and 
       const latest = state.nativeReplyFilePreparation(messageId);
       assert.notEqual(latest.preparationId, older.preparationId);
       assert.throws(() => state.completeAgentHandledWithoutPost(identity), /native reply file custody/);
-      state.directPostOwnerAlive = () => false;
+      state.directPostOwnerEvidence = () => ({ status: OWNER_EVIDENCE.ABSENT, reason: OWNER_EVIDENCE_REASON.PROBE_ABSENT });
       state.releaseNativeReplyFilePreparation(messageId, latest.preparationId);
       state.close();
       state = new SurfaceState(db);

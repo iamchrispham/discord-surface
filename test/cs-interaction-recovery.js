@@ -153,7 +153,9 @@ test('remote callback crash leaves one orphan outcome after live owner exits, wi
     const state = new SurfaceState(first.state.dbPath || first.dir + '/surface.sqlite');
     assert.equal(state.recoverAfterRestart(() => true).interactionCallbacks, 0);
     assert.equal(state.getTransportReceipt('crash-1', 'interaction-callback').outcome, null);
-    const recovered = state.recoverAfterRestart(() => false);
+    assert.equal(state.recoverAfterRestart(() => false).interactionCallbacks, 0);
+    assert.equal(state.getTransportReceipt('crash-1', 'interaction-callback').outcome, null);
+    const recovered = state.recoverAfterRestart(() => ({ status: 'absent', reason: 'probe-absent' }));
     assert.equal(recovered.interactionCallbacks, 1);
     assert.equal(remoteCalls, 1);
     assert.equal(callbackOutcome(state, 'crash-1').outcome, 'unknown');

@@ -1,3 +1,5 @@
+import type { ProcessOwnerEvidence } from '../process-owner-evidence';
+
 export const BOARD_RECEIPT_KINDS = Object.freeze({
   DESIGNATION: 'board-designation',
   ATTEMPT: 'board-refresh-attempt',
@@ -57,6 +59,7 @@ export interface BoardState {
   receipt(discordId: string | null, kind: string, detail: unknown): void;
   directPostOwnerIdentity?(pid: number): unknown;
   directPostOwnerAlive?(pid: number, identity: unknown): boolean;
+  directPostOwnerEvidence?(pid: number, identity?: unknown): ProcessOwnerEvidence;
 }
 
 export interface BoardTarget {
