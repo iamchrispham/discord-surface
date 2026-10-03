@@ -11,9 +11,11 @@ const ROOT = path.resolve(__dirname, '../..');
 const AGENT_OWNER = 'src/agent-message.ts';
 const PLANNER_OWNER = 'src/peer/town-hall-plan.ts';
 const WATCHER_OWNER = 'src/watcher-notice.ts';
+const CHILD_OWNER = 'src/town-hall-child.ts';
 const SELF_REFUSAL_CONSUMER_INVENTORY = Object.freeze([
   Object.freeze({ file: AGENT_OWNER, functionName: 'validateAgentMessage' }),
-  Object.freeze({ file: PLANNER_OWNER, functionName: 'planTownHallBroadcast' })
+  Object.freeze({ file: PLANNER_OWNER, functionName: 'planTownHallBroadcast' }),
+  Object.freeze({ file: CHILD_OWNER, functionName: 'snapshotPacket' })
 ]);
 
 function visit(node, callback) {
@@ -280,14 +282,13 @@ test('self-refusal is delegated to one shared sameAgentSession owner in current 
 
   const agentSource = sources.find(candidate => candidate.file === AGENT_OWNER).sourceFile;
   const plannerSource = sources.find(candidate => candidate.file === PLANNER_OWNER).sourceFile;
+  const childSource = sources.find(candidate => candidate.file === CHILD_OWNER).sourceFile;
 
-  // (a) Both current consumers route their self refusal through the owner.
   assertDelegatedSelfRefusal(agentSource, 'validateAgentMessage');
+  assertDelegatedSelfRefusal(childSource, 'snapshotPacket');
   assertDelegatedSelfRefusal(plannerSource, 'planTownHallBroadcast',
     { forbiddenIdentifiers: ['sourceIdentity'] });
 
-  // (a2) A new production file with an inline comparator must fail the same
-  // inventory, while the two delegated consumers above pass it.
   const thirdFileInlineBypass = parseSourceText('src/peer/third-self-refusal.ts', `
 export function rejectThirdAgentMessage(packet: unknown): void {
   const source = packet.source;
