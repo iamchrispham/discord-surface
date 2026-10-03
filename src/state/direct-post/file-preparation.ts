@@ -3,6 +3,7 @@ import type { DirectPostReceiptDetail, DirectPostState, DirectPostFilePreparatio
 import { DIRECT_POST_FILE_LIMITS, DIRECT_POST_FILE_PHASES, stagedDirectPostFilePath } from '../../direct-post-file';
 import type { DirectPostFileManifest, DirectPostFilePreparation } from '../../direct-post-file';
 import { NATIVE_REPLY_FILE_JOURNAL, NATIVE_REPLY_FILE_PREPARATION } from '../native-reply-file';
+import { normalizeOwnerEvidence, OWNER_EVIDENCE } from '../process-owner-evidence';
 
 function assertFileSeed(seed: DirectPostFilePreparationSeed, BindingError: DirectPostErrorConstructor, assertText: DirectPostDependencies['assertText']): void {
   assertText(seed.preparationId, 'preparationId', 128);
@@ -159,7 +160,10 @@ export function createFilePreparationHandlers(dependencies: DirectPostDependenci
             ownerStartTime: typeof existing.detail.ownerStartTime === 'string' ? existing.detail.ownerStartTime : null,
             ownerCommand: typeof existing.detail.ownerCommand === 'string' ? existing.detail.ownerCommand : null
           };
-          if (state.directPostOwnerAlive(ownerPid, ownerIdentity)) {
+          const evidence = typeof state.directPostOwnerEvidence === 'function'
+            ? state.directPostOwnerEvidence(ownerPid, ownerIdentity)
+            : null;
+          if (normalizeOwnerEvidence(evidence).status !== OWNER_EVIDENCE.ABSENT) {
             throw new BindingError('direct post file preparation owner is still active');
           }
         }

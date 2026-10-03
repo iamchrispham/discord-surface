@@ -4,6 +4,7 @@ const {
   test, assert, fs, http, path, CLI_PATH, STATE_PATH, DISCORD_PATH, SUCCESSOR_ID, READINESS,
   BOARD_OUTCOMES, fixture, deferred, waitFor, waitForFile, spawnChild, boardRefreshArgs, boardTarget
 } = require('./board-refresh-fixture');
+const { OWNER_EVIDENCE, OWNER_EVIDENCE_REASON } = require('../src/state/process-owner-evidence');
 
 test('two child owners contend, hand off, and recover an orphaned board attempt before successor refresh', async t => {
   const f = fixture();
@@ -308,7 +309,7 @@ test('two child owners contend, hand off, and recover an orphaned board attempt 
   assert.ok(oldAttempt);
   const oldDetail = JSON.parse(oldAttempt.detail);
   assert.equal(f.state.inspectBoardRequest('refresh-old', target).status, BOARD_OUTCOMES.IN_FLIGHT);
-  assert.equal(f.state.recoverBoardRefreshAttempt(target, oldDetail.attemptId, () => false), 1);
+  assert.equal(f.state.recoverBoardRefreshAttempt(target, oldDetail.attemptId, () => ({ status: OWNER_EVIDENCE.ABSENT, reason: OWNER_EVIDENCE_REASON.PROBE_ABSENT })), 1);
   assert.equal(f.state.inspectBoardRequest('refresh-old', target).status, BOARD_OUTCOMES.UNKNOWN);
 
   const old = f.state.getBinding('channel-1');

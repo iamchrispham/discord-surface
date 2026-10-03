@@ -117,29 +117,29 @@ function assertReleasedCustody(h, code) {
   assert.equal(activeBefore - h.f.state.activeFilePreparationCount(), 1);
 }
 
-test('direct preparing cleanup retains custody when probe is denied (EPERM)', { todo: 'issue240: indeterminate owner custody is not fixed' }, t => {
+test('direct preparing cleanup retains custody when probe is denied (EPERM)', t => {
   assertRetainedCustody(prepareDirect(t), 'EPERM');
 });
 
-test('native preparing cleanup retains custody when probe is denied (EPERM)', { todo: 'issue240: indeterminate owner custody is not fixed' }, t => {
+test('native preparing cleanup retains custody when probe is denied (EPERM)', t => {
   assertRetainedCustody(prepareNative(t), 'EPERM');
 });
 
-test('direct preparing cleanup retains custody on unexpected probe error (EIO)', { todo: 'issue240: indeterminate owner custody is not fixed' }, t => {
+test('direct preparing cleanup retains custody on unexpected probe error (EIO)', t => {
   assertRetainedCustody(prepareDirect(t), 'EIO');
 });
 
-test('native preparing cleanup retains custody on unexpected probe error (EIO)', { todo: 'issue240: indeterminate owner custody is not fixed' }, t => {
+test('native preparing cleanup retains custody on unexpected probe error (EIO)', t => {
   assertRetainedCustody(prepareNative(t), 'EIO');
 });
 
-test('direct preparing cleanup retains custody when identity capture is unreadable', { todo: 'issue240: indeterminate owner custody is not fixed' }, t => {
+test('direct preparing cleanup retains custody when identity capture is unreadable', t => {
   const h = prepareDirect(t);
   h.f.state.directPostOwnerIdentity = () => null;
   assertRetainedCustody(h, null);
 });
 
-test('native preparing cleanup retains custody when identity capture is unreadable', { todo: 'issue240: indeterminate owner custody is not fixed' }, t => {
+test('native preparing cleanup retains custody when identity capture is unreadable', t => {
   const h = prepareNative(t);
   h.f.state.directPostOwnerIdentity = () => null;
   assertRetainedCustody(h, null);

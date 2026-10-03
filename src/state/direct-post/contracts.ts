@@ -1,6 +1,7 @@
 import type { AgentAddress, AgentMessage, AgentProvider } from '../../agent-message';
 import type { WatcherNotice } from '../../watcher-notice';
 import type { DirectPostFileManifest, DirectPostFilePreparation } from '../../direct-post-file';
+import type { ProcessOwnerEvidence } from '../process-owner-evidence';
 
 export const DIRECT_POST_OUTCOMES = Object.freeze([
   'sent',
@@ -84,6 +85,7 @@ export interface DirectPostState {
   directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null, deliveryChannelId?: string | null, allowUnreadyDelivery?: boolean): boolean;
   directPostOwnerIdentity(pid: number): DirectPostOwnerIdentity | null;
   directPostOwnerAlive(pid: number, expectedIdentity: DirectPostOwnerIdentity): boolean;
+  directPostOwnerEvidence?(pid: number, expectedIdentity?: unknown): ProcessOwnerEvidence;
   receipt(discordId: string | null, kind: string, detail: Record<string, unknown>): void;
 }
 

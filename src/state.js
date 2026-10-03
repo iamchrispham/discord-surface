@@ -39,6 +39,7 @@ const {
   WATCHER_NOTICE_RECEIPTS
 } = require('./state/watcher-notice');
 const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = require('./state/board-refresh');
+const { classifyProcessOwner, normalizeOwnerEvidence, OWNER_EVIDENCE } = require('./state/process-owner-evidence');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
 const {
   createThreadEnrollmentHandlers,
@@ -1276,36 +1277,28 @@ class SurfaceState {
     return { ownerPid: normalizedPid, ownerStartTime, ownerCommand };
   }
 
-  directPostOwnerAlive(pid, expectedIdentity = null) {
-    if (!Number.isInteger(Number(pid)) || Number(pid) < 1 || !expectedIdentity) return false;
-    try { process.kill(Number(pid), 0); } catch (error) { return false; }
-    const actualIdentity = this.directPostOwnerIdentity(pid);
-    if (!actualIdentity) return false;
-    if (expectedIdentity.ownerStartTime && actualIdentity.ownerStartTime !== expectedIdentity.ownerStartTime) return false;
-    if (expectedIdentity.ownerCommand && actualIdentity.ownerCommand !== expectedIdentity.ownerCommand) return false;
-    return Boolean(
-      (expectedIdentity.ownerStartTime && actualIdentity.ownerStartTime) ||
-      (expectedIdentity.ownerCommand && actualIdentity.ownerCommand)
-    );
+  directPostOwnerEvidence(pid, expectedIdentity = null) {
+    return normalizeOwnerEvidence(classifyProcessOwner(pid, expectedIdentity, {
+      probePid: processPid => process.kill(processPid, 0),
+      captureIdentity: processPid => this.directPostOwnerIdentity(processPid)
+    }));
   }
 
-  recoverDirectPostReceipts(ownerAlive = (pid, expectedIdentity) => {
-    if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
-    return this.directPostOwnerAlive(pid, expectedIdentity);
-  }) {
+  directPostOwnerAlive(pid, expectedIdentity = null) {
+    return this.directPostOwnerEvidence(pid, expectedIdentity).status === OWNER_EVIDENCE.MATCHING_LIVE;
+  }
+
+  recoverDirectPostReceipts(ownerAlive = (pid, expectedIdentity) => this.directPostOwnerEvidence(pid, expectedIdentity)) {
     return this.transaction(() => this.recoverDirectPostReceiptsInternal(ownerAlive));
   }
 
-  recoverDirectPostReceiptsInternal(ownerAlive = (pid, expectedIdentity) => {
-    if (!Number.isInteger(Number(pid)) || Number(pid) < 1) return false;
-    return this.directPostOwnerAlive(pid, expectedIdentity);
-  }) {
+  recoverDirectPostReceiptsInternal(ownerAlive = (pid, expectedIdentity) => this.directPostOwnerEvidence(pid, expectedIdentity)) {
     const rows = this.directPostRows();
     const outcomes = new Set(rows.filter(row => row.kind === DIRECT_POST_OUTCOME && row.detail?.attemptId).map(row => row.detail.attemptId));
     let recovered = 0;
     for (const row of rows.filter(item => item.kind === DIRECT_POST_ATTEMPT)) {
       if (outcomes.has(row.detail.attemptId)) continue;
-      if (ownerAlive(row.detail.ownerPid, row.detail)) continue;
+      if (normalizeOwnerEvidence(ownerAlive(row.detail.ownerPid, row.detail)).status !== OWNER_EVIDENCE.ABSENT) continue;
       this.receipt(null, DIRECT_POST_OUTCOME, {
         ...row.detail,
         outcome: 'unknown',
@@ -1341,11 +1334,11 @@ class SurfaceState {
     return boardRefreshHandlers.boardMessageProvenance(this, target);
   }
 
-  recoverBoardRefreshReceipts(ownerAlive = (pid, identity) => this.directPostOwnerAlive(pid, identity)) {
+  recoverBoardRefreshReceipts(ownerAlive = (pid, identity) => this.directPostOwnerEvidence(pid, identity)) {
     return boardRefreshHandlers.recoverBoardRefreshReceipts(this, ownerAlive);
   }
 
-  recoverBoardRefreshAttempt(target, attemptId, ownerAlive = (pid, identity) => this.directPostOwnerAlive(pid, identity)) {
+  recoverBoardRefreshAttempt(target, attemptId, ownerAlive = (pid, identity) => this.directPostOwnerEvidence(pid, identity)) {
     return boardRefreshHandlers.recoverBoardRefreshAttempt(this, target, attemptId, ownerAlive);
   }
 
