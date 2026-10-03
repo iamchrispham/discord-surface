@@ -139,7 +139,8 @@ export async function runBoardRefresh({
   fetchImpl = globalThis.fetch as unknown as BoardFetch,
   timeoutMs = 30000,
   resolveBinding,
-  bindingCurrent = null
+  bindingCurrent = null,
+  assertCallerCurrent = null
 }: {
   state: BoardStateRuntime;
   token: string;
@@ -154,6 +155,7 @@ export async function runBoardRefresh({
   timeoutMs?: number;
   resolveBinding: BoardBindingResolver;
   bindingCurrent?: (() => boolean) | null;
+  assertCallerCurrent?: ((signal?: AbortSignal) => Promise<void>) | null;
 }): Promise<BoardRefreshResult> {
   const nativeId = text(rawNativeId, 'nativeId', 128);
   const ownerGeneration = generation(rawGeneration);
@@ -169,12 +171,24 @@ export async function runBoardRefresh({
     return { status: OWNER_EVIDENCE.INDETERMINATE, reason: OWNER_EVIDENCE_REASON.INVALID_EVIDENCE };
   };
   state.recoverBoardRefreshReceipts(ownerAlive);
+  // Peer caller revalidation for the shared board owner. The assertion is
+  // optional so non-peer CLI consumers keep their current behavior, and a
+  // refusal stays outside every transport classification path here.
+  const revalidateCaller = async () => {
+    if (typeof assertCallerCurrent !== 'function') return;
+    await assertCallerCurrent(signal);
+  };
   const existing = state.inspectBoardRequest(requestId, target);
   if (existing?.attempt?.payloadHash && existing.attempt.payloadHash !== payloadHash &&
       (typeof existing.attempt.content !== 'string' || !boardTextEquivalent(existing.attempt.content, content))) {
     throw new Error('dedupe key is already used for another board payload');
   }
-  if (existing && (existing.historical || existing.duplicate)) return resultFromAdmission(existing);
+  if (existing && (existing.historical || existing.duplicate)) {
+    // A stored historical or duplicate result has no network effect, but the
+    // authenticated caller must still be current before it is disclosed.
+    await revalidateCaller();
+    return resultFromAdmission(existing);
+  }
 
   const binding = resolveBinding(state, { nativeId, generation: ownerGeneration, channelId });
   const isBindingCurrent = () => {
@@ -185,12 +199,46 @@ export async function runBoardRefresh({
 
   // Capture before the asynchronous preflight GETs. Admission compares this value inside BEGIN IMMEDIATE.
   const prepared = state.captureBoardRevision(target);
-  const installation = await fetchBoardInstallation({ token, signal, timeoutMs, fetchImpl });
-  const remoteChannel = await fetchBoardChannel({ token, channelId, signal, timeoutMs, fetchImpl });
-  channelMatches(remoteChannel, target);
-  const remoteTarget = await fetchBoardTarget({ token, channelId, messageId, signal, timeoutMs, fetchImpl });
-  targetMatches(remoteTarget, target);
-  targetAuthorMatches(remoteTarget, installation.id);
+  // Each preflight GET is bracketed separately: assert immediately before, then
+  // again as soon as it settles, before any later request or admission. A
+  // rejection is captured first, the assertion runs outside the transport path,
+  // and a stable caller sees the original transport error unchanged.
+  await revalidateCaller();
+  let installation;
+  let installationError: unknown = null;
+  try {
+    installation = await fetchBoardInstallation({ token, signal, timeoutMs, fetchImpl });
+  } catch (error) {
+    installationError = error;
+  }
+  await revalidateCaller();
+  if (installationError !== null) throw installationError;
+  await revalidateCaller();
+  let remoteChannel;
+  let channelError: unknown = null;
+  try {
+    remoteChannel = await fetchBoardChannel({ token, channelId, signal, timeoutMs, fetchImpl });
+  } catch (error) {
+    channelError = error;
+  }
+  await revalidateCaller();
+  if (channelError !== null) throw channelError;
+  channelMatches(remoteChannel!, target);
+  await revalidateCaller();
+  let remoteTarget;
+  let targetError: unknown = null;
+  try {
+    remoteTarget = await fetchBoardTarget({ token, channelId, messageId, signal, timeoutMs, fetchImpl });
+  } catch (error) {
+    targetError = error;
+  }
+  await revalidateCaller();
+  if (targetError !== null) throw targetError;
+  const installationUser = installation!;
+  const channel = remoteChannel!;
+  const targetMessage = remoteTarget!;
+  targetMatches(targetMessage, target);
+  targetAuthorMatches(targetMessage, installationUser.id);
   const provenance = state.boardMessageProvenance(target);
   if (provenance.length === 0) throw new Error('board target has no sent-message provenance in this installation');
   if (!isBindingCurrent()) {
@@ -209,10 +257,10 @@ export async function runBoardRefresh({
     requestId,
     target,
     content,
-    preEditContent: remoteTarget.content,
+    preEditContent: targetMessage.content,
     payloadHash,
     binding,
-    targetAuthorId: remoteTarget.authorId,
+    targetAuthorId: targetMessage.authorId,
     provenance: provenance[0],
     ownerPid: process.pid,
     ownerIdentity: state.directPostOwnerIdentity?.(process.pid) || null
@@ -231,6 +279,20 @@ export async function runBoardRefresh({
       reason: 'binding readiness changed before board update'
     };
   }
+  // Assert immediately before the mutation, after admission and readiness. A
+  // refusal records the existing stale known-unsent outcome for this claimed
+  // attempt (retaining its request and revision identity) and escapes with no
+  // network request.
+  try {
+    await revalidateCaller();
+  } catch (error) {
+    state.recordBoardRefreshOutcome(target, admission.attemptId, BOARD_OUTCOMES.STALE, {
+      reason: 'native caller changed before board update'
+    });
+    throw error;
+  }
+  let mutationError: unknown = null;
+  let applied: BoardRefreshRecord | null = null;
   try {
     const patched = await patchBoardMessage({ token, channelId, messageId, content, signal, timeoutMs, fetchImpl });
     targetMatches(patched, target);
@@ -239,26 +301,36 @@ export async function runBoardRefresh({
       mismatch.outcome = BOARD_OUTCOMES.UNKNOWN;
       throw mismatch;
     }
-    const applied = state.recordBoardRefreshOutcome(target, admission.attemptId, BOARD_OUTCOMES.APPLIED, {
+    // Persist the exact applied evidence before any post-effect caller check.
+    applied = state.recordBoardRefreshOutcome(target, admission.attemptId, BOARD_OUTCOMES.APPLIED, {
       responseMessageId: patched.id,
       observedContent: patched.content
     });
-    return {
-      ...resultFromAdmission(admission, binding),
-      status: applied.outcome,
-      outcome: applied.outcome
-    };
   } catch (error) {
-    const outcome = transportOutcome(error);
+    mutationError = error;
+  }
+  if (mutationError !== null) {
+    const outcome = transportOutcome(mutationError);
     const recorded = state.recordBoardRefreshOutcome(target, admission.attemptId, outcome, {
-      statusCode: Number((error as { status?: unknown })?.status) || null,
-      error: String((error as Error)?.message || error).slice(0, 300)
+      statusCode: Number((mutationError as { status?: unknown })?.status) || null,
+      error: String((mutationError as Error)?.message || mutationError).slice(0, 300)
     });
+    // The existing failure or unknown classification is saved. Revalidate after
+    // the effect, outside that transport classification, then expose the result.
+    await revalidateCaller();
     return {
       ...resultFromAdmission(admission, binding),
       status: recorded.outcome,
       outcome: recorded.outcome,
-      error: String((error as Error)?.message || error).slice(0, 300)
+      error: String((mutationError as Error)?.message || mutationError).slice(0, 300)
     };
   }
+  // Applied evidence is already persisted. A refusal here must not rewrite it
+  // or trigger a resend.
+  await revalidateCaller();
+  return {
+    ...resultFromAdmission(admission, binding),
+    status: applied!.outcome,
+    outcome: applied!.outcome
+  };
 }

@@ -4,7 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { resolvePeerCaller } = require('./caller');
+const { resolvePeerCaller, createCallerAssertion } = require('./caller');
 const { resolvePeerBinding, validatePeerSelector, requireReadyPeer } = require('../../dist/peer/resolution');
 const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest, resolveAgentReplyRequestMatch } = require('../../dist/state/agent-routing');
 const { readTextFile, resolveAgentAddress, runDirectPost } = require('../direct-post');
@@ -232,11 +232,26 @@ function createPeerService(context) {
       if (input.text !== undefined && Buffer.from(input.text, 'utf8').toString('utf8') !== input.text) throw new Error('text must round-trip losslessly through UTF-8');
       if (input.text_file !== undefined && (typeof input.text_file !== 'string' || !input.text_file.trim())) throw new Error('text_file must be non-empty');
       const initial = await caller(signal);
-      const channels = input.peer && Object.hasOwn(input.peer, 'channelName') ? await loadChannels(signal) : [];
+      const initialCurrent = createCallerAssertion(state, provider, callerDependencies, initial);
+      // The channel-list lookup is a network effect too. Assert before and after
+      // it, including when it rejects: a caller refusal escapes, and otherwise
+      // the original lookup error propagates unchanged.
+      let channels = [];
+      if (input.peer && Object.hasOwn(input.peer, 'channelName')) {
+        await initialCurrent(signal);
+        let listed = null;
+        let lookupError = null;
+        try { listed = await loadChannels(signal); }
+        catch (error) { lookupError = error; }
+        await initialCurrent(signal);
+        if (lookupError !== null) throw lookupError;
+        channels = listed;
+      }
       const source = await caller(signal);
       if (source.channelId !== initial.channelId || canonicalNativeId(source.nativeId) !== canonicalNativeId(initial.nativeId) || source.generation !== initial.generation) {
         throw new Error('peer caller changed during resolution');
       }
+      const assertCallerCurrent = createCallerAssertion(state, provider, callerDependencies, source);
       let agentTarget = null;
       let destination = null;
       let destinationBinding = null;
@@ -299,6 +314,7 @@ function createPeerService(context) {
               input.reply_to !== undefined);
           },
           textFile, dedupeKey: input.dedupe_key, custodyKey, signal, fetchImpl,
+          assertCallerCurrent,
           ...(fileSource === null ? {} : { preparedTextSource: fileSource }) });
         return { correlationId: input.dedupe_key, ...result };
       } finally {

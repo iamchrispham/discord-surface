@@ -21,6 +21,33 @@ function observeAbort(promise, signal) {
   });
 }
 
+// Capture the caller identity that authorized an operation into an immutable
+// five-field snapshot. Each assertion resolves the authenticated native caller
+// again with the same dependencies and signal, then compares every field. The
+// snapshot is frozen, so later mutation of the source binding object cannot
+// change the identity this guard expects. Case-only UUID spelling stays
+// equivalent because native identity is canonicalized the same way the resolver
+// does it.
+function createCallerAssertion(state, provider, dependencies = {}, capturedCaller) {
+  const expected = Object.freeze({
+    provider: capturedCaller?.provider,
+    guildId: capturedCaller?.guildId,
+    channelId: capturedCaller?.channelId,
+    nativeId: canonicalNativeId(capturedCaller?.nativeId),
+    generation: capturedCaller?.generation
+  });
+  return async function assertCallerCurrent(signal) {
+    const current = await resolvePeerCaller(state, provider, dependencies, signal);
+    if (current.provider !== expected.provider ||
+        current.guildId !== expected.guildId ||
+        current.channelId !== expected.channelId ||
+        canonicalNativeId(current.nativeId) !== expected.nativeId ||
+        current.generation !== expected.generation) {
+      throw new Error('native caller must be revalidated: peer caller changed');
+    }
+  };
+}
+
 async function resolvePeerCaller(state, provider, dependencies = {}, signal) {
   if (signal?.aborted) throw abortError(signal);
   let nativeId;
@@ -63,4 +90,4 @@ async function resolvePeerCaller(state, provider, dependencies = {}, signal) {
   return bindings[0];
 }
 
-module.exports = { resolvePeerCaller };
+module.exports = { resolvePeerCaller, createCallerAssertion };

@@ -119,8 +119,15 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     dedupeKey, requestId: legacyRequestId, inReplyTo, signal, fetchImpl, timeoutMs, ordinary = false,
     agentTarget = null, agentKind = KINDS.REQUEST, agentReplyTo = null,
     agentPresentation = AGENT_PRESENTATIONS.LEGACY, attachmentFile, resume = false, stateDir, watcherNotice = null,
-    preparedTextSource, agentDestinationCurrent = null, bindingCurrent = null, custodyKey, peerRouting = false } =
+    preparedTextSource, agentDestinationCurrent = null, bindingCurrent = null, custodyKey, peerRouting = false,
+    assertCallerCurrent = null } =
     input as DirectPostInput & { agentThreadId?: string | null };
+  // Peer caller revalidation belongs outside every transport catch. Absent
+  // assertion keeps non-peer CLI behavior unchanged.
+  const revalidateCaller = async () => {
+    if (typeof assertCallerCurrent !== 'function') return;
+    await assertCallerCurrent(signal);
+  };
   const binding = watcherNotice
     ? watcherNotice.binding
     : resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
@@ -214,11 +221,15 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       const legacyMarker = legacy.detail.legacyAgentPacket;
       const migratedPacket = legacy.detail.agentPacket;
       if (!legacyMarker || typeof legacyMarker !== 'object' || Array.isArray(legacyMarker) ||
-          !migratedPacket || typeof migratedPacket !== 'object' || Array.isArray(migratedPacket)) return legacy.result;
+          !migratedPacket || typeof migratedPacket !== 'object' || Array.isArray(migratedPacket)) {
+        await revalidateCaller();
+        return legacy.result;
+      }
       if (!isAgentSourcePromotion(legacy.packet, migratedPacket, binding.channelId) ||
           (agentThreadId !== null && agentThreadId !== (migratedPacket as AgentMessage).source.channelId)) {
         throw new BindingError('direct post request identity conflicts with existing custody');
       }
+      await revalidateCaller();
       return legacy.result;
     }
     if (!isLegacyRetryableOutcome(legacy.outcome)) {
@@ -359,24 +370,42 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         break;
       }
       if (existing) {
+        // A stored duplicate or historical result performs no network effect,
+        // but the authenticated caller must still be current before disclosure.
+        await revalidateCaller();
         parts.push({ index: partIndex, status: existing.status, messageId: existing.outcome?.messageId || null });
         if (existing.status !== 'sent') break;
         continue;
       }
+      await revalidateCaller();
+      let destinationError: unknown = null;
       try {
         await verifyAgentDestination({ token, agentTarget: deliveryTarget, fetchImpl, signal, timeoutMs });
       } catch (error) {
+        destinationError = error;
+      }
+      if (destinationError !== null) {
         if (!currentBinding() || !currentDestination()) {
           const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
           parts.push({ index: partIndex, status: stale.outcome, messageId: null });
-          break;
+        } else {
+          const preflight = state.recordDirectPostPreflight(meta, outcomeFor(destinationError), {
+            status: errorStatus(destinationError) || null, error: errorMessage(destinationError).slice(0, 300)
+          });
+          parts.push({ index: partIndex, status: preflight.outcome, messageId: null });
         }
-        const preflight = state.recordDirectPostPreflight(meta, outcomeFor(error), {
-          status: errorStatus(error) || null, error: errorMessage(error).slice(0, 300)
-        });
-        parts.push({ index: partIndex, status: preflight.outcome, messageId: null });
+        // The transport classification above is already persisted. The caller
+        // assertion is deliberately outside that classification path, so its
+        // refusal escapes instead of being rewritten as a transport outcome.
+        await revalidateCaller();
         break;
       }
+      // The destination GET succeeded. The stored-binding/destination staleness
+      // check and the abort classification keep their pre-existing precedence:
+      // a stored handoff returns the stale preflight, a cancelled call returns
+      // the not_sent preflight. Only a still-current, non-aborted call runs the
+      // fresh-caller assertion, which refuses on native identity or generation
+      // change outside every transport catch.
       if (!currentBinding() || !currentDestination()) {
         const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
         parts.push({ index: partIndex, status: stale.outcome, messageId: null });
@@ -387,6 +416,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         parts.push({ index: partIndex, status: stopped.outcome, messageId: null });
         break;
       }
+      await revalidateCaller();
     }
     let claim;
     if (deliveryTarget === null && !currentReady()) {
@@ -405,6 +435,9 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       break;
     }
     if (!claim.claimed) {
+      // A stored duplicate or historical claim performs no network effect, but
+      // the authenticated caller must still be current before disclosure.
+      await revalidateCaller();
       parts.push({ index: partIndex, status: claim.status, messageId: claim.outcome?.messageId || null });
       if (claim.status !== 'sent') break;
       continue;
@@ -415,6 +448,16 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       parts.push({ index: partIndex, status: stale.outcome });
       break;
     }
+    // Assert immediately before the mutation, after admission and readiness.
+    // A refusal records the existing known-unsent stale outcome for this claimed
+    // attempt (retaining its nonce) and then escapes with no network request.
+    try {
+      await revalidateCaller();
+    } catch (error) {
+      state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'native caller changed before send' });
+      throw error;
+    }
+    let mutationError: unknown = null;
     try {
       if (!currentReady() || !currentDestination()) {
         const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before send' });
@@ -434,11 +477,22 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       parts.push({ index: partIndex, status: outcome.outcome, messageId: outcome.messageId });
       recorded = true;
     } catch (error) {
-      const outcome = source.fileManifest && error instanceof DirectPostFileSnapshotError ? 'not_sent' : outcomeFor(error);
-      const recorded = state.recordDirectPostOutcome(requestId, claim.attemptId, outcome, { status: errorStatus(error) || null, error: errorMessage(error).slice(0, 300) });
-      parts.push({ index: partIndex, status: recorded.outcome, messageId: recorded.messageId || null });
+      mutationError = error;
+    }
+    if (mutationError !== null) {
+      // Persist the existing failure or unknown classification first, then
+      // revalidate outside the transport catch. A refusal never rewrites the
+      // saved outcome and never starts a retry.
+      const outcome = source.fileManifest && mutationError instanceof DirectPostFileSnapshotError ? 'not_sent' : outcomeFor(mutationError);
+      const recordedOutcome = state.recordDirectPostOutcome(requestId, claim.attemptId, outcome, { status: errorStatus(mutationError) || null, error: errorMessage(mutationError).slice(0, 300) });
+      parts.push({ index: partIndex, status: recordedOutcome.outcome, messageId: recordedOutcome.messageId || null });
+      await revalidateCaller();
       break;
     }
+    // The sent receipt is persisted above. The post-effect assertion runs
+    // outside the transport catch so a refusal cannot overwrite sent evidence,
+    // drop the message ID, resend or continue multipart.
+    await revalidateCaller();
   }
   const status = parts.every(part => part.status === 'sent') ? 'sent' : parts.find(part => part.status !== 'sent')?.status || 'not_sent';
   const duplicate = !claimedAny && parts.length > 0 && parts.every(part => part.status === 'sent');

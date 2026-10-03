@@ -220,6 +220,9 @@ export interface DirectPostInputBase {
   ordinary?: boolean;
   bindingCurrent?: (() => boolean) | null;
   agentDestinationCurrent?: ((target: AgentAddress) => boolean) | null;
+  // Internal peer guard. Absent for ordinary CLI consumers. Shared effect owners
+  // await it around each network operation; peer code supplies it.
+  assertCallerCurrent?: ((signal?: AbortSignal) => Promise<void>) | null;
   watcherNotice?: { packet: WatcherNotice; binding: DirectPostBinding } | null;
 }
 
