@@ -84,6 +84,12 @@ function productionInventory() {
   return files.map(file => ({ file, sourceFile: parseSource(file) }));
 }
 
+function assertNonemptyCodecSources(inventory) {
+  const codecInventory = inventory.filter(item => OWNER_FILES.includes(item.file));
+  assert.ok(codecInventory.every(item => item.sourceFile.text.length > 0),
+    'codec owner sources are non-empty');
+}
+
 function exactKeysDeclarations(inventory, file) {
   const entry = inventory.find(item => item.file === file);
   return entry ? declarationsNamed(entry.sourceFile, 'exactKeys') : [];
@@ -124,13 +130,18 @@ test('required packet field checks use one data-property owner', () => {
     file: 'src/unrelated-empty.ts',
     sourceFile: parseSourceText('src/unrelated-empty.ts', '')
   }];
-  const codecInventory = inventory.filter(item => OWNER_FILES.includes(item.file));
   const files = inventory.map(item => item.file);
 
   // (a) Production inventory is collected from tracked src plus both codec owners.
   assert.ok(files.includes(AGENT_OWNER), 'inventory includes the agent codec owner');
   assert.ok(files.includes(WATCHER_OWNER), 'inventory includes the watcher codec owner');
-  assert.ok(codecInventory.every(item => item.sourceFile.text.length > 0), 'codec owner sources are non-empty');
+  assert.doesNotThrow(() => assertNonemptyCodecSources(ownershipInventory),
+    'unrelated empty sources do not affect codec nonempty checks');
+  assert.throws(() => assertNonemptyCodecSources([
+    { file: AGENT_OWNER, sourceFile: parseSourceText(AGENT_OWNER, '') },
+    inventory.find(item => item.file === WATCHER_OWNER)
+  ]), /codec owner sources are non-empty/,
+  'empty codec sources fail the codec nonempty check');
 
   // (b) exactKeys exists exactly twice in the codec owners: once per owner.
   assertExactKeysOwnerPin(ownershipInventory);
