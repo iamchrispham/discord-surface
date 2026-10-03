@@ -58,6 +58,7 @@
     "src/state/interaction/constants.ts",
     "src/state/interaction/contracts.ts",
     "src/state/interaction/origin.ts",
+    "src/state/process-owner-evidence.ts",
     "src/board-text.ts",
     "src/state/board-refresh.ts",
     "src/state/readback-instant.ts",

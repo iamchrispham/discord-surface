@@ -21,6 +21,7 @@ const {
   ordinary,
   transcript
 } = require('./ordinary-codex-fixture');
+const { OWNER_EVIDENCE, OWNER_EVIDENCE_REASON } = require('../src/state/process-owner-evidence');
 
 test('ordinary handoff refuses unmatched and active direct-post custody', t => {
   const f = fixture(t);
@@ -35,7 +36,7 @@ test('ordinary handoff refuses unmatched and active direct-post custody', t => {
     file: path.join(successorRoot, `${OTHER}.jsonl`), sessionId: OTHER, threadId: OTHER,
     workspace: successorWorkspace, sessionRoot: successorRoot
   };
-  f.state.directPostOwnerAlive = () => true;
+  f.state.directPostOwnerEvidence = () => ({ status: OWNER_EVIDENCE.MATCHING_LIVE, reason: OWNER_EVIDENCE_REASON.IDENTITY_MATCH });
   const attempt = {
     journal: 'direct-post-v1', requestId: 'ordinary-post-handoff', attemptId: 'ordinary-post-attempt',
     ownerPid: 1, sourcePath: path.join(f.dir, 'milestone.txt'), textHash: 'text-hash', operatorId: 'operator',
