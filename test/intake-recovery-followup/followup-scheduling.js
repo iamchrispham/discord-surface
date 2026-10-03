@@ -118,37 +118,45 @@ test('queued scoped recovery starts with a fresh deadline', { timeout: 3000 }, a
     f.channels.set(channelId, { ...f.channels.get('1000'), id: channelId });
     f.history.set(channelId, []);
   }
+  const realNow = Date.now;
+  let clock = 1_000_000;
+  Date.now = () => clock;
+  f.gateway.recoveryTimeoutMs = 5000;
   let entered, release;
   const started = new Promise(resolve => { entered = resolve; });
   const held = new Promise(resolve => { release = resolve; });
-  const original = f.gateway.fetchHistory.bind(f.gateway);
-  let paused = false;
-  let slowRoutePending = true;
-  f.gateway.fetchHistory = async (channel, options) => {
-    if (!paused) { paused = true; entered(); await held; }
-    if (channel.id === '3000' && slowRoutePending) {
-      slowRoutePending = false;
-      await new Promise(resolve => setTimeout(resolve, 40));
-    }
-    return original(channel, options);
+  t.after(() => { Date.now = realNow; release(); });
+  const records = [];
+  let active = 0, peak = 0;
+  f.gateway.recoverInbound = async (signal, reason, lifecycle, scope, deadline) => {
+    active++;
+    peak = Math.max(peak, active);
+    records.push({ reason, scope: scope === null ? null : [...scope], deadline, enteredAt: clock });
+    try {
+      if (reason === 'active') { entered(); await held; }
+      if (scope !== null && scope.has('3000')) clock = deadline + 1;
+      return { ready: true, state: 'ready' };
+    } finally { active--; }
   };
   try {
-    const active = f.gateway.recoverTransport('active', f.gateway.lifecycleEpoch, ['1000'], Date.now() + 1000);
+    const activeRun = f.gateway.recoverTransport('active', f.gateway.lifecycleEpoch, ['1000'], Date.now() + 1000);
     await started;
-    f.gateway.recoveryTimeoutMs = 25;
     const first = f.gateway.recoverTransport('expired-first', f.gateway.lifecycleEpoch, ['3000'], Date.now() - 1);
     const second = f.gateway.recoverTransport('expired-second', f.gateway.lifecycleEpoch, ['4000'], Date.now() - 1);
     release();
-    await settleRecovery(active);
+    await settleRecovery(activeRun);
     await settleRecovery(first);
     await settleRecovery(second);
     await f.gateway.recoveryFollowupPromise;
-    assert.equal(f.calls.some(call => call.kind === 'channel' && call.id === '3000'), true);
-    assert.equal(f.calls.some(call => call.kind === 'channel' && call.id === '4000'), true);
-    assert.equal(f.state.getIntakeWatermark('4000').state, 'ready');
-    assert.equal(f.state.getBinding('4000').readiness, 'ready');
+    assert.deepEqual(records.map(record => record.scope), [['1000'], ['3000'], ['4000']]);
+    assert.equal(peak, 1);
+    const firstQueued = records.find(record => record.scope && record.scope.includes('3000'));
+    const secondQueued = records.find(record => record.scope && record.scope.includes('4000'));
+    assert.equal(firstQueued.deadline, firstQueued.enteredAt + f.gateway.recoveryTimeoutMs);
+    assert.equal(secondQueued.deadline, secondQueued.enteredAt + f.gateway.recoveryTimeoutMs);
+    assert.ok(secondQueued.deadline > firstQueued.deadline);
     assert.equal(f.dispatched.length, 0);
-  } finally { release(); }
+  } finally { Date.now = realNow; release(); }
 });
 
 for (let hops = 0; hops <= 8; hops++) {
