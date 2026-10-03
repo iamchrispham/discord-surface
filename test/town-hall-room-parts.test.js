@@ -240,6 +240,9 @@ function assertOwnerSourcePinned(sourceText) {
   const source = ts.createSourceFile(OWNER_RELATIVE, sourceText, ts.ScriptTarget.Latest, true);
   let calls = 0;
   function visit(node) {
+    if (ts.isIdentifier(node) && node.text === 'arguments') {
+      throw new Error('raw input read bypasses the canonical planner');
+    }
     if (ts.isCallExpression(node) && node.expression.getText(source) === 'planTownHallBroadcast') {
       calls += 1;
       assert.equal(node.arguments.length, 1, 'the canonical planner must be called with one argument');
@@ -662,7 +665,8 @@ test('room parts owner delegates validation to the canonical planner', () => {
     'const rawText = (input as { text: string }).text',
     'const { text } = input',
     'const keys = Object.keys(input)',
-    'const alias = input; const rawText = alias.text'
+    'const alias = input; const rawText = alias.text',
+    'const rawText = arguments[0].text'
   ]) {
     const mutant = source.replace(callPattern, match => match + ';\n' + read);
     assert.notEqual(mutant, source);
