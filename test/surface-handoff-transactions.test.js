@@ -273,3 +273,21 @@ test('simulated: handoff changes local owner without a topic write', () => {
   assert.throws(() => state.handoffConductor({ ...handoff, handoffId: 'handoff-repair-1', nativeId: CLAUDE_ID }), /already used/);
   state.close();
 });
+
+test('handoff reads each input getter once before refusing stale custody', () => {
+  const { dir, state } = fixture();
+  const channelId = 'getter-handoff';
+  state.bind({ channelId, guildId: 'guild-1', provider: 'codex', nativeId: CODEX_ID, workspace: dir, conductorId: 'getter-conductor', repoKey: 'repo:alpha' }, { intakeCutoff: '100' });
+  const before = state.getBinding(channelId);
+  const values = { ...before, fromNativeId: CLAUDE_ID, fromGeneration: before.generation, nativeId: SUCCESSOR_ID, handoffId: 'getter-handoff-1', intakeCutoff: null, enrollmentProof: null, carryAcceptedHuman: false };
+  const reads = new Map();
+  const input = {};
+  for (const key of ['channelId', 'provider', 'conductorId', 'repoKey', 'fromNativeId', 'fromGeneration', 'nativeId', 'workspace', 'endpoint', 'handoffId', 'intakeCutoff', 'enrollmentProof', 'carryAcceptedHuman']) {
+    Object.defineProperty(input, key, { get() { reads.set(key, (reads.get(key) || 0) + 1); return values[key]; } });
+  }
+  try {
+    assert.throws(() => state.handoffConductor(input), /handoff source identity is stale/);
+    assert.deepEqual(state.getBinding(channelId), before);
+    for (const [key, count] of reads) assert.equal(count, 1, key);
+  } finally { state.close(); }
+});
