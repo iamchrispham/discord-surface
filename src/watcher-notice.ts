@@ -1,5 +1,5 @@
 import * as crypto from 'node:crypto';
-import { validAddress } from './agent-message';
+import { ownDataProperty, validAddress } from './agent-message';
 
 const PREFIX = 'discord-tether:watcher-notice:v1:';
 const DOMAIN = 'discord-tether/watcher-notice/v1';
@@ -39,7 +39,7 @@ export interface WatcherNotice {
 
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) &&
-    Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+    Object.keys(value).length === keys.length && keys.every(key => ownDataProperty(value, key));
 }
 
 function stableKey(value: unknown, name: string): string {
