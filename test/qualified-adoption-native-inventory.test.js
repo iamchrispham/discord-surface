@@ -351,6 +351,20 @@ function callsIn(ts, node) {
   return calls;
 }
 
+function constantStringExpression(ts, expression) {
+  if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
+    return expression.text;
+  }
+  if (!ts.isTemplateExpression(expression)) return null;
+  let value = expression.head.text;
+  for (const span of expression.templateSpans) {
+    const interpolation = constantStringExpression(ts, span.expression);
+    if (interpolation === null) return null;
+    value += interpolation + span.literal.text;
+  }
+  return value;
+}
+
 function claudeFactoryMethods(ts, source) {
   let factory = null;
   const visit = node => {
@@ -399,10 +413,10 @@ function receiptSites(ts, entries) {
       if (ts.isCallExpression(node)) {
         const info = calleeInfo(ts, node);
         const kind = node.arguments[1];
-        if (info?.method === 'receipt' && kind &&
-          (ts.isStringLiteral(kind) || ts.isNoSubstitutionTemplateLiteral(kind)) &&
-          ['ordinary-bound', 'ordinary-native-preflight'].includes(kind.text)) {
-          sites.push(`${entry.file}|${ownerOf(ts, node)}|${info.receiver}.receipt|literal:${kind.text}`);
+        const kindText = kind && constantStringExpression(ts, kind);
+        if (info?.method === 'receipt' &&
+          ['ordinary-bound', 'ordinary-native-preflight'].includes(kindText)) {
+          sites.push(`${entry.file}|${ownerOf(ts, node)}|${info.receiver}.receipt|literal:${kindText}`);
         }
       }
       if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
@@ -553,6 +567,20 @@ test('Claude binding owner inventory pins the factory dispatch, receipt census a
     assert.equal(rawWriter.receiptSites.length, real.receiptSites.length + 1);
     assert.notDeepEqual(rawWriter.receiptSites, EXPECTED_RECEIPT_SITES.slice().sort());
   }
+
+  // Mutant: a non-Claude-named duplicate writer using a constant template
+  // expression must still be rejected by the receipt-site census.
+  const interpolatedWriterMutantEntries = entries.map(entry => entry.file === 'src/state.js'
+    ? {
+      ...entry,
+      text: entry.text.replace('_recordOrdinaryPreflight(binding, detail = {}) {',
+        "recordOrdinaryPreflightCopy(binding, detail = {}) { this.receipt(null, `ordinary-native-${'preflight'}`, detail); }\n\n  _recordOrdinaryPreflight(binding, detail = {}) {")
+    }
+    : entry);
+  const interpolatedWriterMutant = renderClaudeInventory(ts, interpolatedWriterMutantEntries);
+  assert.equal(interpolatedWriterMutant.receiptSites.length, real.receiptSites.length + 1,
+    'a constant interpolated receipt writer must be rejected by the inventory');
+  assert.notDeepEqual(interpolatedWriterMutant.receiptSites, EXPECTED_RECEIPT_SITES.slice().sort());
 
   // Mutant: an in-memory copied private Claude preflight policy with a receipt write
   // must be rejected by the name census and the receipt-site census.
