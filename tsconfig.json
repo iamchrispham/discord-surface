@@ -104,6 +104,7 @@
     "src/peer/resolution.ts",
     "src/peer/town-hall-plan.ts",
     "src/peer/town-hall-room-parts.ts",
+    "src/peer/town-hall-room-identity.ts",
     "src/discord/reconciliation-lookups.ts",
     "src/discord/native-proof-recovery.ts",
     "src/state/courier-route/attempt.ts",
