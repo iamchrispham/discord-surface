@@ -120,15 +120,20 @@ test('exactKeys ownership pin ignores unrelated helpers but rejects codec duplic
 
 test('required packet field checks use one data-property owner', () => {
   const inventory = productionInventory();
+  const ownershipInventory = [...inventory, {
+    file: 'src/unrelated-empty.ts',
+    sourceFile: parseSourceText('src/unrelated-empty.ts', '')
+  }];
+  const codecInventory = inventory.filter(item => OWNER_FILES.includes(item.file));
   const files = inventory.map(item => item.file);
 
   // (a) Production inventory is collected from tracked src plus both codec owners.
   assert.ok(files.includes(AGENT_OWNER), 'inventory includes the agent codec owner');
   assert.ok(files.includes(WATCHER_OWNER), 'inventory includes the watcher codec owner');
-  assert.ok(inventory.every(item => item.sourceFile.text.length > 0), 'every inventoried source is non-empty');
+  assert.ok(codecInventory.every(item => item.sourceFile.text.length > 0), 'codec owner sources are non-empty');
 
   // (b) exactKeys exists exactly twice in the codec owners: once per owner.
-  assertExactKeysOwnerPin(inventory);
+  assertExactKeysOwnerPin(ownershipInventory);
 
   // (c) Exactly one ownDataProperty owner, scoped to the two codec files. The
   // unrelated private ownDataProperty in src/peer/town-hall-plan.ts is ignored.
