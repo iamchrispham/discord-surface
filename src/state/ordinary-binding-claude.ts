@@ -147,6 +147,9 @@ export function createOrdinaryClaudeBindingHandlers(
         const current = state.getBinding(binding?.channelId);
         if (!bindingMatchesExpected(current, binding)) return null;
         const currentProvider = current?.provider || 'native';
+        if (currentProvider !== PROVIDERS.CLAUDE) {
+          throw new BindingError(`binding is not an ordinary ${currentProvider} binding`);
+        }
         if (!state._isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${currentProvider} binding`);
         if (!detail || typeof detail !== 'object' || typeof detail.file !== 'string' || !path.isAbsolute(detail.file) ||
           detail.sessionId !== current.nativeId ||

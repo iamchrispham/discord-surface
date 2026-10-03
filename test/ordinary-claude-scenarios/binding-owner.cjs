@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const test = require('node:test');
 const { CLAUDE, fixture } = require('./fixture.cjs');
+const { createOrdinaryClaudeBindingHandlers } = require('../../src/state/ordinary-binding-claude.js');
 
 test('ordinary Claude binding owner rejects invalid proofs and preserves state on refusal', t => {
   const f = fixture(t, { preflight: false });
@@ -62,4 +63,33 @@ test('ordinary Claude binding owner rejects invalid proofs and preserves state o
     assert.deepEqual(state.getBinding(binding.channelId), tombstone);
     assert.equal(state.listReceipts().length, receiptsBeforeRebind);
   } finally { state._isOrdinaryBindingRecord = classifyRecord; }
+});
+
+test('ordinary Claude handler rejects a Codex record before writing preflight receipts', () => {
+  class BindingError extends Error {}
+  const handlers = createOrdinaryClaudeBindingHandlers({
+    BindingError,
+    PROVIDERS: { CLAUDE: 'claude' },
+    READINESS: { PENDING: 'pending' },
+    assertOrdinaryIdentity() {},
+    assertOrdinaryNativeIdentity() {},
+    bindingMatchesExpected(current, expected) { return current?.channelId === expected?.channelId; }
+  });
+  const binding = {
+    channelId: 'codex-channel', provider: 'codex', active: true, conductorId: null, repoKey: null,
+    nativeId: CLAUDE, workspace: '/tmp/codex-workspace', endpoint: '/tmp/codex.sock'
+  };
+  const receipts = [];
+  const state = {
+    getBinding() { return binding; },
+    transaction(work) { return work(); },
+    _isOrdinaryBinding() { return true; },
+    receipt(...args) { receipts.push(args); }
+  };
+
+  assert.throws(() => handlers.recordOrdinaryPreflight(state, binding, {
+    file: '/tmp/session.jsonl', sessionId: CLAUDE, threadId: CLAUDE,
+    workspace: binding.workspace, harness: 'claude-code', endpoint: binding.endpoint
+  }), /ordinary codex binding/);
+  assert.equal(receipts.length, 0);
 });
