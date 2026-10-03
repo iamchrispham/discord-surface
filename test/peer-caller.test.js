@@ -74,6 +74,10 @@ test('Codex injected resolver exclusively selects identity over conflicting envi
   }, stop.signal);
   assert.strictEqual(received, stop.signal);
   assert.equal(caller.nativeId, id);
+  await assert.rejects(resolvePeerCaller(f.state, 'codex', {
+    environment: { CODEX_THREAD_ID: id },
+    resolveCodexCaller: () => ({ sessionId: ` ${id} `, threadId: ` ${id} `, turnId: 't2' })
+  }), /no active binding/);
 });
 
 test('Codex injected resolver is invoked again and selects the new binding generation', async () => {
@@ -112,6 +116,8 @@ test('Codex injected resolver refuses missing, empty or conflicting turn identit
     { sessionId: id, threadId: id, turnId: 5 },
     { sessionId: id, turnId: 't1' },
     { sessionId: id, threadId: other, turnId: 't1' },
+    { sessionId: id, threadId: ` ${id} `, turnId: 't1' },
+    { sessionId: ` ${id} `, threadId: id, turnId: 't1' },
     { threadId: id, turnId: 't1' }
   ];
   for (const identity of candidates) {
