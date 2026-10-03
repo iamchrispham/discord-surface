@@ -132,7 +132,7 @@ const EXPECTED_CREATORS = [
 const EXPECTED_MESSAGES_FETCH = [
   'src/discord.js|constructor|channel.messages',
   'src/discord.js|projectDecisionMessage|channel?.messages',
-  'src/discord.js|reactToFetchedMessage|message.channel.messages',
+  'src/discord/transport-receipts.js|reactToFetchedMessage|message.channel.messages',
   'src/discord/handoff-fence.ts|assertEnrolledThreadIntakeRange|channel.messages',
   'src/discord/handoff-fence.ts|assertOrdinaryIntakeRange|channel.messages!',
   'src/discord/history-access.ts|readAdoptionCutoff|channel.messages',

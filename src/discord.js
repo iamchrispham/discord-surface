@@ -42,8 +42,8 @@ const { THREAD_STATES } = require('./state/thread-enrollment');
 const { heldParentRequestIds, legacyParentReconciliationChannel } = require('./state/legacy-agent-request-route');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer } = require('./discord/decision');
-const { cancelResponseBody, readRetryAfter, sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
-const { createTransportReceiptDelivery } = require('./discord/transport-receipts');
+const { sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
+const { createTransportReceiptDelivery, sendGatewayTransportReceipt } = require('./discord/transport-receipts');
 const { createOwnerAdmission } = require('./discord/owner-admission');
 const { optionalReplyContext } = require('./discord/reply-context-fetch');
 const { createReplyDelivery } = require('./discord/reply-delivery');
@@ -1171,86 +1171,7 @@ class DiscordGateway {
   }
 
   async sendTransportReceipt(message, receipt) {
-    const controller = new AbortController();
-    this.receiptControllers.add(controller);
-    try {
-      let sendPromise;
-      try {
-        const stored = this.state.getMessage(message.id);
-        if (stored?.deliveryChannelId && stored.deliveryChannelId !== stored.channelId) {
-          message = await waitForRecoveryOperation(() => this.threadDeliveryMessage(message), controller.signal, Date.now() + this.recoveryTimeoutMs);
-          this.state.assertMessageCurrent(message.id, 'transport-receipt-send');
-        }
-        // discord.js channel.send drops the signal and uses the shared REST retry queue.
-        if (this.discordToken && this.client?.rest && typeof globalThis.fetch === 'function') {
-          if (receipt.reaction) {
-            const channelId = message.channelId || message.channel.id;
-            const targetMessageId = receipt.targetMessageId || message.id;
-            const url = `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(targetMessageId)}/reactions/${encodeURIComponent(receipt.reaction)}/@me`;
-            sendPromise = globalThis.fetch(url, {
-              method: 'PUT',
-              headers: {
-                Authorization: `Bot ${this.discordToken}`,
-                'User-Agent': 'DiscordBot (discord-surface, 0.1.0)',
-                'Content-Type': 'application/json'
-              },
-              signal: controller.signal
-            }).then(async response => {
-              if (!response?.ok) {
-                const retryAfter = response?.status === 429 ? await readRetryAfter(response) : null;
-                await cancelResponseBody(response);
-                const error = new Error('Discord acknowledgment request rejected');
-                error.status = response?.status;
-                if (retryAfter) {
-                  error.retryAfter = retryAfter.raw;
-                  error.retryAfterMs = retryAfter.milliseconds;
-                }
-                throw error;
-              }
-              await cancelResponseBody(response);
-              return { id: targetMessageId, targetMessageId, reaction: receipt.reaction };
-            });
-          } else {
-            sendPromise = sendDiscordMessage({
-              token: this.discordToken, channelId: message.channelId || message.channel.id,
-              content: receipt.content, nonce: receipt.nonce, signal: controller.signal,
-              timeoutMs: this.recoveryTimeoutMs, allowedMentions: { parse: [], replied_user: false },
-              messageReference: { message_id: message.id, fail_if_not_exists: false }
-            });
-          }
-        } else if (this.discordToken && this.client?.rest) {
-          throw new Error('Discord transport receipt fetch is unavailable');
-        } else {
-          const reactToFetchedMessage = async () => {
-            const targetMessageId = receipt.targetMessageId || message.id;
-            const source = await message.channel.messages.fetch(targetMessageId);
-            this.state.assertMessageCurrent(message.id, 'native-ack-reaction');
-            return source.react(receipt.reaction);
-          };
-          const targetMessageId = receipt.targetMessageId || message.id;
-          sendPromise = receipt.reaction
-            ? Promise.resolve(message.react && targetMessageId === message.id ? message.react(receipt.reaction) : reactToFetchedMessage())
-              .then(() => ({ id: targetMessageId, targetMessageId, reaction: receipt.reaction }))
-            : message.channel.send({
-              content: receipt.content,
-              nonce: receipt.nonce,
-              enforceNonce: true,
-              allowedMentions: receipt.allowedMentions,
-              reply: receipt.reply
-            });
-        }
-      } catch (error) {
-        sendPromise = Promise.reject(error);
-      }
-      return await waitForRecoveryOperation(
-        () => sendPromise,
-        controller.signal,
-        Date.now() + this.recoveryTimeoutMs,
-        () => controller.abort()
-      );
-    } finally {
-      this.receiptControllers.delete(controller);
-    }
+    return await sendGatewayTransportReceipt(this, message, receipt, waitForRecoveryOperation);
   }
 
   isCurrentLifecycle(epoch) {
