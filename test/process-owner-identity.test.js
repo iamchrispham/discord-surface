@@ -256,13 +256,22 @@ test('13. matching start with a different command returns false', () => {
   assert.deepEqual(captureCalls, [4242]);
 });
 
-test('14. ESRCH returns false without attempting identity capture', () => {
+test('14. ESRCH is absent while EPERM is indeterminate before identity capture', () => {
   const { result, calls, captureCalls } = alive(4242, { ownerStartTime: '100', ownerCommand: 'node' }, {
     osData: makeOsData({ killOk: false, killError: Object.assign(new Error('ESRCH'), { code: 'ESRCH' }) })
   });
   assert.equal(result, false);
   assert.deepEqual(calls, [{ kind: 'kill', pid: 4242, signal: 0 }]);
   assert.deepEqual(captureCalls, []);
+
+  const deniedInstance = receiver();
+  const denied = withOs({
+    osData: makeOsData({ killOk: false, killError: Object.assign(new Error('EPERM'), { code: 'EPERM' }) }),
+    run: () => SurfaceState.prototype.directPostOwnerEvidence.call(deniedInstance, 4242, { ownerStartTime: '100', ownerCommand: 'node' })
+  });
+  assert.deepEqual(denied.result, { status: 'indeterminate', reason: 'probe-denied' });
+  assert.deepEqual(denied.calls, [{ kind: 'kill', pid: 4242, signal: 0 }]);
+  assert.deepEqual(deniedInstance.captureCalls, []);
 });
 
 test('15. either matching start alone or matching command alone is sufficient when the other expected field is empty', () => {
