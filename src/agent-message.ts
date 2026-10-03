@@ -77,7 +77,7 @@ export function sameAddress(left: unknown, right: unknown): boolean {
   return Object.keys(left).every(key => left[key as keyof AgentAddress] === right[key as keyof AgentAddress]);
 }
 
-export function sameAgentSession(left: AgentAddress, right: AgentAddress): boolean {
+export function sameAgentSession(left: Pick<AgentAddress, 'provider' | 'nativeId'>, right: Pick<AgentAddress, 'provider' | 'nativeId'>): boolean {
   return left.provider === right.provider && left.nativeId.toLowerCase() === right.nativeId.toLowerCase();
 }
 

@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const Module = require('node:module');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const ts = require('typescript');
@@ -11,9 +12,11 @@ const ROOT = path.resolve(__dirname, '../..');
 const AGENT_OWNER = 'src/agent-message.ts';
 const PLANNER_OWNER = 'src/peer/town-hall-plan.ts';
 const WATCHER_OWNER = 'src/watcher-notice.ts';
+const COURIER_ROUTE_OWNER = 'src/state/courier-route/route.ts';
 const SELF_REFUSAL_CONSUMER_INVENTORY = Object.freeze([
   Object.freeze({ file: AGENT_OWNER, functionName: 'validateAgentMessage' }),
-  Object.freeze({ file: PLANNER_OWNER, functionName: 'planTownHallBroadcast' })
+  Object.freeze({ file: PLANNER_OWNER, functionName: 'planTownHallBroadcast' }),
+  Object.freeze({ file: COURIER_ROUTE_OWNER, functionName: 'routeInput' })
 ]);
 
 function visit(node, callback) {
@@ -212,6 +215,112 @@ function inlineNativeSelfComparisons(body) {
   return found;
 }
 
+// The courier route reads a raw courier identity (`rawCourier.provider` /
+// `rawCourier.nativeId`, or a `*.courier` field) into locals named `provider` /
+// `nativeId` and compares them against the parent target address. That is the
+// pre-fix inline guard `provider === target.provider && nativeId ===
+// target.nativeId`; after the shared-owner fix the same locals are passed to
+// sameAgentSession instead of compared. The courier form is tracked separately
+// from the source/target form so the existing pins and the watcher exception do
+// not shift, and the local taint follows helper calls such as
+// `deps.assertProvider(rawCourier.provider)` and `deps.assertUuid(rawCourier.nativeId)`.
+function courierPropertyKind(node) {
+  if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
+    (node.expression.text === 'rawCourier' || node.expression.text === 'courier') &&
+    (node.name.text === 'provider' || node.name.text === 'nativeId')) {
+    return `courier.${node.name.text}`;
+  }
+  return null;
+}
+
+// The parent session address a courier identity must differ from.
+function targetAddressKind(node) {
+  if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
+    node.expression.text === 'target' &&
+    (node.name.text === 'provider' || node.name.text === 'nativeId')) {
+    return `target.${node.name.text}`;
+  }
+  return null;
+}
+
+// Kinds reached by a courier expression: courier object reads, target address
+// reads, tainted locals, call arguments, concatenation, and unary operands.
+function courierKindTaint(node, tainted) {
+  const kinds = new Set();
+  if (!node) return kinds;
+  const direct = courierPropertyKind(node) || targetAddressKind(node);
+  if (direct) {
+    kinds.add(direct);
+    return kinds;
+  }
+  if (ts.isIdentifier(node)) {
+    for (const kind of tainted.get(node.text) || []) kinds.add(kind);
+    return kinds;
+  }
+  if (ts.isParenthesizedExpression(node)) return courierKindTaint(node.expression, tainted);
+  if (ts.isTemplateExpression(node)) {
+    for (const span of node.templateSpans) {
+      for (const kind of courierKindTaint(span.expression, tainted)) kinds.add(kind);
+    }
+    return kinds;
+  }
+  if (ts.isBinaryExpression(node)) {
+    for (const kind of courierKindTaint(node.left, tainted)) kinds.add(kind);
+    for (const kind of courierKindTaint(node.right, tainted)) kinds.add(kind);
+    return kinds;
+  }
+  if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) {
+    return courierKindTaint(node.operand, tainted);
+  }
+  if (ts.isCallExpression(node)) {
+    for (const kind of courierKindTaint(node.expression, tainted)) kinds.add(kind);
+    for (const argument of node.arguments) {
+      for (const kind of courierKindTaint(argument, tainted)) kinds.add(kind);
+    }
+    return kinds;
+  }
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    return courierKindTaint(node.expression, tainted);
+  }
+  return kinds;
+}
+
+// Locals whose initializer reaches a courier provider/nativeId read. Collected
+// first so a hoisted local can be consumed by a later comparison.
+function collectCourierTaintedLocals(body) {
+  const tainted = new Map();
+  visit(body, node => {
+    if (!ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) || !node.initializer) return;
+    const kinds = courierKindTaint(node.initializer, tainted);
+    if (kinds.size) tainted.set(node.name.text, kinds);
+  });
+  return tainted;
+}
+
+// A comparison that meets a courier-form provider or nativeId with the parent
+// target address is the private inline self comparator the shared owner
+// replaced. The pre-fix guard `provider === target.provider && nativeId ===
+// target.nativeId` is reported through its provider/nativeId equality nodes and
+// through the enclosing logical node.
+function inlineCourierSelfComparisons(body) {
+  const tainted = collectCourierTaintedLocals(body);
+  const found = [];
+  visit(body, node => {
+    if (!ts.isBinaryExpression(node) || !COMPARATOR_OR_LOGICAL.has(node.operatorToken.kind)) return;
+    const kinds = new Set();
+    for (const operand of [node.left, node.right]) {
+      for (const kind of courierKindTaint(operand, tainted)) kinds.add(kind);
+    }
+    if ((kinds.has('courier.provider') && kinds.has('target.provider')) ||
+        (kinds.has('courier.nativeId') && kinds.has('target.nativeId'))) found.push(node);
+  });
+  return found;
+}
+
+function inlineSelfComparisons(body) {
+  return [...inlineNativeSelfComparisons(body), ...inlineCourierSelfComparisons(body)];
+}
+
 // The production census covers only src/**/*.ts and src/**/*.js. A self-refusal
 // consumer is any named function that delegates to sameAgentSession or carries
 // an inline provider/nativeId comparison over source/target identities. The
@@ -224,7 +333,7 @@ function selfRefusalConsumerSites(sources) {
       const body = bodyOf(declaration);
       if (!body) continue;
       const delegated = callsNamed(body, 'sameAgentSession');
-      const inline = inlineNativeSelfComparisons(body);
+      const inline = inlineSelfComparisons(body);
       if (delegated || inline.length) sites.push({ file, functionName: name, delegated, inline });
     }
   }
@@ -268,7 +377,7 @@ function assertDelegatedSelfRefusal(sourceFile, functionName, options = {}) {
     });
     assert.equal(seen, 0, `${functionName} no longer declares or uses ${name}`);
   }
-  assert.equal(inlineNativeSelfComparisons(body).length, 0,
+  assert.equal(inlineSelfComparisons(body).length, 0,
     `${functionName} carries no inline provider/nativeId self comparator`);
   return body;
 }
@@ -302,6 +411,46 @@ export function rejectThirdAgentMessage(packet: unknown): void {
     { file: 'src/peer/third-self-refusal.ts', sourceFile: thirdFileInlineBypass }
   ]), /production self-refusal consumers are inventoried exactly once/,
   'a third-file inline self comparator cannot leave the inventory green');
+
+  // (a3) The courier form is a distinct taint shape: `provider`/`nativeId`
+  // locals read from the raw courier compared against `target.provider`/
+  // `target.nativeId`. A brand-new consumer carrying only that guard must fail
+  // the inventory, exactly like the source/target form above.
+  const thirdCourierInlineBypass = parseSourceText('src/state/courier-route/third-courier.ts', `
+export function rejectThirdCourier(input: unknown): void {
+  const rawCourier = input.courier;
+  const target = input.target;
+  const provider = rawCourier.provider;
+  const nativeId = rawCourier.nativeId;
+  if (provider === target.provider && nativeId === target.nativeId) {
+    throw new Error('courier identity must differ');
+  }
+}
+`);
+  assert.throws(() => assertSelfRefusalConsumerInventory([
+    ...sources,
+    { file: 'src/state/courier-route/third-courier.ts', sourceFile: thirdCourierInlineBypass }
+  ]), /production self-refusal consumers are inventoried exactly once/,
+  'a third-file courier-form inline self comparator cannot leave the inventory green');
+
+  // (a4) Decoy: a sameAgentSession call must not hide a retained raw
+  // courier-form comparator in the real routeInput.
+  const courierDecoy = parseSourceText(COURIER_ROUTE_OWNER, `
+export function routeInput(deps: unknown, input: unknown): unknown {
+  const rawCourier = input.courier;
+  const target = input.target;
+  const provider = rawCourier.provider;
+  const nativeId = rawCourier.nativeId;
+  if (sameAgentSession({ provider, nativeId }, target) ||
+      (provider === target.provider && nativeId === target.nativeId)) {
+    throw new Error('courier identity must differ from parent native identity');
+  }
+  return { provider, nativeId };
+}
+`);
+  assert.throws(() => assertDelegatedSelfRefusal(courierDecoy, 'routeInput'),
+    /inline provider\/nativeId self comparator/,
+    'a courier decoy owner call cannot hide an inline courier comparator');
 
   // (b) The pin genuinely rejects a synthetic inline bypass of each consumer,
   // not just the absence of a call.
@@ -444,4 +593,61 @@ export function validateAgentMessage(packet: unknown): void {
 
   // (d) After restore the planner accepts the same non-self input again.
   assert.equal(planTownHallBroadcast(nonSelfInput).recipients.length, 1);
+
+  // (e) Runtime sentinel for the courier route through public registration.
+  // routeInput resolves sameAgentSession from the dist agent-message exports, so
+  // replacing that export with an always-true function must make registration
+  // refuse a genuinely distinct courier session. After restore the same route
+  // must register. The public facade is src/state (`src/state.js` is not part of
+  // the tsc build, so there is no dist/state to require); it delegates to the
+  // built dist/state/courier-route module.
+  const { SurfaceState, THREAD_STATES } = require('../../src/state');
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'courier-owner-sentinel-'));
+  let state;
+  try {
+    state = new SurfaceState(path.join(tempDir, 'surface.sqlite'));
+    const sessions = path.join(tempDir, 'sessions');
+    fs.mkdirSync(sessions);
+    state.setConfig({ operatorId: 'operator', guildId: '100', secretFile: path.join(tempDir, 'secret') });
+    const parentNative = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const courierNative = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const binding = state.bind({
+      channelId: '1000', guildId: '100', provider: 'codex', nativeId: parentNative,
+      workspace: tempDir, sessionRoot: sessions
+    }, { intakeCutoff: '100' });
+    state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100', adoptionCutoff: '100' }, binding);
+    state.setThreadBaseline('2000', null, binding);
+    state.markThreadBoundary('2000', THREAD_STATES.READY, 'courier owner sentinel', null, null, binding);
+    const route = {
+      routeId: 'owner-sentinel-route',
+      routeGeneration: 1,
+      guildId: '100',
+      parentChannelId: '1000',
+      deliveryChannelId: '2000',
+      target: { guildId: '100', channelId: '2000', provider: 'codex', nativeId: parentNative, generation: binding.generation },
+      courier: {
+        provider: 'codex', nativeId: courierNative, workspace: tempDir, sessionRoot: sessions,
+        recipientThreadId: parentNative, hostId: 'owner-sentinel'
+      }
+    };
+    let ownerCalls = 0;
+    const courierOriginal = agentModule.sameAgentSession;
+    try {
+      agentModule.sameAgentSession = () => { ownerCalls += 1; return true; };
+      assert.throws(() => state.registerCourierRoute(route), error => {
+        assert.match(error.message, /courier identity must differ from parent native identity/);
+        return true;
+      }, 'courier registration refuses a distinct session when the shared owner is forced true');
+      assert.ok(ownerCalls > 0, 'courier route reads the shared owner through the module exports');
+    } finally {
+      agentModule.sameAgentSession = courierOriginal;
+    }
+    const accepted = state.registerCourierRoute(route);
+    assert.ok(accepted, 'a genuinely distinct courier session registers after the owner is restored');
+    assert.equal(accepted.courier.nativeId, courierNative, 'courier identity keeps its exact spelling');
+    assert.equal(accepted.target.nativeId, parentNative, 'parent target identity is unchanged');
+  } finally {
+    state?.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
