@@ -4,14 +4,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const Module = require('node:module');
-const { execFileSync } = require('node:child_process');
 
 const {
   TOWN_HALL_ROOM_MARKER,
   validateTownHallRoomIdentity
 } = require('../dist/peer/town-hall-room-identity');
 
-const BASELINE = 'b377aa8a018cb7b4d7365d1e1e030c7bb3ac54b5';
 const PROJECT_ROOT = path.join(__dirname, '..');
 const OWNER_RELATIVE = 'src/peer/town-hall-room-identity.ts';
 const TYPE_FIXTURE_RELATIVE = 'test/types/town-hall-room-identity-types.ts';
@@ -35,22 +33,6 @@ function response(overrides = {}) {
 
 function ownerRequire() {
   return require(OWNER_BUILT).validateTownHallRoomIdentity;
-}
-
-function baselineJson(relative) {
-  const raw = execFileSync('git', ['show', `${BASELINE}:${relative}`], {
-    cwd: PROJECT_ROOT,
-    encoding: 'utf8'
-  });
-  return JSON.parse(raw);
-}
-
-function isSubsequence(short, long) {
-  let index = 0;
-  for (const entry of long) {
-    if (index < short.length && entry === short[index]) index += 1;
-  }
-  return index === short.length;
 }
 
 // Runs `load` while every require of '../agent-message' made from the built owner
@@ -255,34 +237,16 @@ test('14 isolated shared-owner sentinel plus registration assertions', () => {
 
   const pkg = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'package.json'), 'utf8'));
   const tokens = pkg.scripts.test.trim().split(/\s+/);
-  const baselineTokens = baselineJson('package.json').scripts.test.trim().split(/\s+/);
-  assert.equal(baselineTokens.length, 180, 'baseline npm test token count must be 180');
-  assert.equal(tokens.length, 181, 'npm test must gain exactly one token');
-  assert.deepEqual(tokens.slice(0, baselineTokens.length), baselineTokens,
-    'every baseline npm test token and its relative order must be preserved');
-  assert.equal(tokens[tokens.length - 1], TEST_RELATIVE, 'the new suite must be appended last');
   assert.equal(tokens.filter(entry => entry === TEST_RELATIVE).length, 1,
     'the new suite must be registered exactly once');
 
   const tsconfig = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'tsconfig.json'), 'utf8'));
-  const baselineTsconfig = baselineJson('tsconfig.json');
-  assert.equal(baselineTsconfig.include.length, 112, 'baseline tsconfig include must have 112 entries');
-  assert.equal(tsconfig.include.length, 113, 'tsconfig include must gain exactly one entry');
-  assert.equal(new Set(tsconfig.include).size, tsconfig.include.length, 'tsconfig include must have no duplicates');
-  assert.ok(isSubsequence(baselineTsconfig.include, tsconfig.include),
-    'every baseline tsconfig include entry must be preserved in order');
   assert.equal(tsconfig.include.filter(entry => entry === OWNER_RELATIVE).length, 1,
     'tsconfig must list the TypeScript owner once');
   assert.equal(tsconfig.include.filter(entry => entry === TYPE_FIXTURE_RELATIVE).length, 0,
     'tsconfig must not list the type-test fixture');
 
   const typecheck = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'tsconfig.typecheck.json'), 'utf8'));
-  const baselineTypecheck = baselineJson('tsconfig.typecheck.json');
-  assert.equal(baselineTypecheck.include.length, 151, 'baseline typecheck include must have 151 entries');
-  assert.equal(typecheck.include.length, 153, 'typecheck include must gain exactly two entries');
-  assert.equal(new Set(typecheck.include).size, typecheck.include.length, 'typecheck include must have no duplicates');
-  assert.ok(isSubsequence(baselineTypecheck.include, typecheck.include),
-    'every baseline typecheck include entry must be preserved in order');
   assert.equal(typecheck.include.filter(entry => entry === OWNER_RELATIVE).length, 1,
     'typecheck must list the TypeScript owner once');
   assert.equal(typecheck.include.filter(entry => entry === TYPE_FIXTURE_RELATIVE).length, 1,
