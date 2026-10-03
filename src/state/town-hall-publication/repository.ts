@@ -519,21 +519,17 @@ export function recoverTownHallPublication(
   });
 }
 
-// Prefix-scoped receipt read for the set reader. Escapes LIKE metacharacters and
-// re-checks with startsWith so '_' and '%' can never act as wildcards.
 function readRowsByPrefix(
   deps: TownHallPublicationDependencies,
   state: TownHallPublicationStateStore,
   prefix: string
 ): ReceiptRow[] {
-  const escaped = prefix.replace(/[\\%_]/g, character => `\\${character}`);
-  const pattern = `${escaped}%`;
   return state.db.prepare(
-    "SELECT id, kind, detail, discord_id FROM receipts WHERE kind LIKE ? ESCAPE '\\' ORDER BY id"
-  ).all(pattern).map((row: SqlRow) => {
+    'SELECT id, kind, detail, discord_id FROM receipts WHERE substr(kind,1,length(?)) = ? COLLATE BINARY ORDER BY id'
+  ).all(prefix, prefix).map((row: SqlRow) => {
     if (row.discord_id !== null) return reject(deps);
     return { id: Number(row.id), kind: String(row.kind), detail: String(row.detail), discord_id: null };
-  }).filter(row => row.kind.startsWith(prefix));
+  });
 }
 
 export function getTownHallPublicationSet(
@@ -547,7 +543,7 @@ export function getTownHallPublicationSet(
   const plan = readPartPlan(deps, state, key);
   const fingerprint = plan[0].context.fingerprint;
   const byReceiptKind = new Map(plan.map(entry => [entry.context.receiptKind, entry]));
-  const partPrefix = plan[0].context.receiptKind.slice(0, -plan[0].part.partId.length);
+  const partPrefix = TOWN_HALL_PUBLICATION_RECEIPTS.PUBLICATION_PART_PREFIX + key + ':';
   const parts = state.transaction(() => {
     const rows = readRowsByPrefix(deps, state, partPrefix);
     const grouped = new Map<string, ReceiptRow[]>();

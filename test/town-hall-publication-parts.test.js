@@ -632,6 +632,14 @@ test('publication sets reject malformed and orphaned part receipts', () => {
   const f = fixture();
   try {
     const state = f.state;
+    const unrelated = state.createTownHallBroadcast(longInput({ broadcastId: 'unrelated-case-prefix' }));
+    const unrelatedKey = unrelated.broadcast.journalKey;
+    insertMessagesRow(state, 'unrelated-case-message');
+    insertRawReceipt(state, PUBLICATION_PART_PREFIX.toUpperCase() + unrelatedKey + ':other', {}, 'unrelated-case-message');
+    const beforeUnrelatedRead = receiptIds(state);
+    assert.equal(state.getTownHallPublicationSet(unrelatedKey).complete, false);
+    assert.deepEqual(receiptIds(state), beforeUnrelatedRead);
+
     // Malformed JSON cannot be inserted past the json_extract expression indexes.
     const expressionIndexes = dropExpressionIndexes(state);
     try {
@@ -929,12 +937,21 @@ function collectDefinitions(ts, records) {
       }
     }
     if (ts.isIdentifier(node) && (node.text === 'TOWN_HALL_PUBLICATION_RECEIPTS' || node.text === 'TOWN_HALL_PUBLICATION_EVENTS')) {
-      constantConsumers.add(`${record.file}:${node.text}`);
+      let ancestor = node.parent;
+      while (ancestor && !ts.isImportDeclaration(ancestor)) ancestor = ancestor.parent;
+      if (!ancestor) constantConsumers.add(`${record.file}:${node.text}`);
     }
     ts.forEachChild(node, child => visit(record, child));
   };
   for (const record of records) visit(record, record.sourceFile);
   return { definitions, calls, receiptWrites, constantConsumers };
+}
+
+function assertReceiptConsumerFiles(consumers, expectedFiles) {
+  const suffix = ':TOWN_HALL_PUBLICATION_RECEIPTS';
+  const actual = [...consumers].filter(value => value.endsWith(suffix))
+    .map(value => value.slice(0, -suffix.length)).sort();
+  assert.deepEqual(actual, [...expectedFiles].sort(), 'receipt constants have exactly four real owner consumers');
 }
 
 // 16
@@ -982,6 +999,21 @@ test('publication part transitions keep one writer and decoder', () => {
 
   const repositoryRecord = records.find(record => record.file === repositoryFile);
   assert.ok(repositoryRecord);
+  assertReceiptConsumerFiles(constantConsumers, ownerFiles);
+  const unusedImportText = repositoryRecord.text.replace(
+    "TOWN_HALL_PUBLICATION_RECEIPTS.PUBLICATION_PART_PREFIX + key + ':'",
+    "'town-hall-publication-part/v1:' + key + ':'"
+  );
+  assert.notEqual(unusedImportText, repositoryRecord.text);
+  const unusedImportRecord = {
+    ...repositoryRecord,
+    text: unusedImportText,
+    sourceFile: ts.createSourceFile(repositoryFile, unusedImportText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  };
+  const mutantConsumers = collectDefinitions(ts, records.map(record =>
+    record.file === repositoryFile ? unusedImportRecord : record)).constantConsumers;
+  assert.throws(() => assertReceiptConsumerFiles(mutantConsumers, ownerFiles), /four real owner consumers/);
+
   const entrypoints = ['getTownHallPublication', 'reserveTownHallPublication', 'markTownHallPublicationInFlight',
     'recordTownHallPublicationOutcome', 'recoverTownHallPublication', 'confirmTownHallPublication'];
   for (const name of entrypoints) {
