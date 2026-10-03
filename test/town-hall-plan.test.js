@@ -434,3 +434,16 @@ test('source broadcast ID and target generation changes alter child IDs', () => 
   });
   assert.notEqual(otherGeneration.recipients[0].packetId, basePlan.recipients[0].packetId);
 });
+
+test('malformed address IDs preserve normalized rejection without coercion', () => {
+  let coercions = 0;
+  const coercible = { get [Symbol.toPrimitive]() { coercions += 1; throw new Error('unexpected coercion'); } };
+  for (const field of ['guildId', 'channelId']) {
+    for (const value of [Symbol('invalid'), coercible]) {
+      const base = input();
+      assertInvalid(() => planTownHallBroadcast({ ...base, source: { ...base.source, [field]: value } }));
+      assertInvalid(() => planTownHallBroadcast({ ...base, recipients: [{ ...base.recipients[0], [field]: value }] }));
+    }
+  }
+  assert.equal(coercions, 0);
+});

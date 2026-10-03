@@ -59,8 +59,8 @@ function exactKeys(value: unknown, keys: readonly string[]): value is Record<str
 
 export function validAddress(value: unknown): value is AgentAddress {
   if (!exactKeys(value, ['guildId', 'channelId', 'provider', 'nativeId', 'generation'])) return false;
-  return /^\d{1,20}$/.test(value.guildId as string) && typeof value.guildId === 'string' &&
-    /^\d{1,20}$/.test(value.channelId as string) && typeof value.channelId === 'string' &&
+  return typeof value.guildId === 'string' && /^\d{1,20}$/.test(value.guildId) &&
+    typeof value.channelId === 'string' && /^\d{1,20}$/.test(value.channelId) &&
     Object.values(PROVIDERS).includes(value.provider as AgentProvider) &&
     typeof value.nativeId === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.nativeId as string) &&
     Number.isSafeInteger(value.generation) && value.generation as number > 0;

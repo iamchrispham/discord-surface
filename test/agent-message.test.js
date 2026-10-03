@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const path = require('node:path');
-const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, verifyAgentAddress, verifyLegacyAgentAddress, KINDS } = require('../src/agent-message');
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, validAddress, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, verifyAgentAddress, verifyLegacyAgentAddress, KINDS } = require('../src/agent-message');
 const { source, target, packet, token } = require('./agent-message-fixtures');
 
 test('agent packet retains source, destination and task across authenticated encoding', () => {
@@ -86,4 +86,16 @@ test('agent-send help explains encoded size and variable text budget', () => {
   assert.match(result.stdout, /2000 encoded characters/);
   assert.match(result.stdout, /UTF-8 width/);
   assert.match(result.stdout, /JSON escaping/);
+});
+
+test('agent address IDs reject non-string values without coercion', () => {
+  let coercions = 0;
+  const coercible = { get [Symbol.toPrimitive]() { coercions += 1; throw new Error('unexpected coercion'); } };
+  for (const field of ['guildId', 'channelId']) {
+    for (const value of [Symbol('invalid'), coercible, 100, null, undefined]) {
+      assert.equal(validAddress({ ...target, [field]: value }), false);
+    }
+  }
+  assert.equal(coercions, 0);
+  assert.equal(validAddress(target), true);
 });
