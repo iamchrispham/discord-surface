@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { validAddress, type AgentAddress, type AgentProvider } from '../agent-message';
+import { sameAgentSession, validAddress, type AgentAddress, type AgentProvider } from '../agent-message';
 
 const CHILD_DOMAIN = 'discord-surface/town-hall-child/v1' as const;
 const PLAN_DOMAIN = 'discord-surface/town-hall-plan/v1' as const;
@@ -132,12 +132,11 @@ export function planTownHallBroadcast(input: unknown): TownHallPlan {
   }
 
   if (townHall.guildId !== source.guildId || townHall.channelId === source.channelId) throw invalid();
-  const sourceIdentity = `${source.provider}\u0000${source.nativeId}`;
   const seen = new Set<string>();
   for (const target of targets) {
     if (target.guildId !== source.guildId || target.channelId === townHall.channelId) throw invalid();
     const identity = `${target.provider}\u0000${target.nativeId}`;
-    if (identity === sourceIdentity || seen.has(identity)) throw invalid();
+    if (sameAgentSession(source, target) || seen.has(identity)) throw invalid();
     seen.add(identity);
   }
 
