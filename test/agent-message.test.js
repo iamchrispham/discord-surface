@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const path = require('node:path');
-const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, validAddress, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, verifyAgentAddress, verifyLegacyAgentAddress, KINDS } = require('../src/agent-message');
+const { AGENT_MESSAGE_MAX_ENCODED_LENGTH, PREFIX, validAddress, issueAgentAddress, encodeAgentMessage, decodeAgentMessage, verifyAgentAddress, verifyLegacyAgentAddress, validateAgentMessage, KINDS } = require('../src/agent-message');
 const { source, target, packet, token } = require('./agent-message-fixtures');
 
 test('agent packet retains source, destination and task across authenticated encoding', () => {
@@ -255,4 +255,65 @@ test('agent packet rejects required field accessors before reads', () => {
     }
   }
   assert.deepEqual(failures, []);
+});
+
+test('agent packet rejects a self session that differs only in native id letter case', () => {
+  const lowerId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const upperId = 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE';
+  for (const provider of ['codex', 'claude']) {
+    for (const kind of [KINDS.REQUEST, KINDS.RESULT]) {
+      for (const direction of ['source-lower', 'source-upper']) {
+        const sourceId = direction === 'source-lower' ? lowerId : upperId;
+        const targetId = direction === 'source-lower' ? upperId : lowerId;
+        const casePacket = {
+          id: 'work-case',
+          kind,
+          source: { guildId: '100', channelId: '101', provider, nativeId: sourceId, generation: 1 },
+          target: { guildId: '100', channelId: '102', provider, nativeId: targetId, generation: 9 },
+          replyTo: kind === KINDS.REQUEST ? null : 'work-source',
+          text: 'Inspect the reported failure.'
+        };
+        assert.throws(() => validateAgentMessage(casePacket), /invalid agent message/,
+          `${provider}/${kind}/${direction} must reject a same-session self target`);
+        assert.throws(() => encodeAgentMessage(casePacket, token), /invalid agent message/,
+          `${provider}/${kind}/${direction} must reject a same-session self target while encoding`);
+      }
+    }
+  }
+});
+
+test('agent session identity ignores provider and signing preserves signed native id case', () => {
+  const lowerId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const upperId = 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE';
+  const otherId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+
+  const crossProvider = {
+    id: 'work-cross',
+    kind: KINDS.REQUEST,
+    source: { guildId: '100', channelId: '101', provider: 'codex', nativeId: lowerId, generation: 1 },
+    target: { guildId: '100', channelId: '102', provider: 'claude', nativeId: lowerId, generation: 2 },
+    replyTo: null,
+    text: 'Inspect the reported failure.'
+  };
+  assert.doesNotThrow(() => validateAgentMessage(crossProvider));
+  assert.deepEqual(decodeAgentMessage(encodeAgentMessage(crossProvider, token), token, crossProvider.target), crossProvider);
+
+  const signedTarget = { guildId: '100', channelId: '102', provider: 'claude', nativeId: upperId, generation: 2 };
+  const signedPacket = { ...crossProvider, target: signedTarget };
+  const decoded = decodeAgentMessage(encodeAgentMessage(signedPacket, token), token, signedTarget);
+  assert.equal(decoded.source.nativeId, lowerId);
+  assert.equal(decoded.target.nativeId, upperId);
+  assert.equal(decoded.target.nativeId, signedTarget.nativeId);
+  const caseMismatchTarget = { ...signedTarget, nativeId: lowerId };
+  assert.throws(
+    () => decodeAgentMessage(encodeAgentMessage(signedPacket, token), token, caseMismatchTarget),
+    error => {
+      assert.equal(error.message, 'agent message target is stale or mismatched');
+      return true;
+    }
+  );
+
+  const sameProviderOther = { ...crossProvider, source: { ...crossProvider.source, nativeId: otherId } };
+  assert.doesNotThrow(() => validateAgentMessage(sameProviderOther));
+  assert.deepEqual(decodeAgentMessage(encodeAgentMessage(sameProviderOther, token), token, sameProviderOther.target), sameProviderOther);
 });

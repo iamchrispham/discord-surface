@@ -27,7 +27,7 @@ const EXCLUDED_OWNERS = new Map([
   ['state/direct-post/file-preparation.ts\u0000releaseDirectPostFilePreparation', 2],
   ['state/direct-post.ts\u0000recordDirectPostOutcome', 1],
   ['state/direct-post.ts\u0000reconcileDirectPostOutcome', 1],
-  ['state.js\u0000recoverDirectPostReceiptsInternal', 1],
+  ['state/direct-post/recovery.ts\u0000recoverDirectPostReceiptsInternal', 1],
   // Retirement custody is keyed to the originating caller, not the merged projection.
   ['peer/service.js\u0000custodyKeyFor', 1]
 ]);
