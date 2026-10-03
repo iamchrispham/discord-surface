@@ -34,10 +34,16 @@ function visit(node, callback) {
   ts.forEachChild(node, child => visit(child, callback));
 }
 
-function functionDeclarations(node, names) {
+function functionDefinitions(node, names) {
   const found = [];
   visit(node, current => {
-    if (ts.isFunctionDeclaration(current) && current.name && names.has(current.name.text)) found.push(current);
+    if (ts.isFunctionDeclaration(current) && current.name && names.has(current.name.text)) {
+      found.push(current);
+    } else if (ts.isVariableDeclaration(current) && ts.isIdentifier(current.name) &&
+      names.has(current.name.text) && current.initializer &&
+      (ts.isArrowFunction(current.initializer) || ts.isFunctionExpression(current.initializer))) {
+      found.push(current);
+    }
   });
   return found;
 }
@@ -90,20 +96,20 @@ test('recovery command ownership', () => {
   const cliSource = parseFile(CLI_PATH);
   const companionSource = parseFile(COMPANION_PATH);
 
-  const cliDeclarations = functionDeclarations(cliSource, new Set(HANDLER_NAMES));
+  const cliDeclarations = functionDefinitions(cliSource, new Set(HANDLER_NAMES));
   assert.deepEqual(cliDeclarations.map(declaration => declaration.name.text), [],
     'src/cli.js must not declare recovery handlers');
 
-  const factories = functionDeclarations(companionSource, new Set([FACTORY_NAME]));
+  const factories = functionDefinitions(companionSource, new Set([FACTORY_NAME]));
   assert.equal(factories.length, 1, `expected exactly one ${FACTORY_NAME} declaration`);
   const factory = factories[0];
   const nested = factory.body.statements.filter(ts.isFunctionDeclaration)
     .filter(declaration => HANDLER_NAMES.includes(declaration.name?.text));
-  const companionDeclarations = functionDeclarations(companionSource, new Set(HANDLER_NAMES));
+  const companionDeclarations = functionDefinitions(companionSource, new Set(HANDLER_NAMES));
   assert.deepEqual(companionDeclarations, nested, 'handlers must occur only directly inside the factory');
   for (const sourcePath of [CLI_PATH, ...censusCliFiles()]) {
     if (sourcePath === COMPANION_PATH) continue;
-    assert.equal(functionDeclarations(parseFile(sourcePath), new Set(HANDLER_NAMES)).length, 0,
+    assert.equal(functionDefinitions(parseFile(sourcePath), new Set(HANDLER_NAMES)).length, 0,
       `recovery handlers must not be declared in ${path.relative(SRC_ROOT, sourcePath)}`);
   }
   assert.deepEqual(nested.map(declaration => declaration.name.text), HANDLER_NAMES,
