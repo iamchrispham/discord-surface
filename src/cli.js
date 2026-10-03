@@ -25,6 +25,7 @@ const { createProvisionCommands } = require('./cli/provision-commands');
 const { completeCommandCleanup } = require('./cli/command-cleanup');
 const { createNativeCompletionCommands } = require('./cli/native-completion-commands');
 const { createRecoveryCommands } = require('./cli/recovery-commands');
+const { createBoardRefreshCommands } = require('./cli/board-refresh-commands');
 const { createWatcherCommands } = require('./cli/watcher-commands');
 const { createBindingCommands } = require('./cli/binding-commands');
 const { resolveCurrentCodexWatcherCaller } = require('./cli/codex-watcher-caller');
@@ -33,12 +34,10 @@ const { gatewayProcessStatus, pidMatches, waitForExit } = createGatewayProcessIn
 const createClaudeListeners = require('./cli/claude-listeners');
 const { createClaudeSubmittedReoffer } = require('./cli/claude-submitted-reoffer');
 const { AGENT_MESSAGE_MAX_ENCODED_LENGTH } = require('./agent-message');
-const { resolveDedupeKey, resolveDirectBinding } = require('./direct-post');
-const { runBoardRefresh } = require('./board-refresh');
 const { execFileSync, spawnSync } = require('node:child_process');
 
 const { pathToFileURL } = require('node:url');
-const { SurfaceState, BindingError, PROVIDERS, READINESS, RECOVERY_LIMITS, BOARD_OUTCOMES, validateNativeId } = require('./state');
+const { SurfaceState, BindingError, PROVIDERS, READINESS, RECOVERY_LIMITS, validateNativeId } = require('./state');
 const { DiscordGateway, RECOVERY_POLICIES, discordIdAfter, readSecret, requireInstalled, waitForRecoveryOperation } = require('./discord');
 const { enrollPublicThread } = require('./discord/thread-enrollment');
 const { readAdoptionCutoff } = require('./discord/history-access');
@@ -387,50 +386,7 @@ async function liaisonDraft(args) {
   }
 }
 
-async function boardRefresh(args) {
-  const { state } = openState(args);
-  const controller = new AbortController();
-  let receivedSignal = null;
-  const handleSignal = signal => {
-    if (receivedSignal) return;
-    receivedSignal = signal;
-    controller.abort();
-  };
-  process.once('SIGINT', handleSignal);
-  process.once('SIGTERM', handleSignal);
-  try {
-    const config = state.requireConfig();
-    const result = await runBoardRefresh({
-      state,
-      token: readSecret(config.secretFile),
-      nativeId: required(args, 'native-id'),
-      generation: required(args, 'generation'),
-      channelId: required(args, 'channel-id'),
-      messageId: required(args, 'message-id'),
-      textFile: required(args, 'text-file'),
-      dedupeKey: resolveDedupeKey({ dedupeKey: args['dedupe-key'], requestId: args['request-id'] }, { required: true }),
-      signal: controller.signal,
-      resolveBinding: (surfaceState, input) => resolveDirectBinding(surfaceState, {
-        nativeId: input.nativeId,
-        generation: input.generation,
-        channelId: input.channelId,
-        provider: null,
-        ordinary: false
-      })
-    });
-    print(result);
-    if (![BOARD_OUTCOMES.APPLIED, BOARD_OUTCOMES.NO_OP].includes(result.status)) process.exitCode = 1;
-    if (receivedSignal) process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
-    return result;
-  } catch (error) {
-    if (!receivedSignal || !controller.signal.aborted) throw error;
-    process.exitCode = 128 + (os.constants.signals?.[receivedSignal] || 1);
-  } finally {
-    process.removeListener('SIGINT', handleSignal);
-    process.removeListener('SIGTERM', handleSignal);
-    state.close();
-  }
-}
+const { boardRefresh } = createBoardRefreshCommands({ required, openState, print });
 
 const { migrationRequested, categoryFor, provisionInternal, provision } = createProvisionCommands({ required, openState, pathsFor, print, cliPath: __filename });
 const { handoffInternal, handoff, localHandoff } = createConductorHandoff({ required, openState, print, pathsFor, categoryFor, ordinaryHandoffInternal, cliPath: __filename });
