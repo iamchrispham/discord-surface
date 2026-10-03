@@ -52,7 +52,7 @@ function messageLimitError(encodedLength: number): Error {
   );
 }
 
-function ownDataProperty(value: object, key: string): boolean {
+export function ownDataProperty(value: object, key: string): boolean {
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
   return descriptor !== undefined && Object.hasOwn(descriptor, 'value');
 }
@@ -84,7 +84,7 @@ export function validateAgentMessage(packet: unknown): asserts packet is AgentMe
   const value = packet as Record<string, unknown>;
   const keys = Object.keys(value);
   const required = ['id', 'kind', 'source', 'target', 'replyTo', 'text'];
-  if (!required.every(key => Object.hasOwn(value, key)) ||
+  if (!required.every(key => ownDataProperty(value, key)) ||
       keys.some(key => ![...required, 'routingVersion', 'sourceParentChannelId'].includes(key)) ||
       ['routingVersion', 'sourceParentChannelId'].some(key => key in value && !ownDataProperty(value, key)) ||
       (Object.hasOwn(value, 'routingVersion') && value.routingVersion !== 2)) {

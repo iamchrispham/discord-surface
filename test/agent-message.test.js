@@ -184,7 +184,7 @@ test('agent address IDs reject non-string values without coercion', () => {
   assert.equal(validAddress(target), true);
 });
 
-test('agent packet rejects required field accessors before reads', { todo: 'issue225' }, () => {
+test('agent packet rejects required field accessors before reads', () => {
   const request = packet;
   const result = { ...packet, id: 'result-1', kind: KINDS.RESULT, source: target, target: source, replyTo: packet.id, text: 'Found the cause.' };
   assert.deepEqual(decodeAgentMessage(encodeAgentMessage(request, token), token, request.target), request);

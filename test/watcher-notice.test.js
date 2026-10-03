@@ -474,7 +474,7 @@ test('watcher codec binds stable identity and exact target', () => {
   assert.equal(validWatcherAddress(owner), true);
 });
 
-test('watcher packet rejects required field accessors before reads', { todo: 'issue225' }, () => {
+test('watcher packet rejects required field accessors before reads', () => {
   const notice = {
     id: watcherNoticeId('arm', 'trigger'), kind: 'notice', armKey: 'arm', triggerKey: 'trigger',
     source: owner, target: child, text: 'notice body'
