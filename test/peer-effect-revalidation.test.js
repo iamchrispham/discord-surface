@@ -333,3 +333,103 @@ test('unchanged caller publishes once and duplicate does not resend', async t =>
   assert.equal(rows.outcomes[0].detail.messageId, '10001');
   assert.equal(rows.outcomes[0].detail.nonce, nonce, 'the nonce is unchanged');
 });
+
+test('binding generation changes independently after destination GET', async t => {
+  const f = fixture(t);
+  f.enroll('102');
+  addRecipient(f);
+  let current = ORIGINAL;
+  let gets = 0;
+  let posts = 0;
+  const oldGeneration = f.state.getBinding('101').generation;
+  const peer = service(f, { callerDependencies: identity(() => current), fetchImpl: async (url, options) => {
+    if (options.method === 'GET') {
+      gets += 1;
+      assert.match(url, /\/channels\/202$/);
+      f.state.db.prepare("UPDATE bindings SET generation=? WHERE channel_id='101'").run(oldGeneration + 1);
+      assert.equal(f.state.getBinding('101').generation, oldGeneration + 1, 'the binding generation advanced under the caller');
+      return response({ id: '202', guild_id: '100' });
+    }
+    posts += 1;
+    return response({ id: '10001' });
+  } });
+  const desired = async () => {
+    const refused = await nativeRefusal(peer.send({ peer: { channelId: '201' }, text: 'hello', dedupe_key: 'effect-send-generation' }));
+    assert.equal(refused, true, 'native caller must be revalidated');
+    assert.equal(gets, 1, 'destination lookup runs once');
+    assert.equal(posts, 0, 'no outbound post after the binding generation changed');
+    assert.equal(directPostRows(f.state, 'effect-send-generation').attempts.length, 0, 'no direct-post attempt after the binding generation changed');
+  };
+  await transitional(desired);
+});
+
+test('multipart announcement revalidates after first part sent', async t => {
+  const f = fixture(t);
+  const textFile = messageFile(t, f, 'effect-announce-multipart.txt');
+  const { REPLY_LIMIT, splitReply } = require('../src/state');
+  const text = 'a'.repeat(REPLY_LIMIT * 2);
+  fs.writeFileSync(textFile, text);
+  const parts = splitReply(text);
+  assert.ok(parts.length > 1, 'fixture text must split into multiple parts');
+  let current = ORIGINAL;
+  let posts = 0;
+  let nonce = null;
+  const peer = service(f, { callerDependencies: identity(() => current), fetchImpl: async (url, options) => {
+    posts += 1;
+    const body = JSON.parse(options.body);
+    nonce = body.nonce;
+    current = CHANGED;
+    return response({ id: '10001', channel_id: '101', author: { id: 'bot', bot: true }, content: body.content });
+  } });
+  const desired = async () => {
+    const refused = await nativeRefusal(peer.post({ role: 'announce', text_file: textFile, dedupe_key: 'effect-announce-multipart' }));
+    assert.equal(refused, true, 'native caller must be revalidated');
+    assert.equal(posts, 1, 'one POST total');
+    const rows = directPostRows(f.state, 'effect-announce-multipart');
+    assert.equal(rows.attempts.length, 1, 'one claimed part attempt is retained');
+    assert.equal(rows.outcomes.length, 1, 'the sent part outcome is saved exactly once');
+    assert.equal(rows.outcomes[0].detail.outcome, 'sent');
+    assert.equal(rows.outcomes[0].detail.messageId, '10001');
+    assert.equal(rows.outcomes[0].detail.nonce, nonce, 'the original nonce is retained');
+  };
+  await transitional(desired);
+});
+
+test('abort while caller resolution is pending starts no network or attempt', { timeout: 5000 }, async t => {
+  const f = fixture(t);
+  f.enroll('102');
+  addRecipient(f);
+  let release;
+  const pending = new Promise(r => { release = r; });
+  let enteredResolve;
+  const entered = new Promise(r => { enteredResolve = r; });
+  let fetches = 0;
+  const peer = service(f, { callerDependencies: { resolveClaudeCaller: async () => {
+    enteredResolve();
+    await pending;
+    return { harness: 'claude-code', sessionId: ORIGINAL };
+  } }, fetchImpl: async () => {
+    fetches += 1;
+    return response({ id: '10001' });
+  } });
+  const tmpRoot = path.dirname(path.dirname(f.state.requireConfig().secretFile));
+  const peerDirs = () => fs.readdirSync(tmpRoot).filter(name => name.startsWith('discord-peer-'));
+  const before = new Set(peerDirs());
+  const controller = new AbortController();
+  const sending = peer.send({ peer: { channelId: '201' }, text: 'hello', dedupe_key: 'effect-abort-pending' }, controller.signal);
+  t.after(() => release());
+  let timer;
+  const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('caller resolver was not entered')), 1000); });
+  try {
+    await Promise.race([entered, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+  controller.abort();
+  await assert.rejects(sending);
+  assert.equal(fetches, 0);
+  assert.equal(directPostRows(f.state, 'effect-abort-pending').attempts.length, 0);
+  assert.equal(directPostRows(f.state, 'effect-abort-pending').outcomes.length, 0);
+  const newEntries = peerDirs().filter(name => !before.has(name));
+  assert.deepEqual(newEntries, [], 'peer send wrote no message temp file');
+});
