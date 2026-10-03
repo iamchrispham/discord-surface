@@ -111,8 +111,7 @@ function requireBindings(parsed) {
 
 // `exports.bind = ...` / `module.exports.bind = ...` at module scope declares a
 // copied workflow just as a function declaration does. The base must be exactly
-// `exports` or `module.exports`, so an object-literal `module.exports = {...}`
-// (whose property name is `exports`) or a nested assignment is not a site.
+// `exports` or `module.exports`. Callable object exports are classified separately.
 function exportAssignmentName(left) {
   if (!ts.isPropertyAccessExpression(left)) return null;
   if (!ts.isIdentifier(left.name) || !HANDLERS.includes(left.name.text)) return null;
@@ -147,6 +146,23 @@ function ownerDeclarationSites(sources) {
         statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const exported = exportAssignmentName(statement.expression.left);
         if (exported) record(exported, { file, scope: 'export-assignment' });
+        const { left, right } = statement.expression;
+        const moduleObject = ts.isPropertyAccessExpression(left) &&
+          ts.isIdentifier(left.expression) && left.expression.text === 'module' &&
+          left.name.text === 'exports' && ts.isObjectLiteralExpression(right);
+        if (moduleObject) {
+          for (const property of right.properties) {
+            const implementation = ts.isMethodDeclaration(property) ||
+              (ts.isPropertyAssignment(property) &&
+                (ts.isFunctionExpression(property.initializer) || ts.isArrowFunction(property.initializer)));
+            if (!implementation) continue;
+            const key = property.name;
+            const literal = ts.isComputedPropertyName(key) ? key.expression : key;
+            if (ts.isStringLiteral(literal) || (!ts.isComputedPropertyName(key) && ts.isIdentifier(literal))) {
+              record(literal.text, { file, scope: 'export-object-implementation' });
+            }
+          }
+        }
         continue;
       }
       if (!ts.isVariableStatement(statement)) continue;
@@ -411,6 +427,31 @@ test('binding command inventory rejects copied owners', { timeout: 8000 }, () =>
   }];
   assert.deepEqual(copiedOwnerDeclarations(unrelatedBase), [],
     'a non-exports assignment to a handler name must not be treated as a copied owner');
+
+  for (const name of HANDLERS) {
+    const forms = [
+      `${name}(args) { return args; }`,
+      `${name}: async function(args) { return args; }`,
+      `${name}: async args => args`,
+      `['${name}'](args) { return args; }`,
+      `'${name}': args => args`
+    ];
+    for (const [index, form] of forms.entries()) {
+      const file = `src/cli/object-${name}-${index}.js`;
+      assert.deepEqual(copiedOwnerDeclarations([...realSources, {
+        file, text: `module.exports = { ${form} };`
+      }]), [{ file, name, scope: 'export-object-implementation' }],
+      `callable object export ${name} form ${index} must be rejected`);
+    }
+  }
+  assert.deepEqual(copiedOwnerDeclarations([...realSources, {
+    file: 'src/cli/shorthand-references.js',
+    text: 'module.exports = { bindingArgs, bind, threadEnroll, unbind };'
+  }]), [], 'shorthand exports reference existing handlers');
+  assert.deepEqual(copiedOwnerDeclarations([...realSources, {
+    file: 'src/cli/unrelated-object.js',
+    text: 'module.exports = { other(args) { return args; }, bind: 1 }; const unrelated = { unbind() {} };'
+  }]), [], 'non-callable handler properties and unrelated objects are not implementations');
 
   // A destructuring copy outside the factory call is a declaration site; the
   // facade's own factory destructuring is a reference and stays clean.
