@@ -384,6 +384,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   const resolvedState = require.resolve('../src/state');
   const resolvedOwner = require.resolve('../src/state/process-owner-capture');
   const originalLoad = Module._load;
+  const originalCache = [resolvedState, resolvedOwner].map(file => [file, require.cache[file]]);
   const sentinelResult = { ownerPid: 4242, ownerStartTime: 'sentinel', ownerCommand: 'node' };
   const identity = { ownerStartTime: 'sentinel', ownerCommand: 'node' };
   let received = null;
@@ -425,7 +426,11 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     );
   } finally {
     Module._load = originalLoad;
-    delete require.cache[resolvedState];
-    delete require.cache[resolvedOwner];
+    for (const [file, entry] of originalCache) {
+      if (entry === undefined) delete require.cache[file];
+      else require.cache[file] = entry;
+    }
   }
+  assert.equal(Module._load, originalLoad);
+  for (const [file, entry] of originalCache) assert.equal(require.cache[file], entry);
 });
