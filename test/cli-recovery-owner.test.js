@@ -6,8 +6,6 @@ const path = require('node:path');
 const test = require('node:test');
 const ts = require('typescript');
 
-// Default target is the worktree src tree. RECOVERY_OWNER_SRC_ROOT points the
-// assertions at another src tree, which is how deliberate breakage is checked.
 const DEFAULT_SRC_ROOT = path.resolve(__dirname, '..', 'src');
 const SRC_ROOT = process.env.RECOVERY_OWNER_SRC_ROOT
   ? path.resolve(process.env.RECOVERY_OWNER_SRC_ROOT)
@@ -92,13 +90,10 @@ test('recovery command ownership', () => {
   const cliSource = parseFile(CLI_PATH);
   const companionSource = parseFile(COMPANION_PATH);
 
-  // (a) the facade declares neither recovery handler.
   const cliDeclarations = functionDeclarations(cliSource, new Set(HANDLER_NAMES));
   assert.deepEqual(cliDeclarations.map(declaration => declaration.name.text), [],
     'src/cli.js must not declare recovery handlers');
 
-  // (b) one factory; both handlers directly nested in it and declared nowhere
-  // else in src/cli.js or src/cli/*.js (other domains are out of scope).
   const factories = functionDeclarations(companionSource, new Set([FACTORY_NAME]));
   assert.equal(factories.length, 1, `expected exactly one ${FACTORY_NAME} declaration`);
   const factory = factories[0];
@@ -114,7 +109,6 @@ test('recovery command ownership', () => {
   assert.deepEqual(nested.map(declaration => declaration.name.text), HANDLER_NAMES,
     'companion must nest one declaration of each handler in order');
 
-  // (c) the factory returns exactly the two shorthand identifiers in order.
   const returns = factory.body.statements.filter(statement => ts.isReturnStatement(statement));
   assert.equal(returns.length, 1, 'factory must end with exactly one top-level return');
   const returned = returns[0].expression;
@@ -124,8 +118,6 @@ test('recovery command ownership', () => {
   assert.deepEqual(returned.properties.map(property => property.name.text), HANDLER_NAMES,
     'factory return must list exactly the two handlers in order');
 
-  // (d) the facade instantiates the factory once with the six dependencies and
-  // binds both handler names; only recoverCourier stays public.
   const calls = factoryCalls(cliSource);
   assert.equal(calls.length, 1, `src/cli.js must call ${FACTORY_NAME} exactly once`);
   const call = calls[0];
@@ -143,7 +135,6 @@ test('recovery command ownership', () => {
   assert.ok(cliExports.includes('recoverCourier'), 'src/cli.js module.exports must list recoverCourier');
   assert.ok(!cliExports.includes('recover'), 'src/cli.js module.exports must not list recover');
 
-  // (e) the main switch still dispatches 'recover' to recover(args).
   let dispatched = null;
   visit(cliSource, node => {
     if (!ts.isSwitchStatement(node)) return;
@@ -154,10 +145,6 @@ test('recovery command ownership', () => {
   });
   assert.equal(dispatched, 'recover', "case 'recover' must return recover(args)");
 
-  // (f) the companion's only export is the factory, and it never requires the
-  // CLI facade. Require targets are resolved, not string-matched, so spelling
-  // variants of the facade path are rejected; a non-literal specifier is
-  // rejected outright rather than trusted.
   const companionExports = moduleExportsProperties(companionSource);
   assert.equal(companionExports.length, 1, 'companion must export exactly one property');
   assert.ok(ts.isShorthandPropertyAssignment(companionExports[0]), 'companion export must be the factory identifier');

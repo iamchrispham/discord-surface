@@ -101,6 +101,17 @@
     "src/state/agent-routing.ts",
     "src/peer/resolution.ts",
     "src/discord/reconciliation-lookups.ts",
-    "src/discord/native-proof-recovery.ts"
+    "src/discord/native-proof-recovery.ts",
+    "src/state/courier-route/attempt.ts",
+    "src/state/courier-route/constants.ts",
+    "src/state/courier-route/envelope.ts",
+    "src/state/courier-route/forward.ts",
+    "src/state/courier-route/recovery.ts",
+    "src/state/courier-route/route.ts",
+    "src/state/courier-route/types.ts",
+    "src/state/decision/handlers.ts",
+    "src/state/decision/index.ts",
+    "src/state/decision/reducer.ts",
+    "src/state/decision/types.ts"
   ]
 }
