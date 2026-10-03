@@ -9,6 +9,7 @@ const { EventEmitter } = require('node:events');
 const {
   decodeWatcherNotice,
   encodeWatcherNotice,
+  validWatcherAddress,
   watcherNoticeId
 } = require('../src/watcher-notice');
 const { SurfaceState, MESSAGE_STATES, READINESS } = require('../src/state');
@@ -436,4 +437,39 @@ test('watcher codec binds stable identity and exact target', () => {
   assert.deepEqual(decodeWatcherNotice(encoded, token, child), packet);
   assert.throws(() => decodeWatcherNotice(encoded, token, { ...child, generation: 2 }), /stale|mismatched/);
   assert.throws(() => encodeWatcherNotice({ ...packet, id: 'different' }, token), /watcher notice identity is not stable/);
+
+  for (const field of ['guildId', 'channelId']) {
+    let throwingGetterCalls = 0;
+    const throwingGetterAddress = { ...owner };
+    Object.defineProperty(throwingGetterAddress, field, {
+      enumerable: true,
+      get() {
+        throwingGetterCalls += 1;
+        throw new Error('unexpected accessor access');
+      }
+    });
+    assert.equal(validWatcherAddress(throwingGetterAddress), false);
+    assert.equal(throwingGetterCalls, 0);
+
+    let changingGetterCalls = 0;
+    let accessorCoercions = 0;
+    const accessorCoercible = {
+      [Symbol.toPrimitive]() {
+        accessorCoercions += 1;
+        return owner[field];
+      }
+    };
+    const changingGetterAddress = { ...owner };
+    Object.defineProperty(changingGetterAddress, field, {
+      enumerable: true,
+      get() {
+        changingGetterCalls += 1;
+        return changingGetterCalls === 1 ? owner[field] : accessorCoercible;
+      }
+    });
+    assert.equal(validWatcherAddress(changingGetterAddress), false);
+    assert.equal(changingGetterCalls, 0);
+    assert.equal(accessorCoercions, 0);
+  }
+  assert.equal(validWatcherAddress(owner), true);
 });

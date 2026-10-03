@@ -44,6 +44,58 @@ test('packet grammar prevents self-targeting, uncorrelated results and oversized
   assert.throws(() => encodeAgentMessage({ ...packet, text: 'x'.repeat(2000) }, token), /encoded size \d+ characters, maximum 2000 characters/);
   const oversizedWire = PREFIX + 'x'.repeat(AGENT_MESSAGE_MAX_ENCODED_LENGTH - PREFIX.length + 1);
   assert.throws(() => decodeAgentMessage(oversizedWire, token, target), /encoded size 2001 characters, maximum 2000 characters/);
+
+  const routed = { ...packet, routingVersion: 2 };
+  let throwingGetterCalls = 0;
+  const throwingGetterPacket = { ...routed };
+  Object.defineProperty(throwingGetterPacket, 'sourceParentChannelId', {
+    enumerable: true,
+    get() {
+      throwingGetterCalls += 1;
+      throw new Error('unexpected sourceParentChannelId access');
+    }
+  });
+  assert.throws(() => encodeAgentMessage(throwingGetterPacket, token), /invalid agent message/);
+  assert.equal(throwingGetterCalls, 0);
+
+  let changingGetterCalls = 0;
+  const changingGetterPacket = { ...routed };
+  Object.defineProperty(changingGetterPacket, 'sourceParentChannelId', {
+    enumerable: true,
+    get() {
+      changingGetterCalls += 1;
+      return changingGetterCalls === 1 ? '999' : '998';
+    }
+  });
+  assert.throws(() => encodeAgentMessage(changingGetterPacket, token), /invalid agent message/);
+  assert.equal(changingGetterCalls, 0);
+
+  for (const field of ['sourceParentChannelId', 'routingVersion']) {
+    for (const inherited of [false, true]) {
+      for (const throws of [false, true]) {
+        let getterCalls = 0;
+        const accessorPacket = { ...routed, sourceParentChannelId: '999' };
+        delete accessorPacket[field];
+        const holder = inherited ? {} : accessorPacket;
+        Object.defineProperty(holder, field, {
+          enumerable: true,
+          get() {
+            getterCalls += 1;
+            if (throws) throw new Error('unexpected routing accessor');
+            return field === 'routingVersion' ? 2 : (getterCalls === 1 ? '999' : '998');
+          }
+        });
+        if (inherited) Object.setPrototypeOf(accessorPacket, holder);
+        assert.throws(() => encodeAgentMessage(accessorPacket, token), /invalid agent message/);
+        assert.equal(getterCalls, 0);
+      }
+    }
+  }
+
+  const dataParentPacket = { ...routed, sourceParentChannelId: '999' };
+  assert.deepEqual(decodeAgentMessage(encodeAgentMessage(dataParentPacket, token), token, target), dataParentPacket);
+  const absentParentPacket = { ...routed };
+  assert.equal(typeof encodeAgentMessage(absentParentPacket, token), 'string');
 });
 
 test('agent packet reports the measured encoded size and accepts the exact boundary', () => {
