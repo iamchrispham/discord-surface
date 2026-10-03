@@ -69,7 +69,7 @@ After a qualified integration loads the tools, call `peer_list()` in the bound n
 
 Verify peer adoption in the bound native session. Updating a launcher does not refresh an existing MCP server set, and a long-lived shell may retain an old launcher function. Before the next normal resume, open a fresh shell or reload the launcher's documented initialization. Do not restart solely to pass an adoption check or hand-edit generated configuration as a durable fix.
 
-At that attachment, verify the generated configuration uses the intended installed peer CLI. Confirm `peer_list`, `peer_send` and `peer_result` are exposed in the same session. Record the caller identity, generation and child route from `peer_list()`, then prove a signed request and correlated result through an existing recipient. A ready listener or working ad-hoc CLI does not prove peer adoption.
+At that attachment, verify the generated configuration uses the intended installed peer CLI. Confirm `peer_list`, `peer_send` and `peer_result` are exposed in the same session. Record the native session UUID from the qualified native integration's caller-identity evidence described above, and record the generation and child route from `peer_list()`. Then prove a signed request and correlated result through an existing recipient. A ready listener or working ad-hoc CLI does not prove peer adoption.
 
 Peer MCP registration does not steer an active Codex turn. The adapter's Codex intake uses `codex queue --thread`, which delivers a follow-up on a later turn. Active-turn steering needs a separately qualified route to the owning native app-server.
 
