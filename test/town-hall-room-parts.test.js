@@ -245,9 +245,16 @@ function assertOwnerSourcePinned(sourceText) {
       assert.equal(node.arguments.length, 1, 'the canonical planner must be called with one argument');
       assert.equal(node.arguments[0].getText(source), 'input', 'the canonical planner must receive the bare input identifier');
     }
-    if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
-        node.expression.getText(source) === 'input') {
-      throw new Error('raw input read bypasses the canonical planner');
+    if (ts.isIdentifier(node) && node.text === 'input') {
+      const parent = node.parent;
+      const parameter = ts.isParameter(parent) && parent.name === node &&
+        ts.isFunctionDeclaration(parent.parent) && parent.parent.name?.text === 'planTownHallRoomParts';
+      const plannerArgument = ts.isCallExpression(parent) &&
+        parent.expression.getText(source) === 'planTownHallBroadcast' &&
+        parent.arguments.length === 1 && parent.arguments[0] === node;
+      if (!parameter && !plannerArgument) {
+        throw new Error('raw input read bypasses the canonical planner');
+      }
     }
     ts.forEachChild(node, visit);
   }
@@ -637,8 +644,6 @@ test('room parts owner delegates validation to the canonical planner', () => {
     return null;
   }
 
-  // A structural local validator that re-reads the raw input must be rejected
-  // by the property/element-access rule, not by a banned-label substring.
   const localValidator = source +
     '\nfunction localRoomValidator(input: unknown): boolean {\n' +
     '  return typeof input === "object" && input !== null && input["text"] !== undefined;\n' +
@@ -652,6 +657,19 @@ test('room parts owner delegates validation to the canonical planner', () => {
   const rawReadError = rejection(rawRead);
   assert.ok(rawReadError, 'a raw input.text read must be rejected');
   assert.match(rawReadError.message, /raw input read/);
+
+  for (const read of [
+    'const rawText = (input as { text: string }).text',
+    'const { text } = input',
+    'const keys = Object.keys(input)',
+    'const alias = input; const rawText = alias.text'
+  ]) {
+    const mutant = source.replace(callPattern, match => match + ';\n' + read);
+    assert.notEqual(mutant, source);
+    const error = rejection(mutant);
+    assert.ok(error, 'every alternate raw-input read must be rejected');
+    assert.match(error.message, /raw input read/);
+  }
 
   const secondCall = source.replace(callPattern, match => match + ';\nconst extraPlan = planTownHallBroadcast(input)');
   assert.notEqual(secondCall, source);
