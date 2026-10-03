@@ -1,6 +1,7 @@
 const { createIntakeSerialization } = require('./discord/intake-serialization');
 const { createCourierPickupDeadline } = require('./discord/courier-pickup-deadline');
 const { createLiveAttachmentRecoveryHandlers } = require('./discord/live-attachment-recovery');
+const { createTransportRecoveryWaiter } = require('./discord/transport-recovery-waiter');
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const { WATCHER_NOTICE_PREFIX } = require('./watcher-notice');
 const path = require('node:path');
@@ -2398,82 +2399,6 @@ class DiscordGateway {
       const result = fallback || waiter.lastResult || waiter.ownResult || { ready: false, state: 'unavailable' };
       return result?.ready === true ? { ready: false, state: 'unavailable', error: result.error } : result;
     };
-    const makeWaiter = (scope, deadline) => {
-      let resolveWaiter;
-      const waiter = {
-        scope,
-        deadline,
-        parents: new Set(),
-        childCount: 0,
-        pending: 1,
-        ownDone: false,
-        ownResult: null,
-        lastResult: null,
-        settled: false,
-        stopped: false,
-        timer: null,
-        promise: new Promise(resolve => { resolveWaiter = resolve; })
-      };
-      const armTimer = () => {
-        if (!Number.isFinite(waiter.deadline)) return;
-        if (waiter.timer) clearTimeout(waiter.timer);
-        waiter.timer = setTimeout(() => waiter.settle({ ready: false, state: 'unavailable' }),
-          Math.max(0, waiter.deadline - Date.now()) + RECOVERY_WAITER_DEADLINE_GRACE_MS);
-      };
-      waiter.extendDeadline = nextDeadline => {
-        if (waiter.settled || !Number.isFinite(nextDeadline) ||
-            (Number.isFinite(waiter.deadline) && nextDeadline <= waiter.deadline)) return;
-        waiter.deadline = nextDeadline;
-        armTimer();
-      };
-      const notifyParents = result => {
-        for (const parent of waiter.parents) parent.childFinished(result);
-      };
-      waiter.settle = fallback => {
-        if (waiter.settled) return;
-        waiter.settled = true;
-        if (waiter.timer) clearTimeout(waiter.timer);
-        const result = makeResult(waiter, fallback);
-        resolveWaiter(result);
-        notifyParents(result);
-      };
-      waiter.stop = () => {
-        if (waiter.settled) return;
-        waiter.stopped = true;
-        waiter.settled = true;
-        if (waiter.timer) clearTimeout(waiter.timer);
-        const result = { ready: false, state: 'stopped' };
-        resolveWaiter(result);
-        notifyParents(result);
-      };
-      waiter.maybeSettle = () => {
-        if (waiter.ownDone && waiter.pending === 0) waiter.settle();
-      };
-      waiter.childFinished = result => {
-        if (waiter.settled) return;
-        if (result?.state === 'stopped') {
-          waiter.stop();
-          return;
-        }
-        waiter.lastResult = result;
-        waiter.pending = Math.max(0, waiter.pending - 1);
-        waiter.maybeSettle();
-      };
-      waiter.completeOwn = result => {
-        if (waiter.settled || waiter.ownDone) return;
-        waiter.ownDone = true;
-        waiter.ownResult = result;
-        waiter.lastResult = result;
-        if (result?.state === 'stopped') {
-          waiter.stop();
-          return;
-        }
-        waiter.pending = Math.max(0, waiter.pending - 1);
-        waiter.maybeSettle();
-      };
-      armTimer();
-      return waiter;
-    };
     const attachParents = waiter => {
       for (const parent of this.recoveryActiveWaiters) {
         if (parent === waiter || parent.settled || !scopesIntersect(parent.scope, waiter.scope)) continue;
@@ -2588,7 +2513,7 @@ class DiscordGateway {
 
     const recoveryAlreadyQueued = this.recoveryPromise || this.recoveryFollowupPromise;
     const queuedScoped = recoveryAlreadyQueued && callerScope !== null;
-    const waiter = makeWaiter(callerScope, queuedScoped ? null : overallDeadline);
+    const waiter = createTransportRecoveryWaiter(callerScope, queuedScoped ? null : overallDeadline, makeResult, RECOVERY_WAITER_DEADLINE_GRACE_MS);
     if (recoveryAlreadyQueued) {
       if (callerScope === null) this.ready = false;
       attachParents(waiter);
