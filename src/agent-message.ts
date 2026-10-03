@@ -53,14 +53,19 @@ function messageLimitError(encodedLength: number): Error {
 }
 
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) &&
-    Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).length !== keys.length) return false;
+  return keys.every(key => {
+    if (!Object.hasOwn(value, key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && Object.hasOwn(descriptor, 'value');
+  });
 }
 
 export function validAddress(value: unknown): value is AgentAddress {
   if (!exactKeys(value, ['guildId', 'channelId', 'provider', 'nativeId', 'generation'])) return false;
-  return /^\d{1,20}$/.test(value.guildId as string) && typeof value.guildId === 'string' &&
-    /^\d{1,20}$/.test(value.channelId as string) && typeof value.channelId === 'string' &&
+  return typeof value.guildId === 'string' && /^\d{1,20}$/.test(value.guildId) &&
+    typeof value.channelId === 'string' && /^\d{1,20}$/.test(value.channelId) &&
     Object.values(PROVIDERS).includes(value.provider as AgentProvider) &&
     typeof value.nativeId === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.nativeId as string) &&
     Number.isSafeInteger(value.generation) && value.generation as number > 0;
