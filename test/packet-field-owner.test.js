@@ -509,17 +509,34 @@ export function validateAgentMessage(packet: unknown): void {
       return true;
     }, 'planner reads the owner through the module exports and refuses on a forced true');
 
-    // Known CommonJS trap: validateAgentMessage compiles its intra-module call
-    // to a direct local call, so the forced export does not reach it. This
-    // assertion is the empirical record of that boundary.
-    assert.doesNotThrow(() => agentModule.validateAgentMessage({
+    const nonSelfPacket = {
       id: 'm1',
       kind: 'request',
       source: { guildId: '100', channelId: '200', provider: 'codex', nativeId: lowA, generation: 1 },
       target: { guildId: '100', channelId: '300', provider: 'claude', nativeId: lowB, generation: 1 },
       replyTo: null,
       text: 'hi'
-    }), 'intra-module validateAgentMessage does not observe the module export');
+    };
+    assert.doesNotThrow(() => agentModule.validateAgentMessage(nonSelfPacket));
+
+    // CommonJS keeps the validator's local binding separate from its export.
+    const Module = require('node:module');
+    const filename = require.resolve('../dist/agent-message');
+    const compiledText = fs.readFileSync(filename, 'utf8');
+    const compiledSource = parseSourceText(filename, compiledText);
+    const owners = declarationsNamed(compiledSource, 'sameAgentSession');
+    assert.equal(owners.length, 1, 'compiled module has exactly one comparator owner');
+    const ownerBody = bodyOf(owners[0]);
+    const sentinelText = compiledText.slice(0, ownerBody.getStart(compiledSource)) +
+      '{ return true; }' + compiledText.slice(ownerBody.end);
+    const isolated = new Module(filename, module);
+    isolated.filename = filename;
+    isolated.paths = module.paths;
+    isolated._compile(sentinelText, filename);
+    assert.throws(() => isolated.exports.validateAgentMessage(nonSelfPacket), error => {
+      assert.equal(error.message, 'invalid agent message');
+      return true;
+    }, 'validator refuses when its local comparator owner is forced true');
   } finally {
     agentModule.sameAgentSession = original;
   }
