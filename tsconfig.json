@@ -117,6 +117,10 @@
     "src/state/decision/types.ts",
     "src/state/town-hall-journal/index.ts",
     "src/state/town-hall-journal/types.ts",
-    "src/state/town-hall-journal/repository.ts"
+    "src/state/town-hall-journal/repository.ts",
+    "src/state/town-hall-publication/index.ts",
+    "src/state/town-hall-publication/types.ts",
+    "src/state/town-hall-publication/projection.ts",
+    "src/state/town-hall-publication/repository.ts"
   ]
 }
