@@ -34,7 +34,10 @@ export type ClaudeOrdinaryPreflightDetail = OrdinaryNativeProof & {
 export type ClaudeOrdinaryBindingState = Pick<
   OrdinaryBindingState,
   'db' | 'bind' | 'rebind' | 'getBinding' | 'transaction' | 'receipt'
->;
+> & {
+  _isOrdinaryBindingRecord(binding: OrdinaryBindingRecord | null): binding is ClaudeOrdinaryBindingRecord;
+  _isOrdinaryBinding(binding: OrdinaryBindingRecord | null): binding is ClaudeOrdinaryBindingRecord;
+};
 
 export interface ClaudeOrdinaryBindingDependencies {
   BindingError: OrdinaryBindingDependencies['BindingError'];
@@ -105,7 +108,7 @@ export function createOrdinaryClaudeBindingHandlers(
       if (binding.conductorId != null || binding.repoKey != null) throw new BindingError('ordinary bindings cannot carry conductor identity');
       assertOrdinaryIdentity(PROVIDERS.CLAUDE, identity);
       const existing = state.getBinding(binding.channelId);
-      if (!existing || existing.active || !handlers.isOrdinaryBindingRecord(state, existing)) {
+      if (!existing || existing.active || !state._isOrdinaryBindingRecord(existing)) {
         throw new BindingError('ordinary binding tombstone is unavailable for reuse');
       }
       if (existing.guildId !== binding.guildId || existing.provider !== PROVIDERS.CLAUDE ||
@@ -126,11 +129,11 @@ export function createOrdinaryClaudeBindingHandlers(
 
     isOrdinaryBinding(state, binding): binding is ClaudeOrdinaryBindingRecord {
       if (!binding?.active) return false;
-      return handlers.isOrdinaryBindingRecord(state, binding);
+      return state._isOrdinaryBindingRecord(binding);
     },
 
     hasOrdinaryPreflight(state, binding) {
-      if (!handlers.isOrdinaryBinding(state, binding)) return false;
+      if (!state._isOrdinaryBinding(binding)) return false;
       return hasOrdinaryPreflightReceipt(state, binding);
     },
 
@@ -138,7 +141,7 @@ export function createOrdinaryClaudeBindingHandlers(
       return state.transaction(() => {
         const current = state.getBinding(binding?.channelId);
         if (!bindingMatchesExpected(current, binding)) return null;
-        if (!handlers.isOrdinaryBinding(state, current)) throw new BindingError(`binding is not an ordinary ${current?.provider || 'native'} binding`);
+        if (!state._isOrdinaryBinding(current)) throw new BindingError(`binding is not an ordinary ${current?.provider || 'native'} binding`);
         if (!detail || typeof detail !== 'object' || typeof detail.file !== 'string' || !path.isAbsolute(detail.file) ||
           detail.sessionId !== current.nativeId ||
           detail.threadId !== current.nativeId ||

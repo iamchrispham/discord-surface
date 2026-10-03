@@ -310,6 +310,8 @@ const EXPECTED_RECEIPT_SITES = [
 ];
 
 const EXPECTED_HELPER_CALLS = [
+  `${CODEX_OWNER}|rebindOrdinary|isOrdinaryBindingRecord`,
+  `${CODEX_OWNER}|handoffOrdinary|isOrdinaryBindingRecord`,
   `${CODEX_OWNER}|isOrdinaryBindingRecord|hasOrdinaryBindingReceipt`,
   `${CODEX_OWNER}|isOrdinaryBinding|hasOrdinaryBindingReceipt`,
   `${CODEX_OWNER}|hasOrdinaryPreflight|hasOrdinaryPreflightReceipt`,
@@ -394,6 +396,15 @@ function receiptSites(ts, entries) {
   for (const entry of entries) {
     const source = parseEntry(ts, entry);
     walkNodes(ts, source, node => {
+      if (ts.isCallExpression(node)) {
+        const info = calleeInfo(ts, node);
+        const kind = node.arguments[1];
+        if (info?.method === 'receipt' && kind &&
+          (ts.isStringLiteral(kind) || ts.isNoSubstitutionTemplateLiteral(kind)) &&
+          ['ordinary-bound', 'ordinary-native-preflight'].includes(kind.text)) {
+          sites.push(`${entry.file}|${ownerOf(ts, node)}|${info.receiver}.receipt|literal:${kind.text}`);
+        }
+      }
       if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
         node.expression.text === 'ORDINARY_RECEIPT_KINDS' && RECEIPT_KINDS.has(node.name.text)) {
         sites.push(`${entry.file}|${ownerOf(ts, node)}|ORDINARY_RECEIPT_KINDS.${node.name.text}`);
@@ -420,8 +431,9 @@ function helperCalls(ts, entries) {
       }
       if (!method) return;
       const shared = method === 'hasOrdinaryBindingReceipt' || method === 'hasOrdinaryPreflightReceipt';
-      const delegate = method === 'isOrdinaryBindingRecord' && (receiver === 'handlers' || receiver === 'this');
-      if (shared || delegate) calls.push(`${entry.file}|${ownerOf(ts, node)}|${method}`);
+      const delegate = (method === 'isOrdinaryBindingRecord' || method === '_isOrdinaryBindingRecord') &&
+        (receiver === 'handlers' || receiver === 'this' || receiver === 'state');
+      if (shared || delegate) calls.push(`${entry.file}|${ownerOf(ts, node)}|${method.replace(/^_/, '')}`);
     });
   }
   return calls.sort();
@@ -531,6 +543,16 @@ test('Claude binding owner inventory pins the factory dispatch, receipt census a
     'shared receipt-helper and classification delegates must match exactly');
   assert.deepEqual(real.sqlFindings, [],
     'receipt SELECT SQL and db.prepare must stay out of the facade and Claude owner methods');
+
+  for (const kindLiteral of ["'ordinary-native-preflight'", '`ordinary-native-preflight`']) {
+    const rawWriterEntries = entries.map(entry => entry.file === 'src/state.js'
+      ? { ...entry, text: entry.text.replace('_recordOrdinaryPreflight(binding, detail = {}) {',
+        `_recordOrdinaryPreflight(binding, detail = {}) { this.receipt(null, ${kindLiteral}, detail);`) }
+      : entry);
+    const rawWriter = renderClaudeInventory(ts, rawWriterEntries);
+    assert.equal(rawWriter.receiptSites.length, real.receiptSites.length + 1);
+    assert.notDeepEqual(rawWriter.receiptSites, EXPECTED_RECEIPT_SITES.slice().sort());
+  }
 
   // Mutant: an in-memory copied private Claude preflight policy with a receipt write
   // must be rejected by the name census and the receipt-site census.

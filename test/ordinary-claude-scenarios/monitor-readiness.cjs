@@ -155,6 +155,23 @@ test('ordinary Claude preflight rejects wrong harness and endpoint before record
   assert.ok(recorded);
   assert.equal(state.hasOrdinaryPreflight(binding), true);
 
+  const classifyRecord = state._isOrdinaryBindingRecord;
+  const classifyActive = state._isOrdinaryBinding;
+  const beforeOverride = state.listReceipts().length;
+  try {
+    state._isOrdinaryBindingRecord = () => false;
+    assert.equal(state.isOrdinaryBinding(binding), false);
+    state._isOrdinaryBindingRecord = classifyRecord;
+    state._isOrdinaryBinding = () => false;
+    assert.equal(state.hasOrdinaryPreflight(binding), false);
+    assert.throws(() => state.recordOrdinaryPreflight(binding, { ...proof, harness: 'claude-code' }), /not an ordinary/);
+    assert.equal(state.listReceipts().length, beforeOverride);
+  } finally {
+    state._isOrdinaryBindingRecord = classifyRecord;
+    state._isOrdinaryBinding = classifyActive;
+  }
+
+
   // Unsupported provider stays unclassified and its changed-binding preflight is a null no-op.
   assert.equal(state._isOrdinaryBindingRecord({ ...binding, provider: 'unknown-provider' }), false);
   assert.equal(state._isOrdinaryBinding({ ...binding, provider: 'unknown-provider' }), false);
@@ -169,4 +186,16 @@ test('ordinary Claude preflight rejects wrong harness and endpoint before record
     workspace: dir, endpoint: socketPath, conductorId: 'conductor', repoKey: 'repo'
   }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }, '100'), /ordinary bindings cannot carry conductor identity/);
   assert.equal(state.getBinding('conductor-claude'), null);
+
+  state.unbind(binding.channelId);
+  const tombstone = state.getBinding(binding.channelId);
+  const receiptsBeforeRebind = state.listReceipts().length;
+  try {
+    state._isOrdinaryBindingRecord = () => false;
+    assert.throws(() => state.rebindOrdinaryClaude(binding,
+      { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }, '100'), /tombstone is unavailable/);
+    assert.deepEqual(state.getBinding(binding.channelId), tombstone);
+    assert.equal(state.listReceipts().length, receiptsBeforeRebind);
+  } finally { state._isOrdinaryBindingRecord = classifyRecord; }
+
 });

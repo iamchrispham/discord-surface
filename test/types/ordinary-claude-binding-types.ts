@@ -1,12 +1,12 @@
 import {
   createOrdinaryClaudeBindingHandlers,
   type ClaudeOrdinaryBindingDependencies,
+  type ClaudeOrdinaryBindingState,
   type ClaudeOrdinaryBindingIdentity,
   type ClaudeOrdinaryBindingInput,
   type ClaudeOrdinaryBindingRecord,
   type ClaudeOrdinaryPreflightDetail
 } from '../../src/state/ordinary-binding-claude';
-import type { OrdinaryBindingState } from '../../src/state/ordinary-binding/contracts';
 import type { AgentProvider } from '../../src/agent-message';
 
 const nativeId = '9caa5d21-2169-429d-918b-5f08651b5dbd';
@@ -30,7 +30,7 @@ const binding: ClaudeOrdinaryBindingRecord = {
 
 const identity: ClaudeOrdinaryBindingIdentity = { sessionId: nativeId, threadId: nativeId, harness: 'claude-code' };
 
-const state: Pick<OrdinaryBindingState, 'db' | 'bind' | 'rebind' | 'getBinding' | 'transaction' | 'receipt'> = {
+const state: ClaudeOrdinaryBindingState = {
   db: {
     prepare: () => ({
       all: <T extends Record<string, unknown> = Record<string, unknown>>(..._parameters: unknown[]) => [] as T[],
@@ -42,7 +42,9 @@ const state: Pick<OrdinaryBindingState, 'db' | 'bind' | 'rebind' | 'getBinding' 
   rebind: value => ({ ...binding, ...value }),
   getBinding: () => binding,
   transaction: operation => operation(),
-  receipt: () => undefined
+  receipt: () => undefined,
+  _isOrdinaryBindingRecord: (value): value is typeof binding => value !== null,
+  _isOrdinaryBinding: (value): value is typeof binding => value !== null && Boolean(value.active)
 };
 
 const handlers = createOrdinaryClaudeBindingHandlers({
