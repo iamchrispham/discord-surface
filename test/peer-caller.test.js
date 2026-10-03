@@ -55,3 +55,122 @@ test('ambiguous, foreign guild, inactive and wrong-provider bindings never autho
   f.rows[0].active = true; f.rows[0].provider = 'claude';
   await assert.rejects(resolvePeerCaller(f.state, 'codex', dependencies), /no active binding/);
 });
+
+function countingState(f) {
+  const counts = { listBindings: 0 };
+  return {
+    counts,
+    state: { requireConfig: () => ({ guildId: '100' }), listBindings: () => { counts.listBindings++; return f.rows; } }
+  };
+}
+
+test('Codex injected resolver exclusively selects identity over conflicting environment', async () => {
+  const f = fixture();
+  const stop = new AbortController();
+  let received;
+  const caller = await resolvePeerCaller(f.state, 'codex', {
+    environment: { CODEX_THREAD_ID: other },
+    resolveCodexCaller: signal => { received = signal; return { sessionId: id, threadId: id, turnId: 't1' }; }
+  }, stop.signal);
+  assert.strictEqual(received, stop.signal);
+  assert.equal(caller.nativeId, id);
+  await assert.rejects(resolvePeerCaller(f.state, 'codex', {
+    environment: { CODEX_THREAD_ID: id },
+    resolveCodexCaller: () => ({ sessionId: ` ${id} `, threadId: ` ${id} `, turnId: 't2' })
+  }), /no active binding/);
+});
+
+test('Codex injected resolver is invoked again and selects the new binding generation', async () => {
+  const f = fixture();
+  let calls = 0;
+  const dependencies = { resolveCodexCaller: () => { calls++; return { sessionId: id, threadId: id, turnId: 't1' }; } };
+  assert.equal((await resolvePeerCaller(f.state, 'codex', dependencies)).generation, 1);
+  f.rows[0].generation = 2;
+  assert.equal((await resolvePeerCaller(f.state, 'codex', dependencies)).generation, 2);
+  f.rows[0].generation = 3;
+  assert.equal((await resolvePeerCaller(f.state, 'codex', dependencies)).generation, 3);
+  assert.equal(calls, 3);
+});
+
+test('Codex injected resolver rejection propagates despite valid environment data', async () => {
+  const f = fixture();
+  const { state, counts } = countingState(f);
+  const refusal = new Error('trusted resolver refused');
+  await assert.rejects(
+    resolvePeerCaller(state, 'codex', {
+      environment: { CODEX_THREAD_ID: id },
+      resolveCodexCaller: () => { throw refusal; }
+    }),
+    error => { assert.strictEqual(error, refusal); return true; }
+  );
+  assert.equal(counts.listBindings, 0);
+});
+
+test('Codex injected resolver refuses missing, empty or conflicting turn identity before binding lookup', async () => {
+  const f = fixture();
+  const { state, counts } = countingState(f);
+  const candidates = [
+    { sessionId: id, threadId: id },
+    { sessionId: id, threadId: id, turnId: '' },
+    { sessionId: id, threadId: id, turnId: '   ' },
+    { sessionId: id, threadId: id, turnId: 5 },
+    { sessionId: id, turnId: 't1' },
+    { sessionId: id, threadId: other, turnId: 't1' },
+    { sessionId: id, threadId: ` ${id} `, turnId: 't1' },
+    { sessionId: ` ${id} `, threadId: id, turnId: 't1' },
+    { threadId: id, turnId: 't1' }
+  ];
+  for (const identity of candidates) {
+    await assert.rejects(
+      resolvePeerCaller(state, 'codex', { resolveCodexCaller: () => identity }),
+      /turn identity is unavailable or conflicting/
+    );
+  }
+  assert.equal(counts.listBindings, 0);
+});
+
+test('Codex nonfunction injected resolver refuses despite valid environment data', async () => {
+  const f = fixture();
+  for (const resolveCodexCaller of [{}, 'x', null]) {
+    await assert.rejects(
+      resolvePeerCaller(f.state, 'codex', { environment: { CODEX_THREAD_ID: id }, resolveCodexCaller }),
+      /must be a function/
+    );
+  }
+});
+
+test('Codex pending injected resolution observes cancellation', async () => {
+  const f = fixture();
+  const stop = new AbortController();
+  const pending = resolvePeerCaller(f.state, 'codex', { resolveCodexCaller: () => new Promise(() => {}) }, stop.signal);
+  stop.abort();
+  await assert.rejects(pending, /aborted|closing/);
+});
+
+test('Codex already-aborted resolution invokes no injected resolver and no binding lookup', async () => {
+  const f = fixture();
+  const { state, counts } = countingState(f);
+  const stop = new AbortController();
+  stop.abort();
+  let calls = 0;
+  await assert.rejects(
+    resolvePeerCaller(state, 'codex', { resolveCodexCaller: () => { calls++; return { sessionId: id, threadId: id, turnId: 't1' }; } }, stop.signal),
+    /aborted|closing/
+  );
+  assert.equal(calls, 0);
+  assert.equal(counts.listBindings, 0);
+});
+
+test('Claude already-aborted resolution invokes no native resolver and no binding lookup', async () => {
+  const f = fixture('claude');
+  const { state, counts } = countingState(f);
+  const stop = new AbortController();
+  stop.abort();
+  let calls = 0;
+  await assert.rejects(
+    resolvePeerCaller(state, 'claude', { resolveClaudeCaller: () => { calls++; return { harness: 'claude-code', sessionId: id }; } }, stop.signal),
+    /aborted|closing/
+  );
+  assert.equal(calls, 0);
+  assert.equal(counts.listBindings, 0);
+});

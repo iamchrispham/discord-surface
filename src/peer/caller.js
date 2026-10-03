@@ -22,10 +22,24 @@ function observeAbort(promise, signal) {
 }
 
 async function resolvePeerCaller(state, provider, dependencies = {}, signal) {
+  if (signal?.aborted) throw abortError(signal);
   let nativeId;
   if (provider === 'codex') {
-    const identity = resolveInvocationIdentity(dependencies.environment || process.env);
-    nativeId = identity.sessionId;
+    const resolve = dependencies.resolveCodexCaller;
+    if (resolve === undefined) {
+      const identity = resolveInvocationIdentity(dependencies.environment || process.env);
+      nativeId = identity.sessionId;
+    } else {
+      if (typeof resolve !== 'function') throw new Error('peer Codex caller resolver must be a function');
+      const identity = await observeAbort(Promise.resolve().then(() => resolve(signal)), signal);
+      if (typeof identity?.sessionId !== 'string' || identity.sessionId.trim() === '' ||
+        typeof identity.threadId !== 'string' || identity.threadId.trim() === '' ||
+        typeof identity.turnId !== 'string' || identity.turnId.trim() === '' ||
+        identity.threadId !== identity.sessionId) {
+        throw new Error('peer caller Codex turn identity is unavailable or conflicting');
+      }
+      nativeId = identity.sessionId;
+    }
   } else if (provider === 'claude') {
     const resolve = dependencies.resolveClaudeCaller || require('../cli').resolveCurrentClaudeCaller;
     const identity = await observeAbort(Promise.resolve().then(() => resolve(signal)), signal);
