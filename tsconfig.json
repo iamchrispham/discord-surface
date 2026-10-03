@@ -113,6 +113,9 @@
     "src/state/decision/handlers.ts",
     "src/state/decision/index.ts",
     "src/state/decision/reducer.ts",
-    "src/state/decision/types.ts"
+    "src/state/decision/types.ts",
+    "src/state/town-hall-journal/index.ts",
+    "src/state/town-hall-journal/types.ts",
+    "src/state/town-hall-journal/repository.ts"
   ]
 }
