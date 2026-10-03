@@ -856,7 +856,7 @@ class SurfaceState {
     return ordinaryBindingHandlers.handoffOrdinary(this, input);
   }
 
-  handoffConductor({ channelId, provider, conductorId, repoKey, fromNativeId, fromGeneration, nativeId, workspace, endpoint, handoffId, intakeCutoff = null, enrollmentProof = null, carryAcceptedHuman = false }) { return bindingLifecycleHandlers.handoffConductor.apply(this, arguments); }
+  handoffConductor(input) { return bindingLifecycleHandlers.handoffConductor.apply(this, arguments); }
 
   assertNativeOwnerFree(provider, nativeId, channelId = null) { return bindingLifecycleHandlers.assertNativeOwnerFree.apply(this, arguments); }
 
