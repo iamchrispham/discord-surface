@@ -14,6 +14,7 @@ const {
   TOWN_HALL_PUBLICATION_EVENTS,
   createTownHallPublicationHandlers
 } = require('../dist/state/town-hall-publication/index.js');
+const { OWNER_EVIDENCE, OWNER_EVIDENCE_REASON } = require('../src/state/process-owner-evidence');
 
 const INSTRUCTION_PREFIX = 'town-hall-instruction/v1:';
 const PUBLICATION_PREFIX = 'town-hall-publication/v1:';
@@ -122,9 +123,13 @@ function assertCorrupt(run, label = '') {
 }
 
 function overrideOwnerAlive(state, value) {
-  const original = state.directPostOwnerAlive;
-  state.directPostOwnerAlive = function ownerAliveOverride() { return value; };
-  return () => { state.directPostOwnerAlive = original; };
+  const original = state.directPostOwnerEvidence;
+  state.directPostOwnerEvidence = function ownerEvidenceOverride() {
+    return value === true
+      ? { status: OWNER_EVIDENCE.MATCHING_LIVE, reason: OWNER_EVIDENCE_REASON.IDENTITY_MATCH }
+      : { status: OWNER_EVIDENCE.INDETERMINATE, reason: OWNER_EVIDENCE_REASON.PROBE_DENIED };
+  };
+  return () => { state.directPostOwnerEvidence = original; };
 }
 
 function overrideOwnerIdentity(state, identity) {

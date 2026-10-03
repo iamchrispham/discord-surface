@@ -26,6 +26,9 @@ import type {
   InteractionState,
   InteractionTransportRecord
 } from './interaction/contracts';
+import { normalizeOwnerEvidence, OWNER_EVIDENCE, type ProcessOwnerEvidence } from './process-owner-evidence';
+
+type OwnerAliveResult = boolean | ProcessOwnerEvidence | null;
 
 export { INTERACTION_ORIGIN, INTERACTION_TRANSPORT, INTERACTION_SOURCES } from './interaction/constants';
 export type { InteractionMessage, InteractionInput, InteractionAcceptance, InteractionAcceptanceOptions } from './interaction/contracts';
@@ -38,7 +41,7 @@ export function createInteractionHandlers(): {
   recordCallbackOutcome(state: InteractionState, messageId: string, outcome: string, detail?: Record<string, unknown>): InteractionTransportRecord | null;
   isInteractionMessage(state: InteractionState, messageId: string): boolean;
   responseTarget(state: InteractionState, messageId: string): string | null;
-  recoverCallbacksInTransaction(state: InteractionState, ownerAlive?: (pid: number, identity: unknown) => boolean): number;
+  recoverCallbacksInTransaction(state: InteractionState, ownerAlive?: (pid: number, identity: unknown) => OwnerAliveResult): number;
 } {
   return {
     decisionResult(state, message) {
@@ -145,7 +148,10 @@ export function createInteractionHandlers(): {
       return validText(target) ? target : null;
     },
 
-    recoverCallbacksInTransaction(state, ownerAlive = (pid, identity) => state.directPostOwnerAlive?.(pid, identity) || false) {
+    recoverCallbacksInTransaction(state, ownerAlive = (pid, identity) => {
+      if (typeof state.directPostOwnerEvidence === 'function') return state.directPostOwnerEvidence(pid, identity);
+      return null;
+    }) {
       const rows = state.db.prepare(`SELECT attempt.discord_id AS discord_id, attempt.detail AS detail
         FROM receipts attempt
         LEFT JOIN receipts outcome ON outcome.discord_id=attempt.discord_id
@@ -156,8 +162,9 @@ export function createInteractionHandlers(): {
       let recovered = 0;
       for (const row of rows) {
         const detail = parseJson(row.detail);
-        const pid = Number(detail.ownerPid);
-        if (Number.isInteger(pid) && pid > 0 && ownerAlive(pid, detail.ownerIdentity)) continue;
+        const pid = Number((detail as { ownerPid?: unknown }).ownerPid);
+        if (!Number.isInteger(pid) || pid < 1) continue;
+        if (normalizeOwnerEvidence(ownerAlive(pid, (detail as { ownerIdentity?: unknown }).ownerIdentity)).status !== OWNER_EVIDENCE.ABSENT) continue;
         state.receipt(row.discord_id, 'transport-receipt-outcome', {
           ...detail,
           transport: INTERACTION_TRANSPORT,

@@ -11,6 +11,7 @@ import {
   stagedDirectPostFilePath,
   type DirectPostFileManifest
 } from '../direct-post-file';
+import { normalizeOwnerEvidence, OWNER_EVIDENCE, type ProcessOwnerEvidence } from './process-owner-evidence';
 
 export const NATIVE_REPLY_FILE_PREPARATION = 'native-reply-file-preparation';
 export const NATIVE_REPLY_FILE_JOURNAL = 'native-reply-file-v1';
@@ -50,6 +51,7 @@ interface NativeReplyFileState {
   currentMessageBinding(message: any): any;
   directPostOwnerIdentity(pid: number): any;
   directPostOwnerAlive(pid: number, identity: any): boolean;
+  directPostOwnerEvidence?(pid: number, expectedIdentity?: unknown): ProcessOwnerEvidence;
   receipt(discordId: string, kind: string, detail: unknown): void;
 }
 
@@ -282,7 +284,10 @@ export function createNativeReplyFileHandlers(deps: NativeReplyFileDependencies)
           ownerStartTime: typeof preparation.ownerStartTime === 'string' ? preparation.ownerStartTime : null,
           ownerCommand: typeof preparation.ownerCommand === 'string' ? preparation.ownerCommand : null
         };
-        if (state.directPostOwnerAlive(ownerIdentity.ownerPid, ownerIdentity)) throw new deps.BindingError('native reply file preparation owner is still active');
+        const evidence = typeof state.directPostOwnerEvidence === 'function'
+          ? state.directPostOwnerEvidence(ownerIdentity.ownerPid, ownerIdentity)
+          : null;
+        if (normalizeOwnerEvidence(evidence).status !== OWNER_EVIDENCE.ABSENT) throw new deps.BindingError('native reply file preparation owner is still active');
       } else if (preparation.phase === NATIVE_REPLY_FILE_PHASES.ADMITTED) {
         const part = state.db.prepare('SELECT state, file_manifest FROM reply_parts WHERE discord_id=? AND part_index=?').get(messageId, partIndex);
         if (!part || part.state !== 'sent' || !part.file_manifest) throw new deps.BindingError('native reply file cleanup requires a sent file part');

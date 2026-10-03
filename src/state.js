@@ -39,6 +39,7 @@ const {
   WATCHER_NOTICE_RECEIPTS
 } = require('./state/watcher-notice');
 const { createBoardRefreshHandlers, BOARD_OUTCOMES, BOARD_RECEIPT_KINDS } = require('./state/board-refresh');
+const { classifyProcessOwner, normalizeOwnerEvidence, OWNER_EVIDENCE } = require('./state/process-owner-evidence');
 const { createOrdinaryBindingHandlers } = require('./state/ordinary-binding');
 const {
   createThreadEnrollmentHandlers,
@@ -1280,17 +1281,15 @@ class SurfaceState {
     return { ownerPid: normalizedPid, ownerStartTime, ownerCommand };
   }
 
+  directPostOwnerEvidence(pid, expectedIdentity = null) {
+    return normalizeOwnerEvidence(classifyProcessOwner(pid, expectedIdentity, {
+      probePid: processPid => process.kill(processPid, 0),
+      captureIdentity: processPid => this.directPostOwnerIdentity(processPid)
+    }));
+  }
+
   directPostOwnerAlive(pid, expectedIdentity = null) {
-    if (!Number.isInteger(Number(pid)) || Number(pid) < 1 || !expectedIdentity) return false;
-    try { process.kill(Number(pid), 0); } catch (error) { return false; }
-    const actualIdentity = this.directPostOwnerIdentity(pid);
-    if (!actualIdentity) return false;
-    if (expectedIdentity.ownerStartTime && actualIdentity.ownerStartTime !== expectedIdentity.ownerStartTime) return false;
-    if (expectedIdentity.ownerCommand && actualIdentity.ownerCommand !== expectedIdentity.ownerCommand) return false;
-    return Boolean(
-      (expectedIdentity.ownerStartTime && actualIdentity.ownerStartTime) ||
-      (expectedIdentity.ownerCommand && actualIdentity.ownerCommand)
-    );
+    return this.directPostOwnerEvidence(pid, expectedIdentity).status === OWNER_EVIDENCE.MATCHING_LIVE;
   }
 
   recoverDirectPostReceipts(ownerAlive = undefined) {
@@ -1326,11 +1325,11 @@ class SurfaceState {
     return boardRefreshHandlers.boardMessageProvenance(this, target);
   }
 
-  recoverBoardRefreshReceipts(ownerAlive = (pid, identity) => this.directPostOwnerAlive(pid, identity)) {
+  recoverBoardRefreshReceipts(ownerAlive = (pid, identity) => this.directPostOwnerEvidence(pid, identity)) {
     return boardRefreshHandlers.recoverBoardRefreshReceipts(this, ownerAlive);
   }
 
-  recoverBoardRefreshAttempt(target, attemptId, ownerAlive = (pid, identity) => this.directPostOwnerAlive(pid, identity)) {
+  recoverBoardRefreshAttempt(target, attemptId, ownerAlive = (pid, identity) => this.directPostOwnerEvidence(pid, identity)) {
     return boardRefreshHandlers.recoverBoardRefreshAttempt(this, target, attemptId, ownerAlive);
   }
 

@@ -6,6 +6,7 @@ import type { DirectPostOutcome, DirectPostPartStatus } from '../../direct-post/
 import { TOWN_HALL_ROOM_PARTS } from '../../peer/town-hall-room-parts';
 import type { TownHallRoomPart } from '../../peer/town-hall-room-parts';
 import type { TownHallBroadcastSnapshot, TownHallJournalState } from '../town-hall-journal/types';
+import type { ProcessOwnerEvidence } from '../process-owner-evidence';
 
 export const TOWN_HALL_PUBLICATION_RECEIPTS = Object.freeze({
   INSTRUCTION_PREFIX: 'town-hall-instruction/v1:',
@@ -87,6 +88,7 @@ export interface TownHallPublicationStateStore {
   getTownHallBroadcast(journalKey: string): TownHallBroadcastSnapshot | null;
   directPostOwnerIdentity(pid: number): TownHallPublicationOwner | null;
   directPostOwnerAlive(pid: number, expectedIdentity: TownHallPublicationOwner): boolean;
+  directPostOwnerEvidence?(pid: number, expectedIdentity?: unknown): ProcessOwnerEvidence;
 }
 
 export interface TownHallPublicationErrorClass {

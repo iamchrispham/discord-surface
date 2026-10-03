@@ -26,6 +26,11 @@ import {
   type PublicationProjection,
   type PublicationEvent
 } from './projection';
+import {
+  classifyProcessOwner,
+  OWNER_EVIDENCE,
+  OWNER_EVIDENCE_REASON
+} from '../process-owner-evidence';
 import { readContext, readPartContext, readPartPlan } from './context';
 import type { PublicationContext } from './context';
 
@@ -470,14 +475,14 @@ function classifyLiveness(
   owner: TownHallPublicationOwner
 ): Liveness {
   if (owner.ownerStartTime.length === 0) return 'indeterminate';
-  if (state.directPostOwnerAlive(owner.ownerPid, owner) === true) return 'matching-live';
-  try {
-    deps.probePid(owner.ownerPid);
-    return 'indeterminate';
-  } catch (error) {
-    const code = error !== null && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
-    return code === 'ESRCH' ? 'absent' : 'indeterminate';
-  }
+  const shared = classifyProcessOwner(owner.ownerPid, owner, {
+    probePid: pid => deps.probePid(pid),
+    captureIdentity: pid => typeof state.directPostOwnerIdentity === 'function' ? state.directPostOwnerIdentity(pid) : null
+  });
+  if (shared.reason === OWNER_EVIDENCE_REASON.IDENTITY_MISMATCH) return 'indeterminate';
+  if (shared.status === OWNER_EVIDENCE.ABSENT) return 'absent';
+  if (shared.status === OWNER_EVIDENCE.MATCHING_LIVE) return 'matching-live';
+  return 'indeterminate';
 }
 
 export function recoverTownHallPublication(
