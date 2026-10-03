@@ -323,3 +323,114 @@ test('16. missing identity probes before comparison and returns false without ca
   assert.ok(index > -1, 'process-owner-identity registered in npm test');
   assert.equal(tokens.filter(token => token === 'test/process-owner-identity.test.js').length, 1);
 });
+
+test('17. process capture has one owner and State delegates raw arguments', () => {
+  const ts = require(path.join(__dirname, '..', 'node_modules', 'typescript'));
+  const root = path.join(__dirname, '..');
+  const ownerPath = path.join(root, 'src', 'state', 'process-owner-capture.js');
+  const statePath = path.join(root, 'src', 'state.js');
+  const parse = text => ts.createSourceFile('inventory.js', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const strip = text => text.replace(/\s+/g, '');
+  function walk(node, visit) {
+    visit(node);
+    ts.forEachChild(node, child => walk(child, visit));
+  }
+  function declaredNames(ast) {
+    const names = [];
+    walk(ast, node => {
+      if (ts.isFunctionDeclaration(node) && node.name) names.push(node.name.text);
+      if (ts.isClassDeclaration(node) && node.name) names.push(node.name.text);
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) names.push(node.name.text);
+    });
+    return names;
+  }
+  function sourceFiles(dir) {
+    return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) return sourceFiles(entryPath);
+      return /\.(?:js|ts)$/.test(entry.name) ? [entryPath] : [];
+    });
+  }
+
+  const ownerSource = fs.readFileSync(ownerPath, 'utf8');
+  const ownerAst = parse(ownerSource);
+  assert.equal(ownerAst.statements.length, 3);
+  assert.equal(ownerAst.statements[0].getText(ownerAst), "'use strict';");
+  const ownerFunction = ownerAst.statements[1];
+  assert.ok(ts.isFunctionDeclaration(ownerFunction));
+  assert.equal(ownerFunction.name.getText(ownerAst), 'captureProcessOwnerIdentity');
+  assert.equal(ownerFunction.parameters.length, 1);
+  assert.equal(ownerFunction.parameters[0].getText(ownerAst), 'pid');
+  assert.equal(strip(ownerAst.statements[2].getText(ownerAst)), 'module.exports={captureProcessOwnerIdentity};');
+  assert.equal(declaredNames(ownerAst).filter(name => name === 'captureProcessOwnerIdentity').length, 1);
+
+  const declaringFiles = sourceFiles(path.join(root, 'src'))
+    .filter(filePath => declaredNames(parse(fs.readFileSync(filePath, 'utf8'))).includes('captureProcessOwnerIdentity'))
+    .map(filePath => path.relative(root, filePath));
+  assert.deepEqual(declaringFiles, [path.relative(root, ownerPath)]);
+
+  const stateAst = parse(fs.readFileSync(statePath, 'utf8'));
+  const imports = stateAst.statements.filter(statement => ts.isVariableStatement(statement)
+    && strip(statement.getText(stateAst)) === "const{captureProcessOwnerIdentity}=require('./state/process-owner-capture');");
+  assert.equal(imports.length, 1);
+  const facade = [];
+  walk(stateAst, node => {
+    if (ts.isMethodDeclaration(node) && node.name.getText(stateAst) === 'directPostOwnerIdentity') facade.push(node);
+  });
+  assert.equal(facade.length, 1);
+  assert.equal(strip(facade[0].body.getText(stateAst)), '{returncaptureProcessOwnerIdentity.apply(this,arguments);}');
+
+  const Module = require('node:module');
+  const resolvedState = require.resolve('../src/state');
+  const resolvedOwner = require.resolve('../src/state/process-owner-capture');
+  const originalLoad = Module._load;
+  const originalCache = [resolvedState, resolvedOwner].map(file => [file, require.cache[file]]);
+  const sentinelResult = { ownerPid: 4242, ownerStartTime: 'sentinel', ownerCommand: 'node' };
+  const identity = { ownerStartTime: 'sentinel', ownerCommand: 'node' };
+  let received = null;
+  Module._load = function (request, parent) {
+    if (request === './state/process-owner-capture' && parent && parent.filename === resolvedState) {
+      return {
+        captureProcessOwnerIdentity: function () {
+          received = { receiver: this, args: Array.from(arguments) };
+          return sentinelResult;
+        }
+      };
+    }
+    return originalLoad.apply(this, arguments);
+  };
+  try {
+    delete require.cache[resolvedState];
+    delete require.cache[resolvedOwner];
+    const { SurfaceState: DelegatingState } = require('../src/state');
+    const instance = Object.create(DelegatingState.prototype);
+    const result = DelegatingState.prototype.directPostOwnerIdentity.call(instance, identity, 'extra');
+    assert.equal(received.receiver, instance);
+    assert.equal(received.args.length, 2);
+    assert.equal(received.args[0], identity);
+    assert.equal(received.args[1], 'extra');
+    assert.equal(result, sentinelResult);
+
+    const boom = new Error('sentinel capture failed');
+    Module._load = function (request, parent) {
+      if (request === './state/process-owner-capture' && parent && parent.filename === resolvedState) {
+        return { captureProcessOwnerIdentity: () => { throw boom; } };
+      }
+      return originalLoad.apply(this, arguments);
+    };
+    delete require.cache[resolvedState];
+    const { SurfaceState: ThrowingState } = require('../src/state');
+    assert.throws(
+      () => ThrowingState.prototype.directPostOwnerIdentity.call(Object.create(ThrowingState.prototype), identity, 'extra'),
+      error => error === boom
+    );
+  } finally {
+    Module._load = originalLoad;
+    for (const [file, entry] of originalCache) {
+      if (entry === undefined) delete require.cache[file];
+      else require.cache[file] = entry;
+    }
+  }
+  assert.equal(Module._load, originalLoad);
+  for (const [file, entry] of originalCache) assert.equal(require.cache[file], entry);
+});
