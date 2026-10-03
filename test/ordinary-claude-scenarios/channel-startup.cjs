@@ -4,7 +4,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { attachOrdinaryListener, detachOrdinaryListener, servedOrdinaryBinding } = require('../../src/cli');
 const { READINESS, SurfaceState } = require('../../src/state');
-const { CLAUDE, CLI_PATH, fixture, sleep } = require('./fixture.cjs');
+const { CLAUDE, CLI_PATH, fixture } = require('./fixture.cjs');
 const { expectWithin, readinessReceipts, spawnChannel, spawnGateway } = require('./channel-fixture.cjs');
 
 test('ordinary Claude channel startup reopens an endpoint-unavailable watermark, wakes the Gateway, and revokes readiness on stop', async t => {
@@ -89,7 +89,8 @@ test('Claude channel leaves a conductor binding untouched on start and stop', as
   const before = readinessReceipts(observed, conductor.channelId).length;
   const listener = spawnChannel(t, f);
   await expectWithin(() => fs.existsSync(f.socketPath), 'Claude channel socket');
-  await sleep(50);
+  await expectWithin(() => listener.stderr().includes('could not wake Gateway (gateway-not-running)'),
+    'Claude conductor channel startup requesting a Gateway wake');
   assert.equal(observed.getBinding(conductor.channelId).readiness, READINESS.READY);
   assert.equal(listener.stderr().includes('could not wake Gateway (gateway-not-running)'), true);
   assert.deepEqual(observed.getIntakeWatermark(conductor.channelId), initialWatermark);
