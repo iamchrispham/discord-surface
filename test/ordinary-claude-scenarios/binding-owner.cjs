@@ -2,7 +2,11 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const test = require('node:test');
 const { CLAUDE, fixture } = require('./fixture.cjs');
-const { createOrdinaryClaudeBindingHandlers } = require('../../src/state/ordinary-binding-claude.js');
+const {
+  CLAUDE_HARNESSES,
+  CLAUDE_PROVIDERS,
+  createOrdinaryClaudeBindingHandlers
+} = require('../../src/state/ordinary-binding-claude.js');
 
 test('ordinary Claude binding owner rejects invalid proofs and preserves state on refusal', t => {
   const f = fixture(t, { preflight: false });
@@ -16,11 +20,11 @@ test('ordinary Claude binding owner rejects invalid proofs and preserves state o
   assert.equal(state.hasOrdinaryPreflight(binding), false);
 
   assert.throws(() => state.recordOrdinaryPreflight(binding, {
-    ...proof, endpoint: path.join(dir, 'other.sock'), harness: 'claude-code'
+    ...proof, endpoint: path.join(dir, 'other.sock'), harness: CLAUDE_HARNESSES.CODE
   }), mismatch);
   assert.equal(state.hasOrdinaryPreflight(binding), false);
 
-  const recorded = state.recordOrdinaryPreflight(binding, { ...proof, harness: 'claude-code' });
+  const recorded = state.recordOrdinaryPreflight(binding, { ...proof, harness: CLAUDE_HARNESSES.CODE });
   assert.ok(recorded);
   assert.equal(state.hasOrdinaryPreflight(binding), true);
 
@@ -33,7 +37,7 @@ test('ordinary Claude binding owner rejects invalid proofs and preserves state o
     state._isOrdinaryBindingRecord = classifyRecord;
     state._isOrdinaryBinding = () => false;
     assert.equal(state.hasOrdinaryPreflight(binding), false);
-    assert.throws(() => state.recordOrdinaryPreflight(binding, { ...proof, harness: 'claude-code' }), /not an ordinary/);
+    assert.throws(() => state.recordOrdinaryPreflight(binding, { ...proof, harness: CLAUDE_HARNESSES.CODE }), /not an ordinary/);
     assert.equal(state.listReceipts().length, beforeOverride);
   } finally {
     state._isOrdinaryBindingRecord = classifyRecord;
@@ -44,13 +48,13 @@ test('ordinary Claude binding owner rejects invalid proofs and preserves state o
   assert.equal(state._isOrdinaryBinding({ ...binding, provider: 'unknown-provider' }), false);
   assert.equal(state._recordOrdinaryPreflight(
     { ...binding, provider: 'unknown-provider', generation: binding.generation + 1 },
-    { ...proof, harness: 'claude-code' }
+    { ...proof, harness: CLAUDE_HARNESSES.CODE }
   ), null);
 
   assert.throws(() => state._bindOrdinaryClaude({
-    channelId: 'conductor-claude', guildId: 'guild', provider: 'claude', nativeId: CLAUDE,
+    channelId: 'conductor-claude', guildId: 'guild', provider: CLAUDE_PROVIDERS.CLAUDE, nativeId: CLAUDE,
     workspace: dir, endpoint: socketPath, conductorId: 'conductor', repoKey: 'repo'
-  }, { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }, '100'), /ordinary bindings cannot carry conductor identity/);
+  }, { sessionId: CLAUDE, threadId: CLAUDE, harness: CLAUDE_HARNESSES.CODE }, '100'), /ordinary bindings cannot carry conductor identity/);
   assert.equal(state.getBinding('conductor-claude'), null);
 
   state.unbind(binding.channelId);
@@ -59,7 +63,7 @@ test('ordinary Claude binding owner rejects invalid proofs and preserves state o
   try {
     state._isOrdinaryBindingRecord = () => false;
     assert.throws(() => state.rebindOrdinaryClaude(binding,
-      { sessionId: CLAUDE, threadId: CLAUDE, harness: 'claude-code' }, '100'), /tombstone is unavailable/);
+      { sessionId: CLAUDE, threadId: CLAUDE, harness: CLAUDE_HARNESSES.CODE }, '100'), /tombstone is unavailable/);
     assert.deepEqual(state.getBinding(binding.channelId), tombstone);
     assert.equal(state.listReceipts().length, receiptsBeforeRebind);
   } finally { state._isOrdinaryBindingRecord = classifyRecord; }
@@ -69,7 +73,7 @@ test('ordinary Claude handler rejects a Codex record before writing preflight re
   class BindingError extends Error {}
   const handlers = createOrdinaryClaudeBindingHandlers({
     BindingError,
-    PROVIDERS: { CLAUDE: 'claude' },
+    PROVIDERS: { CLAUDE: CLAUDE_PROVIDERS.CLAUDE },
     READINESS: { PENDING: 'pending' },
     assertOrdinaryIdentity() {},
     assertOrdinaryNativeIdentity() {},
@@ -89,7 +93,7 @@ test('ordinary Claude handler rejects a Codex record before writing preflight re
 
   assert.throws(() => handlers.recordOrdinaryPreflight(state, binding, {
     file: '/tmp/session.jsonl', sessionId: CLAUDE, threadId: CLAUDE,
-    workspace: binding.workspace, harness: 'claude-code', endpoint: binding.endpoint
+    workspace: binding.workspace, harness: CLAUDE_HARNESSES.CODE, endpoint: binding.endpoint
   }), /ordinary codex binding/);
   assert.equal(receipts.length, 0);
 });

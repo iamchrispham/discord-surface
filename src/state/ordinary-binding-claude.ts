@@ -1,5 +1,7 @@
 import * as path from 'node:path';
+import { PROVIDERS as AGENT_PROVIDERS } from '../agent-message';
 import { ORDINARY_RECEIPT_KINDS } from '../ordinary/constants';
+import { WATCHER_NOTICE_HARNESSES, WATCHER_NOTICE_PROVIDERS } from '../watcher-notice';
 import { hasOrdinaryBindingReceipt, hasOrdinaryPreflightReceipt } from './ordinary-binding';
 import type {
   OrdinaryBindingDependencies,
@@ -12,9 +14,11 @@ import type {
   OrdinaryRebindHandlerOptions
 } from './ordinary-binding/contracts';
 
-export const CLAUDE_PROVIDERS = { CLAUDE: 'claude' } as const;
+export const CLAUDE_PROVIDERS = Object.freeze({ CLAUDE: AGENT_PROVIDERS.CLAUDE } as const);
 export type ClaudeProvider = typeof CLAUDE_PROVIDERS[keyof typeof CLAUDE_PROVIDERS];
-export const CLAUDE_HARNESSES = { CODE: 'claude-code' } as const;
+export const CLAUDE_HARNESSES = Object.freeze({
+  CODE: WATCHER_NOTICE_HARNESSES[WATCHER_NOTICE_PROVIDERS.CLAUDE]
+} as const);
 export type ClaudeHarness = typeof CLAUDE_HARNESSES[keyof typeof CLAUDE_HARNESSES];
 
 export type ClaudeOrdinaryBindingIdentity = OrdinaryBindingIdentity & { harness: ClaudeHarness };
