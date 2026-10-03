@@ -92,7 +92,7 @@ function createPeerMcp(service) {
   return server;
 }
 
-async function startPeerMcp(args) {
+async function startPeerMcp(args, { callerDependencies } = {}) {
   if (!['codex', 'claude'].includes(args.provider)) throw new Error('mcp requires --provider codex or claude');
   const { state, paths } = require('../cli').openState(args);
   const stop = new AbortController();
@@ -112,7 +112,7 @@ async function startPeerMcp(args) {
   try {
     const config = state.requireConfig();
     const token = readSecret(config.secretFile);
-    const service = createPeerService({ state, provider: args.provider, token, stateDir: paths.stateDir,
+    const service = createPeerService({ state, provider: args.provider, token, stateDir: paths.stateDir, callerDependencies,
       loadChannels: async signal => {
         const response = await fetch(`https://discord.com/api/v10/guilds/${config.guildId}/channels`, {
           headers: { Authorization: `Bot ${token}` }, signal: AbortSignal.any([signal, stop.signal, AbortSignal.timeout(30000)].filter(Boolean))
