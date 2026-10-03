@@ -279,6 +279,7 @@ test('required packet field checks use one data-property owner', () => {
 });
 
 const PLANNER_OWNER = 'src/peer/town-hall-plan.ts';
+const CHILD_OWNER = 'src/town-hall-child.ts';
 
 // A BinaryExpression that combines provider and nativeId reads reached from the
 // `source`/`target` locals is the inline self comparator the shared owner
@@ -395,8 +396,10 @@ function assertDelegatedSelfRefusal(sourceFile, functionName, options = {}) {
 test('self-refusal is delegated to one shared sameAgentSession owner in current consumers', () => {
   const agentSource = parseSource(AGENT_OWNER);
   const plannerSource = parseSource(PLANNER_OWNER);
+  const childSource = parseSource(CHILD_OWNER);
 
-  // (a) Both current consumers route their self refusal through the owner.
+  // (a) All current consumers route their self refusal through the owner.
+  assertDelegatedSelfRefusal(childSource, 'snapshotPacket');
   assertDelegatedSelfRefusal(agentSource, 'validateAgentMessage');
   assertDelegatedSelfRefusal(plannerSource, 'planTownHallBroadcast',
     { forbiddenIdentifiers: ['sourceIdentity'] });
@@ -501,6 +504,16 @@ export function validateAgentMessage(packet: unknown): void {
     recipients: [{ guildId: '100', channelId: '300', provider: 'codex', nativeId: lowB, generation: 1 }],
     text: 'hello'
   };
+  const childCodec = require('../dist/town-hall-child');
+  const childPacket = {
+    id: `townhall_${'a'.repeat(64)}`, kind: 'request',
+    source: { ...nonSelfInput.source }, target: { ...nonSelfInput.recipients[0] },
+    replyTo: null, routingVersion: 2, text: 'hello', purpose: 'town-hall-child/v1',
+    broadcastId: 'b1', journalKey: 'b'.repeat(64), planFingerprint: 'c'.repeat(64),
+    room: { ...nonSelfInput.townHall }, roomMessageId: '400'
+  };
+  const token = 'disposable-owner-pin';
+  const childWire = childCodec.encodeTownHallChild(childPacket, token);
   const original = agentModule.sameAgentSession;
   try {
     agentModule.sameAgentSession = () => true;
@@ -508,6 +521,15 @@ export function validateAgentMessage(packet: unknown): void {
       assert.equal(error.message, 'invalid town-hall broadcast plan');
       return true;
     }, 'planner reads the owner through the module exports and refuses on a forced true');
+
+    for (const act of [
+      () => childCodec.validateTownHallChild(childPacket),
+      () => childCodec.encodeTownHallChild(childPacket, token),
+      () => childCodec.decodeTownHallChild(childWire, token, childPacket.target)
+    ]) {
+      assert.throws(act, /invalid town-hall child packet/,
+        'child entrypoints refuse when the shared session comparator is forced true');
+    }
 
     const nonSelfPacket = {
       id: 'm1',
@@ -543,4 +565,5 @@ export function validateAgentMessage(packet: unknown): void {
 
   // (d) After restore the planner accepts the same non-self input again.
   assert.equal(planTownHallBroadcast(nonSelfInput).recipients.length, 1);
+  assert.deepEqual(childCodec.decodeTownHallChild(childWire, token, childPacket.target), childPacket);
 });

@@ -2,6 +2,7 @@ import * as crypto from 'node:crypto';
 import {
   ownDataProperty,
   sameAddress,
+  sameAgentSession,
   validAddress,
   type AgentProvider
 } from './agent-message';
@@ -172,8 +173,7 @@ function snapshotPacket(packet: unknown): TownHallChildPacket {
 
   if (source.guildId !== target.guildId || source.guildId !== room.guildId) throw invalid();
   if (room.channelId === source.channelId || room.channelId === target.channelId) throw invalid();
-  if (source.provider === target.provider &&
-      source.nativeId.toLowerCase() === target.nativeId.toLowerCase()) throw invalid();
+  if (sameAgentSession(source, target)) throw invalid();
 
   return {
     id: values.id,
