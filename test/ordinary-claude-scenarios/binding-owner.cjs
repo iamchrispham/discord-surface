@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs');
 const test = require('node:test');
 const { CLAUDE, fixture } = require('./fixture.cjs');
 const {
@@ -96,4 +97,36 @@ test('ordinary Claude handler rejects a Codex record before writing preflight re
     workspace: binding.workspace, harness: CLAUDE_HARNESSES.CODE, endpoint: binding.endpoint
   }), /ordinary codex binding/);
   assert.equal(receipts.length, 0);
+});
+
+
+test('Claude factory classifiers refuse a verified ordinary Codex binding without custody writes', t => {
+  const f = fixture(t, { bind: false });
+  const binding = f.state.bindOrdinary({
+    channelId: 'codex-channel', guildId: 'guild', provider: 'codex', nativeId: CLAUDE, workspace: f.dir
+  }, { sessionId: CLAUDE, threadId: CLAUDE }, '100');
+  const file = path.join(f.dir, 'codex-session.jsonl');
+  fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: CLAUDE, cwd: f.dir } }) + '\n');
+  f.state.recordOrdinaryPreflight(binding, { file, sessionId: CLAUDE, threadId: CLAUDE, workspace: f.dir });
+  assert.equal(f.state.isOrdinaryBinding(binding), true);
+  assert.equal(f.state.hasOrdinaryPreflight(binding), true);
+  class BindingError extends Error {}
+  const handlers = createOrdinaryClaudeBindingHandlers({
+    BindingError,
+    PROVIDERS: { CLAUDE: CLAUDE_PROVIDERS.CLAUDE },
+    READINESS: { PENDING: 'pending' },
+    assertOrdinaryIdentity() {},
+    assertOrdinaryNativeIdentity() {},
+    bindingMatchesExpected(current, expected) { return current?.channelId === expected?.channelId; }
+  });
+  const receipts = f.state.listReceipts();
+  assert.equal(handlers.isOrdinaryBindingRecord(f.state, binding), false);
+  assert.equal(handlers.isOrdinaryBinding(f.state, binding), false);
+  assert.equal(handlers.hasOrdinaryPreflight(f.state, binding), false);
+  assert.throws(() => handlers.recordOrdinaryPreflight(f.state, binding, {
+    file, sessionId: CLAUDE, threadId: CLAUDE, workspace: f.dir, harness: CLAUDE_HARNESSES.CODE,
+    endpoint: f.socketPath
+  }), /ordinary codex binding/);
+  assert.deepEqual(f.state.listReceipts(), receipts);
+  assert.deepEqual(f.state.getBinding(binding.channelId), binding);
 });

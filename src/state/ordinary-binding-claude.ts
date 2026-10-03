@@ -137,12 +137,12 @@ export function createOrdinaryClaudeBindingHandlers(
     },
 
     isOrdinaryBinding(state, binding): binding is OrdinaryBindingRecord {
-      if (!binding?.active) return false;
+      if (binding?.provider !== PROVIDERS.CLAUDE || !binding.active) return false;
       return state._isOrdinaryBindingRecord(binding);
     },
 
     hasOrdinaryPreflight(state, binding) {
-      if (!state._isOrdinaryBinding(binding)) return false;
+      if (binding?.provider !== PROVIDERS.CLAUDE || !state._isOrdinaryBinding(binding)) return false;
       return hasOrdinaryPreflightReceipt(state, binding);
     },
 
