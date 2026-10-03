@@ -86,6 +86,7 @@ export function validateAgentMessage(packet: unknown): asserts packet is AgentMe
   const required = ['id', 'kind', 'source', 'target', 'replyTo', 'text'];
   if (!required.every(key => Object.hasOwn(value, key)) ||
       keys.some(key => ![...required, 'routingVersion', 'sourceParentChannelId'].includes(key)) ||
+      ['routingVersion', 'sourceParentChannelId'].some(key => key in value && !ownDataProperty(value, key)) ||
       (Object.hasOwn(value, 'routingVersion') && value.routingVersion !== 2)) {
     throw new Error('invalid agent message');
   }

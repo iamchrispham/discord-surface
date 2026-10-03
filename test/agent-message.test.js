@@ -70,6 +70,28 @@ test('packet grammar prevents self-targeting, uncorrelated results and oversized
   assert.throws(() => encodeAgentMessage(changingGetterPacket, token), /invalid agent message/);
   assert.equal(changingGetterCalls, 0);
 
+  for (const field of ['sourceParentChannelId', 'routingVersion']) {
+    for (const inherited of [false, true]) {
+      for (const throws of [false, true]) {
+        let getterCalls = 0;
+        const accessorPacket = { ...routed, sourceParentChannelId: '999' };
+        delete accessorPacket[field];
+        const holder = inherited ? {} : accessorPacket;
+        Object.defineProperty(holder, field, {
+          enumerable: true,
+          get() {
+            getterCalls += 1;
+            if (throws) throw new Error('unexpected routing accessor');
+            return field === 'routingVersion' ? 2 : (getterCalls === 1 ? '999' : '998');
+          }
+        });
+        if (inherited) Object.setPrototypeOf(accessorPacket, holder);
+        assert.throws(() => encodeAgentMessage(accessorPacket, token), /invalid agent message/);
+        assert.equal(getterCalls, 0);
+      }
+    }
+  }
+
   const dataParentPacket = { ...routed, sourceParentChannelId: '999' };
   assert.deepEqual(decodeAgentMessage(encodeAgentMessage(dataParentPacket, token), token, target), dataParentPacket);
   const absentParentPacket = { ...routed };
