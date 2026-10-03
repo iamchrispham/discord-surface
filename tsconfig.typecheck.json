@@ -122,6 +122,8 @@
     "src/state/agent-routing.ts",
     "src/peer/resolution.ts",
     "src/peer/town-hall-plan.ts",
+    "src/peer/town-hall-room-parts.ts",
+    "test/types/town-hall-room-parts-types.ts",
     "test/types/peer-resolution-types.ts",
     "src/discord/reconciliation-lookups.ts",
     "test/discord/recovery-fetch-consumer-types.ts",
