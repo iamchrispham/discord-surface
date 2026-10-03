@@ -1,5 +1,5 @@
 import { DIRECT_POST_OUTCOMES, DIRECT_POST_PART_STATUSES, TOWN_HALL_PUBLICATION_EVENTS, TOWN_HALL_PUBLICATION_RECEIPTS } from './types';
-import type { TownHallPublication, TownHallPublicationOwner, TownHallPublicationStatus } from './types';
+import type { TownHallPublication, TownHallPublicationOwner, TownHallPublicationSet, TownHallPublicationStatus } from './types';
 import { TOWN_HALL_JOURNAL_STATES } from '../town-hall-journal/types';
 
 export interface PublicationEvent {
@@ -36,8 +36,14 @@ const RETRYABLE_OUTCOMES = new Set<string>([
   DIRECT_POST_OUTCOMES.STALE
 ]);
 
-export function publicationKeyFor(journalKey: string): string {
-  return TOWN_HALL_PUBLICATION_RECEIPTS.INSTRUCTION_PREFIX + journalKey;
+export function publicationKeyFor(journalKey: string, partId?: string): string {
+  if (partId === undefined) return TOWN_HALL_PUBLICATION_RECEIPTS.INSTRUCTION_PREFIX + journalKey;
+  return TOWN_HALL_PUBLICATION_RECEIPTS.INSTRUCTION_PART_PREFIX + journalKey + ':' + partId;
+}
+
+export function receiptKindFor(journalKey: string, partId?: string): string {
+  if (partId === undefined) return TOWN_HALL_PUBLICATION_RECEIPTS.PUBLICATION_PREFIX + journalKey;
+  return TOWN_HALL_PUBLICATION_RECEIPTS.PUBLICATION_PART_PREFIX + journalKey + ':' + partId;
 }
 
 function sameOwner(left: TownHallPublicationOwner, right: TownHallPublicationOwner): boolean {
@@ -123,7 +129,8 @@ export function deriveProjection(groups: readonly AttemptGroup[], nonce: string)
 export function freezePublication(
   journalKey: string,
   fingerprint: string,
-  projection: PublicationProjection
+  projection: PublicationProjection,
+  publicationKey: string = publicationKeyFor(journalKey)
 ): TownHallPublication {
   const owner = projection.owner === null
     ? null
@@ -134,7 +141,7 @@ export function freezePublication(
       });
   return Object.freeze({
     journalKey,
-    publicationKey: publicationKeyFor(journalKey),
+    publicationKey,
     fingerprint,
     status: projection.status,
     attemptId: projection.attemptId,
@@ -142,4 +149,55 @@ export function freezePublication(
     owner,
     messageId: projection.messageId
   });
+}
+
+export interface PlannedPublicationPart {
+  readonly index: number;
+  readonly total: number;
+  readonly partId: string;
+  readonly content: string;
+  readonly publication: TownHallPublication;
+}
+
+// Pure assembly of the read-only set projection. The complete flag requires an
+// actual sent message ID with distinct IDs across every expected part.
+export function freezePublicationSet(
+  journalKey: string,
+  fingerprint: string,
+  parts: readonly PlannedPublicationPart[]
+): TownHallPublicationSet {
+  const frozenParts = parts.map(part => Object.freeze({
+    index: part.index,
+    total: part.total,
+    partId: part.partId,
+    content: part.content,
+    publication: part.publication
+  }));
+  const complete = parts.length > 0 && parts.every(part =>
+    part.publication.status === DIRECT_POST_OUTCOMES.SENT &&
+    typeof part.publication.messageId === 'string' &&
+    part.publication.messageId.length > 0
+  );
+  const messageIds = new Set(parts.map(part => part.publication.messageId));
+  const distinct = messageIds.size === parts.length;
+  const finished = complete && distinct;
+  Object.freeze(frozenParts);
+  return Object.freeze({
+    journalKey,
+    fingerprint,
+    complete: finished,
+    anchorMessageId: finished ? frozenParts[0].publication.messageId : null,
+    parts: frozenParts
+  });
+}
+
+export function duplicateMessageId(parts: readonly PlannedPublicationPart[]): boolean {
+  const seen = new Set<string>();
+  for (const part of parts) {
+    const messageId = part.publication.messageId;
+    if (typeof messageId !== 'string' || messageId.length === 0) continue;
+    if (seen.has(messageId)) return true;
+    seen.add(messageId);
+  }
+  return false;
 }

@@ -11,20 +11,25 @@ import {
   type TownHallPublicationConfirmationEvidence,
   type TownHallPublicationEvent,
   type TownHallPublicationOwner,
-  type TownHallPublicationStateStore
+  type TownHallPublicationStateStore,
+  type TownHallPublicationSet
 } from './types';
 import {
   deriveProjection,
+  duplicateMessageId,
   freezePublication,
+  freezePublicationSet,
   groupEvents,
-  publicationKeyFor,
   type AttemptGroup,
+  type PlannedPublicationPart,
   type PublicationProjection,
   type PublicationEvent
 } from './projection';
+import { readContext, readPartContext, readPartPlan } from './context';
+import type { PublicationContext } from './context';
 
 const INVALID_KEY_MESSAGE = 'invalid town-hall journal key';
-const MISSING_JOURNAL_MESSAGE = 'town-hall publication requires an existing journal';
+const INVALID_PART_MESSAGE = 'invalid town-hall publication part';
 const OWNER_UNAVAILABLE_MESSAGE = 'town-hall publication owner identity is unavailable';
 const MARK_REFUSED_MESSAGE = 'town-hall publication attempt is not claimed';
 const RECORD_REFUSED_MESSAGE = 'town-hall publication attempt is not in flight';
@@ -52,16 +57,6 @@ interface ReceiptRow {
   kind: string;
   detail: string;
   discord_id: null;
-}
-
-interface PublicationContext {
-  journalKey: string;
-  publicationKey: string;
-  receiptKind: string;
-  nonce: string;
-  fingerprint: string;
-  guildId: string;
-  channelId: string;
 }
 
 interface DecodedEvent {
@@ -228,9 +223,11 @@ function toPublicationEvents(events: readonly DecodedEvent[]): PublicationEvent[
 function decodePublication(
   deps: TownHallPublicationDependencies,
   state: TownHallPublicationStateStore,
-  context: PublicationContext
+  context: PublicationContext,
+  preReadRows?: ReceiptRow[]
 ): DecodedPublication {
-  const events = readRows(deps, state, context.receiptKind).map(row => canonicalEvent(deps, context, row.detail));
+  const rows = preReadRows ?? readRows(deps, state, context.receiptKind);
+  const events = rows.map(row => canonicalEvent(deps, context, row.detail));
   let groups: AttemptGroup[];
   try {
     groups = groupEvents(toPublicationEvents(events));
@@ -241,27 +238,17 @@ function decodePublication(
 }
 
 function publicationOf(context: PublicationContext, projection: PublicationProjection): TownHallPublication {
-  return freezePublication(context.journalKey, context.fingerprint, projection);
+  return freezePublication(context.journalKey, context.fingerprint, projection, context.publicationKey);
 }
 
-function readContext(
+function contextForPart(
   deps: TownHallPublicationDependencies,
   state: TownHallPublicationStateStore,
-  journalKey: string
+  journalKey: string,
+  partId: unknown
 ): PublicationContext {
-  // getTownHallBroadcast opens its own BEGIN IMMEDIATE, so it must run outside any transaction.
-  const journal = state.getTownHallBroadcast(journalKey);
-  if (journal === null) throw new deps.BindingError(MISSING_JOURNAL_MESSAGE);
-  const publicationKey = publicationKeyFor(journalKey);
-  return {
-    journalKey,
-    publicationKey,
-    receiptKind: TOWN_HALL_PUBLICATION_RECEIPTS.PUBLICATION_PREFIX + journalKey,
-    nonce: deps.discordNonce(publicationKey),
-    fingerprint: journal.plan.fingerprint,
-    guildId: journal.plan.townHall.guildId,
-    channelId: journal.plan.townHall.channelId
-  };
+  if (typeof partId !== 'string') throw new deps.BindingError(INVALID_PART_MESSAGE);
+  return readPartContext(deps, state, journalKey, partId);
 }
 
 function ownerIdentity(
@@ -311,20 +298,22 @@ function messageIdFor(outcome: DirectPostOutcome, detail: Record<string, unknown
 export function getTownHallPublication(
   deps: TownHallPublicationDependencies,
   state: TownHallPublicationStateStore,
-  journalKey: string
+  journalKey: string,
+  partId?: string
 ): TownHallPublication {
   const key = assertJournalKey(deps, journalKey);
-  const context = readContext(deps, state, key);
+  const context = partId === undefined ? readContext(deps, state, key) : contextForPart(deps, state, key, partId);
   return publicationOf(context, decodePublication(deps, state, context).projection);
 }
 
 export function reserveTownHallPublication(
   deps: TownHallPublicationDependencies,
   state: TownHallPublicationStateStore,
-  journalKey: string
+  journalKey: string,
+  partId?: string
 ): { claimed: boolean; publication: TownHallPublication } {
   const key = assertJournalKey(deps, journalKey);
-  const context = readContext(deps, state, key);
+  const context = partId === undefined ? readContext(deps, state, key) : contextForPart(deps, state, key, partId);
   return state.transaction(() => {
     const decoded = decodePublication(deps, state, context);
     if (BLOCKED_RESERVE_STATUSES.has(decoded.projection.status)) {
@@ -342,10 +331,11 @@ export function markTownHallPublicationInFlight(
   deps: TownHallPublicationDependencies,
   state: TownHallPublicationStateStore,
   journalKey: string,
-  attemptId: string
+  attemptId: string,
+  partId?: string
 ): { started: boolean; publication: TownHallPublication } {
   const key = assertJournalKey(deps, journalKey);
-  const context = readContext(deps, state, key);
+  const context = partId === undefined ? readContext(deps, state, key) : contextForPart(deps, state, key, partId);
   return state.transaction(() => {
     const decoded = decodePublication(deps, state, context);
     const projection = decoded.projection;
@@ -373,10 +363,11 @@ export function recordTownHallPublicationOutcome(
   journalKey: string,
   attemptId: string,
   outcome: DirectPostOutcome,
-  detail?: Record<string, unknown>
+  detail?: Record<string, unknown>,
+  partId?: string
 ): TownHallPublication {
   const key = assertJournalKey(deps, journalKey);
-  const context = readContext(deps, state, key);
+  const context = partId === undefined ? readContext(deps, state, key) : contextForPart(deps, state, key, partId);
   return state.transaction(() => {
     const decoded = decodePublication(deps, state, context);
     const projection = decoded.projection;
@@ -424,10 +415,11 @@ export function confirmTownHallPublication(
   state: TownHallPublicationStateStore,
   journalKey: string,
   attemptId: string,
-  evidence: TownHallPublicationConfirmationEvidence
+  evidence: TownHallPublicationConfirmationEvidence,
+  partId?: string
 ): TownHallPublication {
   const key = assertJournalKey(deps, journalKey);
-  const context = readContext(deps, state, key);
+  const context = partId === undefined ? readContext(deps, state, key) : contextForPart(deps, state, key, partId);
   return state.transaction(() => {
     const decoded = decodePublication(deps, state, context);
     const projection = decoded.projection;
@@ -490,10 +482,11 @@ function classifyLiveness(
 export function recoverTownHallPublication(
   deps: TownHallPublicationDependencies,
   state: TownHallPublicationStateStore,
-  journalKey: string
+  journalKey: string,
+  partId?: string
 ): TownHallPublication {
   const key = assertJournalKey(deps, journalKey);
-  const context = readContext(deps, state, key);
+  const context = partId === undefined ? readContext(deps, state, key) : contextForPart(deps, state, key, partId);
   const first = decodePublication(deps, state, context);
   if (first.projection.status !== DIRECT_POST_PART_STATUSES.CLAIMED &&
       first.projection.status !== DIRECT_POST_PART_STATUSES.IN_FLIGHT) {
@@ -524,6 +517,60 @@ export function recoverTownHallPublication(
     const updated = decodePublication(deps, state, context);
     return publicationOf(context, updated.projection);
   });
+}
+
+// Prefix-scoped receipt read for the set reader. Escapes LIKE metacharacters and
+// re-checks with startsWith so '_' and '%' can never act as wildcards.
+function readRowsByPrefix(
+  deps: TownHallPublicationDependencies,
+  state: TownHallPublicationStateStore,
+  prefix: string
+): ReceiptRow[] {
+  const escaped = prefix.replace(/[\\%_]/g, character => `\\${character}`);
+  const pattern = `${escaped}%`;
+  return state.db.prepare(
+    "SELECT id, kind, detail, discord_id FROM receipts WHERE kind LIKE ? ESCAPE '\\' ORDER BY id"
+  ).all(pattern).map((row: SqlRow) => {
+    if (row.discord_id !== null) return reject(deps);
+    return { id: Number(row.id), kind: String(row.kind), detail: String(row.detail), discord_id: null };
+  }).filter(row => row.kind.startsWith(prefix));
+}
+
+export function getTownHallPublicationSet(
+  deps: TownHallPublicationDependencies,
+  state: TownHallPublicationStateStore,
+  journalKey: string
+): TownHallPublicationSet {
+  const key = assertJournalKey(deps, journalKey);
+  // The journal read and the canonical part plan are built before the single
+  // snapshot transaction; no public transition method runs inside it.
+  const plan = readPartPlan(deps, state, key);
+  const fingerprint = plan[0].context.fingerprint;
+  const byReceiptKind = new Map(plan.map(entry => [entry.context.receiptKind, entry]));
+  const partPrefix = plan[0].context.receiptKind.slice(0, -plan[0].part.partId.length);
+  const parts = state.transaction(() => {
+    const rows = readRowsByPrefix(deps, state, partPrefix);
+    const grouped = new Map<string, ReceiptRow[]>();
+    for (const row of rows) {
+      if (!byReceiptKind.has(row.kind)) reject(deps);
+      const group = grouped.get(row.kind);
+      if (group) group.push(row);
+      else grouped.set(row.kind, [row]);
+    }
+    return plan.map(entry => {
+      const decoded = decodePublication(deps, state, entry.context, grouped.get(entry.context.receiptKind) ?? []);
+      const part: PlannedPublicationPart = {
+        index: entry.part.index,
+        total: entry.part.total,
+        partId: entry.part.partId,
+        content: entry.part.content,
+        publication: publicationOf(entry.context, decoded.projection)
+      };
+      return part;
+    });
+  });
+  if (duplicateMessageId(parts)) throw new deps.StateCorruptError(CORRUPT_MESSAGE);
+  return freezePublicationSet(key, fingerprint, parts);
 }
 
 export type { SqlRow };
