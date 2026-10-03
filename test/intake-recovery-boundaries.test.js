@@ -568,7 +568,8 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     if (count) sites.set(path.relative(sourceRoot, file).split(path.sep).join('/'), count);
   }
   assert.deepEqual(Object.fromEntries([...sites].sort(([left], [right]) => left.localeCompare(right))), {
-    'discord.js': 11,
+    'discord.js': 10,
+    'discord/inbound-recovery.js': 1,
     'discord/recovery-fetch.ts': 1,
     'discord/thread-enrollment.ts': 3
   }, 'new retryability consumers must join the class inventory before using this policy');
