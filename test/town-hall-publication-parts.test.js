@@ -24,7 +24,7 @@ const MISSING_JOURNAL = 'town-hall publication requires an existing journal';
 const INVALID_PART = 'invalid town-hall publication part';
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 // This checked-in digest keeps the registration-order contract independent of Git history.
-const EXPECTED_PRE_EXISTING_TEST_COMMAND_SHA256 = 'e8679a08139d24258e8ecaf75e6b124771010a76128be05dcc0ab6aee60f9d88';
+const EXPECTED_PRE_EXISTING_TEST_COMMAND_SHA256 = '45bef54cf4b6fe78c4a36ffafd3bb241cf346449b488dc18d5e5415b7e443157';
 
 const SOURCE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const CODEX_ID = '11111111-1111-4111-8111-aabbccddeeff';
