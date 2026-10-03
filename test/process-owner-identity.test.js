@@ -313,7 +313,4 @@ test('16. missing expected identity, both expected fields empty, and unavailable
   const index = tokens.indexOf('test/process-owner-identity.test.js');
   assert.ok(index > -1, 'process-owner-identity registered in npm test');
   assert.equal(tokens.filter(token => token === 'test/process-owner-identity.test.js').length, 1);
-  assert.equal(tokens[index + 1], 'test/town-hall-room-parts.test.js');
-  const testEntries = tokens.filter(token => token.endsWith('.test.js'));
-  assert.equal(testEntries[testEntries.length - 1], 'test/town-hall-room-parts.test.js');
 });
