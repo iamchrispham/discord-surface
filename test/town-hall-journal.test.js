@@ -477,6 +477,9 @@ test('missing duplicate or orphan recipient records refuse', t => {
   corruptDiscordId(corruptRecipient.state, recipient.kind, 'journal-metadata-recipient');
   assertCorrupt(() => corruptRecipient.state.getTownHallBroadcast(corruptRecipientCreated.broadcast.journalKey));
   assertCorrupt(() => corruptRecipient.state.listTownHallBroadcasts());
+  const recipientRowsBefore = corruptRecipient.state.listReceipts().map(row => row.id);
+  assertCorrupt(() => corruptRecipient.state.createTownHallBroadcast(input()));
+  assert.deepEqual(corruptRecipient.state.listReceipts().map(row => row.id), recipientRowsBefore);
 
   const orphan = fixture(t);
   const orphanKey = expectedJournalKey(planTownHallBroadcast(input()));
