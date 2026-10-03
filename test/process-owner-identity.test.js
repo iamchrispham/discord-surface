@@ -335,12 +335,25 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     visit(node);
     ts.forEachChild(node, child => walk(child, visit));
   }
+  function propertyNameText(name) {
+    if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
+    if (ts.isComputedPropertyName(name) && ts.isStringLiteral(name.expression)) return name.expression.text;
+    return undefined;
+  }
   function declaredNames(ast) {
     const names = [];
     walk(ast, node => {
       if (ts.isFunctionDeclaration(node) && node.name) names.push(node.name.text);
       if (ts.isClassDeclaration(node) && node.name) names.push(node.name.text);
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) names.push(node.name.text);
+      if ((ts.isMethodDeclaration(node)
+        || ts.isPropertyDeclaration(node)
+        || ts.isPropertyAssignment(node)
+        || ts.isGetAccessorDeclaration(node)
+        || ts.isSetAccessorDeclaration(node)) && node.name) {
+        const name = propertyNameText(node.name);
+        if (name) names.push(name);
+      }
     });
     return names;
   }
@@ -363,6 +376,24 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   assert.equal(ownerFunction.parameters[0].getText(ownerAst), 'pid');
   assert.equal(strip(ownerAst.statements[2].getText(ownerAst)), 'module.exports={captureProcessOwnerIdentity};');
   assert.equal(declaredNames(ownerAst).filter(name => name === 'captureProcessOwnerIdentity').length, 1);
+
+  const methodControls = [
+    ['class method', 'class Example { captureProcessOwnerIdentity() {} }', true],
+    ['class string method', "class Example { 'captureProcessOwnerIdentity'() {} }", true],
+    ['class static computed method', "class Example { static ['captureProcessOwnerIdentity']() {} }", true],
+    ['class property', 'class Example { captureProcessOwnerIdentity = null; }', true],
+    ['class static string property', "class Example { static 'captureProcessOwnerIdentity' = null; }", true],
+    ['class getter', 'class Example { get captureProcessOwnerIdentity() { return null; } }', true],
+    ['object method', '({ captureProcessOwnerIdentity() {} });', true],
+    ['object property', '({ captureProcessOwnerIdentity: null });', true],
+    ['object string property', "({ 'captureProcessOwnerIdentity': null });", true],
+    ['object computed property', "({ ['captureProcessOwnerIdentity']: null });", true],
+    ['dynamic computed method', 'class Example { static [owner]() {} }', false],
+    ['dynamic computed property', '({ [owner]: null });', false],
+  ];
+  for (const [label, source, expected] of methodControls) {
+    assert.equal(declaredNames(parse(source)).includes('captureProcessOwnerIdentity'), expected, label);
+  }
 
   const declaringFiles = sourceFiles(path.join(root, 'src'))
     .filter(filePath => declaredNames(parse(fs.readFileSync(filePath, 'utf8'))).includes('captureProcessOwnerIdentity'))
