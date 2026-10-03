@@ -435,6 +435,32 @@ test('source broadcast ID and target generation changes alter child IDs', () => 
   assert.notEqual(otherGeneration.recipients[0].packetId, basePlan.recipients[0].packetId);
 });
 
+test('planner refuses a self recipient across native UUID case and allows a different provider', () => {
+  const base = input();
+
+  // Source and recipient are the same codex session: only the signed native
+  // UUID letter case, the delivery channel, and the generation differ.
+  assertInvalid(() => planTownHallBroadcast({
+    ...base,
+    recipients: [address({ channelId: '300', nativeId: SOURCE_UUID_UPPER, generation: 2 })]
+  }));
+  assertInvalid(() => planTownHallBroadcast({
+    ...base,
+    source: address({ channelId: '200', nativeId: SOURCE_UUID_UPPER }),
+    recipients: [address({ channelId: '300', nativeId: SOURCE_UUID, generation: 2 })]
+  }));
+
+  // The same UUID on a different provider is a different native session, so the
+  // source identity refusal must not widen across providers.
+  const crossProvider = planTownHallBroadcast({
+    ...base,
+    recipients: [address({ channelId: '300', provider: 'claude', nativeId: SOURCE_UUID, generation: 2 })]
+  });
+  assert.equal(crossProvider.recipients.length, 1);
+  assert.equal(crossProvider.recipients[0].target.provider, 'claude');
+  assert.equal(crossProvider.recipients[0].target.nativeId, SOURCE_UUID);
+});
+
 test('malformed address IDs preserve normalized rejection without coercion', () => {
   let coercions = 0;
   const coercible = { get [Symbol.toPrimitive]() { coercions += 1; throw new Error('unexpected coercion'); } };
