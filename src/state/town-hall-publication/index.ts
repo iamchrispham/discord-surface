@@ -1,6 +1,7 @@
 import {
   confirmTownHallPublication,
   getTownHallPublication,
+  getTownHallPublicationSet,
   markTownHallPublicationInFlight,
   recordTownHallPublicationOutcome,
   recoverTownHallPublication,
@@ -19,18 +20,20 @@ export function createTownHallPublicationHandlers(
   deps: TownHallPublicationDependencies
 ): TownHallPublicationHandlers {
   return {
-    getTownHallPublication: (state, journalKey) =>
-      getTownHallPublication(deps, state, journalKey),
-    reserveTownHallPublication: (state, journalKey) =>
-      reserveTownHallPublication(deps, state, journalKey),
-    markTownHallPublicationInFlight: (state, journalKey, attemptId) =>
-      markTownHallPublicationInFlight(deps, state, journalKey, attemptId),
-    recordTownHallPublicationOutcome: (state, journalKey, attemptId, outcome, detail) =>
-      recordTownHallPublicationOutcome(deps, state, journalKey, attemptId, outcome, detail),
-    recoverTownHallPublication: (state, journalKey) =>
-      recoverTownHallPublication(deps, state, journalKey),
-    confirmTownHallPublication: (state, journalKey, attemptId, evidence) =>
-      confirmTownHallPublication(deps, state, journalKey, attemptId, evidence)
+    getTownHallPublication: (state, journalKey, partId) =>
+      getTownHallPublication(deps, state, journalKey, partId),
+    reserveTownHallPublication: (state, journalKey, partId) =>
+      reserveTownHallPublication(deps, state, journalKey, partId),
+    markTownHallPublicationInFlight: (state, journalKey, attemptId, partId) =>
+      markTownHallPublicationInFlight(deps, state, journalKey, attemptId, partId),
+    recordTownHallPublicationOutcome: (state, journalKey, attemptId, outcome, detail, partId) =>
+      recordTownHallPublicationOutcome(deps, state, journalKey, attemptId, outcome, detail, partId),
+    recoverTownHallPublication: (state, journalKey, partId) =>
+      recoverTownHallPublication(deps, state, journalKey, partId),
+    confirmTownHallPublication: (state, journalKey, attemptId, evidence, partId) =>
+      confirmTownHallPublication(deps, state, journalKey, attemptId, evidence, partId),
+    getTownHallPublicationSet: (state, journalKey) =>
+      getTownHallPublicationSet(deps, state, journalKey)
   };
 }
 
