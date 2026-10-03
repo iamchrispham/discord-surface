@@ -10,6 +10,11 @@ const ts = require('typescript');
 const ROOT = path.resolve(__dirname, '../..');
 const AGENT_OWNER = 'src/agent-message.ts';
 const PLANNER_OWNER = 'src/peer/town-hall-plan.ts';
+const WATCHER_OWNER = 'src/watcher-notice.ts';
+const SELF_REFUSAL_CONSUMER_INVENTORY = Object.freeze([
+  Object.freeze({ file: AGENT_OWNER, functionName: 'validateAgentMessage' }),
+  Object.freeze({ file: PLANNER_OWNER, functionName: 'planTownHallBroadcast' })
+]);
 
 function visit(node, callback) {
   callback(node);
@@ -26,6 +31,29 @@ function parseSourceText(file, text) {
   return ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
 }
 
+function sourceFilesUnder(relativeDirectory) {
+  const files = [];
+  const visitDirectory = directory => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visitDirectory(absolute);
+      } else if (entry.isFile() && /\.(?:js|ts)$/.test(entry.name)) {
+        files.push(path.relative(ROOT, absolute).split(path.sep).join('/'));
+      }
+    }
+  };
+  visitDirectory(path.join(ROOT, relativeDirectory));
+  return files.sort();
+}
+
+function productionSources() {
+  return sourceFilesUnder('src').map(file => ({
+    file,
+    sourceFile: parseSource(file)
+  }));
+}
+
 function declarationsNamed(sourceFile, name) {
   const found = [];
   visit(sourceFile, node => {
@@ -35,6 +63,19 @@ function declarationsNamed(sourceFile, name) {
       node.name.text === name && node.initializer &&
       (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))) {
       found.push(node);
+    }
+  });
+  return found;
+}
+
+function namedFunctionDeclarations(sourceFile) {
+  const found = [];
+  visit(sourceFile, node => {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      found.push({ name: node.name.text, declaration: node });
+    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer &&
+      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))) {
+      found.push({ name: node.name.text, declaration: node });
     }
   });
   return found;
@@ -51,6 +92,32 @@ function callsNamed(node, name) {
       current.expression.text === name) found = true;
   });
   return found;
+}
+
+function propertyPath(node) {
+  const parts = [];
+  let current = node;
+  while (ts.isPropertyAccessExpression(current)) {
+    parts.unshift(current.name.text);
+    current = current.expression;
+  }
+  if (ts.isIdentifier(current)) parts.unshift(current.text);
+  return parts.join('.');
+}
+
+function watcherRouteEqualityFields(body) {
+  const fields = [];
+  visit(body, node => {
+    if (!ts.isBinaryExpression(node) || node.operatorToken.kind !== ts.SyntaxKind.ExclamationEqualsEqualsToken) return;
+    const left = propertyPath(node.left);
+    const right = propertyPath(node.right);
+    const pair = [left, right].sort();
+    for (const field of ['provider', 'nativeId', 'generation']) {
+      const expected = [`packet.source.${field}`, `packet.target.${field}`].sort();
+      if (pair[0] === expected[0] && pair[1] === expected[1]) fields.push(field);
+    }
+  });
+  return fields.sort();
 }
 
 // A BinaryExpression that combines provider and nativeId reads reached from the
@@ -78,7 +145,7 @@ function nativePropertyKind(node) {
   if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
     (node.expression.text === 'source' || node.expression.text === 'target') &&
     (node.name.text === 'provider' || node.name.text === 'nativeId')) {
-    return node.name.text;
+    return `${node.expression.text}.${node.name.text}`;
   }
   return null;
 }
@@ -137,11 +204,52 @@ function inlineNativeSelfComparisons(body) {
     for (const operand of [node.left, node.right]) {
       for (const kind of nativeKindTaint(operand, tainted)) kinds.add(kind);
     }
-    // Both halves of the native session identity must meet, whether they are
-    // direct reads, hoisted comparison locals, or concatenated identities.
-    if (kinds.has('provider') && kinds.has('nativeId')) found.push(node);
+    // Both halves of the native session identity must meet on both sides,
+    // whether they are direct reads, hoisted locals, or concatenated identities.
+    if (kinds.has('source.provider') && kinds.has('target.provider') &&
+      kinds.has('source.nativeId') && kinds.has('target.nativeId')) found.push(node);
   });
   return found;
+}
+
+// The production census covers only src/**/*.ts and src/**/*.js. A self-refusal
+// consumer is any named function that delegates to sameAgentSession or carries
+// an inline provider/nativeId comparison over source/target identities. The
+// watcher route is intentionally outside this class: validateWatcherNotice
+// keeps strict source/target provider, nativeId, and generation predicates.
+function selfRefusalConsumerSites(sources) {
+  const sites = [];
+  for (const { file, sourceFile } of sources) {
+    for (const { name, declaration } of namedFunctionDeclarations(sourceFile)) {
+      const body = bodyOf(declaration);
+      if (!body) continue;
+      const delegated = callsNamed(body, 'sameAgentSession');
+      const inline = inlineNativeSelfComparisons(body);
+      if (delegated || inline.length) sites.push({ file, functionName: name, delegated, inline });
+    }
+  }
+  return sites.sort((left, right) => `${left.file}:${left.functionName}`.localeCompare(`${right.file}:${right.functionName}`));
+}
+
+function assertSelfRefusalConsumerInventory(sources) {
+  const actual = selfRefusalConsumerSites(sources);
+  const expected = SELF_REFUSAL_CONSUMER_INVENTORY.map(({ file, functionName }) => ({ file, functionName }));
+  assert.deepEqual(actual.map(({ file, functionName }) => ({ file, functionName })), expected,
+    'production self-refusal consumers are inventoried exactly once');
+  for (const { file, functionName } of expected) {
+    const site = actual.find(candidate => candidate.file === file && candidate.functionName === functionName);
+    assert.ok(site.delegated, `${file}:${functionName} delegates self refusal to sameAgentSession`);
+    assert.equal(site.inline.length, 0, `${file}:${functionName} carries no inline provider/nativeId self comparator`);
+  }
+}
+
+function assertWatcherRouteEqualityException(sources) {
+  const source = sources.find(candidate => candidate.file === WATCHER_OWNER);
+  assert.ok(source, `${WATCHER_OWNER} is included in the production census`);
+  const declarations = declarationsNamed(source.sourceFile, 'validateWatcherNotice');
+  assert.equal(declarations.length, 1, 'validateWatcherNotice is declared exactly once');
+  assert.deepEqual(watcherRouteEqualityFields(bodyOf(declarations[0])), ['generation', 'nativeId', 'provider'],
+    'watcher route keeps strict source/target provider, nativeId, and generation equality predicates');
 }
 
 // Pin one consumer to the shared self-refusal owner: it must call
@@ -166,13 +274,34 @@ function assertDelegatedSelfRefusal(sourceFile, functionName, options = {}) {
 }
 
 test('self-refusal is delegated to one shared sameAgentSession owner in current consumers', () => {
-  const agentSource = parseSource(AGENT_OWNER);
-  const plannerSource = parseSource(PLANNER_OWNER);
+  const sources = productionSources();
+  assertSelfRefusalConsumerInventory(sources);
+  assertWatcherRouteEqualityException(sources);
+
+  const agentSource = sources.find(candidate => candidate.file === AGENT_OWNER).sourceFile;
+  const plannerSource = sources.find(candidate => candidate.file === PLANNER_OWNER).sourceFile;
 
   // (a) Both current consumers route their self refusal through the owner.
   assertDelegatedSelfRefusal(agentSource, 'validateAgentMessage');
   assertDelegatedSelfRefusal(plannerSource, 'planTownHallBroadcast',
     { forbiddenIdentifiers: ['sourceIdentity'] });
+
+  // (a2) A new production file with an inline comparator must fail the same
+  // inventory, while the two delegated consumers above pass it.
+  const thirdFileInlineBypass = parseSourceText('src/peer/third-self-refusal.ts', `
+export function rejectThirdAgentMessage(packet: unknown): void {
+  const source = packet.source;
+  const target = packet.target;
+  if (source.provider === target.provider && source.nativeId === target.nativeId) {
+    throw new Error('invalid third agent message');
+  }
+}
+`);
+  assert.throws(() => assertSelfRefusalConsumerInventory([
+    ...sources,
+    { file: 'src/peer/third-self-refusal.ts', sourceFile: thirdFileInlineBypass }
+  ]), /production self-refusal consumers are inventoried exactly once/,
+  'a third-file inline self comparator cannot leave the inventory green');
 
   // (b) The pin genuinely rejects a synthetic inline bypass of each consumer,
   // not just the absence of a call.
