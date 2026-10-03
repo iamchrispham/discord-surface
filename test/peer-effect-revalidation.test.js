@@ -340,9 +340,13 @@ test('binding generation changes independently after destination GET', async t =
   addRecipient(f);
   let current = ORIGINAL;
   let gets = 0;
+  let nativeLookupsAfterGet = 0;
   let posts = 0;
   const oldGeneration = f.state.getBinding('101').generation;
-  const peer = service(f, { callerDependencies: identity(() => current), fetchImpl: async (url, options) => {
+  const peer = service(f, { callerDependencies: identity(() => {
+    if (gets > 0) nativeLookupsAfterGet += 1;
+    return current;
+  }), fetchImpl: async (url, options) => {
     if (options.method === 'GET') {
       gets += 1;
       assert.match(url, /\/channels\/202$/);
@@ -356,6 +360,7 @@ test('binding generation changes independently after destination GET', async t =
   const desired = async () => {
     const refused = await nativeRefusal(peer.send({ peer: { channelId: '201' }, text: 'hello', dedupe_key: 'effect-send-generation' }));
     assert.equal(refused, true, 'native caller must be revalidated');
+    assert.ok(nativeLookupsAfterGet > 0, 'native caller is resolved after the destination GET');
     assert.equal(gets, 1, 'destination lookup runs once');
     assert.equal(posts, 0, 'no outbound post after the binding generation changed');
     assert.equal(directPostRows(f.state, 'effect-send-generation').attempts.length, 0, 'no direct-post attempt after the binding generation changed');
@@ -412,9 +417,13 @@ test('abort while caller resolution is pending starts no network or attempt', { 
     fetches += 1;
     return response({ id: '10001' });
   } });
-  const tmpRoot = path.dirname(path.dirname(f.state.requireConfig().secretFile));
-  const peerDirs = () => fs.readdirSync(tmpRoot).filter(name => name.startsWith('discord-peer-'));
-  const before = new Set(peerDirs());
+  const originalMkdtemp = fs.mkdtempSync;
+  let stagedDirectories = 0;
+  fs.mkdtempSync = function (prefix, ...args) {
+    if (path.basename(String(prefix)).startsWith('discord-peer-')) stagedDirectories += 1;
+    return originalMkdtemp.call(this, prefix, ...args);
+  };
+  t.after(() => { fs.mkdtempSync = originalMkdtemp; });
   const controller = new AbortController();
   const sending = peer.send({ peer: { channelId: '201' }, text: 'hello', dedupe_key: 'effect-abort-pending' }, controller.signal);
   t.after(() => release());
@@ -430,6 +439,5 @@ test('abort while caller resolution is pending starts no network or attempt', { 
   assert.equal(fetches, 0);
   assert.equal(directPostRows(f.state, 'effect-abort-pending').attempts.length, 0);
   assert.equal(directPostRows(f.state, 'effect-abort-pending').outcomes.length, 0);
-  const newEntries = peerDirs().filter(name => !before.has(name));
-  assert.deepEqual(newEntries, [], 'peer send wrote no message temp file');
+  assert.equal(stagedDirectories, 0, 'peer send never staged a message temp directory');
 });
