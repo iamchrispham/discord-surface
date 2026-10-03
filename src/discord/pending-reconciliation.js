@@ -1,3 +1,5 @@
+'use strict';
+
 function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES }) {
   return {
     async reconcilePending(before, signal, readyOnly = false, channelIds = null, messageIds = null) {

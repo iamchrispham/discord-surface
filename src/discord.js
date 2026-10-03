@@ -2145,7 +2145,7 @@ class DiscordGateway {
     }
   }
 
-  async _reconcilePending(before, signal, readyOnly = false, channelIds = null, messageIds = null) { return pendingReconciliation.reconcilePending.apply(this, arguments); }
+  _reconcilePending(before, signal, ...args) { return pendingReconciliation.reconcilePending.apply(this, arguments); }
 
   startDecisionRecovery(signal, channelIds = null) {
     if (this.stopping || this.decisionRecoveryPromise || !this.decisionConsumer) return this.decisionRecoveryPromise;
