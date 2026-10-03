@@ -3,12 +3,20 @@ import {
   DIRECT_POST_PART_STATUSES
 } from '../../direct-post/contracts';
 import type { DirectPostOutcome, DirectPostPartStatus } from '../../direct-post/contracts';
+import { TOWN_HALL_ROOM_PARTS } from '../../peer/town-hall-room-parts';
+import type { TownHallRoomPart } from '../../peer/town-hall-room-parts';
 import type { TownHallBroadcastSnapshot, TownHallJournalState } from '../town-hall-journal/types';
 
 export const TOWN_HALL_PUBLICATION_RECEIPTS = Object.freeze({
   INSTRUCTION_PREFIX: 'town-hall-instruction/v1:',
-  PUBLICATION_PREFIX: 'town-hall-publication/v1:'
+  PUBLICATION_PREFIX: 'town-hall-publication/v1:',
+  INSTRUCTION_PART_PREFIX: 'town-hall-instruction-part/v1:',
+  PUBLICATION_PART_PREFIX: 'town-hall-publication-part/v1:'
 } as const);
+
+// Explicitly a room-part ID, so the existing fixture assertion that recover()
+// takes no extra plain string argument keeps failing typecheck.
+export type TownHallPublicationPartId = `${typeof TOWN_HALL_ROOM_PARTS.ID_PREFIX}${string}`;
 
 export const TOWN_HALL_PUBLICATION_EVENTS = Object.freeze({
   RESERVED: 'reserved',
@@ -45,6 +53,19 @@ export interface TownHallPublicationReservation {
 export interface TownHallPublicationStart {
   readonly started: boolean;
   readonly publication: TownHallPublication;
+}
+
+export interface TownHallPublicationPart extends TownHallRoomPart {
+  readonly partId: TownHallPublicationPartId;
+  readonly publication: TownHallPublication;
+}
+
+export interface TownHallPublicationSet {
+  readonly journalKey: string;
+  readonly fingerprint: string;
+  readonly complete: boolean;
+  readonly anchorMessageId: string | null;
+  readonly parts: readonly TownHallPublicationPart[];
 }
 
 export interface SqlRow {
@@ -87,27 +108,31 @@ export interface TownHallPublicationConfirmationEvidence {
 }
 
 export interface TownHallPublicationHandlers {
-  getTownHallPublication(state: TownHallPublicationStateStore, journalKey: string): TownHallPublication;
-  reserveTownHallPublication(state: TownHallPublicationStateStore, journalKey: string): TownHallPublicationReservation;
+  getTownHallPublication(state: TownHallPublicationStateStore, journalKey: string, partId?: TownHallPublicationPartId): TownHallPublication;
+  reserveTownHallPublication(state: TownHallPublicationStateStore, journalKey: string, partId?: TownHallPublicationPartId): TownHallPublicationReservation;
   markTownHallPublicationInFlight(
     state: TownHallPublicationStateStore,
     journalKey: string,
-    attemptId: string
+    attemptId: string,
+    partId?: TownHallPublicationPartId
   ): TownHallPublicationStart;
   recordTownHallPublicationOutcome(
     state: TownHallPublicationStateStore,
     journalKey: string,
     attemptId: string,
     outcome: DirectPostOutcome,
-    detail?: Record<string, unknown>
+    detail?: Record<string, unknown>,
+    partId?: TownHallPublicationPartId
   ): TownHallPublication;
-  recoverTownHallPublication(state: TownHallPublicationStateStore, journalKey: string): TownHallPublication;
+  recoverTownHallPublication(state: TownHallPublicationStateStore, journalKey: string, partId?: TownHallPublicationPartId): TownHallPublication;
   confirmTownHallPublication(
     state: TownHallPublicationStateStore,
     journalKey: string,
     attemptId: string,
-    evidence: TownHallPublicationConfirmationEvidence
+    evidence: TownHallPublicationConfirmationEvidence,
+    partId?: TownHallPublicationPartId
   ): TownHallPublication;
+  getTownHallPublicationSet(state: TownHallPublicationStateStore, journalKey: string): TownHallPublicationSet;
 }
 
 export { DIRECT_POST_OUTCOMES, DIRECT_POST_PART_STATUSES };
