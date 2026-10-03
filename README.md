@@ -411,7 +411,7 @@ The tests use injected native providers and fake Discord events. They do not con
 
 ## Conductor milestone announcements
 
-`post` sends an explicit milestone from an existing bound conductor without an inbound message, a running Gateway, or sidecar inference. `claude-post` is the Claude-only alias. Use it for a landing, a blocker, or a ruling the operator may want to override. Keep round-by-round detail in beacons and PR bodies. Human-grade events retain the existing phone path. This command sends no Telegram copy. Questions requiring an operator answer remain pending until that answer is recorded.
+`post` sends an explicit milestone from an existing bound conductor without an inbound message, a running Gateway, or sidecar inference. `claude-post` is the Claude-only alias. Use it for a landing, a blocker, or a ruling the operator may want to override. Keep round-by-round detail in beacons and PR bodies. Use Discord for operator decisions and agent coordination. Telegram retirement is in progress. Preserve outstanding custody and canonical answers until their replacement is qualified before stopping legacy components. This command sends no Telegram copy. Questions requiring an operator answer remain pending until that answer is recorded.
 
 ```sh
 node src/cli.js claude-post \
