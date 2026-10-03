@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
-const { fixture } = require('./fixtures/peer-fixture');
+const { fixture, addRecipient } = require('./fixtures/peer-fixture');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { parseArgs } = require('../src/cli');
 
@@ -109,5 +109,61 @@ test('public MCP stdio lists the caller and refuses an unready send', { timeout:
     assert.equal(refused.isError, true);
     assert.match(refused.content[0].text, /no enrolled child/);
     assert.equal(f.state.listReceipts().length, before);
+  } finally { clearTimeout(deadline); await client.close(); await transport.close(); }
+});
+
+
+test('public MCP stdio resolves each call and never falls back after resolver refusal', { timeout: 15000 }, async t => {
+  const f = fixture(t);
+  f.state.db.prepare("UPDATE bindings SET provider='codex'").run();
+  f.enroll('102');
+  addRecipient(f);
+  const config = f.state.requireConfig();
+  const directory = path.dirname(config.secretFile);
+  fs.writeFileSync(config.secretFile, 'DISCORD_TOKEN=fixture\n', { mode: 0o600 });
+  const callsFile = path.join(directory, 'resolver-calls.jsonl');
+  const child = path.join(directory, 'resolver-server.cjs');
+  fs.writeFileSync(child, `
+    const fs = require('node:fs');
+    const { startPeerMcp } = require(${JSON.stringify(path.resolve(__dirname, '../src/peer/server.js'))});
+    setTimeout(() => process.exit(124), 12000).unref();
+    let calls = 0;
+    startPeerMcp({ provider: 'codex', db: ${JSON.stringify(path.join(directory, 'surface.sqlite'))} }, {
+      callerDependencies: { resolveCodexCaller: async signal => {
+        calls++;
+        fs.appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ calls, signal: signal instanceof AbortSignal }) + '\\n');
+        if (calls === 4) throw new Error('fixture resolver refused');
+        const sessionId = calls === 1 ? '11111111-1111-1111-1111-111111111111' : '22222222-2222-2222-2222-222222222222';
+        return { sessionId, threadId: calls === 3 ? 'conflicting-thread' : sessionId, turnId: 'turn-' + calls };
+      } }
+    }).catch(error => { console.error(error); process.exitCode = 1; });
+  `);
+  const client = new Client({ name: 'peer-resolver-fixture', version: '1' });
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: ['--disable-warning=ExperimentalWarning', child],
+    env: { ...process.env, CODEX_THREAD_ID: '11111111-1111-1111-1111-111111111111', CODEX_SESSION_ID: '11111111-1111-1111-1111-111111111111' }, stderr: 'pipe' });
+  const deadline = setTimeout(() => { void transport.close(); }, 10000);
+  try {
+    await client.connect(transport);
+    for (let index = 0; index < 2; index++) {
+      const listed = await client.callTool({ name: 'peer_list', arguments: {} });
+      assert.notEqual(listed.isError, true);
+      const peers = JSON.parse(listed.content[0].text);
+      assert.equal(peers.length, 2);
+      const callerChannelId = index === 0 ? '101' : '201';
+      for (const peer of peers) {
+        const isCaller = peer.channelId === callerChannelId;
+        assert.equal(peer.reachable, !isCaller);
+        assert.equal(peer.reason, isCaller ? 'caller cannot target itself' : null);
+      }
+    }
+    const invalid = await client.callTool({ name: 'peer_list', arguments: {} });
+    assert.equal(invalid.isError, true);
+    assert.match(invalid.content[0].text, /turn identity is unavailable or conflicting/);
+    const refused = await client.callTool({ name: 'peer_list', arguments: {} });
+    assert.equal(refused.isError, true);
+    assert.match(refused.content[0].text, /fixture resolver refused/);
+    const calls = fs.readFileSync(callsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(calls, [1, 2, 3, 4].map(calls => ({ calls, signal: true })));
   } finally { clearTimeout(deadline); await client.close(); await transport.close(); }
 });
