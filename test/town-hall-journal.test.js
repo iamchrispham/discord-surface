@@ -83,6 +83,22 @@ function ownedRows(state) {
     row.kind.startsWith(MANIFEST_PREFIX) || row.kind.startsWith(RECIPIENT_PREFIX));
 }
 
+function insertMessagesRow(state, discordId) {
+  state.db.prepare(`INSERT OR IGNORE INTO bindings(channel_id, guild_id, provider, native_id, workspace,
+    readiness, generation, active, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?)`).run(
+    '900', '100', 'codex', CODEX_ID, '/tmp/townhall-journal-fixture', 'ready', 1, '2026-01-01T00:00:00.000Z');
+  state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id,
+    content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation,
+    state, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    discordId, '100', '900', '900', '901', 'journal metadata fixture', '[]', 'codex', CODEX_ID,
+    '/tmp/townhall-journal-fixture', null, null, null, 1, 'accepted', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+}
+
+function corruptDiscordId(state, kind, discordId) {
+  insertMessagesRow(state, discordId);
+  state.db.prepare('UPDATE receipts SET discord_id=? WHERE kind=?').run(discordId, kind);
+}
+
 function assertConflict(run) {
   assert.throws(run, error => {
     assert.ok(error instanceof BindingError, `expected BindingError, got ${error?.constructor?.name}: ${error?.message}`);
@@ -103,6 +119,7 @@ const WORKER_SOURCE = `
 const { parentPort, workerData } = require('node:worker_threads');
 const selfDestruct = setTimeout(() => process.exit(1), workerData.timeoutMs);
 selfDestruct.unref();
+if (workerData.controlExit) process.exit(workerData.controlExit);
 let state = null;
 try {
   const { SurfaceState } = require(workerData.statePath);
@@ -275,26 +292,45 @@ test('write failure rolls back manifest and every recipient', t => {
   assert.equal(ownedRows(f.state).length, 3);
 });
 
-test('competing connections preserve one immutable manifest', async t => {
+test('competing connections preserve one immutable manifest', { timeout: 20000 }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'town-hall-journal-race-'));
   const dbPath = path.join(dir, 'surface.sqlite');
   const seed = new SurfaceState(dbPath);
   seed.close();
   const statePath = require.resolve('../src/state');
   const workers = [];
-  const runWorker = source => new Promise((resolve, reject) => {
+  const workerResult = worker => new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      callback(value);
+    };
+    worker.once('message', message => settle(resolve, message));
+    worker.once('error', error => settle(reject, error));
+    worker.once('exit', code => {
+      settle(reject, new Error(`town-hall journal worker exited without result (code ${code})`));
+    });
+  });
+  const startWorker = workerData => {
     const worker = new Worker(WORKER_SOURCE, {
       eval: true,
-      workerData: { dbPath, statePath, timeoutMs: 10000, input: source }
+      workerData: { dbPath, statePath, timeoutMs: 10000, ...workerData }
     });
     workers.push(worker);
-    worker.once('message', resolve);
-    worker.once('error', reject);
-  });
+    return { worker, result: workerResult(worker) };
+  };
   try {
+    const control = startWorker({ controlExit: 7 });
+    await assert.rejects(control.result, error => {
+      assert.equal(error.message, 'town-hall journal worker exited without result (code 7)');
+      return true;
+    });
+    await control.worker.terminate();
+
     const results = await Promise.all([
-      runWorker(input({ recipients: twoRecipients(), text: 'race original text' })),
-      runWorker(input({ recipients: twoRecipients(), text: 'race competing text' }))
+      startWorker({ input: input({ recipients: twoRecipients(), text: 'race original text' }) }).result,
+      startWorker({ input: input({ recipients: twoRecipients(), text: 'race competing text' }) }).result
     ]);
     const winners = results.filter(result => result.ok === true);
     const losers = results.filter(result => result.ok === false);
@@ -384,6 +420,16 @@ test('malformed owned manifest refuses instead of appearing absent', t => {
   }
   assert.equal(f.state.getTownHallBroadcast(journalKey).plan.text, 'hello');
 
+  const corruptManifestId = 'journal-metadata-manifest';
+  corruptDiscordId(f.state, manifest.kind, corruptManifestId);
+  assertCorrupt(() => f.state.getTownHallBroadcast(journalKey));
+  assertCorrupt(() => f.state.listTownHallBroadcasts());
+  const rowsBefore = f.state.listReceipts().map(row => row.id);
+  assertCorrupt(() => f.state.createTownHallBroadcast(input()));
+  assert.deepEqual(f.state.listReceipts().map(row => row.id), rowsBefore);
+  f.state.db.prepare('UPDATE receipts SET discord_id=NULL WHERE kind=?').run(manifest.kind);
+  assert.equal(f.state.getTownHallBroadcast(journalKey).plan.text, 'hello');
+
   for (const key of ['', journalKey.toUpperCase(), journalKey.slice(0, 63), journalKey + '0', 'not-a-key']) {
     assert.throws(() => f.state.getTownHallBroadcast(key), error => {
       assert.ok(error instanceof BindingError, `expected BindingError for ${JSON.stringify(key)}`);
@@ -412,6 +458,25 @@ test('missing duplicate or orphan recipient records refuse', t => {
     .run(null, duplicateManifest.kind, duplicateManifest.detail, duplicateManifest.created_at);
   assertCorrupt(() => duplicate.state.getTownHallBroadcast(duplicateCreated.broadcast.journalKey));
   assertCorrupt(() => duplicate.state.listTownHallBroadcasts());
+
+  const duplicateRecipient = fixture(t);
+  const duplicateRecipientCreated = duplicateRecipient.state.createTownHallBroadcast(input());
+  const existingRecipient = duplicateRecipient.state.listReceipts()
+    .find(row => row.kind === RECIPIENT_PREFIX + duplicateRecipientCreated.broadcast.journalKey);
+  assert.ok(existingRecipient);
+  duplicateRecipient.state.db.prepare('INSERT INTO receipts(discord_id, kind, detail, created_at) VALUES(?, ?, ?, ?)')
+    .run(null, existingRecipient.kind, existingRecipient.detail, existingRecipient.created_at);
+  assertCorrupt(() => duplicateRecipient.state.getTownHallBroadcast(duplicateRecipientCreated.broadcast.journalKey));
+  assertCorrupt(() => duplicateRecipient.state.listTownHallBroadcasts());
+
+  const corruptRecipient = fixture(t);
+  const corruptRecipientCreated = corruptRecipient.state.createTownHallBroadcast(input());
+  const recipient = corruptRecipient.state.listReceipts()
+    .find(row => row.kind === RECIPIENT_PREFIX + corruptRecipientCreated.broadcast.journalKey);
+  assert.ok(recipient);
+  corruptDiscordId(corruptRecipient.state, recipient.kind, 'journal-metadata-recipient');
+  assertCorrupt(() => corruptRecipient.state.getTownHallBroadcast(corruptRecipientCreated.broadcast.journalKey));
+  assertCorrupt(() => corruptRecipient.state.listTownHallBroadcasts());
 
   const orphan = fixture(t);
   const orphanKey = expectedJournalKey(planTownHallBroadcast(input()));

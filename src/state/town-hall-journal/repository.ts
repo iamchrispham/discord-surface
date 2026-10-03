@@ -28,6 +28,7 @@ interface ReceiptRow {
   id: number;
   kind: string;
   detail: string;
+  discord_id: string | null;
 }
 
 interface ReceiptProjection {
@@ -69,16 +70,27 @@ function assertJournalKey(deps: TownHallJournalDependencies, journalKey: string)
   return journalKey;
 }
 
-function readRows(state: TownHallJournalStateStore, kind: string): ReceiptRow[] {
-  return state.db.prepare('SELECT id, kind, detail FROM receipts WHERE kind=? ORDER BY id').all(kind)
-    .map(row => ({ id: Number(row.id), kind: String(row.kind), detail: String(row.detail) }))
-    .filter(row => row.kind === kind);
+function decodeRow(deps: TownHallJournalDependencies, row: SqlRow): ReceiptRow {
+  // Compare the raw column so a null sentinel is not coerced into a non-null value.
+  if (row.discord_id !== null) reject(deps);
+  return {
+    id: Number(row.id),
+    kind: String(row.kind),
+    detail: String(row.detail),
+    discord_id: null
+  };
 }
 
-function readRowsWithPrefix(state: TownHallJournalStateStore, prefix: string): ReceiptRow[] {
-  return state.db.prepare('SELECT id, kind, detail FROM receipts WHERE kind LIKE ? ORDER BY id').all(`${prefix}%`)
-    .map(row => ({ id: Number(row.id), kind: String(row.kind), detail: String(row.detail) }))
-    .filter(row => row.kind.startsWith(prefix));
+function readRows(deps: TownHallJournalDependencies, state: TownHallJournalStateStore, kind: string): ReceiptRow[] {
+  return state.db.prepare('SELECT id, kind, detail, discord_id FROM receipts WHERE kind=? ORDER BY id').all(kind)
+    .filter(row => row.kind === kind)
+    .map(row => decodeRow(deps, row));
+}
+
+function readRowsWithPrefix(deps: TownHallJournalDependencies, state: TownHallJournalStateStore, prefix: string): ReceiptRow[] {
+  return state.db.prepare('SELECT id, kind, detail, discord_id FROM receipts WHERE kind LIKE ? ORDER BY id').all(`${prefix}%`)
+    .filter(row => String(row.kind).startsWith(prefix))
+    .map(row => decodeRow(deps, row));
 }
 
 function parseDetail(deps: TownHallJournalDependencies, detail: string): unknown {
@@ -177,8 +189,8 @@ function freezeSnapshot(plan: TownHallPlan, journalKey: string): TownHallBroadca
 }
 
 function projectByKey(deps: TownHallJournalDependencies, state: TownHallJournalStateStore, key: string): TownHallBroadcastSnapshot | null {
-  const manifestRows = readRows(state, TOWN_HALL_JOURNAL_RECEIPTS.MANIFEST_PREFIX + key);
-  const recipientRows = readRows(state, TOWN_HALL_JOURNAL_RECEIPTS.RECIPIENT_PREFIX + key);
+  const manifestRows = readRows(deps, state, TOWN_HALL_JOURNAL_RECEIPTS.MANIFEST_PREFIX + key);
+  const recipientRows = readRows(deps, state, TOWN_HALL_JOURNAL_RECEIPTS.RECIPIENT_PREFIX + key);
   if (manifestRows.length === 0) {
     if (recipientRows.length !== 0) reject(deps);
     return null;
@@ -197,8 +209,8 @@ export function createTownHallBroadcast(
   const plan = planTownHallBroadcast(input);
   const key = journalKeyForPlan(plan);
   return state.transaction(() => {
-    const manifestRows = readRows(state, TOWN_HALL_JOURNAL_RECEIPTS.MANIFEST_PREFIX + key);
-    const recipientRows = readRows(state, TOWN_HALL_JOURNAL_RECEIPTS.RECIPIENT_PREFIX + key);
+    const manifestRows = readRows(deps, state, TOWN_HALL_JOURNAL_RECEIPTS.MANIFEST_PREFIX + key);
+    const recipientRows = readRows(deps, state, TOWN_HALL_JOURNAL_RECEIPTS.RECIPIENT_PREFIX + key);
     if (manifestRows.length !== 0) {
       if (manifestRows.length !== 1) reject(deps);
       const projection = canonicalPlan(deps, key, manifestRows[0].detail);
@@ -235,8 +247,8 @@ export function listTownHallBroadcasts(
   state: TownHallJournalStateStore
 ): TownHallBroadcastSnapshot[] {
   return state.transaction(() => {
-    const manifestRows = readRowsWithPrefix(state, TOWN_HALL_JOURNAL_RECEIPTS.MANIFEST_PREFIX);
-    const recipientRows = readRowsWithPrefix(state, TOWN_HALL_JOURNAL_RECEIPTS.RECIPIENT_PREFIX);
+    const manifestRows = readRowsWithPrefix(deps, state, TOWN_HALL_JOURNAL_RECEIPTS.MANIFEST_PREFIX);
+    const recipientRows = readRowsWithPrefix(deps, state, TOWN_HALL_JOURNAL_RECEIPTS.RECIPIENT_PREFIX);
     const recipientGroups = new Map<string, ReceiptRow[]>();
     for (const row of recipientRows) {
       const key = row.kind.slice(TOWN_HALL_JOURNAL_RECEIPTS.RECIPIENT_PREFIX.length);
