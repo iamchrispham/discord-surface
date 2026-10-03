@@ -52,14 +52,15 @@ function messageLimitError(encodedLength: number): Error {
   );
 }
 
+function ownDataProperty(value: object, key: string): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && Object.hasOwn(descriptor, 'value');
+}
+
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value) ||
       Object.keys(value).length !== keys.length) return false;
-  return keys.every(key => {
-    if (!Object.hasOwn(value, key)) return false;
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor !== undefined && Object.hasOwn(descriptor, 'value');
-  });
+  return keys.every(key => Object.hasOwn(value, key) && ownDataProperty(value, key));
 }
 
 export function validAddress(value: unknown): value is AgentAddress {
@@ -85,11 +86,15 @@ export function validateAgentMessage(packet: unknown): asserts packet is AgentMe
   const required = ['id', 'kind', 'source', 'target', 'replyTo', 'text'];
   if (!required.every(key => Object.hasOwn(value, key)) ||
       keys.some(key => ![...required, 'routingVersion', 'sourceParentChannelId'].includes(key)) ||
-      (Object.hasOwn(value, 'routingVersion') && value.routingVersion !== 2) ||
-      (Object.hasOwn(value, 'sourceParentChannelId') &&
-        (value.routingVersion !== 2 || typeof value.sourceParentChannelId !== 'string' ||
-          !/^\d{1,20}$/.test(value.sourceParentChannelId)))) {
+      (Object.hasOwn(value, 'routingVersion') && value.routingVersion !== 2)) {
     throw new Error('invalid agent message');
+  }
+  if (Object.hasOwn(value, 'sourceParentChannelId')) {
+    if (!ownDataProperty(value, 'sourceParentChannelId') ||
+        value.routingVersion !== 2 || typeof value.sourceParentChannelId !== 'string' ||
+        !/^\d{1,20}$/.test(value.sourceParentChannelId)) {
+      throw new Error('invalid agent message');
+    }
   }
   if (typeof value.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.id) ||
       !Object.values(KINDS).includes(value.kind as AgentMessageKind) || !validAddress(value.source) || !validAddress(value.target)) {

@@ -1,4 +1,5 @@
 import * as crypto from 'node:crypto';
+import { validAddress } from './agent-message';
 
 const PREFIX = 'discord-tether:watcher-notice:v1:';
 const DOMAIN = 'discord-tether/watcher-notice/v1';
@@ -49,13 +50,7 @@ function stableKey(value: unknown, name: string): string {
 }
 
 export function validWatcherAddress(value: unknown): value is WatcherAddress {
-  if (!exactKeys(value, ['guildId', 'channelId', 'provider', 'nativeId', 'generation'])) return false;
-  const generation = value.generation;
-  return typeof value.guildId === 'string' && /^\d{1,20}$/.test(value.guildId) &&
-    typeof value.channelId === 'string' && /^\d{1,20}$/.test(value.channelId) &&
-    isWatcherNoticeProvider(value.provider) &&
-    typeof value.nativeId === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.nativeId) &&
-    Number.isSafeInteger(generation) && (generation as number) > 0;
+  return validAddress(value);
 }
 
 export function sameWatcherAddress(left: unknown, right: unknown): boolean {
