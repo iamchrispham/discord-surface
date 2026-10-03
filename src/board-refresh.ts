@@ -22,12 +22,16 @@ import {
   type BoardChannel,
   type BoardMessage
 } from './discord/board-refresh';
+import type { ProcessOwnerEvidence } from './state/process-owner-evidence';
+import { OWNER_EVIDENCE, OWNER_EVIDENCE_REASON } from './state/process-owner-evidence';
+
+type OwnerAliveResult = boolean | ProcessOwnerEvidence;
 
 interface BoardStateRuntime extends BoardState {
   captureBoardRevision(target: BoardTarget): { target: BoardTarget; revision: number };
   inspectBoardRequest(requestId: string, target: BoardTarget): BoardAdmission | null;
   boardMessageProvenance(target: BoardTarget): BoardProvenance[];
-  recoverBoardRefreshReceipts(ownerAlive?: (pid: number, identity: unknown) => boolean): number;
+  recoverBoardRefreshReceipts(ownerAlive?: (pid: number, identity: unknown) => OwnerAliveResult): number;
   beginBoardRefresh(meta: BoardRefreshMeta, capturedRevision: number): BoardAdmission;
   recordBoardRefreshOutcome(target: BoardTarget, attemptId: string, outcome: BoardOutcome, detail?: Record<string, unknown>): BoardRefreshRecord;
 }
@@ -160,7 +164,10 @@ export async function runBoardRefresh({
   const payloadHash = hashBoardText(content);
   const config = state.requireConfig();
   const target: BoardTarget = { guildId: config.guildId, channelId, messageId };
-  const ownerAlive = (pid: number, identity: unknown) => state.directPostOwnerAlive?.(pid, identity) || false;
+  const ownerAlive = (pid: number, identity: unknown): OwnerAliveResult => {
+    if (typeof state.directPostOwnerEvidence === 'function') return state.directPostOwnerEvidence(pid, identity);
+    return { status: OWNER_EVIDENCE.INDETERMINATE, reason: OWNER_EVIDENCE_REASON.INVALID_EVIDENCE };
+  };
   state.recoverBoardRefreshReceipts(ownerAlive);
   const existing = state.inspectBoardRequest(requestId, target);
   if (existing?.attempt?.payloadHash && existing.attempt.payloadHash !== payloadHash &&

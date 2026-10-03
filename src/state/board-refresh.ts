@@ -36,6 +36,11 @@ import {
 export { BOARD_RECEIPT_KINDS, BOARD_OUTCOMES } from './board-refresh/contracts';
 export type { BoardOutcome, BoardTerminalOutcome, BoardBinding, BoardConfig, BoardState, BoardTarget, BoardProvenance, BoardOwner, BoardRefreshMeta, BoardRefreshAttempt, BoardRefreshRecord, BoardRevisionSnapshot, BoardAdmission, BoardRecoveryEvidence } from './board-refresh/contracts';
 
+import {
+  normalizeOwnerEvidence,
+  OWNER_EVIDENCE
+} from './process-owner-evidence';
+
 function text(value: unknown, name: string, max = 512): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`${name} must be a non-empty string`);
@@ -208,10 +213,13 @@ function boardMessageProvenance(state: BoardState, rawTarget: BoardTarget): Boar
   return [...directProvenance, ...replyProvenance];
 }
 
-function recoverOrphanBoardRefreshAttempt(state: BoardState, attempt: ReceiptRow, ownerAlive: ((pid: number, identity: unknown) => boolean) | null): number {
+type OwnerAliveCallback = (pid: number, identity: unknown) => unknown;
+
+function recoverOrphanBoardRefreshAttempt(state: BoardState, attempt: ReceiptRow, ownerAlive: OwnerAliveCallback | null): number {
   const pid = Number(attempt.detail.ownerPid);
   const identity = attempt.detail.ownerIdentity;
-  if (ownerAlive && Number.isInteger(pid) && pid > 0 && ownerAlive(pid, identity)) return 0;
+  if (!ownerAlive || !Number.isInteger(pid) || pid < 1) return 0;
+  if (normalizeOwnerEvidence(ownerAlive(pid, identity)).status !== OWNER_EVIDENCE.ABSENT) return 0;
   const ended = new Date().toISOString();
   state.receipt(null, BOARD_RECEIPT_KINDS.OUTCOME, {
     ...attempt.detail,
@@ -223,7 +231,7 @@ function recoverOrphanBoardRefreshAttempt(state: BoardState, attempt: ReceiptRow
   return 1;
 }
 
-function recoverBoardRefreshReceipts(state: BoardState, ownerAlive: ((pid: number, identity: unknown) => boolean) | null = null, inTransaction = false): number {
+function recoverBoardRefreshReceipts(state: BoardState, ownerAlive: OwnerAliveCallback | null = null, inTransaction = false): number {
   const recover = (): number => {
     const rows = readReceipts(state, [BOARD_RECEIPT_KINDS.ATTEMPT, BOARD_RECEIPT_KINDS.OUTCOME]);
     let count = 0;
@@ -237,7 +245,7 @@ function recoverBoardRefreshReceipts(state: BoardState, ownerAlive: ((pid: numbe
   return inTransaction ? recover() : state.transaction(recover);
 }
 
-function recoverBoardRefreshAttempt(state: BoardState, targetInput: BoardTarget, attemptIdInput: string, ownerAlive: ((pid: number, identity: unknown) => boolean) | null = null): number {
+function recoverBoardRefreshAttempt(state: BoardState, targetInput: BoardTarget, attemptIdInput: string, ownerAlive: OwnerAliveCallback | null = null): number {
   const target = assertTarget(targetInput);
   const attemptId = text(attemptIdInput, 'attemptId', 128);
   return state.transaction(() => {

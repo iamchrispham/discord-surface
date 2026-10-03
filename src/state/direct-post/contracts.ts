@@ -1,6 +1,7 @@
 import type { AgentAddress, AgentMessage, AgentProvider } from '../../agent-message';
 import type { WatcherNotice } from '../../watcher-notice';
 import type { DirectPostFileManifest, DirectPostFilePreparation } from '../../direct-post-file';
+import type { ProcessOwnerEvidence } from '../process-owner-evidence';
 
 export const DIRECT_POST_OUTCOMES = Object.freeze([
   'sent',
@@ -84,15 +85,16 @@ export interface DirectPostState {
   directPostBindingCurrent(binding: DirectPostBinding, operatorId?: string | null, deliveryChannelId?: string | null, allowUnreadyDelivery?: boolean): boolean;
   directPostOwnerIdentity(pid: number): DirectPostOwnerIdentity | null;
   directPostOwnerAlive(pid: number, expectedIdentity: DirectPostOwnerIdentity): boolean;
+  directPostOwnerEvidence?(pid: number, expectedIdentity?: unknown): ProcessOwnerEvidence;
   receipt(discordId: string | null, kind: string, detail: Record<string, unknown>): void;
 }
 
-export type DirectPostRecoveryOwnerAlive = (pid: unknown, detail: DirectPostReceiptDetail) => boolean;
+export type DirectPostRecoveryOwnerAlive = (pid: unknown, detail: DirectPostReceiptDetail) => ProcessOwnerEvidence | boolean;
 
 export interface DirectPostRecoveryState {
   transaction<T>(operation: () => T): T;
   directPostRows(requestId?: string | null, channelId?: string | null, relatedChannelIds?: readonly string[]): DirectPostReceiptRow[];
-  directPostOwnerAlive(pid: unknown, expectedIdentity: DirectPostReceiptDetail): boolean;
+  directPostOwnerEvidence(pid: unknown, expectedIdentity: DirectPostReceiptDetail): ProcessOwnerEvidence;
   recoverDirectPostReceiptsInternal(ownerAlive?: DirectPostRecoveryOwnerAlive): number;
   receipt(discordId: string | null, kind: string, detail: Record<string, unknown>): void;
 }
