@@ -88,7 +88,7 @@ function readRows(deps: TownHallJournalDependencies, state: TownHallJournalState
 }
 
 function readRowsWithPrefix(deps: TownHallJournalDependencies, state: TownHallJournalStateStore, prefix: string): ReceiptRow[] {
-  return state.db.prepare('SELECT id, kind, detail, discord_id FROM receipts WHERE kind LIKE ? ORDER BY id').all(`${prefix}%`)
+  return state.db.prepare("SELECT id, kind, detail, discord_id FROM receipts WHERE kind GLOB ? ORDER BY id").all(`${prefix}*`)
     .filter(row => String(row.kind).startsWith(prefix))
     .map(row => decodeRow(deps, row));
 }
