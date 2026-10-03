@@ -1,5 +1,5 @@
 import { ownDataProperty } from '../agent-message';
-import type { TownHallRoom } from './town-hall-plan';
+import { isTownHallRoom, type TownHallRoom } from './town-hall-plan';
 
 export const TOWN_HALL_ROOM_MARKER = '[discord-surface:town-hall:v1]' as const;
 
@@ -17,6 +17,7 @@ export function validateTownHallRoomIdentity(response: unknown, expected: TownHa
     if (!isRecord(response) || !isRecord(expected)) return false;
     if (!RESPONSE_REQUIRED.every(key => ownDataProperty(response, key))) return false;
     if (!EXPECTED_REQUIRED.every(key => ownDataProperty(expected, key))) return false;
+    if (!isTownHallRoom(expected)) return false;
 
     if (response.id !== expected.channelId) return false;
     if (response.guild_id !== expected.guildId) return false;

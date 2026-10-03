@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const Module = require('node:module');
+const ts = require('typescript');
 
 const {
   TOWN_HALL_ROOM_MARKER,
@@ -257,4 +258,103 @@ test('14 isolated shared-owner sentinel plus registration assertions', () => {
     'the type fixture must pin at least one expected error');
   assert.equal(/\bany\b|@ts-ignore|@ts-nocheck/.test(fixture), false,
     'the type fixture must not use an escape hatch');
+});
+
+
+test('matching malformed room identifiers are refused at both boundaries', () => {
+  const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
+  for (const key of ['guildId', 'channelId']) {
+    for (const value of ['', 7, null, undefined, 'abc', '1'.repeat(21), '1\n', '1\r', '1\u2028', '1\u2029']) {
+      const expected = room({ [key]: value });
+      assert.equal(require('../dist/peer/town-hall-plan').isTownHallRoom(expected), false);
+      const actual = response({ [key === 'guildId' ? 'guild_id' : 'id']: value });
+      assert.equal(validateTownHallRoomIdentity(actual, expected), false);
+      assert.throws(() => planTownHallBroadcast({
+        broadcastId: 'invalid_room', townHall: expected,
+        source: { guildId: expected.guildId, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', generation: 1 },
+        recipients: [{ guildId: expected.guildId, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', generation: 1 }], text: 'fixture'
+      }));
+    }
+  }
+});
+
+test('room identifier length boundaries preserve valid matches', () => {
+  const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
+  for (const id of ['0', '1'.repeat(20)]) {
+    assert.equal(validateTownHallRoomIdentity(response({ id, guild_id: id }), room({ channelId: id, guildId: id })), true);
+    assert.doesNotThrow(() => planTownHallBroadcast({ broadcastId: 'valid_room', townHall: room({ guildId: id, channelId: id }), source: { guildId: id, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', generation: 1 }, recipients: [{ guildId: id, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', generation: 1 }], text: 'fixture' }));
+  }
+});
+
+
+function roomDigitPolicies(records) {
+  const sites = {};
+  for (const { file, text } of records) {
+    const roomContext = /TownHallRoom|\b(?:validate|copy|is)\w*Room\w*\b/.test(text) || /town-hall/.test(file);
+    const ast = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+    const numeric = /\\[dD]|\[(?:\^)?0-9\]/;
+    const boundedId = /(?:\\d|\[0-9\])\{1,20\}/;
+    const visit = node => {
+      let pattern = null;
+      if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
+      else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
+          ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
+          node.arguments?.length && ts.isStringLiteralLike(node.arguments[0])) {
+        pattern = node.arguments[0].text;
+      }
+      if (pattern !== null && numeric.test(pattern) && (roomContext || boundedId.test(pattern))) {
+        sites[file] = (sites[file] || 0) + 1;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+  }
+  return sites;
+}
+
+test('room ID policy has exactly two consumers and the response uses the shared owner', () => {
+  const src = path.join(PROJECT_ROOT, 'src');
+  const references = {};
+  const records = [];
+  for (const relative of fs.readdirSync(src, { recursive: true })) {
+    if (!/\.(?:ts|js)$/.test(relative)) continue;
+    const text = fs.readFileSync(path.join(src, relative), 'utf8');
+    records.push({ file: relative.split(path.sep).join('/'), text });
+    const count = (text.match(/\bisTownHallRoom\b/g) || []).length;
+    if (count) references[relative.split(path.sep).join('/')] = count;
+  }
+  assert.deepEqual(references, { 'peer/town-hall-plan.ts': 2, 'peer/town-hall-room-identity.ts': 2 });
+  const expectedPolicies = { 'agent-attachment.ts': 2, 'agent-message.ts': 3, 'reply-context.ts': 1, 'peer/town-hall-plan.ts': 2 };
+  assert.deepEqual(roomDigitPolicies(records), expectedPolicies);
+  const inline = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return /^\d{1,20}$/.test(room.guildId); }` };
+  assert.notDeepEqual(roomDigitPolicies([...records, inline]), expectedPolicies);
+  const constructor = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return new RegExp('^[0-9]{1,21}$').test(room.guildId); }` };
+  assert.notDeepEqual(roomDigitPolicies([...records, constructor]), expectedPolicies);
+  const directCall = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return RegExp('^[0-9]{1,21}$').test(room.channelId); }` };
+  assert.notDeepEqual(roomDigitPolicies([...records, directCall]), expectedPolicies);
+  const copied = records.map(record => record.file === 'peer/town-hall-room-identity.ts'
+    ? { ...record, text: record.text + inline.text } : record);
+  assert.notDeepEqual(roomDigitPolicies(copied), expectedPolicies);
+
+  const planBuilt = path.join(PROJECT_ROOT, 'dist/peer/town-hall-plan.js');
+  const real = require(planBuilt);
+  const originalLoad = Module._load;
+  const savedOwner = require.cache[OWNER_BUILT];
+  delete require.cache[OWNER_BUILT];
+  let calls = 0;
+  Module._load = function(request, parent, isMain) {
+    if (parent?.filename === OWNER_BUILT && Module._resolveFilename(request, parent, isMain) === planBuilt) {
+      return { ...real, isTownHallRoom() { calls += 1; return false; } };
+    }
+    return originalLoad.apply(this, arguments);
+  };
+  try {
+    assert.equal(ownerRequire()(response(), room()), false);
+    assert.equal(calls, 1);
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[OWNER_BUILT];
+    if (savedOwner) require.cache[OWNER_BUILT] = savedOwner;
+  }
+  assert.equal(ownerRequire()(response(), room()), true);
 });
