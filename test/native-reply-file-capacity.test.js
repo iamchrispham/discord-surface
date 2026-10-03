@@ -12,6 +12,7 @@ const {
   waitForCondition,
   directPreparationSeed
 } = require('./native-reply-file-fixture');
+const { OWNER_EVIDENCE, OWNER_EVIDENCE_REASON } = require('../src/state/process-owner-evidence');
 
 test('startup initial drain wakes a reply-ready native file', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
@@ -202,10 +203,10 @@ test('newest capacity refusal cleanup survives changed caption and reopen', asyn
         assert.throws(() => f.state.prepareNativeReplyFile({ ...input, caption: 'revised caption' }), /file custody capacity is exhausted/);
         const latest = f.state.nativeReplyFilePreparation(id);
         assert.notEqual(latest.preparationId, refused.preparationId);
-        const originalAlive = f.state.directPostOwnerAlive;
-        f.state.directPostOwnerAlive = () => false;
+        const originalEvidence = f.state.directPostOwnerEvidence;
+        f.state.directPostOwnerEvidence = () => ({ status: OWNER_EVIDENCE.ABSENT, reason: OWNER_EVIDENCE_REASON.PROBE_ABSENT });
         try { assert.equal(f.state.releaseNativeReplyFilePreparation(id, latest.preparationId).phase, 'released'); }
-        finally { f.state.directPostOwnerAlive = originalAlive; }
+        finally { f.state.directPostOwnerEvidence = originalEvidence; }
         assert.equal(f.state.nativeReplyFilePreparation(id).preparationId, latest.preparationId);
         assert.equal(f.state.nativeReplyFilePreparation(id).phase, 'released');
         assert.equal(f.state.activeFilePreparationCount(), 8);

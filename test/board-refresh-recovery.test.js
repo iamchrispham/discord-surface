@@ -5,6 +5,19 @@ const {
   fixture, runChild, recoveryEvidence, seedBoardAttempt, rewriteBoardAttemptContent,
   seedBoardOutcome, runRecoverChild
 } = require('./board-refresh-fixture');
+const { OWNER_EVIDENCE, OWNER_EVIDENCE_REASON } = require('../src/state/process-owner-evidence');
+
+// The orphan's producer is recorded as a PID that the OS probe proves absent
+// (ESRCH). Empty identity is fine: a proved ESRCH is absence by itself.
+function recordAbsentOwner(state, attemptId) {
+  const row = state.db.prepare("SELECT id, detail FROM receipts WHERE kind='board-refresh-attempt' AND json_extract(detail, '$.attemptId')=?").get(attemptId);
+  assert.ok(row);
+  const detail = JSON.parse(row.detail);
+  state.db.prepare('UPDATE receipts SET detail=? WHERE id=?').run(
+    JSON.stringify({ ...detail, ownerPid: 999999 }),
+    row.id
+  );
+}
 
 test('board recovery returns applied history without writing a receipt', async t => {
   const f = fixture();
@@ -100,8 +113,9 @@ test('board recovery preserves in-flight refusal and unknown evidence reconcilia
     /has no outcome to reconcile/
   );
   assert.deepEqual(missing.state.listReceipts(), missingBefore);
-  assert.equal(missing.state.recoverBoardRefreshAttempt({ ...missingSeed.target, messageId: 'other-target' }, missingSeed.attemptId, () => false), 0);
+  assert.equal(missing.state.recoverBoardRefreshAttempt({ ...missingSeed.target, messageId: 'other-target' }, missingSeed.attemptId, () => ({ status: OWNER_EVIDENCE.ABSENT, reason: OWNER_EVIDENCE_REASON.PROBE_ABSENT })), 0);
   assert.equal(missing.state.inspectBoardRequest('recover-missing', missingSeed.target).status, BOARD_OUTCOMES.IN_FLIGHT);
+  recordAbsentOwner(missing.state, missingSeed.attemptId);
   missing.state.close();
   const missingEvidence = recoveryEvidence('new board', new Date(Date.now() + 5000).toISOString());
   const recoveredChild = await runRecoverChild(missing, missingSeed.attemptId, missingEvidence);

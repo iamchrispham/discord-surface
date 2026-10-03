@@ -1,4 +1,5 @@
 import type { DecisionResult } from '../decision/types';
+import type { ProcessOwnerEvidence } from '../process-owner-evidence';
 import type { INTERACTION_TRANSPORT } from './constants';
 
 interface SqlRow {
@@ -70,6 +71,7 @@ export interface InteractionState {
   receipt(discordId: string | null, kind: string, detail: unknown): void;
   directPostOwnerIdentity?(pid: number): unknown;
   directPostOwnerAlive?(pid: number, expectedIdentity: unknown): boolean;
+  directPostOwnerEvidence?(pid: number, expectedIdentity?: unknown): ProcessOwnerEvidence;
   ordinaryHandoffPauses?: Set<string>;
 }
 
