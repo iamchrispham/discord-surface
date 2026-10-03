@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   DIRECT_POST_OUTCOMES,
+  DIRECT_POST_PART_STATUSES,
   TOWN_HALL_PUBLICATION_EVENTS,
   TOWN_HALL_PUBLICATION_RECEIPTS,
   type DirectPostOutcome,
@@ -8,6 +9,7 @@ import {
   type TownHallPublication,
   type TownHallPublicationDependencies,
   type TownHallPublicationConfirmationEvidence,
+  type TownHallPublicationEvent,
   type TownHallPublicationOwner,
   type TownHallPublicationStateStore
 } from './types';
@@ -36,8 +38,14 @@ const COMMON_DETAIL_KEYS = ['version', 'journalKey', 'fingerprint', 'event', 'at
 const OWNER_KEYS = ['ownerPid', 'ownerStartTime', 'ownerCommand'] as const;
 const OUTCOME_EXTRA_KEYS = ['outcome', 'messageId'] as const;
 const CONFIRMED_EXTRA_KEYS = ['messageId', 'guildId', 'channelId'] as const;
+const OUTCOME_DETAIL_KEYS = ['messageId'] as const;
 const EVIDENCE_KEYS = ['messageId', 'nonce', 'guildId', 'channelId'] as const;
-const BLOCKED_RESERVE_STATUSES = new Set(['claimed', 'in_flight', 'sent', 'unknown']);
+const BLOCKED_RESERVE_STATUSES = new Set<string>([
+  DIRECT_POST_PART_STATUSES.CLAIMED,
+  DIRECT_POST_PART_STATUSES.IN_FLIGHT,
+  DIRECT_POST_OUTCOMES.SENT,
+  DIRECT_POST_OUTCOMES.UNKNOWN
+]);
 
 interface ReceiptRow {
   id: number;
@@ -74,14 +82,52 @@ function reject(deps: TownHallPublicationDependencies): never {
   throw new deps.StateCorruptError(CORRUPT_MESSAGE);
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+// The single workflow-owned own-data snapshot. It rejects arrays, nonobjects, own
+// symbol keys, accessor descriptors and unexpected keys; it never evaluates getters.
+// Each descriptor value is read exactly once into a fresh ordinary record, which is
+// then used for every validation, comparison and append read. Keys may be resolved
+// from the captured snapshot itself when the required set depends on a field value.
+function snapshotOwnData(
+  value: unknown,
+  keys: readonly string[] | ((record: Record<string, unknown>) => readonly string[] | null),
+  exact: boolean
+): Record<string, unknown> | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (Object.getOwnPropertySymbols(value).length !== 0) return null;
+  const names = Object.getOwnPropertyNames(value);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const snapshot: Record<string, unknown> = {};
+  for (const name of names) {
+    const descriptor = descriptors[name] as PropertyDescriptor | undefined;
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) return null;
+    snapshot[name] = descriptor.value;
+  }
+  const required = typeof keys === 'function' ? keys(snapshot) : keys;
+  if (required === null) return null;
+  if (exact && names.length !== required.length) return null;
+  if (!names.every(name => (required as readonly string[]).includes(name))) return null;
+  return snapshot;
 }
 
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  if (Object.getOwnPropertySymbols(value).length !== 0) return false;
-  const names = Object.getOwnPropertyNames(value);
-  return names.length === keys.length && names.every(name => keys.includes(name));
+function isDirectPostOutcome(value: unknown): value is DirectPostOutcome {
+  return typeof value === 'string' && (Object.values(DIRECT_POST_OUTCOMES) as readonly string[]).includes(value);
+}
+
+function isPublicationEvent(value: unknown): value is TownHallPublicationEvent {
+  return value === TOWN_HALL_PUBLICATION_EVENTS.RESERVED ||
+    value === TOWN_HALL_PUBLICATION_EVENTS.IN_FLIGHT ||
+    value === TOWN_HALL_PUBLICATION_EVENTS.OUTCOME ||
+    value === TOWN_HALL_PUBLICATION_EVENTS.CONFIRMED;
+}
+
+function eventKeysFor(record: Record<string, unknown>): readonly string[] | null {
+  const event = record.event;
+  if (event === TOWN_HALL_PUBLICATION_EVENTS.OUTCOME) return [...COMMON_DETAIL_KEYS, ...OUTCOME_EXTRA_KEYS];
+  if (event === TOWN_HALL_PUBLICATION_EVENTS.CONFIRMED) return [...COMMON_DETAIL_KEYS, ...CONFIRMED_EXTRA_KEYS];
+  if (event === TOWN_HALL_PUBLICATION_EVENTS.RESERVED || event === TOWN_HALL_PUBLICATION_EVENTS.IN_FLIGHT) {
+    return COMMON_DETAIL_KEYS;
+  }
+  return null;
 }
 
 function assertJournalKey(deps: TownHallPublicationDependencies, journalKey: string): string {
@@ -134,44 +180,37 @@ function canonicalEvent(
   detail: string
 ): DecodedEvent {
   const parsed = parseDetail(deps, detail);
-  if (!isPlainRecord(parsed)) reject(deps);
-  const event = parsed.event;
-  if (event !== TOWN_HALL_PUBLICATION_EVENTS.RESERVED &&
-      event !== TOWN_HALL_PUBLICATION_EVENTS.IN_FLIGHT &&
-      event !== TOWN_HALL_PUBLICATION_EVENTS.OUTCOME &&
-      event !== TOWN_HALL_PUBLICATION_EVENTS.CONFIRMED) reject(deps);
-  const eventKeys = event === TOWN_HALL_PUBLICATION_EVENTS.OUTCOME
-    ? [...COMMON_DETAIL_KEYS, ...OUTCOME_EXTRA_KEYS]
-    : event === TOWN_HALL_PUBLICATION_EVENTS.CONFIRMED
-      ? [...COMMON_DETAIL_KEYS, ...CONFIRMED_EXTRA_KEYS]
-      : [...COMMON_DETAIL_KEYS];
-  if (!hasExactKeys(parsed, eventKeys)) reject(deps);
-  if (parsed.version !== 1 || parsed.journalKey !== context.journalKey) reject(deps);
-  if (parsed.fingerprint !== context.fingerprint || parsed.nonce !== context.nonce) reject(deps);
-  if (typeof parsed.attemptId !== 'string' || parsed.attemptId.length === 0) reject(deps);
-  if (!isPlainRecord(parsed.owner) || !hasExactKeys(parsed.owner, OWNER_KEYS)) reject(deps);
-  const owner = parsed.owner as unknown as TownHallPublicationOwner;
+  const eventRecord = snapshotOwnData(parsed, eventKeysFor, true);
+  if (eventRecord === null) reject(deps);
+  const event = eventRecord.event;
+  if (typeof event !== 'string' || !isPublicationEvent(event)) reject(deps);
+  const ownerRecord = snapshotOwnData(eventRecord.owner, OWNER_KEYS, true);
+  if (ownerRecord === null) reject(deps);
+  if (eventRecord.version !== 1 || eventRecord.journalKey !== context.journalKey) reject(deps);
+  if (eventRecord.fingerprint !== context.fingerprint || eventRecord.nonce !== context.nonce) reject(deps);
+  if (typeof eventRecord.attemptId !== 'string' || eventRecord.attemptId.length === 0) reject(deps);
+  const owner = ownerRecord as unknown as TownHallPublicationOwner;
   if (!validOwner(owner)) reject(deps);
   const decoded: DecodedEvent = {
     event,
-    attemptId: parsed.attemptId,
+    attemptId: eventRecord.attemptId as string,
     owner: copyOwner(owner),
     outcome: null,
     messageId: null
   };
   if (event === TOWN_HALL_PUBLICATION_EVENTS.OUTCOME) {
-    const outcome = parsed.outcome;
-    if (typeof outcome !== 'string' || !(Object.values(DIRECT_POST_OUTCOMES) as readonly string[]).includes(outcome)) reject(deps);
-    if (outcome === 'sent') {
-      if (typeof parsed.messageId !== 'string' || parsed.messageId.length === 0) reject(deps);
-    } else if (parsed.messageId !== null) reject(deps);
+    const outcome = eventRecord.outcome;
+    if (!isDirectPostOutcome(outcome)) reject(deps);
+    if (outcome === DIRECT_POST_OUTCOMES.SENT) {
+      if (typeof eventRecord.messageId !== 'string' || eventRecord.messageId.length === 0) reject(deps);
+    } else if (eventRecord.messageId !== null) reject(deps);
     decoded.outcome = outcome;
-    decoded.messageId = outcome === 'sent' ? String(parsed.messageId) : null;
+    decoded.messageId = outcome === DIRECT_POST_OUTCOMES.SENT ? String(eventRecord.messageId) : null;
   }
   if (event === TOWN_HALL_PUBLICATION_EVENTS.CONFIRMED) {
-    if (typeof parsed.messageId !== 'string' || parsed.messageId.length === 0) reject(deps);
-    if (parsed.guildId !== context.guildId || parsed.channelId !== context.channelId) reject(deps);
-    decoded.messageId = parsed.messageId;
+    if (typeof eventRecord.messageId !== 'string' || eventRecord.messageId.length === 0) reject(deps);
+    if (eventRecord.guildId !== context.guildId || eventRecord.channelId !== context.channelId) reject(deps);
+    decoded.messageId = eventRecord.messageId as string;
   }
   return decoded;
 }
@@ -265,7 +304,7 @@ function appendEvent(
 }
 
 function messageIdFor(outcome: DirectPostOutcome, detail: Record<string, unknown> | undefined): string | null {
-  if (outcome !== 'sent') return null;
+  if (outcome !== DIRECT_POST_OUTCOMES.SENT) return null;
   return String(detail?.messageId);
 }
 
@@ -316,10 +355,10 @@ export function markTownHallPublicationInFlight(
     if (!currentMatchesStored(deps, state, projection.owner)) {
       throw new deps.BindingError(MARK_REFUSED_MESSAGE);
     }
-    if (projection.status === 'in_flight') {
+    if (projection.status === DIRECT_POST_PART_STATUSES.IN_FLIGHT) {
       return { started: false, publication: publicationOf(context, projection) };
     }
-    if (projection.status !== 'claimed') {
+    if (projection.status !== DIRECT_POST_PART_STATUSES.CLAIMED) {
       throw new deps.BindingError(MARK_REFUSED_MESSAGE);
     }
     appendEvent(state, context, TOWN_HALL_PUBLICATION_EVENTS.IN_FLIGHT, attemptId, projection.owner as TownHallPublicationOwner, {});
@@ -346,35 +385,34 @@ export function recordTownHallPublicationOutcome(
       throw new deps.BindingError(RECORD_REFUSED_MESSAGE);
     }
     if (!currentMatchesStored(deps, state, projection.owner)) throw new deps.BindingError(RECORD_REFUSED_MESSAGE);
-    if (typeof outcome !== 'string' || !(Object.values(DIRECT_POST_OUTCOMES) as readonly string[]).includes(outcome)) {
+    if (!isDirectPostOutcome(outcome)) {
       throw new deps.BindingError(INVALID_OUTCOME_MESSAGE);
     }
+    let detailRecord: Record<string, unknown> | undefined;
     if (detail !== undefined) {
-      if (!isPlainRecord(detail)) throw new deps.BindingError(RECORD_REFUSED_MESSAGE);
-      if (Object.getOwnPropertySymbols(detail).length !== 0) throw new deps.BindingError(RECORD_REFUSED_MESSAGE);
-      if (!Object.getOwnPropertyNames(detail).every(name => name === 'messageId')) {
-        throw new deps.BindingError(RECORD_REFUSED_MESSAGE);
-      }
+      const snapshot = snapshotOwnData(detail, OUTCOME_DETAIL_KEYS, false);
+      if (snapshot === null) throw new deps.BindingError(RECORD_REFUSED_MESSAGE);
+      detailRecord = snapshot;
     }
-    const hasMessageId = detail !== undefined && Object.prototype.hasOwnProperty.call(detail, 'messageId');
-    if (outcome === 'sent') {
-      if (!hasMessageId || typeof detail?.messageId !== 'string' || detail.messageId.length === 0) {
+    const hasMessageId = detailRecord !== undefined && Object.prototype.hasOwnProperty.call(detailRecord, 'messageId');
+    if (outcome === DIRECT_POST_OUTCOMES.SENT) {
+      if (!hasMessageId || typeof detailRecord?.messageId !== 'string' || detailRecord.messageId.length === 0) {
         throw new deps.BindingError(RECORD_REFUSED_MESSAGE);
       }
     } else if (hasMessageId) {
       throw new deps.BindingError(RECORD_REFUSED_MESSAGE);
     }
     if (group.outcome !== null) {
-      const identical = group.outcome === outcome && group.outcomeMessageId === messageIdFor(outcome, detail);
+      const identical = group.outcome === outcome && group.outcomeMessageId === messageIdFor(outcome, detailRecord);
       if (identical) return publicationOf(context, projection);
       throw new deps.BindingError(OUTCOME_CONFLICT_MESSAGE);
     }
-    if (projection.status === 'claimed' && outcome !== 'not_sent') {
+    if (projection.status === DIRECT_POST_PART_STATUSES.CLAIMED && outcome !== DIRECT_POST_OUTCOMES.NOT_SENT) {
       throw new deps.BindingError(RECORD_REFUSED_MESSAGE);
     }
     appendEvent(state, context, TOWN_HALL_PUBLICATION_EVENTS.OUTCOME, attemptId, projection.owner as TownHallPublicationOwner, {
       outcome,
-      messageId: messageIdFor(outcome, detail)
+      messageId: messageIdFor(outcome, detailRecord)
     });
     const updated = decodePublication(deps, state, context);
     return publicationOf(context, updated.projection);
@@ -398,30 +436,31 @@ export function confirmTownHallPublication(
       throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
     }
     if (!currentMatchesStored(deps, state, projection.owner)) throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
-    if (!isPlainRecord(evidence) || !hasExactKeys(evidence as unknown as Record<string, unknown>, EVIDENCE_KEYS)) {
+    const evidenceRecord = snapshotOwnData(evidence, EVIDENCE_KEYS, true);
+    if (evidenceRecord === null) {
       throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
     }
-    if (typeof evidence.messageId !== 'string' || evidence.messageId.length === 0 ||
-        typeof evidence.nonce !== 'string' || evidence.nonce.length === 0 ||
-        typeof evidence.guildId !== 'string' || evidence.guildId.length === 0 ||
-        typeof evidence.channelId !== 'string' || evidence.channelId.length === 0) {
+    if (typeof evidenceRecord.messageId !== 'string' || evidenceRecord.messageId.length === 0 ||
+        typeof evidenceRecord.nonce !== 'string' || evidenceRecord.nonce.length === 0 ||
+        typeof evidenceRecord.guildId !== 'string' || evidenceRecord.guildId.length === 0 ||
+        typeof evidenceRecord.channelId !== 'string' || evidenceRecord.channelId.length === 0) {
       throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
     }
     if (group.confirmed) {
-      const identical = group.confirmedMessageId === evidence.messageId &&
-        evidence.nonce === context.nonce &&
-        evidence.guildId === context.guildId &&
-        evidence.channelId === context.channelId;
+      const identical = group.confirmedMessageId === evidenceRecord.messageId &&
+        evidenceRecord.nonce === context.nonce &&
+        evidenceRecord.guildId === context.guildId &&
+        evidenceRecord.channelId === context.channelId;
       if (identical) return publicationOf(context, projection);
       throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
     }
-    if (projection.status !== 'unknown') throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
-    if (evidence.nonce !== context.nonce) throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
-    if (evidence.guildId !== context.guildId || evidence.channelId !== context.channelId) {
+    if (projection.status !== DIRECT_POST_OUTCOMES.UNKNOWN) throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
+    if (evidenceRecord.nonce !== context.nonce) throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
+    if (evidenceRecord.guildId !== context.guildId || evidenceRecord.channelId !== context.channelId) {
       throw new deps.BindingError(CONFIRM_REFUSED_MESSAGE);
     }
     appendEvent(state, context, TOWN_HALL_PUBLICATION_EVENTS.CONFIRMED, attemptId, projection.owner as TownHallPublicationOwner, {
-      messageId: evidence.messageId,
+      messageId: evidenceRecord.messageId,
       guildId: context.guildId,
       channelId: context.channelId
     });
@@ -456,7 +495,8 @@ export function recoverTownHallPublication(
   const key = assertJournalKey(deps, journalKey);
   const context = readContext(deps, state, key);
   const first = decodePublication(deps, state, context);
-  if (first.projection.status !== 'claimed' && first.projection.status !== 'in_flight') {
+  if (first.projection.status !== DIRECT_POST_PART_STATUSES.CLAIMED &&
+      first.projection.status !== DIRECT_POST_PART_STATUSES.IN_FLIGHT) {
     return publicationOf(context, first.projection);
   }
   const owner = first.projection.owner as TownHallPublicationOwner;
@@ -470,8 +510,12 @@ export function recoverTownHallPublication(
     const storedOwner = second.projection.owner as TownHallPublicationOwner;
     const attemptId = second.projection.attemptId as string;
     let outcome: DirectPostOutcome | null = null;
-    if (liveness === 'absent' && second.projection.status === 'claimed') outcome = 'not_sent';
-    if (second.projection.status === 'in_flight' && liveness !== 'matching-live') outcome = 'unknown';
+    if (liveness === 'absent' && second.projection.status === DIRECT_POST_PART_STATUSES.CLAIMED) {
+      outcome = DIRECT_POST_OUTCOMES.NOT_SENT;
+    }
+    if (second.projection.status === DIRECT_POST_PART_STATUSES.IN_FLIGHT && liveness !== 'matching-live') {
+      outcome = DIRECT_POST_OUTCOMES.UNKNOWN;
+    }
     if (outcome === null) return publicationOf(context, second.projection);
     appendEvent(state, context, TOWN_HALL_PUBLICATION_EVENTS.OUTCOME, attemptId, storedOwner, {
       outcome,

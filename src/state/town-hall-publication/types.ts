@@ -3,7 +3,7 @@ import {
   DIRECT_POST_PART_STATUSES
 } from '../../direct-post/contracts';
 import type { DirectPostOutcome, DirectPostPartStatus } from '../../direct-post/contracts';
-import type { TownHallBroadcastSnapshot } from '../town-hall-journal/types';
+import type { TownHallBroadcastSnapshot, TownHallJournalState } from '../town-hall-journal/types';
 
 export const TOWN_HALL_PUBLICATION_RECEIPTS = Object.freeze({
   INSTRUCTION_PREFIX: 'town-hall-instruction/v1:',
@@ -18,7 +18,7 @@ export const TOWN_HALL_PUBLICATION_EVENTS = Object.freeze({
 } as const);
 
 export type TownHallPublicationEvent = (typeof TOWN_HALL_PUBLICATION_EVENTS)[keyof typeof TOWN_HALL_PUBLICATION_EVENTS];
-export type TownHallPublicationStatus = 'planned' | DirectPostPartStatus;
+export type TownHallPublicationStatus = TownHallJournalState | DirectPostPartStatus;
 
 export interface TownHallPublicationOwner {
   readonly ownerPid: number;

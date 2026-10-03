@@ -1,5 +1,6 @@
-import { TOWN_HALL_PUBLICATION_EVENTS, TOWN_HALL_PUBLICATION_RECEIPTS } from './types';
+import { DIRECT_POST_OUTCOMES, DIRECT_POST_PART_STATUSES, TOWN_HALL_PUBLICATION_EVENTS, TOWN_HALL_PUBLICATION_RECEIPTS } from './types';
 import type { TownHallPublication, TownHallPublicationOwner, TownHallPublicationStatus } from './types';
+import { TOWN_HALL_JOURNAL_STATES } from '../town-hall-journal/types';
 
 export interface PublicationEvent {
   readonly event: string;
@@ -28,7 +29,12 @@ export interface PublicationProjection {
   readonly messageId: string | null;
 }
 
-const RETRYABLE_OUTCOMES = new Set(['not_sent', 'rejected', 'rate_limited', 'stale']);
+const RETRYABLE_OUTCOMES = new Set<string>([
+  DIRECT_POST_OUTCOMES.NOT_SENT,
+  DIRECT_POST_OUTCOMES.REJECTED,
+  DIRECT_POST_OUTCOMES.RATE_LIMITED,
+  DIRECT_POST_OUTCOMES.STALE
+]);
 
 export function publicationKeyFor(journalKey: string): string {
   return TOWN_HALL_PUBLICATION_RECEIPTS.INSTRUCTION_PREFIX + journalKey;
@@ -41,10 +47,10 @@ function sameOwner(left: TownHallPublicationOwner, right: TownHallPublicationOwn
 }
 
 function groupStatus(group: AttemptGroup): TownHallPublicationStatus {
-  if (group.confirmed) return 'sent';
+  if (group.confirmed) return DIRECT_POST_OUTCOMES.SENT;
   if (group.outcome !== null) return group.outcome as TownHallPublicationStatus;
-  if (group.inFlight) return 'in_flight';
-  return 'claimed';
+  if (group.inFlight) return DIRECT_POST_PART_STATUSES.IN_FLIGHT;
+  return DIRECT_POST_PART_STATUSES.CLAIMED;
 }
 
 export function groupEvents(events: readonly PublicationEvent[]): AttemptGroup[] {
@@ -80,11 +86,11 @@ export function groupEvents(events: readonly PublicationEvent[]): AttemptGroup[]
         break;
       case TOWN_HALL_PUBLICATION_EVENTS.OUTCOME:
         if (current.outcome !== null || current.confirmed) throw new Error('misordered outcome event');
-        if (!current.inFlight && event.outcome !== 'not_sent') throw new Error('outcome before in-flight');
+        if (!current.inFlight && event.outcome !== DIRECT_POST_OUTCOMES.NOT_SENT) throw new Error('outcome before in-flight');
         current = { ...current, outcome: event.outcome ?? null, outcomeMessageId: event.messageId ?? null };
         break;
       case TOWN_HALL_PUBLICATION_EVENTS.CONFIRMED:
-        if (current.confirmed || current.outcome !== 'unknown') throw new Error('misordered confirmation event');
+        if (current.confirmed || current.outcome !== DIRECT_POST_OUTCOMES.UNKNOWN) throw new Error('misordered confirmation event');
         current = { ...current, confirmed: true, confirmedMessageId: event.messageId ?? null };
         break;
       default:
@@ -98,18 +104,18 @@ export function groupEvents(events: readonly PublicationEvent[]): AttemptGroup[]
 export function deriveProjection(groups: readonly AttemptGroup[], nonce: string): PublicationProjection {
   const latest = groups.length === 0 ? null : groups[groups.length - 1];
   if (!latest) {
-    return Object.freeze({ status: 'planned', attemptId: null, nonce, owner: null, messageId: null });
+    return Object.freeze({ status: TOWN_HALL_JOURNAL_STATES.PLANNED, attemptId: null, nonce, owner: null, messageId: null });
   }
-  let status: TownHallPublicationStatus = 'claimed';
+  let status: TownHallPublicationStatus = DIRECT_POST_PART_STATUSES.CLAIMED;
   let messageId: string | null = null;
   if (latest.confirmed) {
-    status = 'sent';
+    status = DIRECT_POST_OUTCOMES.SENT;
     messageId = latest.confirmedMessageId;
   } else if (latest.outcome !== null) {
     status = latest.outcome as TownHallPublicationStatus;
-    messageId = latest.outcome === 'sent' ? latest.outcomeMessageId : null;
+    messageId = latest.outcome === DIRECT_POST_OUTCOMES.SENT ? latest.outcomeMessageId : null;
   } else if (latest.inFlight) {
-    status = 'in_flight';
+    status = DIRECT_POST_PART_STATUSES.IN_FLIGHT;
   }
   return Object.freeze({ status, attemptId: latest.attemptId, nonce, owner: latest.owner, messageId });
 }

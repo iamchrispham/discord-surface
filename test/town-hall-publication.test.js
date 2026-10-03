@@ -201,64 +201,176 @@ try {
 `;
 
 const CHILD_SOURCE = `
-const { SurfaceState } = require(process.env.DOWN_STATE);
+// The referenced self-destruct timer is armed BEFORE any require so a child
+// that hangs in module loading or holds the reservation cannot outlive its
+// deadline. It is cleared only on actual normal completion.
+const CHILD_DEADLINE_MS = Number(process.env.DOWN_CHILD_DEADLINE_MS || 8000);
+const selfDestruct = setTimeout(() => {
+  process.stderr.write('publication child deadline elapsed before completion');
+  process.exit(97);
+}, CHILD_DEADLINE_MS);
 let state = null;
+let result = null;
+let failed = false;
 try {
+  const { SurfaceState } = require(process.env.DOWN_STATE);
   state = new SurfaceState(process.env.DOWN_DB);
-  const result = state.reserveTownHallPublication(process.env.DOWN_JOURNAL_KEY);
-  process.stdout.write(JSON.stringify({
-    claimed: result.claimed,
-    status: result.publication.status,
-    attemptId: result.publication.attemptId,
-    journalKey: result.publication.journalKey
-  }));
+  const reserved = state.reserveTownHallPublication(process.env.DOWN_JOURNAL_KEY);
+  result = {
+    claimed: reserved.claimed,
+    status: reserved.publication.status,
+    attemptId: reserved.publication.attemptId,
+    journalKey: reserved.publication.journalKey
+  };
 } catch (error) {
+  failed = true;
   process.stderr.write(String((error && error.stack) || error));
-  process.exitCode = 1;
 } finally {
   if (state) { try { state.close(); } catch {} }
 }
+if (failed) {
+  // The failure path exits immediately; the timer stays armed (never cleared).
+  process.exit(1);
+} else if (process.env.DOWN_CHILD_KEEP_ALIVE === '1') {
+  // Fixture keeps the child alive until the self-destruct deadline or SIGKILL.
+} else {
+  if (process.env.DOWN_CHILD_EMPTY_OUTPUT !== '1') {
+    process.stdout.write(JSON.stringify(result));
+  }
+  clearTimeout(selfDestruct);
+}
 `;
 
-function reserveWithChild(dbPath, journalKey, timeoutMs = 10000) {
+function reserveWithChild(dbPath, journalKey, options = {}) {
+  const timeoutMs = options.timeoutMs === undefined ? 10000 : options.timeoutMs;
+  const childDeadlineMs = options.childDeadlineMs === undefined ? 8000 : options.childDeadlineMs;
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['-e', CHILD_SOURCE], {
-      env: {
-        ...process.env,
-        DOWN_DB: dbPath,
-        DOWN_JOURNAL_KEY: journalKey,
-        DOWN_STATE: require.resolve('../src/state')
-      },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
+    let child;
+    try {
+      child = spawn(process.execPath, ['-e', CHILD_SOURCE], {
+        env: {
+          ...process.env,
+          DOWN_DB: dbPath,
+          DOWN_JOURNAL_KEY: journalKey,
+          DOWN_STATE: require.resolve('../src/state'),
+          DOWN_CHILD_DEADLINE_MS: String(childDeadlineMs),
+          DOWN_CHILD_KEEP_ALIVE: options.keepAlive ? '1' : '0',
+          DOWN_CHILD_EMPTY_OUTPUT: options.emptyOutput ? '1' : '0'
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+    } catch (error) {
+      // A synchronous spawn failure has no PID, so there is nothing to reap.
+      reject(error);
+      return;
+    }
+
     let stdout = '';
     let stderr = '';
     let settled = false;
+    let timedOut = false;
+    let spawnError = null;
+    let killError = null;
+    let timer = null;
+    let stdoutEnded = false;
+    let stderrEnded = false;
+    // `closeObserved` is set only by the event-loop 'close' event, never by the
+    // timeout callback and never by 'exit'. It is captured at settle time, so a
+    // rejection that fires before 'close' carries closeObserved === false.
+    let closeObserved = false;
+
+    // The fixture database state is untouched until the child 'close' event
+    // proves the process has actually exited and been reaped.
     const settle = (callback, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       callback(value);
     };
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch {}
-      settle(reject, new Error('publication child reservation timed out'));
+    const fail = error => {
+      if (child.pid !== undefined) error.pid = child.pid;
+      error.closeObserved = closeObserved && stdoutEnded && stderrEnded;
+      settle(reject, error);
+    };
+    const requestKill = () => {
+      try {
+        if (!child.kill('SIGKILL')) {
+          killError = new Error('child.kill(SIGKILL) returned false');
+        }
+      } catch (error) {
+        killError = error;
+      }
+    };
+
+    // The parent deadline starts at spawn. It records the timeout and requests
+    // SIGKILL, but never settles: only 'close' proves the child exited.
+    timer = setTimeout(() => {
+      timedOut = true;
+      requestKill();
     }, timeoutMs);
+
     child.stdout.on('data', chunk => { stdout += chunk; });
     child.stderr.on('data', chunk => { stderr += chunk; });
-    child.once('error', error => settle(reject, error));
-    child.once('exit', (code, signal) => {
+    child.stdout.on('end', () => { stdoutEnded = true; });
+    child.stderr.on('end', () => { stderrEnded = true; });
+    // Independent close observation registered before the settling handler so
+    // the marker is already true when the genuine 'close' handler runs.
+    child.once('close', () => { closeObserved = true; });
+
+    // A spawn error without a PID settles safely with no kill. With a PID the
+    // reap obligation remains and 'close' settles the promise.
+    child.once('error', error => {
+      spawnError = error;
+      if (child.pid === undefined) fail(error);
+    });
+
+    child.once('close', (code, signal) => {
+      if (timedOut) {
+        const killNote = killError ? `; kill failed: ${killError.message}` : '';
+        const spawnNote = spawnError ? `; spawn error: ${spawnError.message}` : '';
+        fail(new Error(
+          `publication child reservation timed out after ${timeoutMs}ms (code ${code} signal ${signal})`
+          + `${killNote}${spawnNote}`
+        ));
+        return;
+      }
+      if (spawnError) {
+        fail(spawnError);
+        return;
+      }
       if (code !== 0) {
-        settle(reject, new Error(`publication child exited code ${code} signal ${signal}: ${stderr}`));
+        fail(new Error(`publication child exited code ${code} signal ${signal}: ${stderr}`));
+        return;
+      }
+      const output = stdout.trim();
+      if (output === '') {
+        fail(new Error(`publication child produced unusable output ${JSON.stringify(stdout)}: empty output`));
         return;
       }
       try {
-        settle(resolve, { pid: child.pid, result: JSON.parse(stdout.trim()) });
+        settle(resolve, { pid: child.pid, result: JSON.parse(output) });
       } catch (error) {
-        settle(reject, new Error(`publication child produced unusable output ${JSON.stringify(stdout)}: ${error.message}`));
+        fail(new Error(`publication child produced unusable output ${JSON.stringify(stdout)}: ${error.message}`));
       }
     });
   });
+}
+
+// Bounded ESRCH proof: after a rejection, the child PID must be gone.
+async function waitForChildGone(pid, label) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      assert.equal(error.code, 'ESRCH', `${label}: expected ESRCH for pid ${pid}, got ${error.code || error.message}`);
+      return;
+    }
+    if (Date.now() >= deadline) {
+      assert.fail(`${label}: pid ${pid} still exists after rejection`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
 }
 
 test('planned publication reads without writes', t => {
@@ -587,6 +699,56 @@ test('reserved absent owner releases only matching claim', async t => {
     'old token after release'
   );
   assert.equal(publicationRows(f.state, journalKey).length, 2);
+});
+
+test('publication child deadlines finish after process exit', { timeout: 60000 }, async t => {
+  const f = fixture(t);
+  const created = f.state.createTownHallBroadcast(input());
+  const journalKey = created.broadcast.journalKey;
+
+  // (a) Child self-destruct deadline: the child exits on its own before the
+  // parent deadline, and rejection is settled only after it is gone.
+  let childPid = null;
+  try {
+    await reserveWithChild(f.dbPath, journalKey, { timeoutMs: 15000, childDeadlineMs: 300, keepAlive: true });
+    assert.fail('child self-destruct must reject');
+  } catch (error) {
+    assert.match(error.message, /publication child exited code 97/);
+    assert.equal(typeof error.pid, 'number');
+    assert.equal(error.closeObserved, true, 'rejection must settle after the child close event');
+    childPid = error.pid;
+  }
+  await waitForChildGone(childPid, 'child self-destruct');
+
+  // (b) Parent deadline: the parent SIGKILLs the still-alive child and settles
+  // only after the close event. The closeObserved marker is attached only in
+  // the 'close' path, so an early rejection from the timeout callback, or an
+  // 'exit'-instead-of-'close' mutation, both fail this assertion.
+  let killedPid = null;
+  try {
+    await reserveWithChild(f.dbPath, journalKey, { timeoutMs: 250, childDeadlineMs: 15000, keepAlive: true });
+    assert.fail('parent deadline must reject');
+  } catch (error) {
+    assert.match(error.message, /publication child reservation timed out after 250ms/);
+    assert.equal(typeof error.pid, 'number');
+    assert.equal(error.closeObserved, true, 'timeout rejection must settle only after the child close event');
+    killedPid = error.pid;
+  }
+  await waitForChildGone(killedPid, 'parent deadline SIGKILL');
+
+  // (c) Empty output: the child exits 0 with no stdout and settles after close.
+  let emptyPid = null;
+  try {
+    await reserveWithChild(f.dbPath, journalKey, { timeoutMs: 15000, childDeadlineMs: 5000, emptyOutput: true });
+    assert.fail('empty output must reject');
+  } catch (error) {
+    assert.match(error.message, /unusable output/);
+    assert.equal(error.closeObserved, true, 'empty-output rejection must settle after the child close event');
+    emptyPid = error.pid;
+  }
+  await waitForChildGone(emptyPid, 'empty output');
+
+  assert.ok(childPid !== null && childPid !== killedPid && childPid !== emptyPid, 'one child per case');
 });
 
 test('reserved indeterminate owner remains held', t => {
@@ -1308,7 +1470,7 @@ function confirmCaseFailures(state, field, variant) {
   return failures;
 }
 
-test('outcome detail rejects accessor fields before reads', { todo: 'publication-own-data' }, t => {
+test('outcome detail rejects accessor fields before reads', t => {
   const f = fixture(t);
   const control = seedInFlight(f.state, 'rec-control');
   const sent = f.state.recordTownHallPublicationOutcome(control.journalKey, control.attemptId, 'sent', { messageId: '123' });
@@ -1329,7 +1491,7 @@ test('outcome detail rejects accessor fields before reads', { todo: 'publication
   assert.equal(failures.length, 0, failures.join('\n'));
 });
 
-test('confirmation evidence rejects accessor fields before reads', { todo: 'publication-own-data' }, t => {
+test('confirmation evidence rejects accessor fields before reads', t => {
   const f = fixture(t);
   const control = seedInFlight(f.state, 'conf-control');
   f.state.recordTownHallPublicationOutcome(control.journalKey, control.attemptId, 'unknown');
@@ -1350,4 +1512,407 @@ test('confirmation evidence rejects accessor fields before reads', { todo: 'publ
     }
   }
   assert.equal(failures.length, 0, failures.join('\n'));
+});
+
+const PUBLICATION_OWNER_PREFIX = 'src/state/town-hall-publication/';
+const PUBLICATION_OWNER_FILES = Object.freeze({
+  index: `${PUBLICATION_OWNER_PREFIX}index.ts`,
+  projection: `${PUBLICATION_OWNER_PREFIX}projection.ts`,
+  repository: `${PUBLICATION_OWNER_PREFIX}repository.ts`,
+  types: `${PUBLICATION_OWNER_PREFIX}types.ts`
+});
+const PUBLICATION_OWNER_FILE_LIST = Object.freeze([
+  PUBLICATION_OWNER_FILES.repository,
+  PUBLICATION_OWNER_FILES.projection,
+  PUBLICATION_OWNER_FILES.types,
+  PUBLICATION_OWNER_FILES.index
+]);
+// Derivation of these two allowlists is the census in F-001: the publication
+// receipt prefix/constants and the event vocabulary are consumed only by the
+// four owner files. Any new consumer (for example an alternate writer) fails.
+const PUBLICATION_RECEIPT_CONSUMER_ALLOWLIST = PUBLICATION_OWNER_FILE_LIST;
+const PUBLICATION_EVENT_CONSUMER_ALLOWLIST = PUBLICATION_OWNER_FILE_LIST;
+const FINITE_PUBLICATION_VALUES = Object.freeze([
+  'planned', 'claimed', 'in_flight', 'sent', 'not_sent', 'rejected', 'rate_limited', 'unknown', 'stale'
+]);
+const PUBLICATION_EVENT_VOCABULARY = Object.freeze(['reserved', 'in_flight', 'outcome', 'confirmed']);
+const PUBLICATION_PREFIX_LITERALS = Object.freeze(['town-hall-publication/v1:', 'town-hall-instruction/v1:']);
+const APPEND_EVENT_CALL_COUNT = 5;
+const RETRYABLE_OUTCOME_REFS = Object.freeze([
+  'DIRECT_POST_OUTCOMES.NOT_SENT',
+  'DIRECT_POST_OUTCOMES.REJECTED',
+  'DIRECT_POST_OUTCOMES.RATE_LIMITED',
+  'DIRECT_POST_OUTCOMES.STALE'
+]);
+const BLOCKED_RESERVE_STATUS_REFS = Object.freeze([
+  'DIRECT_POST_PART_STATUSES.CLAIMED',
+  'DIRECT_POST_PART_STATUSES.IN_FLIGHT',
+  'DIRECT_POST_OUTCOMES.SENT',
+  'DIRECT_POST_OUTCOMES.UNKNOWN'
+]);
+
+function publicationSourceRoot() {
+  const override = process.env.TOWN_HALL_PUBLICATION_SOURCE_ROOT;
+  return override ? path.resolve(override) : path.resolve(__dirname, '..');
+}
+
+function listProductionSourceFiles(root) {
+  const { spawnSync } = require('node:child_process');
+  const run = args => {
+    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    if (result.error || result.status !== 0) return null;
+    return result.stdout.split('\n').map(line => line.trim()).filter(Boolean);
+  };
+  const keep = file => !file.endsWith('.d.ts') && (file.endsWith('.ts') || file.endsWith('.js'));
+  const tracked = run(['ls-files', 'src']);
+  const untracked = run(['ls-files', '--others', '--exclude-standard', 'src']) || [];
+  if (tracked !== null && (tracked.length > 0 || untracked.length > 0)) {
+    return [...new Set([...tracked, ...untracked])].filter(keep).sort();
+  }
+  // Source-root override that is not a git checkout: walk the source tree.
+  const files = [];
+  const walk = dir => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else {
+        const rel = path.relative(root, full).split(path.sep).join('/');
+        if (keep(rel)) files.push(rel);
+      }
+    }
+  };
+  walk(path.join(root, 'src'));
+  return files.sort();
+}
+
+function parseProductionSources(root, files) {
+  const ts = require('typescript');
+  return files.map(file => {
+    const text = fs.readFileSync(path.join(root, file), 'utf8');
+    const sourceFile = ts.createSourceFile(
+      file,
+      text,
+      ts.ScriptTarget.Latest,
+      true,
+      file.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS
+    );
+    return { file, text, sourceFile };
+  });
+}
+
+function walkAst(node, visit) {
+  const ts = require('typescript');
+  visit(node);
+  ts.forEachChild(node, child => walkAst(child, visit));
+}
+
+// Constant-fold a string expression made only of literals and local const
+// identifiers. Returns null when the expression depends on a runtime value.
+function foldStringExpression(ts, node, constMap) {
+  if (!node) return null;
+  if (ts.isParenthesizedExpression(node)) return foldStringExpression(ts, node.expression, constMap);
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  if (ts.isIdentifier(node)) return constMap.has(node.text) ? constMap.get(node.text) : null;
+  if (ts.isTemplateExpression(node)) {
+    // Fold a template whose head and substitutions are all constant strings.
+    let value = node.head.text;
+    for (const span of node.templateSpans) {
+      const expression = foldStringExpression(ts, span.expression, constMap);
+      if (expression === null) return null;
+      value += expression + span.literal.text;
+    }
+    return value;
+  }
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = foldStringExpression(ts, node.left, constMap);
+    const right = foldStringExpression(ts, node.right, constMap);
+    if (left !== null && right !== null) return left + right;
+  }
+  return null;
+}
+
+// AST-based consumer census. Comments are not AST nodes, so a comment-only
+// mention of a constant is not a consumer; a split literal concatenation is
+// folded, so it cannot evade the prefix allowlist.
+function collectConsumerEvidence(ts, record) {
+  const constMap = new Map();
+  walkAst(record.sourceFile, node => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      const folded = foldStringExpression(ts, node.initializer, constMap);
+      if (folded !== null) constMap.set(node.name.text, folded);
+    }
+  });
+  const evidence = {
+    symbols: new Set(),
+    prefixLines: [],
+    receiptLines: [],
+    receiptDetailEventLines: []
+  };
+  const lineOf = node => record.sourceFile.getLineAndCharacterOfPosition(node.getStart(record.sourceFile)).line + 1;
+  walkAst(record.sourceFile, node => {
+    if (ts.isIdentifier(node)) evidence.symbols.add(node.text);
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ||
+        ts.isBinaryExpression(node) || ts.isIdentifier(node)) {
+      const folded = foldStringExpression(ts, node, constMap);
+      if (folded !== null && PUBLICATION_PREFIX_LITERALS.includes(folded)) {
+        const line = lineOf(node);
+        if (!evidence.prefixLines.includes(line)) evidence.prefixLines.push(line);
+      }
+    }
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      const isReceipt = (ts.isIdentifier(callee) && callee.text === 'receipt') ||
+        (ts.isPropertyAccessExpression(callee) && callee.name.text === 'receipt');
+      if (isReceipt) {
+        evidence.receiptLines.push(lineOf(node));
+        const usesPrefix = node.arguments.some(argument => {
+          let folded = null;
+          walkAst(argument, child => {
+            if (folded !== null) return;
+            const value = foldStringExpression(ts, child, constMap);
+            if (value !== null && PUBLICATION_PREFIX_LITERALS.includes(value)) folded = value;
+          });
+          return folded !== null;
+        });
+        const usesEventVocabulary = node.arguments.some(argument => {
+          let found = false;
+          walkAst(argument, child => {
+            if (!ts.isObjectLiteralExpression(child)) return;
+            for (const property of child.properties) {
+              if (!ts.isPropertyAssignment(property)) continue;
+              const name = property.name;
+              const named = (ts.isIdentifier(name) && name.text === 'event') ||
+                (ts.isStringLiteral(name) && name.text === 'event');
+              if (!named) continue;
+              const folded = foldStringExpression(ts, property.initializer, constMap);
+              if (folded !== null && PUBLICATION_EVENT_VOCABULARY.includes(folded)) found = true;
+            }
+          });
+          return found;
+        });
+        if (usesPrefix || usesEventVocabulary) evidence.receiptDetailEventLines.push(lineOf(node));
+      }
+    }
+  });
+  return evidence;
+}
+
+// Focused ownership census over the publication owner. It rejects a duplicate
+// writer/decoder definition, a caller outside the owner, a new prefix/constant
+// consumer and a raw finite status/outcome literal.
+function analyzePublicationOwnership(records) {
+  const ts = require('typescript');
+  const failures = [];
+  const definitions = [];
+  const variableDeclarations = [];
+  const calls = [];
+  const stringLiterals = [];
+  const consumerEvidence = new Map();
+  for (const record of records) {
+    const lineOf = node =>
+      record.sourceFile.getLineAndCharacterOfPosition(node.getStart(record.sourceFile)).line + 1;
+    walkAst(record.sourceFile, node => {
+      if (ts.isFunctionDeclaration(node) && node.name) {
+        definitions.push({ name: node.name.text, file: record.file });
+      } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+        variableDeclarations.push({ name: node.name.text, file: record.file, initializer: node.initializer || null });
+        if (node.initializer && (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))) {
+          definitions.push({ name: node.name.text, file: record.file });
+        }
+      }
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+        calls.push({ name: node.expression.text, file: record.file });
+      }
+      if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+        stringLiterals.push({ value: node.text, file: record.file, line: lineOf(node) });
+      }
+    });
+    consumerEvidence.set(record.file, collectConsumerEvidence(ts, record));
+  }
+  const definitionsNamed = name => definitions.filter(entry => entry.name === name);
+  const callsNamed = name => calls.filter(entry => entry.name === name);
+  const recordsByFile = new Map(records.map(record => [record.file, record]));
+  const typesRecord = recordsByFile.get(PUBLICATION_OWNER_FILES.types);
+
+  // 1. exactly one appendEvent definition and exactly five callers.
+  const appendDefinitions = definitionsNamed('appendEvent');
+  if (appendDefinitions.length !== 1) {
+    failures.push(`expected exactly one appendEvent definition, found ${appendDefinitions.length}: ${appendDefinitions.map(d => d.file).join(', ') || 'none'}`);
+  } else if (appendDefinitions[0].file !== PUBLICATION_OWNER_FILES.repository) {
+    failures.push(`appendEvent must be defined in ${PUBLICATION_OWNER_FILES.repository}, found ${appendDefinitions[0].file}`);
+  }
+  const appendCalls = callsNamed('appendEvent');
+  if (appendCalls.length !== APPEND_EVENT_CALL_COUNT) {
+    failures.push(`expected exactly ${APPEND_EVENT_CALL_COUNT} appendEvent calls, found ${appendCalls.length}: ${appendCalls.map(c => c.file).join(', ') || 'none'}`);
+  }
+  for (const call of appendCalls) {
+    if (call.file !== PUBLICATION_OWNER_FILES.repository) {
+      failures.push(`appendEvent is called outside the owner at ${call.file}`);
+    }
+  }
+
+  // 2. exactly one decodePublication definition.
+  const decodeDefinitions = definitionsNamed('decodePublication');
+  if (decodeDefinitions.length !== 1) {
+    failures.push(`expected exactly one decodePublication definition, found ${decodeDefinitions.length}: ${decodeDefinitions.map(d => d.file).join(', ') || 'none'}`);
+  } else if (decodeDefinitions[0].file !== PUBLICATION_OWNER_FILES.repository) {
+    failures.push(`decodePublication must be defined in ${PUBLICATION_OWNER_FILES.repository}, found ${decodeDefinitions[0].file}`);
+  }
+
+  // 3. the publication read path readRows -> canonicalEvent lives only with the
+  // owner. The journal workflow has its own private readRows helper, so scope
+  // the ownership check to the owner files and reject any duplicated
+  // readRows -> canonicalEvent path outside them.
+  for (const name of ['readRows', 'canonicalEvent']) {
+    const named = definitions.filter(entry => entry.name === name && PUBLICATION_OWNER_FILE_LIST.includes(entry.file));
+    if (named.length !== 1) {
+      failures.push(`expected exactly one ${name} definition under the publication owner, found ${named.length}: ${named.map(d => d.file).join(', ') || 'none'}`);
+      continue;
+    }
+    if (named[0].file !== PUBLICATION_OWNER_FILES.repository) {
+      failures.push(`${name} must be defined in ${PUBLICATION_OWNER_FILES.repository}, found ${named[0].file}`);
+    }
+  }
+  const canonicalOutsideOwner = definitions
+    .filter(entry => entry.name === 'canonicalEvent' && !PUBLICATION_OWNER_FILE_LIST.includes(entry.file));
+  for (const entry of canonicalOutsideOwner) {
+    failures.push(`canonicalEvent is duplicated outside the publication owner at ${entry.file}`);
+  }
+  const readRowsOutsideOwner = definitions
+    .filter(entry => entry.name === 'readRows' && !PUBLICATION_OWNER_FILE_LIST.includes(entry.file));
+  for (const entry of readRowsOutsideOwner) {
+    const callsCanonical = calls.some(call => call.file === entry.file && call.name === 'canonicalEvent');
+    const definesCanonical = definitions.some(other => other.file === entry.file && other.name === 'canonicalEvent');
+    if (callsCanonical || definesCanonical) {
+      failures.push(`duplicated publication read path readRows -> canonicalEvent outside the owner at ${entry.file}`);
+    }
+  }
+  if (!calls.some(call => call.file === PUBLICATION_OWNER_FILES.repository && call.name === 'canonicalEvent')) {
+    failures.push('canonicalEvent must be reached from the publication read path');
+  }
+
+  // 4. exact allowlist of receipt-prefix/constant and event-vocabulary consumers,
+  // detected from the AST (comments ignored, literal concatenation folded).
+  const receiptConsumerFailures = [];
+  const eventConsumerFailures = [];
+  for (const record of records) {
+    const evidence = consumerEvidence.get(record.file);
+    const isOwner = PUBLICATION_OWNER_FILE_LIST.includes(record.file);
+    if (!isOwner) {
+      if (evidence.symbols.has('TOWN_HALL_PUBLICATION_RECEIPTS')) {
+        receiptConsumerFailures.push(`${record.file} references TOWN_HALL_PUBLICATION_RECEIPTS`);
+      }
+      if (evidence.prefixLines.length > 0) {
+        receiptConsumerFailures.push(`${record.file}:${evidence.prefixLines.join(',')} builds/uses a publication receipt prefix`);
+      }
+      if (evidence.receiptDetailEventLines.length > 0) {
+        receiptConsumerFailures.push(`${record.file}:${evidence.receiptDetailEventLines.join(',')} writes a publication receipt (state.receipt with publication prefix/event vocabulary)`);
+      }
+      if (evidence.symbols.has('TOWN_HALL_PUBLICATION_EVENTS')) {
+        eventConsumerFailures.push(`${record.file} references TOWN_HALL_PUBLICATION_EVENTS`);
+      }
+    }
+  }
+  for (const failure of receiptConsumerFailures) {
+    failures.push(`publication receipt constants may only be consumed by the four owner files: ${failure}`);
+  }
+  for (const failure of eventConsumerFailures) {
+    failures.push(`publication event vocabulary may only be consumed by the four owner files: ${failure}`);
+  }
+  const receiptConsumers = records
+    .filter(record => {
+      const evidence = consumerEvidence.get(record.file);
+      return evidence.symbols.has('TOWN_HALL_PUBLICATION_RECEIPTS') ||
+        evidence.prefixLines.length > 0 ||
+        evidence.receiptDetailEventLines.length > 0;
+    })
+    .map(record => record.file)
+    .sort();
+  try {
+    assert.deepEqual(receiptConsumers, [...PUBLICATION_RECEIPT_CONSUMER_ALLOWLIST].sort(),
+      'publication receipt constants may only be consumed by the four owner files');
+  } catch (error) {
+    failures.push(error.message);
+  }
+  const eventConsumers = records
+    .filter(record => consumerEvidence.get(record.file).symbols.has('TOWN_HALL_PUBLICATION_EVENTS'))
+    .map(record => record.file)
+    .sort();
+  try {
+    assert.deepEqual(eventConsumers, [...PUBLICATION_EVENT_CONSUMER_ALLOWLIST].sort(),
+      'publication event vocabulary may only be consumed by the four owner files');
+  } catch (error) {
+    failures.push(error.message);
+  }
+  for (const name of ['TOWN_HALL_PUBLICATION_RECEIPTS', 'TOWN_HALL_PUBLICATION_EVENTS']) {
+    const declarations = variableDeclarations.filter(entry => entry.name === name);
+    if (declarations.length !== 1 || declarations[0].file !== PUBLICATION_OWNER_FILES.types) {
+      failures.push(`${name} must be declared exactly once in ${PUBLICATION_OWNER_FILES.types}, found ${declarations.map(d => d.file).join(', ') || 'none'}`);
+    }
+  }
+
+  // 5. F3: no raw finite status/outcome literal survives in the owner repository
+  // or projection; the finite sets come from the shared typed vocabularies.
+  for (const file of [PUBLICATION_OWNER_FILES.repository, PUBLICATION_OWNER_FILES.projection]) {
+    for (const literal of stringLiterals.filter(entry => entry.file === file)) {
+      if (FINITE_PUBLICATION_VALUES.includes(literal.value)) {
+        failures.push(`raw finite status/outcome literal ${JSON.stringify(literal.value)} at ${file}:${literal.line}`);
+      }
+    }
+  }
+  const initializerOf = (file, name) => {
+    const declaration = variableDeclarations.find(entry => entry.file === file && entry.name === name);
+    return declaration ? declaration.initializer : null;
+  };
+  const propertyRefsIn = node => {
+    const refs = [];
+    walkAst(node, child => {
+      if (ts.isPropertyAccessExpression(child)) refs.push(child.getText(child.getSourceFile()));
+    });
+    return refs.sort();
+  };
+  const retryable = initializerOf(PUBLICATION_OWNER_FILES.projection, 'RETRYABLE_OUTCOMES');
+  if (!retryable) {
+    failures.push('RETRYABLE_OUTCOMES initializer not found in projection.ts');
+  } else {
+    try {
+      assert.deepEqual(propertyRefsIn(retryable), [...RETRYABLE_OUTCOME_REFS].sort(),
+        'RETRYABLE_OUTCOMES must be built from the shared typed vocabularies');
+    } catch (error) {
+      failures.push(error.message);
+    }
+  }
+  const blocked = initializerOf(PUBLICATION_OWNER_FILES.repository, 'BLOCKED_RESERVE_STATUSES');
+  if (!blocked) {
+    failures.push('BLOCKED_RESERVE_STATUSES initializer not found in repository.ts');
+  } else {
+    try {
+      assert.deepEqual(propertyRefsIn(blocked), [...BLOCKED_RESERVE_STATUS_REFS].sort(),
+        'BLOCKED_RESERVE_STATUSES must be built from the shared typed vocabularies');
+    } catch (error) {
+      failures.push(error.message);
+    }
+  }
+  for (const [key, label] of [['repository', 'repository.ts'], ['projection', 'projection.ts']]) {
+    const record = recordsByFile.get(PUBLICATION_OWNER_FILES[key]);
+    if (!record ||
+        !record.text.includes('DIRECT_POST_OUTCOMES') ||
+        !record.text.includes('DIRECT_POST_PART_STATUSES')) {
+      failures.push(`${label} must consume DIRECT_POST_OUTCOMES and DIRECT_POST_PART_STATUSES`);
+    }
+  }
+  if (!typesRecord || !/TownHallPublicationStatus\s*=\s*TownHallJournalState/.test(typesRecord.text)) {
+    failures.push('types.ts must derive TownHallPublicationStatus from TownHallJournalState');
+  }
+
+  return failures;
+}
+
+test('publication receipts have one writer and decoder', { timeout: 30000 }, () => {
+  const root = publicationSourceRoot();
+  const files = listProductionSourceFiles(root);
+  assert.ok(files.length > 0, `no production source files found under ${path.join(root, 'src')}`);
+  const records = parseProductionSources(root, files);
+  const failures = analyzePublicationOwnership(records);
+  assert.deepEqual(failures, [], `source ownership census failed (${root}):\n${failures.join('\n')}`);
 });
