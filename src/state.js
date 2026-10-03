@@ -81,6 +81,11 @@ const {
   COURIER_ROUTE_STATES,
   COURIER_SOURCE_KINDS
 } = require('./state/courier-route');
+const {
+  createTownHallJournalHandlers,
+  TOWN_HALL_JOURNAL_RECEIPTS,
+  TOWN_HALL_JOURNAL_STATES
+} = require('./state/town-hall-journal');
 
 const SCHEMA_VERSION = '1.8';
 const PROVIDERS = Object.freeze({ CODEX: 'codex', CLAUDE: 'claude' });
@@ -272,6 +277,11 @@ const courierRouteHandlers = createCourierRouteHandlers({
   assertProvider,
   parseJson,
   now
+});
+
+const townHallJournalHandlers = createTownHallJournalHandlers({
+  BindingError,
+  StateCorruptError
 });
 
 const replyLifecycleHandlers = createReplyLifecycleHandlers({ assertProvider, assertText, assertUuid, StaleGenerationError, assertNativeReplyFileManifest, BindingError, REPLY_LIMIT, AuthorizationError, NATIVE_ACK_RECEIPT, MESSAGE_STATES, now, NATIVE_REPLY_FILE_PHASES, splitReply, discordNonce, safeDetail, REPLY_COMPLETED_WITHOUT_POST, rowReplyPart });
@@ -830,6 +840,18 @@ class SurfaceState {
 
   getCourierDeliveryStatus(...args) {
     return courierRouteHandlers.getCourierDeliveryStatus(this, ...args);
+  }
+
+  createTownHallBroadcast(...args) {
+    return townHallJournalHandlers.createTownHallBroadcast(this, ...args);
+  }
+
+  getTownHallBroadcast(...args) {
+    return townHallJournalHandlers.getTownHallBroadcast(this, ...args);
+  }
+
+  listTownHallBroadcasts(...args) {
+    return townHallJournalHandlers.listTownHallBroadcasts(this, ...args);
   }
 
   findNativeBinding(nativeId, provider = null) { return bindingLifecycleHandlers.findNativeBinding.apply(this, arguments); }
@@ -1532,6 +1554,8 @@ module.exports = {
   COURIER_RESULT_STATUSES,
   COURIER_ROUTE_STATES,
   COURIER_SOURCE_KINDS,
+  TOWN_HALL_JOURNAL_RECEIPTS,
+  TOWN_HALL_JOURNAL_STATES,
   DISPATCH_OUTCOMES,
   TOPIC_PUBLICATION_STATES,
   THREAD_STATES,
