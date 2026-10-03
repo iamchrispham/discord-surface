@@ -1,13 +1,13 @@
 import type { TownHallAddress, TownHallBroadcastInput, TownHallPlan } from '../../peer/town-hall-plan';
 
-export const TOWN_HALL_JOURNAL_RECEIPTS = {
+export const TOWN_HALL_JOURNAL_RECEIPTS = Object.freeze({
   MANIFEST_PREFIX: 'town-hall-manifest/v1:',
   RECIPIENT_PREFIX: 'town-hall-recipient/v1:'
-} as const;
+} as const);
 
-export const TOWN_HALL_JOURNAL_STATES = {
+export const TOWN_HALL_JOURNAL_STATES = Object.freeze({
   PLANNED: 'planned'
-} as const;
+} as const);
 
 export type TownHallJournalState = (typeof TOWN_HALL_JOURNAL_STATES)[keyof typeof TOWN_HALL_JOURNAL_STATES];
 export type TownHallJournalManifestKind = `${typeof TOWN_HALL_JOURNAL_RECEIPTS.MANIFEST_PREFIX}${string}`;
