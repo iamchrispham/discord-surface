@@ -10,8 +10,8 @@ const INVALID = 'invalid town-hall broadcast plan';
 
 const SOURCE_UUID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const SOURCE_UUID_UPPER = 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA';
-const CODEX_UUID = '11111111-1111-4111-8111-111111111111';
-const CODEX_UUID_UPPER = '11111111-1111-4111-8111-111111111111';
+const CODEX_UUID = '11111111-1111-4111-8111-aabbccddeeff';
+const CODEX_UUID_UPPER = '11111111-1111-4111-8111-AABBCCDDEEFF';
 const CLAUDE_UUID = '22222222-2222-4222-8222-222222222222';
 const THIRD_UUID = '33333333-3333-4333-8333-333333333333';
 const OTHER_UUID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -320,6 +320,10 @@ test('rejects empty and sparse audience arrays', () => {
 
 test('rejects duplicate native recipients across routes and generations', () => {
   const base = input();
+  assertInvalid(() => planTownHallBroadcast({
+    ...base,
+    recipients: [address(), address({ nativeId: CODEX_UUID_UPPER })]
+  }));
   assertInvalid(() => planTownHallBroadcast({
     ...base,
     recipients: [address({ channelId: '300' }), address({ channelId: '301' })]
