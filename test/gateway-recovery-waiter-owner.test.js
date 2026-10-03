@@ -1,11 +1,5 @@
 'use strict';
 
-// Structural ownership contract for the Gateway transport-recovery waiter
-// factory plus a behavioral check of the moved completion/stop semantics.
-// The factory must live in exactly one owner module and the facade
-// recoverTransport method must hold only the single construction call.
-// Parsed with the TypeScript AST only; the source root is overridable so the
-// same test can be pointed at scratch copies for red controls.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -64,8 +58,6 @@ function isCallableInitializer(node) {
   return ts.isArrowFunction(node) || ts.isFunctionExpression(node);
 }
 
-// A declaration of OWNER_NAME: function declaration, variable initialized with
-// an arrow/function, named class/object method, or property assignment.
 function declaresOwnerName(node) {
   if (ts.isFunctionDeclaration(node) && node.name && node.name.text === OWNER_NAME && node.body) return true;
   if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === OWNER_NAME &&
@@ -79,7 +71,6 @@ function declaresOwnerName(node) {
 test('Gateway waiter construction belongs to its single scoped owner', () => {
   const facade = parse(FACADE_FILE);
 
-  // The public recoverTransport method must still exist exactly once.
   const methods = [];
   walk(facade, node => {
     if (!ts.isClassDeclaration(node) || !node.name || node.name.text !== 'DiscordGateway') return;
@@ -92,14 +83,12 @@ test('Gateway waiter construction belongs to its single scoped owner', () => {
   const method = methods[0];
   assert.ok(method.body && ts.isBlock(method.body), `${PUBLIC_METHOD} must have a block body`);
 
-  // No local makeWaiter reference may survive inside the public method.
   const makeWaiterReferences = [];
   walk(method, node => {
     if (ts.isIdentifier(node) && node.text === 'makeWaiter') makeWaiterReferences.push(node.getText());
   });
   assert.deepEqual(makeWaiterReferences, [], `recoverTransport must not reference a local makeWaiter`);
 
-  // The facade must bind the owner factory from the owner module itself.
   const ownerModule = OWNER_FILE.replace(/\.js$/, '');
   const requireBindings = [];
   walk(facade, node => {
@@ -114,7 +103,6 @@ test('Gateway waiter construction belongs to its single scoped owner', () => {
   assert.ok(requireBindings.includes(OWNER_NAME),
     `discord.js must destructure ${OWNER_NAME} from require('./discord/transport-recovery-waiter')`);
 
-  // Exactly one owner construction call, with exactly the four contracted arguments.
   const constructionCalls = [];
   walk(method, node => {
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === OWNER_NAME) {
@@ -128,7 +116,6 @@ test('Gateway waiter construction belongs to its single scoped owner', () => {
     ['callerScope', 'queuedScoped ? null : overallDeadline', 'makeResult', 'RECOVERY_WAITER_DEADLINE_GRACE_MS'],
     'the owner must receive callerScope, the scoped deadline, makeResult, and the facade grace constant');
 
-  // No makeWaiter declaration may remain anywhere under the source root.
   const makeWaiterDeclarations = [];
   for (const file of sourceFilesUnder(SRC_ROOT)) {
     const source = parse(file);
@@ -139,7 +126,6 @@ test('Gateway waiter construction belongs to its single scoped owner', () => {
   }
   assert.deepEqual(makeWaiterDeclarations, [], 'the nested makeWaiter factory must not be declared anywhere in src');
 
-  // Exactly one six-field waiter constructor across every .js and .ts source file.
   const waiterConstructors = [];
   for (const file of sourceFilesUnder(SRC_ROOT)) {
     const source = parse(file);
@@ -154,7 +140,6 @@ test('Gateway waiter construction belongs to its single scoped owner', () => {
   assert.deepEqual(waiterConstructors, [path.resolve(OWNER_FILE)],
     `exactly one waiter constructor must exist, in ${OWNER_FILE}`);
 
-  // Exactly one implementation of the owner factory, and it lives in the owner.
   const implementations = [];
   for (const file of sourceFilesUnder(SRC_ROOT)) {
     const source = parse(file);
@@ -165,7 +150,6 @@ test('Gateway waiter construction belongs to its single scoped owner', () => {
   assert.deepEqual(implementations, [path.resolve(OWNER_FILE)],
     `${OWNER_NAME} must be implemented exactly once, in ${OWNER_FILE}`);
 
-  // The owner module must export the factory.
   const owner = parse(OWNER_FILE);
   let exported = null;
   walk(owner, node => {
@@ -180,7 +164,6 @@ test('Gateway waiter construction belongs to its single scoped owner', () => {
     .map(property => property.name.getText());
   assert.ok(exportedNames.includes(OWNER_NAME), `${OWNER_NAME} must be exported from the owner module`);
 
-  // The owner must not require the facade.
   const facadeModule = FACADE_FILE.replace(/\.js$/, '');
   const forbidden = [];
   walk(owner, node => {

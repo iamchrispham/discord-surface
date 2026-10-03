@@ -1,9 +1,5 @@
 'use strict';
 
-// Owner for the Gateway transport-recovery waiter factory: the waiter starts
-// pending, arms a deadline timer only for a finite deadline, and settles exactly
-// once via settle/stop/completeOwn/childFinished, forwarding the settled result
-// to each parent exactly once and ignoring all later completions or stops.
 function createTransportRecoveryWaiter(scope, deadline, makeResult, deadlineGraceMs) {
   let resolveWaiter;
   const waiter = {
