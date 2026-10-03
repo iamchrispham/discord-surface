@@ -121,6 +121,7 @@
     "src/discord/recovery-fetch.ts",
     "src/state/agent-routing.ts",
     "src/peer/resolution.ts",
+    "src/peer/town-hall-plan.ts",
     "test/types/peer-resolution-types.ts",
     "src/discord/reconciliation-lookups.ts",
     "test/discord/recovery-fetch-consumer-types.ts",
