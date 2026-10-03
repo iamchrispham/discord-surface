@@ -276,7 +276,8 @@ test('15. either matching start alone or matching command alone is sufficient wh
   assert.equal(commandOnly.result, true);
 });
 
-test('16. missing expected identity, both expected fields empty, and unavailable actual capture return false; registration is immediate-before-town-hall', () => {
+test('16. missing identity probes before comparison and returns false without capture; registration is unique', () => {
+  const expectedProbeCalls = [{ kind: 'kill', pid: 4242, signal: 0 }];
   const invalid = alive('abc', { ownerStartTime: '100' }, {});
   assert.equal(invalid.result, false);
   assert.equal(invalid.calls.length, 0);
@@ -284,22 +285,23 @@ test('16. missing expected identity, both expected fields empty, and unavailable
 
   const missingExpected = alive(4242, null, {});
   assert.equal(missingExpected.result, false);
-  assert.deepEqual(missingExpected.calls, []);
+  assert.deepEqual(missingExpected.calls, expectedProbeCalls);
   assert.deepEqual(missingExpected.captureCalls, []);
 
   const undefinedExpected = alive(4242, undefined, {});
   assert.equal(undefinedExpected.result, false);
-  assert.deepEqual(undefinedExpected.calls, []);
+  assert.deepEqual(undefinedExpected.calls, expectedProbeCalls);
   assert.deepEqual(undefinedExpected.captureCalls, []);
 
   const omittedExpected = aliveOmittedExpected(4242, {});
   assert.equal(omittedExpected.result, false);
-  assert.deepEqual(omittedExpected.calls, []);
+  assert.deepEqual(omittedExpected.calls, expectedProbeCalls);
   assert.deepEqual(omittedExpected.captureCalls, []);
 
   const emptyExpected = alive(4242, {}, {});
   assert.equal(emptyExpected.result, false);
-  assert.deepEqual(emptyExpected.calls.map(call => call.kind), ['kill', 'fs', 'ps']);
+  assert.deepEqual(emptyExpected.calls, expectedProbeCalls);
+  assert.deepEqual(emptyExpected.captureCalls, []);
 
   const unavailable = alive(4242, { ownerStartTime: '100' }, { capture: 'unavailable' });
   assert.equal(unavailable.result, false);
