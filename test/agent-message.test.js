@@ -183,3 +183,76 @@ test('agent address IDs reject non-string values without coercion', () => {
   assert.equal(coercions, 0);
   assert.equal(validAddress(target), true);
 });
+
+test('agent packet rejects required field accessors before reads', () => {
+  const request = packet;
+  const result = { ...packet, id: 'result-1', kind: KINDS.RESULT, source: target, target: source, replyTo: packet.id, text: 'Found the cause.' };
+  assert.deepEqual(decodeAgentMessage(encodeAgentMessage(request, token), token, request.target), request);
+  assert.deepEqual(decodeAgentMessage(encodeAgentMessage(result, token), token, result.target), result);
+
+  const failures = [];
+  for (const [label, fixture] of [['request', request], ['result', result]]) {
+    for (const field of Object.keys(fixture)) {
+      for (const variant of ['throwing', 'changing', 'inherited']) {
+        const copy = { ...fixture };
+        const original = fixture[field];
+        let reads = 0;
+        let coercions = 0;
+        const sentinel = {
+          [Symbol.toPrimitive]() {
+            coercions += 1;
+            return '';
+          }
+        };
+        const fixtureError = new Error('issue225 fixture getter executed');
+        if (variant === 'throwing') {
+          Object.defineProperty(copy, field, {
+            enumerable: true,
+            configurable: true,
+            get() {
+              reads += 1;
+              throw fixtureError;
+            }
+          });
+        } else if (variant === 'changing') {
+          Object.defineProperty(copy, field, {
+            enumerable: true,
+            configurable: true,
+            get() {
+              reads += 1;
+              return reads === 1 ? original : sentinel;
+            }
+          });
+        } else {
+          delete copy[field];
+          const proto = {};
+          Object.defineProperty(proto, field, {
+            enumerable: true,
+            configurable: true,
+            get() {
+              reads += 1;
+              return original;
+            }
+          });
+          Object.setPrototypeOf(copy, proto);
+        }
+        try {
+          assert.throws(() => encodeAgentMessage(copy, token), /invalid agent message/);
+        } catch (error) {
+          failures.push(`${label}/${field}/${variant}: ${error.message.split('\n')[0]}`);
+        }
+        try {
+          assert.equal(reads, 0);
+        } catch (error) {
+          failures.push(`${label}/${field}/${variant}: ${error.message.split('\n')[0]}`);
+        }
+        try {
+          assert.equal(coercions, 0);
+        } catch (error) {
+          failures.push(`${label}/${field}/${variant}: ${error.message.split('\n')[0]}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(failures, []);
+});
