@@ -12,6 +12,7 @@ const {
   submitted,
   directPreparationSeed
 } = require('./native-reply-file-fixture');
+const { OWNER_EVIDENCE, OWNER_EVIDENCE_REASON } = require('../src/state/process-owner-evidence');
 
 test('HTTP 413 native file upload is definite not-sent and retries the retained snapshot', async t => {
   for (const provider of ['codex', 'claude']) await t.test(provider, async t2 => {
@@ -61,7 +62,7 @@ test('old capacity refusal cleanup cannot shadow a later admitted native file', 
   for (const provider of ['codex', 'claude']) for (const cleanupFirst of [true, false]) await t.test(`${provider} old cleanup first ${cleanupFirst}`, t2 => {
     const f = fixture(t2, provider);
     const held = [];
-    const ownerAlive = f.state.directPostOwnerAlive;
+    const ownerEvidence = f.state.directPostOwnerEvidence;
     try {
       for (let index = 0; index < 8; index += 1) {
         const seed = directPreparationSeed(f, index);
@@ -95,7 +96,7 @@ test('old capacity refusal cleanup cannot shadow a later admitted native file', 
       );
       assert.equal(f.state.activeFilePreparationCount(), 8);
 
-      f.state.directPostOwnerAlive = () => false;
+      f.state.directPostOwnerEvidence = () => ({ status: OWNER_EVIDENCE.ABSENT, reason: OWNER_EVIDENCE_REASON.PROBE_ABSENT });
       assert.equal(f.state.releaseDirectPostFilePreparation(held[0].preparationId).phase, 'released');
       assert.equal(f.state.activeFilePreparationCount(), 7);
 
@@ -144,7 +145,7 @@ test('old capacity refusal cleanup cannot shadow a later admitted native file', 
           f.state.releaseDirectPostFilePreparation(preparation.preparationId);
         } catch {}
       }
-      f.state.directPostOwnerAlive = ownerAlive;
+      f.state.directPostOwnerEvidence = ownerEvidence;
     }
   });
 });

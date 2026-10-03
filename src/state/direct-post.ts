@@ -311,7 +311,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
         assertFilePreparationClaim(state, meta, BindingError, DIRECT_POST_FILE_PREPARATION, parseJson, StateCorruptError);
         const ownerIdentity = state.directPostOwnerIdentity(process.pid);
         state.receipt(null, DIRECT_POST_ATTEMPT, {
-          journal: 'direct-post-v1', ...meta, ...ownerIdentity, status: 'attempted'
+          journal: 'direct-post-v1', ...meta, ...ownerIdentity, ownerPid: process.pid, status: 'attempted'
         });
         return { claimed: true, status: 'claimed', attemptId: meta.attemptId, nonce: meta.nonce };
       });
