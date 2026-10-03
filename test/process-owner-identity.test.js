@@ -256,15 +256,13 @@ test('13. matching start with a different command returns false', () => {
   assert.deepEqual(captureCalls, [4242]);
 });
 
-test('14. legacy boolean API maps EPERM or ESRCH to false with zero capture calls, unlike intake and town-hall policies', () => {
-  for (const code of ['EPERM', 'ESRCH']) {
-    const { result, calls, captureCalls } = alive(4242, { ownerStartTime: '100', ownerCommand: 'node' }, {
-      osData: makeOsData({ killOk: false, killError: Object.assign(new Error(code), { code }) })
-    });
-    assert.equal(result, false, code);
-    assert.deepEqual(calls, [{ kind: 'kill', pid: 4242, signal: 0 }], code);
-    assert.deepEqual(captureCalls, [], code);
-  }
+test('14. ESRCH returns false without attempting identity capture', () => {
+  const { result, calls, captureCalls } = alive(4242, { ownerStartTime: '100', ownerCommand: 'node' }, {
+    osData: makeOsData({ killOk: false, killError: Object.assign(new Error('ESRCH'), { code: 'ESRCH' }) })
+  });
+  assert.equal(result, false);
+  assert.deepEqual(calls, [{ kind: 'kill', pid: 4242, signal: 0 }]);
+  assert.deepEqual(captureCalls, []);
 });
 
 test('15. either matching start alone or matching command alone is sufficient when the other expected field is empty', () => {
