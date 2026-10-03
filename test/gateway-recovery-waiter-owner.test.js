@@ -13,6 +13,7 @@ const SRC_ROOT = process.env.GATEWAY_RECOVERY_WAITER_SRC_ROOT
   : path.resolve(__dirname, '..', 'src');
 const FACADE_FILE = path.join(SRC_ROOT, 'discord.js');
 const OWNER_FILE = path.join(SRC_ROOT, 'discord', 'transport-recovery-waiter.js');
+const WORKFLOW_FILE = path.join(SRC_ROOT, 'discord', 'transport-recovery.js');
 const WAITER_FIELDS = new Set(['ownDone', 'parents', 'pending', 'promise', 'settled', 'stopped']);
 
 function parse(file) {
@@ -80,8 +81,48 @@ test('Gateway waiter construction belongs to its single scoped owner', () => {
     }
   });
   assert.equal(methods.length, 1, `${PUBLIC_METHOD} must be declared exactly once on DiscordGateway`);
-  const method = methods[0];
-  assert.ok(method.body && ts.isBlock(method.body), `${PUBLIC_METHOD} must have a block body`);
+  const facadeMethod = methods[0];
+  assert.equal(Boolean(facadeMethod.modifiers?.some(node => node.kind === ts.SyntaxKind.AsyncKeyword)), false,
+    'the facade must return the owner promise without async adoption');
+  assert.deepEqual(facadeMethod.parameters.map(node => node.getText()), ['reason', '...args'],
+    'only the async owner may evaluate transport defaults');
+  assert.ok(facadeMethod.body && ts.isBlock(facadeMethod.body), `${PUBLIC_METHOD} must have a block body`);
+  assert.equal(facadeMethod.body.getText().replace(/\s+/g, ''),
+    '{returntransportRecovery.recoverTransport.apply(this,arguments);}',
+    'the facade must delegate with its original receiver and arguments');
+
+  const workflow = parse(WORKFLOW_FILE);
+  assert.equal(workflow.statements[0]?.expression?.text, 'use strict',
+    'the extracted object method must retain class-method strictness');
+  const workflowImport = [];
+  const workflowInitializers = [];
+  walk(facade, node => {
+    if (!ts.isVariableDeclaration(node)) return;
+    if (node.initializer && isRequireCall(node.initializer, FACADE_FILE) === WORKFLOW_FILE.replace(/\.js$/, '')) {
+      workflowImport.push(node.name.getText().replace(/\s/g, ''));
+    }
+    if (node.name.getText() === 'transportRecovery') workflowInitializers.push(node.initializer);
+  });
+  assert.deepEqual(workflowImport, ['{createTransportRecoveryHandlers}']);
+  assert.equal(workflowInitializers.length, 1);
+  const initializer = workflowInitializers[0];
+  assert.ok(initializer && ts.isCallExpression(initializer));
+  assert.equal(initializer.expression.getText(), 'createTransportRecoveryHandlers');
+  assert.equal(initializer.arguments.length, 1);
+  assert.ok(ts.isObjectLiteralExpression(initializer.arguments[0]));
+  const injected = initializer.arguments[0].properties;
+  assert.ok(injected.every(node => ts.isShorthandPropertyAssignment(node)));
+  assert.deepEqual(injected.map(node => node.name.getText()).sort(),
+    ['READINESS', 'THREAD_STATES', 'RECOVERY_POLICIES', 'recoveryKind',
+      'createTransportRecoveryWaiter', 'RECOVERY_WAITER_DEADLINE_GRACE_MS'].sort());
+  const handlers = [];
+  walk(workflow, node => {
+    if (ts.isMethodDeclaration(node) && node.name && ts.isIdentifier(node.name) &&
+        node.name.text === PUBLIC_METHOD) handlers.push(node);
+  });
+  assert.equal(handlers.length, 1, 'the workflow must declare exactly one transport recovery handler');
+  const method = handlers[0];
+  assert.ok(method.body && ts.isBlock(method.body), 'the transport recovery handler must have a block body');
 
   const makeWaiterReferences = [];
   walk(method, node => {
@@ -171,6 +212,33 @@ test('Gateway waiter construction belongs to its single scoped owner', () => {
     if (resolved && resolved === facadeModule) forbidden.push(node.getText());
   });
   assert.deepEqual(forbidden, [], 'the owner must not require the Gateway facade');
+});
+
+test('transport defaults execute once and getter failures reject asynchronously', async () => {
+  const { DiscordGateway } = require('../src/discord.js');
+  const method = DiscordGateway.prototype.recoverTransport;
+  let lifecycleReads = 0;
+  let policyReads = 0;
+  const receiver = {
+    get lifecycleEpoch() { lifecycleReads++; return 1; },
+    isCurrentLifecycle() { return false; }
+  };
+  const options = {
+    get recoveryPolicy() {
+      policyReads++;
+      if (policyReads > 1) throw new Error('duplicate policy read');
+      return 'full';
+    }
+  };
+  assert.equal(method.length, 1);
+  assert.deepEqual(await method.call(receiver, 'probe', undefined, undefined, undefined, options),
+    { ready: false, state: 'stopped' });
+  assert.equal(lifecycleReads, 1);
+  assert.equal(policyReads, 1);
+  const broken = { get lifecycleEpoch() { throw new Error('lifecycle getter failed'); } };
+  let rejected;
+  assert.doesNotThrow(() => { rejected = method.call(broken, 'probe'); });
+  await assert.rejects(rejected, /lifecycle getter failed/);
 });
 
 test('public waiter factory retains completion and stop semantics', async (t) => {

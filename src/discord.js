@@ -1902,8 +1902,7 @@ class DiscordGateway {
     return failure || { ready: true, state: 'ready' };
   }
 
-  async recoverTransport(reason, lifecycleEpoch = this.lifecycleEpoch, channelIds = null, recoveryDeadline = null,
-    { recoveryPolicy = RECOVERY_POLICIES.FULL } = {}) { return transportRecovery.recoverTransport.apply(this, arguments); }
+  recoverTransport(reason, ...args) { return transportRecovery.recoverTransport.apply(this, arguments); }
 
   async reconcilePending(before = undefined, {
     allowPaused = false,
