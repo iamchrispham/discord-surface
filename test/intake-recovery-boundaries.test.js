@@ -539,7 +539,7 @@ for (const control of LEGACY_NEGATIVE_CONTROLS) {
 
 const SOURCE_FILE_PATTERN = /\.(?:js|ts)$/;
 const DEADLINE_TRIGGER_PATTERN = /\b(?:DEADLINE|deadlineReached)\b|\bDate\.now\(\)\s*>=\s*deadline\b/;
-const GAP_DECISION_PATTERN = /\b(?:READINESS\.GAP|THREAD_STATES\.GAP)\b|\?\s*['"]gap['"]|\breturn\s+['"]gap['"]/;
+const GAP_DECISION_PATTERN = /\b(?:READINESS\.GAP|THREAD_STATES\.GAP)\b|\?\s*['"]gap['"]|\breturn\s+['"]gap['"]|\bstate\s*:\s*['"]gap['"]/;
 
 const collectSourceFiles = directory => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
   const absolute = path.join(directory, entry.name);
@@ -568,6 +568,14 @@ test('deadline policy inventory has no direct deadline-to-gap decision', () => {
   const sourceRoot = path.join(__dirname, '../src');
   const offenders = findDeadlineGapOffenders(readSourceInventory(sourceRoot));
   assert.deepEqual(offenders, [], 'new deadline decisions must not map expiry directly to a history gap');
+});
+
+test('deadline policy inventory catches object-shaped gap decisions', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/inbound-recovery.js',
+    source: "if (Date.now() >= deadline) return { ready: false, state: 'gap', detail: 'history unavailable' };"
+  }]);
+  assert.deepEqual(offenders, ['discord/inbound-recovery.js:1']);
 });
 
 test('deadline policy inventory catches new owners while allowing unavailable classifiers and ordinary deadlines', () => {
