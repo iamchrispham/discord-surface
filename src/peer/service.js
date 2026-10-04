@@ -271,6 +271,12 @@ function createPeerService(context) {
       const sourceReadiness = source.readiness;
       const sourceIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
       const sourceAddress = resolveAgentAddress(state, source, sourceRoute.childId);
+      const currentSourceBinding = () => {
+        const current = state.getBinding(source.channelId);
+        const currentIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
+        if (!current || current.readiness !== sourceReadiness || currentIntakeState !== sourceIntakeState) return null;
+        return current;
+      };
       if (input.reply_to === undefined && destination !== null) {
         agentTarget = issueAgentAddress(resolveAgentAddress(state, destination.binding, destination.childId), token);
       }
@@ -296,9 +302,8 @@ function createPeerService(context) {
           agentThreadId: sourceRoute.childId, agentTarget, agentKind: input.reply_to === undefined ? 'request' : 'result',
           agentReplyTo: input.reply_to ?? null, agentPresentation: 'attachment-v1',
           agentDestinationCurrent: target => {
-            const currentSource = state.getBinding(source.channelId);
-            const currentIntakeState = state.getIntakeWatermark(source.channelId)?.state ?? null;
-            if (!currentSource || currentSource.readiness !== sourceReadiness || currentIntakeState !== sourceIntakeState) return false;
+            const currentSource = currentSourceBinding();
+            if (!currentSource) return false;
             if (input.reply_to === undefined) {
               requireReadyPeer(state, currentSource);
             } else {
@@ -315,6 +320,7 @@ function createPeerService(context) {
               input.reply_to === undefined ? null : target?.channelId ?? null,
               input.reply_to !== undefined);
           },
+          bindingCurrent: () => currentSourceBinding() !== null,
           textFile, dedupeKey: input.dedupe_key, custodyKey, signal, fetchImpl,
           assertCallerCurrent,
           ...(fileSource === null ? {} : { preparedTextSource: fileSource }) });

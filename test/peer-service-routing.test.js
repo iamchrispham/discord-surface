@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fixture, service, addRecipient } = require('./fixtures/peer-fixture');
 const { createPeerService } = require('../src/peer/service');
-const { MESSAGE_STATES } = require('../src/state');
+const { MESSAGE_STATES, READINESS } = require('../src/state');
 const { THREAD_STATES } = require('../src/state/thread-enrollment');
 const { decodeAgentMessage, encodeAgentMessage, PREFIX } = require('../src/agent-message');
 const { id, request } = require('./peer-service-scenarios/setup.cjs');
@@ -41,6 +41,72 @@ test('peer result preserves current and rejects stale legacy parent destinations
   f.state.db.prepare("UPDATE bindings SET generation=generation+1 WHERE channel_id='101'").run();
   const stale = await recipient.send({ reply_to: request.id, text: 'stale result', dedupe_key: 'legacy-parent-stale' });
   assert.equal(stale.status, 'stale');
+});
+
+test('targetless legacy result refuses after source readiness changes during revalidation', async t => {
+  const f = fixture(t); const target = addRecipient(f);
+  const sourceBinding = f.state.getBinding('101');
+  const request = {
+    id: 'legacy-targetless-readiness-request', kind: 'request',
+    source: { guildId: '100', channelId: '101', provider: sourceBinding.provider,
+      nativeId: sourceBinding.nativeId, generation: sourceBinding.generation },
+    target: { guildId: '100', channelId: '201', provider: target.provider,
+      nativeId: target.nativeId, generation: target.generation },
+    replyTo: null, text: 'legacy request'
+  };
+  const timestamp = new Date().toISOString();
+  f.state.db.prepare(`INSERT INTO messages(discord_id, guild_id, channel_id, delivery_channel_id, author_id,
+    content, attachments, provider, native_id, workspace, endpoint, conductor_id, repo_key, generation,
+    state, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'legacy-targetless-readiness-discord', '100', '201', '201', '901', encodeAgentMessage(request, 'fixture'), '[]',
+    target.provider, target.nativeId, target.workspace, target.endpoint, target.conductorId, target.repoKey,
+    target.generation, 'accepted', timestamp, timestamp);
+  f.state.receipt('legacy-targetless-readiness-discord', 'agent-message', { packet: request, authorId: '901' });
+  f.state.receipt('legacy-targetless-readiness-discord', 'accepted', { channelId: '201', generation: target.generation, readiness: 'ready' });
+  assert.equal(f.state.claimDispatch('legacy-targetless-readiness-discord').claimed, true);
+
+  const requestId = 'legacy-targetless-readiness-result';
+  const sourceAddress = { guildId: sourceBinding.guildId, channelId: sourceBinding.channelId,
+    provider: sourceBinding.provider, nativeId: sourceBinding.nativeId, generation: sourceBinding.generation };
+  const targetAddress = { guildId: target.guildId, channelId: target.channelId,
+    provider: target.provider, nativeId: target.nativeId, generation: target.generation };
+  const legacyPacket = {
+    id: requestId, kind: 'result', source: targetAddress, target: sourceAddress,
+    replyTo: request.id, text: 'legacy result'
+  };
+  const legacyAttempt = {
+    journal: 'direct-post-v1', requestId, inReplyTo: null, attemptId: 'legacy-targetless-attempt',
+    sourcePath: '/tmp/legacy-targetless-result.txt', textHash: 'legacy-targetless-text', operatorId: '900',
+    partHash: 'legacy-targetless-part', channelId: target.channelId, guildId: target.guildId,
+    provider: target.provider, nativeId: target.nativeId, generation: target.generation,
+    partIndex: 0, partCount: 1, nonce: 'legacy-targetless-nonce', agentPacket: legacyPacket
+  };
+  f.state.receipt(null, 'direct-post-attempt', { ...legacyAttempt, status: 'attempted' });
+  f.state.receipt(null, 'direct-post-outcome', { ...legacyAttempt, status: 200, messageId: 'legacy-targetless-message', outcome: 'sent' });
+
+  let resolutions = 0;
+  let posts = 0;
+  const recipient = createPeerService({ state: f.state, provider: 'codex', token: 'fixture',
+    callerDependencies: { resolveCodexCaller: async () => {
+      resolutions += 1;
+      if (resolutions > 2) {
+        const current = f.state.getBinding(target.channelId);
+        f.state.setBindingReadiness(target.channelId, READINESS.GAP, 'source readiness changed during legacy disclosure', current);
+      }
+      return { sessionId: target.nativeId, threadId: target.nativeId, turnId: 't1' };
+    } },
+    fetchImpl: async (url, options) => {
+      if (options.method === 'GET') return { ok: true, status: 200, json: async () => ({ id: '101', guild_id: '100' }) };
+      posts += 1;
+      return { ok: true, status: 200, json: async () => ({ id: '10002' }) };
+    } });
+
+  await assert.rejects(
+    recipient.send({ reply_to: request.id, text: 'legacy result', dedupe_key: requestId }),
+    /direct post binding is no longer current/
+  );
+  assert.ok(resolutions > 2, 'caller revalidation reached the source readiness change');
+  assert.equal(posts, 0, 'the revoked legacy replay does not send again');
 });
 
 test('peer result resolves a frozen local child before sibling selection', async t => {
