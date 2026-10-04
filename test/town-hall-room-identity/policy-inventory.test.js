@@ -534,6 +534,16 @@ function roomDigitPolicies(records) {
       }
       return null;
     };
+    const indexCommonJsFunction = (exportName, node) => {
+      const fn = {
+        info,
+        node,
+        name: node.name?.text || exportName,
+        calls: [],
+      };
+      info.exports.set(exportName, fn);
+      info.functionDefs.push(fn);
+    };
     const commonJsExportVisit = node => {
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const target = commonJsExportTarget(node.left);
@@ -543,22 +553,22 @@ function roomDigitPolicies(records) {
           for (const property of node.right.properties) {
             if (ts.isShorthandPropertyAssignment(property)) {
               info.exports.set(property.name.text, property.name.text);
+            } else if (ts.isMethodDeclaration(property) &&
+                (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name))) {
+              indexCommonJsFunction(property.name.text, property);
             } else if (ts.isPropertyAssignment(property) &&
                 (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) &&
                 ts.isIdentifier(property.initializer)) {
               info.exports.set(property.name.text, property.initializer.text);
+            } else if (ts.isPropertyAssignment(property) &&
+                (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) &&
+                (ts.isFunctionExpression(property.initializer) || ts.isArrowFunction(property.initializer))) {
+              indexCommonJsFunction(property.name.text, property.initializer);
             }
           }
         } else if (target &&
             (ts.isFunctionExpression(node.right) || ts.isArrowFunction(node.right))) {
-          const fn = {
-            info,
-            node: node.right,
-            name: node.right.name?.text || 'default',
-            calls: [],
-          };
-          info.exports.set(target, fn);
-          info.functionDefs.push(fn);
+          indexCommonJsFunction(target, node.right);
         }
       }
       ts.forEachChild(node, commonJsExportVisit);
