@@ -472,15 +472,20 @@ function compact(raw) {
   };
 }
 
-let canonicalForwardingNames;
-
-function currentForwardingNames() {
-  if (!canonicalForwardingNames) {
-    const canonicalText = fs.readFileSync(stateSourcePath, 'utf8');
-    canonicalForwardingNames = new Set(inventory(canonicalText).forwarding);
-  }
-  return canonicalForwardingNames;
-}
+const PRIOR_UNSUPPORTED_FORWARDING_NAMES = new Set([
+  'listTopicPublications', 'bindingInput', 'bind', '_bindOrdinary', '_rebindOrdinary',
+  'enrollThread', 'listThreadEnrollments', 'deactivateThreadEnrollments', 'setThreadBaseline',
+  'checkpointThread', 'findNativeBinding', 'setBindingReadiness', 'assertNativeOwnerFree',
+  'assertConductorOwnerFree', 'upsertIntakeWatermark', 'checkpointIntake', 'setIntakeBaseline',
+  'setIntakeCutoff', 'setIntakeCutoffInTransaction', 'markIntakeBoundary', 'recordTopicPublication',
+  'reconcileTopicPublication', 'acceptInteraction', 'recordInteractionCallbackOutcome',
+  'recordDecisionPresentationOutcome', 'getTransportReceipt', 'beginTransportReceipt',
+  'recordTransportReceiptOutcome', 'markSubmitted', 'setObserverCursor', 'releaseNativeReplyFilePreparation',
+  'markReplyFailure', 'reconcileReplyDelivery', 'recoverAfterRestart', 'recoverDirectPostReceipts',
+  'recoverDirectPostReceiptsInternal', 'recoverBoardRefreshReceipts', 'recoverBoardRefreshAttempt',
+  'recordBoardRefreshOutcome', 'recordDirectPostPreflight', 'recordDirectPostOutcome',
+  'reconcileDirectPostOutcome', 'recoveryCandidates', 'completeProvisionIntent'
+]);
 
 function matches(text, baseline) {
   try {
@@ -496,14 +501,15 @@ function matches(text, baseline) {
     }
     const parsed = ts.createSourceFile('state.js', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const owner = parsed.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'SurfaceState');
-    const canonicalForwarding = currentForwardingNames();
+    const priorUnsupportedForwarding = PRIOR_UNSUPPORTED_FORWARDING_NAMES;
     for (const method of owner.members) {
-      const name = method.name?.text;
+      const name = ts.isConstructorDeclaration(method) ? 'constructor' : method.name?.text;
       if (!candidate.forwarding.includes(name)) continue;
+      if (ts.isConstructorDeclaration(method)) return false;
       const unsupportedShape = method.modifiers?.length ||
         method.parameters.some(parameter => parameter.initializer || !ts.isIdentifier(parameter.name));
       if (unsupportedShape) {
-        if (!baseline.forwarding.includes(name) || !canonicalForwarding.has(name)) return false;
+        if (!baseline.forwarding.includes(name) || !priorUnsupportedForwarding.has(name)) return false;
         continue;
       }
       const call = method.body.statements[0].expression;
