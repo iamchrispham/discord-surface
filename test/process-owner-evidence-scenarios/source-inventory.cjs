@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const ts = require('typescript');
+const { createLocalModuleResolver } = require('./local-module-resolver.cjs');
 
 const SRC_ROOT = path.join(__dirname, '..', '..', 'src');
 
@@ -91,9 +92,9 @@ function enclosingOwner(node) {
   return null;
 }
 
-function parseOwnerSites(fileName, text, generatedOwner = null) {
+function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver = null, sourcePath = null) {
   const kind = fileName.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS;
-  const virtualPath = path.resolve(fileName);
+  const virtualPath = path.resolve(sourcePath || fileName);
   const options = { noLib: true, noResolve: true, allowJs: true };
   const sourceFile = ts.createSourceFile(virtualPath, text, ts.ScriptTarget.Latest, true, kind);
   const host = ts.createCompilerHost(options);
@@ -149,6 +150,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     if (existing) existing.push(entry);
     else parameterArguments.set(symbol, [entry]);
   };
+  const recordRestParameterArguments = (symbol, values) => {
+    if (!symbol) return;
+    const entries = values.filter(Boolean).map((source, index) => ({ source, restIndex: index }));
+    if (!entries.length) return;
+    const existing = parameterArguments.get(symbol);
+    if (existing) existing.push(...entries);
+    else parameterArguments.set(symbol, entries);
+  };
   const symbolDeclaration = symbol => {
     if (!symbol) return null;
     if (symbol.valueDeclaration) return symbol.valueDeclaration;
@@ -184,6 +193,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
   };
   const processImportAtom = symbol => {
     for (const declaration of symbol?.declarations || []) {
+      if (ts.isImportEqualsDeclaration(declaration)) {
+        const reference = declaration.moduleReference;
+        const moduleName = reference && ts.isExternalModuleReference(reference)
+          ? reference.expression : null;
+        if (ts.isStringLiteral(moduleName) &&
+          (moduleName.text === 'node:process' || moduleName.text === 'process')) return PROCESS_OBJECT;
+        continue;
+      }
       let importDeclaration = declaration;
       while (importDeclaration && !ts.isImportDeclaration(importDeclaration)) {
         importDeclaration = importDeclaration.parent;
@@ -203,6 +220,36 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     }
     return null;
   };
+  const localImportAtoms = symbol => {
+    if (!moduleResolver) return new Set();
+    const atoms = new Set();
+    for (const declaration of symbol?.declarations || []) {
+      let importDeclaration = declaration;
+      while (importDeclaration && !ts.isImportDeclaration(importDeclaration)) {
+        importDeclaration = importDeclaration.parent;
+      }
+      if (importDeclaration && ts.isStringLiteral(importDeclaration.moduleSpecifier)) {
+        const clause = importDeclaration.importClause;
+        let name = null;
+        if (clause?.name && (declaration === clause || declaration === clause.name)) name = 'default';
+        if (ts.isNamespaceImport(declaration)) name = '*';
+        if (ts.isImportSpecifier(declaration)) name = (declaration.propertyName || declaration.name).text;
+        if (name) {
+          for (const atom of moduleResolver.resolveImport(
+            virtualPath, importDeclaration.moduleSpecifier.text, name)) atoms.add(atom);
+        }
+      }
+      if (ts.isImportEqualsDeclaration(declaration)) {
+        const reference = declaration.moduleReference;
+        const moduleName = reference && ts.isExternalModuleReference(reference)
+          ? reference.expression : null;
+        if (ts.isStringLiteral(moduleName)) {
+          for (const atom of moduleResolver.resolveImport(virtualPath, moduleName.text, '*')) atoms.add(atom);
+        }
+      }
+    }
+    return atoms;
+  };
   const staticPropertyNames = (access, resolveAliases = true) => {
     if (ts.isPropertyAccessExpression(access)) return [access.name.text];
     if (!ts.isElementAccessExpression(access)) return [];
@@ -217,6 +264,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       if (initializer && (ts.isStringLiteral(initializer) || ts.isNumericLiteral(initializer))) {
         return [initializer.text];
       }
+      const values = staticValue(argument);
+      if (values.size) return [...values].filter(value => typeof value === 'string' || typeof value === 'number')
+        .map(String);
     }
     return [];
   };
@@ -271,8 +321,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
           }
         }
       } else if (ts.isPropertyAccessExpression(left) || ts.isElementAccessExpression(left)) {
-        for (const propertySymbol of propertySymbols(left, false)) {
-          recordAssignment(propertySymbol, { source: expression.right });
+        if (!receiverSymbols(left.expression).size) {
+          for (const propertySymbol of propertySymbols(left, false)) {
+            recordAssignment(propertySymbol, { source: expression.right });
+          }
         }
         recordMemberAssignment(left, { source: expression.right });
       }
@@ -289,9 +341,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     }
     return ts.isIdentifier(binding.name) ? binding.name.text : null;
   };
-  const indexParameterBinding = (name, argument) => {
+  const indexParameterBinding = (name, argument, parameter, restArguments = null) => {
     if (ts.isIdentifier(name)) {
-      recordParameterArgument(checker.getSymbolAtLocation(name), argument);
+      if (parameter?.dotDotDotToken) {
+        recordRestParameterArguments(checker.getSymbolAtLocation(name), restArguments || []);
+      } else if (argument) {
+        recordParameterArgument(checker.getSymbolAtLocation(name), argument);
+      }
       return;
     }
     if (ts.isArrayBindingPattern(name)) {
@@ -410,9 +466,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
         return;
       }
       for (let index = 0; index < parameters.length; index += 1) {
+        const parameter = parameters[index];
         const argument = argumentsList[index];
-        if (argument && !ts.isSpreadElement(argument)) {
-          indexParameterBinding(parameters[index].name, argument);
+        if (parameter.dotDotDotToken) {
+          indexParameterBinding(parameter.name, argument, parameter, argumentsList.slice(index));
+        } else if (argument && !ts.isSpreadElement(argument)) {
+          indexParameterBinding(parameter.name, argument, parameter);
         }
       }
     }
@@ -546,6 +605,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     if (!declaration || visited.has(symbol)) return [];
     const symbolSeen = new Set(seen).add(symbol);
     const sources = [];
+    for (const argument of parameterArguments.get(symbol) || []) {
+      if (argument && argument.restIndex === index && argument.source) sources.push(argument.source);
+    }
     if ((ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) && declaration.initializer) {
       sources.push(...arrayElementSources(declaration.initializer, index, symbolSeen));
     }
@@ -682,6 +744,11 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       const result = new Set();
       for (const name of names) {
         if (name === 'process' && hasAtom(receiver, GLOBAL_OBJECT)) result.add(PROCESS_OBJECT);
+        for (const atom of receiver) {
+          const modulePath = moduleResolver?.modulePathFromAtom(atom);
+          if (!modulePath) continue;
+          for (const resolved of moduleResolver.resolveExport(modulePath, String(name), seen)) result.add(resolved);
+        }
         if (name === 'directPostOwnerAlive') result.add(LEGACY_OWNER);
         if (hasAtom(receiver, LEGACY_OWNER) &&
           (name === 'bind' || name === 'call' || name === 'apply')) result.add(LEGACY_OWNER);
@@ -749,9 +816,11 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       if (ts.isIdentifier(node.expression) && node.expression.text === 'require' &&
         !symbolDeclaration(checker.getSymbolAtLocation(node.expression))) {
         const moduleName = node.arguments[0];
-        if (moduleName && ts.isStringLiteral(moduleName) &&
-          (moduleName.text === 'node:process' || moduleName.text === 'process')) {
-          return new Set([PROCESS_OBJECT]);
+        if (moduleName && ts.isStringLiteral(moduleName)) {
+          if (moduleName.text === 'node:process' || moduleName.text === 'process') {
+            return new Set([PROCESS_OBJECT]);
+          }
+          if (moduleResolver) return moduleResolver.resolveRequire(virtualPath, moduleName.text);
         }
       }
       // `probe.bind(...)` yields a bound probe; a later invocation of that
@@ -796,6 +865,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       : checker.getSymbolAtLocation(node);
     const importedAtom = processImportAtom(symbol);
     if (importedAtom) return new Set([importedAtom]);
+    const importedAtoms = localImportAtoms(symbol);
+    if (importedAtoms.size) return importedAtoms;
     const declaration = symbolDeclaration(symbol);
     if (declaration && isAmbientDeclaration(declaration)) {
       if (node.text === 'process') return new Set([PROCESS_OBJECT]);
@@ -817,6 +888,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       for (const atom of resolveSet(valueNode, symbolSeen)) result.add(atom);
     };
     const addFromParameterArgument = entry => {
+      if (entry && entry.restIndex !== undefined) return;
       if (entry && entry.source) addFromAssignment(entry);
       else addFrom(entry);
     };
@@ -957,6 +1029,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     const declaration = symbolDeclaration(symbol);
     if (!declaration || visited.has(symbol)) return true;
     const symbolSeen = new Set(seen).add(symbol);
+    const index = Number(name);
+    if (Number.isInteger(index) && index >= 0) {
+      const restSources = (parameterArguments.get(symbol) || [])
+        .filter(entry => entry && entry.restIndex === index && entry.source)
+        .map(entry => entry.source);
+      if (restSources.length) return restSources.some(source => mayBeUnresolved(source, symbolSeen));
+    }
     const checks = [];
     const memberSources = [];
     for (const receiver of receiverSymbols(node)) {
@@ -991,6 +1070,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     const seen = new Set(visited).add(node);
     const transparent = transparentExpression(node);
     if (transparent) return literalProperty(transparent, name, seen);
+    if (moduleResolver && ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
+      node.expression.text === 'require' && ts.isStringLiteral(node.arguments[0])) {
+      for (const atom of moduleResolver.resolveRequire(virtualPath, node.arguments[0].text)) {
+        const modulePath = moduleResolver.modulePathFromAtom(atom);
+        if (!modulePath) continue;
+        for (const resolved of moduleResolver.resolveExport(modulePath, name, seen)) found.add(resolved);
+      }
+      return found;
+    }
     if (ts.isObjectLiteralExpression(node)) {
       for (const property of node.properties) {
         if (ts.isSpreadAssignment(property)) {
@@ -1230,9 +1318,11 @@ function inventoryProcessOwnerSites(root) {
   const kills = [];
   const legacyCalls = [];
   const violations = [];
-  for (const full of sourceFiles(root)) {
+  const files = sourceFiles(root);
+  const moduleResolver = createLocalModuleResolver(files);
+  for (const full of files) {
     const relative = path.relative(root, full).split(path.sep).join('/');
-    const parsed = parseOwnerSites(relative, fs.readFileSync(full, 'utf8'));
+    const parsed = parseOwnerSites(relative, fs.readFileSync(full, 'utf8'), null, moduleResolver, full);
     for (const site of parsed.kills) {
       const key = `${site.file}\u0000${site.owner}`;
       kills.push(key);
