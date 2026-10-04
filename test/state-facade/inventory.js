@@ -149,9 +149,10 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
     return null;
   };
   const collectObject = object => {
+    const methods = new Map();
     for (const property of object.properties) {
       if (ts.isSpreadAssignment(property)) {
-        for (const [method, descriptor] of resolveExpression(property.expression)) methods.set(method, descriptor);
+        for (const [method, descriptor] of resolveReturnedExpression(property.expression)) methods.set(method, descriptor);
         continue;
       }
       const name = propertyName(property.name);
@@ -162,19 +163,31 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
       else if (ts.isPropertyAssignment(property)) descriptor = resolveValue(property.initializer);
       if (descriptor) methods.set(name, descriptor);
     }
+    return methods;
   };
-  const visit = node => {
-    if (ts.isObjectLiteralExpression(node)) collectObject(node);
-    if (node !== factory && ts.isFunctionLike(node)) return;
-    ts.forEachChild(node, visit);
+  const resolveReturnedExpression = (expression, seen = new Set()) => {
+    if (!expression) return new Map();
+    let current = expression;
+    while (ts.isParenthesizedExpression(current)) current = current.expression;
+    if (ts.isObjectLiteralExpression(current)) return collectObject(current);
+    if (ts.isIdentifier(current)) {
+      const declaration = declarations.get(current.text);
+      if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        const key = declaration.getStart(source);
+        if (seen.has(key)) return new Map();
+        const next = new Set(seen);
+        next.add(key);
+        return resolveReturnedExpression(declaration.initializer, next);
+      }
+    }
+    return resolveExpression(current);
   };
-  visit(factory);
   const body = factory.body;
   const returns = body && ts.isBlock(body)
     ? body.statements.filter(statement => ts.isReturnStatement(statement)).map(statement => statement.expression).filter(Boolean)
     : [body];
   for (const expression of returns) {
-    for (const [method, descriptor] of resolveExpression(expression)) methods.set(method, descriptor);
+    for (const [method, descriptor] of resolveReturnedExpression(expression)) methods.set(method, descriptor);
   }
   return methods;
 }
@@ -472,20 +485,58 @@ function compact(raw) {
   };
 }
 
-const PRIOR_UNSUPPORTED_FORWARDING_NAMES = new Set([
-  'listTopicPublications', 'bindingInput', 'bind', '_bindOrdinary', '_rebindOrdinary',
-  'enrollThread', 'listThreadEnrollments', 'deactivateThreadEnrollments', 'setThreadBaseline',
-  'checkpointThread', 'findNativeBinding', 'setBindingReadiness', 'assertNativeOwnerFree',
-  'assertConductorOwnerFree', 'upsertIntakeWatermark', 'checkpointIntake', 'setIntakeBaseline',
-  'setIntakeCutoff', 'setIntakeCutoffInTransaction', 'markIntakeBoundary', 'recordTopicPublication',
-  'reconcileTopicPublication', 'acceptInteraction', 'recordInteractionCallbackOutcome',
-  'recordDecisionPresentationOutcome', 'getTransportReceipt', 'beginTransportReceipt',
-  'recordTransportReceiptOutcome', 'markSubmitted', 'setObserverCursor', 'releaseNativeReplyFilePreparation',
-  'markReplyFailure', 'reconcileReplyDelivery', 'recoverAfterRestart', 'recoverDirectPostReceipts',
-  'recoverDirectPostReceiptsInternal', 'recoverBoardRefreshReceipts', 'recoverBoardRefreshAttempt',
-  'recordBoardRefreshOutcome', 'recordDirectPostPreflight', 'recordDirectPostOutcome',
-  'reconcileDirectPostOutcome', 'recoveryCandidates', 'completeProvisionIntent'
+function parameterShape(method, source) {
+  return method.parameters.map(parameter => tokens(parameter.getText(source)));
+}
+
+const PRIOR_UNSUPPORTED_FORWARDING_SHAPES = new Map([
+  ['listTopicPublications', ['channelId = null']],
+  ['bindingInput', ['binding', 'existing = null']],
+  ['bind', ['binding', 'options = {}']],
+  ['_bindOrdinary', ['binding', 'identity', 'adoptionCutoff = null', 'options = {}']],
+  ['_rebindOrdinary', ['binding', 'identity', 'nativeProof = null', 'intakeCutoff = null', 'options = {}']],
+  ['enrollThread', ['input', 'expectedBinding = null']],
+  ['listThreadEnrollments', ['parentChannelId = null']],
+  ['deactivateThreadEnrollments', ['parentChannelId', 'expectedBinding = null']],
+  ['setThreadBaseline', ['threadId', 'latestId', 'expectedBinding = null', 'expectedEnrollment = undefined']],
+  ['checkpointThread', ['threadId', 'coverageId', 'expectedBinding = null', 'expectedEnrollment = undefined']],
+  ['findNativeBinding', ['nativeId', 'provider = null']],
+  ['setBindingReadiness', ['channelId', 'readiness', 'detail = null', 'expectedBinding = null']],
+  ['assertNativeOwnerFree', ['provider', 'nativeId', 'channelId = null']],
+  ['assertConductorOwnerFree', ['provider', 'conductorId', 'channelId = null']],
+  ['upsertIntakeWatermark', ['event', 'ready', 'coverageId = null']],
+  ['checkpointIntake', ['channelId', 'coverageId', 'expectedBinding = null']],
+  ['setIntakeBaseline', ['channelId', 'lastSeenId', 'detail', 'expectedBinding = null', 'expectedBoundary = undefined', 'expectedReadiness = undefined']],
+  ['setIntakeCutoff', ['channelId', 'guildId', 'lastSeenId', 'detail', 'expectedBinding = undefined']],
+  ['setIntakeCutoffInTransaction', ['channelId', 'guildId', 'lastSeenId', 'detail', 'expectedBinding = undefined']],
+  ['markIntakeBoundary', ['channelId', 'state', 'detail = null', 'gapFrom = null', 'gapTo = null', 'expectedBinding = null', 'pauseMetadata = null', 'expectedBoundary = undefined', 'expectedReadiness = undefined']],
+  ['recordTopicPublication', ['channelId', 'publication', 'expectedBinding = null']],
+  ['reconcileTopicPublication', ['channelId', 'requestId', 'resolution', 'evidenceScope', 'readback = null']],
+  ['acceptInteraction', ['input', 'expectedBinding = null', 'options = {}']],
+  ['recordInteractionCallbackOutcome', ['messageId', 'outcome', 'detail = {}']],
+  ['recordDecisionPresentationOutcome', ['presentationId', 'outcome', 'messageId = null']],
+  ['getTransportReceipt', ['messageId', 'transport = null']],
+  ['beginTransportReceipt', ['messageId', 'options = {}']],
+  ['recordTransportReceiptOutcome', ['messageId', 'outcome', 'detail = {}', 'transport = null']],
+  ['markSubmitted', ['messageId', 'cursor = null', 'marker = null']],
+  ['setObserverCursor', ['messageId', 'cursor', 'marker = null']],
+  ['releaseNativeReplyFilePreparation', ['messageId', 'preparationId', 'partIndex = 0']],
+  ['markReplyFailure', ['messageId', 'error', 'unknown = false', 'partIndex = null']],
+  ['reconcileReplyDelivery', ['messageId', 'resolution', 'options = {}']],
+  ['recoverAfterRestart', ['ownerAlive = null']],
+  ['recoverDirectPostReceipts', ['ownerAlive = undefined']],
+  ['recoverDirectPostReceiptsInternal', ['ownerAlive = undefined']],
+  ['recoverBoardRefreshReceipts', ['ownerAlive = (pid, identity) => this.directPostOwnerEvidence(pid, identity)']],
+  ['recoverBoardRefreshAttempt', ['target', 'attemptId', 'ownerAlive = (pid, identity) => this.directPostOwnerEvidence(pid, identity)']],
+  ['recordBoardRefreshOutcome', ['target', 'attemptId', 'outcome', 'detail = {}']],
+  ['recordDirectPostPreflight', ['meta', 'outcome', 'detail = {}']],
+  ['recordDirectPostOutcome', ['requestId', 'attemptId', 'outcome', 'detail = {}']],
+  ['reconcileDirectPostOutcome', ['requestId', 'attemptId', 'resolution', 'evidence = {}']],
+  ['recoveryCandidates', ['before = null']],
+  ['completeProvisionIntent', ['provider', 'nativeId', 'channelId', 'conductorId = null']]
 ]);
+
+const PRIOR_UNSUPPORTED_FORWARDING_NAMES = new Set(PRIOR_UNSUPPORTED_FORWARDING_SHAPES.keys());
 
 function matches(text, baseline) {
   try {
@@ -506,12 +557,16 @@ function matches(text, baseline) {
       const name = ts.isConstructorDeclaration(method) ? 'constructor' : method.name?.text;
       if (!candidate.forwarding.includes(name)) continue;
       if (ts.isConstructorDeclaration(method)) return false;
-      const unsupportedShape = method.modifiers?.length ||
-        method.parameters.some(parameter => parameter.initializer || !ts.isIdentifier(parameter.name));
-      if (unsupportedShape) {
-        if (!baseline.forwarding.includes(name) || !priorUnsupportedForwarding.has(name)) return false;
-        continue;
-      }
+      const hasUnsupportedModifiers = !!method.modifiers?.length;
+      const hasUnsupportedParameters = method.parameters.some(parameter =>
+        parameter.initializer || !ts.isIdentifier(parameter.name));
+      const exactLegacyParameterShape = JSON.stringify(parameterShape(method, parsed)) ===
+        JSON.stringify((PRIOR_UNSUPPORTED_FORWARDING_SHAPES.get(name) || []).map(text => tokens(text)));
+      const grandfatheredParameterShape = hasUnsupportedParameters &&
+        baseline.forwarding.includes(name) &&
+        priorUnsupportedForwarding.has(name) &&
+        exactLegacyParameterShape;
+      if (hasUnsupportedModifiers || (hasUnsupportedParameters && !grandfatheredParameterShape)) return false;
       const call = method.body.statements[0].expression;
       const dispatch = call.expression;
       if (method.asteriskToken || !ts.isPropertyAccessExpression(dispatch)) return false;
@@ -542,11 +597,12 @@ function matches(text, baseline) {
       let matchesStyle = false;
       if (style === INVOCATION_STYLES.THIS) {
         matchesStyle = (restApply || orderedCall || argumentsApply) &&
-          (restApply || method.parameters.length >= requiredArguments);
+          (restApply || argumentsApply || method.parameters.length >= requiredArguments);
       }
       else if (style === INVOCATION_STYLES.STATE) {
         matchesStyle = (directCall || argumentsSpread) &&
-          (method.parameters.some(parameter => parameter.dotDotDotToken) || method.parameters.length >= requiredArguments);
+          (argumentsSpread || method.parameters.some(parameter => parameter.dotDotDotToken) ||
+            method.parameters.length >= requiredArguments);
       }
       if (!matchesStyle) return false;
     }
