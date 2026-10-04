@@ -326,8 +326,24 @@ test("Reflect callable origin survives finite wrappers", () => {
   runFixture("const invoke = Reflect.apply['apply'](Reflect, [Reflect]); function newProbe(pid) { invoke(process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
 });
 
-test("ordinary nested Reflect target stays ordinary", () => {
-  runFixture("function newProbe(pid) { Reflect.apply(Reflect.apply, Reflect, [process.kill, null, [pid, 0]]); }", [], []);
+test("nested Reflect target refuses", () => {
+  runFixture("function newProbe(pid) { Reflect.apply(Reflect.apply, Reflect, [process.kill, null, [pid, 0]]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("member calls and mutable properties retain finite probe facts", () => {
+  runFixture("const helpers = { invoke(probe, pid) { probe(pid, 0); } }; helpers.invoke(process.kill, 1);", ["private-alias.js\u0000invoke"], ["unclassified process probe private-alias.js:invoke"]);
+  runFixture("class Helpers { invoke(probe, pid) { probe(pid, 0); } } const helpers = new Helpers(); helpers.invoke(process.kill, 1);", ["private-alias.js\u0000invoke"], ["unclassified process probe private-alias.js:invoke"]);
+  runFixture("const state = {}; const alias = state; alias.probe = process.kill; function newProbe(pid) { state.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const options = {}; options.signal = 9; function newProbe(pid) { process.kill(pid, options.signal); }", [], []);
+  runFixture("const options = {}; options.signal = 'SIGTERM'; function newProbe(pid) { process.kill(pid, options.signal); }", [], []);
+});
+
+test("fallback and omitted signals stay ordinary", () => {
+  runFixture("function newProbe(pid, signal) { process.kill(pid, signal || 'SIGTERM'); }", [], []);
+  runFixture("function newProbe(pid) { process.kill(pid, 0 || 'SIGTERM'); }", [], []);
+  runFixture("let signal = 0; signal = 9; function newProbe(pid) { process.kill(pid, signal || 'SIGTERM'); }", [], []);
+  runFixture("function newProbe(pid) { process.kill(pid); }", [], []);
+  runFixture("const terminate = process.kill; function newProbe(pid) { terminate(pid); }", [], []);
 });
 
 test("unresolved direct signal refuses", () => {

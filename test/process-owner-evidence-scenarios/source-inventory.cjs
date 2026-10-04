@@ -117,19 +117,19 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     else assignments.set(symbol, [value]);
   };
   const recordMemberAssignment = (access, value) => {
-    const receiver = checker.getSymbolAtLocation(access.expression);
-    if (!receiver) return;
     const names = staticPropertyNames(access, false);
     if (!names.length) return;
-    let byName = memberAssignments.get(receiver);
-    if (!byName) {
-      byName = new Map();
-      memberAssignments.set(receiver, byName);
-    }
-    for (const name of names) {
-      const existing = byName.get(String(name));
-      if (existing) existing.push(value);
-      else byName.set(String(name), [value]);
+    for (const receiver of receiverSymbols(access.expression)) {
+      let byName = memberAssignments.get(receiver);
+      if (!byName) {
+        byName = new Map();
+        memberAssignments.set(receiver, byName);
+      }
+      for (const name of names) {
+        const existing = byName.get(String(name));
+        if (existing) existing.push(value);
+        else byName.set(String(name), [value]);
+      }
     }
   };
   const recordParameterArgument = (symbol, value, name = null) => {
@@ -146,6 +146,24 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     return declarations.length === 1 &&
       (ts.isVariableDeclaration(declarations[0]) || ts.isBindingElement(declarations[0]))
       ? declarations[0] : null;
+  };
+  const receiverSymbols = (node, visited = new Set()) => {
+    const symbols = new Set();
+    const symbol = checker.getSymbolAtLocation(node);
+    if (!symbol || visited.has(symbol)) return symbols;
+    const seen = new Set(visited).add(symbol);
+    symbols.add(symbol);
+    const declaration = symbolDeclaration(symbol);
+    if (declaration && (ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) &&
+      declaration.initializer) {
+      for (const nested of receiverSymbols(declaration.initializer, seen)) symbols.add(nested);
+    }
+    for (const assigned of assignments.get(symbol) || []) {
+      const source = assigned && assigned.source ? assigned.source : assigned;
+      if (!source) continue;
+      for (const nested of receiverSymbols(source, seen)) symbols.add(nested);
+    }
+    return symbols;
   };
   const processImportAtom = symbol => {
     for (const declaration of symbol?.declarations || []) {
@@ -280,22 +298,44 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
   const callableParameters = (callee, visited = new Set()) => {
     if (ts.isParenthesizedExpression(callee)) return callableParameters(callee.expression, visited);
     if (ts.isFunctionExpression(callee) || ts.isArrowFunction(callee)) return callee.parameters;
-    if (!ts.isIdentifier(callee)) return [];
-    const symbol = checker.getSymbolAtLocation(callee);
-    if (!symbol || visited.has(symbol)) return [];
-    const symbolSeen = new Set(visited).add(symbol);
-    const declaration = symbolDeclaration(symbol);
-    if (declaration && (ts.isFunctionDeclaration(declaration) || ts.isFunctionExpression(declaration) ||
-      ts.isArrowFunction(declaration) || ts.isMethodDeclaration(declaration))) {
-      return declaration.parameters;
+    const symbols = [];
+    if (ts.isIdentifier(callee) || ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
+      const direct = checker.getSymbolAtLocation(callee);
+      if (direct) symbols.push(direct);
+      if (ts.isPropertyAccessExpression(callee)) {
+        const member = checker.getSymbolAtLocation(callee.name);
+        if (member) symbols.push(member);
+      }
+      for (const property of propertySymbols(callee)) symbols.push(property);
     }
-    if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) {
-      if (ts.isFunctionExpression(declaration.initializer) || ts.isArrowFunction(declaration.initializer)) {
-        return declaration.initializer.parameters;
+    const seenSymbols = new Set();
+    const parametersFor = symbol => {
+      if (!symbol || visited.has(symbol) || seenSymbols.has(symbol)) return [];
+      seenSymbols.add(symbol);
+      const symbolSeen = new Set(visited).add(symbol);
+      const declaration = symbolDeclaration(symbol);
+      if (declaration && (ts.isFunctionDeclaration(declaration) || ts.isFunctionExpression(declaration) ||
+        ts.isArrowFunction(declaration) || ts.isMethodDeclaration(declaration))) {
+        return declaration.parameters;
       }
-      if (ts.isIdentifier(declaration.initializer)) {
-        return callableParameters(declaration.initializer, symbolSeen);
+      if (declaration && ts.isPropertyAssignment(declaration)) {
+        if (ts.isFunctionExpression(declaration.initializer) || ts.isArrowFunction(declaration.initializer)) {
+          return declaration.initializer.parameters;
+        }
       }
+      if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        if (ts.isFunctionExpression(declaration.initializer) || ts.isArrowFunction(declaration.initializer)) {
+          return declaration.initializer.parameters;
+        }
+        if (ts.isIdentifier(declaration.initializer)) {
+          return callableParameters(declaration.initializer, symbolSeen);
+        }
+      }
+      return [];
+    };
+    for (const symbol of symbols) {
+      const parameters = parametersFor(symbol);
+      if (parameters.length) return parameters;
     }
     return [];
   };
@@ -320,6 +360,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     if (ts.isElementAccessExpression(node)) return staticValue(node.argumentExpression, visited);
     return new Set();
   }
+
+  const isFalsyStaticAtom = atom => atom === 0 || atom === '' || atom === false || atom == null;
 
   // True only for a symbol bound by an object- or array-destructuring pattern
   // (BindingElement), whose possible values are the pattern sources of its
@@ -379,7 +421,6 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       if (operator === ts.SyntaxKind.EqualsToken) return resolveSet(node.right, seen);
       if (operator === ts.SyntaxKind.CommaToken) return resolveSet(node.right, seen);
       if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
-        operator === ts.SyntaxKind.BarBarToken ||
         operator === ts.SyntaxKind.QuestionQuestionToken ||
         operator === ts.SyntaxKind.BarBarEqualsToken ||
         operator === ts.SyntaxKind.QuestionQuestionEqualsToken ||
@@ -387,6 +428,22 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
         const union = resolveSet(node.left, seen);
         for (const atom of resolveSet(node.right, seen)) union.add(atom);
         return union;
+      }
+      if (operator === ts.SyntaxKind.BarBarToken) {
+        const left = resolveSet(node.left, seen);
+        const right = resolveSet(node.right, seen);
+        const leftMayBeFalsy = left.size === 0 || [...left].some(isFalsyStaticAtom);
+        const leftMayBeTruthy = left.size === 0 || [...left].some(atom => !isFalsyStaticAtom(atom));
+        const result = new Set();
+        if (leftMayBeTruthy) {
+          for (const atom of left) {
+            if (!isFalsyStaticAtom(atom)) result.add(atom);
+          }
+        }
+        if (leftMayBeFalsy) {
+          for (const atom of right) result.add(atom);
+        }
+        return result;
       }
       return empty;
     }
@@ -429,9 +486,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
           for (const atom of resolveSet(assigned.source, seen)) result.add(atom);
         }
       }
-      const receiverSymbol = checker.getSymbolAtLocation(node.expression);
-      const byName = memberAssignments.get(receiverSymbol);
-      if (byName) {
+      for (const receiverSymbol of receiverSymbols(node.expression)) {
+        const byName = memberAssignments.get(receiverSymbol);
+        if (!byName) continue;
         for (const name of names) {
           for (const assigned of byName.get(String(name)) || []) {
             for (const atom of resolveSet(assigned.source, seen)) result.add(atom);
@@ -551,9 +608,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     return result;
   }
 
-  // Logical signal expressions keep their known branch values, but an
-  // unresolved short-circuit operand still represents a possible zero at
-  // runtime and must be refused rather than accepted as the known branch.
+  // Logical signal expressions keep only branches that can reach the call.
+  // A zero on the left of `||` is filtered by its fallback; unresolved
+  // branches that can still supply the signal remain refused.
   function mayBeUnresolved(node, visited = new Set()) {
     if (!node || visited.has(node)) return true;
     const seen = new Set(visited).add(node);
@@ -566,8 +623,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     if (ts.isBinaryExpression(node)) {
       const operator = node.operatorToken.kind;
       if (operator === ts.SyntaxKind.EqualsToken) return mayBeUnresolved(node.right, seen);
+      if (operator === ts.SyntaxKind.BarBarToken) {
+        const left = staticValue(node.left, seen);
+        const leftMayBeFalsy = left.size === 0 || [...left].some(isFalsyStaticAtom);
+        if (!leftMayBeFalsy) return false;
+        return mayBeUnresolved(node.right, seen);
+      }
       if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
-        operator === ts.SyntaxKind.BarBarToken ||
         operator === ts.SyntaxKind.QuestionQuestionToken ||
         operator === ts.SyntaxKind.BarBarEqualsToken ||
         operator === ts.SyntaxKind.QuestionQuestionEqualsToken ||
@@ -631,6 +693,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     if (!declaration || visited.has(symbol)) return true;
     const symbolSeen = new Set(seen).add(symbol);
     const origins = [];
+    const memberSources = [];
+    for (const receiver of receiverSymbols(node)) {
+      const byName = memberAssignments.get(receiver);
+      if (byName) memberSources.push(...(byName.get(String(name)) || []));
+    }
+    if (memberSources.length) {
+      return memberSources.some(assigned => mayBeUnresolved(assigned.source, symbolSeen));
+    }
     if ((ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) && declaration.initializer) {
       origins.push(declaration.initializer);
     }
@@ -665,6 +735,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     if (!declaration || visited.has(symbol)) return found;
     const symbolSeen = new Set(seen).add(symbol);
     const origins = [];
+    const memberSources = [];
+    for (const receiver of receiverSymbols(node)) {
+      const byName = memberAssignments.get(receiver);
+      if (byName) memberSources.push(...(byName.get(String(name)) || []));
+    }
+    for (const assigned of memberSources) {
+      for (const atom of resolveSet(assigned.source, seen)) found.add(atom);
+    }
     if ((ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) && declaration.initializer) {
       origins.push(declaration.initializer);
     }
@@ -807,7 +885,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
           const signal = node.arguments[1];
           const values = signal ? staticValue(signal) : new Set();
           if (hasAtom(values, 0)) kills.push({ file: fileName, owner });
-          if (values.size === 0 || (signal && mayBeUnresolved(signal))) {
+          if (signal && (values.size === 0 || mayBeUnresolved(signal))) {
             violations.push(`unsupported process probe ${fileName}:${owner}`);
           }
         }
@@ -816,7 +894,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
         }
         const probeTarget = node.arguments[0] && staticValue(node.arguments[0]);
         if (hasAtom(resolved, REFLECT_APPLY) && probeTarget &&
-          [PID_PROBE, BOUND_PROBE, BOUND_REFLECT_APPLY, ...INVOCATION_METHODS]
+          [PID_PROBE, BOUND_PROBE, BOUND_REFLECT_APPLY, REFLECT_APPLY, ...INVOCATION_METHODS]
             .some(atom => hasAtom(probeTarget, atom))) {
           violations.push(`unsupported process probe ${fileName}:${owner}`);
         }
