@@ -37,7 +37,7 @@ const {
 } = require('../dist/discord/reconciliation-lookups.js');
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { heldParentRequestIds, legacyParentReconciliationChannel } = require('./state/legacy-agent-request-route');
-const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
+const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, sendInteractionFollowup, upsertGuildCsCommand } = require('./discord-interaction');
 const { createDecisionConsumer, renderDecisionProjection } = require('./discord/decision');
 const { sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
 const { sendGatewayTransportReceipt } = require('./discord/transport-receipts');
@@ -350,6 +350,7 @@ class DiscordGateway {
       interactionFetch: this.interactionFetch,
       callbackTimeoutMs: this.interactionCallbackTimeoutMs,
       authorize: (input, signal) => this.authorizeDecisionInteraction(input, signal),
+      reject: (interaction, reason, signal, deferred) => this.sendInteractionRejection(interaction, reason, signal, deferred),
       waitForDispatch: (channelId, signal) => this.waitForInteractionDispatch({ channelId }, signal),
       processAccepted: (message, signal, options) => this.consumer.processAccepted(message, signal, options),
       project: (input, signal) => this.projectDecisionMessage(input, signal)
@@ -478,19 +479,25 @@ class DiscordGateway {
   }
 
   async projectDecisionMessage({ click, presentation, answer }, signal) {
-    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
+    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent', retryable: true });
     const channel = await this.client.channels?.fetch?.(click.channelId);
+    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent', retryable: true });
     if (answer.length > 4096) {
-      const permission = this.historyPermission(channel, { requireSend: true, requireAttachFiles: true });
+      const permission = this.historyPermission(channel, { requireSend: true, requireAttachFiles: true, requireEmbedLinks: true });
       if (!permission.known || !permission.allowed) {
-        throw Object.assign(new Error('decision projection requires Attach Files permission'), { outcome: 'not_sent' });
+        throw Object.assign(new Error('decision projection requires Attach Files permission and Embed Links permission'), { outcome: 'not_sent', retryable: true });
+      }
+    } else {
+      const permission = this.historyPermission(channel, { requireSend: true, requireEmbedLinks: true });
+      if (!permission.known || !permission.allowed) {
+        throw Object.assign(new Error('decision projection requires Embed Links permission'), { outcome: 'not_sent', retryable: true });
       }
     }
     const message = await channel?.messages?.fetch?.(click.messageId);
     if (!message || typeof message.edit !== 'function') {
-      throw Object.assign(new Error('decision question message cannot be edited'), { outcome: 'not_sent' });
+      throw Object.assign(new Error('decision question message cannot be edited'), { outcome: 'not_sent', retryable: true });
     }
-    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
+    if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent', retryable: true });
     const stored = this.state.getMessage(click.interactionId);
     if (stored) {
       this.state.assertMessageCurrent(click.interactionId, 'decision-projection');
@@ -514,13 +521,39 @@ class DiscordGateway {
 
   async authorizeDecisionInteraction({ channelId }, signal) {
     if (signal?.aborted || this.stopping) return false;
-    const channel = await this.client.channels?.fetch?.(channelId);
-    const permission = this.historyPermission(channel, { requireSend: true, requireAttachFiles: true });
-    return permission.known && permission.allowed;
+    const fetchPromise = Promise.resolve().then(() => this.client.channels?.fetch?.(channelId));
+    let timeout;
+    let abort;
+    const abortPromise = new Promise(resolve => {
+      abort = () => resolve(null);
+      signal?.addEventListener('abort', abort, { once: true });
+    });
+    const timeoutPromise = new Promise(resolve => {
+      timeout = setTimeout(() => resolve(null), this.interactionCallbackTimeoutMs);
+    });
+    try {
+      const channel = await Promise.race([fetchPromise, abortPromise, timeoutPromise]);
+      if (signal?.aborted || this.stopping || !channel) return false;
+      const permission = this.historyPermission(channel, { requireSend: true });
+      return permission.known && permission.allowed;
+    } catch {
+      return false;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (signal && abort) signal.removeEventListener('abort', abort);
+    }
   }
 
-  async sendInteractionRejection(interaction, reason, signal) {
+  async sendInteractionRejection(interaction, reason, signal, deferred = false) {
     try {
+      if (deferred && interaction.applicationId) {
+        return await sendInteractionFollowup(interaction, {
+          signal,
+          fetchImpl: this.interactionFetch,
+          content: interactionRejectionMessage(reason),
+          timeoutMs: this.interactionCallbackTimeoutMs
+        });
+      }
       return await sendInteractionCallback(interaction, {
         signal,
         fetchImpl: this.interactionFetch,
@@ -919,8 +952,8 @@ class DiscordGateway {
     return [];
   }
 
-  historyPermission(channel, { requireSend = false, requireAttachFiles = false } = {}) {
-    return historyPermission(channel, this.client.user, requireSend, requireAttachFiles);
+  historyPermission(channel, { requireSend = false, requireAttachFiles = false, requireEmbedLinks = false } = {}) {
+    return historyPermission(channel, this.client.user, requireSend, requireAttachFiles, requireEmbedLinks);
   }
 
   async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null, deadline = null, expectedBoundary = undefined, expectedReadiness = undefined) {

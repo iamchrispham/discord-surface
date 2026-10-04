@@ -1,6 +1,7 @@
 import { PROVIDERS, type AgentProvider } from '../../agent-message';
 import {
   DECISION_JOURNAL,
+  DECISION_AUTHORIZATION_OUTCOMES,
   DECISION_NATIVE_OUTCOMES,
   DECISION_RECEIPT_KINDS,
   DECISION_STATES,
@@ -8,6 +9,7 @@ import {
   DECISION_WINNER_SOURCES,
   DecisionError,
   type DecisionBinding,
+  type DecisionAuthorizationOutcome,
   type DecisionCanonicalResult,
   type DecisionCanonicalRoute,
   type DecisionClick,
@@ -42,11 +44,13 @@ const BINDING_KEYS: readonly (keyof DecisionBinding)[] = [
 
 const RECEIPT_KIND_VALUES = Object.values(DECISION_RECEIPT_KINDS) as DecisionReceiptKind[];
 const TRANSPORT_OUTCOME_VALUES = Object.values(DECISION_TRANSPORT_OUTCOMES) as DecisionTransportOutcome[];
+const AUTHORIZATION_OUTCOME_VALUES = Object.values(DECISION_AUTHORIZATION_OUTCOMES) as DecisionAuthorizationOutcome[];
 const WINNER_SOURCE_VALUES = Object.values(DECISION_WINNER_SOURCES) as DecisionWinnerSource[];
 const NATIVE_OUTCOME_VALUES = Object.values(DECISION_NATIVE_OUTCOMES) as DecisionNativeOutcome[];
 const CANONICAL_ROUTE_PATH_MAX = 4096;
 const CANONICAL_CONTENT_MAX = 2000;
 export const PENDING_STATES = new Set<DecisionState>([
+  DECISION_STATES.AUTHORIZATION_PENDING,
   DECISION_STATES.CLICK_ADMITTED,
   DECISION_STATES.CALLBACK_PENDING,
   DECISION_STATES.CANONICAL_PENDING,
@@ -89,6 +93,11 @@ export function generation(value: unknown, name = 'generation'): number {
 export function outcome(value: unknown): DecisionTransportOutcome {
   if (!TRANSPORT_OUTCOME_VALUES.includes(value as DecisionTransportOutcome)) throw new DecisionError('invalid decision transport outcome');
   return value as DecisionTransportOutcome;
+}
+
+export function authorizationOutcome(value: unknown): DecisionAuthorizationOutcome {
+  if (!AUTHORIZATION_OUTCOME_VALUES.includes(value as DecisionAuthorizationOutcome)) throw new DecisionError('invalid decision authorization outcome');
+  return value as DecisionAuthorizationOutcome;
 }
 
 export function nativeOutcome(value: unknown): DecisionNativeOutcome {
@@ -273,7 +282,8 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         channelId: text(detail.channelId, 'channelId', 128),
         messageId: text(detail.messageId, 'messageId', 256),
         binding: normalizeBinding(detail.binding),
-        state: DECISION_STATES.CLICK_ADMITTED,
+        state: detail.authorizationPending === true ? DECISION_STATES.AUTHORIZATION_PENDING : DECISION_STATES.CLICK_ADMITTED,
+        authorizationOutcome: null,
         callbackAttempted: false,
         callbackOutcome: null,
         canonical: null,
@@ -289,13 +299,32 @@ export function snapshot(state: DecisionStateStore): Snapshot {
     }
     const click = interactionId ? clicks.get(interactionId) : undefined;
     if (!click) continue;
-    if (row.kind === DECISION_RECEIPT_KINDS.CALLBACK_ATTEMPT) {
+    if (row.kind === DECISION_RECEIPT_KINDS.AUTHORIZATION_OUTCOME) {
+      const nextOutcome = authorizationOutcome(detail.outcome);
+      click.authorizationOutcome = nextOutcome;
+      click.state = nextOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED
+        ? DECISION_STATES.REFUSED
+        : click.callbackOutcome ? DECISION_STATES.CANONICAL_PENDING : DECISION_STATES.CALLBACK_PENDING;
+      click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.CALLBACK_ATTEMPT) {
       click.callbackAttempted = true;
-      if (!click.canonical && !click.nativeReturn) click.state = DECISION_STATES.CALLBACK_PENDING;
+      if (!click.canonical && !click.nativeReturn && click.authorizationOutcome === null) click.state = click.state === DECISION_STATES.AUTHORIZATION_PENDING
+        ? DECISION_STATES.AUTHORIZATION_PENDING
+        : DECISION_STATES.CALLBACK_PENDING;
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.CALLBACK_OUTCOME) {
       click.callbackOutcome = outcome(detail.outcome);
-      if (!click.canonical && !click.nativeReturn) click.state = DECISION_STATES.CANONICAL_PENDING;
+      if (!click.canonical && !click.nativeReturn) {
+        if (click.authorizationOutcome === null) {
+          click.state = click.state === DECISION_STATES.AUTHORIZATION_PENDING
+            ? DECISION_STATES.AUTHORIZATION_PENDING
+            : DECISION_STATES.CANONICAL_PENDING;
+        } else if (click.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) {
+          click.state = DECISION_STATES.CANONICAL_PENDING;
+        } else {
+          click.state = DECISION_STATES.REFUSED;
+        }
+      }
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.CANONICAL_IMPORT) {
       const source = winnerSource(detail.source);
@@ -343,7 +372,9 @@ export function snapshot(state: DecisionStateStore): Snapshot {
       const nextOutcome = nativeOutcome(detail.outcome);
       click.nativeReturn.outcome = nextOutcome;
       click.nativeReturn.state = nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED
-        ? DECISION_STATES.TERMINAL
+        ? click.projectionOutcome === null && click.canonical?.materialized
+          ? DECISION_STATES.MATERIALIZED_PROJECTION_PENDING
+          : DECISION_STATES.TERMINAL
         : nextOutcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT
           ? DECISION_STATES.NATIVE_RETURN_PENDING
           : DECISION_STATES.UNKNOWN;

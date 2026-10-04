@@ -14,7 +14,7 @@ const { READINESS, SurfaceState } = require('../src/state');
 
 const NATIVE_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 
-async function fixture(t, { callback = null, questionText = 'Choose the canonical answer', attachFiles = true } = {}) {
+async function fixture(t, { callback = null, questionText = 'Choose the canonical answer', attachFiles = true, embedLinks = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-decision-gateway-'));
   const db = path.join(dir, 'surface.sqlite');
   const secretFile = path.join(dir, 'discord.secret');
@@ -64,6 +64,7 @@ async function fixture(t, { callback = null, questionText = 'Choose the canonica
   const edits = [];
   const callbacks = [];
   const dispatches = [];
+  const permissionState = { attachFiles, embedLinks };
   const question = {
     id: presentation.messageId,
     async edit(payload) { edits.push(payload); return { id: presentation.messageId, ...payload }; }
@@ -71,7 +72,7 @@ async function fixture(t, { callback = null, questionText = 'Choose the canonica
   const channel = {
     id: 'channel',
     permissionsFor() {
-      return { has: permission => permission !== PermissionFlagsBits.AttachFiles || attachFiles };
+      return { has: permission => permission === PermissionFlagsBits.EmbedLinks ? permissionState.embedLinks : permission !== PermissionFlagsBits.AttachFiles || permissionState.attachFiles };
     },
     messages: { async fetch(messageId) { assert.equal(messageId, presentation.messageId); return question; } },
     async send(payload) { return { id: `reply-${payload.nonce || edits.length}` }; }
@@ -104,7 +105,9 @@ async function fixture(t, { callback = null, questionText = 'Choose the canonica
     state.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
-  return { dir, db, state, request, presentation, posts, edits, callbacks, dispatches, gateway, listeners };
+  return { dir, db, state, request, presentation, posts, edits, callbacks, dispatches, gateway, listeners,
+    setAttachFiles(value) { permissionState.attachFiles = value; },
+    setEmbedLinks(value) { permissionState.embedLinks = value; } };
 }
 
 function component(presentation, id, selectedIndex, overrides = {}) {
@@ -481,14 +484,13 @@ test('cancellation leaves accepted pre-row custody and Gateway stop drains it', 
   assert.equal(f.gateway.stopping, false);
 });
 
-test('decision interaction is not admitted without Attach Files permission', { timeout: 30000 }, async t => {
+test('short-answer decision interaction does not require Attach Files permission', { timeout: 30000 }, async t => {
   const f = await fixture(t, { attachFiles: false });
   const result = await f.gateway.handleInteraction(component(f.presentation, 'missing-attach', 0), new AbortController().signal);
 
-  assert.equal(result.accepted, false);
-  assert.equal(result.reason, 'presentation-not-admissible');
-  assert.equal(f.state.getDecisionClick('missing-attach'), null);
-  assert.equal(f.callbacks.length, 0);
+  assert.equal(result.accepted, true);
+  assert.equal(f.state.getDecisionClick('missing-attach')?.projectionOutcome, null);
+  assert.equal(f.callbacks.length, 1);
   assert.equal(f.edits.length, 0);
 });
 
@@ -506,6 +508,83 @@ test('long-answer projection refuses attachment without Attach Files permission'
     /Attach Files permission/
   );
   assert.equal(f.edits.length, 0);
+});
+
+test('authorization denial acknowledges the component without admitting a decision', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.authorizeDecisionInteraction = async () => false;
+  const result = await f.gateway.handleInteraction(component(f.presentation, 'denied-component', 0), new AbortController().signal);
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, 'presentation-not-admissible');
+  assert.equal(f.callbacks.length, 2);
+  assert.equal(f.callbacks[0].body.type, 6);
+  assert.equal(f.callbacks[1].body.flags, 64);
+  assert.equal(f.state.getDecisionClick('denied-component'), null);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
+test('authorization cancellation leaves pending custody and ignores a late channel lookup', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const channel = await f.gateway.client.channels.fetch('channel');
+  let lookupStarted;
+  const started = new Promise(resolve => { lookupStarted = resolve; });
+  let releaseLookup;
+  const lookupRelease = new Promise(resolve => { releaseLookup = resolve; });
+  f.gateway.client.channels.fetch = async () => {
+    lookupStarted();
+    await lookupRelease;
+    return channel;
+  };
+  const controller = new AbortController();
+  const pending = f.gateway.handleInteraction(component(f.presentation, 'cancelled-authorization', 0), controller.signal);
+  await started;
+  controller.abort();
+  const result = await pending;
+  releaseLookup();
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.click?.state, 'authorization_pending');
+  assert.equal(f.state.listDecisionPendingWork().length, 1);
+  assert.equal(f.edits.length, 0);
+  const recoveredState = new SurfaceState(f.db);
+  assert.equal(recoveredState.listDecisionPendingWork()[0]?.state, 'authorization_pending');
+  recoveredState.close();
+});
+
+test('Embed Links loss leaves a short-answer projection retryable', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { embedLinks: false });
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const result = await f.gateway.handleInteraction(component(f.presentation, 'missing-embed-links', 0), new AbortController().signal);
+
+  assert.equal(result.accepted, true);
+  assert.equal(f.edits.length, 0);
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.state.getDecisionClick('missing-embed-links')?.projectionOutcome, null);
+  f.setEmbedLinks(true);
+  await f.gateway.reconcilePending();
+  assert.equal(f.edits.length, 1);
+});
+
+test('known-unsent long-answer projection retries after Attach Files returns', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { attachFiles: false });
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId: 'recovering-attachment', presentationId: f.presentation.presentationId, selectedKey: 'approve',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  const answer = 'x'.repeat(4097);
+  await assert.rejects(
+    f.gateway.projectDecisionMessage({ click: admitted.click, presentation: f.presentation, answer }, new AbortController().signal),
+    /Attach Files permission/
+  );
+  assert.equal(f.state.getDecisionClick('recovering-attachment')?.projectionOutcome, null);
+  f.setAttachFiles(true);
+  await f.gateway.projectDecisionMessage({ click: admitted.click, presentation: f.presentation, answer }, new AbortController().signal);
+  assert.equal(f.edits.length, 1);
 });
 
 test('a full-length decision keeps every prompt character after selection', { timeout: 30000 }, async t => {

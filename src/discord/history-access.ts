@@ -6,7 +6,7 @@ export interface HistoryPermissionChannel {
   locked?: boolean;
 }
 
-export function historyPermission(channel: HistoryPermissionChannel, user: unknown, requireSend = false, requireAttachFiles = false) {
+export function historyPermission(channel: HistoryPermissionChannel, user: unknown, requireSend = false, requireAttachFiles = false, requireEmbedLinks = false) {
   if (!user || typeof channel?.permissionsFor !== 'function') return { known: false, allowed: false };
   try {
     const { PermissionFlagsBits } = discord();
@@ -14,11 +14,12 @@ export function historyPermission(channel: HistoryPermissionChannel, user: unkno
     if (!permissions || typeof permissions.has !== 'function') return { known: false, allowed: false };
     const history = permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory);
     const attachments = !requireAttachFiles || permissions.has(PermissionFlagsBits.AttachFiles);
-    if (!requireSend) return { known: true, allowed: history && attachments };
+    const embeds = !requireEmbedLinks || permissions.has(PermissionFlagsBits.EmbedLinks);
+    if (!requireSend) return { known: true, allowed: history && attachments && embeds };
     const thread = channel.isThread?.() === true;
     const send = permissions.has(thread ? PermissionFlagsBits.SendMessagesInThreads : PermissionFlagsBits.SendMessages);
     const locked = thread && channel.locked === true && !permissions.has(PermissionFlagsBits.ManageThreads) && !permissions.has(PermissionFlagsBits.Administrator);
-    return { known: true, allowed: history && attachments && send && !locked };
+    return { known: true, allowed: history && attachments && embeds && send && !locked };
   } catch { return { known: false, allowed: false }; }
 }
 

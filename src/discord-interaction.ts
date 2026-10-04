@@ -369,6 +369,53 @@ export async function sendInteractionCallback(
   }, { signal, fetchImpl, timeoutMs });
 }
 
+export async function sendInteractionFollowup(
+  interaction: Pick<ParsedComponentInteraction, 'applicationId' | 'token'>,
+  { signal, fetchImpl = globalThis.fetch as unknown as InteractionFetch,
+    content, timeoutMs = DEFAULT_CALLBACK_TIMEOUT_MS }: {
+    signal?: AbortSignal;
+    fetchImpl?: InteractionFetch;
+    content: string;
+    timeoutMs?: number;
+  }
+): Promise<InteractionCallbackResult> {
+  if (signal?.aborted) return { outcome: INTERACTION_OUTCOMES.NOT_SENT, reason: 'followup stopped before request' };
+  if (typeof fetchImpl !== 'function') return { outcome: INTERACTION_OUTCOMES.NOT_SENT, reason: 'Discord interaction followup fetch is unavailable' };
+  const controller = new AbortController();
+  const relayAbort = () => controller.abort();
+  signal?.addEventListener('abort', relayAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const request = Promise.resolve().then(() => fetchImpl(
+      `https://discord.com/api/v10/webhooks/${encodeURIComponent(interaction.applicationId)}/${encodeURIComponent(interaction.token)}`,
+      {
+        method: 'POST',
+        headers: { 'User-Agent': 'DiscordBot (discord-surface, 0.1.0)', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content, flags: EPHEMERAL_MESSAGE_FLAG, allowed_mentions: { parse: [] } }),
+        signal: controller.signal
+      }
+    ));
+    const timeout = Number(timeoutMs);
+    const boundedTimeout = Number.isFinite(timeout) && timeout > 0 ? Math.min(timeout, 3000) : DEFAULT_CALLBACK_TIMEOUT_MS;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => { controller.abort(); reject(new Error('Discord interaction followup deadline exceeded')); }, boundedTimeout);
+    });
+    const response = await Promise.race([request, deadline]);
+    const status = responseStatus(response);
+    await Promise.race([cancelBody(response), deadline]);
+    return response?.ok === true
+      ? { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }) }
+      : { outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
+        ...(status === null ? {} : { statusCode: status }), reason: 'Discord interaction followup request rejected' };
+  } catch (error) {
+    return { outcome: signal?.aborted ? INTERACTION_OUTCOMES.NOT_SENT : INTERACTION_OUTCOMES.UNKNOWN, reason: String((error as { message?: unknown })?.message || error).slice(0, 200) };
+  } finally {
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener('abort', relayAbort);
+    controller.abort();
+  }
+}
+
 export async function sendComponentCallback(
   interaction: Pick<ParsedComponentInteraction, 'id' | 'token'>,
   { signal, fetchImpl = globalThis.fetch as unknown as InteractionFetch,

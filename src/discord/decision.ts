@@ -3,6 +3,7 @@ import {
   decodeDecisionCustomId,
   parseComponentInteraction,
   sendComponentCallback,
+  sendInteractionFollowup,
   type InteractionCallbackResult,
   type InteractionFetch,
   type ParsedComponentInteraction
@@ -17,11 +18,13 @@ import {
 } from '../decision-canonical';
 import {
   DECISION_NATIVE_OUTCOMES,
+  DECISION_AUTHORIZATION_OUTCOMES,
   DECISION_REASONS,
   DECISION_STATES,
   DECISION_TRANSPORT_OUTCOMES,
   DECISION_WINNER_SOURCES,
   type DecisionBinding,
+  type DecisionAuthorizationOutcome,
   type DecisionBindingInput,
   type DecisionCanonicalResult,
   type DecisionClick,
@@ -89,6 +92,23 @@ export interface DecisionConsumerState {
     reason?: DecisionReason;
     click: DecisionClick | null;
   };
+  admitDecisionClickAndBeginAuthorization(input: {
+    interactionId: string;
+    presentationId: string;
+    selectedKey: string;
+    actorId: string;
+    guildId: string;
+    channelId: string;
+    messageId: string;
+    binding: DecisionBindingInput;
+  }): {
+    accepted: boolean;
+    duplicate?: boolean;
+    continuing?: boolean;
+    reason?: DecisionReason;
+    click: DecisionClick | null;
+  };
+  recordDecisionAuthorizationOutcome(interactionId: string, outcome: DecisionAuthorizationOutcome): unknown;
   getDecisionClick(interactionId: string): DecisionClick | null;
   recordDecisionCallbackOutcome(interactionId: string, outcome: DecisionTransportOutcome): unknown;
   importDecisionWinner(interactionId: string, result: DecisionCanonicalResult): {
@@ -119,6 +139,7 @@ export interface DecisionConsumerOptions {
   interactionFetch?: InteractionFetch;
   callbackTimeoutMs?: number;
   authorize?: (input: DecisionAuthorizationInput, signal?: AbortSignal) => Promise<boolean>;
+  reject?: (interaction: ParsedComponentInteraction, reason: DecisionReason, signal?: AbortSignal, deferred?: boolean) => Promise<InteractionCallbackResult>;
   waitForDispatch?: (channelId: string, signal?: AbortSignal) => Promise<boolean>;
   processAccepted?: (message: DecisionMessage, signal?: AbortSignal, options?: Record<string, unknown>) => Promise<unknown>;
   project?: (input: DecisionProjectionInput, signal?: AbortSignal) => Promise<unknown>;
@@ -246,6 +267,12 @@ function invalidResult(reason: DecisionReason = DECISION_REASONS.INVALID_DECISIO
   return { handled: true, accepted: false, reason };
 }
 
+function authorizationRejectionMessage(reason: DecisionReason): string {
+  return reason === DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE
+    ? 'This decision cannot be accepted in this channel.'
+    : 'This decision is no longer available.';
+}
+
 export function parseDecisionComponent(input: unknown, expectedApplicationId: string | null = null): ParsedComponentInteraction | null {
   return parseComponentInteraction(input, expectedApplicationId);
 }
@@ -330,6 +357,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       state.recordDecisionProjectionOutcome(click.interactionId, DECISION_TRANSPORT_OUTCOMES.SENT);
     } catch (error) {
       const outcome = transportOutcome((error as { outcome?: unknown })?.outcome);
+      if (outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT && (error as { retryable?: unknown })?.retryable === true) return;
       state.recordDecisionProjectionOutcome(click.interactionId, outcome);
     }
   }
@@ -354,6 +382,17 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     const presentation = state.getDecisionPresentation(click.presentationId);
     if (!presentation) return invalidResult(DECISION_REASONS.UNKNOWN_PRESENTATION);
     let current = state.getDecisionClick(click.interactionId) || click;
+    if (current.state === DECISION_STATES.AUTHORIZATION_PENDING) {
+      const allowed = await authorizationAllowed(current, signal);
+      if (signal?.aborted) {
+        return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
+      }
+      if (!allowed) {
+        return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
+      }
+      state.recordDecisionAuthorizationOutcome(current.interactionId, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED);
+      current = state.getDecisionClick(current.interactionId) || current;
+    }
     let canonical: DecisionCanonicalResult | null = null;
     try {
       canonical = await settleAndRead(current, presentation, signal);
@@ -364,9 +403,6 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     if (!canonical && !current.canonical) return { ...invalidResult(DECISION_REASONS.CANONICAL_RESULT_CONFLICT), click: current };
     if (current.canonical?.source === DECISION_WINNER_SOURCES.CLAIM && !current.canonical.materialized) {
       return { handled: true, accepted: true, click: current, canonical: current.canonical, message: null };
-    }
-    if (!await authorizationAllowed(current, signal)) {
-      return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
     }
     await project(current, presentation, signal);
     current = state.getDecisionClick(click.interactionId) || current;
@@ -382,10 +418,17 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     const binding = bindingInput(state.getBinding(parsed.channelId));
     const selectedKey = presentation.keys[decoded.selectedIndex];
     if (!binding || !selectedKey) return invalidResult(DECISION_REASONS.PRESENTATION_IDENTITY_MISMATCH);
-    if (!signal?.aborted && !state.getDecisionClick(parsed.id) && !await authorizationAllowed(parsed, signal)) {
-      return invalidResult(DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE);
-    }
-    const admission = state.admitDecisionClickAndBeginCallback({
+    const existing = state.getDecisionClick(parsed.id);
+    const admission = existing ? state.admitDecisionClickAndBeginCallback({
+      interactionId: parsed.id,
+      presentationId: presentation.presentationId,
+      selectedKey,
+      actorId: parsed.userId,
+      guildId: parsed.guildId,
+      channelId: parsed.channelId,
+      messageId: parsed.messageId,
+      binding
+    }) : state.admitDecisionClickAndBeginAuthorization({
       interactionId: parsed.id,
       presentationId: presentation.presentationId,
       selectedKey,
@@ -399,12 +442,44 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       return { ...invalidResult(admission.reason || DECISION_REASONS.INVALID_DECISION_INTERACTION), duplicate: admission.duplicate, click: admission.click };
     }
     let callback: InteractionCallbackResult | undefined;
-    if (admission.accepted) {
+    if (admission.accepted && !admission.duplicate) {
       callback = await sendComponentCallback(parsed, { signal, fetchImpl: interactionFetch, timeoutMs: callbackTimeoutMs });
       state.recordDecisionCallbackOutcome(parsed.id, transportOutcome(callback.outcome));
     }
-    const click = state.getDecisionClick(parsed.id) || admission.click;
+    let click = state.getDecisionClick(parsed.id) || admission.click;
     if (!click) return invalidResult(DECISION_REASONS.UNKNOWN_INTERACTION);
+    if (click.state === DECISION_STATES.AUTHORIZATION_PENDING) {
+      const allowed = await authorizationAllowed(parsed, signal);
+      if (signal?.aborted) {
+        return {
+          handled: true,
+          accepted: true,
+          click,
+          message: safeMessage(state, click.interactionId),
+          ...(callback ? { callback } : {})
+        };
+      }
+      if (!allowed) {
+        state.recordDecisionAuthorizationOutcome(parsed.id, DECISION_AUTHORIZATION_OUTCOMES.DENIED);
+        const rejection = options.reject
+          ? await options.reject(parsed, DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE, signal, true)
+          : await sendInteractionFollowup(parsed, {
+            signal,
+            fetchImpl: interactionFetch,
+            content: authorizationRejectionMessage(DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE),
+            timeoutMs: callbackTimeoutMs
+          });
+        return {
+          handled: true,
+          accepted: false,
+          reason: DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE,
+          click: null,
+          ...(rejection ? { callback: rejection } : callback ? { callback } : {})
+        };
+      }
+      state.recordDecisionAuthorizationOutcome(parsed.id, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED);
+      click = state.getDecisionClick(parsed.id) || click;
+    }
     if (options.waitForDispatch && !await options.waitForDispatch(click.channelId, signal)) {
       return {
         handled: true,

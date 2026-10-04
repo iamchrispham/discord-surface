@@ -1104,6 +1104,14 @@ class SurfaceState {
     return decisionHandlers.admitClickAndBeginCallback(this, input);
   }
 
+  admitDecisionClickAndBeginAuthorization(input) {
+    return decisionHandlers.admitClickAndBeginAuthorization(this, input);
+  }
+
+  recordDecisionAuthorizationOutcome(interactionId, outcome) {
+    return decisionHandlers.recordAuthorizationOutcome(this, interactionId, outcome);
+  }
+
   getDecisionClick(interactionId) {
     return decisionHandlers.getClick(this, interactionId);
   }
