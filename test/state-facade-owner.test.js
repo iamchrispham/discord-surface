@@ -173,6 +173,14 @@ test('existing handler delegation accepted', () => {
   assert.equal(matches(insert('newForward(...args) { return configurationHandlers.getConfig.apply(this, args); }')), true);
 });
 
+test('missing handler method refused', () => {
+  assert.equal(!matches(insert('newForward(...args) { return configurationHandlers.noSuchMethod.apply(this, args); }')), true);
+});
+
+test('generator delegation refused', () => {
+  assert.equal(!matches(insert('*newForward(...args) { return configurationHandlers.getConfig.apply(this, args); }')), true);
+});
+
 test('comment-only change accepted', () => {
   assert.equal(matches(source.replace('class SurfaceState {', 'class SurfaceState { /* harmless trivia */')), true);
 });
@@ -188,4 +196,3 @@ test('changed constructor refused', () => {
 test('optional delegation refused', () => {
   assert.equal(!matches(insert('newInline(...args) { return configurationHandlers?.getConfig(this, ...args); }')), true);
 });
-
