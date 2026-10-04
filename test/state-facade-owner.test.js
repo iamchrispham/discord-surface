@@ -181,6 +181,22 @@ test('direct state argument delegation accepted', () => {
   assert.equal(matches(insert('newForward(...args) { return provisionIntentHandlers.beginProvisionIntent(this, ...args); }')), true);
 });
 
+test('explicit-state handler rejects bound forwarding', () => {
+  assert.equal(!matches(insert('newForward(...args) { return provisionIntentHandlers.beginProvisionIntent.apply(this, args); }')), true);
+});
+
+test('this-bound handler rejects explicit-state forwarding', () => {
+  assert.equal(!matches(insert('newForward(...args) { return configurationHandlers.getConfig(this, ...args); }')), true);
+});
+
+test('non-callable shorthand cannot approve delegation', () => {
+  assert.equal(!matches(insert('newForward(...args) { return conductorCustodyHandlers.CUSTODY_RECEIPT_KINDS.apply(this, args); }')), true);
+});
+
+test('proto method receives an own body fingerprint', () => {
+  assert.equal(!matches(insert('__proto__() { return Date.now(); }')), true);
+});
+
 test('cooked method name collision refused', () => {
   assert.equal(!matches(insert('g\\u0065tConfig() { return configurationHandlers.getConfig(this); }')), true);
 });

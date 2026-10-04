@@ -37,24 +37,115 @@ function factoryDeclaration(source, factoryName) {
   return null;
 }
 
-function collectFactoryMethods(factory, resolveExpression = () => new Set()) {
-  const methods = new Set();
+const INVOCATION_STYLES = Object.freeze({ THIS: 'this', STATE: 'state' });
+
+function invocationStyle(node) {
+  let usesThis = false;
+  const visit = current => {
+    if (current !== node && ts.isFunctionLike(current) && !ts.isArrowFunction(current)) return;
+    if (current.kind === ts.SyntaxKind.ThisKeyword) usesThis = true;
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  const parameters = (node.parameters || []).filter(parameter =>
+    !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'));
+  const first = parameters[0];
+  if (first && ts.isIdentifier(first.name) && ['state', 'surface'].includes(first.name.text)) {
+    return INVOCATION_STYLES.STATE;
+  }
+  if (usesThis) return INVOCATION_STYLES.THIS;
+  if (first) return INVOCATION_STYLES.STATE;
+  return null;
+}
+
+function callableDeclarations(source, factory) {
+  const declarations = new Map();
+  const add = (name, declaration) => {
+    if (name) declarations.set(name, declaration);
+  };
+  const visitSource = node => {
+    if (ts.isFunctionDeclaration(node)) {
+      add(node.name?.text, node);
+      return;
+    }
+    if (ts.isFunctionLike(node)) return;
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      add(node.name.text, node);
+    }
+    ts.forEachChild(node, visitSource);
+  };
+  visitSource(source);
+  const visitFactory = node => {
+    if (node !== factory && ts.isFunctionLike(node)) {
+      if (ts.isFunctionDeclaration(node)) add(node.name?.text, node);
+      return;
+    }
+    if (ts.isFunctionDeclaration(node)) add(node.name?.text, node);
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      add(node.name.text, node);
+    }
+    ts.forEachChild(node, visitFactory);
+  };
+  visitFactory(factory);
+  return declarations;
+}
+
+function callableDescriptor(node) {
+  if (!node || !ts.isFunctionLike(node)) return null;
+  return { style: invocationStyle(node) };
+}
+
+function collectFactoryMethods(factory, source, resolveExpression = () => new Map()) {
+  const methods = new Map();
+  const declarations = callableDeclarations(source, factory);
+  const resolving = new Set();
+  const resolveValue = expression => {
+    if (!expression) return null;
+    const direct = callableDescriptor(expression);
+    if (direct) return direct;
+    if (ts.isIdentifier(expression)) {
+      if (resolving.has(expression.text)) return null;
+      const declaration = declarations.get(expression.text);
+      if (!declaration) return null;
+      resolving.add(expression.text);
+      const resolved = ts.isVariableDeclaration(declaration)
+        ? resolveValue(declaration.initializer)
+        : callableDescriptor(declaration);
+      resolving.delete(expression.text);
+      return resolved;
+    }
+    if (ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression) &&
+        expression.expression.name.text === 'bind') {
+      return resolveValue(expression.expression.expression);
+    }
+    if (!ts.isPropertyAccessExpression(expression)) return null;
+    const receiver = expression.expression;
+    if (ts.isIdentifier(receiver)) {
+      const declaration = declarations.get(receiver.text);
+      if (declaration && ts.isVariableDeclaration(declaration)) {
+        const resolved = resolveExpression(declaration.initializer);
+        return resolved.get(expression.name.text) || null;
+      }
+    }
+    if (ts.isCallExpression(receiver)) {
+      const resolved = resolveExpression(receiver);
+      return resolved.get(expression.name.text) || null;
+    }
+    return null;
+  };
   const collectObject = object => {
     for (const property of object.properties) {
       if (ts.isSpreadAssignment(property)) {
-        for (const method of resolveExpression(property.expression)) methods.add(method);
+        for (const [method, descriptor] of resolveExpression(property.expression)) methods.set(method, descriptor);
         continue;
       }
       const name = propertyName(property.name);
       if (!name) continue;
-      if (ts.isMethodDeclaration(property) || ts.isShorthandPropertyAssignment(property)) {
-        methods.add(name);
-      }
-      if (ts.isPropertyAssignment(property) &&
-          (ts.isFunctionExpression(property.initializer) || ts.isArrowFunction(property.initializer) ||
-           ts.isIdentifier(property.initializer) || ts.isPropertyAccessExpression(property.initializer))) {
-        methods.add(name);
-      }
+      let descriptor = null;
+      if (ts.isMethodDeclaration(property)) descriptor = callableDescriptor(property);
+      else if (ts.isShorthandPropertyAssignment(property)) descriptor = resolveValue(property.name);
+      else if (ts.isPropertyAssignment(property)) descriptor = resolveValue(property.initializer);
+      if (descriptor) methods.set(name, descriptor);
     }
   };
   const visit = node => {
@@ -68,7 +159,7 @@ function collectFactoryMethods(factory, resolveExpression = () => new Set()) {
     ? body.statements.filter(statement => ts.isReturnStatement(statement)).map(statement => statement.expression).filter(Boolean)
     : [body];
   for (const expression of returns) {
-    for (const method of resolveExpression(expression)) methods.add(method);
+    for (const [method, descriptor] of resolveExpression(expression)) methods.set(method, descriptor);
   }
   return methods;
 }
@@ -184,29 +275,29 @@ function reexportedModulePath(source) {
 
 function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
   const key = `${sourcePath}:${factoryName}`;
-  if (seen.has(key)) return new Set();
+  if (seen.has(key)) return new Map();
   seen.add(key);
   const factory = factoryDeclaration(source, factoryName);
   if (!factory) return null;
   const bindings = requireBindings(source);
   const resolveExpression = expression => {
     const called = calledFactory(expression);
-    if (!called) return new Set();
+    if (!called) return new Map();
     const local = factoryMethodsFromSource(source, sourcePath, called.name, seen);
     if (local?.size) return local;
     const binding = called.receiver
       ? (ts.isIdentifier(called.receiver) ? bindings.get(called.receiver.text) : null)
       : bindings.get(called.name);
     const modulePath = directRequire(called.receiver) || binding?.modulePath;
-    if (!modulePath) return new Set();
+    if (!modulePath) return new Map();
     const importedPath = resolveModulePath(modulePath, sourcePath);
-    if (!importedPath) return new Set();
+    if (!importedPath) return new Map();
     const importedName = called.receiver && ts.isPropertyAccessExpression(called.receiver)
       ? called.name
       : binding?.exportName || called.name;
     return moduleFactoryMethods(importedPath, importedName, seen);
   };
-  return collectFactoryMethods(factory, resolveExpression);
+  return collectFactoryMethods(factory, source, resolveExpression);
 }
 
 function moduleFactoryMethods(filePath, factoryName, seen) {
@@ -224,16 +315,16 @@ function moduleFactoryMethods(filePath, factoryName, seen) {
     const binding = bindings.get(exportedName || factoryName) || receiverBinding;
     const exportedReceiver = exported && ts.isPropertyAccessExpression(exported) ? exported.expression : null;
     const modulePath = binding?.modulePath || directRequire(exportedReceiver) || directRequire(exported) || reexportedModulePath(importedSource);
-    if (!modulePath) return new Set();
+    if (!modulePath) return new Map();
     const importedPath = resolveModulePath(modulePath, filePath);
-    if (!importedPath) return new Set();
+    if (!importedPath) return new Map();
     const importedName = exported && ts.isPropertyAccessExpression(exported)
       ? exported.name.text
       : binding?.exportName || factoryName;
     return moduleFactoryMethods(importedPath, importedName, seen);
   }
   catch {
-    return new Set();
+    return new Map();
   }
 }
 
@@ -264,11 +355,14 @@ function inventory(text) {
       }
     }
   }
-  const handlerMethods = Object.fromEntries([...handlerFactories].map(([name, factory]) => [name, [...importedFactoryMethods(source, factory)].sort()]));
+  const handlerMethodDescriptors = Object.fromEntries([...handlerFactories].map(([name, factory]) => [name, importedFactoryMethods(source, factory)]));
+  const handlerMethods = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name, [...methods.keys()].sort()]));
+  const handlerContracts = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
+    Object.fromEntries([...methods].map(([method, descriptor]) => [method, descriptor.style]))]));
   const classHeader = tokens(text.slice(owner.getStart(source), owner.members.pos));
   const topLevel = source.statements.filter(node => node !== owner).map(node => tokens(node.getText(source)));
-  const bodies = {};
-  const delegationBodies = {};
+  const bodies = Object.create(null);
+  const delegationBodies = Object.create(null);
   const forwarding = [];
   for (const method of owner.members) {
     assert.ok(ts.isMethodDeclaration(method) || ts.isConstructorDeclaration(method), 'unsupported class member');
@@ -306,7 +400,7 @@ function inventory(text) {
     }
     else bodies[name] = crypto.createHash('sha256').update(JSON.stringify(tokens(method.getText(source)))).digest('hex');
   }
-  return { handlers: [...handlers].sort(), handlerMethods, forwarding: forwarding.sort(), delegationBodies, topLevel, classHeader, bodies };
+  return { handlers: [...handlers].sort(), handlerMethods, handlerContracts, forwarding: forwarding.sort(), delegationBodies, topLevel, classHeader, bodies };
 }
 
 function compact(raw) {
@@ -344,6 +438,7 @@ function matches(text, baseline) {
       const target = ['call', 'apply'].includes(dispatch.name.text) ? dispatch.expression : dispatch;
       if (!ts.isPropertyAccessExpression(target) || !ts.isIdentifier(target.expression) ||
           !raw.handlerMethods[target.expression.text]?.includes(target.name.text)) return false;
+      const style = raw.handlerContracts[target.expression.text]?.[target.name.text];
       const parameterNames = method.parameters.map(parameter => parameter.name.text);
       const argumentTexts = call.arguments.slice(1).map(argument => argument.getText(parsed));
       const restApply = dispatch.name.text === 'apply' && method.parameters.length === 1 &&
@@ -358,7 +453,10 @@ function matches(text, baseline) {
           const parameterName = parameter.name.text;
           return parameter.dotDotDotToken ? argument === `...${parameterName}` : argument === parameterName;
         });
-      if (!restApply && !orderedCall && !directCall) return false;
+      let matchesStyle = false;
+      if (style === INVOCATION_STYLES.THIS) matchesStyle = restApply || orderedCall;
+      else if (style === INVOCATION_STYLES.STATE) matchesStyle = directCall;
+      if (!matchesStyle) return false;
     }
     return true;
   }
