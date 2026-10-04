@@ -549,7 +549,7 @@ function roomDigitPolicies(records) {
               info.exports.set(property.name.text, property.initializer.text);
             }
           }
-        } else if (target === 'default' &&
+        } else if (target &&
             (ts.isFunctionExpression(node.right) || ts.isArrowFunction(node.right))) {
           const fn = {
             info,
@@ -878,6 +878,28 @@ test('room policy inventory records only town-hall room validators', () => {
   ]), {
     ...expectedPolicies,
     'peer/direct-commonjs-arrow-helper.js': 1
+  });
+  const namedCommonJsHelper = {
+    file: 'peer/named-commonjs-room-helper.js',
+    text: String.raw`exports.validateGuildId = value => /^\d{1,20}$/.test(value);
+    module.exports.validateChannelId = function validateChannelId(value) {
+      return /^\d{1,20}$/.test(value);
+    }`
+  };
+  const namedCommonJsConsumer = {
+    file: 'peer/named-commonjs-room-consumer.js',
+    text: String.raw`const { validateGuildId, validateChannelId } = require('./named-commonjs-room-helper');
+    function validateRoom(room) {
+      return validateGuildId(room.guildId) && validateChannelId(room.guildId);
+    }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    namedCommonJsHelper,
+    namedCommonJsConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/named-commonjs-room-helper.js': 2
   });
   const inline = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return /^\d{1,20}$/.test(room.guildId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, inline]), expectedPolicies);
