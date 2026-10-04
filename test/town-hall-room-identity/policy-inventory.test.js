@@ -429,6 +429,95 @@ function roomDigitPolicies(records) {
     };
     importVisit(info.ast);
 
+    const commonJsImport = node => {
+      if (ts.isVariableStatement(node)) {
+        for (const declaration of node.declarationList.declarations) {
+          const initializer = declaration.initializer;
+          let specifier;
+          let imported;
+          if (
+            initializer &&
+            ts.isCallExpression(initializer) &&
+            ts.isIdentifier(initializer.expression) &&
+            initializer.expression.text === 'require' &&
+            initializer.arguments.length === 1 &&
+            ts.isStringLiteralLike(initializer.arguments[0])
+          ) {
+            specifier = initializer.arguments[0].text;
+            imported = 'default';
+          } else if (
+            initializer &&
+            ts.isPropertyAccessExpression(initializer) &&
+            ts.isCallExpression(initializer.expression) &&
+            ts.isIdentifier(initializer.expression.expression) &&
+            initializer.expression.expression.text === 'require' &&
+            initializer.expression.arguments.length === 1 &&
+            ts.isStringLiteralLike(initializer.expression.arguments[0])
+          ) {
+            specifier = initializer.expression.arguments[0].text;
+            imported = initializer.name.text;
+          }
+          if (!specifier) continue;
+          if (ts.isIdentifier(declaration.name)) {
+            info.imports.set(declaration.name.text, { specifier, imported, commonJs: true });
+          } else if (ts.isObjectBindingPattern(declaration.name)) {
+            for (const element of declaration.name.elements) {
+              if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+              const propertyName = element.propertyName && ts.isIdentifier(element.propertyName)
+                ? element.propertyName.text
+                : element.name.text;
+              info.imports.set(element.name.text, { specifier, imported: propertyName, commonJs: true });
+            }
+          }
+        }
+      }
+      ts.forEachChild(node, commonJsImport);
+    };
+    commonJsImport(info.ast);
+
+    const commonJsExportTarget = expression => {
+      if (!ts.isPropertyAccessExpression(expression)) return null;
+      if (ts.isIdentifier(expression.expression) && expression.expression.text === 'exports') {
+        return expression.name.text;
+      }
+      if (
+        ts.isPropertyAccessExpression(expression.expression) &&
+        ts.isIdentifier(expression.expression.expression) &&
+        expression.expression.expression.text === 'module' &&
+        expression.expression.name.text === 'exports'
+      ) {
+        return expression.name.text;
+      }
+      if (
+        ts.isIdentifier(expression.expression) &&
+        expression.expression.text === 'module' &&
+        expression.name.text === 'exports'
+      ) {
+        return 'default';
+      }
+      return null;
+    };
+    const commonJsExportVisit = node => {
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const target = commonJsExportTarget(node.left);
+        if (target && ts.isIdentifier(node.right)) {
+          info.exports.set(target, node.right.text);
+        } else if (target === 'default' && ts.isObjectLiteralExpression(node.right)) {
+          for (const property of node.right.properties) {
+            if (ts.isShorthandPropertyAssignment(property)) {
+              info.exports.set(property.name.text, property.name.text);
+            } else if (ts.isPropertyAssignment(property) &&
+                (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) &&
+                ts.isIdentifier(property.initializer)) {
+              info.exports.set(property.name.text, property.initializer.text);
+            }
+          }
+        }
+      }
+      ts.forEachChild(node, commonJsExportVisit);
+    };
+    commonJsExportVisit(info.ast);
+
     for (const statement of info.ast.statements) {
       if (ts.isExportDeclaration(statement) && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
         for (const element of statement.exportClause.elements) {
@@ -489,7 +578,8 @@ function roomDigitPolicies(records) {
       if (candidates[0]) return candidates[0];
       if (binding) {
         const local = info.functions.get(expression.text);
-        if (local && (local.node === binding.declaration || local.node === binding.source)) {
+        if (local && (local.node === binding.declaration || local.node === binding.source ||
+            info.imports.has(expression.text))) {
           return local;
         }
         return null;
@@ -498,9 +588,10 @@ function roomDigitPolicies(records) {
     }
     if (ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.expression)) {
       const imported = info.imports.get(expression.expression.text);
-      if (imported?.namespace) {
+      if (imported?.namespace || imported?.commonJs) {
         const target = resolveModule(info, imported.specifier);
-        return target?.functions.get(expression.name.text) || null;
+        const exported = target?.exports.get(expression.name.text) || expression.name.text;
+        return target?.functions.get(exported) || null;
       }
     }
     return null;
@@ -642,8 +733,40 @@ test('room policy inventory records only town-hall room validators', () => {
   function isTownHallRoom(room) { return room; }
   isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(referenceFixture, 'isTownHallRoom'), 2);
+  // Synthetic fixtures are independent of production files, so reuse the production baseline.
+  const uncachedRoomDigitPolicies = roomDigitPolicies;
+  const productionRecordTexts = new Map(records.map(record => [record.file, record.text]));
+  const basePolicies = uncachedRoomDigitPolicies(records);
+  const policyFixtureCache = new Map();
+  roomDigitPolicies = fixtureRecords => {
+    const syntheticRecords = fixtureRecords.filter(record => productionRecordTexts.get(record.file) !== record.text);
+    if (!syntheticRecords.length) return basePolicies;
+    const key = syntheticRecords.map(record => `${record.file}\u0000${record.text}`).join('\u0000');
+    if (!policyFixtureCache.has(key)) {
+      policyFixtureCache.set(key, uncachedRoomDigitPolicies(syntheticRecords));
+    }
+    const combined = { ...basePolicies };
+    for (const [file, count] of Object.entries(policyFixtureCache.get(key))) {
+      combined[file] = (combined[file] || 0) + count;
+    }
+    return combined;
+  };
   const expectedPolicies = { 'peer/town-hall-plan.ts': 2 };
   assert.deepEqual(roomDigitPolicies(records), expectedPolicies);
+  const commonJsHelper = {
+    file: 'peer/commonjs-room-helper.js',
+    text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    module.exports = validateGuildId;`
+  };
+  const commonJsConsumer = {
+    file: 'peer/commonjs-room-consumer.js',
+    text: String.raw`const validateGuildId = require('./commonjs-room-helper');
+    function validateRoom(room) { return validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, commonJsHelper, commonJsConsumer]), {
+    ...expectedPolicies,
+    'peer/commonjs-room-helper.js': 1
+  });
   const inline = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return /^\d{1,20}$/.test(room.guildId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, inline]), expectedPolicies);
   const constructor = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return new RegExp('^[0-9]{1,21}$').test(room.guildId); }` };
