@@ -93,6 +93,17 @@ function nearestLexicalScope(node) {
 
 function collectBindings(sourceFile) {
   const bindings = [];
+  const addPatternBindings = (pattern, declaration, scope) => {
+    if (ts.isIdentifier(pattern)) {
+      bindings.push({ declaration, name: pattern.text, scope });
+      return;
+    }
+    if (!ts.isObjectBindingPattern(pattern) && !ts.isArrayBindingPattern(pattern)) return;
+    for (const element of pattern.elements) {
+      if (!ts.isBindingElement(element)) continue;
+      addPatternBindings(element.name, element, scope);
+    }
+  };
   const visit = node => {
     let declaration = null;
     let name = null;
@@ -113,6 +124,11 @@ function collectBindings(sourceFile) {
       name = node.name.text;
     }
     if (declaration) bindings.push({ declaration, name, scope: nearestLexicalScope(declaration) });
+    if (ts.isVariableDeclaration(node) && !ts.isIdentifier(node.name)) {
+      addPatternBindings(node.name, node, nearestLexicalScope(node));
+    } else if (ts.isParameter(node) && !ts.isIdentifier(node.name)) {
+      addPatternBindings(node.name, node, nearestLexicalScope(node));
+    }
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
@@ -134,7 +150,12 @@ function countIdentifierReferences(sourceFile, name) {
       }
       if (node.importClause.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
         for (const element of node.importClause.namedBindings.elements) {
-          importBindings.push({ declaration: element.name, name: element.name.text, scope });
+          importBindings.push({
+            declaration: element.name,
+            name: element.name.text,
+            importedName: element.propertyName?.text || element.name.text,
+            scope,
+          });
         }
       }
     }
@@ -147,13 +168,15 @@ function countIdentifierReferences(sourceFile, name) {
   const target = candidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&
     binding.declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) ||
     candidates[0] || null;
-  if (!target) return 0;
+  const importedTarget = target || importBindings.find(binding => binding.importedName === name) || null;
+  if (!importedTarget) return 0;
+  const targetName = importedTarget.name;
   let count = 0;
   const visit = node => {
-    if (ts.isIdentifier(node) && node.text === name &&
-        node !== target.declaration.name &&
+    if (ts.isIdentifier(node) && node.text === targetName &&
+        node !== importedTarget.declaration.name &&
         isSemanticIdentifierReference(node) &&
-        resolveBinding(node, bindings) === target.declaration) count += 1;
+        resolveBinding(node, bindings) === importedTarget.declaration) count += 1;
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
@@ -165,9 +188,10 @@ function isSemanticIdentifierReference(node) {
   if (!parent) return true;
   if (ts.isPropertyAccessExpression(parent) && parent.name === node) return false;
   if (ts.isQualifiedName(parent) && parent.right === node) return false;
-  if (ts.isBindingElement(parent) && parent.propertyName === node) return false;
+  if (ts.isBindingElement(parent) && (parent.propertyName === node || parent.name === node)) return false;
   if ((ts.isImportSpecifier(parent) || ts.isNamespaceImport(parent) ||
       ts.isImportClause(parent)) && parent.name === node) return false;
+  if (ts.isImportSpecifier(parent) && parent.propertyName === node) return false;
   if ((ts.isPropertyAssignment(parent) || ts.isPropertyDeclaration(parent) ||
       ts.isPropertySignature(parent) || ts.isMethodDeclaration(parent) ||
       ts.isMethodSignature(parent) || ts.isGetAccessorDeclaration(parent) ||
@@ -312,14 +336,22 @@ function isGenericRoomValidatorName(name) {
   return name === 'validateRoom';
 }
 
+function isRoomPolicyFile(sourceFile) {
+  const fileName = sourceFile?.fileName || '';
+  return /(?:room|town.?hall)/i.test(fileName) || /(?:^|[\\/])peer(?:[\\/]|$)/i.test(fileName);
+}
+
+function isTownHallContextName(name, sourceFile) {
+  return isTownHallName(name) || (isGenericRoomValidatorName(name) && isRoomPolicyFile(sourceFile));
+}
+
 function hasTownHallDeclarationContext(scope, sourceFile) {
   let current = scope;
   while (current) {
     const binding = ts.isFunctionLike(current) ? functionBinding(current) : null;
-    if (binding && (isTownHallName(bindingName(binding)) ||
-        isGenericRoomValidatorName(bindingName(binding)))) return true;
+    if (binding && isTownHallContextName(bindingName(binding), sourceFile)) return true;
     if (current.name && ts.isIdentifier(current.name) &&
-        (isTownHallName(current.name.text) || isGenericRoomValidatorName(current.name.text))) return true;
+        isTownHallContextName(current.name.text, sourceFile)) return true;
     current = current.parent;
   }
   const functionScope = enclosingFunction(scope) || (ts.isFunctionLike(scope) ? scope : null);
@@ -337,8 +369,7 @@ function hasTownHallCallsite(scope, sourceFile, bindings) {
         resolveBinding(node.expression, bindings) === target) {
       const caller = enclosingFunction(node);
       const callerBinding = caller && functionBinding(caller);
-      if (callerBinding && (isTownHallName(bindingName(callerBinding)) ||
-          isGenericRoomValidatorName(bindingName(callerBinding)))) found = true;
+      if (callerBinding && isTownHallContextName(bindingName(callerBinding), sourceFile)) found = true;
     }
     ts.forEachChild(node, visit);
   };
@@ -642,24 +673,28 @@ function roomDigitPolicies(records) {
     };
     commonJsImport(info.ast);
 
+    const commonJsPropertyKey = expression => {
+      if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+      if (ts.isElementAccessExpression(expression) && expression.argumentExpression &&
+          ts.isStringLiteralLike(expression.argumentExpression)) {
+        return expression.argumentExpression.text;
+      }
+      return null;
+    };
     const commonJsExportTarget = expression => {
-      if (!ts.isPropertyAccessExpression(expression)) return null;
+      const property = commonJsPropertyKey(expression);
+      if (property === null) return null;
       if (ts.isIdentifier(expression.expression) && expression.expression.text === 'exports') {
-        return expression.name.text;
+        return property;
       }
-      if (
-        ts.isPropertyAccessExpression(expression.expression) &&
-        ts.isIdentifier(expression.expression.expression) &&
-        expression.expression.expression.text === 'module' &&
-        expression.expression.name.text === 'exports'
-      ) {
-        return expression.name.text;
+      const object = expression.expression;
+      if ((ts.isPropertyAccessExpression(object) || ts.isElementAccessExpression(object)) &&
+          ts.isIdentifier(object.expression) && object.expression.text === 'module' &&
+          commonJsPropertyKey(object) === 'exports') {
+        return property;
       }
-      if (
-        ts.isIdentifier(expression.expression) &&
-        expression.expression.text === 'module' &&
-        expression.name.text === 'exports'
-      ) {
+      if (ts.isIdentifier(expression.expression) &&
+          expression.expression.text === 'module' && property === 'exports') {
         return 'default';
       }
       return null;
@@ -950,7 +985,7 @@ function roomDigitPolicies(records) {
       const caller = call.node && enclosingFunction(call.node);
       const callerBinding = caller && functionBinding(caller);
       const callerName = callerBinding ? bindingName(callerBinding) : null;
-      return (isTownHallName(callerName) || isGenericRoomValidatorName(callerName)) &&
+      return isTownHallContextName(callerName, call.info.ast) &&
         call.args[binding.index] && expressionIsRoomField(call.args[binding.index], call.info);
     });
   };
@@ -958,6 +993,33 @@ function roomDigitPolicies(records) {
     const inputs = [];
     const direct = regexInput(node);
     if (direct) inputs.push(direct);
+    const propertyAssignment = node.parent && ts.isPropertyAssignment(node.parent) &&
+      node.parent.initializer === node ? node.parent : null;
+    const objectLiteral = propertyAssignment?.parent && ts.isObjectLiteralExpression(propertyAssignment.parent)
+      ? propertyAssignment.parent
+      : null;
+    const objectDeclaration = objectLiteral?.parent && ts.isVariableDeclaration(objectLiteral.parent) &&
+      objectLiteral.parent.initializer === objectLiteral && ts.isIdentifier(objectLiteral.parent.name)
+      ? objectLiteral.parent
+      : null;
+    if (propertyAssignment && objectDeclaration &&
+        (ts.isIdentifier(propertyAssignment.name) || ts.isStringLiteralLike(propertyAssignment.name))) {
+      const ownerName = objectDeclaration.name.text;
+      const propertyName = propertyAssignment.name.text;
+      const visitObject = current => {
+        if (ts.isIdentifier(current) && current.text === ownerName && current !== objectDeclaration.name &&
+            findBinding(info, ownerName, current)?.declaration === objectDeclaration) {
+          const member = current.parent;
+          if ((ts.isPropertyAccessExpression(member) || ts.isElementAccessExpression(member)) &&
+              member.expression === current && policyPropertyKey(member) === propertyName) {
+            const input = regexInput(member);
+            if (input) inputs.push(input);
+          }
+        }
+        ts.forEachChild(current, visitObject);
+      };
+      visitObject(info.ast);
+    }
     const declaration = node.parent && ts.isVariableDeclaration(node.parent) &&
       node.parent.initializer === node && ts.isIdentifier(node.parent.name) ? node.parent : null;
     if (!declaration) return inputs;
@@ -1188,6 +1250,18 @@ test('room policy inventory records only town-hall room validators', () => {
   const importedReferenceFixture = ts.createSourceFile('peer/imported-reference-fixture.ts', String.raw`import { isTownHallRoom } from './town-hall-plan';
   isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(importedReferenceFixture, 'isTownHallRoom'), 1);
+  const aliasedImportedReferenceFixture = ts.createSourceFile('peer/aliased-imported-reference-fixture.ts', String.raw`import { isTownHallRoom as roomGuard } from './town-hall-plan';
+  roomGuard({});`, ts.ScriptTarget.Latest, true);
+  assert.equal(countIdentifierReferences(aliasedImportedReferenceFixture, 'isTownHallRoom'), 1);
+  const destructuredShadowReferenceFixture = ts.createSourceFile('peer/destructured-shadow-reference-fixture.ts', String.raw`export function isTownHallRoom(room) { return room; }
+  function parameterShadow({ isTownHallRoom }) { return isTownHallRoom({}); }
+  function localShadow() {
+    const { isTownHallRoom: guard = () => false } = { isTownHallRoom: () => true };
+    const { nested: { isTownHallRoom: nestedGuard }, ...rest } = { nested: { isTownHallRoom: () => true } };
+    return guard({}) || nestedGuard({}) || rest.isTownHallRoom;
+  }
+  isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
+  assert.equal(countIdentifierReferences(destructuredShadowReferenceFixture, 'isTownHallRoom'), 1);
   // Synthetic fixtures are independent of production files, so reuse the production baseline.
   const uncachedRoomDigitPolicies = roomDigitPolicies;
   const productionRecordTexts = new Map(records.map(record => [record.file, record.text]));
@@ -1347,6 +1421,26 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/named-commonjs-room-helper.js': 2
   });
+  const bracketedCommonJsHelper = {
+    file: 'peer/bracketed-commonjs-room-helper.js',
+    text: String.raw`exports['validateGuildId'] = value => /^\d{1,21}$/.test(value);
+    module.exports['validateChannelId'] = value => /^\d{1,21}$/.test(value);`
+  };
+  const bracketedCommonJsConsumer = {
+    file: 'peer/bracketed-commonjs-room-consumer.js',
+    text: String.raw`const { validateGuildId, validateChannelId } = require('./bracketed-commonjs-room-helper');
+    function validateRoom(room) {
+      return validateGuildId(room.guildId) && validateChannelId(room.channelId);
+    }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    bracketedCommonJsHelper,
+    bracketedCommonJsConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/bracketed-commonjs-room-helper.js': 2
+  });
   const esmDefaultObjectHelper = {
     file: 'peer/esm-default-room-helper.ts',
     text: String.raw`export default {
@@ -1384,6 +1478,27 @@ test('room policy inventory records only town-hall room validators', () => {
   });
   const inline = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return /^\d{1,20}$/.test(room.guildId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, inline]), expectedPolicies);
+  const unrelatedGenericRoomValidator = {
+    file: 'other/ordinary.ts',
+    text: String.raw`function validateRoom(room) { return /^\d{17,20}$/.test(room.guildId); }`
+  };
+  const unrelatedGenericValueValidator = {
+    file: 'other/ordinary-value.ts',
+    text: String.raw`function validateRoom(value) { return /^\d{17,20}$/.test(value.id); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    unrelatedGenericRoomValidator,
+    unrelatedGenericValueValidator,
+  ]), expectedPolicies);
+  const genuineTownHallGenericRoomValidator = {
+    file: 'other/town-hall-room.ts',
+    text: String.raw`function validateRoom(room) { return /^\d{17,20}$/.test(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, genuineTownHallGenericRoomValidator]), {
+    ...expectedPolicies,
+    'other/town-hall-room.ts': 1
+  });
   const constructor = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return new RegExp('^[0-9]{1,21}$').test(room.guildId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, constructor]), expectedPolicies);
   const expandedAsciiDigits = {
@@ -1466,6 +1581,17 @@ test('room policy inventory records only town-hall room validators', () => {
   assert.deepEqual(roomDigitPolicies([...records, regexConstant]), {
     ...expectedPolicies,
     'peer/future-room.ts': 1
+  });
+  const objectRegexConstant = {
+    file: 'peer/local-object-room-regex.ts',
+    text: String.raw`function validateRoom(room) {
+      const patterns = { ROOM_ID: /^\d{1,21}$/ };
+      return patterns.ROOM_ID.test(room.guildId);
+    }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, objectRegexConstant]), {
+    ...expectedPolicies,
+    'peer/local-object-room-regex.ts': 1
   });
   const regexAlias = {
     file: 'peer/future-room.ts',

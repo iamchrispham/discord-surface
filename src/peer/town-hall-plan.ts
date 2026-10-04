@@ -27,8 +27,11 @@ export function isTownHallRoom(value: unknown): value is TownHallRoom {
   try {
     const guildId = ownDataProperty(value, 'guildId');
     const channelId = ownDataProperty(value, 'channelId');
-    return typeof guildId === 'string' && /^\d{1,20}$/.test(guildId) &&
-      typeof channelId === 'string' && /^\d{1,20}$/.test(channelId);
+    const observableGuildId = (value as { guildId: unknown }).guildId;
+    const observableChannelId = (value as { channelId: unknown }).channelId;
+    return guildId === observableGuildId && channelId === observableChannelId &&
+      typeof observableGuildId === 'string' && /^\d{1,20}$/.test(observableGuildId) &&
+      typeof observableChannelId === 'string' && /^\d{1,20}$/.test(observableChannelId);
   } catch {
     return false;
   }

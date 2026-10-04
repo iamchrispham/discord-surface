@@ -357,6 +357,18 @@ test('room guard rejects accessor descriptors with inherited value fields', () =
   }
 });
 
+test('room guard rejects proxy reads that diverge from valid descriptors', () => {
+  const { isTownHallRoom } = require('../dist/peer/town-hall-plan');
+  const proxy = new Proxy(room(), {
+    get(target, key, receiver) {
+      if (key === 'guildId') return 7;
+      if (key === 'channelId') return OTHER_CHANNEL;
+      return Reflect.get(target, key, receiver);
+    }
+  });
+  assert.equal(isTownHallRoom(proxy), false);
+});
+
 test('room identifier length boundaries preserve valid matches', () => {
   const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
   for (const id of ['0', '1'.repeat(20)]) {
