@@ -6,13 +6,13 @@ const os = require('node:os');
 const path = require('node:path');
 const { inventoryProcessOwnerSites, SRC_ROOT } = require('./process-owner-evidence-scenarios/source-inventory.cjs');
 
-const runFixture = (source, expectedKills, expectedViolations, fileName = 'private-alias.js') => {
+const runFixture = (source, expectedKills, expectedViolations, fileName = 'private-alias.js', expectedLegacyCalls = []) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-probe-alias-'));
   try {
     fs.writeFileSync(path.join(directory, fileName), source);
     const result = inventoryProcessOwnerSites(directory);
     assert.deepEqual(result.kills, expectedKills);
-    assert.deepEqual(result.legacyCalls, []);
+    assert.deepEqual(result.legacyCalls, expectedLegacyCalls);
     assert.deepEqual(result.violations, expectedViolations);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -114,6 +114,15 @@ test("static element key resolves process kill", () => {
 runFixture("const key = 'kill'; function newProbe(pid) { process[key](pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
 
+test("static element assignment retains process kill", () => {
+  runFixture("const state = {}; state['probe'] = process.kill; function newProbe(pid) { state['probe'](pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const key = 'probe'; const state = {}; state[key] = process.kill; function newProbe(pid) { state[key](pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("comma aliases resolve their final operand", () => {
+  runFixture("const probe = (sideEffect(), process.kill); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
 test("declared production probe inventory remains valid", () => {
 const result = inventoryProcessOwnerSites(SRC_ROOT);
 assert.equal(result.kills.length, 8);
@@ -145,6 +154,11 @@ test("callable aliases retain function parameters", () => {
   runFixture("function invoke(probe, pid) { probe(pid, 0); } const run = invoke; run(process.kill, 1);", ["private-alias.js\u0000invoke"], ["unclassified process probe private-alias.js:invoke"]);
 });
 
+test("direct function and arrow expressions receive probe arguments", () => {
+  runFixture("(function invoke(probe, pid) { probe(pid, 0); })(process.kill, 1);", ["private-alias.js\u0000invoke"], ["unclassified process probe private-alias.js:invoke"]);
+  runFixture("((probe, pid) => { probe(pid, 0); })(process.kill, 1);", ["private-alias.js\u0000null"], ["unclassified process probe private-alias.js:null"]);
+});
+
 test("chained assignments retain the right-hand probe", () => {
   runFixture("let probe; let next; probe = next = process.kill; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
@@ -156,6 +170,16 @@ test("object property probes retain their literal origin", () => {
 test("CommonJS process origins retain module and destructured probes", () => {
   runFixture("const processModule = require('node:process'); function newProbe(pid) { processModule.kill(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("const { kill: probe } = require('node:process'); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("ES module process origins retain namespace and named probes", () => {
+  runFixture("import * as proc from 'node:process'; function newProbe(pid) { proc.kill(pid, 0); }", ["private-alias.ts\u0000newProbe"], ["unclassified process probe private-alias.ts:newProbe"], 'private-alias.ts');
+  runFixture("import { kill as probe } from 'node:process'; function newProbe(pid) { probe(pid, 0); }", ["private-alias.ts\u0000newProbe"], ["unclassified process probe private-alias.ts:newProbe"], 'private-alias.ts');
+});
+
+test("array binding probes retain indexed process origins", () => {
+  runFixture("const [probe] = [process.kill]; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function invoke([probe], pid) { probe(pid, 0); } invoke([process.kill], 1);", ["private-alias.js\u0000invoke"], ["unclassified process probe private-alias.js:invoke"]);
 });
 
 test("destructured probe invocation methods remain unsupported", () => {
@@ -312,4 +336,12 @@ test("Reflect ordinary control", () => {
 
 test("Reflect lexical shadow control", () => {
   runFixture("const Reflect={apply(){}};function newProbe(pid){Reflect.apply(process.kill,null,[pid,0]);}", [], []);
+});
+
+test("legacy owner identity survives invocation methods", () => {
+  const expectedLegacy = ["private-alias.js\u0000newProbe"];
+  const expectedViolation = ["legacy directPostOwnerAlive callsite private-alias.js:newProbe"];
+  runFixture("const state = { directPostOwnerAlive }; function newProbe(pid, identity) { state.directPostOwnerAlive.call(state, pid, identity); }", [], expectedViolation, 'private-alias.js', expectedLegacy);
+  runFixture("const state = { directPostOwnerAlive }; function newProbe(pid, identity) { state.directPostOwnerAlive.apply(state, [pid, identity]); }", [], expectedViolation, 'private-alias.js', expectedLegacy);
+  runFixture("const state = { directPostOwnerAlive }; function newProbe(pid, identity) { state.directPostOwnerAlive.bind(state)(pid, identity); }", [], expectedViolation, 'private-alias.js', expectedLegacy);
 });
