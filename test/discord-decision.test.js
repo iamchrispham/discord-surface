@@ -637,6 +637,50 @@ test('Embed Links loss uses a visible short-answer projection fallback', { timeo
   assert.equal(f.edits.length, 1);
 });
 
+test('failed short projection remains pending after native submission', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { questionText: 'q'.repeat(1800), embedLinks: false, attachFiles: false });
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const interactionId = 'short-projection-retry';
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.importDecisionWinner(interactionId, {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'short-answer',
+    answer: 'x'.repeat(100)
+  }).accepted, true);
+
+  const result = await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
+
+  assert.equal(result.accepted, true);
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.state.getDecisionClick('short-projection-retry')?.projectionOutcome, 'not_sent');
+  assert.equal(f.state.getDecisionClick('short-projection-retry')?.state, 'materialized_projection_pending');
+  assert.equal(f.state.listDecisionPendingWork().length, 1);
+
+  f.setEmbedLinks(true);
+  f.setAttachFiles(true);
+  await f.gateway.reconcilePending();
+
+  assert.equal(f.edits.length, 1);
+  assert.equal(f.state.getDecisionClick('short-projection-retry')?.projectionOutcome, 'sent');
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
 test('known-unsent long-answer projection retries after Attach Files returns', { timeout: 30000 }, async t => {
   const f = await fixture(t, { attachFiles: false });
   const admitted = f.state.admitDecisionClickAndBeginCallback({

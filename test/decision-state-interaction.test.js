@@ -78,13 +78,14 @@ test('denied rejection follow-up stays pending across restart until sent', () =>
   }
 });
 
-test('successful projection closes custody after native submission', () => {
+test('retryable projection closes custody after native submission', () => {
   const fixtureState = fixture();
   try {
     const { state } = fixtureState;
     presented(state);
     assert.equal(state.admitDecisionClick(click(state)).accepted, true);
     assert.equal(state.importDecisionWinner('interaction-1', materializedWinner()).accepted, true);
+    assert.equal(state.recordDecisionProjectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.NOT_SENT).accepted, true);
     assert.equal(state.recordDecisionNativeReturnOutcome('interaction-1', DECISION_NATIVE_OUTCOMES.SUBMITTED).accepted, true);
     assert.equal(state.getDecisionClick('interaction-1')?.state, DECISION_STATES.MATERIALIZED_PROJECTION_PENDING);
     assert.equal(state.recordDecisionProjectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);

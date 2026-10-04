@@ -435,7 +435,10 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         state.getDecisionClick(click.interactionId)?.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT;
     } catch (error) {
       const outcome = transportOutcome((error as { outcome?: unknown })?.outcome);
-      if (outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT && (error as { retryable?: unknown })?.retryable === true) return false;
+      if (outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT && (error as { retryable?: unknown })?.retryable === true) {
+        state.recordDecisionProjectionOutcome(click.interactionId, outcome);
+        return false;
+      }
       state.recordDecisionProjectionOutcome(click.interactionId, outcome);
       return false;
     }
