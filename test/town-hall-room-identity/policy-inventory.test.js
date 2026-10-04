@@ -284,7 +284,7 @@ function isSplitRoomDigitPolicy(node, sourceFile, pattern, bindings) {
   return roomFieldSubject(node, sourceFile, bindings) && hasSplitRoomLengthBound(scope, subject, sourceFile);
 }
 
-function roomDigitPolicies(records) {
+function legacyRoomDigitPolicies(records) {
   const sites = {};
   for (const { file, text } of records) {
     const ast = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
@@ -307,6 +307,307 @@ function roomDigitPolicies(records) {
       ts.forEachChild(node, visit);
     };
     visit(ast);
+  }
+  return sites;
+}
+
+function unwrapPolicyExpression(node) {
+  let current = node;
+  while (current && (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) ||
+      ts.isTypeAssertionExpression(current) || ts.isNonNullExpression(current))) {
+    current = current.expression;
+  }
+  return current;
+}
+
+function policyPropertyKey(node) {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  if (ts.isElementAccessExpression(node) && node.argumentExpression &&
+      ts.isStringLiteralLike(node.argumentExpression)) return node.argumentExpression.text;
+  return null;
+}
+
+function roomDigitPolicies(records) {
+  const infos = records.map(({ file, text }) => ({
+    file,
+    ast: ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true),
+    bindings: [],
+    functions: new Map(),
+    functionDefs: [],
+    imports: new Map(),
+    exports: new Map(),
+  }));
+  const byFile = new Map(infos.map(info => [info.file, info]));
+
+  const addPatternBindings = (pattern, source, info, extra) => {
+    if (ts.isIdentifier(pattern)) {
+      info.bindings.push({ name: pattern.text, kind: 'value', source, ...extra });
+      return;
+    }
+    if (ts.isObjectBindingPattern(pattern)) {
+      for (const element of pattern.elements) {
+        if (!ts.isBindingElement(element)) continue;
+        const keyNode = element.propertyName || element.name;
+        if (ts.isIdentifier(element.name) && (ts.isIdentifier(keyNode) || ts.isStringLiteralLike(keyNode))) {
+          info.bindings.push({
+            name: element.name.text,
+            kind: extra.kind === 'parameter' ? 'parameter-field' : 'field',
+            key: keyNode.text,
+            source,
+            ...extra,
+          });
+        } else {
+          addPatternBindings(element.name, source, info, extra);
+        }
+      }
+    }
+  };
+
+  for (const info of infos) {
+    const visit = node => {
+      if (ts.isVariableDeclaration(node)) {
+        const scope = nearestLexicalScope(node);
+        addPatternBindings(node.name, node.initializer || null, info, {
+          declaration: node,
+          scope,
+        });
+        if (ts.isIdentifier(node.name) && node.initializer &&
+            (ts.isFunctionExpression(node.initializer) || ts.isArrowFunction(node.initializer))) {
+          const fn = {
+            info,
+            node: node.initializer,
+            name: node.name.text,
+            calls: [],
+          };
+          info.functions.set(node.name.text, fn);
+          info.functionDefs.push(fn);
+        }
+      } else if (ts.isFunctionDeclaration(node) && node.name) {
+        const fn = {
+          info,
+          node,
+          name: node.name.text,
+          calls: [],
+        };
+        info.functions.set(node.name.text, fn);
+        info.functionDefs.push(fn);
+      } else if (ts.isParameter(node)) {
+        const fn = enclosingFunction(node);
+        addPatternBindings(node.name, null, info, {
+          kind: 'parameter',
+          function: fn,
+          ownerInfo: info,
+          index: fn ? fn.parameters.indexOf(node) : -1,
+          declaration: node,
+          scope: fn,
+        });
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(info.ast);
+
+    const importVisit = node => {
+      if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
+        const specifier = node.moduleSpecifier.text;
+        if (node.importClause?.name) {
+          info.imports.set(node.importClause.name.text, { specifier, imported: 'default' });
+        }
+        if (node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
+          for (const element of node.importClause.namedBindings.elements) {
+            info.imports.set(element.name.text, {
+              specifier,
+              imported: element.propertyName?.text || element.name.text,
+            });
+          }
+        }
+        if (node.importClause?.namedBindings && ts.isNamespaceImport(node.importClause.namedBindings)) {
+          info.imports.set(node.importClause.namedBindings.name.text, { specifier, namespace: true });
+        }
+      }
+      ts.forEachChild(node, importVisit);
+    };
+    importVisit(info.ast);
+
+    for (const statement of info.ast.statements) {
+      if (ts.isExportDeclaration(statement) && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+        for (const element of statement.exportClause.elements) {
+          info.exports.set(element.name.text, element.propertyName?.text || element.name.text);
+        }
+      }
+      if (ts.isFunctionDeclaration(statement) && statement.name &&
+          statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+        info.exports.set(statement.name.text, statement.name.text);
+        if (statement.modifiers.some(modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword)) {
+          info.exports.set('default', statement.name.text);
+        }
+      }
+      if (ts.isVariableStatement(statement) &&
+          statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+        for (const declaration of statement.declarationList.declarations) {
+          if (ts.isIdentifier(declaration.name)) info.exports.set(declaration.name.text, declaration.name.text);
+        }
+      }
+    }
+  }
+
+  const resolveModule = (info, specifier) => {
+    if (!specifier || !specifier.startsWith('.')) return null;
+    const base = path.posix.normalize(path.posix.join(path.posix.dirname(info.file), specifier));
+    for (const candidate of [base, base + '.ts', base + '.js', base + '/index.ts', base + '/index.js']) {
+      if (byFile.has(candidate)) return byFile.get(candidate);
+    }
+    return null;
+  };
+  const resolveImported = (info, name) => {
+    const imported = info.imports.get(name);
+    if (!imported || imported.namespace) return null;
+    const target = resolveModule(info, imported.specifier);
+    if (!target) return null;
+    const exported = target.exports.get(imported.imported) || imported.imported;
+    return target.functions.get(exported) || null;
+  };
+  for (const info of infos) {
+    for (const [name, imported] of info.imports) {
+      if (!imported.namespace) {
+        const fn = resolveImported(info, name);
+        if (fn) info.functions.set(name, fn);
+      }
+    }
+  }
+
+  const resolveFunction = (info, node) => {
+    const expression = unwrapPolicyExpression(node);
+    if (!expression) return null;
+    if (ts.isIdentifier(expression)) {
+      const candidates = info.functionDefs.filter(candidate => candidate.name === expression.text &&
+        isAncestor(nearestLexicalScope(candidate.node), expression));
+      candidates.sort((left, right) =>
+        scopeDepth(nearestLexicalScope(right.node)) - scopeDepth(nearestLexicalScope(left.node)));
+      return candidates[0] || info.functions.get(expression.text) || resolveImported(info, expression.text);
+    }
+    if (ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.expression)) {
+      const imported = info.imports.get(expression.expression.text);
+      if (imported?.namespace) {
+        const target = resolveModule(info, imported.specifier);
+        return target?.functions.get(expression.name.text) || null;
+      }
+    }
+    return null;
+  };
+  for (const info of infos) {
+    const visit = node => {
+      if (ts.isCallExpression(node)) {
+        const fn = resolveFunction(info, node.expression);
+        if (fn) fn.calls.push({ info, args: node.arguments });
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(info.ast);
+  }
+
+  const findBinding = (info, name, node) => {
+    const bindings = info.bindings.filter(binding => binding.name === name &&
+      (!binding.scope || isAncestor(binding.scope, node) || binding.scope === node));
+    bindings.sort((left, right) => scopeDepth(right.scope) - scopeDepth(left.scope));
+    return bindings[0] || null;
+  };
+  const bindingCalls = (binding, fallbackInfo) => {
+    if (!binding.function) return [];
+    const ownerInfo = binding.ownerInfo || fallbackInfo;
+    const functionInfo = [...ownerInfo.functions.values()].find(candidate => candidate.node === binding.function);
+    return functionInfo?.calls || [];
+  };
+  const objectIsRoom = (node, info, seen = new Set()) => {
+    const expression = unwrapPolicyExpression(node);
+    if (!expression) return false;
+    if (ts.isIdentifier(expression)) {
+      if (/^(?:room|townHall|townHallRoom)$/i.test(expression.text)) return true;
+      const binding = findBinding(info, expression.text, expression);
+      if (!binding || seen.has(binding)) return false;
+      seen.add(binding);
+      if (binding.kind === 'value' && binding.source) return objectIsRoom(binding.source, info, seen);
+      if (binding.kind === 'parameter') {
+        return bindingCalls(binding, info).some(call => call.args[binding.index] &&
+          objectIsRoom(call.args[binding.index], call.info, new Set(seen)));
+      }
+    }
+    return false;
+  };
+  const expressionIsRoomField = (node, info, seen = new Set()) => {
+    const expression = unwrapPolicyExpression(node);
+    if (!expression) return false;
+    const key = policyPropertyKey(expression);
+    if (key && ['guildId', 'channelId'].includes(key)) {
+      const object = expression.expression;
+      if (objectIsRoom(object, info, new Set(seen))) return true;
+    }
+    if (!ts.isIdentifier(expression)) return false;
+    const binding = findBinding(info, expression.text, expression);
+    if (!binding || seen.has(binding)) return false;
+    seen.add(binding);
+    if (binding.kind === 'value' && binding.source) {
+      return expressionIsRoomField(binding.source, info, seen);
+    }
+    if ((binding.kind === 'field' || binding.kind === 'parameter-field') &&
+        ['guildId', 'channelId'].includes(binding.key)) {
+      if (binding.kind === 'field') return objectIsRoom(binding.source, info, new Set(seen));
+      return bindingCalls(binding, info).some(call => call.args[binding.index] &&
+        objectIsRoom(call.args[binding.index], call.info, new Set(seen)));
+    }
+    if (binding.kind === 'parameter') {
+      return bindingCalls(binding, info).some(call => call.args[binding.index] &&
+        expressionIsRoomField(call.args[binding.index], call.info, new Set(seen)));
+    }
+    return false;
+  };
+  const regexInputs = (node, info) => {
+    const inputs = [];
+    const direct = regexInput(node);
+    if (direct) inputs.push(direct);
+    const declaration = node.parent && ts.isVariableDeclaration(node.parent) &&
+      node.parent.initializer === node && ts.isIdentifier(node.parent.name) ? node.parent : null;
+    if (!declaration) return inputs;
+    const name = declaration.name.text;
+    const visit = current => {
+      if (ts.isIdentifier(current) && current.text === name && current !== declaration.name) {
+        const parent = current.parent;
+        if (ts.isPropertyAccessExpression(parent) && parent.expression === current &&
+            (parent.name.text === 'test' || parent.name.text === 'exec') && ts.isCallExpression(parent.parent)) {
+          if (parent.parent.arguments[0]) inputs.push(parent.parent.arguments[0]);
+        } else if (ts.isCallExpression(parent) && parent.arguments[0] === current &&
+            ts.isPropertyAccessExpression(parent.expression) && parent.expression.name.text === 'match') {
+          inputs.push(parent.expression.expression);
+        }
+      }
+      ts.forEachChild(current, visit);
+    };
+    visit(info.ast);
+    return inputs;
+  };
+
+  const sites = legacyRoomDigitPolicies(records);
+  const numeric = /\\[dD]|\\[(?:\\^)?0-9\\]/;
+  for (const info of infos) {
+    const legacyBindings = collectBindings(info.ast);
+    const visit = node => {
+      let pattern = null;
+      if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
+      else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
+          ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
+          node.arguments?.length && ts.isStringLiteralLike(node.arguments[0])) {
+        pattern = node.arguments[0].text;
+      }
+      if (pattern !== null && numeric.test(pattern)) {
+        const legacyPolicy = isTownHallRoomOwner(node, info.ast, legacyBindings) ||
+          roomFieldSubject(node, info.ast, legacyBindings) ||
+          isSplitRoomDigitPolicy(node, info.ast, pattern, legacyBindings);
+        if (!legacyPolicy && regexInputs(node, info).some(input => expressionIsRoomField(input, info))) {
+          sites[info.file] = (sites[info.file] || 0) + 1;
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(info.ast);
   }
   return sites;
 }
@@ -337,6 +638,34 @@ test('room policy inventory records only town-hall room validators', () => {
   assert.notDeepEqual(roomDigitPolicies([...records, constructor]), expectedPolicies);
   const directCall = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return RegExp('^[0-9]{1,21}$').test(room.channelId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, directCall]), expectedPolicies);
+  const destructuredRoomField = {
+    file: 'peer/future-room.ts',
+    text: 'function validateRoom(room) { const { guildId } = room; return /^\\d{1,21}$/.test(guildId); }'
+  };
+  assert.deepEqual(roomDigitPolicies([...records, destructuredRoomField]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
+  const regexConstant = {
+    file: 'peer/future-room.ts',
+    text: 'function validateRoom(room) { const ROOM_ID = /^\\d{1,21}$/; return ROOM_ID.test(room.guildId); }'
+  };
+  assert.deepEqual(roomDigitPolicies([...records, regexConstant]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
+  const importedRoomHelper = {
+    file: 'peer/future-helper.ts',
+    text: 'export function validateGuildId(value) { return /^\\d{1,21}$/.test(value); }'
+  };
+  const importedRoomConsumer = {
+    file: 'peer/future-consumer.ts',
+    text: "import { validateGuildId } from './future-helper'; function validateRoom(room) { return validateGuildId(room.guildId); }"
+  };
+  assert.deepEqual(roomDigitPolicies([...records, importedRoomHelper, importedRoomConsumer]), {
+    ...expectedPolicies,
+    'peer/future-helper.ts': 1
+  });
   const renamedParameter = { file: 'peer/future-room.ts', text: String.raw`function validateTownHallRoom(candidate) {
     return /^\d{1,21}$/.test(candidate.guildId);
   }` };
