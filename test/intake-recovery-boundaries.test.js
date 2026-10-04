@@ -537,21 +537,55 @@ for (const control of LEGACY_NEGATIVE_CONTROLS) {
   });
 }
 
+const SOURCE_FILE_PATTERN = /\.(?:js|ts)$/;
+const CLASSIFIER_PATTERN = /\b(?:classifyRecoveryDeadline|recoveryDeadlineClassifier)\s*\(/;
+
+const collectSourceFiles = directory => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+  const absolute = path.join(directory, entry.name);
+  if (entry.isDirectory()) return collectSourceFiles(absolute);
+  return SOURCE_FILE_PATTERN.test(entry.name) ? [absolute] : [];
+});
+
+const readSourceInventory = sourceRoot => collectSourceFiles(sourceRoot).map(absolute => ({
+  relative: path.relative(sourceRoot, absolute).split(path.sep).join('/'),
+  source: fs.readFileSync(absolute, 'utf8')
+}));
+
+const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source }) => {
+  const lines = source.split(/\r?\n/);
+  const offenders = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/\b(?:DEADLINE|deadlineReached)\b/.test(lines[index])) continue;
+    const window = lines.slice(index, index + 4).join('\n');
+    if (!/\b(?:READINESS\.GAP|THREAD_STATES\.GAP)\b|\?\s*['"]gap['"]/.test(window)) continue;
+    if (CLASSIFIER_PATTERN.test(window)) continue;
+    offenders.push(`${relative}:${index + 1}`);
+  }
+  return offenders;
+});
+
 test('deadline policy inventory has no direct deadline-to-gap decision outside its classifier', () => {
   const sourceRoot = path.join(__dirname, '../src');
-  const files = ['discord.js', 'discord/inbound-recovery.js', 'discord/thread-enrollment.ts'];
-  const offenders = [];
-  for (const relative of files) {
-    const lines = fs.readFileSync(path.join(sourceRoot, relative), 'utf8').split(/\r?\n/);
-    for (let index = 0; index < lines.length; index += 1) {
-      if (!/\b(?:DEADLINE|deadlineReached)\b/.test(lines[index])) continue;
-      const window = lines.slice(index, index + 4).join('\n');
-      if (/\b(?:READINESS\.GAP|THREAD_STATES\.GAP)\b|\?\s*['"]gap['"]/.test(window)) {
-        offenders.push(`${relative}:${index + 1}`);
-      }
-    }
-  }
+  const offenders = findDeadlineGapOffenders(readSourceInventory(sourceRoot));
   assert.deepEqual(offenders, [], 'new deadline decisions must use the shared recovery classifier');
+});
+
+test('deadline policy inventory catches a new source owner and permits classifier and ordinary deadlines', () => {
+  const entries = [
+    {
+      relative: 'discord/new-owner.js',
+      source: "const state = deadlineReached ? READINESS.GAP : READINESS.READY;"
+    },
+    {
+      relative: 'discord/recovery-classifier.js',
+      source: "function classifyRecoveryDeadline(deadlineReached) { return deadlineReached ? READINESS.GAP : READINESS.READY; }"
+    },
+    {
+      relative: 'discord/ordinary-deadline.js',
+      source: "if (deadlineReached) return RETRY;"
+    }
+  ];
+  assert.deepEqual(findDeadlineGapOffenders(entries), ['discord/new-owner.js:1']);
 });
 
 test('pre-adoption retry classifier sites stay in the audited owners', () => {
@@ -559,16 +593,10 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
   assert.equal(registered.filter(value => value === 'test/intake-recovery-boundaries.test.js').length, 1,
     'the retry-classifier inventory must execute exactly once in npm test');
   const sourceRoot = path.join(__dirname, '../src');
-  const collect = directory => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
-    const absolute = path.join(directory, entry.name);
-    if (entry.isDirectory()) return collect(absolute);
-    return /\.(?:js|ts)$/.test(entry.name) ? [absolute] : [];
-  });
   const sites = new Map();
-  for (const file of collect(sourceRoot)) {
-    const source = fs.readFileSync(file, 'utf8');
+  for (const { relative, source } of readSourceInventory(sourceRoot)) {
     const count = source.match(/\bisPreAdoptionRetryableThread\b/g)?.length || 0;
-    if (count) sites.set(path.relative(sourceRoot, file).split(path.sep).join('/'), count);
+    if (count) sites.set(relative, count);
   }
   assert.deepEqual(Object.fromEntries([...sites].sort(([left], [right]) => left.localeCompare(right))), {
     'discord.js': 10,
