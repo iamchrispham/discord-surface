@@ -339,7 +339,8 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     while (ts.isParenthesizedExpression(expression)
       || ts.isAsExpression(expression)
       || ts.isSatisfiesExpression(expression)
-      || ts.isNonNullExpression(expression)) {
+      || ts.isNonNullExpression(expression)
+      || ts.isTypeAssertionExpression(expression)) {
       expression = expression.expression;
     }
     if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
@@ -374,11 +375,24 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   function declaredNames(ast) {
     const names = [];
     walk(ast, node => {
-      if (ts.isFunctionDeclaration(node) && node.name) names.push(node.name.text);
-      if (ts.isClassDeclaration(node) && node.name) names.push(node.name.text);
+      if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name) {
+        names.push(node.name.text);
+      }
+      if ((ts.isClassDeclaration(node) || ts.isClassExpression(node)) && node.name) {
+        names.push(node.name.text);
+      }
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) names.push(node.name.text);
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const name = assignmentPropertyNameText(node.left);
+        if (name) names.push(name);
+      }
+      if (ts.isCallExpression(node)
+        && ts.isPropertyAccessExpression(node.expression)
+        && ts.isIdentifier(node.expression.expression)
+        && node.expression.expression.text === 'Object'
+        && node.expression.name.text === 'defineProperty'
+        && node.arguments.length >= 2) {
+        const name = staticStringText(node.arguments[1]);
         if (name) names.push(name);
       }
       if ((ts.isMethodDeclaration(node)
@@ -423,6 +437,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['class static computed as string', "class Example { static ['captureProcessOwnerIdentity' as string]() {} }", true, ts.ScriptKind.TS],
     ['class static computed satisfies string', "class Example { static ['captureProcessOwnerIdentity' satisfies string]() {} }", true, ts.ScriptKind.TS],
     ['class static computed non-null string', "class Example { static ['captureProcessOwnerIdentity'!]() {} }", true, ts.ScriptKind.TS],
+    ['class static computed angle-bracket string', "class Example { static [<string>'captureProcessOwnerIdentity']() {} }", true, ts.ScriptKind.TS],
     ['class property', 'class Example { captureProcessOwnerIdentity = null; }', true],
     ['class static string property', "class Example { static 'captureProcessOwnerIdentity' = null; }", true],
     ['class getter', 'class Example { get captureProcessOwnerIdentity() { return null; } }', true],
@@ -435,7 +450,11 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['property access assignment', 'exports.captureProcessOwnerIdentity = function () {};', true],
     ['string element assignment', "exports['captureProcessOwnerIdentity'] = function () {};", true],
     ['concatenated element assignment', "exports['captureProcessOwner' + 'Identity'] = function () {};", true],
+    ['angle-bracket element assignment', "exports[<string>'captureProcessOwnerIdentity'] = function () {};", true, ts.ScriptKind.TS],
     ['prototype property assignment', 'Example.prototype.captureProcessOwnerIdentity = function () {};', true],
+    ['named function expression', 'const other = function captureProcessOwnerIdentity() {};', true],
+    ['named class expression', 'const Other = class captureProcessOwnerIdentity {};', true],
+    ['defineProperty descriptor', "Object.defineProperty(exports, 'captureProcessOwnerIdentity', { value() {} });", true],
     ['dynamic computed method', 'class Example { static [owner]() {} }', false],
     ['dynamic computed property', '({ [owner]: null });', false],
     ['dynamic wrapped computed method', 'class Example { static [(owner)]() {} }', false],
@@ -443,6 +462,8 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['dynamic satisfies computed method', 'class Example { static [owner satisfies string]() {} }', false, ts.ScriptKind.TS],
     ['dynamic non-null computed property', '({ [owner!]: null });', false, ts.ScriptKind.TS],
     ['dynamic element assignment', 'exports[owner] = function () {};', false],
+    ['dynamic angle-bracket element assignment', 'exports[<string>owner] = function () {};', false, ts.ScriptKind.TS],
+    ['dynamic defineProperty descriptor', 'Object.defineProperty(exports, owner, { value() {} });', false],
   ];
   for (const [label, source, expected, scriptKind] of methodControls) {
     assert.equal(declaredNames(parse(source, scriptKind)).includes('captureProcessOwnerIdentity'), expected, label);
@@ -459,7 +480,11 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   assert.equal(imports.length, 1);
   const facade = [];
   walk(stateAst, node => {
-    if (ts.isMethodDeclaration(node) && propertyNameText(node.name) === 'directPostOwnerIdentity') facade.push(node);
+    if ((ts.isMethodDeclaration(node)
+      || ts.isPropertyDeclaration(node)
+      || ts.isGetAccessorDeclaration(node)
+      || ts.isSetAccessorDeclaration(node))
+      && propertyNameText(node.name) === 'directPostOwnerIdentity') facade.push(node);
   });
   assert.equal(facade.length, 1);
   assert.equal(strip(facade[0].body.getText(stateAst)), '{returncaptureProcessOwnerIdentity.apply(this,arguments);}');
@@ -470,6 +495,22 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     if (ts.isMethodDeclaration(node) && propertyNameText(node.name) === 'directPostOwnerIdentity') duplicateFacade.push(node);
   });
   assert.equal(duplicateFacade.length, 2);
+
+  const overridingFacadeMembers = [
+    ['class field', 'class State { directPostOwnerIdentity = null; }'],
+    ['getter', 'class State { get directPostOwnerIdentity() { return null; } }'],
+    ['setter', 'class State { set directPostOwnerIdentity(value) {} }'],
+  ];
+  for (const [label, source] of overridingFacadeMembers) {
+    const members = [];
+    walk(parse(source, ts.ScriptKind.TS), node => {
+      if ((ts.isPropertyDeclaration(node)
+        || ts.isGetAccessorDeclaration(node)
+        || ts.isSetAccessorDeclaration(node))
+        && propertyNameText(node.name) === 'directPostOwnerIdentity') members.push(node);
+    });
+    assert.equal(members.length, 1, label);
+  }
 
   const Module = require('node:module');
   const resolvedState = require.resolve('../src/state');
