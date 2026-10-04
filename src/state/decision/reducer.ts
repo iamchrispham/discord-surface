@@ -65,7 +65,9 @@ function projectionStateAfterOutcome(click: MutableClick): DecisionState {
     ? DECISION_STATES.UNKNOWN
     : DECISION_STATES.TERMINAL;
   if (native.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED) {
-    if (click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT) return DECISION_STATES.TERMINAL;
+    if (click.projectionOutcome && !PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome)) {
+      return DECISION_STATES.TERMINAL;
+    }
     if (click.projectionOutcome && PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome)) {
       return DECISION_STATES.MATERIALIZED_PROJECTION_PENDING;
     }

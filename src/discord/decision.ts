@@ -63,8 +63,9 @@ export function renderDecisionProjection(
   const inline = answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT;
   const file = attach || !inline;
   const promptContent = presentation.content || '';
-  const fileFallbackContent = `${promptContent}\n\nSelected action is attached in selected-action.txt.`.trim();
-  let fallbackContent = `${promptContent}\n\nSelected action:\n${answer}`.trim();
+  const promptSeparator = promptContent.length > 0 ? '\n\n' : '';
+  const fileFallbackContent = `${promptContent}${promptSeparator}Selected action is attached in selected-action.txt.`;
+  let fallbackContent = `${promptContent}${promptSeparator}Selected action:\n${answer}`;
   if (file) fallbackContent = fileFallbackContent.length <= DISCORD_MESSAGE_CONTENT_LIMIT ? fileFallbackContent : promptContent;
   const content = embed ? presentation.content : fallbackContent;
   const embedDescription = inline && !file ? answer : 'Full answer attached in selected-action.txt.';
@@ -226,20 +227,21 @@ function transportOutcome(value: unknown): DecisionTransportOutcome {
     : DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
 }
 
-function isUnknownDiscordMessageError(error: unknown): boolean {
+function isTerminalDiscordProjectionError(error: unknown): boolean {
   const candidate = record(error);
   const rawError = record(candidate?.rawError);
   const code = candidate?.code ?? rawError?.code;
   const status = candidate?.status ?? candidate?.statusCode ?? rawError?.status ?? rawError?.statusCode;
   const message = candidate?.message ?? rawError?.message;
-  return String(code) === '10008' ||
-    (Number(status) === 404 && typeof message === 'string' && message.toLowerCase() === 'unknown message');
+  return String(code) === '10008' || String(code) === '10003' ||
+    (Number(status) === 404 && typeof message === 'string' &&
+      ['unknown message', 'unknown channel'].includes(message.toLowerCase()));
 }
 
 function projectionErrorOutcome(error: unknown): DecisionTransportOutcome {
   const candidate = record(error);
   if (candidate && 'outcome' in candidate) return transportOutcome(candidate.outcome);
-  if (isUnknownDiscordMessageError(error)) return DECISION_TRANSPORT_OUTCOMES.REJECTED;
+  if (isTerminalDiscordProjectionError(error)) return DECISION_TRANSPORT_OUTCOMES.REJECTED;
   return DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
 }
 
