@@ -287,6 +287,84 @@ test('room identifier length boundaries preserve valid matches', () => {
 });
 
 
+function isRoomField(node) {
+  if (!ts.isPropertyAccessExpression(node) || !['guildId', 'channelId'].includes(node.name.text)) {
+    return false;
+  }
+  return ts.isIdentifier(node.expression) && /^(?:room|townHall|townHallRoom)$/i.test(node.expression.text);
+}
+
+function regexInput(node) {
+  let current = node;
+  while (current.parent) {
+    const parent = current.parent;
+    if (ts.isPropertyAccessExpression(parent) && parent.name.text === 'test' && parent.expression === current &&
+        ts.isCallExpression(parent.parent)) {
+      return parent.parent.arguments[0] || null;
+    }
+    current = parent;
+  }
+  return null;
+}
+
+function enclosingFunction(node) {
+  let current = node.parent;
+  while (current) {
+    if (ts.isFunctionLike(current)) return current;
+    current = current.parent;
+  }
+  return null;
+}
+
+function hasRoomFieldAlias(scope, subject, sourceFile) {
+  if (!ts.isIdentifier(subject)) return false;
+  let found = false;
+  const visit = node => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === subject.text &&
+        node.initializer && isRoomField(node.initializer)) {
+      found = true;
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(node.left) && node.left.text === subject.text && isRoomField(node.right)) {
+      found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(scope || sourceFile);
+  return found;
+}
+
+function hasSplitRoomLengthBound(scope, subject, sourceFile) {
+  const subjectText = subject.getText(sourceFile).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|\\W)${subjectText}\\s*\\.\\s*length\\s*(?:<=\\s*20|<\\s*21)(?:\\W|$)`).test(
+    (scope || sourceFile).getText(sourceFile)
+  );
+}
+
+function hasRoomFieldCall(scope, sourceFile) {
+  const name = scope?.name && ts.isIdentifier(scope.name) ? scope.name.text : null;
+  if (!name) return false;
+  let found = false;
+  const visit = node => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name &&
+        node.arguments.length === 1 && isRoomField(node.arguments[0])) {
+      found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return found;
+}
+
+function isSplitRoomDigitPolicy(node, sourceFile, pattern) {
+  if (!/(?:\\[dD]|\[0-9\])(?:\+|\{1,\})/.test(pattern)) return false;
+  const subject = regexInput(node);
+  if (!subject) return false;
+  const scope = enclosingFunction(node) || sourceFile;
+  const roomSubject = isRoomField(subject) || hasRoomFieldAlias(scope, subject, sourceFile) || hasRoomFieldCall(scope, sourceFile);
+  return roomSubject && hasSplitRoomLengthBound(scope, subject, sourceFile);
+}
+
 function roomDigitPolicies(records) {
   const sites = {};
   for (const { file, text } of records) {
@@ -302,7 +380,8 @@ function roomDigitPolicies(records) {
           node.arguments?.length && ts.isStringLiteralLike(node.arguments[0])) {
         pattern = node.arguments[0].text;
       }
-      if (pattern !== null && numeric.test(pattern) && (roomContext || boundedId.test(pattern))) {
+      if (pattern !== null && numeric.test(pattern) &&
+          (roomContext || boundedId.test(pattern) || isSplitRoomDigitPolicy(node, ast, pattern))) {
         sites[file] = (sites[file] || 0) + 1;
       }
       ts.forEachChild(node, visit);
@@ -332,6 +411,46 @@ test('room ID policy has exactly two consumers and the response uses the shared 
   assert.notDeepEqual(roomDigitPolicies([...records, constructor]), expectedPolicies);
   const directCall = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return RegExp('^[0-9]{1,21}$').test(room.channelId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, directCall]), expectedPolicies);
+  const splitNeutral = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(room) {
+    return /^\d+$/.test(room.guildId) && room.guildId.length <= 20;
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, splitNeutral]), {
+    ...expectedPolicies,
+    'peer/snowflake.ts': 1
+  });
+  const splitAlias = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(room) {
+    const value = room.channelId;
+    return /^\d+$/.test(value) && value.length <= 20;
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, splitAlias]), {
+    ...expectedPolicies,
+    'peer/snowflake.ts': 1
+  });
+  const splitCall = { file: 'peer/snowflake.ts', text: String.raw`function isSnowflake(value) {
+    return /^\d+$/.test(value) && value.length <= 20;
+  }
+  function inspect(room) { return isSnowflake(room.guildId); }` };
+  assert.deepEqual(roomDigitPolicies([...records, splitCall]), {
+    ...expectedPolicies,
+    'peer/snowflake.ts': 1
+  });
+  const emptySplit = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(room) {
+    return /^\d*$/.test(room.guildId) && room.guildId.length <= 20;
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, emptySplit]), expectedPolicies);
+  const ordinarySplit = { file: 'peer/snowflake.ts', text: String.raw`function validateSnowflake(value) {
+    return /^\d+$/.test(value) && value.length <= 20;
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, ordinarySplit]), expectedPolicies);
+  const ordinaryFieldSplit = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(user) {
+    return /^\d+$/.test(user.guildId) && user.guildId.length <= 20;
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, ordinaryFieldSplit]), expectedPolicies);
+  const ordinaryCall = { file: 'peer/snowflake.ts', text: String.raw`function isSnowflake(value) {
+    return /^\d+$/.test(value) && value.length <= 20;
+  }
+  function inspect(user) { return isSnowflake(user.guildId); }` };
+  assert.deepEqual(roomDigitPolicies([...records, ordinaryCall]), expectedPolicies);
   const copied = records.map(record => record.file === 'peer/town-hall-room-identity.ts'
     ? { ...record, text: record.text + inline.text } : record);
   assert.notDeepEqual(roomDigitPolicies(copied), expectedPolicies);
