@@ -37,7 +37,7 @@ function factoryDeclaration(source, factoryName) {
   return null;
 }
 
-const INVOCATION_STYLES = Object.freeze({ THIS: 'this', STATE: 'state' });
+const INVOCATION_STYLES = Object.freeze({ THIS: 'this', STATE: 'state', PURE: 'pure' });
 
 function invocationStyle(node) {
   let usesThis = false;
@@ -50,12 +50,16 @@ function invocationStyle(node) {
   const parameters = (node.parameters || []).filter(parameter =>
     !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'));
   const first = parameters[0];
+  const hasStateParameter = parameters.some(parameter =>
+    ts.isIdentifier(parameter.name) && ['state', 'surface'].includes(parameter.name.text));
   if (first && ts.isIdentifier(first.name) && ['state', 'surface'].includes(first.name.text)) {
     return INVOCATION_STYLES.STATE;
   }
+  if (hasStateParameter && !usesThis) {
+    return INVOCATION_STYLES.STATE;
+  }
   if (usesThis) return INVOCATION_STYLES.THIS;
-  if (first) return INVOCATION_STYLES.STATE;
-  return null;
+  return INVOCATION_STYLES.PURE;
 }
 
 function callableDeclarations(source, factory) {
@@ -468,6 +472,16 @@ function compact(raw) {
   };
 }
 
+let canonicalForwardingNames;
+
+function currentForwardingNames() {
+  if (!canonicalForwardingNames) {
+    const canonicalText = fs.readFileSync(stateSourcePath, 'utf8');
+    canonicalForwardingNames = new Set(inventory(canonicalText).forwarding);
+  }
+  return canonicalForwardingNames;
+}
+
 function matches(text, baseline) {
   try {
     const raw = inventory(text);
@@ -482,13 +496,14 @@ function matches(text, baseline) {
     }
     const parsed = ts.createSourceFile('state.js', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const owner = parsed.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'SurfaceState');
+    const canonicalForwarding = currentForwardingNames();
     for (const method of owner.members) {
       const name = method.name?.text;
       if (!candidate.forwarding.includes(name)) continue;
       const unsupportedShape = method.modifiers?.length ||
         method.parameters.some(parameter => parameter.initializer || !ts.isIdentifier(parameter.name));
       if (unsupportedShape) {
-        if (!baseline.forwarding.includes(name)) return false;
+        if (!baseline.forwarding.includes(name) || !canonicalForwarding.has(name)) return false;
         continue;
       }
       const call = method.body.statements[0].expression;

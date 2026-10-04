@@ -200,6 +200,21 @@ test('new handler delegation is accepted when recorded in baseline', () => {
   assert.equal(matchesWithAddedBaseline(text), true);
 });
 
+test('baseline cannot approve static delegation', () => {
+  const text = insert('static newForward(...args) { return configurationHandlers.getConfig.apply(this, args); }');
+  assert.equal(matchesWithAddedBaseline(text), false);
+});
+
+test('baseline cannot approve async delegation', () => {
+  const text = insert('async newForward(...args) { return configurationHandlers.getConfig.apply(this, args); }');
+  assert.equal(matchesWithAddedBaseline(text), false);
+});
+
+test('pure handler delegation is refused when recorded in baseline', () => {
+  const text = insert('newForward(...args) { return conductorCustodyHandlers.transferDetail(this, ...args); }');
+  assert.equal(matchesWithAddedBaseline(text), false);
+});
+
 test('lazy factory delegation accepted when recorded in baseline', () => {
   const text = insert('newForward(...args) { return schemaHandlers.createSchema.apply(this, args); }');
   assert.equal(matchesWithAddedBaseline(text), true);
