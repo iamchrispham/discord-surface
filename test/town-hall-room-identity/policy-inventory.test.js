@@ -22,8 +22,13 @@ function isRoomField(node) {
   } else {
     return false;
   }
-  return ['guildId', 'channelId'].includes(key) && ts.isIdentifier(object) &&
-    /^(?:room|townHall|townHallRoom)$/i.test(object.text);
+  return ['guildId', 'channelId'].includes(key) && ts.isIdentifier(object);
+}
+
+function isNamedRoomField(node) {
+  if (!isRoomField(node)) return false;
+  const object = node.expression;
+  return /^(?:room|townHall|townHallRoom)$/i.test(object.text);
 }
 
 function regexInput(node) {
@@ -33,6 +38,14 @@ function regexInput(node) {
     if (ts.isPropertyAccessExpression(parent) && parent.name.text === 'test' && parent.expression === current &&
         ts.isCallExpression(parent.parent)) {
       return parent.parent.arguments[0] || null;
+    }
+    if (ts.isCallExpression(parent) && parent.arguments[0] === current &&
+        ts.isPropertyAccessExpression(parent.expression) && parent.expression.name.text === 'match') {
+      return parent.expression.expression;
+    }
+    if (ts.isCallExpression(parent) && ts.isPropertyAccessExpression(parent.expression) &&
+        parent.expression.name.text === 'exec' && parent.expression === current) {
+      return parent.arguments[0] || null;
     }
     current = parent;
   }
@@ -171,7 +184,7 @@ function isRoomKeyLookup(node) {
 }
 
 function hasRoomFieldAlias(scope, subject, sourceFile, bindings) {
-  return hasBoundAlias(scope, subject, sourceFile, bindings, isRoomField);
+  return hasBoundAlias(scope, subject, sourceFile, bindings, isNamedRoomField);
 }
 
 function hasRoomKeyAlias(scope, subject, sourceFile, bindings) {
@@ -185,14 +198,14 @@ function hasSplitRoomLengthBound(scope, subject, sourceFile) {
   );
 }
 
-function hasRoomFieldCall(scope, sourceFile, bindings) {
+function hasRoomFieldCall(scope, sourceFile, bindings, matches = isNamedRoomField) {
   const target = functionBinding(scope);
   const name = target ? bindingName(target) : null;
   if (!name) return false;
   let found = false;
   const visit = node => {
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name &&
-        node.arguments.length === 1 && isRoomField(node.arguments[0]) &&
+        node.arguments.length === 1 && matches(node.arguments[0]) &&
         resolveBinding(node.expression, bindings) === target) {
       found = true;
     }
@@ -202,11 +215,56 @@ function hasRoomFieldCall(scope, sourceFile, bindings) {
   return found;
 }
 
+function isTownHallName(name) {
+  return typeof name === 'string' && /town.?hall/i.test(name);
+}
+
+function hasTownHallDeclarationContext(scope, sourceFile) {
+  let current = scope;
+  while (current) {
+    const binding = ts.isFunctionLike(current) ? functionBinding(current) : null;
+    if (binding && isTownHallName(bindingName(binding))) return true;
+    if (current.name && ts.isIdentifier(current.name) && isTownHallName(current.name.text)) return true;
+    current = current.parent;
+  }
+  const functionScope = enclosingFunction(scope) || (ts.isFunctionLike(scope) ? scope : null);
+  return Boolean(functionScope?.parameters?.some(parameter => parameter.type &&
+    isTownHallName(parameter.type.getText(sourceFile))));
+}
+
+function hasTownHallCallsite(scope, sourceFile, bindings) {
+  const target = functionBinding(scope);
+  if (!target) return false;
+  let found = false;
+  const visit = node => {
+    if (found) return;
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
+        resolveBinding(node.expression, bindings) === target) {
+      const caller = enclosingFunction(node);
+      const callerBinding = caller && functionBinding(caller);
+      if (callerBinding && isTownHallName(bindingName(callerBinding))) found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return found;
+}
+
+function isTownHallContext(scope, sourceFile, bindings) {
+  return hasTownHallDeclarationContext(scope, sourceFile) ||
+    hasTownHallCallsite(scope, sourceFile, bindings);
+}
+
 function roomFieldSubject(node, sourceFile, bindings) {
   const subject = regexInput(node);
   if (!subject) return false;
   const scope = enclosingFunction(node) || sourceFile;
-  return isRoomField(subject) || hasRoomFieldAlias(scope, subject, sourceFile, bindings) ||
+  const townHallContext = isTownHallContext(scope, sourceFile, bindings);
+  return isNamedRoomField(subject) ||
+    hasRoomFieldAlias(scope, subject, sourceFile, bindings) ||
+    (townHallContext && (isRoomField(subject) ||
+      hasBoundAlias(scope, subject, sourceFile, bindings, isRoomField) ||
+      hasRoomFieldCall(scope, sourceFile, bindings, isRoomField))) ||
     hasRoomFieldCall(scope, sourceFile, bindings);
 }
 
@@ -279,6 +337,35 @@ test('room policy inventory records only town-hall room validators', () => {
   assert.notDeepEqual(roomDigitPolicies([...records, constructor]), expectedPolicies);
   const directCall = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return RegExp('^[0-9]{1,21}$').test(room.channelId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, directCall]), expectedPolicies);
+  const renamedParameter = { file: 'peer/future-room.ts', text: String.raw`function validateTownHallRoom(candidate) {
+    return /^\d{1,21}$/.test(candidate.guildId);
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, renamedParameter]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
+  const matchRoomField = { file: 'peer/future-room.ts', text: String.raw`function validateTownHallRoom(candidate) {
+    return candidate.guildId.match(/^\d{1,21}$/);
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, matchRoomField]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
+  const execRoomField = { file: 'peer/future-room.ts', text: String.raw`function validateTownHallRoom(candidate) {
+    return /^\d{1,21}$/.exec(candidate.channelId);
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, execRoomField]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
+  const unrelatedMatch = { file: 'peer/snowflake.ts', text: String.raw`function inspect(candidate) {
+    return candidate.guildId.match(/^\d{1,21}$/);
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, unrelatedMatch]), expectedPolicies);
+  const unrelatedExec = { file: 'peer/snowflake.ts', text: String.raw`function inspect(candidate) {
+    return /^\d{1,21}$/.exec(candidate.channelId);
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, unrelatedExec]), expectedPolicies);
   const unrelatedBounded = { file: 'peer/snowflake.ts', text: String.raw`function validateId(value) { return /^\d{1,20}$/.test(value); }` };
   assert.deepEqual(roomDigitPolicies([...records, unrelatedBounded]), expectedPolicies);
   const unrelatedOwnerPattern = { file: 'peer/town-hall-plan.ts', text: String.raw`function isTownHallRoom(value) { return /^\d{1,20}$/.test(value); }` };
