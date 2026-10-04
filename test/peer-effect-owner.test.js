@@ -1,421 +1,11 @@
 'use strict';
 
-// Issue 131 owner pin. Five top-level tests pin the two shared network-effect
-// owners (direct-post and board-refresh), the peer caller assertion factory, the
-// public caller wiring, and the suite registration. The inventory checkers are
-// pure functions over source text so test five can mutate in-memory strings
-// without ever executing a mutant against the worktree.
-
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const ts = require('typescript');
-
-const ROOT = path.resolve(__dirname, '..');
-
-const EXPECTED_TRANSPORT = {
-  'src/direct-post.ts': {
-    verifyAgentDestination: 1,
-    sendDiscordMessage: 1
-  },
-  // The destination lookup itself lives one owner deeper: direct-post.ts calls
-  // verifyAgentDestination, which calls fetchDiscordChannel here. Pin the
-  // primitive too, so a new unbracketed GET added at this layer fails.
-  'src/direct-post/delivery-identity.ts': {
-    fetchDiscordChannel: 1
-  },
-  'src/board-refresh.ts': {
-    fetchBoardInstallation: 1,
-    fetchBoardChannel: 1,
-    fetchBoardTarget: 1,
-    patchBoardMessage: 1
-  }
-};
-
-// Files that must never call fetch directly. Peer service injects loadChannels,
-// so a raw fetch there would bypass the bracketed lookup.
-const NO_RAW_FETCH = new Set([
-  ...Object.keys(EXPECTED_TRANSPORT),
-  'src/peer/service.js',
-  'src/peer/post.js'
-]);
-
-const REFUSAL = /native caller|peer caller|caller changed|caller has no active binding|caller binding is ambiguous|caller identity is unavailable|binding changed|binding is stale|aborted|closing/i;
-
-function parse(fileName, text) {
-  return ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true,
-    fileName.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS);
-}
-
-// Walk from a call expression to the nearest enclosing named function or method.
-function enclosingOwner(node) {
-  let current = node.parent;
-  while (current) {
-    if (ts.isFunctionDeclaration(current) && current.name) return current.name.text;
-    if (ts.isMethodDeclaration(current) && current.name) return current.name.getText();
-    if (ts.isPropertyAssignment(current) && current.name &&
-      (ts.isFunctionExpression(current.initializer) || ts.isArrowFunction(current.initializer))) {
-      return current.name.getText();
-    }
-    if (ts.isVariableDeclaration(current) && ts.isIdentifier(current.name) && current.initializer &&
-      (ts.isFunctionExpression(current.initializer) || ts.isArrowFunction(current.initializer))) {
-      return current.name.text;
-    }
-    if (ts.isClassDeclaration(current)) return null;
-    current = current.parent;
-  }
-  return null;
-}
-
-function calleeName(node) {
-  const expression = node.expression;
-  if (ts.isIdentifier(expression)) return expression.text;
-  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
-  return null;
-}
-
-// local alias -> canonical imported name, resolved from ES imports and CommonJS
-// require destructuring, so `import { sendDiscordMessage as send }` still counts.
-function importedAliases(sourceFile) {
-  const aliases = new Map();
-  const visit = node => {
-    if (ts.isImportDeclaration(node) && node.importClause?.namedBindings &&
-        ts.isNamedImports(node.importClause.namedBindings)) {
-      for (const element of node.importClause.namedBindings.elements) {
-        aliases.set(element.name.text, (element.propertyName || element.name).text);
-      }
-    }
-    if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer) &&
-        ts.isIdentifier(node.initializer.expression) && node.initializer.expression.text === 'require' &&
-        ts.isObjectBindingPattern(node.name)) {
-      const argument = node.initializer.arguments[0];
-      if (argument && ts.isStringLiteral(argument)) {
-        for (const element of node.name.elements) {
-          aliases.set(element.name.text, (element.propertyName || element.name).text);
-        }
-      }
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return aliases;
-}
-
-function callSites(sourceFile) {
-  const sites = [];
-  const aliases = importedAliases(sourceFile);
-  const visit = node => {
-    if (ts.isCallExpression(node)) {
-      const name = calleeName(node);
-      if (name) sites.push({ node, name, canonical: aliases.get(name) || name, owner: enclosingOwner(node) });
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return sites;
-}
-
-// Names bound to a createCallerAssertion(...) result in one source file.
-function assertionFactoryNames(sourceFile) {
-  const names = [];
-  const visit = node => {
-    if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer) &&
-        ts.isIdentifier(node.initializer.expression) && node.initializer.expression.text === 'createCallerAssertion') {
-      if (ts.isIdentifier(node.name)) names.push(node.name.text);
-      else if (ts.isObjectBindingPattern(node.name)) {
-        for (const element of node.name.elements) names.push(element.name.text);
-      }
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return names;
-}
-
-function hasFactoryCall(sourceFile) {
-  return callSites(sourceFile).some(site => site.canonical === 'createCallerAssertion');
-}
-
-// Resolve an object literal's named properties, following identifier spreads of
-// other object-literal variable declarations one level deep.
-function objectProperties(expression, variableInitializers) {
-  const properties = new Map();
-  if (!expression || !ts.isObjectLiteralExpression(expression)) return properties;
-  for (const property of expression.properties) {
-    if (ts.isPropertyAssignment(property) && property.name) {
-      properties.set(property.name.getText().replace(/['"]/g, ''), property.initializer);
-    } else if (ts.isShorthandPropertyAssignment(property)) {
-      properties.set(property.name.getText(), property.name);
-    } else if (ts.isSpreadAssignment(property) && ts.isIdentifier(property.expression)) {
-      const spread = objectProperties(variableInitializers.get(property.expression.text), variableInitializers);
-      for (const [key, value] of spread) if (!properties.has(key)) properties.set(key, value);
-    }
-  }
-  return properties;
-}
-
-function variableInitializers(sourceFile) {
-  const initializers = new Map();
-  const visit = node => {
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-      initializers.set(node.name.text, node.initializer);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return initializers;
-}
-
-function referencesRequestField(initializer) {
-  if (!initializer) return true;
-  const text = initializer.getText();
-  return /\b(input|args|request)\s*\./.test(text) || /\[\s*['"]assertCallerCurrent['"]\s*\]/.test(text) ||
-    /objectAssign|Object\.assign/.test(text);
-}
-
-// A property that is written as null or undefined is treated as absent.
-function suppliesValue(initializer) {
-  if (!initializer) return false;
-  if (initializer.kind === ts.SyntaxKind.NullKeyword) return false;
-  if (ts.isIdentifier(initializer) && initializer.text === 'undefined') return false;
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// Inventory checkers. Each returns an array of human-readable violations.
-
-function transportViolations(sources) {
-  const violations = [];
-  for (const [file, expected] of Object.entries(EXPECTED_TRANSPORT)) {
-    const text = sources[file];
-    if (typeof text !== 'string') {
-      violations.push(`${file}: source is missing`);
-      continue;
-    }
-    const sourceFile = parse(file, text);
-    const counts = new Map();
-    for (const site of callSites(sourceFile)) {
-      if (site.canonical === 'fetch' || site.name === 'fetch' ||
-          (ts.isPropertyAccessExpression(site.node.expression) && site.name === 'fetch')) {
-        violations.push(`${file}: direct fetch call at ${site.owner || '<top>'}`);
-      }
-      if (Object.hasOwn(expected, site.canonical)) {
-        counts.set(site.canonical, (counts.get(site.canonical) || 0) + 1);
-      }
-    }
-    for (const [name, wanted] of Object.entries(expected)) {
-      const got = counts.get(name) || 0;
-      if (got !== wanted) violations.push(`${file}: ${name} expected ${wanted}, found ${got}`);
-    }
-    // A transport import that is not part of the pinned inventory is a new site.
-    const visit = node => {
-      if (ts.isImportDeclaration(node) && !node.importClause?.isTypeOnly && node.importClause?.namedBindings &&
-          ts.isNamedImports(node.importClause.namedBindings)) {
-        const specifier = node.moduleSpecifier.getText();
-        if (/discord|delivery-identity|direct-post/.test(specifier)) {
-          for (const element of node.importClause.namedBindings.elements) {
-            if (element.isTypeOnly) continue;
-            const canonical = (element.propertyName || element.name).text;
-            if (!Object.hasOwn(expected, canonical) && /fetch|send|patch|Destination/i.test(canonical)) {
-              violations.push(`${file}: unexpected transport import ${canonical} from ${specifier}`);
-            }
-          }
-        }
-      }
-      ts.forEachChild(node, visit);
-    };
-    visit(sourceFile);
-  }
-  // Raw fetch must not appear in any owner that is expected to route through
-  // an inventoried transport helper, including peer service (which injects
-  // loadChannels) and post.
-  for (const file of NO_RAW_FETCH) {
-    if (Object.hasOwn(EXPECTED_TRANSPORT, file)) continue;
-    const text = sources[file];
-    if (typeof text !== 'string') {
-      violations.push(`${file}: source is missing`);
-      continue;
-    }
-    for (const site of callSites(parse(file, text))) {
-      if (site.name === 'fetch') violations.push(`${file}: direct fetch call at ${site.owner || '<top>'}`);
-    }
-  }
-  return violations;
-}
-
-function channelLookupViolations(sources) {
-  const violations = [];
-  const text = sources['src/peer/service.js'];
-  if (typeof text !== 'string') {
-    violations.push('src/peer/service.js: source is missing');
-    return violations;
-  }
-  const sourceFile = parse('src/peer/service.js', text);
-  const sites = callSites(sourceFile);
-  const lookups = sites.filter(site => site.canonical === 'loadChannels');
-  if (lookups.length !== 1) violations.push(`src/peer/service.js: loadChannels expected 1, found ${lookups.length}`);
-  const factoryNames = new Set(assertionFactoryNames(sourceFile));
-  factoryNames.add('assertCallerCurrent');
-  const assertions = sites.filter(site => factoryNames.has(site.name) || factoryNames.has(site.canonical));
-  if (!hasFactoryCall(sourceFile)) violations.push('src/peer/service.js: no createCallerAssertion call found');
-  if (lookups.length === 1) {
-    const lookup = lookups[0].node;
-    const before = assertions.some(site => site.node.pos < lookup.pos && site.owner === lookups[0].owner);
-    const after = assertions.some(site => site.node.end > lookup.end && site.owner === lookups[0].owner);
-    if (!before) violations.push('src/peer/service.js: no caller assertion before loadChannels');
-    if (!after) violations.push('src/peer/service.js: no caller assertion after loadChannels');
-  }
-  return violations;
-}
-
-// Public peer roles must forward the assertion produced by the peer caller owner.
-function wiringViolations(sources) {
-  const violations = [];
-  for (const file of ['src/peer/service.js', 'src/peer/post.js']) {
-    const text = sources[file];
-    if (typeof text !== 'string') {
-      violations.push(`${file}: source is missing`);
-      continue;
-    }
-    const sourceFile = parse(file, text);
-    const initializers = variableInitializers(sourceFile);
-    const factoryNames = new Set(assertionFactoryNames(sourceFile));
-    if (!hasFactoryCall(sourceFile)) violations.push(`${file}: no createCallerAssertion call found`);
-    const runCalls = callSites(sourceFile).filter(site =>
-      site.canonical === 'runDirectPost' || site.canonical === 'runBoardRefresh');
-    if (file.endsWith('service.js')) {
-      const sendRun = runCalls.filter(site => site.owner === 'send');
-      if (sendRun.length !== 1) violations.push('src/peer/service.js: send must call runDirectPost exactly once');
-      for (const site of sendRun) {
-        const properties = objectProperties(site.node.arguments[0], initializers);
-        const value = properties.get('assertCallerCurrent');
-        if (!suppliesValue(value)) violations.push('src/peer/service.js: send does not supply assertCallerCurrent');
-        else if (referencesRequestField(value)) violations.push('src/peer/service.js: assertCallerCurrent comes from request fields');
-        else if (!(ts.isIdentifier(value) && factoryNames.has(value.text)) &&
-                 !(ts.isCallExpression(value) && calleeName(value) === 'createCallerAssertion')) {
-          violations.push('src/peer/service.js: assertCallerCurrent is not derived from createCallerAssertion');
-        }
-      }
-    } else {
-      const announce = runCalls.filter(site => site.owner === 'postByRole');
-      const board = announce.filter(site => site.canonical === 'runBoardRefresh');
-      const direct = announce.filter(site => site.canonical === 'runDirectPost');
-      if (direct.length !== 1) violations.push('src/peer/post.js: postByRole must call announcement runDirectPost exactly once');
-      if (board.length !== 1) violations.push('src/peer/post.js: postByRole must call runBoardRefresh exactly once');
-      for (const site of [...direct, ...board]) {
-        const properties = objectProperties(site.node.arguments[0], initializers);
-        const value = properties.get('assertCallerCurrent');
-        if (!suppliesValue(value)) violations.push(`src/peer/post.js: ${site.canonical} does not receive assertCallerCurrent`);
-        else if (referencesRequestField(value)) violations.push(`src/peer/post.js: ${site.canonical} assertion comes from request fields`);
-        else if (!(ts.isIdentifier(value) && factoryNames.has(value.text)) &&
-                 !(ts.isCallExpression(value) && calleeName(value) === 'createCallerAssertion')) {
-          violations.push(`src/peer/post.js: ${site.canonical} assertion is not derived from createCallerAssertion`);
-        }
-      }
-    }
-    // bindingCurrent and agentDestinationCurrent stay synchronous.
-    const visit = node => {
-      if (ts.isPropertyAssignment(node) && node.name && ['bindingCurrent', 'agentDestinationCurrent'].includes(node.name.getText())) {
-        const initializer = node.initializer;
-        if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)) {
-          if (initializer.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
-            violations.push(`${file}: ${node.name.getText()} must remain synchronous`);
-          }
-          const containsAwait = node => {
-            if (ts.isAwaitExpression(node)) return true;
-            return ts.forEachChild(node, containsAwait) || false;
-          };
-          if (containsAwait(initializer)) violations.push(`${file}: ${node.name.getText()} must not await`);
-        }
-      }
-      ts.forEachChild(node, visit);
-    };
-    visit(sourceFile);
-  }
-  const revalidation = sources['test/peer-effect-revalidation.test.js'];
-  if (typeof revalidation !== 'string') violations.push('test/peer-effect-revalidation.test.js: source is missing');
-  else if (/FIXED|PEER_EFFECT_EXPECT_FIXED|transitional\s*\(/.test(revalidation)) {
-    violations.push('test/peer-effect-revalidation.test.js: still contains a transitional expected-red mode');
-  }
-  return violations;
-}
-
-function realSources() {
-  const files = [
-    'src/direct-post.ts', 'src/direct-post/delivery-identity.ts', 'src/board-refresh.ts',
-    'src/peer/service.js', 'src/peer/post.js', 'test/peer-effect-revalidation.test.js'
-  ];
-  return Object.fromEntries(files.map(file => [file, fs.readFileSync(path.join(ROOT, file), 'utf8')]));
-}
-
-function ownerViolations(sources) {
-  return [...transportViolations(sources), ...channelLookupViolations(sources), ...wiringViolations(sources)];
-}
-
-// ---------------------------------------------------------------------------
-// Runtime harness for the shared effect owners.
-
-const DIRECT_POST_OWNER = 'src/direct-post.ts';
-const BOARD_OWNER = 'src/board-refresh.ts';
-
-function refusalError() {
-  return new Error('native caller must be revalidated: peer caller changed');
-}
-
-function buildHarness({ snapshot, rejectWhen = null }) {
-  const events = [];
-  let fetchCount = 0;
-  const assertCallerCurrent = async () => {
-    const state = snapshot();
-    events.push({ kind: 'assert', snapshot: state });
-    if (rejectWhen && rejectWhen({ fetchCount, snapshot: state, events })) throw refusalError();
-  };
-  const wrapFetch = inner => async (url, init = {}) => {
-    fetchCount += 1;
-    events.push({ kind: 'fetch', method: init.method || 'GET', url });
-    return inner(url, init);
-  };
-  return { events, assertCallerCurrent, wrapFetch, fetchCount: () => fetchCount };
-}
-
-function directSnapshot(state, requestId) {
-  const rows = state.directPostRows(requestId);
-  return {
-    attempts: rows.filter(row => row.kind === 'direct-post-attempt').length,
-    outcomes: rows.filter(row => row.kind === 'direct-post-outcome'),
-    sent: rows.some(row => row.kind === 'direct-post-outcome' && row.detail.outcome === 'sent'),
-    unknown: rows.some(row => row.kind === 'direct-post-outcome' && row.detail.outcome === 'unknown'),
-    preflight: rows.filter(row => row.kind === 'direct-post-outcome' && row.detail.phase === 'preflight')
-  };
-}
-
-function boardSnapshot(state, requestId) {
-  const rows = state.listReceipts()
-    .map(row => ({ kind: row.kind, detail: JSON.parse(row.detail) }))
-    .filter(row => row.kind.startsWith('board-refresh') && row.detail.requestId === requestId);
-  return {
-    attempts: rows.filter(row => row.kind === 'board-refresh-attempt'),
-    outcomes: rows.filter(row => row.kind === 'board-refresh-outcome'),
-    applied: rows.some(row => row.kind === 'board-refresh-outcome' && row.detail.outcome === 'applied')
-  };
-}
-
-function fetchEventIndex(events, method) {
-  return events.findIndex(event => event.kind === 'fetch' && event.method === method);
-}
-
-function assertBracketed(events, method) {
-  const index = fetchEventIndex(events, method);
-  assert.ok(index > 0, `a ${method} request must be preceded by a caller assertion`);
-  const before = events.slice(0, index).some(event => event.kind === 'assert');
-  const after = events.slice(index + 1).some(event => event.kind === 'assert');
-  assert.equal(before, true, `caller assertion before ${method}`);
-  assert.equal(after, true, `caller assertion after ${method}`);
-  return index;
-}
-
-// ---------------------------------------------------------------------------
+const { rejectionViolations, wiringViolations, realSources, ownerViolations, REFUSAL } = require('./peer-effects/owner-inventory');
+const { buildHarness, directSnapshot, boardSnapshot, fetchEventIndex, assertBracketed, boardRun, boardFixtureBoardRows } = require('./peer-effects/execution-fixtures');
 
 test('transport inventory pins every peer network effect and the channel-list lookup', async t => {
   assert.deepEqual(ownerViolations(realSources()), []);
@@ -466,8 +56,34 @@ test('public peer roles supply the caller assertion from the peer caller owner',
 });
 
 test('the caller assertion factory compares all five captured identity fields', async t => {
+  const { TransportRejection } = require('../dist/direct-post/transport-rejection');
+  for (const reason of [null, undefined, false, 0, '']) {
+    const rejection = new TransportRejection();
+    assert.equal(rejection.rejected, false);
+    rejection.capture(reason);
+    assert.equal(rejection.rejected, true);
+    assert.strictEqual(rejection.reason, reason);
+  }
+  const { fixture, service, addRecipient } = require('./fixtures/peer-fixture');
+  for (const reason of [null, undefined]) {
+    const f = fixture(t);
+    f.enroll('102');
+    addRecipient(f);
+    let caught = false;
+    let observed;
+    const peer = service(f, { loadChannels: async () => { throw reason; } });
+    try {
+      await peer.send({ peer: { channelName: 'recipient' }, text: 'hi', dedupe_key: 'empty-rejection' });
+    } catch (error) {
+      caught = true;
+      observed = error;
+    }
+    assert.equal(caught, true);
+    assert.strictEqual(observed, reason);
+    assert.equal(f.state.directPostRows('empty-rejection').length, 0);
+  }
+
   const { createCallerAssertion, resolvePeerCaller } = require('../src/peer/caller');
-  const { fixture } = require('./fixtures/peer-fixture');
   const ORIGINAL = '11111111-1111-1111-1111-111111111111';
   const CHANGED = '99999999-9999-9999-9999-999999999999';
   const CODEX_ID = '22222222-2222-2222-2222-222222222222';
@@ -794,10 +410,37 @@ test('direct-post and board execution bracket each network effect with the asser
 });
 
 test('the effect-owner inventory is sensitive to new or removed network calls and the suites are registered once', () => {
+  const base = realSources();
+  assert.deepEqual(rejectionViolations(base), []);
+  const nullable = { ...base, 'src/peer/service.js': base['src/peer/service.js'] + '\nasync function privateFailure() { let failure = null; try {} catch (error) { failure = error; } }' };
+  assert.ok(rejectionViolations(nullable).some(message => message.includes('nullable rejection sentinel')));
+  const captures = {
+    'src/peer/service.js': ['lookupRejection'],
+    'src/direct-post.ts': ['destinationRejection', 'mutationRejection'],
+    'src/board-refresh.ts': ['installationRejection', 'channelRejection', 'targetRejection', 'mutationRejection']
+  };
+  for (const [file, owners] of Object.entries(captures)) {
+    for (const owner of owners) {
+      const needle = `${owner}.capture(error);`;
+      assert.equal(base[file].split(needle).length - 1, 1);
+      for (const replacement of [`${owner}.capture(error.message);`, '']) {
+        const mutant = { ...base, [file]: base[file].replace(needle, replacement) };
+        assert.ok(rejectionViolations(mutant).some(message => message.includes(owner)),
+          `${file} ${owner} must reject transformed or omitted capture`);
+      }
+    }
+  }
+
   const sources = realSources();
   assert.deepEqual(ownerViolations(sources), [], 'the real source passes the combined inventory');
 
   const mutants = [
+    ['second fetch inside channel loader', 'src/peer/server.js',
+      '      loadChannels: async signal => {',
+      "      loadChannels: async signal => { await fetch('https://example.invalid/extra');"],
+    ['fetch outside channel loader', 'src/peer/server.js',
+      "const config = state.requireConfig();",
+      "await fetch('https://example.invalid/extra'); const config = state.requireConfig();"],
     ['extra destination GET', 'src/direct-post.ts',
       'const sent = await sendDiscordMessage({',
       'await verifyAgentDestination({ token, agentTarget: deliveryTarget, fetchImpl, signal, timeoutMs });\n      const sent = await sendDiscordMessage({'],
@@ -846,46 +489,3 @@ test('the effect-owner inventory is sensitive to new or removed network calls an
 
 // Board run helper local to this suite, so mutant checks never touch the
 // worktree and runtime fixtures stay disposable.
-async function boardRun(f, content, requestId, harness, board, hooks = {}) {
-  const { runBoardRefresh } = require('../src/board-refresh');
-  const { response } = require('./board-refresh-fixture');
-  fs.writeFileSync(f.textFile, content);
-  const binding = f.state.getBinding('channel-1');
-  const fetchImpl = harness.wrapFetch(async (url, init = {}) => {
-    if (url.endsWith('/users/@me')) { hooks.onGet?.('installation'); return response({ id: 'bot-1' }); }
-    if (init.method === 'GET' && url.endsWith('/channels/channel-1')) { hooks.onGet?.('channel'); return response({ id: 'channel-1', guild_id: 'guild-1' }); }
-    if (init.method === 'GET') { hooks.onGet?.('target'); return response({ id: 'target-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content }); }
-    if (init.method === 'PATCH') {
-      hooks.onPatch?.();
-      const body = JSON.parse(init.body);
-      board.content = body.content;
-      return response({ id: 'target-1', channel_id: 'channel-1', author: { id: 'bot-1', bot: true }, content: board.content });
-    }
-    hooks.onAny?.();
-    throw new Error(`unexpected board request ${init.method} ${url}`);
-  });
-  try {
-    return await runBoardRefresh({
-      state: f.state,
-      token: 'fixture-token',
-      nativeId: binding.nativeId,
-      generation: binding.generation,
-      channelId: 'channel-1',
-      messageId: 'target-1',
-      textFile: f.textFile,
-      dedupeKey: requestId,
-      fetchImpl,
-      timeoutMs: 1000,
-      resolveBinding: state => state.getBinding('channel-1'),
-      assertCallerCurrent: harness.assertCallerCurrent
-    });
-  } finally {
-    hooks.onAny?.();
-  }
-}
-
-function boardFixtureBoardRows(state, requestId) {
-  return state.listReceipts()
-    .map(row => ({ kind: row.kind, detail: row.detail }))
-    .filter(row => row.kind.startsWith('board-refresh') && JSON.parse(row.detail).requestId === requestId);
-}

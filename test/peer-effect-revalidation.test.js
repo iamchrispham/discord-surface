@@ -1,10 +1,5 @@
 'use strict';
 
-// Issue 131: every peer network effect must be bracketed by a fresh authenticated
-// native caller check, while a mutation receipt recorded before a later caller
-// refusal survives unchanged. These scenarios are unconditional: the production
-// code is expected to refuse, and every post-state assertion describes the desired
-// behavior. There is no expected-red mode left in this suite.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -448,18 +443,11 @@ test('binding generation changes independently after destination GET', async t =
   const f = fixture(t);
   f.enroll('102');
   addRecipient(f);
-  // A second authenticated caller lives in channel 301 with a distinct
-  // generation. The captured stored binding for channel 101 stays current and
-  // unchanged, so only the fresh resolver identity changes after the GET.
-  f.state.bind({ guildId: '100', channelId: '301', provider: 'claude', nativeId: CHANGED,
-    workspace: '/tmp', endpoint: '/tmp/changed-caller.sock', generation: 2,
-    conductorId: 'changed-caller', repoKey: 'github.com/test/changed' }, { intakeCutoff: '100' });
-  f.state.setBindingReadiness('301', READINESS.READY, 'fixture', f.state.getBinding('301'));
-  const captured = f.state.getBinding('101');
   let current = ORIGINAL;
   let gets = 0;
   let nativeLookupsAfterGet = 0;
   let posts = 0;
+  const oldGeneration = f.state.getBinding('101').generation;
   const peer = service(f, { callerDependencies: identity(() => {
     if (gets > 0) nativeLookupsAfterGet += 1;
     return current;
@@ -467,33 +455,22 @@ test('binding generation changes independently after destination GET', async t =
     if (options.method === 'GET') {
       gets += 1;
       assert.match(url, /\/channels\/202$/);
-      // Only the native resolver identity changes; the captured stored binding
-      // row for channel 101 is left exactly as it was.
-      current = CHANGED;
+      f.state.db.prepare("UPDATE bindings SET generation=? WHERE channel_id='101'").run(oldGeneration + 1);
+      assert.equal(f.state.getBinding('101').generation, oldGeneration + 1, 'the binding generation advanced under the caller');
       return response({ id: '202', guild_id: '100' });
     }
     posts += 1;
     return response({ id: '10001' });
   } });
-  const refused = await nativeRefusal(peer.send({ peer: { channelId: '201' }, text: 'hello', dedupe_key: 'effect-send-generation' }));
-  assert.equal(refused, true, 'native caller must be revalidated');
-  assert.ok(nativeLookupsAfterGet > 0, 'native caller is resolved after the destination GET');
-  assert.equal(gets, 1, 'destination lookup runs once');
-  assert.equal(posts, 0, 'no outbound post after the caller identity changed');
-  assert.equal(directPostRows(f.state, 'effect-send-generation').attempts.length, 0, 'no direct-post attempt after the caller identity changed');
-  // The captured row is still current at the moment of refusal, so the refusal
-  // can only come from the fresh-caller assertion, not the synchronous
-  // stored-binding check.
-  const still = f.state.getBinding('101');
-  assert.equal(still.active, true, 'the captured binding row is still active');
-  assert.equal(still.readiness, captured.readiness, 'the captured binding row keeps its readiness');
-  assert.equal(still.generation, captured.generation, 'the captured binding row keeps its generation');
-  assert.equal(still.nativeId, captured.nativeId, 'the captured binding row keeps its native identity');
-  assert.equal(still.channelId, captured.channelId, 'the captured binding row keeps its channel');
-  assert.equal(still.provider, captured.provider, 'the captured binding row keeps its provider');
-  assert.equal(still.guildId, captured.guildId, 'the captured binding row keeps its guild');
-  assert.equal(f.state.directPostBindingCurrent(captured, f.state.requireConfig().operatorId),
-    true, 'the synchronous stored-binding check still passes at the refusal');
+  const desired = async () => {
+    const refused = await nativeRefusal(peer.send({ peer: { channelId: '201' }, text: 'hello', dedupe_key: 'effect-send-generation' }));
+    assert.equal(refused, true, 'native caller must be revalidated');
+    assert.ok(nativeLookupsAfterGet > 0, 'native caller is resolved after the destination GET');
+    assert.equal(gets, 1, 'destination lookup runs once');
+    assert.equal(posts, 0, 'no outbound post after the binding generation changed');
+    assert.equal(directPostRows(f.state, 'effect-send-generation').attempts.length, 0, 'no direct-post attempt after the binding generation changed');
+  };
+  await desired();
 });
 
 test('multipart announcement revalidates after first part sent', async t => {

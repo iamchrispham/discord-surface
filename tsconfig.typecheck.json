@@ -84,6 +84,7 @@
     "src/discord/history-access.ts",
     "src/direct-post.ts",
     "src/direct-post/contracts.ts",
+    "src/direct-post/transport-rejection.ts",
     "src/direct-post/source.ts",
     "src/direct-post/delivery-identity.ts",
     "src/direct-post/request-values.ts",

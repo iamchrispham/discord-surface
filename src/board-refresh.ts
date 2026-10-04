@@ -1,3 +1,4 @@
+import { TransportRejection } from './direct-post/transport-rejection';
 import * as fs from 'node:fs';
 import { boardTextEquivalent } from './board-text';
 import {
@@ -205,35 +206,35 @@ export async function runBoardRefresh({
   // and a stable caller sees the original transport error unchanged.
   await revalidateCaller();
   let installation;
-  let installationError: unknown = null;
+  const installationRejection = new TransportRejection();
   try {
     installation = await fetchBoardInstallation({ token, signal, timeoutMs, fetchImpl });
   } catch (error) {
-    installationError = error;
+    installationRejection.capture(error);
   }
   await revalidateCaller();
-  if (installationError !== null) throw installationError;
+  if (installationRejection.rejected) throw installationRejection.reason;
   await revalidateCaller();
   let remoteChannel;
-  let channelError: unknown = null;
+  const channelRejection = new TransportRejection();
   try {
     remoteChannel = await fetchBoardChannel({ token, channelId, signal, timeoutMs, fetchImpl });
   } catch (error) {
-    channelError = error;
+    channelRejection.capture(error);
   }
   await revalidateCaller();
-  if (channelError !== null) throw channelError;
+  if (channelRejection.rejected) throw channelRejection.reason;
   channelMatches(remoteChannel!, target);
   await revalidateCaller();
   let remoteTarget;
-  let targetError: unknown = null;
+  const targetRejection = new TransportRejection();
   try {
     remoteTarget = await fetchBoardTarget({ token, channelId, messageId, signal, timeoutMs, fetchImpl });
   } catch (error) {
-    targetError = error;
+    targetRejection.capture(error);
   }
   await revalidateCaller();
-  if (targetError !== null) throw targetError;
+  if (targetRejection.rejected) throw targetRejection.reason;
   const installationUser = installation!;
   const channel = remoteChannel!;
   const targetMessage = remoteTarget!;
@@ -291,7 +292,7 @@ export async function runBoardRefresh({
     });
     throw error;
   }
-  let mutationError: unknown = null;
+  const mutationRejection = new TransportRejection();
   let applied: BoardRefreshRecord | null = null;
   try {
     const patched = await patchBoardMessage({ token, channelId, messageId, content, signal, timeoutMs, fetchImpl });
@@ -307,13 +308,13 @@ export async function runBoardRefresh({
       observedContent: patched.content
     });
   } catch (error) {
-    mutationError = error;
+    mutationRejection.capture(error);
   }
-  if (mutationError !== null) {
-    const outcome = transportOutcome(mutationError);
+  if (mutationRejection.rejected) {
+    const outcome = transportOutcome(mutationRejection.reason);
     const recorded = state.recordBoardRefreshOutcome(target, admission.attemptId, outcome, {
-      statusCode: Number((mutationError as { status?: unknown })?.status) || null,
-      error: String((mutationError as Error)?.message || mutationError).slice(0, 300)
+      statusCode: Number((mutationRejection.reason as { status?: unknown })?.status) || null,
+      error: String((mutationRejection.reason as Error)?.message || mutationRejection.reason).slice(0, 300)
     });
     // The existing failure or unknown classification is saved. Revalidate after
     // the effect, outside that transport classification, then expose the result.
@@ -322,7 +323,7 @@ export async function runBoardRefresh({
       ...resultFromAdmission(admission, binding),
       status: recorded.outcome,
       outcome: recorded.outcome,
-      error: String((mutationError as Error)?.message || mutationError).slice(0, 300)
+      error: String((mutationRejection.reason as Error)?.message || mutationRejection.reason).slice(0, 300)
     };
   }
   // Applied evidence is already persisted. A refusal here must not rewrite it

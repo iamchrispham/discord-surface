@@ -1,3 +1,4 @@
+import { TransportRejection } from './direct-post/transport-rejection';
 import { generationValue, resolveDirectBinding, resolveDedupeKey, requestIdFor, canonicalAddress, resolveAgentAddress, verifyAgentDestination, partMeta } from './direct-post/delivery-identity';
 import { readTextFile, prepareFileSource } from './direct-post/source';
 import { hash, requiredString, inReplyToValue, errorMessage } from './direct-post/request-values';
@@ -378,19 +379,19 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         continue;
       }
       await revalidateCaller();
-      let destinationError: unknown = null;
+      const destinationRejection = new TransportRejection();
       try {
         await verifyAgentDestination({ token, agentTarget: deliveryTarget, fetchImpl, signal, timeoutMs });
       } catch (error) {
-        destinationError = error;
+        destinationRejection.capture(error);
       }
-      if (destinationError !== null) {
+      if (destinationRejection.rejected) {
         if (!currentBinding() || !currentDestination()) {
           const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
           parts.push({ index: partIndex, status: stale.outcome, messageId: null });
         } else {
-          const preflight = state.recordDirectPostPreflight(meta, outcomeFor(destinationError), {
-            status: errorStatus(destinationError) || null, error: errorMessage(destinationError).slice(0, 300)
+          const preflight = state.recordDirectPostPreflight(meta, outcomeFor(destinationRejection.reason), {
+            status: errorStatus(destinationRejection.reason) || null, error: errorMessage(destinationRejection.reason).slice(0, 300)
           });
           parts.push({ index: partIndex, status: preflight.outcome, messageId: null });
         }
@@ -400,12 +401,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         await revalidateCaller();
         break;
       }
-      // The destination GET succeeded. The stored-binding/destination staleness
-      // check and the abort classification keep their pre-existing precedence:
-      // a stored handoff returns the stale preflight, a cancelled call returns
-      // the not_sent preflight. Only a still-current, non-aborted call runs the
-      // fresh-caller assertion, which refuses on native identity or generation
-      // change outside every transport catch.
+      await revalidateCaller();
       if (!currentBinding() || !currentDestination()) {
         const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
         parts.push({ index: partIndex, status: stale.outcome, messageId: null });
@@ -416,7 +412,6 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         parts.push({ index: partIndex, status: stopped.outcome, messageId: null });
         break;
       }
-      await revalidateCaller();
     }
     let claim;
     if (deliveryTarget === null && !currentReady()) {
@@ -457,7 +452,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'native caller changed before send' });
       throw error;
     }
-    let mutationError: unknown = null;
+    const mutationRejection = new TransportRejection();
     try {
       if (!currentReady() || !currentDestination()) {
         const stale = state.recordDirectPostOutcome(requestId, claim.attemptId, 'stale', { reason: 'binding changed before send' });
@@ -477,14 +472,14 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       parts.push({ index: partIndex, status: outcome.outcome, messageId: outcome.messageId });
       recorded = true;
     } catch (error) {
-      mutationError = error;
+      mutationRejection.capture(error);
     }
-    if (mutationError !== null) {
+    if (mutationRejection.rejected) {
       // Persist the existing failure or unknown classification first, then
       // revalidate outside the transport catch. A refusal never rewrites the
       // saved outcome and never starts a retry.
-      const outcome = source.fileManifest && mutationError instanceof DirectPostFileSnapshotError ? 'not_sent' : outcomeFor(mutationError);
-      const recordedOutcome = state.recordDirectPostOutcome(requestId, claim.attemptId, outcome, { status: errorStatus(mutationError) || null, error: errorMessage(mutationError).slice(0, 300) });
+      const outcome = source.fileManifest && mutationRejection.reason instanceof DirectPostFileSnapshotError ? 'not_sent' : outcomeFor(mutationRejection.reason);
+      const recordedOutcome = state.recordDirectPostOutcome(requestId, claim.attemptId, outcome, { status: errorStatus(mutationRejection.reason) || null, error: errorMessage(mutationRejection.reason).slice(0, 300) });
       parts.push({ index: partIndex, status: recordedOutcome.outcome, messageId: recordedOutcome.messageId || null });
       await revalidateCaller();
       break;

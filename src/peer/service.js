@@ -1,5 +1,7 @@
 'use strict';
 
+const { TransportRejection } = require('../../dist/direct-post/transport-rejection');
+
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -240,11 +242,11 @@ function createPeerService(context) {
       if (input.peer && Object.hasOwn(input.peer, 'channelName')) {
         await initialCurrent(signal);
         let listed = null;
-        let lookupError = null;
+        const lookupRejection = new TransportRejection();
         try { listed = await loadChannels(signal); }
-        catch (error) { lookupError = error; }
+        catch (error) { lookupRejection.capture(error); }
         await initialCurrent(signal);
-        if (lookupError !== null) throw lookupError;
+        if (lookupRejection.rejected) throw lookupRejection.reason;
         channels = listed;
       }
       const source = await caller(signal);

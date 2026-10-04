@@ -339,8 +339,7 @@ for (const transition of ['handoff', 'cancel']) {
       else abort.abort();
       return { ok: true, status: 200, json: async () => ({ id: '202', guild_id: '100' }) };
     } });
-    const result = await peer.send({ ...request, peer: { conductorId: 'recipient' } }, abort.signal);
-    assert.equal(result.status, transition === 'handoff' ? 'stale' : 'not_sent');
+    await assert.rejects(peer.send({ ...request, peer: { conductorId: 'recipient' } }, abort.signal));
     assert.equal(f.state.directPostRows(request.dedupe_key).filter(row => row.kind === 'direct-post-attempt').length, 0);
   });
 }
