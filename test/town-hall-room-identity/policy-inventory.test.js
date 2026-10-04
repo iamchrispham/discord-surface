@@ -36,21 +36,33 @@ function isNamedRoomField(node) {
   return /^(?:room|townHall|townHallRoom)$/i.test(object.text);
 }
 
+function callPropertyName(expression) {
+  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+  if (ts.isElementAccessExpression(expression) && expression.argumentExpression &&
+      ts.isStringLiteralLike(expression.argumentExpression)) {
+    return expression.argumentExpression.text;
+  }
+  return null;
+}
+
 function regexInput(node) {
   let current = node;
   while (current.parent) {
     const parent = current.parent;
-    if (ts.isPropertyAccessExpression(parent) && parent.name.text === 'test' && parent.expression === current &&
+    if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+        parent.expression === current &&
+        ['test', 'exec'].includes(callPropertyName(parent)) &&
         ts.isCallExpression(parent.parent)) {
       return parent.parent.arguments[0] || null;
     }
     if (ts.isCallExpression(parent) && parent.arguments[0] === current &&
-        ts.isPropertyAccessExpression(parent.expression) &&
-        ['match', 'search'].includes(parent.expression.name.text)) {
+        ['match', 'search'].includes(callPropertyName(parent.expression))) {
       return parent.expression.expression;
     }
-    if (ts.isCallExpression(parent) && ts.isPropertyAccessExpression(parent.expression) &&
-        parent.expression.name.text === 'exec' && parent.expression === current) {
+    if (ts.isCallExpression(parent) && parent.arguments[1] === current &&
+        ts.isPropertyAccessExpression(parent.expression) &&
+        parent.expression.name.text === 'call' &&
+        callPropertyName(parent.expression.expression) === 'search') {
       return parent.arguments[0] || null;
     }
     current = parent;
@@ -110,11 +122,30 @@ function collectBindings(sourceFile) {
 function countIdentifierReferences(sourceFile, name) {
   let count = 0;
   const visit = node => {
-    if (ts.isIdentifier(node) && node.text === name) count += 1;
+    if (ts.isIdentifier(node) && node.text === name && isSemanticIdentifierReference(node)) count += 1;
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
   return count;
+}
+
+function isSemanticIdentifierReference(node) {
+  const parent = node.parent;
+  if (!parent) return true;
+  if (ts.isPropertyAccessExpression(parent) && parent.name === node) return false;
+  if (ts.isQualifiedName(parent) && parent.right === node) return false;
+  if (ts.isBindingElement(parent) && parent.propertyName === node) return false;
+  if ((ts.isPropertyAssignment(parent) || ts.isPropertyDeclaration(parent) ||
+      ts.isPropertySignature(parent) || ts.isMethodDeclaration(parent) ||
+      ts.isMethodSignature(parent) || ts.isGetAccessorDeclaration(parent) ||
+      ts.isSetAccessorDeclaration(parent)) && parent.name === node) {
+    return false;
+  }
+  if ((ts.isInterfaceDeclaration(parent) || ts.isTypeAliasDeclaration(parent) ||
+      ts.isEnumDeclaration(parent) || ts.isModuleDeclaration(parent)) && parent.name === node) {
+    return false;
+  }
+  return true;
 }
 
 function isAncestor(ancestor, node) {
@@ -151,6 +182,10 @@ function functionBinding(scope) {
       ts.isIdentifier(parent.name)) {
     return parent;
   }
+  if (parent && (ts.isPropertyAssignment(parent) || ts.isPropertyDeclaration(parent)) &&
+      parent.initializer === scope && ts.isIdentifier(parent.name)) {
+    return parent;
+  }
   if (ts.isFunctionDeclaration(scope) && scope.name && ts.isIdentifier(scope.name)) return scope;
   if (scope.name && ts.isIdentifier(scope.name)) return scope;
   return null;
@@ -158,7 +193,8 @@ function functionBinding(scope) {
 
 function bindingName(binding) {
   if ((ts.isVariableDeclaration(binding) || ts.isFunctionDeclaration(binding) ||
-      ts.isFunctionExpression(binding) || ts.isClassDeclaration(binding)) &&
+      ts.isFunctionExpression(binding) || ts.isClassDeclaration(binding) ||
+      ts.isPropertyAssignment(binding) || ts.isPropertyDeclaration(binding)) &&
       binding.name && ts.isIdentifier(binding.name)) {
     return binding.name.text;
   }
@@ -209,10 +245,24 @@ function hasRoomFieldCall(scope, sourceFile, bindings, matches = isNamedRoomFiel
   const name = target ? bindingName(target) : null;
   if (!name) return false;
   let found = false;
+  const resolvesToTarget = (reference, seen = new Set()) => {
+    if (!ts.isIdentifier(reference)) return false;
+    const binding = resolveBinding(reference, bindings);
+    if (!binding || seen.has(binding)) return false;
+    if (binding === target) return true;
+    seen.add(binding);
+    return ts.isVariableDeclaration(binding) && binding.initializer &&
+      resolvesToTarget(binding.initializer, seen);
+  };
   const visit = node => {
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name &&
         node.arguments.length === 1 && matches(node.arguments[0]) &&
         resolveBinding(node.expression, bindings) === target) {
+      found = true;
+    }
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
+        node.arguments.length === 1 && matches(node.arguments[0]) &&
+        resolvesToTarget(node.expression)) {
       found = true;
     }
     ts.forEachChild(node, visit);
@@ -291,12 +341,20 @@ function isSplitRoomDigitPolicy(node, sourceFile, pattern, bindings) {
   return roomFieldSubject(node, sourceFile, bindings) && hasSplitRoomLengthBound(scope, subject, sourceFile);
 }
 
+function hasAsciiDigitPattern(pattern) {
+  if (/\\[dD]/.test(pattern)) return true;
+  const classes = pattern.match(/\[(?:\^)?([^\]]*)\]/g) || [];
+  return classes.some(characterClass => {
+    const body = characterClass.replace(/^\[\^?/, '').replace(/\]$/, '');
+    return /[0-9]-[0-9]/.test(body) || /[0-9]{2,}/.test(body);
+  });
+}
+
 function legacyRoomDigitPolicies(records) {
   const sites = {};
   for (const { file, text } of records) {
     const ast = createSourceFile(file, text);
     const bindings = collectBindings(ast);
-    const numeric = /\\[dD]|\[(?:\^)?(?:0-9|0123456789)\]/;
     const visit = node => {
       let pattern = null;
       if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
@@ -305,7 +363,7 @@ function legacyRoomDigitPolicies(records) {
           node.arguments?.length && ts.isStringLiteralLike(node.arguments[0])) {
         pattern = node.arguments[0].text;
       }
-      const roomPolicy = pattern !== null && numeric.test(pattern) &&
+      const roomPolicy = pattern !== null && hasAsciiDigitPattern(pattern) &&
         (isTownHallRoomOwner(node, ast, bindings) || roomFieldSubject(node, ast, bindings) ||
           isSplitRoomDigitPolicy(node, ast, pattern, bindings));
       if (roomPolicy) {
@@ -669,11 +727,21 @@ function roomDigitPolicies(records) {
     }
   }
 
-  const resolveFunction = (info, node) => {
+  const resolveFunction = (info, node, seen = new Set()) => {
     const expression = unwrapPolicyExpression(node);
     if (!expression) return null;
     if (ts.isIdentifier(expression)) {
       const binding = findBinding(info, expression.text, expression);
+      if (binding?.kind === 'value' && binding.source && !seen.has(binding)) {
+        seen.add(binding);
+        const aliased = resolveFunction(info, binding.source, seen);
+        if (aliased) return aliased;
+      }
+      if ((binding?.kind === 'field' || binding?.kind === 'parameter-field') &&
+          binding.source && binding.key && ts.isIdentifier(binding.source)) {
+        const aliased = (info.objectMethods.get(binding.source.text + '.' + binding.key) || [])[0];
+        if (aliased) return aliased;
+      }
       const candidates = info.functionDefs.filter(candidate => candidate.name === expression.text &&
         isAncestor(nearestLexicalScope(candidate.node), expression) &&
         (!binding || candidate.node === binding.declaration || candidate.node === binding.source));
@@ -690,8 +758,11 @@ function roomDigitPolicies(records) {
       }
       return info.functions.get(expression.text) || resolveImported(info, expression.text);
     }
-    if (ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.expression)) {
-      const key = `${expression.expression.text}.${expression.name.text}`;
+    if ((ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) &&
+        ts.isIdentifier(expression.expression)) {
+      const property = policyPropertyKey(expression);
+      if (!property) return null;
+      const key = expression.expression.text + '.' + property;
       const ownerBinding = findBinding(info, expression.expression.text, expression.expression);
       const localMethods = info.objectMethods.get(key) || [];
       const localMethod = localMethods
@@ -702,7 +773,7 @@ function roomDigitPolicies(records) {
       const imported = info.imports.get(expression.expression.text);
       if (imported?.namespace || imported?.commonJs) {
         const target = resolveModule(info, imported.specifier);
-        return target ? resolveExportedFunction(target, expression.name.text) : null;
+        return target ? resolveExportedFunction(target, property) : null;
       }
     }
     return null;
@@ -785,13 +856,19 @@ function roomDigitPolicies(records) {
       if (ts.isIdentifier(current) && current.text === name && current !== declaration.name &&
           findBinding(info, name, current)?.declaration === declaration) {
         const parent = current.parent;
-        if (ts.isPropertyAccessExpression(parent) && parent.expression === current &&
-            (parent.name.text === 'test' || parent.name.text === 'exec') && ts.isCallExpression(parent.parent)) {
+        if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+            parent.expression === current &&
+            ['test', 'exec'].includes(callPropertyName(parent)) && ts.isCallExpression(parent.parent)) {
           if (parent.parent.arguments[0]) inputs.push(parent.parent.arguments[0]);
         } else if (ts.isCallExpression(parent) && parent.arguments[0] === current &&
-            ts.isPropertyAccessExpression(parent.expression) &&
-            ['match', 'search'].includes(parent.expression.name.text)) {
+            ['match', 'search'].includes(callPropertyName(parent.expression))) {
           inputs.push(parent.expression.expression);
+        } else if (ts.isCallExpression(parent) && parent.arguments[1] === current &&
+            ts.isPropertyAccessExpression(parent.expression) &&
+            parent.expression.name.text === 'call' &&
+            callPropertyName(parent.expression.expression) === 'search' &&
+            parent.arguments[0]) {
+          inputs.push(parent.arguments[0]);
         }
       }
       ts.forEachChild(current, visit);
@@ -801,7 +878,6 @@ function roomDigitPolicies(records) {
   };
 
   const sites = legacyRoomDigitPolicies(records);
-  const numeric = /\\[dD]|\\[(?:\\^)?(?:0-9|0123456789)\\]/;
   for (const info of infos) {
     const legacyBindings = collectBindings(info.ast);
     const visit = node => {
@@ -812,11 +888,15 @@ function roomDigitPolicies(records) {
           node.arguments?.length && ts.isStringLiteralLike(node.arguments[0])) {
         pattern = node.arguments[0].text;
       }
-      if (pattern !== null && numeric.test(pattern)) {
+      if (pattern !== null && hasAsciiDigitPattern(pattern)) {
         const legacyPolicy = isTownHallRoomOwner(node, info.ast, legacyBindings) ||
           roomFieldSubject(node, info.ast, legacyBindings) ||
           isSplitRoomDigitPolicy(node, info.ast, pattern, legacyBindings);
-        if (!legacyPolicy && regexInputs(node, info).some(input => expressionIsRoomField(input, info))) {
+        const roomScope = enclosingFunction(node) || info.ast;
+        const roomContext = isTownHallContext(roomScope, info.ast, legacyBindings);
+        const isRoomInput = input => expressionIsRoomField(input, info) ||
+          (roomContext && isRoomField(input));
+        if (!legacyPolicy && regexInputs(node, info).some(isRoomInput)) {
           sites[info.file] = (sites[info.file] || 0) + 1;
         }
       }
@@ -842,6 +922,10 @@ test('room policy inventory records only town-hall room validators', () => {
   assert.deepEqual(references, { 'peer/town-hall-plan.ts': 2, 'peer/town-hall-room-identity.ts': 2 });
   const referenceFixture = ts.createSourceFile('peer/reference-fixture.ts', String.raw`// isTownHallRoom
   const label = 'isTownHallRoom';
+  interface Options { isTownHallRoom: boolean }
+  type Alias = { isTownHallRoom: boolean };
+  const options = { isTownHallRoom: true };
+  const { isTownHallRoom: flag } = options;
   function isTownHallRoom(room) { return room; }
   isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(referenceFixture, 'isTownHallRoom'), 2);
@@ -949,6 +1033,19 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/future-room.ts': 1
   });
+  const restrictedAsciiDigits = {
+    file: 'peer/future-room.ts',
+    text: String.raw`function validateRoom(room) { return /^[1-9]{1,20}$/.test(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, restrictedAsciiDigits]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
+  const unrelatedRestrictedDigits = {
+    file: 'peer/snowflake.ts',
+    text: String.raw`function inspect(value) { return /^[1-9]+$/.test(value); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, unrelatedRestrictedDigits]), expectedPolicies);
   const directCall = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return RegExp('^[0-9]{1,21}$').test(room.channelId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, directCall]), expectedPolicies);
   const destructuredRoomField = {
@@ -1031,6 +1128,14 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/function-property-validator.ts': 1
   });
+  const aliasedFunctionPropertyValidator = {
+    file: 'peer/function-property-alias-validator.ts',
+    text: "const validators = { validateGuildId: value => /^\\d{1,21}$/.test(value) }; const validateGuildId = validators.validateGuildId; function validateRoom(room) { return validateGuildId(room.guildId); }"
+  };
+  assert.deepEqual(roomDigitPolicies([...records, aliasedFunctionPropertyValidator]), {
+    ...expectedPolicies,
+    'peer/function-property-alias-validator.ts': 1
+  });
   const functionExpressionPropertyValidator = {
     file: 'peer/function-expression-property-validator.ts',
     text: String.raw`const validators = {
@@ -1086,6 +1191,14 @@ test('room policy inventory records only town-hall room validators', () => {
     return candidate.guildId.search(/^\d{1,21}$/) !== -1;
   }` };
   assert.deepEqual(roomDigitPolicies([...records, searchRoomField]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
+  const prototypeSearchRoomField = {
+    file: 'peer/future-room.ts',
+    text: 'function validateTownHallRoom(candidate) { const pattern = /^\\d{1,21}$/; return String.prototype.search.call(candidate.guildId, pattern) !== -1; }'
+  };
+  assert.deepEqual(roomDigitPolicies([...records, prototypeSearchRoomField]), {
     ...expectedPolicies,
     'peer/future-room.ts': 1
   });
@@ -1181,6 +1294,14 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/snowflake.ts': 1
   });
+  const neutralSplitValidator = {
+    file: 'peer/snowflake.ts',
+    text: "function validate(value) { return /^\\d+$/.test(value) && value.length <= 20; } function inspect(room) { return validate(room.guildId); }"
+  };
+  assert.deepEqual(roomDigitPolicies([...records, neutralSplitValidator]), {
+    ...expectedPolicies,
+    'peer/snowflake.ts': 1
+  });
   const splitAlias = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(room) {
     const value = room.channelId;
     return /^\d+$/.test(value) && value.length <= 20;
@@ -1194,6 +1315,14 @@ test('room policy inventory records only town-hall room validators', () => {
   }
   function inspect(room) { return isSnowflake(room.guildId); }` };
   assert.deepEqual(roomDigitPolicies([...records, splitCall]), {
+    ...expectedPolicies,
+    'peer/snowflake.ts': 1
+  });
+  const splitCallAlias = {
+    file: 'peer/snowflake.ts',
+    text: "function isSnowflake(value) { return /^\\d+$/.test(value) && value.length <= 20; } function inspect(room) { const check = isSnowflake; return check(room.guildId); }"
+  };
+  assert.deepEqual(roomDigitPolicies([...records, splitCallAlias]), {
     ...expectedPolicies,
     'peer/snowflake.ts': 1
   });
