@@ -329,7 +329,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   const root = path.join(__dirname, '..');
   const ownerPath = path.join(root, 'src', 'state', 'process-owner-capture.js');
   const statePath = path.join(root, 'src', 'state.js');
-  const parse = text => ts.createSourceFile('inventory.js', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const parse = (text, scriptKind = ts.ScriptKind.JS) => ts.createSourceFile('inventory.js', text, ts.ScriptTarget.Latest, true, scriptKind);
   const strip = text => text.replace(/\s+/g, '');
   function walk(node, visit) {
     visit(node);
@@ -337,7 +337,15 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   }
   function propertyNameText(name) {
     if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
-    if (ts.isComputedPropertyName(name) && ts.isStringLiteral(name.expression)) return name.expression.text;
+    if (!ts.isComputedPropertyName(name)) return undefined;
+    let expression = name.expression;
+    while (ts.isParenthesizedExpression(expression)
+      || ts.isAsExpression(expression)
+      || ts.isSatisfiesExpression(expression)
+      || ts.isNonNullExpression(expression)) {
+      expression = expression.expression;
+    }
+    if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
     return undefined;
   }
   function declaredNames(ast) {
@@ -381,6 +389,11 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['class method', 'class Example { captureProcessOwnerIdentity() {} }', true],
     ['class string method', "class Example { 'captureProcessOwnerIdentity'() {} }", true],
     ['class static computed method', "class Example { static ['captureProcessOwnerIdentity']() {} }", true],
+    ['class static computed template', 'class Example { static [`captureProcessOwnerIdentity`]() {} }', true],
+    ['class static computed parenthesized string', "class Example { static [('captureProcessOwnerIdentity')]() {} }", true],
+    ['class static computed as string', "class Example { static ['captureProcessOwnerIdentity' as string]() {} }", true, ts.ScriptKind.TS],
+    ['class static computed satisfies string', "class Example { static ['captureProcessOwnerIdentity' satisfies string]() {} }", true, ts.ScriptKind.TS],
+    ['class static computed non-null string', "class Example { static ['captureProcessOwnerIdentity'!]() {} }", true, ts.ScriptKind.TS],
     ['class property', 'class Example { captureProcessOwnerIdentity = null; }', true],
     ['class static string property', "class Example { static 'captureProcessOwnerIdentity' = null; }", true],
     ['class getter', 'class Example { get captureProcessOwnerIdentity() { return null; } }', true],
@@ -388,11 +401,17 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['object property', '({ captureProcessOwnerIdentity: null });', true],
     ['object string property', "({ 'captureProcessOwnerIdentity': null });", true],
     ['object computed property', "({ ['captureProcessOwnerIdentity']: null });", true],
+    ['object computed wrapped template', '({ [(`captureProcessOwnerIdentity`)]: null });', true],
+    ['object computed wrapped as string', "({ [('captureProcessOwnerIdentity' as string)]: null });", true, ts.ScriptKind.TS],
     ['dynamic computed method', 'class Example { static [owner]() {} }', false],
     ['dynamic computed property', '({ [owner]: null });', false],
+    ['dynamic wrapped computed method', 'class Example { static [(owner)]() {} }', false],
+    ['dynamic as computed property', '({ [owner as string]: null });', false, ts.ScriptKind.TS],
+    ['dynamic satisfies computed method', 'class Example { static [owner satisfies string]() {} }', false, ts.ScriptKind.TS],
+    ['dynamic non-null computed property', '({ [owner!]: null });', false, ts.ScriptKind.TS],
   ];
-  for (const [label, source, expected] of methodControls) {
-    assert.equal(declaredNames(parse(source)).includes('captureProcessOwnerIdentity'), expected, label);
+  for (const [label, source, expected, scriptKind] of methodControls) {
+    assert.equal(declaredNames(parse(source, scriptKind)).includes('captureProcessOwnerIdentity'), expected, label);
   }
 
   const declaringFiles = sourceFiles(path.join(root, 'src'))
