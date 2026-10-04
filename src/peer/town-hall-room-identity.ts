@@ -24,15 +24,30 @@ export function validateTownHallRoomIdentity(response: unknown, expected: TownHa
         !Object.hasOwn(expectedGuildDescriptor, 'value')) return false;
     const expectedChannelId = expectedChannelDescriptor.value;
     const expectedGuildId = expectedGuildDescriptor.value;
-    if (!isTownHallRoom(expected)) return false;
+    if (!isTownHallRoom({ channelId: expectedChannelId, guildId: expectedGuildId })) return false;
 
-    if (response.id !== expectedChannelId) return false;
-    if (response.guild_id !== expectedGuildId) return false;
-    if (response.type !== 0) return false;
-    if (typeof response.topic !== 'string') return false;
+    const responseIdDescriptor = Object.getOwnPropertyDescriptor(response, 'id');
+    const responseGuildIdDescriptor = Object.getOwnPropertyDescriptor(response, 'guild_id');
+    const responseTypeDescriptor = Object.getOwnPropertyDescriptor(response, 'type');
+    const responseTopicDescriptor = Object.getOwnPropertyDescriptor(response, 'topic');
+    if (!responseIdDescriptor || !responseGuildIdDescriptor ||
+        !responseTypeDescriptor || !responseTopicDescriptor ||
+        !Object.hasOwn(responseIdDescriptor, 'value') ||
+        !Object.hasOwn(responseGuildIdDescriptor, 'value') ||
+        !Object.hasOwn(responseTypeDescriptor, 'value') ||
+        !Object.hasOwn(responseTopicDescriptor, 'value')) return false;
+    const responseId = responseIdDescriptor.value;
+    const responseGuildId = responseGuildIdDescriptor.value;
+    const responseType = responseTypeDescriptor.value;
+    const responseTopic = responseTopicDescriptor.value;
 
-    const suffix = response.topic.slice(TOWN_HALL_ROOM_MARKER.length);
-    return response.topic.startsWith(TOWN_HALL_ROOM_MARKER) && (suffix === '' || /^\s/.test(suffix));
+    if (responseId !== expectedChannelId) return false;
+    if (responseGuildId !== expectedGuildId) return false;
+    if (responseType !== 0) return false;
+    if (typeof responseTopic !== 'string') return false;
+
+    const suffix = responseTopic.slice(TOWN_HALL_ROOM_MARKER.length);
+    return responseTopic.startsWith(TOWN_HALL_ROOM_MARKER) && (suffix === '' || /^\s/.test(suffix));
   } catch {
     return false;
   }

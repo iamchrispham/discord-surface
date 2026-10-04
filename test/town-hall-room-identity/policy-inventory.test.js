@@ -592,9 +592,12 @@ function roomDigitPolicies(records) {
             : imported);
         }
       }
-      if (ts.isExportAssignment(statement) &&
-          (ts.isFunctionExpression(statement.expression) || ts.isArrowFunction(statement.expression))) {
-        indexCommonJsFunction('default', statement.expression);
+      if (ts.isExportAssignment(statement)) {
+        if (ts.isFunctionExpression(statement.expression) || ts.isArrowFunction(statement.expression)) {
+          indexCommonJsFunction('default', statement.expression);
+        } else if (!statement.isExportEquals && ts.isIdentifier(statement.expression)) {
+          info.exports.set('default', statement.expression.text);
+        }
       }
       if (ts.isFunctionDeclaration(statement) &&
           statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
@@ -1119,6 +1122,24 @@ test('room policy inventory records only town-hall room validators', () => {
   ]), {
     ...expectedPolicies,
     'peer/default-expression-validator.ts': 1
+  });
+  const identifierDefaultValidator = {
+    file: 'peer/identifier-default-validator.ts',
+    text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    export default validateGuildId;`
+  };
+  const identifierDefaultConsumer = {
+    file: 'peer/identifier-default-consumer.ts',
+    text: String.raw`import validateGuildId from './identifier-default-validator';
+    function validateRoom(room) { return validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    identifierDefaultValidator,
+    identifierDefaultConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/identifier-default-validator.ts': 1
   });
   const moduleSpecificValidator = {
     file: 'peer/module-specific-room-validator.cts',

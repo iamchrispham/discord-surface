@@ -225,6 +225,36 @@ test('expected proxy getters cannot replace validated descriptor values', () => 
   }), expected), false);
 });
 
+test('response proxy getters cannot replace validated descriptor values', () => {
+  const actual = new Proxy(response({ id: OTHER_CHANNEL, guild_id: OTHER_GUILD }), {
+    get(target, key) {
+      if (key === 'id') return CHANNEL;
+      if (key === 'guild_id') return GUILD;
+      return Reflect.get(target, key);
+    }
+  });
+  assert.equal(validateTownHallRoomIdentity(actual, room()), false);
+});
+
+test('expected proxy descriptors are snapshotted before room validation', () => {
+  const calls = { guildId: 0, channelId: 0 };
+  const expected = new Proxy(room(), {
+    getOwnPropertyDescriptor(target, key) {
+      if (key !== 'guildId' && key !== 'channelId') return Reflect.getOwnPropertyDescriptor(target, key);
+      calls[key] += 1;
+      const valid = key === 'guildId' ? GUILD : CHANNEL;
+      const malformed = key === 'guildId' ? 'not-a-guild' : 'not-a-channel';
+      return {
+        value: calls[key] >= 3 ? valid : malformed,
+        writable: true,
+        enumerable: true,
+        configurable: true
+      };
+    }
+  });
+  assert.equal(validateTownHallRoomIdentity(response({ id: 'not-a-channel', guild_id: 'not-a-guild' }), expected), false);
+});
+
 test('14 isolated shared-owner sentinel plus registration assertions', () => {
   const validResponse = response();
   const validRoom = room();
@@ -236,16 +266,22 @@ test('14 isolated shared-owner sentinel plus registration assertions', () => {
     'stubbing the shared ownDataProperty owner to false must refuse an otherwise valid room');
 
   // The real ownDataProperty rejects inherited required fields; a stub that
-  // always returns true lets the same response through, proving the owner
-  // consults the shared helper rather than a private classifier.
+  // always returns true still reaches the descriptor snapshot, proving the
+  // owner consults the shared helper rather than a private classifier.
   const inherited = Object.create(response());
   assert.equal(ownerRequire()(inherited, validRoom), false,
     'the real shared owner must refuse inherited required fields');
-  const forcedTrue = withStubbedOwnDataProperty(() => true, () => {
+  let forcedTrueCalls = 0;
+  const forcedTrue = withStubbedOwnDataProperty(() => {
+    forcedTrueCalls += 1;
+    return true;
+  }, () => {
     return ownerRequire()(inherited, validRoom);
   });
-  assert.equal(forcedTrue, true,
-    'the stubbed true owner must accept the inherited response, proving the stub is wired');
+  assert.equal(forcedTrue, false,
+    'descriptor snapshots must still refuse inherited response fields');
+  assert.ok(forcedTrueCalls >= 4,
+    'the shared ownDataProperty owner must still be consulted for each response field');
 
   assert.equal(ownerRequire()(validResponse, validRoom), true,
     'restoring the shared owner must accept the valid room again');
