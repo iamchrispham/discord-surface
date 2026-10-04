@@ -77,6 +77,10 @@ export function sameAddress(left: unknown, right: unknown): boolean {
   return Object.keys(left).every(key => left[key as keyof AgentAddress] === right[key as keyof AgentAddress]);
 }
 
+export function sameAgentSession(left: Pick<AgentAddress, 'provider' | 'nativeId'>, right: Pick<AgentAddress, 'provider' | 'nativeId'>): boolean {
+  return left.provider === right.provider && left.nativeId.toLowerCase() === right.nativeId.toLowerCase();
+}
+
 export function validateAgentMessage(packet: unknown): asserts packet is AgentMessage {
   if (packet === null || typeof packet !== 'object' || Array.isArray(packet)) {
     throw new Error('invalid agent message');
@@ -104,7 +108,7 @@ export function validateAgentMessage(packet: unknown): asserts packet is AgentMe
   const source = value.source as AgentAddress;
   const target = value.target as AgentAddress;
   if (value.sourceParentChannelId === source.channelId || source.guildId !== target.guildId ||
-      (source.provider === target.provider && source.nativeId === target.nativeId) ||
+      sameAgentSession(source, target) ||
       typeof value.text !== 'string' || !value.text.trim() ||
       ((value.kind as AgentMessageKind) === KINDS.REQUEST ? value.replyTo !== null :
         typeof value.replyTo !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.replyTo as string))) {
