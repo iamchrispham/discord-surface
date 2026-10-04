@@ -349,6 +349,7 @@ class DiscordGateway {
       state,
       interactionFetch: this.interactionFetch,
       callbackTimeoutMs: this.interactionCallbackTimeoutMs,
+      authorize: (input, signal) => this.authorizeDecisionInteraction(input, signal),
       waitForDispatch: (channelId, signal) => this.waitForInteractionDispatch({ channelId }, signal),
       processAccepted: (message, signal, options) => this.consumer.processAccepted(message, signal, options),
       project: (input, signal) => this.projectDecisionMessage(input, signal)
@@ -479,6 +480,12 @@ class DiscordGateway {
   async projectDecisionMessage({ click, presentation, answer }, signal) {
     if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
     const channel = await this.client.channels?.fetch?.(click.channelId);
+    if (answer.length > 4096) {
+      const permission = this.historyPermission(channel, { requireSend: true, requireAttachFiles: true });
+      if (!permission.known || !permission.allowed) {
+        throw Object.assign(new Error('decision projection requires Attach Files permission'), { outcome: 'not_sent' });
+      }
+    }
     const message = await channel?.messages?.fetch?.(click.messageId);
     if (!message || typeof message.edit !== 'function') {
       throw Object.assign(new Error('decision question message cannot be edited'), { outcome: 'not_sent' });
@@ -503,6 +510,13 @@ class DiscordGateway {
     }
     const original = presentation || this.state.getDecisionPresentation(click.presentationId);
     return message.edit(renderDecisionProjection(original, answer));
+  }
+
+  async authorizeDecisionInteraction({ channelId }, signal) {
+    if (signal?.aborted || this.stopping) return false;
+    const channel = await this.client.channels?.fetch?.(channelId);
+    const permission = this.historyPermission(channel, { requireSend: true, requireAttachFiles: true });
+    return permission.known && permission.allowed;
   }
 
   async sendInteractionRejection(interaction, reason, signal) {
@@ -905,8 +919,8 @@ class DiscordGateway {
     return [];
   }
 
-  historyPermission(channel, { requireSend = false } = {}) {
-    return historyPermission(channel, this.client.user, requireSend);
+  historyPermission(channel, { requireSend = false, requireAttachFiles = false } = {}) {
+    return historyPermission(channel, this.client.user, requireSend, requireAttachFiles);
   }
 
   async recordBoundary(binding, channel, state, detail, gapFrom = null, gapTo = null, signal = null, deadline = null, expectedBoundary = undefined, expectedReadiness = undefined) {

@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { PermissionFlagsBits } = require('discord.js');
 
 const { presentDecision } = require('../src/decision-present');
 const { DiscordGateway } = require('../src/discord');
@@ -13,7 +14,7 @@ const { READINESS, SurfaceState } = require('../src/state');
 
 const NATIVE_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 
-async function fixture(t, { callback = null, questionText = 'Choose the canonical answer' } = {}) {
+async function fixture(t, { callback = null, questionText = 'Choose the canonical answer', attachFiles = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-decision-gateway-'));
   const db = path.join(dir, 'surface.sqlite');
   const secretFile = path.join(dir, 'discord.secret');
@@ -69,11 +70,15 @@ async function fixture(t, { callback = null, questionText = 'Choose the canonica
   };
   const channel = {
     id: 'channel',
+    permissionsFor() {
+      return { has: permission => permission !== PermissionFlagsBits.AttachFiles || attachFiles };
+    },
     messages: { async fetch(messageId) { assert.equal(messageId, presentation.messageId); return question; } },
     async send(payload) { return { id: `reply-${payload.nonce || edits.length}` }; }
   };
   const listeners = new Map();
   const client = {
+    user: { id: 'bot' },
     application: { id: 'application', commands: null },
     channels: { async fetch(channelId) { assert.equal(channelId, 'channel'); return channel; } },
     on(name, listener) { listeners.set(name, listener); },
@@ -474,6 +479,33 @@ test('cancellation leaves accepted pre-row custody and Gateway stop drains it', 
   assert.equal(f.state.listDecisionPendingWork().length, 1);
   await f.gateway.stop();
   assert.equal(f.gateway.stopping, false);
+});
+
+test('decision interaction is not admitted without Attach Files permission', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { attachFiles: false });
+  const result = await f.gateway.handleInteraction(component(f.presentation, 'missing-attach', 0), new AbortController().signal);
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, 'presentation-not-admissible');
+  assert.equal(f.state.getDecisionClick('missing-attach'), null);
+  assert.equal(f.callbacks.length, 0);
+  assert.equal(f.edits.length, 0);
+});
+
+test('long-answer projection refuses attachment without Attach Files permission', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { attachFiles: false });
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId: 'projection-missing-attach', presentationId: f.presentation.presentationId, selectedKey: 'approve',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+
+  await assert.rejects(
+    f.gateway.projectDecisionMessage({ click: admitted.click, presentation: f.presentation, answer: 'x'.repeat(4097) }, new AbortController().signal),
+    /Attach Files permission/
+  );
+  assert.equal(f.edits.length, 0);
 });
 
 test('a full-length decision keeps every prompt character after selection', { timeout: 30000 }, async t => {

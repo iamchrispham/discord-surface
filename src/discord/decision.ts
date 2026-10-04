@@ -109,10 +109,16 @@ export interface DecisionProjectionInput {
   answer: string;
 }
 
+export interface DecisionAuthorizationInput {
+  channelId: string;
+  guildId: string;
+}
+
 export interface DecisionConsumerOptions {
   state: DecisionConsumerState;
   interactionFetch?: InteractionFetch;
   callbackTimeoutMs?: number;
+  authorize?: (input: DecisionAuthorizationInput, signal?: AbortSignal) => Promise<boolean>;
   waitForDispatch?: (channelId: string, signal?: AbortSignal) => Promise<boolean>;
   processAccepted?: (message: DecisionMessage, signal?: AbortSignal, options?: Record<string, unknown>) => Promise<unknown>;
   project?: (input: DecisionProjectionInput, signal?: AbortSignal) => Promise<unknown>;
@@ -251,6 +257,11 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   const resolveRoute = options.resolveRoute || resolveCanonicalRoute;
   const runCanonical = options.runCanonical || runCanonicalOperation;
 
+  async function authorizationAllowed(input: DecisionAuthorizationInput, signal?: AbortSignal): Promise<boolean> {
+    if (typeof options.authorize !== 'function') return true;
+    try { return await options.authorize(input, signal); } catch { return false; }
+  }
+
   async function routeFor(presentation: DecisionPresentation, signal?: AbortSignal): Promise<CanonicalRoute | null> {
     const saved = presentation.canonicalRoute;
     const environment = routeEnvironment(saved);
@@ -354,6 +365,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     if (current.canonical?.source === DECISION_WINNER_SOURCES.CLAIM && !current.canonical.materialized) {
       return { handled: true, accepted: true, click: current, canonical: current.canonical, message: null };
     }
+    if (!await authorizationAllowed(current, signal)) {
+      return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
+    }
     await project(current, presentation, signal);
     current = state.getDecisionClick(click.interactionId) || current;
     const nativeResult = await native(current, signal);
@@ -368,6 +382,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     const binding = bindingInput(state.getBinding(parsed.channelId));
     const selectedKey = presentation.keys[decoded.selectedIndex];
     if (!binding || !selectedKey) return invalidResult(DECISION_REASONS.PRESENTATION_IDENTITY_MISMATCH);
+    if (!signal?.aborted && !state.getDecisionClick(parsed.id) && !await authorizationAllowed(parsed, signal)) {
+      return invalidResult(DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE);
+    }
     const admission = state.admitDecisionClickAndBeginCallback({
       interactionId: parsed.id,
       presentationId: presentation.presentationId,
