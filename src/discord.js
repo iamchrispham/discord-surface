@@ -11,7 +11,7 @@ const {
 const fs = require('node:fs');
 const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, agentCompletionCommand, watcherNoticeCompletionCommand, ClaudeProvider, CodexProvider, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
-const { DISPATCH_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { DISPATCH_OUTCOMES, DECISION_TRANSPORT_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { readDirectPostFileSnapshot } = require('./direct-post-file');
@@ -201,7 +201,7 @@ function createSurfaceConsumer(options) {
 }
 
 const liveAttachmentRecovery = createLiveAttachmentRecoveryHandlers({ recoveryKind, bindingIdentityMatches, AGENT_ATTACHMENT_RECOVERY_KINDS, CODEX_VALIDATION_KINDS, READINESS, THREAD_STATES });
-const pendingReconciliation = createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES });
+const pendingReconciliation = createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES, DECISION_TRANSPORT_OUTCOMES });
 const transportRecovery = createTransportRecoveryHandlers({ READINESS, THREAD_STATES, RECOVERY_POLICIES, recoveryKind, createTransportRecoveryWaiter, RECOVERY_WAITER_DEADLINE_GRACE_MS });
 
 class DiscordGateway {
@@ -229,6 +229,8 @@ class DiscordGateway {
     this.recoveryPromise = null;
     this.decisionRecoveryPromise = null;
     this.decisionRecoveryController = null;
+    this.queuedDecisionRecoveryAll = false;
+    this.queuedDecisionRecoveryChannels = new Set();
     this.recoveryFollowupPromise = null;
     this.recoveryFollowupScope = null;
     this.recoveryActiveWaiters = new Set();
@@ -351,6 +353,7 @@ class DiscordGateway {
       callbackTimeoutMs: this.interactionCallbackTimeoutMs,
       authorize: (input, signal) => this.authorizeDecisionInteraction(input, signal),
       reject: (interaction, reason, signal, deferred) => this.sendInteractionRejection(interaction, reason, signal, deferred),
+      scheduleRecovery: channelIds => this.startDecisionRecovery(undefined, channelIds),
       waitForDispatch: (channelId, signal) => this.waitForInteractionDispatch({ channelId }, signal),
       processAccepted: (message, signal, options) => this.consumer.processAccepted(message, signal, options),
       project: (input, signal) => this.projectDecisionMessage(input, signal)
@@ -492,7 +495,9 @@ class DiscordGateway {
     }
     const inline = answer.length <= 4096;
     const prompt = presentation?.content || '';
-    const plainFits = inline && `${prompt}\n\nSelected action:\n${answer}`.trim().length <= 2000;
+    const promptSeparator = prompt.length > 0 ? '\n\n' : '';
+    const plainProjection = `${prompt}${promptSeparator}Selected action:\n${answer}`;
+    const plainFits = inline && plainProjection.length <= 2000;
     const needsFile = !inline || (!embedPermission.allowed && !plainFits);
     if (needsFile) {
       const attachPermission = this.historyPermission(channel, { requireSend: true, requireAttachFiles: true });
@@ -2002,13 +2007,22 @@ class DiscordGateway {
   _reconcilePending(before, signal, ...args) { return pendingReconciliation.reconcilePending.apply(this, arguments); }
 
   startDecisionRecovery(signal, channelIds = null) {
-    if (this.stopping || this.decisionRecoveryPromise || !this.decisionConsumer) return this.decisionRecoveryPromise;
+    if (this.stopping || !this.decisionConsumer) return this.decisionRecoveryPromise;
+    if (this.decisionRecoveryPromise) {
+      if (signal?.aborted) return this.decisionRecoveryPromise;
+      if (channelIds === null) this.queuedDecisionRecoveryAll = true;
+      else if (!this.queuedDecisionRecoveryAll) {
+        for (const channelId of channelIds) this.queuedDecisionRecoveryChannels.add(channelId);
+      }
+      return this.decisionRecoveryPromise;
+    }
     const controller = new AbortController();
     const relayAbort = () => controller.abort();
     if (signal?.aborted) controller.abort();
     else signal?.addEventListener('abort', relayAbort, { once: true });
     this.decisionRecoveryController = controller;
-    const work = Promise.resolve().then(() => this.decisionConsumer.recover(controller.signal, channelIds));
+    const scope = channelIds === null ? null : new Set(channelIds);
+    const work = Promise.resolve().then(() => this.decisionConsumer.recover(controller.signal, scope));
     const tracked = work.catch(error => {
       this.logger(`Discord decision recovery failed: ${error.message}`);
       return [];
@@ -2018,7 +2032,20 @@ class DiscordGateway {
     tracked.finally(() => {
       signal?.removeEventListener('abort', relayAbort);
       this.inFlight.delete(tracked);
-      if (this.decisionRecoveryPromise === tracked) this.decisionRecoveryPromise = null;
+      if (this.decisionRecoveryPromise === tracked) {
+        this.decisionRecoveryPromise = null;
+        const queuedAll = this.queuedDecisionRecoveryAll;
+        const queuedChannels = new Set(this.queuedDecisionRecoveryChannels);
+        this.queuedDecisionRecoveryAll = false;
+        this.queuedDecisionRecoveryChannels.clear();
+        if (!this.stopping && (queuedAll || queuedChannels.size > 0)) {
+          queueMicrotask(() => {
+            if (!this.stopping && !this.decisionRecoveryPromise) {
+              this.startDecisionRecovery(undefined, queuedAll ? null : queuedChannels);
+            }
+          });
+        }
+      }
       if (this.decisionRecoveryController === controller) this.decisionRecoveryController = null;
     }).catch(() => {});
     return tracked;
@@ -2049,6 +2076,8 @@ class DiscordGateway {
     this.pendingHandoffRecoveryChannels.clear();
     this.pendingFullRecovery = false;
     this.pendingRecoveryChannels.clear();
+    this.queuedDecisionRecoveryAll = false;
+    this.queuedDecisionRecoveryChannels.clear();
     for (const request of this.pendingRecoveryRequests.splice(0)) request.waiter?.stop?.();
     this.recoveryRetryScheduledChannels.clear();
     this.closingCustodyRetries.clear();

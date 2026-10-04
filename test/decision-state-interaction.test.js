@@ -73,6 +73,24 @@ test('denied rejection follow-up stays pending across restart until sent', () =>
     assert.equal(fixtureState.state.beginDecisionRejectionFollowup('interaction-1').accepted, true);
     assert.equal(fixtureState.state.recordDecisionRejectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
     assert.equal(fixtureState.state.listDecisionPendingWork().length, 0);
+    assert.equal(fixtureState.state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 1);
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
+test('authorized interaction releases its callback token custody', () => {
+  const fixtureState = fixture();
+  try {
+    const { state } = fixtureState;
+    presented(state);
+    assert.equal(state.admitDecisionClickAndBeginAuthorization({
+      ...click(state), applicationId: 'application', token: 'authorized-token'
+    }).accepted, true);
+    assert.equal(state.recordDecisionAuthorizationOutcome('interaction-1', DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED).accepted, true);
+    assert.equal(state.getDecisionClick('interaction-1')?.token, null);
+    assert.equal(state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 1);
+    assert.equal(state.listReceipts().some(row => String(row.detail).includes('authorized-token')), false);
   } finally {
     closeFixture(fixtureState);
   }
@@ -93,6 +111,36 @@ test('retryable projection closes custody after native submission', () => {
     assert.equal(state.listDecisionPendingWork().length, 0);
   } finally {
     closeFixture(fixtureState);
+  }
+});
+
+test('permanent projection outcomes terminalize submitted native custody', () => {
+  for (const initialOutcome of [DECISION_TRANSPORT_OUTCOMES.UNKNOWN, DECISION_TRANSPORT_OUTCOMES.NOT_SENT]) {
+    const fixtureState = fixture();
+    try {
+      const { state } = fixtureState;
+      presented(state);
+      const interactionId = `permanent-projection-${initialOutcome}`;
+      assert.equal(state.admitDecisionClickAndBeginCallback({
+        ...click(state),
+        interactionId,
+        applicationId: 'application',
+        token: `token-${initialOutcome}`
+      }).accepted, true);
+      assert.equal(state.importDecisionWinner(interactionId, materializedWinner({ reference: `answer-${initialOutcome}` })).accepted, true);
+      assert.equal(state.recordDecisionProjectionOutcome(interactionId, initialOutcome).accepted, true);
+      assert.equal(state.recordDecisionNativeReturnOutcome(interactionId, DECISION_NATIVE_OUTCOMES.SUBMITTED).accepted, true);
+      assert.equal(state.recordDecisionProjectionOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.REJECTED).accepted, true);
+
+      const terminal = state.getDecisionClick(interactionId);
+      assert.equal(terminal?.state, DECISION_STATES.TERMINAL);
+      assert.equal(terminal?.token, null);
+      assert.equal(state.listDecisionPendingWork().length, 0);
+      assert.equal(state.listReceipts().filter(row => row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE).length, 1);
+      assert.equal(state.listReceipts().some(row => String(row.detail).includes(`token-${initialOutcome}`)), false);
+    } finally {
+      closeFixture(fixtureState);
+    }
   }
 });
 

@@ -1,6 +1,6 @@
 'use strict';
 
-function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES }) {
+function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES, DECISION_TRANSPORT_OUTCOMES }) {
   return {
     async reconcilePending(before, signal, readyOnly = false, channelIds = null, messageIds = null) {
       const deadline = Date.now() + this.recoveryTimeoutMs;
@@ -25,6 +25,15 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
         (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
         (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready ||
           isHeldDurable(message));
+      const decisionProjectionPending = message => {
+        const click = this.state.listDecisionPendingWork?.().find(candidate => candidate.interactionId === message.id);
+        const retryable = click?.projectionOutcome == null || [
+          DECISION_TRANSPORT_OUTCOMES.NOT_SENT,
+          DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED,
+          DECISION_TRANSPORT_OUTCOMES.UNKNOWN
+        ].includes(click.projectionOutcome);
+        return Boolean(click?.canonical?.materialized && retryable);
+      };
       this.startDecisionRecovery(signal, selectedChannels);
       const candidates = this.state.recoveryCandidates(before).filter(allowed);
       const retryOrder = messageIds ? new Map(messageIds.map((messageId, index) => [messageId, index])) : null;
@@ -320,6 +329,10 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
             ).finally(() => signal?.removeEventListener('abort', relayAbort));
           };
           if (message.state === 'accepted') {
+            if (decisionProjectionPending(message)) {
+              blockedOwners.add(key);
+              continue;
+            }
             for (let attempt = 0; attempt < 2; attempt += 1) {
               recoveryOperationStarted = false;
               result = await waitForRecoveryOperation(
