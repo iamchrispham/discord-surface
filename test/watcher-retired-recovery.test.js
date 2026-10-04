@@ -96,8 +96,27 @@ test(TUNABLE, { todo: 'Issue267 source recovery pending', timeout: 5000 }, async
     await consumer.waitForNativeWork();
   }
   reopen(f);
-  const afterRestart = duplicateBegin(f, f.state.getMessage(message.id));
-  assert.equal(afterRestart.attempt.attemptId, successor.attempt.attemptId, 'restart minted a third attempt identity');
+  const restartedCourier = [];
+  const restartedDirect = [];
+  const restartedConsumer = scenarioConsumer(f, { courier: restartedCourier, direct: restartedDirect });
+  const restartedDeadline = deadline();
+  try {
+    await Promise.race([
+      processToDispatch(restartedConsumer, f.state.getMessage(message.id), restartedDeadline.controller.signal),
+      restartedDeadline.expired
+    ]);
+    const afterWake = f.state.getCourierAttempt(message.id);
+    assert.equal(afterWake.attempt.attemptId, successor.attempt.attemptId, 'restart wake minted a third attempt identity');
+    assert.equal(restartedCourier.length, 0, 'restart wake duplicated courier dispatch');
+    assert.equal(restartedDirect.length, 0, 'restart wake fell back to direct dispatch');
+    const afterRestart = duplicateBegin(f, f.state.getMessage(message.id));
+    assert.equal(afterRestart.attempt.attemptId, successor.attempt.attemptId, 'restart minted a third attempt identity');
+  } finally {
+    restartedDeadline.clear();
+    restartedDeadline.controller.abort();
+    restartedConsumer.abortNativeWork();
+    await restartedConsumer.waitForNativeWork();
+  }
 });
 
 test(PUBLIC, { todo: 'Issue267 source recovery pending', timeout: 5000 }, async t => {
