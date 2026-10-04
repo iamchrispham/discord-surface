@@ -36,6 +36,13 @@ const PRESERVED_PROBES = new Map([
 const PID_PROBE = 'pid-probe';
 const PROCESS_OBJECT = 'process-object';
 const LEGACY_OWNER = 'legacy-owner';
+// Indirect `.call`/`.apply` of a probe: invoking one is refused, never guessed.
+const CALL_METHOD = 'probe-call-method';
+const APPLY_METHOD = 'probe-apply-method';
+const INVOCATION_METHODS = [CALL_METHOD, APPLY_METHOD];
+// Global `Reflect.apply`: invoking it on a probe is refused.
+const REFLECT_OBJECT = 'reflect-object';
+const REFLECT_APPLY = 'reflect-apply';
 
 function sourceFiles(root) {
   const found = [];
@@ -190,12 +197,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       const receiver = resolveSet(node.expression, seen);
       if (name === 'directPostOwnerAlive') return new Set([LEGACY_OWNER]);
       if (name === 'kill' && hasAtom(receiver, PROCESS_OBJECT)) return new Set([PID_PROBE]);
-      // A probe method borrowed off a probe-valued receiver (.bind/.call/.apply)
-      // stays a potential probe source; shield it so the invocation still counts
-      // as a kill instead of vanishing.
-      if ((name === 'bind' || name === 'call' || name === 'apply') && hasAtom(receiver, PID_PROBE)) {
-        return new Set([PID_PROBE]);
+      if (hasAtom(receiver, PID_PROBE)) {
+        if (name === 'bind') return new Set([PID_PROBE]);
+        if (name === 'call') return new Set([CALL_METHOD]);
+        if (name === 'apply') return new Set([APPLY_METHOD]);
       }
+      if (hasAtom(receiver, REFLECT_OBJECT) && name === 'apply') return new Set([REFLECT_APPLY]);
+      const methods = INVOCATION_METHODS.filter(atom => hasAtom(receiver, atom));
+      if (name === 'bind') return new Set(methods);
+      if ((name === 'call' || name === 'apply') && methods.length) return new Set([APPLY_METHOD]);
       return empty;
     }
 
@@ -204,23 +214,24 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       // result is still a potential liveness probe. `.call`/`.apply` are
       // invocations themselves, handled at the call visitor with shifted args.
       const callee = node.expression;
-      if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'bind' &&
-        hasAtom(resolveSet(callee.expression, seen), PID_PROBE)) {
-        return new Set([PID_PROBE]);
+      if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'bind') {
+        const receiver = resolveSet(callee.expression, seen);
+        if (hasAtom(receiver, PID_PROBE)) return new Set([PID_PROBE]);
+        return new Set(INVOCATION_METHODS.filter(atom => hasAtom(receiver, atom)));
       }
       return empty;
     }
 
     if (!ts.isIdentifier(node)) return empty;
-    const symbol = checker.getSymbolAtLocation(node);
-    if (!symbol) {
-      return node.text === 'process' ? new Set([PROCESS_OBJECT])
-        : node.text === 'directPostOwnerAlive' ? new Set([LEGACY_OWNER]) : empty;
-    }
-    const declaration = symbol.valueDeclaration;
+    // A shorthand property key names the property symbol; the value is the binding.
+    const symbol = ts.isShorthandPropertyAssignment(node.parent) && node.parent.name === node
+      ? checker.getShorthandAssignmentValueSymbol(node.parent)
+      : checker.getSymbolAtLocation(node);
+    const declaration = symbol && symbol.valueDeclaration;
     if (!declaration) {
-      return node.text === 'process' ? new Set([PROCESS_OBJECT])
-        : node.text === 'directPostOwnerAlive' ? new Set([LEGACY_OWNER]) : empty;
+      if (node.text === 'process') return new Set([PROCESS_OBJECT]);
+      if (node.text === 'Reflect') return new Set([REFLECT_OBJECT]);
+      return node.text === 'directPostOwnerAlive' ? new Set([LEGACY_OWNER]) : empty;
     }
     if (visited.has(symbol)) return empty;
     const symbolSeen = new Set(visited).add(symbol);
@@ -244,6 +255,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       if (entry.name === 'kill' && hasAtom(resolveSet(entry.source, symbolSeen), PROCESS_OBJECT)) {
         result.add(PID_PROBE);
       }
+      for (const atom of literalProperty(entry.source, entry.name, symbolSeen)) result.add(atom);
     };
 
     if (ts.isVariableDeclaration(declaration)) {
@@ -263,6 +275,41 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     return result;
   }
 
+  // Named property of a literal object origin, reached directly or through
+  // identifier aliases. Static lookup only: computed keys are not evaluated.
+  function literalProperty(node, name, visited) {
+    const found = new Set();
+    if (!node || !name || visited.has(node)) return found;
+    const seen = new Set(visited).add(node);
+    if (ts.isParenthesizedExpression(node)) return literalProperty(node.expression, name, seen);
+    if (ts.isObjectLiteralExpression(node)) {
+      for (const property of node.properties) {
+        if (!property.name) continue;
+        const shorthand = ts.isShorthandPropertyAssignment(property);
+        if (!shorthand && !ts.isPropertyAssignment(property)) continue;
+        const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? property.name.text : null;
+        if (key !== name) continue;
+        const value = shorthand ? property.name : property.initializer;
+        for (const atom of resolveSet(value, seen)) found.add(atom);
+      }
+      return found;
+    }
+    if (!ts.isIdentifier(node)) return found;
+    const symbol = checker.getSymbolAtLocation(node);
+    const declaration = symbol && symbol.valueDeclaration;
+    if (!declaration || visited.has(symbol)) return found;
+    const symbolSeen = new Set(seen).add(symbol);
+    const origins = [];
+    if ((ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) && declaration.initializer) {
+      origins.push(declaration.initializer);
+    }
+    for (const assigned of assignments.get(symbol) || []) if (!assigned.name) origins.push(assigned.source);
+    for (const origin of origins) {
+      for (const atom of literalProperty(origin, name, symbolSeen)) found.add(atom);
+    }
+    return found;
+  }
+
   function addFromBindingElement(binding, visited, result) {
     const sources = bindingSources(binding);
     const sourceSet = new Set();
@@ -277,6 +324,11 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       : (ts.isIdentifier(binding.name) ? binding.name.text : null);
     if (binding.initializer) {
       for (const atom of resolveSet(binding.initializer, visited)) result.add(atom);
+    }
+    if (sources) {
+      for (const source of sources) {
+        for (const atom of literalProperty(source, name, visited)) result.add(atom);
+      }
     }
     if (name === 'directPostOwnerAlive') {
       result.add(LEGACY_OWNER);
@@ -293,26 +345,29 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
         (callee.name.text === 'bind' || callee.name.text === 'call' || callee.name.text === 'apply') &&
         hasAtom(staticValue(callee.expression), PID_PROBE);
       if (method && callee.name.text !== 'bind') {
-        // `probe.call(thisArg, pid, signal)` / `probe.apply(thisArg, [pid, signal])`
-        // invoke a probe with shifted arguments; `.bind` instead yields a bound
-        // probe that a later call site resolves through the ordinary path.
-        let signal = null;
-        if (callee.name.text === 'call') signal = node.arguments[2];
-        else if (ts.isArrayLiteralExpression(node.arguments[1])) signal = node.arguments[1].elements[1];
-        if (signal && hasAtom(staticValue(signal), 0)) kills.push({ file: fileName, owner });
-        // A resolved probe applied to a list this parse cannot see is refused,
-        // never guessed: an identifier or `arguments` (the default-parameter
-        // shape) could carry a zero signal at runtime, so it must not be
-        // silently dropped, and it must not fabricate a kill.
-        if (callee.name.text === 'apply' && node.arguments[1] &&
-          !ts.isArrayLiteralExpression(node.arguments[1])) {
-          violations.push(`unsupported process probe ${fileName}:${owner}`);
-        }
+        // `.call(thisArg, pid, signal)` / `.apply(thisArg, [pid, signal])` shift
+        // the arguments. A signal this parse cannot resolve (absent, nonliteral
+        // list, unknown value) is refused: never guessed, never evaluated.
+        const list = node.arguments[1];
+        const signal = callee.name.text === 'call' ? node.arguments[2]
+          : list && ts.isArrayLiteralExpression(list) ? list.elements[1] : undefined;
+        const values = signal ? staticValue(signal) : new Set();
+        if (hasAtom(values, 0)) kills.push({ file: fileName, owner });
+        else if (values.size === 0) violations.push(`unsupported process probe ${fileName}:${owner}`);
       } else if (!method) {
         const resolved = staticValue(callee);
+        const isBind = ts.isPropertyAccessExpression(callee) && callee.name.text === 'bind';
         const isProbe = hasAtom(resolved, PID_PROBE);
         if (isProbe && node.arguments.length >= 2 && hasAtom(staticValue(node.arguments[1]), 0)) {
           kills.push({ file: fileName, owner });
+        }
+        if (!isBind && INVOCATION_METHODS.some(atom => hasAtom(resolved, atom))) {
+          violations.push(`unsupported process probe ${fileName}:${owner}`);
+        }
+        const probeTarget = node.arguments[0] && staticValue(node.arguments[0]);
+        if (hasAtom(resolved, REFLECT_APPLY) && probeTarget &&
+          [PID_PROBE, ...INVOCATION_METHODS].some(atom => hasAtom(probeTarget, atom))) {
+          violations.push(`unsupported process probe ${fileName}:${owner}`);
         }
         if (hasAtom(resolved, LEGACY_OWNER)) legacyCalls.push({ file: fileName, owner });
       }

@@ -152,3 +152,79 @@ test("ordinary default function stays empty", () => {
 test("nonzero default signal stays empty", () => {
   runFixture("function newProbe(pid, signal = 9) { process.kill(pid, signal); }", [], []);
 });
+
+test("bound apply invocation refuses", () => {
+  runFixture("const invoke = process.kill.apply.bind(process.kill); function newProbe(pid) { invoke(null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("bound call invocation refuses", () => {
+  runFixture("const invoke = process.kill.call.bind(process.kill); function newProbe(pid) { invoke(null, pid, 0); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("destructured literal zero signal", () => {
+  runFixture("const { signal } = { signal: 0 }; function newProbe(pid) { process.kill(pid, signal); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("destructured aliased literal zero signal", () => {
+  runFixture("const values = { signal: 0 }; const { signal } = values; function newProbe(pid) { process.kill(pid, signal); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("absent apply list refuses", () => {
+  runFixture("function newProbe(pid) { process.kill.apply(null); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("ordinary bound apply stays empty", () => {
+  runFixture("const ordinary = () => true; const invoke = ordinary.apply.bind(ordinary); function newProbe(pid) { invoke(null, [pid, 0]); }", [], []);
+});
+
+test("destructured nonzero signal stays empty", () => {
+  runFixture("const { signal } = { signal: 9 }; function newProbe(pid) { process.kill(pid, signal); }", [], []);
+});
+
+test("explicit nonzero apply signal stays empty", () => {
+  runFixture("function newProbe(pid) { process.kill.apply(null, [pid, 9]); }", [], []);
+});
+
+test("unresolved call signal refuses", () => {
+  runFixture("function newProbe(pid, signal) { process.kill.call(null, pid, signal); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("shorthand object alias zero", () => {
+  runFixture("const signal=0;const values={signal};const {signal:s}=values;function newProbe(pid){process.kill(pid,s);}", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("direct shorthand origin zero", () => {
+  runFixture("const signal=0;const {signal:s}={signal};function newProbe(pid){process.kill(pid,s);}", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("shorthand nonzero control", () => {
+  runFixture("const signal=9;const values={signal};const {signal:s}=values;function newProbe(pid){process.kill(pid,s);}", [], []);
+});
+
+test("shorthand ordinary lexical control", () => {
+  runFixture("const signal=0;function newProbe(pid){const signal=9;const {signal:s}={signal};process.kill(pid,s);}", [], []);
+});
+
+test("apply alias through call refuses", () => {
+  runFixture("const invoke=process.kill.apply;function newProbe(pid){invoke.call(process.kill,null,[pid,0]);}", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("call alias through apply refuses", () => {
+  runFixture("const invoke=process.kill.call;function newProbe(pid){invoke.apply(process.kill,[null,pid,0]);}", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("Reflect direct probe refuses", () => {
+  runFixture("function newProbe(pid){Reflect.apply(process.kill,null,[pid,0]);}", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("Reflect probe alias refuses", () => {
+  runFixture("const probe=process.kill;function newProbe(pid){Reflect.apply(probe,null,[pid,0]);}", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("Reflect ordinary control", () => {
+  runFixture("const ordinary=()=>true;function newProbe(pid){Reflect.apply(ordinary,null,[pid,0]);}", [], []);
+});
+
+test("Reflect lexical shadow control", () => {
+  runFixture("const Reflect={apply(){}};function newProbe(pid){Reflect.apply(process.kill,null,[pid,0]);}", [], []);
+});
