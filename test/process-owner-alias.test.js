@@ -343,6 +343,10 @@ test("fallback and omitted signals stay ordinary", () => {
   runFixture("function newProbe(pid) { process.kill(pid, 0 || 'SIGTERM'); }", [], []);
   runFixture("let signal = 0; signal = 9; function newProbe(pid) { process.kill(pid, signal || 'SIGTERM'); }", [], []);
   runFixture("function newProbe(pid) { process.kill(pid); }", [], []);
+  runFixture("function newProbe(pid) { process.kill.call(null, pid); }", [], []);
+  runFixture("function newProbe(pid) { process.kill.apply(null, [pid]); }", [], []);
+  runFixture("function newProbe(pid) { process.kill.apply(null, [pid, undefined]); }", [], []);
+  runFixture("function newProbe(pid) { process.kill(...[pid]); }", [], []);
   runFixture("const terminate = process.kill; function newProbe(pid) { terminate(pid); }", [], []);
 });
 
@@ -363,6 +367,97 @@ test("Reflect ordinary control", () => {
 
 test("Reflect lexical shadow control", () => {
   runFixture("const Reflect={apply(){}};function newProbe(pid){Reflect.apply(process.kill,null,[pid,0]);}", [], []);
+});
+
+test("finite resolver closes indirect probe gaps", () => {
+  runFixture(
+    "function newProbe(pid) { process.kill(...[pid, 0]); }",
+    ["private-alias.js\u0000newProbe"],
+    ["unclassified process probe private-alias.js:newProbe"]
+  );
+  runFixture(
+    "function newProbe(pid) { const args = [pid, 0]; process.kill(...args); }",
+    [],
+    ["unsupported process probe private-alias.js:newProbe"]
+  );
+  runFixture(
+    "function invoke(probe, pid) { probe(pid, 0); } let run; run = invoke; run(process.kill, 1);",
+    ["private-alias.js\u0000invoke"],
+    ["unclassified process probe private-alias.js:invoke"]
+  );
+  runFixture("function Runner(probe) {} new Runner;", [], []);
+  runFixture("function newProbe(pid) { process.kill(pid, undefined); }", [], []);
+  runFixture(
+    "function identity(value) { return value; } const probe = identity(process.kill); function newProbe(pid) { probe(pid, 0); }",
+    ["private-alias.js\u0000newProbe"],
+    ["unclassified process probe private-alias.js:newProbe"]
+  );
+  runFixture(
+    "const { tools: { kill: probe } } = { tools: process }; function newProbe(pid) { probe(pid, 0); }",
+    ["private-alias.js\u0000newProbe"],
+    ["unclassified process probe private-alias.js:newProbe"]
+  );
+  runFixture(
+    "class Worker { probe = process.kill; check(pid) { this.probe(pid, 0); } } new Worker().check(1);",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+  runFixture(
+    "const deps = [process.kill]; function newProbe(pid) { deps[0](pid, 0); }",
+    ["private-alias.js\u0000newProbe"],
+    ["unclassified process probe private-alias.js:newProbe"]
+  );
+  runFixture(
+    "function newProbe(pid) { globalThis.process.kill(pid, 0); } function otherProbe(pid) { global.process.kill(pid, 0); }",
+    ["private-alias.js\u0000newProbe", "private-alias.js\u0000otherProbe"],
+    ["unclassified process probe private-alias.js:newProbe", "unclassified process probe private-alias.js:otherProbe"]
+  );
+  runFixture(
+    "declare const process: { kill(pid: number, signal: number): boolean }; function newProbe(pid: number) { process.kill(pid, 0); }",
+    ["private-alias.ts\u0000newProbe"],
+    ["unclassified process probe private-alias.ts:newProbe"],
+    'private-alias.ts'
+  );
+});
+
+test("forwarding and property uncertainty stay conservative", () => {
+  runFixture(
+    "import { setImmediate } from 'node:timers'; function newProbe() { setImmediate(process.kill, 1234, 0); }",
+    ["private-alias.ts\u0000newProbe"],
+    ["unclassified process probe private-alias.ts:newProbe"],
+    'private-alias.ts'
+  );
+  runFixture(
+    "import { setImmediate as schedule } from 'timers'; function newProbe() { schedule(process.kill, 1234, 0); }",
+    ["private-alias.ts\u0000newProbe"],
+    ["unclassified process probe private-alias.ts:newProbe"],
+    'private-alias.ts'
+  );
+  runFixture(
+    "const options = { signal: runtimeSignal() }; function newProbe(pid) { process.kill(pid, options.signal); } newProbe(1); options.signal = 9;",
+    [],
+    ["unsupported process probe private-alias.js:newProbe"]
+  );
+  runFixture(
+    "const state = {}; const alias = state; const next = alias; next.probe = process.kill; function newProbe(pid) { state.probe(pid, 0); }",
+    ["private-alias.js\u0000newProbe"],
+    ["unclassified process probe private-alias.js:newProbe"]
+  );
+  runFixture(
+    "class Helpers {} Helpers.probe = process.kill; function newProbe(pid) { Helpers.probe(pid, 0); }",
+    ["private-alias.js\u0000newProbe"],
+    ["unclassified process probe private-alias.js:newProbe"]
+  );
+  runFixture(
+    "function invoke(probe, pid) { probe(pid, 0); } const api = { invoke }; api.invoke(process.kill, 1);",
+    ["private-alias.js\u0000invoke"],
+    ["unclassified process probe private-alias.js:invoke"]
+  );
+  runFixture(
+    "function newProbe(pid, signal) { process.kill(pid, signal || 0); }",
+    ["private-alias.js\u0000newProbe"],
+    ["unclassified process probe private-alias.js:newProbe"]
+  );
 });
 
 test("legacy owner identity survives invocation methods", () => {
