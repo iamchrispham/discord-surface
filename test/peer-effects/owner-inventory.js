@@ -118,6 +118,7 @@ function callSites(sourceFile) {
   const visitParameters = parameters => {
     for (const parameter of parameters) declarePattern(parameter.name);
   };
+  const objectPropertyInitializers = new Map();
   const visit = node => {
     if (ts.isImportDeclaration(node) && node.importClause?.namedBindings &&
         ts.isNamedImports(node.importClause.namedBindings)) {
@@ -191,7 +192,20 @@ function callSites(sourceFile) {
           canonical = canonicalForExpression(expression.expression);
           indirect = true;
         } else {
-          canonical = name;
+          const receiver = expression.expression;
+          const candidates = ts.isIdentifier(receiver) ? objectPropertyInitializers.get(receiver.text) : null;
+          let initializer = null;
+          if (candidates) {
+            for (const candidate of candidates) {
+              if (candidate.position < node.getStart(sourceFile)) initializer = candidate.properties.get(name) || null;
+            }
+          }
+          if (initializer && ts.isIdentifier(initializer)) {
+            canonical = canonicalForExpression(initializer);
+            indirect = true;
+          } else {
+            canonical = name;
+          }
         }
       } else if (ts.isElementAccessExpression(expression)) {
         indirect = true;
@@ -210,6 +224,27 @@ function callSites(sourceFile) {
     }
     ts.forEachChild(node, visit);
   };
+
+  const collectObjectPropertyInitializers = node => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && ts.isObjectLiteralExpression(node.initializer)) {
+      const properties = new Map();
+      for (const property of node.initializer.properties) {
+        if (ts.isPropertyAssignment(property)) {
+          const propertyName = property.name && (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name))
+            ? property.name.text
+            : null;
+          if (propertyName) properties.set(propertyName, property.initializer);
+        } else if (ts.isShorthandPropertyAssignment(property)) {
+          properties.set(property.name.text, property.name);
+        }
+      }
+      const entries = objectPropertyInitializers.get(node.name.text) || [];
+      entries.push({ position: node.getStart(sourceFile), properties });
+      objectPropertyInitializers.set(node.name.text, entries);
+    }
+    ts.forEachChild(node, collectObjectPropertyInitializers);
+  };
+  collectObjectPropertyInitializers(sourceFile);
 
   // Imports are hoisted, so aliases used by earlier-looking declarations still
   // resolve to their lexical binding rather than to a name-global map.

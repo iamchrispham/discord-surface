@@ -215,6 +215,20 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   const legacyChildAddress = legacy && !sameAddress(legacy.packet.source, canonicalAddress(binding))
     ? legacy.packet.source
     : null;
+  const currentDestination = () => {
+    if (typeof agentDestinationCurrent !== 'function') return true;
+    try {
+      let target = deliveryTarget;
+      if (target === null && agentTarget !== null) {
+        if (isLegacyAgentAddressEnvelope(agentTarget)) target = verifyLegacyAgentAddress(agentTarget, token);
+        else if (Object.hasOwn(agentTarget, 'proof')) target = verifyAgentAddress(agentTarget, token);
+        else target = agentTarget as AgentAddress;
+      }
+      if (target === null) return true;
+      return agentDestinationCurrent(target);
+    }
+    catch { return false; }
+  };
   if (legacy) {
     if (legacyChildAddress !== null && agentThreadId !== null && agentThreadId !== legacyChildAddress.channelId) {
       throw new BindingError('direct post request identity conflicts with existing custody');
@@ -229,7 +243,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       if (!legacyMarker || typeof legacyMarker !== 'object' || Array.isArray(legacyMarker) ||
           !migratedPacket || typeof migratedPacket !== 'object' || Array.isArray(migratedPacket)) {
         await revalidateCaller();
-        if (!callerBindingCurrent()) throw new BindingError('direct post binding is no longer current');
+        if (!callerBindingCurrent() || !currentDestination()) throw new BindingError('direct post binding is no longer current');
         return legacy.result;
       }
       if (!isAgentSourcePromotion(legacy.packet, migratedPacket, binding.channelId) ||
@@ -237,7 +251,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         throw new BindingError('direct post request identity conflicts with existing custody');
       }
       await revalidateCaller();
-      if (!callerBindingCurrent()) throw new BindingError('direct post binding is no longer current');
+      if (!callerBindingCurrent() || !currentDestination()) throw new BindingError('direct post binding is no longer current');
       return legacy.result;
     }
     if (!isLegacyRetryableOutcome(legacy.outcome)) {
@@ -352,11 +366,6 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   const currentReady = () => {
     if (!currentBinding()) return false;
     return callerBindingCurrent();
-  };
-  const currentDestination = () => {
-    if (deliveryTarget === null || typeof agentDestinationCurrent !== 'function') return true;
-    try { return agentDestinationCurrent(deliveryTarget); }
-    catch { return false; }
   };
   for (let partIndex = 0; partIndex < source.parts.length; partIndex += 1) {
     if (signal?.aborted) {
