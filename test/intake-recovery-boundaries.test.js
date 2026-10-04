@@ -538,10 +538,7 @@ for (const control of LEGACY_NEGATIVE_CONTROLS) {
 }
 
 const SOURCE_FILE_PATTERN = /\.(?:js|ts)$/;
-const DEADLINE_TRIGGER_PATTERN = /\b(?:DEADLINE|deadlineReached)\b|\bDate\.now\(\)\s*>=\s*deadline\b/;
-const GAP_VALUE_PATTERN = /(?:['"]gap['"]|\b(?:READINESS|THREAD_STATES)\.GAP\b)/;
-const NESTED_BLOCK_START_PATTERN = /^\s*(?:if|else|switch|for|while|try|catch|finally)\b/;
-const OUTCOME_STATEMENT_PATTERN = /^\s*(?:(?:if\s*\([^\n]*\)\s*)?return\b|(?:(?:const|let|var)\s+)?(?:state|readiness|status|result|outcome)\s*=)/;
+const OUTCOME_NAMES = new Set(['state', 'readiness', 'status', 'result', 'outcome']);
 
 const collectSourceFiles = directory => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
   const absolute = path.join(directory, entry.name);
@@ -554,173 +551,423 @@ const readSourceInventory = sourceRoot => collectSourceFiles(sourceRoot).map(abs
   source: fs.readFileSync(absolute, 'utf8')
 }));
 
-const findMatchingBrace = (source, openingIndex) => {
-  let depth = 0;
-  let quote = null;
-  let escaped = false;
-  for (let index = openingIndex; index < source.length; index += 1) {
-    const character = source[index];
-    if (quote) {
-      if (escaped) escaped = false;
-      else if (character === '\\') escaped = true;
-      else if (character === quote) quote = null;
-      continue;
-    }
-    if (character === '"' || character === "'" || character === '`') {
-      quote = character;
-      continue;
-    }
-    if (character === '{') depth += 1;
-    if (character === '}' && --depth === 0) return index;
-  }
-  return source.length - 1;
-};
+const isIdentifierStart = character => /[A-Za-z_$]/.test(character);
+const isIdentifierPart = character => /[A-Za-z0-9_$]/.test(character);
+const REGEX_PREFIXES = new Set(['(', '{', '[', ',', ';', ':', '=', '==', '===', '!=', '!==', '!', '&&', '||', '??', '?', '=>', 'return', 'case', 'throw', 'else', 'do', 'in', 'of']);
 
-const findStatementEnd = (source, startIndex) => {
-  let braceDepth = 0;
-  let parenDepth = 0;
-  let bracketDepth = 0;
-  let quote = null;
-  let escaped = false;
-  for (let index = startIndex; index < source.length; index += 1) {
-    const character = source[index];
-    if (quote) {
-      if (escaped) escaped = false;
-      else if (character === '\\') escaped = true;
-      else if (character === quote) quote = null;
-      continue;
-    }
-    if (character === '"' || character === "'" || character === '`') {
-      quote = character;
-      continue;
-    }
-    if (character === '{') braceDepth += 1;
-    if (character === '}') braceDepth -= 1;
-    if (character === '(') parenDepth += 1;
-    if (character === ')') parenDepth -= 1;
-    if (character === '[') bracketDepth += 1;
-    if (character === ']') bracketDepth -= 1;
-    if (character === ';' && braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) return index + 1;
-  }
-  return source.length;
-};
+const tokenizeSource = source => {
+  const tokens = [];
+  let index = 0;
+  let previous = null;
+  const push = (type, value, start, end) => {
+    const token = { type, value, start, end, line: source.slice(0, start).split(/\r?\n/).length };
+    tokens.push(token);
+    previous = token;
+  };
+  const canStartRegex = () => !previous || REGEX_PREFIXES.has(previous.value);
 
-const extractTopLevelStatements = source => {
-  const statements = [];
-  let start = 0;
-  let braceDepth = 0;
-  let parenDepth = 0;
-  let bracketDepth = 0;
-  let quote = null;
-  let escaped = false;
-  for (let index = 0; index < source.length; index += 1) {
+  while (index < source.length) {
     const character = source[index];
-    if (quote) {
-      if (escaped) escaped = false;
-      else if (character === '\\') escaped = true;
-      else if (character === quote) quote = null;
+    if (/\s/.test(character)) {
+      index += 1;
       continue;
     }
-    if (character === '"' || character === "'" || character === '`') {
-      quote = character;
+    if (character === '/' && source[index + 1] === '/') {
+      index += 2;
+      while (index < source.length && source[index] !== '\n') index += 1;
       continue;
     }
-    if (character === '{') braceDepth += 1;
-    if (character === '}') {
-      braceDepth -= 1;
-      if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) {
-        const nested = source.slice(start, index + 1);
-        if (NESTED_BLOCK_START_PATTERN.test(nested)) start = index + 1;
+    if (character === '/' && source[index + 1] === '*') {
+      const end = source.indexOf('*/', index + 2);
+      index = end === -1 ? source.length : end + 2;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      const start = index;
+      const quote = character;
+      let escaped = false;
+      index += 1;
+      while (index < source.length) {
+        const current = source[index];
+        if (escaped) escaped = false;
+        else if (current === '\\') escaped = true;
+        else if (current === quote) {
+          index += 1;
+          break;
+        }
+        index += 1;
       }
+      push('string', source.slice(start + 1, Math.max(start + 1, index - 1)), start, index);
+      continue;
     }
-    if (character === '(') parenDepth += 1;
-    if (character === ')') parenDepth -= 1;
-    if (character === '[') bracketDepth += 1;
-    if (character === ']') bracketDepth -= 1;
-    if (character === ';' && braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) {
-      statements.push(source.slice(start, index + 1));
-      start = index + 1;
+    if (character === '`') {
+      const start = index;
+      let escaped = false;
+      let hasSubstitution = false;
+      index += 1;
+      while (index < source.length) {
+        const current = source[index];
+        if (escaped) escaped = false;
+        else if (current === '\\') escaped = true;
+        else if (current === '$' && source[index + 1] === '{') hasSubstitution = true;
+        else if (current === '`') {
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      const value = source.slice(start + 1, Math.max(start + 1, index - 1));
+      push(hasSubstitution ? 'template-dynamic' : 'template', hasSubstitution ? null : value, start, index);
+      continue;
     }
+    if (character === '/' && canStartRegex()) {
+      const start = index;
+      let escaped = false;
+      let inClass = false;
+      index += 1;
+      while (index < source.length) {
+        const current = source[index];
+        if (escaped) escaped = false;
+        else if (current === '\\') escaped = true;
+        else if (current === '[') inClass = true;
+        else if (current === ']') inClass = false;
+        else if (current === '/' && !inClass) {
+          index += 1;
+          while (index < source.length && isIdentifierPart(source[index])) index += 1;
+          break;
+        }
+        index += 1;
+      }
+      push('regex', null, start, index);
+      continue;
+    }
+    if (isIdentifierStart(character)) {
+      const start = index;
+      index += 1;
+      while (index < source.length && isIdentifierPart(source[index])) index += 1;
+      push('identifier', source.slice(start, index), start, index);
+      continue;
+    }
+    if (/[0-9]/.test(character)) {
+      const start = index;
+      index += 1;
+      while (index < source.length && /[0-9A-Za-z._]/.test(source[index])) index += 1;
+      push('number', source.slice(start, index), start, index);
+      continue;
+    }
+    const operator = ['===', '!==', '=>', '>=', '<=', '==', '!=', '&&', '||', '??', '?.', '++', '--'].find(value => source.startsWith(value, index));
+    if (operator) {
+      push('operator', operator, index, index + operator.length);
+      index += operator.length;
+      continue;
+    }
+    push('punctuation', character, index, index + 1);
+    index += 1;
   }
-  if (source.slice(start).trim()) statements.push(source.slice(start));
-  return statements;
+  return tokens;
 };
 
-const hasTopLevelStateGap = statement => {
+const findTokenPairs = tokens => {
+  const pairs = new Map();
+  const stacks = new Map([['(', []], ['{', []], ['[', []]]);
+  const closing = new Map([[')', '('], ['}', '{'], [']', '[']]);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const value = tokens[index].value;
+    if (stacks.has(value)) {
+      stacks.get(value).push(index);
+      continue;
+    }
+    if (!closing.has(value)) continue;
+    const stack = stacks.get(closing.get(value));
+    const opening = stack.pop();
+    if (opening === undefined) continue;
+    pairs.set(opening, index);
+    pairs.set(index, opening);
+  }
+  return pairs;
+};
+
+const isGapValueAt = (tokens, index) => {
+  const token = tokens[index];
+  if (!token) return false;
+  if ((token.type === 'string' || token.type === 'template') && token.value === 'gap') return true;
+  return (token.value === 'READINESS' || token.value === 'THREAD_STATES')
+    && tokens[index + 1]?.value === '.'
+    && tokens[index + 2]?.value === 'GAP';
+};
+
+const findDelimitedEnd = (tokens, start, end, closingValue) => {
+  let parenDepth = 0;
   let braceDepth = 0;
-  let quote = null;
-  let escaped = false;
-  for (let index = 0; index < statement.length; index += 1) {
-    const character = statement[index];
-    if (quote) {
-      if (escaped) escaped = false;
-      else if (character === '\\') escaped = true;
-      else if (character === quote) quote = null;
-      continue;
-    }
-    if (character === '"' || character === "'" || character === '`') {
-      quote = character;
-      continue;
-    }
-    if (character === '{') {
-      braceDepth += 1;
-      continue;
-    }
-    if (character === '}') {
-      braceDepth -= 1;
-      continue;
-    }
-    if (braceDepth !== 1) continue;
-    const property = statement.slice(index).match(/^\s*(?:state|readiness|status|result|outcome)\s*:\s*((?:['"]gap['"]|(?:READINESS|THREAD_STATES)\.GAP))/);
-    if (property && GAP_VALUE_PATTERN.test(property[1])) return true;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (value === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+    else if (value === closingValue && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+  }
+  return end;
+};
+
+const expressionHasGap = (tokens, start, end) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && isGapValueAt(tokens, index)) return true;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
   }
   return false;
 };
 
-const isGapOutcome = statement => {
-  if (!OUTCOME_STATEMENT_PATTERN.test(statement)) return false;
-  if (/\breturn\s+(?:['"]gap['"]|(?:READINESS|THREAD_STATES)\.GAP\b)/.test(statement)) return true;
-  if (/\?\s*(?:['"]gap['"]|(?:READINESS|THREAD_STATES)\.GAP\b)/.test(statement)) return true;
-  if (/\b(?:state|readiness|status|result|outcome)\s*=\s*(?:['"]gap['"]|(?:READINESS|THREAD_STATES)\.GAP\b)/.test(statement)) return true;
-  return hasTopLevelStateGap(statement);
+const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = openingIndex + 1; index < closingIndex; index += 1) {
+    const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && OUTCOME_NAMES.has(value) && tokens[index + 1]?.value === ':') {
+      const valueStart = index + 2;
+      const valueEnd = findDelimitedEnd(tokens, valueStart, closingIndex, '}');
+      if (expressionHasGap(tokens, valueStart, valueEnd)) return true;
+    }
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return false;
 };
 
-const extractDeadlineDecision = (source, triggerIndex) => {
-  const openingBrace = source.indexOf('{', triggerIndex);
-  if (openingBrace !== -1) {
-    const ifStart = source.lastIndexOf('if', openingBrace);
-    const functionStart = source.lastIndexOf('function', openingBrace);
-    const controlPrefix = ifStart === -1 ? '' : source.slice(ifStart, openingBrace);
-    const functionPrefix = functionStart === -1 ? '' : source.slice(functionStart, openingBrace);
-    if (/\bif\s*\([\s\S]*\)\s*$/.test(controlPrefix)
-      || /\bfunction\b[\s\S]*\)\s*$/.test(functionPrefix)
-      || /=>\s*$/.test(source.slice(Math.max(0, openingBrace - 200), openingBrace))) {
-      const closingBrace = findMatchingBrace(source, openingBrace);
-      return { body: source.slice(openingBrace + 1, closingBrace), block: true };
+const valueHasGap = (tokens, start, end, pairs) => {
+  if (start >= end) return false;
+  if (isGapValueAt(tokens, start)) return true;
+  if (tokens[start].value === '{') {
+    const closingIndex = pairs.get(start);
+    return closingIndex !== undefined && closingIndex < end
+      ? objectHasTopLevelStateGap(tokens, start, closingIndex)
+      : false;
+  }
+  return expressionHasGap(tokens, start, end);
+};
+
+const findStatementEnd = (tokens, start, end) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  const statementLine = tokens[start]?.line;
+  const asiStarters = new Set(['function', 'const', 'let', 'var', 'if', 'return', 'for', 'while', 'switch', 'try', 'throw', 'class', 'export', 'import']);
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (index > start && tokens[index].line > statementLine && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && asiStarters.has(value) && ['identifier', 'string', 'template', 'number'].includes(tokens[index - 1]?.type)) return index;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') {
+      if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+      braceDepth -= 1;
+    } else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (value === ';' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index + 1;
+  }
+  return end;
+};
+
+const findControlledStatementEnd = (tokens, start, end, pairs) => {
+  if (start >= end) return end;
+  if (tokens[start].value === '{') return Math.min(end, (pairs.get(start) ?? end - 1) + 1);
+  if (tokens[start].value === 'if' && tokens[start + 1]?.value === '(') {
+    const conditionEnd = pairs.get(start + 1);
+    if (conditionEnd === undefined) return findStatementEnd(tokens, start, end);
+    const bodyStart = conditionEnd + 1;
+    const bodyEnd = tokens[bodyStart]?.value === '{'
+      ? Math.min(end, (pairs.get(bodyStart) ?? end - 1) + 1)
+      : findControlledStatementEnd(tokens, bodyStart, end, pairs);
+    if (tokens[bodyEnd]?.value === 'else') return findControlledStatementEnd(tokens, bodyEnd + 1, end, pairs);
+    return bodyEnd;
+  }
+  return findStatementEnd(tokens, start, end);
+};
+
+const findFunctionRanges = (tokens, pairs) => {
+  const ranges = [];
+  for (let opening = 0; opening < tokens.length; opening += 1) {
+    if (tokens[opening].value !== '{') continue;
+    const closing = pairs.get(opening);
+    if (closing === undefined) continue;
+    const previousIndex = opening - 1;
+    if (tokens[previousIndex]?.value === '=>') {
+      ranges.push({ start: previousIndex, opening, closing });
+      continue;
+    }
+    if (tokens[previousIndex]?.value !== ')') continue;
+    const parameterOpening = pairs.get(previousIndex);
+    if (parameterOpening === undefined) continue;
+    let start = parameterOpening - 1;
+    while (start >= 0 && ![';', '{', '}'].includes(tokens[start].value)) {
+      if (tokens[start].value === 'function') {
+        ranges.push({ start, opening, closing });
+        break;
+      }
+      start -= 1;
     }
   }
-  const lineStart = source.lastIndexOf('\n', triggerIndex) + 1;
-  const end = findStatementEnd(source, lineStart);
-  return { body: source.slice(lineStart, end), block: false };
+  return ranges;
+};
+
+const findIfDecision = (tokens, triggerIndex, pairs) => {
+  let best = null;
+  for (let index = triggerIndex; index >= 0; index -= 1) {
+    if (tokens[index].value !== 'if' || tokens[index + 1]?.value !== '(') continue;
+    const closingCondition = pairs.get(index + 1);
+    if (closingCondition === undefined || triggerIndex > closingCondition) continue;
+    if (!best || closingCondition - index < best.closingCondition - best.start) {
+      best = { start: index, closingCondition };
+    }
+  }
+  return best;
+};
+
+const findFunctionDecision = (ranges, triggerIndex) => {
+  const containing = ranges
+    .filter(range => range.opening < triggerIndex && triggerIndex < range.closing)
+    .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening));
+  if (containing[0]) return containing[0];
+  return ranges
+    .filter(range => range.start < triggerIndex && triggerIndex < range.opening)
+    .sort((left, right) => left.opening - right.opening)[0] || null;
+};
+
+const findStatementRange = (tokens, triggerIndex) => {
+  let start = triggerIndex;
+  while (start > 0 && ![';', '{', '}'].includes(tokens[start - 1].value)) start -= 1;
+  return { start, end: findStatementEnd(tokens, start, tokens.length), opening: null };
+};
+
+const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) => {
+  const ifDecision = findIfDecision(tokens, triggerIndex, pairs);
+  if (ifDecision) {
+    const bodyStart = ifDecision.closingCondition + 1;
+    if (tokens[bodyStart]?.value === '{') {
+      return {
+        start: bodyStart + 1,
+        end: pairs.get(bodyStart) ?? tokens.length,
+        opening: bodyStart
+      };
+    }
+    return {
+      start: bodyStart,
+      end: findControlledStatementEnd(tokens, bodyStart, tokens.length, pairs),
+      opening: null
+    };
+  }
+  const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
+  if (functionDecision) {
+    return { start: functionDecision.opening + 1, end: functionDecision.closing, opening: functionDecision.opening };
+  }
+  return findStatementRange(tokens, triggerIndex);
+};
+
+const isBoundaryWriter = value => /boundary|readiness/i.test(value);
+
+const callHasGapArgument = (tokens, opening, closing, pairs) => {
+  let argumentStart = opening + 1;
+  let argumentIndex = 0;
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  const check = argumentEnd => argumentIndex < 2 && valueHasGap(tokens, argumentStart, argumentEnd, pairs);
+  for (let index = opening + 1; index < closing; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (value === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      if (check(index)) return true;
+      argumentStart = index + 1;
+      argumentIndex += 1;
+    }
+  }
+  return check(closing);
+};
+
+const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges) => {
+  const nestedFunctionStarts = new Map(functionRanges
+    .filter(range => range.opening !== opening && range.start >= start && range.opening < end)
+    .map(range => [range.start, range]));
+  for (let index = start; index < end; index += 1) {
+    const nestedFunction = nestedFunctionStarts.get(index);
+    if (nestedFunction) {
+      index = nestedFunction.closing;
+      continue;
+    }
+    const token = tokens[index];
+    if (token.value === 'return') {
+      const statementEnd = findStatementEnd(tokens, index + 1, end);
+      const expressionStart = index + 1;
+      if (valueHasGap(tokens, expressionStart, statementEnd, pairs)) return true;
+      index = Math.max(index, statementEnd - 1);
+      continue;
+    }
+    if (token.type === 'identifier' && OUTCOME_NAMES.has(token.value)
+      && tokens[index - 1]?.value !== '.' && tokens[index + 1]?.value === '=') {
+      const statementEnd = findStatementEnd(tokens, index + 2, end);
+      if (valueHasGap(tokens, index + 2, statementEnd, pairs)) return true;
+      index = Math.max(index, statementEnd - 1);
+      continue;
+    }
+    if (token.type === 'identifier' && isBoundaryWriter(token.value)
+      && tokens[index + 1]?.value === '(' && tokens[index - 1]?.value !== 'function') {
+      const closing = pairs.get(index + 1);
+      if (closing !== undefined && closing < end && callHasGapArgument(tokens, index + 1, closing, pairs)) return true;
+    }
+  }
+  return false;
+};
+
+const isDeadlineTriggerAt = (tokens, index) => {
+  const value = tokens[index]?.value;
+  if (value === 'DEADLINE' || value === 'deadlineReached') return true;
+  return value === 'Date'
+    && tokens[index + 1]?.value === '.'
+    && tokens[index + 2]?.value === 'now'
+    && tokens[index + 3]?.value === '('
+    && tokens[index + 4]?.value === ')'
+    && tokens[index + 5]?.value === '>='
+    && tokens[index + 6]?.value === 'deadline';
 };
 
 const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source }) => {
-  const lines = source.split(/\r?\n/);
-  const offenders = [];
-  let offset = 0;
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (DEADLINE_TRIGGER_PATTERN.test(line)) {
-      const triggerIndex = offset + line.search(DEADLINE_TRIGGER_PATTERN);
-      const decision = extractDeadlineDecision(source, triggerIndex);
-      const statements = decision.block ? extractTopLevelStatements(decision.body) : [decision.body];
-      if (statements.some(isGapOutcome)) offenders.push(`${relative}:${index + 1}`);
+  const tokens = tokenizeSource(source);
+  const pairs = findTokenPairs(tokens);
+  const functionRanges = findFunctionRanges(tokens, pairs);
+  const lines = new Set();
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (!isDeadlineTriggerAt(tokens, index)) continue;
+    const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
+    if (hasGapOutcome(tokens, decision.start, decision.end, decision.opening, pairs, functionRanges)) {
+      lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
     }
-    offset += line.length;
-    if (source[offset] === '\r') offset += 1;
-    if (source[offset] === '\n') offset += 1;
   }
-  return offenders;
+  return [...lines].sort((left, right) => left - right).map(line => `${relative}:${line}`);
 });
 
 test('deadline policy inventory has no direct deadline-to-gap decision', () => {
@@ -806,7 +1053,86 @@ test('deadline policy inventory scans complete outcomes and ignores unrelated ga
   ];
   assert.deepEqual(findDeadlineGapOffenders(entries), [
     'discord/multiline-owner.js:1',
-    'discord/multiline-assignment.js:1'
+    'discord/multiline-assignment.js:1',
+    'discord/nested-gap.js:1'
+  ]);
+});
+
+test('deadline policy inventory binds lexical and persistence controls to the deadline branch', () => {
+  const entries = [
+    {
+      relative: 'discord/braceless-gap.js',
+      source: [
+        'if (deadlineReached) return READINESS.GAP;',
+        'function later() { return READINESS.UNAVAILABLE; }'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/braceless-safe.js',
+      source: [
+        'if (deadlineReached) return READINESS.UNAVAILABLE;',
+        'function later() { return READINESS.GAP; }'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/braceless-safe-asi.js',
+      source: [
+        'if (deadlineReached) return READINESS.UNAVAILABLE',
+        'function later() { return READINESS.GAP; }'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/comment-brace.js',
+      source: [
+        'if (deadlineReached) { // }',
+        "  return 'gap';",
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/comment-decoy.js',
+      source: [
+        "if (deadlineReached) return READINESS.UNAVAILABLE; // state: 'gap'",
+        'const regex = /return gap/;'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/regex-brace.js',
+      source: [
+        'if (deadlineReached) {',
+        '  const regex = /}/;',
+        '  return READINESS.GAP;',
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/template-return.js',
+      source: 'if (deadlineReached) return `gap`;'
+    },
+    {
+      relative: 'discord/template-property.js',
+      source: 'if (deadlineReached) return { state: `gap` };'
+    },
+    {
+      relative: 'discord/template-decoy.js',
+      source: 'if (deadlineReached) return { detail: `state: gap` };'
+    },
+    {
+      relative: 'discord/persistence-gap.js',
+      source: 'if (deadlineReached) state.markIntakeBoundary(id, READINESS.GAP, detail);'
+    },
+    {
+      relative: 'discord/persistence-safe.js',
+      source: "if (deadlineReached) state.markIntakeBoundary(id, READINESS.UNAVAILABLE, 'gap');"
+    }
+  ];
+  assert.deepEqual(findDeadlineGapOffenders(entries), [
+    'discord/braceless-gap.js:1',
+    'discord/comment-brace.js:1',
+    'discord/regex-brace.js:1',
+    'discord/template-return.js:1',
+    'discord/template-property.js:1',
+    'discord/persistence-gap.js:1'
   ]);
 });
 
