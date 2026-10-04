@@ -38,7 +38,7 @@ const {
 const { THREAD_STATES } = require('./state/thread-enrollment');
 const { heldParentRequestIds, legacyParentReconciliationChannel } = require('./state/legacy-agent-request-route');
 const { parseComponentInteraction, parseCsInteraction, sendInteractionCallback, upsertGuildCsCommand } = require('./discord-interaction');
-const { createDecisionConsumer } = require('./discord/decision');
+const { createDecisionConsumer, renderDecisionProjection } = require('./discord/decision');
 const { sendDiscordMessage, fetchDiscordChannel } = require('./discord/http-transport');
 const { sendGatewayTransportReceipt } = require('./discord/transport-receipts');
 const { createSurfaceConsumer: createSurfaceConsumerImpl } = require('./discord/surface-consumer');
@@ -476,7 +476,7 @@ class DiscordGateway {
     return this.consumer.processAccepted(message, signal);
   }
 
-  async projectDecisionMessage({ click, answer }, signal) {
+  async projectDecisionMessage({ click, presentation, answer }, signal) {
     if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent' });
     const channel = await this.client.channels?.fetch?.(click.channelId);
     const message = await channel?.messages?.fetch?.(click.messageId);
@@ -501,7 +501,8 @@ class DiscordGateway {
         throw new Error('decision projection authorization is no longer valid');
       }
     }
-    return message.edit({ content: answer, components: [] });
+    const original = presentation || this.state.getDecisionPresentation(click.presentationId);
+    return message.edit(renderDecisionProjection(original, answer));
   }
 
   async sendInteractionRejection(interaction, reason, signal) {

@@ -44,6 +44,20 @@ const { DISPATCH_OUTCOMES, MESSAGE_STATES } = require('../../src/state') as {
   }>;
 };
 
+const DECISION_EMBED_DESCRIPTION_LIMIT = 4096;
+
+export function renderDecisionProjection(presentation: Pick<DecisionPresentation, 'content'>, answer: string) {
+  const inline = answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT;
+  return {
+    content: presentation.content,
+    embeds: [{ title: 'Selected action', description: inline ? answer : 'Full answer attached in selected-action.txt.' }],
+    components: [],
+    attachments: [],
+    allowedMentions: { parse: [] },
+    ...(inline ? {} : { files: [{ attachment: Buffer.from(answer, 'utf8'), name: 'selected-action.txt' }] })
+  };
+}
+
 export interface DecisionMessage {
   id: string;
   guildId: string;

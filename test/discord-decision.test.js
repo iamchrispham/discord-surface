@@ -13,7 +13,7 @@ const { READINESS, SurfaceState } = require('../src/state');
 
 const NATIVE_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 
-async function fixture(t, { callback = null } = {}) {
+async function fixture(t, { callback = null, questionText = 'Choose the canonical answer' } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-decision-gateway-'));
   const db = path.join(dir, 'surface.sqlite');
   const secretFile = path.join(dir, 'discord.secret');
@@ -33,7 +33,7 @@ async function fixture(t, { callback = null } = {}) {
     requestId: `gateway-${path.basename(dir)}`,
     target: 'run:discord-gateway',
     head: '-',
-    question: 'Choose the canonical answer',
+    question: questionText,
     menu: [{ key: 'approve', consequence: 'apply the saved choice' }, 'hold'],
     channelId: 'channel',
     provider: 'codex',
@@ -144,7 +144,12 @@ test('Gateway settles competing component clicks once and imports the canonical 
   assert.deepEqual(f.callbacks.map(item => item.body), [{ type: 6 }, { type: 6 }]);
   assert.equal(f.dispatches.length, 1);
   assert.equal(f.edits.length, 2);
-  assert.deepEqual(f.edits.map(item => item.content), ['approve', 'approve']);
+  assert.deepEqual(f.edits.map(item => item.embeds), [
+    [{ title: 'Selected action', description: 'approve' }],
+    [{ title: 'Selected action', description: 'approve' }]
+  ]);
+  assert.ok(f.edits.every(item => item.components.length === 0));
+  assert.deepEqual(f.edits.map(item => item.content), [f.posts[0].content, f.posts[0].content]);
   assert.equal(decisionMessages(f.state).length, 1);
   const row = decisionMessages(f.state)[0];
   assert.equal(row.decisionResult.answer, 'approve');
@@ -178,7 +183,7 @@ test('bound component ingress keeps callback custody before readiness and gates 
   f.gateway.resolveInteractionRecovery(true);
   await waitForCondition(() => f.edits.length === 1 && f.dispatches.length === 1,
     'decision continuation did not resume after readiness barrier');
-  assert.deepEqual(f.edits.map(item => item.content), ['approve']);
+  assert.deepEqual(f.edits.map(item => item.content), [f.posts[0].content]);
   assert.equal(decisionMessages(f.state).length, 1);
 
   const aborted = await fixture(t);
@@ -225,7 +230,7 @@ test('decision native return is held before startup and proceeds once after a he
 
   assert.equal(f.dispatches.length, 1);
   assert.equal(f.edits.length, 1);
-  assert.deepEqual(f.edits.map(item => item.content), ['approve']);
+  assert.deepEqual(f.edits.map(item => item.content), [f.posts[0].content]);
   assert.equal(decisionMessages(f.state).length, 1);
   assert.equal(f.state.getDecisionClick('native-after-start').nativeReturn.outcome, 'submitted');
   assert.equal(f.state.getDecisionClick('held-before-start').nativeReturn, null);
@@ -380,6 +385,8 @@ test('recovery resumes an admitted click without repeating its callback and pres
   assert.deepEqual(remaining, []);
   assert.equal(click.callbackOutcome, null);
   assert.equal(click.canonical.answer, 'hold');
+  assert.equal(f.edits[0].content, f.posts[0].content);
+  assert.deepEqual(f.edits[0].embeds, [{ title: 'Selected action', description: 'hold' }]);
   assert.equal(recoveredState.interactionResponseTarget('recovered-component'), f.presentation.messageId);
   assert.equal(recoveredState.listMessages().filter(message => message.decisionResult).length, 1);
 });
@@ -422,6 +429,8 @@ test('restart recovery classifies an interrupted callback without resending it',
   assert.equal(recoveryCallbacks, 0);
   assert.equal(click.callbackOutcome, 'unknown');
   assert.equal(click.canonical.answer, 'hold');
+  assert.equal(f.edits[0].content, f.posts[0].content);
+  assert.deepEqual(f.edits[0].embeds, [{ title: 'Selected action', description: 'hold' }]);
   assert.equal(recoveredState.interactionResponseTarget('restart-callback'), f.presentation.messageId);
   assert.equal(recoveredState.listMessages().filter(message => message.decisionResult).length, 1);
 });
@@ -466,3 +475,57 @@ test('cancellation leaves accepted pre-row custody and Gateway stop drains it', 
   await f.gateway.stop();
   assert.equal(f.gateway.stopping, false);
 });
+
+test('a full-length decision keeps every prompt character after selection', { timeout: 30000 }, async t => {
+  const sample = await fixture(t);
+  const suffixLength = sample.posts[0].content.length - sample.request.question.length;
+  const f = await fixture(t, { questionText: 'Q'.repeat(2000 - suffixLength) });
+  assert.equal(f.posts[0].content.length, 2000);
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId: 'full-prompt', presentationId: f.presentation.presentationId, selectedKey: 'approve',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  await f.gateway.projectDecisionMessage({ click: admitted.click, presentation: f.presentation, answer: 'approve' },
+    new AbortController().signal);
+  assert.equal(f.edits[0].content, f.posts[0].content);
+  assert.deepEqual(f.edits[0].embeds, [{ title: 'Selected action', description: 'approve' }]);
+  assert.deepEqual(f.edits[0].components, []);
+});
+
+for (const length of [4096, 4097, 10000]) {
+  test(`decision projection preserves a ${length}-character answer across repeated recovery edits`, { timeout: 30000 }, async t => {
+    const f = await fixture(t);
+    const admitted = f.state.admitDecisionClickAndBeginCallback({
+      interactionId: `answer-${length}`, presentationId: f.presentation.presentationId, selectedKey: 'approve',
+      actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+      binding: f.state.getBinding('channel')
+    });
+    assert.equal(admitted.accepted, true);
+    const answer = '文'.repeat(length);
+    await f.gateway.projectDecisionMessage({ click: admitted.click, presentation: f.presentation, answer },
+      new AbortController().signal);
+    const recoveredState = new SurfaceState(f.db);
+    const recovered = new DiscordGateway({ state: recoveredState, client: f.gateway.client });
+    t.after(async () => { await recovered.stop(); recoveredState.close(); });
+    await recovered.projectDecisionMessage({ click: recoveredState.getDecisionClick(`answer-${length}`), answer },
+      new AbortController().signal);
+    assert.equal(f.edits.length, 2);
+    for (const payload of f.edits) {
+      assert.equal(payload.content, f.posts[0].content);
+      assert.deepEqual(payload.components, []);
+      assert.deepEqual(payload.attachments, []);
+      assert.deepEqual(payload.allowedMentions, { parse: [] });
+      assert.ok(payload.embeds[0].description.length <= 4096);
+      if (length <= 4096) {
+        assert.equal(payload.embeds[0].description, answer);
+        assert.equal(payload.files, undefined);
+      } else {
+        assert.equal(payload.files.length, 1);
+        assert.equal(payload.files[0].name, 'selected-action.txt');
+        assert.deepEqual(payload.files[0].attachment, Buffer.from(answer, 'utf8'));
+      }
+    }
+  });
+}
