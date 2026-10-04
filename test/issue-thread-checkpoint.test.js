@@ -137,6 +137,9 @@ async function pendingScenario(t, secondDeadline) {
   let checkpointStarts = 0;
   const checkpointEntries = [];
   const originalBegin = f.gateway.beginLiveCheckpoint.bind(f.gateway);
+  const originalSchedule = f.gateway.scheduleLiveCheckpointRetry.bind(f.gateway);
+  const childCheckpoints = [];
+  const retryTimers = [];
   let capped = null;
   f.gateway.beginLiveCheckpoint = function(counts = new Map(), ...options) {
     checkpointStarts++;
@@ -146,8 +149,42 @@ async function pendingScenario(t, secondDeadline) {
       capped = { counts: [...counts], live: [...this.liveIntakeCounts], recovery: Boolean(this.recoveryPromise) };
       return;
     }
-    return originalBegin(counts, ...options);
+    const before = this.liveCheckpointPromise;
+    const result = originalBegin(counts, ...options);
+    const installed = this.liveCheckpointPromise;
+    if (installed && installed !== before && counts instanceof Map && counts.has(f.child.id)) {
+      childCheckpoints.push(installed);
+    }
+    return result;
   };
+  // The retry owner creates a timer only on its first deferred call; later calls
+  // may extend the accumulated channel set. Capture each real timer (delay
+  // unchanged) so the drain can await its callback when that accumulated set
+  // names the child, and never await an unrelated timer to discover its channels.
+  f.gateway.scheduleLiveCheckpointRetry = function(deferredCounts) {
+    let captured = null;
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = (callback, delay, ...rest) => {
+      const timer = realSetTimeout(() => {
+        captured.fired();
+        callback();
+      }, delay, ...rest);
+      let markFired;
+      captured = { timer, fired: new Promise(resolve => { markFired = resolve; }), markFired };
+      return timer;
+    };
+    let result;
+    try { result = originalSchedule(deferredCounts); }
+    finally { globalThis.setTimeout = realSetTimeout; }
+    if (captured && this.liveCheckpointRetryTimer === captured.timer) {
+      retryTimers.push({ timer: captured.timer, fired: captured.fired, awaited: false });
+    }
+    return result;
+  };
+  t.after(() => {
+    f.gateway.beginLiveCheckpoint = originalBegin;
+    f.gateway.scheduleLiveCheckpointRetry = originalSchedule;
+  });
   f.gateway.recoveryTimeoutMs = 30;
   const slowChild = f.makeChannel('1500', ChannelType.PublicThread);
   if (secondDeadline) {
@@ -176,7 +213,25 @@ async function pendingScenario(t, secondDeadline) {
   await f.gateway.recoverTransport('reconnect');
   const firstRetry = f.gateway.liveCheckpointPromise;
   if (firstRetry) await firstRetry;
-  await new Promise(resolve => setTimeout(resolve, 120));
+  // Wait on real checkpoint completion rather than a fixed delay: drain every
+  // recorded child checkpoint, then run the captured retry timer only when its
+  // accumulated channel set names the child. The owner's finally block adds a
+  // child checkpoint synchronously, so the drain repeats until neither source
+  // yields more work.
+  for (;;) {
+    let progressed = false;
+    while (childCheckpoints.length) {
+      await childCheckpoints.shift();
+      progressed = true;
+    }
+    const timer = retryTimers.find(item => !item.awaited && (f.gateway.liveCheckpointRetryChannels || new Set()).has(f.child.id));
+    if (timer) {
+      timer.awaited = true;
+      await timer.fired;
+      progressed = true;
+    }
+    if (!progressed) break;
+  }
   await f.gateway.consumer.waitForReceipts();
   await f.gateway.consumer.waitForNativeWork();
   const snapshot = {

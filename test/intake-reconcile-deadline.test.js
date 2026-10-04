@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { fixture } = require('./helpers/intake-recovery-fixture');
+const { getReconciliationLookup } = require('../dist/discord/reconciliation-lookups');
 
 test('pending facade preserves the original rejection settlement order', async () => {
   const { DiscordGateway } = require('../src/discord.js');
@@ -46,6 +47,53 @@ function seedReplyReady(f, id, channelId = '1000') {
     text: 'saved reply'
   });
   return stored;
+}
+
+// Starts one real pending SDK lookup for the fixture destination and returns
+// its fetch counter plus the resolver for that shared promise.
+function armPendingLookup(f) {
+  f.gateway.recoveryTimeoutMs = 30;
+  f.gateway.sendAcknowledgment = async () => {};
+  let release;
+  let fetches = 0;
+  f.gateway.client.channels.fetch = id => {
+    fetches += 1;
+    return new Promise(resolve => { release = () => resolve(f.channels.get(id)); });
+  };
+  return { get fetches() { return fetches; }, release: () => release() };
+}
+
+// Reopen builds a new gateway over the same client; only the deadline
+// configuration is restored, leaving the single outstanding fetch override.
+function rearmDeadline(f) {
+  f.gateway.recoveryTimeoutMs = 30;
+  f.gateway.sendAcknowledgment = async () => {};
+}
+
+// Records each reconciliation pass started on the current gateway (including
+// the pass an abandoned waiter's settlement queues) and drains them in order,
+// so a late settlement is awaited instead of polled.
+function trackReconcilePasses(f) {
+  const passes = [];
+  const original = f.gateway.reconcilePending.bind(f.gateway);
+  f.gateway.reconcilePending = (...args) => {
+    const pass = original(...args);
+    passes.push(pass);
+    return pass;
+  };
+  return async function drain() {
+    let index = 0;
+    for (;;) {
+      while (index < passes.length) {
+        await passes[index].catch(() => {});
+        index += 1;
+      }
+      await f.gateway.consumer.waitForReceipts();
+      await f.gateway.consumer.waitForNativeWork();
+      await Promise.resolve();
+      if (index >= passes.length) break;
+    }
+  };
 }
 
 for (const adoptThread of [true, false]) {
@@ -299,177 +347,161 @@ test('T4: stop returns without awaiting a stuck lookup and later settlement is i
   assert.equal(reconcileCalls, 1, 'a settlement after stop must not enqueue reconciliation');
 });
 
-// T5 exercises the adopted still-pending lookup path. node:test counts nested
-// t.test() subtests as tests, and the three-suite gate pins the total at exactly
-// 101, so all six phases stay inside this single top-level test; each phase
-// builds its own fixture so custody, lookups, and counters cannot leak.
-test('T5: an adopted pending lookup keeps late-settlement interest across deadlines and fences', { timeout: 4000 }, async t => {
-  // Starts one real pending SDK lookup for the fixture destination and returns
-  // its fetch counter plus the resolver for that ORIGINAL shared promise.
-  const armPendingLookup = f => {
-    f.gateway.recoveryTimeoutMs = 30;
-    f.gateway.sendAcknowledgment = async () => {};
-    let release;
-    let fetches = 0;
-    f.gateway.client.channels.fetch = id => {
-      fetches += 1;
-      return new Promise(resolve => { release = () => resolve(f.channels.get(id)); });
-    };
-    return { get fetches() { return fetches; }, release: () => release() };
-  };
-  // Reopen builds a new gateway over the same client; restore only the deadline
-  // configuration and leave the single outstanding fetch override in place.
-  const rearmDeadline = f => {
-    f.gateway.recoveryTimeoutMs = 30;
-    f.gateway.sendAcknowledgment = async () => {};
-  };
-  const repliedWait = async (f, id) => {
-    const waitUntil = Date.now() + 1000;
-    while (f.state.getMessage(id).state !== 'replied' && Date.now() < waitUntil) await delay(10);
-  };
+// T5.1: the adopted-waiter defect. The first pass starts the lookup and gives up
+// at its deadline; a reconnect pass adopts the SAME unresolved promise, gives up
+// again, and then the original promise settles. The adopted waiter must still
+// retain late-settlement interest and deliver once.
+test('T5.1: adopted late settlement replies once', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  seedReplyReady(f, '101', '1000');
+  f.enableDelivery();
+  const pending = armPendingLookup(f);
 
-  // case 1: the adopted-waiter defect. The first pass starts the lookup and
-  // gives up at its deadline; a reconnect pass adopts the SAME unresolved
-  // promise, gives up again, and then the original promise settles. The adopted
-  // waiter must still retain late-settlement interest and deliver once.
-  {
-    const f = fixture(t);
-    seedReplyReady(f, '101', '1000');
-    f.enableDelivery();
-    const pending = armPendingLookup(f);
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(pending.fetches, 1, 'T5.1: the first pass starts exactly one lookup');
+  assert.equal(f.state.getMessage('101').state, 'reply_ready');
 
+  await f.reopen();
+  rearmDeadline(f);
+  const lookup = getReconciliationLookup(f.gateway.client, '1000');
+  const drain = trackReconcilePasses(f);
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(pending.fetches, 1, 'T5.1: the reconnect adopts the outstanding lookup');
+  assert.equal(f.state.getMessage('101').state, 'reply_ready', 'T5.1: the adopted deadline keeps custody held');
+
+  pending.release();
+  await lookup.catch(() => {});
+  await drain();
+  assert.equal(f.state.getMessage('101').state, 'replied', 'T5.1: late settlement wakes the adopted waiter');
+  assert.equal(f.replies.length, 1, 'T5.1: exactly one saved reply');
+  assert.equal(pending.fetches, 1, 'T5.1: no second speculative fetch');
+  assert.equal(f.dispatched.length, 0, 'T5.1: no native redispatch');
+});
+
+// T5.2: stale-only settlement. After the original wait expires and the gateway
+// reopens, the promise settles while NO new pass has attached a current waiter,
+// so nothing may act and no retry storm may start.
+test('T5.2: stale-only settlement preserves custody', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  seedReplyReady(f, '102', '1000');
+  f.enableDelivery();
+  const pending = armPendingLookup(f);
+
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(pending.fetches, 1);
+  await f.reopen();
+  rearmDeadline(f);
+  const lookup = getReconciliationLookup(f.gateway.client, '1000');
+  const drain = trackReconcilePasses(f);
+
+  pending.release();
+  await lookup.catch(() => {});
+  await drain();
+  assert.equal(f.replies.length, 0, 'T5.2: no current waiter means no reply');
+  assert.equal(f.dispatched.length, 0, 'T5.2: no native redispatch');
+  assert.equal(f.state.getMessage('102').state, 'reply_ready', 'T5.2: custody stays held');
+  assert.equal(pending.fetches, 1, 'T5.2: settlement does not start a retry storm');
+});
+
+// T5.3: authority fencing by binding generation. An adopted waiter is current,
+// but the fixture binding generation moves +1 before settlement, so the late
+// continuation must refuse without sending or dispatching.
+test('T5.3: changed generation refuses late settlement', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  seedReplyReady(f, '103', '1000');
+  f.enableDelivery();
+  const pending = armPendingLookup(f);
+
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(pending.fetches, 1);
+  await f.reopen();
+  rearmDeadline(f);
+  const lookup = getReconciliationLookup(f.gateway.client, '1000');
+  const drain = trackReconcilePasses(f);
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(pending.fetches, 1, 'T5.3: the reconnect adopts the outstanding lookup');
+
+  f.state.db.prepare('UPDATE bindings SET generation=generation+1 WHERE channel_id=?').run('1000');
+  pending.release();
+  await lookup.catch(() => {});
+  await drain();
+  assert.equal(f.replies.length, 0, 'T5.3: a stale generation must not send');
+  assert.equal(f.dispatched.length, 0, 'T5.3: a stale generation must not dispatch');
+  assert.equal(f.state.getMessage('103').state, 'reply_ready', 'T5.3: custody stays held');
+});
+
+// T5.4: authority fencing by revoked permission. The adopted waiter is current,
+// but the fixture destination stops granting send permission before settlement,
+// so the late continuation must refuse.
+test('T5.4: revoked permission refuses late settlement', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  seedReplyReady(f, '104', '1000');
+  f.enableDelivery();
+  const pending = armPendingLookup(f);
+
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(pending.fetches, 1);
+  await f.reopen();
+  rearmDeadline(f);
+  const lookup = getReconciliationLookup(f.gateway.client, '1000');
+  const drain = trackReconcilePasses(f);
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(pending.fetches, 1, 'T5.4: the reconnect adopts the outstanding lookup');
+
+  f.channels.get('1000').permissionsFor = () => ({ has: () => false });
+  pending.release();
+  await lookup.catch(() => {});
+  await drain();
+  assert.equal(f.replies.length, 0, 'T5.4: revoked permission must not send');
+  assert.equal(f.dispatched.length, 0, 'T5.4: revoked permission must not dispatch');
+  assert.equal(f.state.getMessage('104').state, 'reply_ready', 'T5.4: custody stays held');
+});
+
+// T5.5: repeated-deadline guard. Two consecutive adopted deadline expiries must
+// keep charging the same single unresolved lookup, not start a new one.
+test('T5.5: repeated deadlines share one lookup', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  seedReplyReady(f, '105', '1000');
+  f.enableDelivery();
+  const pending = armPendingLookup(f);
+
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(pending.fetches, 1);
+  await f.reopen();
+  rearmDeadline(f);
+  for (let pass = 0; pass < 2; pass += 1) {
     await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    assert.equal(pending.fetches, 1, 'case 1: the first pass starts exactly one lookup');
-    assert.equal(f.state.getMessage('101').state, 'reply_ready');
-
-    await f.reopen();
-    rearmDeadline(f);
-    await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    assert.equal(pending.fetches, 1, 'case 1: the reconnect adopts the outstanding lookup');
-    assert.equal(f.state.getMessage('101').state, 'reply_ready', 'case 1: the adopted deadline keeps custody held');
-
-    pending.release();
-    await repliedWait(f, '101');
-    assert.equal(f.state.getMessage('101').state, 'replied', 'case 1: late settlement wakes the adopted waiter');
-    assert.equal(f.replies.length, 1, 'case 1: exactly one saved reply');
-    assert.equal(pending.fetches, 1, 'case 1: no second speculative fetch');
-    assert.equal(f.dispatched.length, 0, 'case 1: no native redispatch');
   }
+  assert.equal(pending.fetches, 1, 'T5.5: one SDK promise per destination across adopted deadlines');
+  assert.equal(f.state.getMessage('105').state, 'reply_ready');
+  assert.equal(f.replies.length, 0);
+});
 
-  // case 2: stale-only settlement. After the original wait expires and the
-  // gateway reopens, the promise settles while NO new pass has attached a
-  // current waiter, so nothing may act and no retry storm may start.
-  {
-    const f = fixture(t);
-    seedReplyReady(f, '102', '1000');
-    f.enableDelivery();
-    const pending = armPendingLookup(f);
+// T5.6: success guard. An adopted pass that is still within its deadline when
+// the original promise settles must deliver exactly once with no second
+// speculative fetch.
+test('T5.6: timely adopted success replies once', { timeout: 4000 }, async t => {
+  const f = fixture(t);
+  seedReplyReady(f, '106', '1000');
+  f.enableDelivery();
+  const pending = armPendingLookup(f);
 
-    await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    assert.equal(pending.fetches, 1);
-    await f.reopen();
-    rearmDeadline(f);
-    pending.release();
-    await delay(150);
-    assert.equal(f.replies.length, 0, 'case 2: no current waiter means no reply');
-    assert.equal(f.dispatched.length, 0, 'case 2: no native redispatch');
-    assert.equal(f.state.getMessage('102').state, 'reply_ready', 'case 2: custody stays held');
-    assert.equal(pending.fetches, 1, 'case 2: settlement does not start a retry storm');
-  }
+  await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
+  assert.equal(pending.fetches, 1);
+  await f.reopen();
+  f.gateway.recoveryTimeoutMs = 500;
+  f.gateway.sendAcknowledgment = async () => {};
 
-  // case 3: authority fencing by binding generation. An adopted waiter is
-  // current, but the fixture binding generation moves +1 before settlement, so
-  // the late continuation must refuse without sending or dispatching.
-  {
-    const f = fixture(t);
-    seedReplyReady(f, '103', '1000');
-    f.enableDelivery();
-    const pending = armPendingLookup(f);
-
-    await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    assert.equal(pending.fetches, 1);
-    await f.reopen();
-    rearmDeadline(f);
-    await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    assert.equal(pending.fetches, 1, 'case 3: the reconnect adopts the outstanding lookup');
-
-    f.state.db.prepare('UPDATE bindings SET generation=generation+1 WHERE channel_id=?').run('1000');
-    pending.release();
-    await delay(200);
-    assert.equal(f.replies.length, 0, 'case 3: a stale generation must not send');
-    assert.equal(f.dispatched.length, 0, 'case 3: a stale generation must not dispatch');
-    assert.equal(f.state.getMessage('103').state, 'reply_ready', 'case 3: custody stays held');
-  }
-
-  // case 4: authority fencing by revoked permission. The adopted waiter is
-  // current, but the fixture destination stops granting send permission before
-  // settlement, so the late continuation must refuse.
-  {
-    const f = fixture(t);
-    seedReplyReady(f, '104', '1000');
-    f.enableDelivery();
-    const pending = armPendingLookup(f);
-
-    await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    assert.equal(pending.fetches, 1);
-    await f.reopen();
-    rearmDeadline(f);
-    await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    assert.equal(pending.fetches, 1, 'case 4: the reconnect adopts the outstanding lookup');
-
-    f.channels.get('1000').permissionsFor = () => ({ has: () => false });
-    pending.release();
-    await delay(200);
-    assert.equal(f.replies.length, 0, 'case 4: revoked permission must not send');
-    assert.equal(f.dispatched.length, 0, 'case 4: revoked permission must not dispatch');
-    assert.equal(f.state.getMessage('104').state, 'reply_ready', 'case 4: custody stays held');
-  }
-
-  // case 5: repeated-deadline guard. Two consecutive adopted deadline expiries
-  // must keep charging the same single unresolved lookup, not start a new one.
-  {
-    const f = fixture(t);
-    seedReplyReady(f, '105', '1000');
-    f.enableDelivery();
-    const pending = armPendingLookup(f);
-
-    await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    assert.equal(pending.fetches, 1);
-    await f.reopen();
-    rearmDeadline(f);
-    for (let pass = 0; pass < 2; pass += 1) {
-      await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    }
-    assert.equal(pending.fetches, 1, 'case 5: one SDK promise per destination across adopted deadlines');
-    assert.equal(f.state.getMessage('105').state, 'reply_ready');
-    assert.equal(f.replies.length, 0);
-  }
-
-  // case 6: success guard. An adopted pass that is still within its deadline
-  // when the original promise settles must deliver exactly once with no second
-  // speculative fetch.
-  {
-    const f = fixture(t);
-    seedReplyReady(f, '106', '1000');
-    f.enableDelivery();
-    const pending = armPendingLookup(f);
-
-    await settle(f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true }));
-    assert.equal(pending.fetches, 1);
-    await f.reopen();
-    f.gateway.recoveryTimeoutMs = 500;
-    f.gateway.sendAcknowledgment = async () => {};
-
-    const adopted = f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
-    await delay(20);
-    pending.release();
-    await settle(adopted);
-    await repliedWait(f, '106');
-    assert.equal(f.state.getMessage('106').state, 'replied', 'case 6: late success delivers');
-    assert.equal(f.replies.length, 1, 'case 6: delivers exactly once');
-    assert.equal(pending.fetches, 1, 'case 6: no second speculative fetch');
-    assert.equal(f.dispatched.length, 0, 'case 6: no native redispatch');
-  }
+  const adopted = f.gateway.reconcilePending(undefined, { allowPaused: true, readyOnly: true });
+  await new Promise(resolve => setImmediate(resolve));
+  pending.release();
+  await settle(adopted);
+  await f.gateway.consumer.waitForReceipts();
+  await f.gateway.consumer.waitForNativeWork();
+  assert.equal(f.state.getMessage('106').state, 'replied', 'T5.6: late success delivers');
+  assert.equal(f.replies.length, 1, 'T5.6: delivers exactly once');
+  assert.equal(pending.fetches, 1, 'T5.6: no second speculative fetch');
+  assert.equal(f.dispatched.length, 0, 'T5.6: no native redispatch');
 });
 
 test('T6: an immediate rejection does not self-retry; an explicit later call may deliver', { timeout: 4000 }, async t => {
