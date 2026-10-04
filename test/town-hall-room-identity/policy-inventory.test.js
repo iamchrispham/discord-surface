@@ -120,9 +120,40 @@ function collectBindings(sourceFile) {
 }
 
 function countIdentifierReferences(sourceFile, name) {
+  const bindings = collectBindings(sourceFile);
+  const importBindings = [];
+  const collectImportBindings = node => {
+    if (ts.isImportDeclaration(node) && node.importClause) {
+      const scope = sourceFile;
+      if (node.importClause.name) {
+        importBindings.push({
+          declaration: node.importClause.name,
+          name: node.importClause.name.text,
+          scope,
+        });
+      }
+      if (node.importClause.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
+        for (const element of node.importClause.namedBindings.elements) {
+          importBindings.push({ declaration: element.name, name: element.name.text, scope });
+        }
+      }
+    }
+    ts.forEachChild(node, collectImportBindings);
+  };
+  collectImportBindings(sourceFile);
+  bindings.push(...importBindings);
+  const candidates = bindings.filter(binding => binding.name === name &&
+    binding.scope === sourceFile);
+  const target = candidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&
+    binding.declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) ||
+    candidates[0] || null;
+  if (!target) return 0;
   let count = 0;
   const visit = node => {
-    if (ts.isIdentifier(node) && node.text === name && isSemanticIdentifierReference(node)) count += 1;
+    if (ts.isIdentifier(node) && node.text === name &&
+        node !== target.declaration.name &&
+        isSemanticIdentifierReference(node) &&
+        resolveBinding(node, bindings) === target.declaration) count += 1;
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
@@ -311,10 +342,20 @@ function isTownHallContext(scope, sourceFile, bindings) {
     hasTownHallCallsite(scope, sourceFile, bindings);
 }
 
+function isNeutralRoomPolicy(scope) {
+  const owner = functionBinding(scope);
+  const ownerName = scope?.name && ts.isIdentifier(scope.name)
+    ? scope.name.text
+    : owner ? bindingName(owner) : null;
+  const fileName = scope?.getSourceFile?.().fileName || scope?.fileName || '';
+  return /snowflake/i.test(ownerName || '') || /(?:^|[\\/])snowflake\.[cm]?[tj]s$/.test(fileName);
+}
+
 function roomFieldSubject(node, sourceFile, bindings) {
   const subject = regexInput(node);
   if (!subject) return false;
   const scope = enclosingFunction(node) || sourceFile;
+  if (isNeutralRoomPolicy(scope)) return false;
   const townHallContext = isTownHallContext(scope, sourceFile, bindings);
   return isNamedRoomField(subject) ||
     hasRoomFieldAlias(scope, subject, sourceFile, bindings) ||
@@ -673,7 +714,7 @@ function roomDigitPolicies(records) {
               indexCommonJsFunction(property.name.text, property.initializer);
             }
           }
-        } else if (!statement.isExportEquals && ts.isIdentifier(statement.expression)) {
+        } else if (ts.isIdentifier(statement.expression)) {
           info.exports.set('default', statement.expression.text);
         }
       }
@@ -917,6 +958,77 @@ function roomDigitPolicies(records) {
     return inputs;
   };
 
+  const importedRegexInputs = (info, localName, imported) => {
+    const inputs = [];
+    const visit = node => {
+      if (ts.isIdentifier(node) && node.text === localName) {
+        const binding = findBinding(info, localName, node);
+        const requireBinding = binding?.source && ts.isCallExpression(binding.source) &&
+          ts.isIdentifier(binding.source.expression) && binding.source.expression.text === 'require';
+        const importedBinding = !binding || imported.commonJs || requireBinding;
+        if (importedBinding) {
+          const parent = node.parent;
+          if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+              parent.expression === node &&
+              ['test', 'exec'].includes(callPropertyName(parent)) && ts.isCallExpression(parent.parent)) {
+            if (parent.parent.arguments[0]) inputs.push(parent.parent.arguments[0]);
+          } else if (ts.isCallExpression(parent) && parent.arguments[0] === node &&
+              ['match', 'search'].includes(callPropertyName(parent.expression))) {
+            inputs.push(parent.expression.expression);
+          } else if (ts.isCallExpression(parent) && parent.arguments[1] === node &&
+              ts.isPropertyAccessExpression(parent.expression) &&
+              parent.expression.name.text === 'call' &&
+              callPropertyName(parent.expression.expression) === 'search' &&
+              parent.arguments[0]) {
+            inputs.push(parent.arguments[0]);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(info.ast);
+    return inputs;
+  };
+
+  const resolveRegexExport = (info, name, seen = new Set()) => {
+    const marker = `${info.file}\u0000${name}`;
+    if (seen.has(marker)) return null;
+    seen.add(marker);
+    const exported = info.exports.get(name);
+    if (exported && typeof exported === 'object') {
+      if (exported.kind === 'reexport') {
+        const target = resolveModule(info, exported.specifier);
+        return target ? resolveRegexExport(target, exported.imported, seen) : null;
+      }
+      return null;
+    }
+    for (const specifier of info.starExports) {
+      const target = resolveModule(info, specifier);
+      const resolved = target ? resolveRegexExport(target, name, seen) : null;
+      if (resolved) return resolved;
+    }
+    const localName = typeof exported === 'string' ? exported : name;
+    let result = null;
+    const visit = node => {
+      if (result || !ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) ||
+          node.name.text !== localName || !node.initializer) {
+        ts.forEachChild(node, visit);
+        return;
+      }
+      const initializer = node.initializer;
+      if (ts.isRegularExpressionLiteral(initializer)) {
+        result = { info, name, declaration: node, pattern: initializer.text };
+      } else if (ts.isCallExpression(initializer) && ts.isIdentifier(initializer.expression) &&
+          initializer.expression.text === 'RegExp' && initializer.arguments.length &&
+          ts.isStringLiteralLike(initializer.arguments[0])) {
+        result = { info, name, declaration: node, pattern: initializer.arguments[0].text };
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(info.ast);
+    return result;
+  };
+
   const sites = legacyRoomDigitPolicies(records);
   for (const info of infos) {
     const legacyBindings = collectBindings(info.ast);
@@ -934,8 +1046,8 @@ function roomDigitPolicies(records) {
           isSplitRoomDigitPolicy(node, info.ast, pattern, legacyBindings);
         const roomScope = enclosingFunction(node) || info.ast;
         const roomContext = isTownHallContext(roomScope, info.ast, legacyBindings);
-        const isRoomInput = input => expressionIsRoomField(input, info) ||
-          (roomContext && isRoomField(input));
+        const isRoomInput = input => !isNeutralRoomPolicy(roomScope) &&
+          (expressionIsRoomField(input, info) || (roomContext && isRoomField(input)));
         if (!legacyPolicy && regexInputs(node, info).some(isRoomInput)) {
           sites[info.file] = (sites[info.file] || 0) + 1;
         }
@@ -943,6 +1055,31 @@ function roomDigitPolicies(records) {
       ts.forEachChild(node, visit);
     };
     visit(info.ast);
+  }
+  const countedRegexExports = new Set();
+  for (const consumer of infos) {
+    for (const [localName, imported] of consumer.imports) {
+      if (imported.namespace) continue;
+      const target = resolveModule(consumer, imported.specifier);
+      const resolved = target && resolveRegexExport(target, imported.imported);
+      if (!resolved || !hasAsciiDigitPattern(resolved.pattern)) continue;
+      const inputs = importedRegexInputs(consumer, localName, imported);
+      const roomInput = inputs.some(input => {
+        const scope = enclosingFunction(input) || consumer.ast;
+        return !isNeutralRoomPolicy(scope) && expressionIsRoomField(input, consumer);
+      });
+      if (!roomInput) continue;
+      const key = `${resolved.info.file}\u0000${resolved.name}`;
+      const localInputs = regexInputs(resolved.declaration.initializer, resolved.info);
+      if (localInputs.some(input => expressionIsRoomField(input, resolved.info))) {
+        countedRegexExports.add(key);
+        continue;
+      }
+      if (!countedRegexExports.has(key)) {
+        sites[resolved.info.file] = (sites[resolved.info.file] || 0) + 1;
+        countedRegexExports.add(key);
+      }
+    }
   }
   return sites;
 }
@@ -959,7 +1096,7 @@ test('room policy inventory records only town-hall room validators', () => {
     const count = countIdentifierReferences(ast, 'isTownHallRoom');
     if (count) references[relative.split(path.sep).join('/')] = count;
   }
-  assert.deepEqual(references, { 'peer/town-hall-plan.ts': 2, 'peer/town-hall-room-identity.ts': 2 });
+  assert.deepEqual(references, { 'peer/town-hall-plan.ts': 1, 'peer/town-hall-room-identity.ts': 2 });
   const referenceFixture = ts.createSourceFile('peer/reference-fixture.ts', String.raw`// isTownHallRoom
   const label = 'isTownHallRoom';
   interface Options { isTownHallRoom: boolean }
@@ -968,7 +1105,11 @@ test('room policy inventory records only town-hall room validators', () => {
   const { isTownHallRoom: flag } = options;
   function isTownHallRoom(room) { return room; }
   isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
-  assert.equal(countIdentifierReferences(referenceFixture, 'isTownHallRoom'), 2);
+  assert.equal(countIdentifierReferences(referenceFixture, 'isTownHallRoom'), 1);
+  const shadowedReferenceFixture = ts.createSourceFile('peer/shadowed-reference-fixture.ts', String.raw`function isTownHallRoom(room) { return room; }
+  function unrelated() { function isTownHallRoom(room) { return room; } return isTownHallRoom({}); }
+  isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
+  assert.equal(countIdentifierReferences(shadowedReferenceFixture, 'isTownHallRoom'), 1);
   // Synthetic fixtures are independent of production files, so reuse the production baseline.
   const uncachedRoomDigitPolicies = roomDigitPolicies;
   const productionRecordTexts = new Map(records.map(record => [record.file, record.text]));
@@ -1002,6 +1143,54 @@ test('room policy inventory records only town-hall room validators', () => {
   assert.deepEqual(roomDigitPolicies([...records, commonJsHelper, commonJsConsumer]), {
     ...expectedPolicies,
     'peer/commonjs-room-helper.js': 1
+  });
+  const exportEqualsHelper = {
+    file: 'peer/export-equals-room-helper.cts',
+    text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    export = validateGuildId;`
+  };
+  const exportEqualsConsumer = {
+    file: 'peer/export-equals-room-consumer.cts',
+    text: String.raw`const validateGuildId = require('./export-equals-room-helper');
+    function validateRoom(room) { return validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    exportEqualsHelper,
+    exportEqualsConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/export-equals-room-helper.cts': 1
+  });
+  const exportEqualsNegativeConsumer = {
+    file: 'peer/export-equals-room-negative-consumer.cts',
+    text: String.raw`const validateGuildId = require('./export-equals-room-helper');
+    function inspectRoom(room) { return validateGuildId(room.name); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    exportEqualsHelper,
+    exportEqualsNegativeConsumer,
+  ]), expectedPolicies);
+  const inlineCommonJsObjectHelper = {
+    file: 'peer/inline-commonjs-room-helper.cjs',
+    text: String.raw`module.exports = {
+      validateGuildId(value) { return /^\d{1,21}$/.test(value); },
+      validateChannelId: value => /^\d{1,21}$/.test(value),
+    };`
+  };
+  const inlineCommonJsObjectConsumer = {
+    file: 'peer/inline-commonjs-room-consumer.cjs',
+    text: String.raw`const { validateGuildId, validateChannelId } = require('./inline-commonjs-room-helper');
+    function validateRoom(room) { return validateGuildId(room.guildId) && validateChannelId(room.channelId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    inlineCommonJsObjectHelper,
+    inlineCommonJsObjectConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/inline-commonjs-room-helper.cjs': 2
   });
   const directCommonJsFunctionHelper = {
     file: 'peer/direct-commonjs-room-helper.js',
@@ -1121,6 +1310,11 @@ test('room policy inventory records only town-hall room validators', () => {
     text: String.raw`function inspect(value) { return /^[1-9]+$/.test(value); }`
   };
   assert.deepEqual(roomDigitPolicies([...records, unrelatedRestrictedDigits]), expectedPolicies);
+  const neutralSnowflakeRoomValidator = {
+    file: 'peer/snowflake.ts',
+    text: String.raw`function inspectSnowflake(room) { return /^\d{1,21}$/.test(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, neutralSnowflakeRoomValidator]), expectedPolicies);
   const directCall = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return RegExp('^[0-9]{1,21}$').test(room.channelId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, directCall]), expectedPolicies);
   const destructuredRoomField = {
@@ -1147,6 +1341,31 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/future-room.ts': 1
   });
+  const importedRegexHelper = {
+    file: 'peer/imported-room-regex.ts',
+    text: 'export const ROOM_ID = /^\\d{1,21}$/;'
+  };
+  const importedRegexConsumer = {
+    file: 'peer/imported-room-regex-consumer.ts',
+    text: "import { ROOM_ID } from './imported-room-regex'; function validateRoom(room) { return ROOM_ID.test(room.guildId); }"
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importedRegexHelper,
+    importedRegexConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/imported-room-regex.ts': 1
+  });
+  const importedRegexNegativeConsumer = {
+    file: 'peer/imported-room-regex-negative-consumer.ts',
+    text: "import { ROOM_ID } from './imported-room-regex'; function inspectRoom(room) { return ROOM_ID.test(room.name); }"
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importedRegexHelper,
+    importedRegexNegativeConsumer,
+  ]), expectedPolicies);
   const shadowedRegex = {
     file: 'peer/snowflake.ts',
     text: String.raw`const ROOM_ID = /^\d+$/;
@@ -1394,63 +1613,39 @@ test('room policy inventory records only town-hall room validators', () => {
   const splitNeutral = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(room) {
     return /^\d+$/.test(room.guildId) && room.guildId.length <= 20;
   }` };
-  assert.deepEqual(roomDigitPolicies([...records, splitNeutral]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, splitNeutral]), expectedPolicies);
   const neutralSplitValidator = {
     file: 'peer/snowflake.ts',
     text: "function validate(value) { return /^\\d+$/.test(value) && value.length <= 20; } function inspect(room) { return validate(room.guildId); }"
   };
-  assert.deepEqual(roomDigitPolicies([...records, neutralSplitValidator]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, neutralSplitValidator]), expectedPolicies);
   const splitAlias = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(room) {
     const value = room.channelId;
     return /^\d+$/.test(value) && value.length <= 20;
   }` };
-  assert.deepEqual(roomDigitPolicies([...records, splitAlias]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, splitAlias]), expectedPolicies);
   const splitCall = { file: 'peer/snowflake.ts', text: String.raw`function isSnowflake(value) {
     return /^\d+$/.test(value) && value.length <= 20;
   }
   function inspect(room) { return isSnowflake(room.guildId); }` };
-  assert.deepEqual(roomDigitPolicies([...records, splitCall]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, splitCall]), expectedPolicies);
   const splitCallAlias = {
     file: 'peer/snowflake.ts',
     text: "function isSnowflake(value) { return /^\\d+$/.test(value) && value.length <= 20; } function inspect(room) { const check = isSnowflake; return check(room.guildId); }"
   };
-  assert.deepEqual(roomDigitPolicies([...records, splitCallAlias]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, splitCallAlias]), expectedPolicies);
   const bracketField = { file: 'peer/snowflake.ts', text: String.raw`function inspect(room) {
     return /^\d+$/.test(room['guildId']);
   }` };
-  assert.deepEqual(roomDigitPolicies([...records, bracketField]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, bracketField]), expectedPolicies);
   const arrowBound = { file: 'peer/snowflake.ts', text: String.raw`const isDigits = value => /^\d+$/.test(value) && value.length <= 20;
   function inspect(room) { return isDigits(room.guildId); }` };
-  assert.deepEqual(roomDigitPolicies([...records, arrowBound]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, arrowBound]), expectedPolicies);
   const anonymousBound = { file: 'peer/snowflake.ts', text: String.raw`const isDigits = function(value) {
     return /^\d+$/.test(value) && value.length <= 20;
   };
   function inspect(room) { return isDigits(room.channelId); }` };
-  assert.deepEqual(roomDigitPolicies([...records, anonymousBound]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, anonymousBound]), expectedPolicies);
   const shadowedBound = { file: 'peer/snowflake.ts', text: String.raw`const isDigits = value => /^\d+$/.test(value) && value.length <= 20;
   function inspect(room) { return isDigits(room.guildId); }
   function shadowed(room, isDigits) { return isDigits(room.guildId); }
@@ -1459,10 +1654,7 @@ test('room policy inventory records only town-hall room validators', () => {
     const isDigits = value => /^\d+$/.test(value) && value.length <= 20;
     return isDigits(user.id);
   }` };
-  assert.deepEqual(roomDigitPolicies([...records, shadowedBound]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, shadowedBound]), expectedPolicies);
   const emptyInitializer = { file: 'peer/town-hall-plan.ts', text: String.raw`function isTownHallRoom(room) {
     const id = ownDataProperty(room, 'guildId');
     function nested() { let id; return /^\d+$/.test(id); }
@@ -1484,26 +1676,17 @@ test('room policy inventory records only town-hall room validators', () => {
   const emptySplit = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(room) {
     return /^\d*$/.test(room.guildId) && room.guildId.length <= 20;
   }` };
-  assert.deepEqual(roomDigitPolicies([...records, emptySplit]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, emptySplit]), expectedPolicies);
   const emptyAlias = { file: 'peer/snowflake.ts', text: String.raw`function inspectSnowflake(room) {
     const value = room.channelId;
     return /^\d*$/.test(value) && value.length <= 20;
   }` };
-  assert.deepEqual(roomDigitPolicies([...records, emptyAlias]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, emptyAlias]), expectedPolicies);
   const emptyCall = { file: 'peer/snowflake.ts', text: String.raw`function isSnowflake(value) {
     return /^\d*$/.test(value) && value.length <= 20;
   }
   function inspect(room) { return isSnowflake(room.channelId); }` };
-  assert.deepEqual(roomDigitPolicies([...records, emptyCall]), {
-    ...expectedPolicies,
-    'peer/snowflake.ts': 1
-  });
+  assert.deepEqual(roomDigitPolicies([...records, emptyCall]), expectedPolicies);
   const ordinarySplit = { file: 'peer/snowflake.ts', text: String.raw`function validateSnowflake(value) {
     return /^\d+$/.test(value) && value.length <= 20;
   }` };
