@@ -1468,7 +1468,17 @@ class SurfaceState {
   }
 
   listReceipts() {
-    return this.db.prepare('SELECT * FROM receipts ORDER BY id').all();
+    return this.db.prepare('SELECT * FROM receipts ORDER BY id').all().map(row => {
+      if (typeof row.detail !== 'string') return row;
+      try {
+        const detail = JSON.parse(row.detail);
+        if (detail?.journal !== 'decision-v1' || !Object.prototype.hasOwnProperty.call(detail, 'token')) return row;
+        const { token: _token, ...redacted } = detail;
+        return { ...row, detail: JSON.stringify(redacted) };
+      } catch {
+        return row;
+      }
+    });
   }
 
   getReadiness() {

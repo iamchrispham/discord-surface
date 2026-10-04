@@ -385,16 +385,21 @@ export async function sendInteractionFollowup(
   const relayAbort = () => controller.abort();
   signal?.addEventListener('abort', relayAbort, { once: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let requestStarted = false;
   try {
-    const request = Promise.resolve().then(() => fetchImpl(
-      `https://discord.com/api/v10/webhooks/${encodeURIComponent(interaction.applicationId)}/${encodeURIComponent(interaction.token)}`,
-      {
-        method: 'POST',
-        headers: { 'User-Agent': 'DiscordBot (discord-surface, 0.1.0)', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content, flags: EPHEMERAL_MESSAGE_FLAG, allowed_mentions: { parse: [] } }),
-        signal: controller.signal
-      }
-    ));
+    const request = Promise.resolve().then(() => {
+      if (signal?.aborted) throw Object.assign(new Error('followup stopped before request'), { preSend: true });
+      requestStarted = true;
+      return fetchImpl(
+        `https://discord.com/api/v10/webhooks/${encodeURIComponent(interaction.applicationId)}/${encodeURIComponent(interaction.token)}`,
+        {
+          method: 'POST',
+          headers: { 'User-Agent': 'DiscordBot (discord-surface, 0.1.0)', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content, flags: EPHEMERAL_MESSAGE_FLAG, allowed_mentions: { parse: [] } }),
+          signal: controller.signal
+        }
+      );
+    });
     const timeout = Number(timeoutMs);
     const boundedTimeout = Number.isFinite(timeout) && timeout > 0 ? Math.min(timeout, 3000) : DEFAULT_CALLBACK_TIMEOUT_MS;
     const deadline = new Promise<never>((_, reject) => {
@@ -408,7 +413,8 @@ export async function sendInteractionFollowup(
       : { outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
         ...(status === null ? {} : { statusCode: status }), reason: 'Discord interaction followup request rejected' };
   } catch (error) {
-    return { outcome: signal?.aborted ? INTERACTION_OUTCOMES.NOT_SENT : INTERACTION_OUTCOMES.UNKNOWN, reason: String((error as { message?: unknown })?.message || error).slice(0, 200) };
+    const preSend = (error as { preSend?: unknown })?.preSend === true || (!requestStarted && signal?.aborted);
+    return { outcome: preSend ? INTERACTION_OUTCOMES.NOT_SENT : INTERACTION_OUTCOMES.UNKNOWN, reason: String((error as { message?: unknown })?.message || error).slice(0, 200) };
   } finally {
     if (timer) clearTimeout(timer);
     signal?.removeEventListener('abort', relayAbort);

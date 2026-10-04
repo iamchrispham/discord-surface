@@ -49,6 +49,41 @@ const WINNER_SOURCE_VALUES = Object.values(DECISION_WINNER_SOURCES) as DecisionW
 const NATIVE_OUTCOME_VALUES = Object.values(DECISION_NATIVE_OUTCOMES) as DecisionNativeOutcome[];
 const CANONICAL_ROUTE_PATH_MAX = 4096;
 const CANONICAL_CONTENT_MAX = 2000;
+const PROJECTION_RETRYABLE_OUTCOMES = new Set<DecisionTransportOutcome>([
+  DECISION_TRANSPORT_OUTCOMES.NOT_SENT,
+  DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED,
+  DECISION_TRANSPORT_OUTCOMES.UNKNOWN
+]);
+const REJECTION_RETRYABLE_OUTCOMES = new Set<DecisionTransportOutcome>([
+  DECISION_TRANSPORT_OUTCOMES.NOT_SENT,
+  DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED
+]);
+
+function projectionStateAfterOutcome(click: MutableClick): DecisionState {
+  const native = click.nativeReturn;
+  if (!native) return PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome as DecisionTransportOutcome)
+    ? DECISION_STATES.UNKNOWN
+    : DECISION_STATES.TERMINAL;
+  if (native.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED) {
+    if (click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT) return DECISION_STATES.TERMINAL;
+    if (click.projectionOutcome && PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome)) {
+      return DECISION_STATES.MATERIALIZED_PROJECTION_PENDING;
+    }
+  }
+  return native.state;
+}
+
+function nativeStateAfterOutcome(click: MutableClick, nextOutcome: DecisionNativeOutcome): DecisionState {
+  if (nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED) {
+    if (click.canonical?.materialized && click.projectionOutcome !== null &&
+      PROJECTION_RETRYABLE_OUTCOMES.has(click.projectionOutcome)) {
+      return DECISION_STATES.MATERIALIZED_PROJECTION_PENDING;
+    }
+    return DECISION_STATES.TERMINAL;
+  }
+  if (nextOutcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT) return DECISION_STATES.NATIVE_RETURN_PENDING;
+  return DECISION_STATES.UNKNOWN;
+}
 export const PENDING_STATES = new Set<DecisionState>([
   DECISION_STATES.AUTHORIZATION_PENDING,
   DECISION_STATES.CLICK_ADMITTED,
@@ -306,6 +341,7 @@ export function snapshot(state: DecisionStateStore): Snapshot {
     if (row.kind === DECISION_RECEIPT_KINDS.AUTHORIZATION_OUTCOME) {
       const nextOutcome = authorizationOutcome(detail.outcome);
       click.authorizationOutcome = nextOutcome;
+      if (nextOutcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) click.token = null;
       click.state = nextOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED
         ? DECISION_STATES.REFUSED
         : click.callbackOutcome ? DECISION_STATES.CANONICAL_PENDING : DECISION_STATES.CALLBACK_PENDING;
@@ -336,6 +372,10 @@ export function snapshot(state: DecisionStateStore): Snapshot {
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.REJECTION_OUTCOME) {
       click.rejectionOutcome = outcome(detail.outcome);
+      if (!REJECTION_RETRYABLE_OUTCOMES.has(click.rejectionOutcome)) click.token = null;
+      click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE) {
+      click.token = null;
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.CANONICAL_IMPORT) {
       const source = winnerSource(detail.source);
@@ -354,13 +394,7 @@ export function snapshot(state: DecisionStateStore): Snapshot {
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.PROJECTION_OUTCOME) {
       click.projectionOutcome = outcome(detail.outcome);
-      if (click.nativeReturn) click.state = click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT &&
-        click.nativeReturn.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED
-        ? DECISION_STATES.TERMINAL
-        : click.nativeReturn.state;
-      else click.state = click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN
-        ? DECISION_STATES.UNKNOWN
-        : DECISION_STATES.TERMINAL;
+      click.state = projectionStateAfterOutcome(click);
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.NATIVE_RETURN) {
       const canonical = click.canonical;
@@ -385,13 +419,7 @@ export function snapshot(state: DecisionStateStore): Snapshot {
     } else if (row.kind === DECISION_RECEIPT_KINDS.NATIVE_OUTCOME && click.nativeReturn) {
       const nextOutcome = nativeOutcome(detail.outcome);
       click.nativeReturn.outcome = nextOutcome;
-      click.nativeReturn.state = nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED
-        ? click.projectionOutcome === null && click.canonical?.materialized
-          ? DECISION_STATES.MATERIALIZED_PROJECTION_PENDING
-          : DECISION_STATES.TERMINAL
-        : nextOutcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT
-          ? DECISION_STATES.NATIVE_RETURN_PENDING
-          : DECISION_STATES.UNKNOWN;
+      click.nativeReturn.state = nativeStateAfterOutcome(click, nextOutcome);
       click.state = click.nativeReturn.state;
       click.updatedAt = row.created_at;
     }

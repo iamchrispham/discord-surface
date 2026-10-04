@@ -482,15 +482,22 @@ class DiscordGateway {
     if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent', retryable: true });
     const channel = await this.client.channels?.fetch?.(click.channelId);
     if (signal?.aborted || this.stopping) throw Object.assign(new Error('decision projection stopped'), { outcome: 'not_sent', retryable: true });
-    if (answer.length > 4096) {
-      const permission = this.historyPermission(channel, { requireSend: true, requireAttachFiles: true, requireEmbedLinks: true });
-      if (!permission.known || !permission.allowed) {
-        throw Object.assign(new Error('decision projection requires Attach Files permission and Embed Links permission'), { outcome: 'not_sent', retryable: true });
-      }
-    } else {
-      const permission = this.historyPermission(channel, { requireSend: true, requireEmbedLinks: true });
-      if (!permission.known || !permission.allowed) {
-        throw Object.assign(new Error('decision projection requires Embed Links permission'), { outcome: 'not_sent', retryable: true });
+    const sendPermission = this.historyPermission(channel, { requireSend: true });
+    if (!sendPermission.known || !sendPermission.allowed) {
+      throw Object.assign(new Error('decision projection requires Send Messages permission'), { outcome: 'not_sent', retryable: true });
+    }
+    const embedPermission = this.historyPermission(channel, { requireSend: true, requireEmbedLinks: true });
+    if (!embedPermission.known) {
+      throw Object.assign(new Error('decision projection Embed Links permission is unknown'), { outcome: 'not_sent', retryable: true });
+    }
+    const inline = answer.length <= 4096;
+    const prompt = presentation?.content || '';
+    const plainFits = inline && `${prompt}\n\nSelected action:\n${answer}`.trim().length <= 2000;
+    const needsFile = !inline || (!embedPermission.allowed && !plainFits);
+    if (needsFile) {
+      const attachPermission = this.historyPermission(channel, { requireSend: true, requireAttachFiles: true });
+      if (!attachPermission.known || !attachPermission.allowed) {
+        throw Object.assign(new Error('decision projection requires Attach Files permission'), { outcome: 'not_sent', retryable: true });
       }
     }
     const message = await channel?.messages?.fetch?.(click.messageId);
@@ -516,7 +523,10 @@ class DiscordGateway {
       }
     }
     const original = presentation || this.state.getDecisionPresentation(click.presentationId);
-    return message.edit(renderDecisionProjection(original, answer));
+    return message.edit(renderDecisionProjection(original, answer, {
+      embed: embedPermission.allowed,
+      attach: needsFile
+    }));
   }
 
   async authorizeDecisionInteraction({ channelId }, signal) {

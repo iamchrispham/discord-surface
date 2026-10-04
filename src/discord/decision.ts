@@ -48,16 +48,33 @@ const { DISPATCH_OUTCOMES, MESSAGE_STATES } = require('../../src/state') as {
 };
 
 const DECISION_EMBED_DESCRIPTION_LIMIT = 4096;
+const DISCORD_MESSAGE_CONTENT_LIMIT = 2000;
 
-export function renderDecisionProjection(presentation: Pick<DecisionPresentation, 'content'>, answer: string) {
+function projectionOutcomeRetryable(outcome: DecisionTransportOutcome | null): boolean {
+  return outcome === null || outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT ||
+    outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED || outcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
+}
+
+export function renderDecisionProjection(
+  presentation: Pick<DecisionPresentation, 'content'>,
+  answer: string,
+  { embed = true, attach = answer.length > DECISION_EMBED_DESCRIPTION_LIMIT } = {}
+) {
   const inline = answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT;
+  const file = attach || !inline;
+  const promptContent = presentation.content || '';
+  const fileFallbackContent = `${promptContent}\n\nSelected action is attached in selected-action.txt.`.trim();
+  let fallbackContent = `${promptContent}\n\nSelected action:\n${answer}`.trim();
+  if (file) fallbackContent = fileFallbackContent.length <= DISCORD_MESSAGE_CONTENT_LIMIT ? fileFallbackContent : promptContent;
+  const content = embed ? presentation.content : fallbackContent;
+  const embedDescription = inline && !file ? answer : 'Full answer attached in selected-action.txt.';
   return {
-    content: presentation.content,
-    embeds: [{ title: 'Selected action', description: inline ? answer : 'Full answer attached in selected-action.txt.' }],
+    content,
+    embeds: embed ? [{ title: 'Selected action', description: embedDescription }] : [],
     components: [],
     attachments: [],
     allowedMentions: { parse: [] },
-    ...(inline ? {} : { files: [{ attachment: Buffer.from(answer, 'utf8'), name: 'selected-action.txt' }] })
+    ...(file ? { files: [{ attachment: Buffer.from(answer, 'utf8'), name: 'selected-action.txt' }] } : {})
   };
 }
 
@@ -404,15 +421,18 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   }
 
   async function project(click: DecisionClick, presentation: DecisionPresentation, signal?: AbortSignal): Promise<boolean> {
-    if (click.projectionOutcome || !click.canonical?.materialized || !click.canonical.answer) return true;
+    if (click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT || !click.canonical?.materialized || !click.canonical.answer) return true;
+    if (click.projectionOutcome && !projectionOutcomeRetryable(click.projectionOutcome)) return false;
     if (typeof options.project !== 'function') {
+      if (click.canonical.answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT) return true;
       state.recordDecisionProjectionOutcome(click.interactionId, DECISION_TRANSPORT_OUTCOMES.NOT_SENT);
       return false;
     }
     try {
       await options.project({ click, presentation, answer: click.canonical.answer }, signal);
-      state.recordDecisionProjectionOutcome(click.interactionId, DECISION_TRANSPORT_OUTCOMES.SENT);
-      return true;
+      const recorded = state.recordDecisionProjectionOutcome(click.interactionId, DECISION_TRANSPORT_OUTCOMES.SENT) as { click?: DecisionClick | null };
+      return recorded.click?.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT ||
+        state.getDecisionClick(click.interactionId)?.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT;
     } catch (error) {
       const outcome = transportOutcome((error as { outcome?: unknown })?.outcome);
       if (outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT && (error as { retryable?: unknown })?.retryable === true) return false;
@@ -634,7 +654,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         continue;
       }
       const stored = safeMessage(state, pendingClick.interactionId);
-      if (stored?.decisionResult && pendingClick.projectionOutcome) continue;
+      if (stored?.decisionResult && pendingClick.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT) continue;
       try {
         const result = await continueClick(pendingClick, signal);
         const unresolved = state.listDecisionPendingWork().find(click => click.interactionId === pendingClick.interactionId);

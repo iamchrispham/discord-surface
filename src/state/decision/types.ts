@@ -31,6 +31,7 @@ export const DECISION_RECEIPT_KINDS = {
   CALLBACK_OUTCOME: 'decision-callback-outcome',
   REJECTION_ATTEMPT: 'decision-rejection-attempt',
   REJECTION_OUTCOME: 'decision-rejection-outcome',
+  TOKEN_RELEASE: 'decision-token-release',
   CANONICAL_IMPORT: 'decision-canonical-import',
   PROJECTION_OUTCOME: 'decision-projection-outcome',
   NATIVE_RETURN: 'decision-native-return',

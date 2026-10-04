@@ -9,7 +9,7 @@ const { PermissionFlagsBits } = require('discord.js');
 
 const { presentDecision } = require('../src/decision-present');
 const { DiscordGateway } = require('../src/discord');
-const { encodeDecisionCustomId } = require('../src/discord-interaction');
+const { encodeDecisionCustomId, sendInteractionFollowup } = require('../src/discord-interaction');
 const { READINESS, SurfaceState } = require('../src/state');
 
 const NATIVE_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
@@ -510,6 +510,22 @@ test('long-answer projection refuses attachment without Attach Files permission'
   assert.equal(f.edits.length, 0);
 });
 
+test('long-answer projection uses a file-only fallback without Embed Links', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { embedLinks: false });
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId: 'projection-missing-embed', presentationId: f.presentation.presentationId, selectedKey: 'approve',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+
+  await f.gateway.projectDecisionMessage({ click: admitted.click, presentation: f.presentation, answer: 'x'.repeat(4097) }, new AbortController().signal);
+  assert.equal(f.edits.length, 1);
+  assert.deepEqual(f.edits[0].embeds, []);
+  assert.equal(f.edits[0].files.length, 1);
+  assert.match(f.edits[0].content, /attached in selected-action\.txt/);
+});
+
 test('authorization denial acknowledges the component without admitting a decision', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.authorizeDecisionInteraction = async () => false;
@@ -563,7 +579,47 @@ test('authorization lookup failure remains pending for recovery', { timeout: 300
   assert.equal(f.state.listDecisionPendingWork().length, 1);
 });
 
-test('Embed Links loss leaves a short-answer projection retryable', { timeout: 30000 }, async t => {
+test('persisted denial wins an authorization race and prevents native dispatch', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const gates = [];
+  f.gateway.authorizeDecisionInteraction = () => new Promise(resolve => gates.push(resolve));
+  const first = f.gateway.handleInteraction(component(f.presentation, 'authorization-race-denied', 0), new AbortController().signal);
+  await waitForCondition(() => gates.length === 1, 'first authorization did not start');
+  const second = f.gateway.handleInteraction(component(f.presentation, 'authorization-race-denied', 0), new AbortController().signal);
+  await waitForCondition(() => gates.length === 2, 'duplicate authorization did not start');
+  gates[0](false);
+  gates[1](true);
+  const results = await Promise.all([first, second]);
+
+  assert.equal(results.some(result => result.accepted), false);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
+test('persisted authorization wins a late denial and dispatches native work once', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const gates = [];
+  f.gateway.authorizeDecisionInteraction = () => new Promise(resolve => gates.push(resolve));
+  const first = f.gateway.handleInteraction(component(f.presentation, 'authorization-race-allowed', 0), new AbortController().signal);
+  await waitForCondition(() => gates.length === 1, 'first authorization did not start');
+  const second = f.gateway.handleInteraction(component(f.presentation, 'authorization-race-allowed', 0), new AbortController().signal);
+  await waitForCondition(() => gates.length === 2, 'duplicate authorization did not start');
+  gates[0](true);
+  await waitForCondition(() => f.state.getDecisionClick('authorization-race-allowed')?.authorizationOutcome === 'authorized', 'authorization winner was not persisted');
+  gates[1](false);
+  await Promise.all([first, second]);
+
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
+test('Embed Links loss uses a visible short-answer projection fallback', { timeout: 30000 }, async t => {
   const f = await fixture(t, { embedLinks: false });
   f.gateway.started = true;
   f.gateway.transportReady = true;
@@ -571,9 +627,11 @@ test('Embed Links loss leaves a short-answer projection retryable', { timeout: 3
   const result = await f.gateway.handleInteraction(component(f.presentation, 'missing-embed-links', 0), new AbortController().signal);
 
   assert.equal(result.accepted, true);
-  assert.equal(f.edits.length, 0);
+  assert.equal(f.edits.length, 1);
+  assert.equal(f.edits[0].embeds.length, 0);
+  assert.match(f.edits[0].content, /Selected action:/);
   assert.equal(f.dispatches.length, 1);
-  assert.equal(f.state.getDecisionClick('missing-embed-links')?.projectionOutcome, null);
+  assert.equal(f.state.getDecisionClick('missing-embed-links')?.projectionOutcome, 'sent');
   f.setEmbedLinks(true);
   await f.gateway.reconcilePending();
   assert.equal(f.edits.length, 1);
@@ -620,6 +678,140 @@ test('long-answer projection failure does not dispatch native work', { timeout: 
   assert.equal(f.dispatches.length, 0);
   assert.equal(f.state.getDecisionClick('blocked-long-answer')?.nativeReturn?.outcome, null);
   assert.equal(f.state.listDecisionPendingWork().length, 1);
+});
+
+test('unknown projection remains retryable after native submission and closes custody when sent', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId: 'projection-unknown-replay', presentationId: f.presentation.presentationId, selectedKey: 'approve',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel'), applicationId: 'application', token: 'projection-token'
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.importDecisionWinner('projection-unknown-replay', {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'answer-unknown',
+    answer: 'x'.repeat(4097)
+  }).accepted, true);
+  assert.equal(f.state.recordDecisionProjectionOutcome('projection-unknown-replay', 'unknown').accepted, true);
+  assert.equal(f.state.recordDecisionNativeReturnOutcome('projection-unknown-replay', 'submitted').accepted, true);
+  assert.equal(f.state.getDecisionClick('projection-unknown-replay')?.state, 'materialized_projection_pending');
+  assert.equal(f.state.listDecisionPendingWork().length, 1);
+
+  assert.equal(f.state.recordDecisionProjectionOutcome('projection-unknown-replay', 'sent').accepted, true);
+  assert.equal(f.state.getDecisionClick('projection-unknown-replay')?.state, 'terminal');
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+  assert.equal(f.state.getDecisionClick('projection-unknown-replay')?.token, null);
+  assert.equal(f.state.listReceipts().some(row => String(row.detail).includes('projection-token')), false);
+});
+
+test('long-answer replay waits for SENT projection before dispatching native work', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId: 'projection-replay-boundary', presentationId: f.presentation.presentationId, selectedKey: 'approve',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.importDecisionWinner('projection-replay-boundary', {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'answer-replay',
+    answer: 'x'.repeat(4097)
+  }).accepted, true);
+
+  let projectionAttempts = 0;
+  f.gateway.projectDecisionMessage = async () => {
+    projectionAttempts += 1;
+    throw Object.assign(new Error('projection response was lost'), { outcome: 'unknown' });
+  };
+  await f.gateway.decisionConsumer.recover(new AbortController().signal);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(projectionAttempts, 1);
+
+  f.gateway.projectDecisionMessage = async () => { projectionAttempts += 1; };
+  await f.gateway.decisionConsumer.recover(new AbortController().signal);
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(projectionAttempts, 2);
+  await f.gateway.decisionConsumer.recover(new AbortController().signal);
+  assert.equal(f.dispatches.length, 1);
+});
+
+test('restart classifies an interrupted rejection as terminal without resending', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const admitted = f.state.admitDecisionClickAndBeginAuthorization({
+    interactionId: 'rejection-restart', presentationId: f.presentation.presentationId, selectedKey: 'hold',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel'), applicationId: 'application', token: 'rejection-token'
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.recordDecisionAuthorizationOutcome('rejection-restart', 'denied').accepted, true);
+  assert.equal(f.state.beginDecisionRejectionFollowup('rejection-restart').accepted, true);
+  f.state.close();
+
+  const recovered = new SurfaceState(f.db);
+  recovered.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(f.dir, 'discord.secret') });
+  assert.equal(recovered.listDecisionPendingWork().length, 1);
+  recovered.recoverAfterRestart();
+  assert.equal(recovered.listDecisionPendingWork().length, 0);
+  assert.equal(recovered.listReceipts().some(row => String(row.detail).includes('rejection-token')), false);
+  recovered.close();
+});
+
+test('permanent rejection drains denied custody and does not retry', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const admitted = f.state.admitDecisionClickAndBeginAuthorization({
+    interactionId: 'rejection-permanent', presentationId: f.presentation.presentationId, selectedKey: 'hold',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel'), applicationId: 'application', token: 'rejected-token'
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.recordDecisionAuthorizationOutcome('rejection-permanent', 'denied').accepted, true);
+  assert.equal(f.state.beginDecisionRejectionFollowup('rejection-permanent').accepted, true);
+  assert.equal(f.state.recordDecisionRejectionOutcome('rejection-permanent', 'rejected').accepted, true);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+  assert.equal(f.state.beginDecisionRejectionFollowup('rejection-permanent').accepted, false);
+  assert.equal(f.state.listReceipts().some(row => String(row.detail).includes('rejected-token')), false);
+});
+
+test('rejection followup distinguishes pre-send and post-send cancellation', { timeout: 30000 }, async t => {
+  const interaction = { applicationId: 'application', token: 'transport-token' };
+  const before = new AbortController();
+  before.abort();
+  let beforeCalls = 0;
+  const beforeResult = await sendInteractionFollowup(interaction, {
+    signal: before.signal,
+    fetchImpl: async () => { beforeCalls += 1; return { ok: true, status: 204 }; }
+  });
+  assert.equal(beforeResult.outcome, 'not_sent');
+  assert.equal(beforeCalls, 0);
+
+  const after = new AbortController();
+  let startedResolve;
+  const started = new Promise(resolve => { startedResolve = resolve; });
+  const pending = sendInteractionFollowup(interaction, {
+    signal: after.signal,
+    fetchImpl: (_url, options) => {
+      startedResolve();
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    }
+  });
+  await started;
+  after.abort();
+  const afterResult = await pending;
+  assert.equal(afterResult.outcome, 'unknown');
 });
 
 test('a full-length decision keeps every prompt character after selection', { timeout: 30000 }, async t => {
