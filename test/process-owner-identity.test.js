@@ -335,34 +335,41 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     visit(node);
     ts.forEachChild(node, child => walk(child, visit));
   }
+  function staticStringText(expression) {
+    while (ts.isParenthesizedExpression(expression)
+      || ts.isAsExpression(expression)
+      || ts.isSatisfiesExpression(expression)
+      || ts.isNonNullExpression(expression)) {
+      expression = expression.expression;
+    }
+    if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
+    if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = staticStringText(expression.left);
+      const right = staticStringText(expression.right);
+      return left === undefined || right === undefined ? undefined : left + right;
+    }
+    if (ts.isTemplateExpression(expression)) {
+      let text = expression.head.text;
+      for (const span of expression.templateSpans) {
+        const value = staticStringText(span.expression);
+        if (value === undefined) return undefined;
+        text += value + span.literal.text;
+      }
+      return text;
+    }
+    return undefined;
+  }
   function propertyNameText(name) {
     if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
     if (!ts.isComputedPropertyName(name)) return undefined;
-    function constantStringText(expression) {
-      while (ts.isParenthesizedExpression(expression)
-        || ts.isAsExpression(expression)
-        || ts.isSatisfiesExpression(expression)
-        || ts.isNonNullExpression(expression)) {
-        expression = expression.expression;
-      }
-      if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
-      if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-        const left = constantStringText(expression.left);
-        const right = constantStringText(expression.right);
-        return left === undefined || right === undefined ? undefined : left + right;
-      }
-      if (ts.isTemplateExpression(expression)) {
-        let text = expression.head.text;
-        for (const span of expression.templateSpans) {
-          const value = constantStringText(span.expression);
-          if (value === undefined) return undefined;
-          text += value + span.literal.text;
-        }
-        return text;
-      }
-      return undefined;
+    return staticStringText(name.expression);
+  }
+  function assignmentPropertyNameText(expression) {
+    if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+    if (ts.isElementAccessExpression(expression) && expression.argumentExpression) {
+      return staticStringText(expression.argumentExpression);
     }
-    return constantStringText(name.expression);
+    return undefined;
   }
   function declaredNames(ast) {
     const names = [];
@@ -370,6 +377,10 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       if (ts.isFunctionDeclaration(node) && node.name) names.push(node.name.text);
       if (ts.isClassDeclaration(node) && node.name) names.push(node.name.text);
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) names.push(node.name.text);
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const name = assignmentPropertyNameText(node.left);
+        if (name) names.push(name);
+      }
       if ((ts.isMethodDeclaration(node)
         || ts.isPropertyDeclaration(node)
         || ts.isPropertyAssignment(node)
@@ -421,12 +432,17 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['object computed property', "({ ['captureProcessOwnerIdentity']: null });", true],
     ['object computed wrapped template', '({ [(`captureProcessOwnerIdentity`)]: null });', true],
     ['object computed wrapped as string', "({ [('captureProcessOwnerIdentity' as string)]: null });", true, ts.ScriptKind.TS],
+    ['property access assignment', 'exports.captureProcessOwnerIdentity = function () {};', true],
+    ['string element assignment', "exports['captureProcessOwnerIdentity'] = function () {};", true],
+    ['concatenated element assignment', "exports['captureProcessOwner' + 'Identity'] = function () {};", true],
+    ['prototype property assignment', 'Example.prototype.captureProcessOwnerIdentity = function () {};', true],
     ['dynamic computed method', 'class Example { static [owner]() {} }', false],
     ['dynamic computed property', '({ [owner]: null });', false],
     ['dynamic wrapped computed method', 'class Example { static [(owner)]() {} }', false],
     ['dynamic as computed property', '({ [owner as string]: null });', false, ts.ScriptKind.TS],
     ['dynamic satisfies computed method', 'class Example { static [owner satisfies string]() {} }', false, ts.ScriptKind.TS],
     ['dynamic non-null computed property', '({ [owner!]: null });', false, ts.ScriptKind.TS],
+    ['dynamic element assignment', 'exports[owner] = function () {};', false],
   ];
   for (const [label, source, expected, scriptKind] of methodControls) {
     assert.equal(declaredNames(parse(source, scriptKind)).includes('captureProcessOwnerIdentity'), expected, label);
@@ -443,10 +459,17 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   assert.equal(imports.length, 1);
   const facade = [];
   walk(stateAst, node => {
-    if (ts.isMethodDeclaration(node) && node.name.getText(stateAst) === 'directPostOwnerIdentity') facade.push(node);
+    if (ts.isMethodDeclaration(node) && propertyNameText(node.name) === 'directPostOwnerIdentity') facade.push(node);
   });
   assert.equal(facade.length, 1);
   assert.equal(strip(facade[0].body.getText(stateAst)), '{returncaptureProcessOwnerIdentity.apply(this,arguments);}');
+
+  const facadeInventoryAst = parse('class State { directPostOwnerIdentity() {} [\'directPostOwner\' + \'Identity\']() {} }');
+  const duplicateFacade = [];
+  walk(facadeInventoryAst, node => {
+    if (ts.isMethodDeclaration(node) && propertyNameText(node.name) === 'directPostOwnerIdentity') duplicateFacade.push(node);
+  });
+  assert.equal(duplicateFacade.length, 2);
 
   const Module = require('node:module');
   const resolvedState = require.resolve('../src/state');
