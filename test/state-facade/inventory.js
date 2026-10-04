@@ -92,10 +92,16 @@ function callableDeclarations(source, factory) {
 
 function callableDescriptor(node) {
   if (!node || !ts.isFunctionLike(node)) return null;
-  return { style: invocationStyle(node) };
+  const parameters = (node.parameters || []).filter(parameter =>
+    !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'));
+  const style = invocationStyle(node);
+  const postStateParameters = style === INVOCATION_STYLES.STATE ? parameters.slice(1) : parameters;
+  const requiredArguments = postStateParameters.filter(parameter =>
+    !parameter.initializer && !parameter.dotDotDotToken).length;
+  return { style, requiredArguments };
 }
 
-function collectFactoryMethods(factory, source, resolveExpression = () => new Map()) {
+function collectFactoryMethods(factory, source, resolveExpression = () => new Map(), resolveImportedValue = () => null) {
   const methods = new Map();
   const declarations = callableDeclarations(source, factory);
   const resolving = new Set();
@@ -116,11 +122,16 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
     }
     if (ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression) &&
         expression.expression.name.text === 'bind') {
-      return resolveValue(expression.expression.expression);
+      const descriptor = resolveValue(expression.expression.expression);
+      if (!descriptor) return null;
+      const boundArguments = Math.max(0, expression.arguments.length - 1);
+      return { ...descriptor, requiredArguments: Math.max(0, descriptor.requiredArguments - boundArguments) };
     }
     if (!ts.isPropertyAccessExpression(expression)) return null;
     const receiver = expression.expression;
     if (ts.isIdentifier(receiver)) {
+      const imported = resolveImportedValue(receiver.text, expression.name.text);
+      if (imported) return imported;
       const declaration = declarations.get(receiver.text);
       if (declaration && ts.isVariableDeclaration(declaration)) {
         const resolved = resolveExpression(declaration.initializer);
@@ -164,6 +175,37 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
   return methods;
 }
 
+function moduleCallableDescriptor(filePath, methodName, seen = new Set()) {
+  const key = `${filePath}:${methodName}`;
+  if (seen.has(key)) return null;
+  seen.add(key);
+  try {
+    const text = fs.readFileSync(filePath, 'utf8');
+    const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const local = factoryDeclaration(source, methodName);
+    if (local) return callableDescriptor(local);
+    const bindings = requireBindings(source);
+    const exported = exportedFactoryExpression(source, methodName);
+    const exportedName = exported && ts.isIdentifier(exported) ? exported.text : null;
+    const receiverBinding = exported && ts.isPropertyAccessExpression(exported) && ts.isIdentifier(exported.expression)
+      ? bindings.get(exported.expression.text)
+      : null;
+    const binding = bindings.get(exportedName || methodName) || receiverBinding;
+    const exportedReceiver = exported && ts.isPropertyAccessExpression(exported) ? exported.expression : null;
+    const modulePath = binding?.modulePath || directRequire(exportedReceiver) || directRequire(exported);
+    if (!modulePath) return null;
+    const importedPath = resolveModulePath(modulePath, filePath);
+    if (!importedPath) return null;
+    const importedName = exported && ts.isPropertyAccessExpression(exported)
+      ? exported.name.text
+      : binding?.exportName || methodName;
+    return moduleCallableDescriptor(importedPath, importedName, seen);
+  }
+  catch {
+    return null;
+  }
+}
+
 function requireBindings(source) {
   const bindings = new Map();
   const visit = node => {
@@ -204,7 +246,9 @@ function resolveModulePath(modulePath, sourcePath) {
 }
 
 function calledFactory(expression) {
-  const target = ts.isCallExpression(expression) ? expression.expression : expression;
+  let target = ts.isCallExpression(expression) ? expression.expression : expression;
+  while (ts.isParenthesizedExpression(target)) target = target.expression;
+  if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.CommaToken) target = target.right;
   if (ts.isIdentifier(target)) return { name: target.text, receiver: null };
   if (ts.isPropertyAccessExpression(target)) return { name: target.name.text, receiver: target.expression };
   return null;
@@ -283,7 +327,7 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
   const resolveExpression = expression => {
     const called = calledFactory(expression);
     if (!called) return new Map();
-    const local = factoryMethodsFromSource(source, sourcePath, called.name, seen);
+    const local = factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen));
     if (local?.size) return local;
     const binding = called.receiver
       ? (ts.isIdentifier(called.receiver) ? bindings.get(called.receiver.text) : null)
@@ -295,9 +339,15 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
     const importedName = called.receiver && ts.isPropertyAccessExpression(called.receiver)
       ? called.name
       : binding?.exportName || called.name;
-    return moduleFactoryMethods(importedPath, importedName, seen);
+    return moduleFactoryMethods(importedPath, importedName, new Set(seen));
   };
-  return collectFactoryMethods(factory, source, resolveExpression);
+  const resolveImportedValue = (receiverName, methodName) => {
+    const binding = bindings.get(receiverName);
+    if (!binding) return null;
+    const importedPath = resolveModulePath(binding.modulePath, sourcePath);
+    return importedPath ? moduleCallableDescriptor(importedPath, methodName) : null;
+  };
+  return collectFactoryMethods(factory, source, resolveExpression, resolveImportedValue);
 }
 
 function moduleFactoryMethods(filePath, factoryName, seen) {
@@ -359,6 +409,8 @@ function inventory(text) {
   const handlerMethods = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name, [...methods.keys()].sort()]));
   const handlerContracts = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
     Object.fromEntries([...methods].map(([method, descriptor]) => [method, descriptor.style]))]));
+  const handlerRequiredArguments = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
+    Object.fromEntries([...methods].map(([method, descriptor]) => [method, descriptor.requiredArguments]))]));
   const classHeader = tokens(text.slice(owner.getStart(source), owner.members.pos));
   const topLevel = source.statements.filter(node => node !== owner).map(node => tokens(node.getText(source)));
   const bodies = Object.create(null);
@@ -400,7 +452,8 @@ function inventory(text) {
     }
     else bodies[name] = crypto.createHash('sha256').update(JSON.stringify(tokens(method.getText(source)))).digest('hex');
   }
-  return { handlers: [...handlers].sort(), handlerMethods, handlerContracts, forwarding: forwarding.sort(), delegationBodies, topLevel, classHeader, bodies };
+  return { handlers: [...handlers].sort(), handlerMethods, handlerContracts, handlerRequiredArguments,
+    forwarding: forwarding.sort(), delegationBodies, topLevel, classHeader, bodies };
 }
 
 function compact(raw) {
@@ -420,6 +473,7 @@ function matches(text, baseline) {
     const raw = inventory(text);
     const candidate = compact(raw);
     if (JSON.stringify(candidate.handlers) !== JSON.stringify(baseline.handlers) ||
+        JSON.stringify(candidate.forwarding) !== JSON.stringify(baseline.forwarding) ||
         JSON.stringify(candidate.topLevel) !== JSON.stringify(baseline.topLevel) ||
         JSON.stringify(candidate.classHeader) !== JSON.stringify(baseline.classHeader) ||
         JSON.stringify(candidate.bodies) !== JSON.stringify(baseline.bodies)) return false;
@@ -430,8 +484,13 @@ function matches(text, baseline) {
     const owner = parsed.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'SurfaceState');
     for (const method of owner.members) {
       const name = method.name?.text;
-      if (!candidate.forwarding.includes(name) || baseline.forwarding.includes(name)) continue;
-      if (method.modifiers?.length || method.parameters.some(parameter => parameter.initializer || !ts.isIdentifier(parameter.name))) return false;
+      if (!candidate.forwarding.includes(name)) continue;
+      const unsupportedShape = method.modifiers?.length ||
+        method.parameters.some(parameter => parameter.initializer || !ts.isIdentifier(parameter.name));
+      if (unsupportedShape) {
+        if (!baseline.forwarding.includes(name)) return false;
+        continue;
+      }
       const call = method.body.statements[0].expression;
       const dispatch = call.expression;
       if (method.asteriskToken || !ts.isPropertyAccessExpression(dispatch)) return false;
@@ -439,12 +498,15 @@ function matches(text, baseline) {
       if (!ts.isPropertyAccessExpression(target) || !ts.isIdentifier(target.expression) ||
           !raw.handlerMethods[target.expression.text]?.includes(target.name.text)) return false;
       const style = raw.handlerContracts[target.expression.text]?.[target.name.text];
+      const requiredArguments = raw.handlerRequiredArguments[target.expression.text]?.[target.name.text] || 0;
       const parameterNames = method.parameters.map(parameter => parameter.name.text);
       const argumentTexts = call.arguments.slice(1).map(argument => argument.getText(parsed));
       const restApply = dispatch.name.text === 'apply' && method.parameters.length === 1 &&
         !!method.parameters[0].dotDotDotToken && argumentTexts.length === 1 && argumentTexts[0] === parameterNames[0];
       const orderedCall = dispatch.name.text === 'call' && method.parameters.every(parameter => !parameter.dotDotDotToken) &&
         JSON.stringify(argumentTexts) === JSON.stringify(parameterNames);
+      const argumentsApply = dispatch.name.text === 'apply' && method.parameters.every(parameter => !parameter.dotDotDotToken) &&
+        argumentTexts.length === 1 && argumentTexts[0] === 'arguments';
       const directCall = dispatch.name.text !== 'call' && dispatch.name.text !== 'apply' &&
         call.arguments[0]?.kind === ts.SyntaxKind.ThisKeyword &&
         argumentTexts.length === parameterNames.length &&
@@ -453,9 +515,18 @@ function matches(text, baseline) {
           const parameterName = parameter.name.text;
           return parameter.dotDotDotToken ? argument === `...${parameterName}` : argument === parameterName;
         });
+      const argumentsSpread = dispatch.name.text !== 'call' && dispatch.name.text !== 'apply' &&
+        call.arguments[0]?.kind === ts.SyntaxKind.ThisKeyword &&
+        argumentTexts.length === 1 && argumentTexts[0] === '...arguments';
       let matchesStyle = false;
-      if (style === INVOCATION_STYLES.THIS) matchesStyle = restApply || orderedCall;
-      else if (style === INVOCATION_STYLES.STATE) matchesStyle = directCall;
+      if (style === INVOCATION_STYLES.THIS) {
+        matchesStyle = (restApply || orderedCall || argumentsApply) &&
+          (restApply || method.parameters.length >= requiredArguments);
+      }
+      else if (style === INVOCATION_STYLES.STATE) {
+        matchesStyle = (directCall || argumentsSpread) &&
+          (method.parameters.some(parameter => parameter.dotDotDotToken) || method.parameters.length >= requiredArguments);
+      }
       if (!matchesStyle) return false;
     }
     return true;

@@ -8,13 +8,26 @@ const path = require('node:path');
 
 const ts = require('typescript');
 
-const { matches: matchesInventory } = require('./state-facade/inventory');
+const { compact, inventory, matches: matchesInventory } = require('./state-facade/inventory');
 
 const baseline = require('./state-facade/baseline.json');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/state.js'), 'utf8');
 
 function matches(text) { return matchesInventory(text, baseline); }
+
+function baselineWith(text, methodName) {
+  const candidate = compact(inventory(text));
+  return {
+    ...baseline,
+    forwarding: [...baseline.forwarding, methodName].sort(),
+    delegationBodies: { ...baseline.delegationBodies, [methodName]: candidate.delegationBodies[methodName] }
+  };
+}
+
+function matchesWithAddedBaseline(text, methodName = 'newForward') {
+  return matchesInventory(text, baselineWith(text, methodName));
+}
 
 const insert = body => source.replace('class SurfaceState {', `class SurfaceState {\n${body}\n`);
 
@@ -109,8 +122,16 @@ test('optional apply marker refused', () => {
   assert.equal(!matches(insert('newForward(...args) { return configurationHandlers.getConfig?.apply(this, args); }')), true);
 });
 
-test('ordered call accepted', () => {
-  assert.equal(matches(insert('newForward(a, b) { return configurationHandlers.setConfig.call(this, a, b); }')), true);
+test('ordered call accepted when recorded in baseline', () => {
+  const text = insert('newForward(a, b) { return configurationHandlers.setConfig.call(this, a, b); }');
+  assert.equal(matchesWithAddedBaseline(text), true);
+});
+
+test('fixed delegate cannot omit required handler arguments', () => {
+  const thisBound = insert('newForward() { return configurationHandlers.setConfig.call(this); }');
+  const stateBound = insert('newForward() { return provisionIntentHandlers.beginProvisionIntent(this); }');
+  assert.equal(matchesWithAddedBaseline(thisBound), false);
+  assert.equal(matchesWithAddedBaseline(stateBound), false);
 });
 
 test('parameter initializer refused', () => {
@@ -169,16 +190,29 @@ test('nested call refused', () => {
   assert.equal(!matches(insert('newInline(value) { return configurationHandlers.setConfig(this, transform(value)); }')), true);
 });
 
-test('existing handler delegation accepted', () => {
-  assert.equal(matches(insert('newForward(...args) { return configurationHandlers.getConfig.apply(this, args); }')), true);
+test('new handler delegation requires baseline', () => {
+  const text = insert('newForward(...args) { return configurationHandlers.getConfig.apply(this, args); }');
+  assert.equal(matches(text), false);
 });
 
-test('lazy factory delegation accepted', () => {
-  assert.equal(matches(insert('newForward(...args) { return schemaHandlers.createSchema.apply(this, args); }')), true);
+test('new handler delegation is accepted when recorded in baseline', () => {
+  const text = insert('newForward(...args) { return configurationHandlers.getConfig.apply(this, args); }');
+  assert.equal(matchesWithAddedBaseline(text), true);
 });
 
-test('direct state argument delegation accepted', () => {
-  assert.equal(matches(insert('newForward(...args) { return provisionIntentHandlers.beginProvisionIntent(this, ...args); }')), true);
+test('lazy factory delegation accepted when recorded in baseline', () => {
+  const text = insert('newForward(...args) { return schemaHandlers.createSchema.apply(this, args); }');
+  assert.equal(matchesWithAddedBaseline(text), true);
+});
+
+test('composed factory delegation accepted when recorded in baseline', () => {
+  const text = insert('newForward(...args) { return courierRouteHandlers.claimCourierForward(this, ...args); }');
+  assert.equal(matchesWithAddedBaseline(text), true);
+});
+
+test('direct state argument delegation accepted when recorded in baseline', () => {
+  const text = insert('newForward(...args) { return provisionIntentHandlers.beginProvisionIntent(this, ...args); }');
+  assert.equal(matchesWithAddedBaseline(text), true);
 });
 
 test('explicit-state handler rejects bound forwarding', () => {
