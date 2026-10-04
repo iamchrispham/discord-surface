@@ -539,7 +539,7 @@ for (const control of LEGACY_NEGATIVE_CONTROLS) {
 
 test('deadline policy inventory has no direct deadline-to-gap decision outside its classifier', () => {
   const sourceRoot = path.join(__dirname, '../src');
-  const files = ['discord.js', 'discord/thread-enrollment.ts'];
+  const files = ['discord.js', 'discord/inbound-recovery.js', 'discord/thread-enrollment.ts'];
   const offenders = [];
   for (const relative of files) {
     const lines = fs.readFileSync(path.join(sourceRoot, relative), 'utf8').split(/\r?\n/);
