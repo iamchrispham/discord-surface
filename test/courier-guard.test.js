@@ -395,6 +395,8 @@ test('public hook startup blocks when its module or runtime build is missing', t
   assert.match(result.stderr, /Cannot find module/);
   fs.copyFileSync(path.join(path.dirname(CLI), 'courier-guard.js'), path.join(isolated, 'courier-guard.js'));
   fs.copyFileSync(path.join(path.dirname(CLI), 'state.js'), path.join(isolated, 'state.js'));
+  fs.mkdirSync(path.join(isolated, 'state'));
+  fs.copyFileSync(path.join(path.dirname(CLI), 'state', 'readiness.js'), path.join(isolated, 'state', 'readiness.js'));
   fs.copyFileSync(path.join(path.dirname(CLI), 'agent-message.js'), path.join(isolated, 'agent-message.js'));
   result = run();
   denied({ ...result, decision: JSON.parse(result.stdout).hookSpecificOutput }, /build is missing/);
