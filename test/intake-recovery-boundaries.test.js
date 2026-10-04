@@ -539,7 +539,9 @@ for (const control of LEGACY_NEGATIVE_CONTROLS) {
 
 const SOURCE_FILE_PATTERN = /\.(?:js|ts)$/;
 const DEADLINE_TRIGGER_PATTERN = /\b(?:DEADLINE|deadlineReached)\b|\bDate\.now\(\)\s*>=\s*deadline\b/;
-const GAP_DECISION_PATTERN = /\b(?:READINESS\.GAP|THREAD_STATES\.GAP)\b|\?\s*['"]gap['"]|\breturn\s+['"]gap['"]|\bstate\s*:\s*['"]gap['"]/;
+const GAP_VALUE_PATTERN = /(?:['"]gap['"]|\b(?:READINESS|THREAD_STATES)\.GAP\b)/;
+const NESTED_BLOCK_START_PATTERN = /^\s*(?:if|else|switch|for|while|try|catch|finally)\b/;
+const OUTCOME_STATEMENT_PATTERN = /^\s*(?:(?:if\s*\([^\n]*\)\s*)?return\b|(?:(?:const|let|var)\s+)?(?:state|readiness|status|result|outcome)\s*=)/;
 
 const collectSourceFiles = directory => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
   const absolute = path.join(directory, entry.name);
@@ -552,14 +554,171 @@ const readSourceInventory = sourceRoot => collectSourceFiles(sourceRoot).map(abs
   source: fs.readFileSync(absolute, 'utf8')
 }));
 
+const findMatchingBrace = (source, openingIndex) => {
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = openingIndex; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character;
+      continue;
+    }
+    if (character === '{') depth += 1;
+    if (character === '}' && --depth === 0) return index;
+  }
+  return source.length - 1;
+};
+
+const findStatementEnd = (source, startIndex) => {
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = startIndex; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character;
+      continue;
+    }
+    if (character === '{') braceDepth += 1;
+    if (character === '}') braceDepth -= 1;
+    if (character === '(') parenDepth += 1;
+    if (character === ')') parenDepth -= 1;
+    if (character === '[') bracketDepth += 1;
+    if (character === ']') bracketDepth -= 1;
+    if (character === ';' && braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) return index + 1;
+  }
+  return source.length;
+};
+
+const extractTopLevelStatements = source => {
+  const statements = [];
+  let start = 0;
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character;
+      continue;
+    }
+    if (character === '{') braceDepth += 1;
+    if (character === '}') {
+      braceDepth -= 1;
+      if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) {
+        const nested = source.slice(start, index + 1);
+        if (NESTED_BLOCK_START_PATTERN.test(nested)) start = index + 1;
+      }
+    }
+    if (character === '(') parenDepth += 1;
+    if (character === ')') parenDepth -= 1;
+    if (character === '[') bracketDepth += 1;
+    if (character === ']') bracketDepth -= 1;
+    if (character === ';' && braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) {
+      statements.push(source.slice(start, index + 1));
+      start = index + 1;
+    }
+  }
+  if (source.slice(start).trim()) statements.push(source.slice(start));
+  return statements;
+};
+
+const hasTopLevelStateGap = statement => {
+  let braceDepth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < statement.length; index += 1) {
+    const character = statement[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character;
+      continue;
+    }
+    if (character === '{') {
+      braceDepth += 1;
+      continue;
+    }
+    if (character === '}') {
+      braceDepth -= 1;
+      continue;
+    }
+    if (braceDepth !== 1) continue;
+    const property = statement.slice(index).match(/^\s*(?:state|readiness|status|result|outcome)\s*:\s*((?:['"]gap['"]|(?:READINESS|THREAD_STATES)\.GAP))/);
+    if (property && GAP_VALUE_PATTERN.test(property[1])) return true;
+  }
+  return false;
+};
+
+const isGapOutcome = statement => {
+  if (!OUTCOME_STATEMENT_PATTERN.test(statement)) return false;
+  if (/\breturn\s+(?:['"]gap['"]|(?:READINESS|THREAD_STATES)\.GAP\b)/.test(statement)) return true;
+  if (/\?\s*(?:['"]gap['"]|(?:READINESS|THREAD_STATES)\.GAP\b)/.test(statement)) return true;
+  if (/\b(?:state|readiness|status|result|outcome)\s*=\s*(?:['"]gap['"]|(?:READINESS|THREAD_STATES)\.GAP\b)/.test(statement)) return true;
+  return hasTopLevelStateGap(statement);
+};
+
+const extractDeadlineDecision = (source, triggerIndex) => {
+  const openingBrace = source.indexOf('{', triggerIndex);
+  if (openingBrace !== -1) {
+    const ifStart = source.lastIndexOf('if', openingBrace);
+    const functionStart = source.lastIndexOf('function', openingBrace);
+    const controlPrefix = ifStart === -1 ? '' : source.slice(ifStart, openingBrace);
+    const functionPrefix = functionStart === -1 ? '' : source.slice(functionStart, openingBrace);
+    if (/\bif\s*\([\s\S]*\)\s*$/.test(controlPrefix)
+      || /\bfunction\b[\s\S]*\)\s*$/.test(functionPrefix)
+      || /=>\s*$/.test(source.slice(Math.max(0, openingBrace - 200), openingBrace))) {
+      const closingBrace = findMatchingBrace(source, openingBrace);
+      return { body: source.slice(openingBrace + 1, closingBrace), block: true };
+    }
+  }
+  const lineStart = source.lastIndexOf('\n', triggerIndex) + 1;
+  const end = findStatementEnd(source, lineStart);
+  return { body: source.slice(lineStart, end), block: false };
+};
+
 const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source }) => {
   const lines = source.split(/\r?\n/);
   const offenders = [];
+  let offset = 0;
   for (let index = 0; index < lines.length; index += 1) {
-    if (!DEADLINE_TRIGGER_PATTERN.test(lines[index])) continue;
-    const window = lines.slice(index, index + 4).join('\n');
-    if (!GAP_DECISION_PATTERN.test(window)) continue;
-    offenders.push(`${relative}:${index + 1}`);
+    const line = lines[index];
+    if (DEADLINE_TRIGGER_PATTERN.test(line)) {
+      const triggerIndex = offset + line.search(DEADLINE_TRIGGER_PATTERN);
+      const decision = extractDeadlineDecision(source, triggerIndex);
+      const statements = decision.block ? extractTopLevelStatements(decision.body) : [decision.body];
+      if (statements.some(isGapOutcome)) offenders.push(`${relative}:${index + 1}`);
+    }
+    offset += line.length;
+    if (source[offset] === '\r') offset += 1;
+    if (source[offset] === '\n') offset += 1;
   }
   return offenders;
 });
@@ -576,6 +735,79 @@ test('deadline policy inventory catches object-shaped gap decisions', () => {
     source: "if (Date.now() >= deadline) return { ready: false, state: 'gap', detail: 'history unavailable' };"
   }]);
   assert.deepEqual(offenders, ['discord/inbound-recovery.js:1']);
+});
+
+test('deadline policy inventory scans complete outcomes and ignores unrelated gaps', () => {
+  const entries = [
+    {
+      relative: 'discord/multiline-owner.js',
+      source: [
+        'if (deadlineReached) {',
+        '  return {',
+        '    ready: false,',
+        "    detail: 'expired',",
+        "    state: 'gap'",
+        '  };',
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/multiline-assignment.js',
+      source: [
+        'const state = deadlineReached',
+        '  ? READINESS.GAP',
+        '  : READINESS.READY;'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/unavailable-owner.js',
+      source: [
+        'if (deadlineReached) {',
+        "  return { ready: false, state: 'unavailable' };",
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/retry-owner.js',
+      source: [
+        'if (deadlineReached) {',
+        "  return { ready: false, state: 'retry' };",
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/unrelated-gap.js',
+      source: [
+        'if (deadlineReached) {',
+        "  return { ready: false, state: 'retry' };",
+        '}',
+        "const history = { state: 'gap' };"
+      ].join('\n')
+    },
+    {
+      relative: 'discord/nested-gap.js',
+      source: [
+        'if (deadlineReached) {',
+        '  if (shouldRetry) {',
+        "    return { state: 'gap' };",
+        '  }',
+        "  return { state: 'retry' };",
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/nested-object-gap.js',
+      source: [
+        'if (deadlineReached) {',
+        "  return { detail: { state: 'gap' } };",
+        '}'
+      ].join('\n')
+    }
+  ];
+  assert.deepEqual(findDeadlineGapOffenders(entries), [
+    'discord/multiline-owner.js:1',
+    'discord/multiline-assignment.js:1'
+  ]);
 });
 
 test('deadline policy inventory catches new owners while allowing unavailable classifiers and ordinary deadlines', () => {
