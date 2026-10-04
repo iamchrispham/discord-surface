@@ -62,70 +62,166 @@ function enclosingOwner(node) {
   return null;
 }
 
-function calleeName(node) {
-  const expression = node.expression;
-  if (ts.isIdentifier(expression)) return expression.text;
-  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
-  return null;
-}
+function callSites(sourceFile) {
+  const sites = [];
+  const scopes = [new Map()];
 
-// local alias -> canonical imported name, resolved from ES imports, CommonJS
-// require destructuring, and identifier assignments, so local transport aliases
-// remain inside the declared effect inventory.
-function importedAliases(sourceFile) {
-  const aliases = new Map();
-  const localAliases = new Map();
+  const declare = (name, canonical = null, tracked = false) => {
+    scopes[scopes.length - 1].set(name, { canonical, tracked });
+  };
+  const lookup = name => {
+    for (let index = scopes.length - 1; index >= 0; index -= 1) {
+      const binding = scopes[index].get(name);
+      if (binding) return binding;
+    }
+    return null;
+  };
+  const canonicalForExpression = expression => {
+    if (!expression) return null;
+    if (ts.isIdentifier(expression)) return lookup(expression.text)?.canonical ?? expression.text;
+    if (ts.isPropertyAccessExpression(expression)) {
+      const object = canonicalForExpression(expression.expression);
+      return object ? `${object}.${expression.name.text}` : null;
+    }
+    if (ts.isElementAccessExpression(expression)) {
+      const object = canonicalForExpression(expression.expression);
+      const argument = expression.argumentExpression;
+      if (object === 'globalThis' && argument && ts.isStringLiteral(argument)) return argument.text;
+      return null;
+    }
+    return null;
+  };
+  const aliasValue = expression => {
+    if (!expression) return { canonical: null, tracked: false };
+    if (ts.isIdentifier(expression)) {
+      const binding = lookup(expression.text);
+      return { canonical: binding?.canonical ?? expression.text, tracked: true };
+    }
+    if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+      return { canonical: canonicalForExpression(expression), tracked: true };
+    }
+    return { canonical: null, tracked: false };
+  };
+  const declarePattern = (pattern, value = null) => {
+    if (ts.isIdentifier(pattern)) {
+      declare(pattern.text, value?.canonical ?? null, value?.tracked ?? false);
+      return;
+    }
+    if (ts.isObjectBindingPattern(pattern)) {
+      for (const element of pattern.elements) {
+        if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+        const property = element.propertyName || element.name;
+        declare(element.name.text, ts.isIdentifier(property) ? property.text : null, true);
+      }
+    }
+  };
+  const visitParameters = parameters => {
+    for (const parameter of parameters) declarePattern(parameter.name);
+  };
   const visit = node => {
     if (ts.isImportDeclaration(node) && node.importClause?.namedBindings &&
         ts.isNamedImports(node.importClause.namedBindings)) {
       for (const element of node.importClause.namedBindings.elements) {
-        aliases.set(element.name.text, (element.propertyName || element.name).text);
+        declare(element.name.text, (element.propertyName || element.name).text, true);
       }
+      return;
     }
-    if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer) &&
-        ts.isIdentifier(node.initializer.expression) && node.initializer.expression.text === 'require' &&
-        ts.isObjectBindingPattern(node.name)) {
-      const argument = node.initializer.arguments[0];
-      if (argument && ts.isStringLiteral(argument)) {
+    if (ts.isVariableDeclaration(node)) {
+      let value = null;
+      if (node.initializer &&
+          ts.isCallExpression(node.initializer) &&
+          ts.isIdentifier(node.initializer.expression) &&
+          node.initializer.expression.text === 'require' &&
+          ts.isObjectBindingPattern(node.name) &&
+          node.initializer.arguments[0] && ts.isStringLiteral(node.initializer.arguments[0])) {
+        value = { canonical: null, tracked: true };
         for (const element of node.name.elements) {
-          aliases.set(element.name.text, (element.propertyName || element.name).text);
+          if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+          const property = element.propertyName || element.name;
+          declare(element.name.text, ts.isIdentifier(property) ? property.text : null, true);
+        }
+      } else {
+        value = aliasValue(node.initializer);
+        declarePattern(node.name, value);
+      }
+      if (node.initializer) visit(node.initializer);
+      return;
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      if (ts.isIdentifier(node.left)) {
+        const value = aliasValue(node.right);
+        const binding = lookup(node.left.text);
+        if (binding) {
+          binding.canonical = value.canonical;
+          binding.tracked = value.tracked;
+        } else {
+          declare(node.left.text, value.canonical, value.tracked);
         }
       }
+      visit(node.right);
+      return;
     }
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer &&
-        ts.isIdentifier(node.initializer)) {
-      localAliases.set(node.name.text, node.initializer.text);
+    if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
+      if (ts.isFunctionDeclaration(node) && node.name) declare(node.name.text, null, false);
+      scopes.push(new Map());
+      visitParameters(node.parameters);
+      if (node.body) visit(node.body);
+      scopes.pop();
+      return;
     }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  const resolve = (name, seen = new Set()) => {
-    if (seen.has(name)) return name;
-    const imported = aliases.get(name);
-    if (imported !== undefined) return imported;
-    const target = localAliases.get(name);
-    if (target === undefined) return name;
-    const nextSeen = new Set(seen);
-    nextSeen.add(name);
-    const canonical = resolve(target, nextSeen);
-    aliases.set(name, canonical);
-    return canonical;
-  };
-  for (const name of localAliases.keys()) resolve(name);
-  return aliases;
-}
-
-function callSites(sourceFile) {
-  const sites = [];
-  const aliases = importedAliases(sourceFile);
-  const visit = node => {
+    if (ts.isBlock(node) || ts.isModuleBlock(node) || ts.isCaseBlock(node)) {
+      scopes.push(new Map());
+      for (const statement of node.statements) visit(statement);
+      scopes.pop();
+      return;
+    }
     if (ts.isCallExpression(node)) {
-      const name = calleeName(node);
-      if (name) sites.push({ node, name, canonical: aliases.get(name) || name, owner: enclosingOwner(node) });
+      const expression = node.expression;
+      let canonical = null;
+      let name = null;
+      let indirect = false;
+      if (ts.isIdentifier(expression)) {
+        name = expression.text;
+        const binding = lookup(name);
+        canonical = binding ? binding.canonical : name;
+        indirect = Boolean(binding?.tracked);
+      } else if (ts.isPropertyAccessExpression(expression)) {
+        name = expression.name.text;
+        if (name === 'call' || name === 'apply') {
+          canonical = canonicalForExpression(expression.expression);
+          indirect = true;
+        } else {
+          canonical = name;
+        }
+      } else if (ts.isElementAccessExpression(expression)) {
+        indirect = true;
+        name = expression.getText(sourceFile);
+        canonical = canonicalForExpression(expression);
+      }
+      if (name) {
+        sites.push({
+          node,
+          name,
+          canonical,
+          indirect,
+          owner: enclosingOwner(node)
+        });
+      }
     }
     ts.forEachChild(node, visit);
   };
-  visit(sourceFile);
+
+  // Imports are hoisted, so aliases used by earlier-looking declarations still
+  // resolve to their lexical binding rather than to a name-global map.
+  for (const statement of sourceFile.statements) {
+    if (ts.isImportDeclaration(statement) && statement.importClause?.namedBindings &&
+        ts.isNamedImports(statement.importClause.namedBindings)) {
+      for (const element of statement.importClause.namedBindings.elements) {
+        declare(element.name.text, (element.propertyName || element.name).text, true);
+      }
+    }
+  }
+  for (const statement of sourceFile.statements) visit(statement);
   return sites;
 }
 

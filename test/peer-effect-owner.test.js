@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { rejectionViolations, wiringViolations, realSources, ownerViolations, REFUSAL } = require('./peer-effects/owner-inventory');
 const { buildHarness, directSnapshot, boardSnapshot, fetchEventIndex, assertBracketed, boardRun, boardFixtureBoardRows } = require('./peer-effects/execution-fixtures');
@@ -468,6 +469,18 @@ test('the effect-owner inventory is sensitive to new or removed network calls an
     ['aliased extra channel fetch', 'src/peer/server.js',
       '      loadChannels: async signal => {',
       "      loadChannels: async signal => { const request = fetch; await request('https://example.invalid/extra');"],
+    ['assigned alias extra channel fetch', 'src/peer/server.js',
+      '      loadChannels: async signal => {',
+      "      loadChannels: async signal => { let request; request = fetch; await request('https://example.invalid/extra');"],
+    ['shadowed alias extra channel fetch', 'src/peer/server.js',
+      '      loadChannels: async signal => {',
+      "      loadChannels: async signal => { const request = fetch; { const request = JSON.stringify; await request('https://example.invalid/extra'); } await request('https://example.invalid/extra-outer');"],
+    ['computed global fetch', 'src/peer/server.js',
+      '      loadChannels: async signal => {',
+      "      loadChannels: async signal => { await globalThis['fetch']('https://example.invalid/extra');"],
+    ['indirect fetch call', 'src/peer/server.js',
+      '      loadChannels: async signal => {',
+      "      loadChannels: async signal => { await fetch.call(globalThis, 'https://example.invalid/extra');"],
     ['aliased extra send', 'src/direct-post.ts',
       'const sent = await sendDiscordMessage({',
       "const send = sendDiscordMessage; await send({});\n      const sent = await sendDiscordMessage({"]
@@ -489,11 +502,15 @@ test('the effect-owner inventory is sensitive to new or removed network calls an
     assert.equal(files.filter(file => file === suite).length, 1, `${suite} is registered exactly once`);
   }
 
-  const scratch = process.env.PEER_EFFECT_SCRATCH ||
-    '/Users/cphamballer/Documents/Codex/2026-09-04/is-there-a-discord-mcp/outputs/peer-effect-source-131-1003/scratch';
-  fs.mkdirSync(scratch, { recursive: true });
-  fs.writeFileSync(path.join(scratch, 'owner-mutants.log'),
-    `Issue 131 owner mutant results\n\n${results.join('\n')}\n\nregistration: both suites appear once in package.json scripts.test\n`);
+  const configuredScratch = process.env.PEER_EFFECT_SCRATCH;
+  const scratch = configuredScratch || fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-peer-effect-'));
+  try {
+    fs.mkdirSync(scratch, { recursive: true });
+    fs.writeFileSync(path.join(scratch, 'owner-mutants.log'),
+      `Issue 131 owner mutant results\n\n${results.join('\n')}\n\nregistration: both suites appear once in package.json scripts.test\n`);
+  } finally {
+    if (!configuredScratch) fs.rmSync(scratch, { recursive: true, force: true });
+  }
 });
 
 // Board run helper local to this suite, so mutant checks never touch the

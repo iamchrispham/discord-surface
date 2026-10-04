@@ -267,7 +267,10 @@ export async function runBoardRefresh({
     ownerIdentity: state.directPostOwnerIdentity?.(process.pid) || null
   };
   const admission = state.beginBoardRefresh(meta, prepared.revision);
-  if (admission.status !== 'admitted') return resultFromAdmission(admission, binding);
+  if (admission.status !== 'admitted') {
+    await revalidateCaller();
+    return resultFromAdmission(admission, binding);
+  }
   if (!admission.attemptId) throw new Error('board refresh admission lacks an attempt ID');
   if (!isBindingCurrent()) {
     const stale = state.recordBoardRefreshOutcome(target, admission.attemptId, BOARD_OUTCOMES.STALE, {
@@ -291,6 +294,17 @@ export async function runBoardRefresh({
       reason: 'native caller changed before board update'
     });
     throw error;
+  }
+  if (!isBindingCurrent()) {
+    const stale = state.recordBoardRefreshOutcome(target, admission.attemptId, BOARD_OUTCOMES.STALE, {
+      reason: 'binding readiness changed before board update'
+    });
+    return {
+      ...resultFromAdmission(admission, binding),
+      status: stale.outcome,
+      outcome: stale.outcome,
+      reason: 'binding readiness changed before board update'
+    };
   }
   const mutationRejection = new TransportRejection();
   let applied: BoardRefreshRecord | null = null;
