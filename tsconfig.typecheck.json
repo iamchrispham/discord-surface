@@ -156,6 +156,7 @@
     "src/state/town-hall-publication/repository.ts",
     "src/state/town-hall-publication/context.ts",
     "test/types/town-hall-publication-types.ts",
-    "test/types/town-hall-publication-parts-types.ts"
+    "test/types/town-hall-publication-parts-types.ts",
+    "src/state/town-hall-publication/journal.ts"
   ]
 }

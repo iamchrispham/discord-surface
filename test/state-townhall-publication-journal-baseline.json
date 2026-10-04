@@ -1,0 +1,918 @@
+{
+  "head": "48fa4aebc1f3c67120307f96b77847494eb8d451",
+  "sourceSha256": "5405a1db3e3eb90ba98d697296d451036c2d31d3b91011fb0b693adf5c5dd5dc",
+  "functions": [
+    {
+      "name": "reject",
+      "owner": "journal",
+      "bodySha256": "15eb2711770bff8f9cc456079f29832ee82699223e44f2c33fe7d0f21774cb3f",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "snapshotOwnData",
+      "owner": "journal",
+      "bodySha256": "33f6a291e91b7f34a1780bb22d0c481205b88bdeb5a7f3128747a1126647dfe5",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "isDirectPostOutcome",
+      "owner": "journal",
+      "bodySha256": "cb1aa1e9deda0171afb7d8064135fb531f8c6d76c0540c743653dfac074ae058",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "isPublicationEvent",
+      "owner": "journal",
+      "bodySha256": "c26a3d8c738f7f37a250a7a8dafe44b4c8195759f1688006acd8b88f0e1ff7a7",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "eventKeysFor",
+      "owner": "journal",
+      "bodySha256": "063265dc0ed10e114f8665102598a48418cecdd8601f72d0acede5c54bad6b78",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "assertJournalKey",
+      "owner": "repository",
+      "bodySha256": "c6a3c1823a85b4da5f08ee9d11e0764f5dc8c2b7faf927c7d31045f84089641c",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "commandOf",
+      "owner": "journal",
+      "bodySha256": "26b8fb82ac327b8b46dad29635d893814de9574c7f3889ed826282553f504991",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "sameOwner",
+      "owner": "journal",
+      "bodySha256": "6f035a657d16fc9eb15fa6a87209dbf8db808dab27bbec4a9138d90d2d99e97c",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "validOwner",
+      "owner": "journal",
+      "bodySha256": "d63c42863f7bf4bbff7a004fd5523b68025af2ca3797f6396bcd191a95410aca",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "copyOwner",
+      "owner": "journal",
+      "bodySha256": "1b9b237fcd3e6b681be92c704bc3f729bafa89e549e9167e2303e82614a310b3",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "readRows",
+      "owner": "journal",
+      "bodySha256": "7959fe2bdaebd3b46e0ebc1ac28ec1b408c0312c14e8aa76d46b613ff65213dd",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "parseDetail",
+      "owner": "journal",
+      "bodySha256": "a36847c7e9eae0d5c69da9d231cc68600ea085fb2a95699c46ec1395d28ec239",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "canonicalEvent",
+      "owner": "journal",
+      "bodySha256": "52f8b24fe8b8d05b6913a1498b9c9a5d59a0608e42ba8cc8e6481bd032f4c31f",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "toPublicationEvents",
+      "owner": "journal",
+      "bodySha256": "5f4b982a5dcf726f802c2a631b4bd1327335d896e2901ee75ae9e85c25586fee",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "decodePublication",
+      "owner": "journal",
+      "bodySha256": "ad459b15629ffaa927b74a9dddc7100b10116138956acb5541f4d8d101bedd27",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "publicationOf",
+      "owner": "repository",
+      "bodySha256": "9682be4895b612a65255b332355b7ee60868834bcf0a09cc4fb9bf058a52fc92",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "contextForPart",
+      "owner": "repository",
+      "bodySha256": "3ad85ee717f573b391d151cc713ea53cedfa18a218ae5f84f87f4b81edae5c89",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "ownerIdentity",
+      "owner": "repository",
+      "bodySha256": "dd24ac04642a4d93ae5e48cfadd4ba1d41c9b1e86d5fa34a4d5f4f6326a5308c",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "currentMatchesStored",
+      "owner": "repository",
+      "bodySha256": "8bb39c0d3fe20ab7d906f22c3c9a65e3e9813f6dc1f1ce3b0eb5538ad38b9f99",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "appendEvent",
+      "owner": "journal",
+      "bodySha256": "a2c9d6445fab17c945719d379632be70c655a8184e43feacf1987364da4f633a",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "messageIdFor",
+      "owner": "repository",
+      "bodySha256": "4ca83b6940756676e1aa8f65c8dda85c850fd24bfc58549929d657b08dbf530c",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "getTownHallPublication",
+      "owner": "repository",
+      "bodySha256": "50370f1f585891ab29dbed47189ba4cb9b266c9f6af769500098dfcea43f7a82",
+      "publicDeclarationSha256": "f3c6bc97bcf14c992b95bb1567ca79acb4c1e0c9f12978a285d4757d456f0464"
+    },
+    {
+      "name": "reserveTownHallPublication",
+      "owner": "repository",
+      "bodySha256": "67610c16a81f930df9aaae7f6aa4cef2501916d0915516afd5208ecdbf76ace2",
+      "publicDeclarationSha256": "2444acb7749a3e71bb00af5ba93c905fcf78067858281b4b5565b99cdfbe0451"
+    },
+    {
+      "name": "markTownHallPublicationInFlight",
+      "owner": "repository",
+      "bodySha256": "7d6bfd3c37db08e20d8e1ec4f5d660f3cc496e5cd6a2795b2ac647ce1cf747d1",
+      "publicDeclarationSha256": "5c608cfa33f8e8edce9dbf8b70a877e5db1763735fd58069a353a33e500cece1"
+    },
+    {
+      "name": "recordTownHallPublicationOutcome",
+      "owner": "repository",
+      "bodySha256": "9a62233ce2eb1093ee7d7e737bf738f12db87ea65784658480242e222b33fea8",
+      "publicDeclarationSha256": "f0c5ae7a0b83fd631a31a88c80797e6ebb53e55bb2ae88d5e4df8a71f401aa07"
+    },
+    {
+      "name": "confirmTownHallPublication",
+      "owner": "repository",
+      "bodySha256": "ae0785b04f3cf28f0ed61840d8a68276dbc953bc5a8cd4bd9d84ec771a5d018f",
+      "publicDeclarationSha256": "875b8ddb8bd0494306dc9aa5bea41305fb57942cb3f2d4fd5630a85b3b444051"
+    },
+    {
+      "name": "classifyLiveness",
+      "owner": "repository",
+      "bodySha256": "e53b0e7029c9d0472dfc0c75c1b8482a3901107190b8e5f957b100cddf772851",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "recoverTownHallPublication",
+      "owner": "repository",
+      "bodySha256": "d4ba7b458f7a1c1292bfc36f60f184ba8fd1482900f7a424e302707c71e7c502",
+      "publicDeclarationSha256": "2059546370dae17960a8d149788d6ca5fbb34b51f05fc628031a9e6f81de3ae6"
+    },
+    {
+      "name": "readRowsByPrefix",
+      "owner": "journal",
+      "bodySha256": "6eb5622cbe2ad918188d7fa7acc370e42dfbbf5042bed87897646c4161d5e9a8",
+      "publicDeclarationSha256": null
+    },
+    {
+      "name": "getTownHallPublicationSet",
+      "owner": "repository",
+      "bodySha256": "bd3326a69e94d4d55e81e8570167a40731ddef0d487da490a4e11b8bd7094de8",
+      "publicDeclarationSha256": "8b0ab4f5c88929e8003a1aecbb37659ae71f5ee5f5071b03e72b508cbe55a89c"
+    }
+  ],
+  "declarations": [
+    {
+      "names": [
+        "INVALID_KEY_MESSAGE"
+      ],
+      "owner": "repository",
+      "sha256": "370f884343242f6d215f52adb5e1b426f413c1d4094fd4845fc845313e33cc1a"
+    },
+    {
+      "names": [
+        "INVALID_PART_MESSAGE"
+      ],
+      "owner": "repository",
+      "sha256": "02a105761bd54383783fd33c0e06b46e4968fea3e1bb663474430fe89dd74a2e"
+    },
+    {
+      "names": [
+        "OWNER_UNAVAILABLE_MESSAGE"
+      ],
+      "owner": "repository",
+      "sha256": "259605b68e562cf71d258aa066f1e93596cad2d2a10be6bacfa157961eef239d"
+    },
+    {
+      "names": [
+        "MARK_REFUSED_MESSAGE"
+      ],
+      "owner": "repository",
+      "sha256": "17d9dca276090ec72208e3bb1e351225641ba8c97aff905d003da3dfa0aff355"
+    },
+    {
+      "names": [
+        "RECORD_REFUSED_MESSAGE"
+      ],
+      "owner": "repository",
+      "sha256": "2a5a7db1b2395a7336a5229b71e74e42ee9c47b63e2dba52ec4c4a527265c8b6"
+    },
+    {
+      "names": [
+        "INVALID_OUTCOME_MESSAGE"
+      ],
+      "owner": "repository",
+      "sha256": "163c470cf8c8e194c0e00e8857123f9b98bde202c9cc8d906bb77e0407d80be8"
+    },
+    {
+      "names": [
+        "OUTCOME_CONFLICT_MESSAGE"
+      ],
+      "owner": "repository",
+      "sha256": "23cd77122eedf12e974cb7543172c28cf0652edd1fbf78005c59208451430de9"
+    },
+    {
+      "names": [
+        "CONFIRM_REFUSED_MESSAGE"
+      ],
+      "owner": "repository",
+      "sha256": "97022ba215920d95162e2fc2b06c529047594f68608225918c5cf5d175759a32"
+    },
+    {
+      "names": [
+        "CORRUPT_MESSAGE"
+      ],
+      "owner": "journal",
+      "sha256": "a883e9d1d3c41df0c94fc4e324d25458dac7dcdf76974fb7e2bef1522cc9c695"
+    },
+    {
+      "names": [
+        "KEY_PATTERN"
+      ],
+      "owner": "repository",
+      "sha256": "38e8d1443c6a963f0bf7910a9adcbba77a07beea4fa6ad3a1363279a2aeb3c7c"
+    },
+    {
+      "names": [
+        "COMMON_DETAIL_KEYS"
+      ],
+      "owner": "journal",
+      "sha256": "871491127046048c19cfcc227067d01ee3213803e1c488ebbbd3d3f806e7b007"
+    },
+    {
+      "names": [
+        "OWNER_KEYS"
+      ],
+      "owner": "journal",
+      "sha256": "c98334f2072bddbf006ad82deeeb1b49bf58c2ecf5a564d82420330e6fec2ea7"
+    },
+    {
+      "names": [
+        "OUTCOME_EXTRA_KEYS"
+      ],
+      "owner": "journal",
+      "sha256": "f044f87ff48a3703665d962df383631b1d53d6763d56df317e0fe2184a1c7c78"
+    },
+    {
+      "names": [
+        "CONFIRMED_EXTRA_KEYS"
+      ],
+      "owner": "journal",
+      "sha256": "f582bafd0822dafd87f555555e2f759accb0e16ff052afa6fcb3da25b3345e55"
+    },
+    {
+      "names": [
+        "OUTCOME_DETAIL_KEYS"
+      ],
+      "owner": "repository",
+      "sha256": "ee050c085b30d02ce901b3d5646b5677ab45d8477cc922f97192f01ddca1caef"
+    },
+    {
+      "names": [
+        "EVIDENCE_KEYS"
+      ],
+      "owner": "repository",
+      "sha256": "6ea360739f7c5da470a5e244a0297104379bc22a36839c17e00ce2e8bc8ec401"
+    },
+    {
+      "names": [
+        "BLOCKED_RESERVE_STATUSES"
+      ],
+      "owner": "repository",
+      "sha256": "0c2c8d93468f630f2a1a277eadd6bd1a05f9dff37270ee7ed45c3a92813f95cc"
+    },
+    {
+      "names": [
+        "ReceiptRow"
+      ],
+      "owner": "journal",
+      "sha256": "d82eaf4a50836e8aa528a4f1a6b4f57042859232195d4edd02d01bf92a5b3d23"
+    },
+    {
+      "names": [
+        "DecodedEvent"
+      ],
+      "owner": "journal",
+      "sha256": "eef20b90f7d67e8715d5bfe2b53e2d18f753e8049c876228c8a0f840679d76c1"
+    },
+    {
+      "names": [
+        "DecodedPublication"
+      ],
+      "owner": "journal",
+      "sha256": "4043d2215621c6a728a281a848b9a1ab0e141db02cf11e9a78e42363c23e1d21"
+    },
+    {
+      "names": [
+        "reject"
+      ],
+      "owner": "journal",
+      "sha256": "d2f76af159713e67e39120f5dddb30d5ad9db55c7d4782b6298cefd8d65071c2"
+    },
+    {
+      "names": [
+        "snapshotOwnData"
+      ],
+      "owner": "journal",
+      "sha256": "6c4cea3bec679deadc2c4f1788e3f33b4565a2d2628cf077af9b44ec3aa98e4d"
+    },
+    {
+      "names": [
+        "isDirectPostOutcome"
+      ],
+      "owner": "journal",
+      "sha256": "cda7c1b3fa657d88914ddf8b8bcc685a10c5047cb0eda866d2b6361439851fc6"
+    },
+    {
+      "names": [
+        "isPublicationEvent"
+      ],
+      "owner": "journal",
+      "sha256": "a9c4da6de3ebe8ed44e1e4f159e889cb8126ddbcd7d5f4a7bb3e48fb26bb383e"
+    },
+    {
+      "names": [
+        "eventKeysFor"
+      ],
+      "owner": "journal",
+      "sha256": "3b895bfc5c62739ce5d3c2e3233b8756cd4ca021d2a8280f2bb9f26f329eaf38"
+    },
+    {
+      "names": [
+        "assertJournalKey"
+      ],
+      "owner": "repository",
+      "sha256": "c2fa641b77c877fbb3245925f4bb15391203ef192b46cda238b256c6478ac353"
+    },
+    {
+      "names": [
+        "commandOf"
+      ],
+      "owner": "journal",
+      "sha256": "db93e6b84f464538496b42110ee84949c7d8a6fc5fff0549e88c509457b8dd42"
+    },
+    {
+      "names": [
+        "sameOwner"
+      ],
+      "owner": "journal",
+      "sha256": "ed505dde88f7cc7cf835c2937673e85721189f5c6707cdfa55331bb024711643"
+    },
+    {
+      "names": [
+        "validOwner"
+      ],
+      "owner": "journal",
+      "sha256": "bbee12ab48eb61a4dc7167fba812b1c968276c834861d6a5ced93314f24c927d"
+    },
+    {
+      "names": [
+        "copyOwner"
+      ],
+      "owner": "journal",
+      "sha256": "f09680e8960f34a34b80bbb9af47d9980b9babbd6620f4907f588ba15128811f"
+    },
+    {
+      "names": [
+        "readRows"
+      ],
+      "owner": "journal",
+      "sha256": "bb2e888324fc9f39f2410a3b330c48d6f023e80050e8247a07d3478d6e8a5bb1"
+    },
+    {
+      "names": [
+        "parseDetail"
+      ],
+      "owner": "journal",
+      "sha256": "4f761cde22de61b55b541677e142d4efee3febee67c987a49d2aba028b3d30dc"
+    },
+    {
+      "names": [
+        "canonicalEvent"
+      ],
+      "owner": "journal",
+      "sha256": "0d0f9ddbb3293e468462445ff8183b0651f7bdc1bd9cf2b644ffe876af98a8ff"
+    },
+    {
+      "names": [
+        "toPublicationEvents"
+      ],
+      "owner": "journal",
+      "sha256": "1d0538a81d15725e12503d7d95bb1ddf4dba625e44ca4a982f929cd3d5e5504a"
+    },
+    {
+      "names": [
+        "decodePublication"
+      ],
+      "owner": "journal",
+      "sha256": "d2a650241e374525b5b973bb1b1da02955bbff5bd6afd1d067a4c757c77dcf0e"
+    },
+    {
+      "names": [
+        "publicationOf"
+      ],
+      "owner": "repository",
+      "sha256": "15806f6b4e9cb54f764011d74a9b783aa03fbb8bea4ef1b3ae1c4965e3b51a48"
+    },
+    {
+      "names": [
+        "contextForPart"
+      ],
+      "owner": "repository",
+      "sha256": "a2ebae9fd8d32b312092ec33222b8ea4bf4a74bdc51c3586f3a0d3c1e3e48834"
+    },
+    {
+      "names": [
+        "ownerIdentity"
+      ],
+      "owner": "repository",
+      "sha256": "0ead65749433b5c3229285cba6c06ba1bd1899cef570d9d03de7bc98f5e5046a"
+    },
+    {
+      "names": [
+        "currentMatchesStored"
+      ],
+      "owner": "repository",
+      "sha256": "fd75e20f48a20f5b276b08f0198751e8fe84da7e5fdc38881500c4d8b34623ac"
+    },
+    {
+      "names": [
+        "appendEvent"
+      ],
+      "owner": "journal",
+      "sha256": "2692fdb0ed2968c00150b79eca1763e8982591ea218719e04fa8793069643fd1"
+    },
+    {
+      "names": [
+        "messageIdFor"
+      ],
+      "owner": "repository",
+      "sha256": "d737178b7b7a76c27a52e45df4bd4798e9c34593878c0ae0a6ad93f7275aea62"
+    },
+    {
+      "names": [
+        "getTownHallPublication"
+      ],
+      "owner": "repository",
+      "sha256": "11948143461930c8515432ad6563f76e852618e047e60cdf32f8764488239ff9"
+    },
+    {
+      "names": [
+        "reserveTownHallPublication"
+      ],
+      "owner": "repository",
+      "sha256": "7f8d1ee11f1b8a370c4ec8a373cf1345c4faffcb823afd67ccc1ab33bd4396e6"
+    },
+    {
+      "names": [
+        "markTownHallPublicationInFlight"
+      ],
+      "owner": "repository",
+      "sha256": "8abce25bd6150fdc60709190f2e969f7d317fb7d3757695b4cfa125db8007fab"
+    },
+    {
+      "names": [
+        "recordTownHallPublicationOutcome"
+      ],
+      "owner": "repository",
+      "sha256": "aeac013b8b0585b81272d7b34290c4985a47eebc8274d869ff481c3b2b4f46b1"
+    },
+    {
+      "names": [
+        "confirmTownHallPublication"
+      ],
+      "owner": "repository",
+      "sha256": "226f4f60f8b5487353cad42b998c14f2da5b8fdde596985b9048167b25b087d1"
+    },
+    {
+      "names": [
+        "Liveness"
+      ],
+      "owner": "repository",
+      "sha256": "56af11e25e4876483995af0b519cab88445c13ebd877f86e81789998e52a5609"
+    },
+    {
+      "names": [
+        "classifyLiveness"
+      ],
+      "owner": "repository",
+      "sha256": "376463a9085d0fbc8ed17fccfb58b4806979afbcaf8ff86acf6e3729e937ca5d"
+    },
+    {
+      "names": [
+        "recoverTownHallPublication"
+      ],
+      "owner": "repository",
+      "sha256": "b6c524705c46966e74f7fd0535f5a7fa1420b3f93a9e93cd05c4ea2da9b180a6"
+    },
+    {
+      "names": [
+        "readRowsByPrefix"
+      ],
+      "owner": "journal",
+      "sha256": "616f2928981e49ea454956ea9342ac4a144a7685845150e16e5366037e70e55c"
+    },
+    {
+      "names": [
+        "getTownHallPublicationSet"
+      ],
+      "owner": "repository",
+      "sha256": "30e2b914fa6daa746eb7a75758272d0ff57d6ed36d1d2a2cde5a2383a2dc9db1"
+    },
+    {
+      "names": [
+        "SqlRow"
+      ],
+      "owner": "repository",
+      "sha256": "d457b347c00a2272570b603a8d144b742601a06476d70dd42c15d959920975e2"
+    }
+  ],
+  "imports": {
+    "journal": [
+      "46aec21bd2ad6ddf575420f84b1286a5de93d7ec68d7779ed3fc609f16b42e4f",
+      "25445deed0cb9a3f4ea656e4d885465a5f902e54c17c867f5fdb8c3ff7fa1ee2",
+      "edc0dc6b99ed4420904a184b04a57a516b0e3355d89038ed05f62fdee67c86ad"
+    ],
+    "repository": [
+      "2258a13043b94b68a59451be7cc57449858c8c34c676240114c8a677fe1b91b3",
+      "a21974a8af4b566f3342eb3732ac05b6918dacec0418353d1664c0a0b45f2e19",
+      "8f65c23480cd84337e051bb00a4d277c5043be250b22c6f03149d30f514d1b0f",
+      "5b05dc33fb63df741a640de716317a8cb993180e0ff6c16ac067c4ad6665e328",
+      "0602e0e02dbf8c50e058dce39bf0216f2795fc104ffd47f74f510f1caad14e22",
+      "f680854490970350b3a718c080b54345ac39228415d04d9996d1e9315f8c5860",
+      "a30c31f50aa457c2d992d439221582b231702383adec505dc149ea16b6938526"
+    ]
+  },
+  "journalExports": [
+    "CORRUPT_MESSAGE",
+    "ReceiptRow",
+    "appendEvent",
+    "copyOwner",
+    "decodePublication",
+    "isDirectPostOutcome",
+    "readRowsByPrefix",
+    "reject",
+    "sameOwner",
+    "snapshotOwnData",
+    "validOwner"
+  ],
+  "repositoryExports": [
+    "SqlRow",
+    "confirmTownHallPublication",
+    "getTownHallPublication",
+    "getTownHallPublicationSet",
+    "markTownHallPublicationInFlight",
+    "recordTownHallPublicationOutcome",
+    "recoverTownHallPublication",
+    "reserveTownHallPublication"
+  ],
+  "facadeSha256": "2aee4f3f0a4ff95109c339f070f5738fa35f1e83eed3654b8d2ccee5381edc9c",
+  "configs": {
+    "tsconfig.json": {
+      "compilerOptions": {
+        "target": "ES2022",
+        "module": "CommonJS",
+        "moduleResolution": "Node",
+        "strict": true,
+        "noEmitOnError": true,
+        "declaration": true,
+        "rootDir": "src",
+        "outDir": "dist",
+        "skipLibCheck": true,
+        "forceConsistentCasingInFileNames": true
+      },
+      "include": [
+        "src/topic.ts",
+        "src/attachments.ts",
+        "src/ordinary-codex.ts",
+        "src/ordinary-bind/channel-resolution.ts",
+        "src/ordinary-bind/gateway-capability.ts",
+        "src/native-transcript.ts",
+        "src/native.ts",
+        "src/native/codex-provider.ts",
+        "src/native/claude-provider.ts",
+        "src/native/observation.ts",
+        "src/native/final-answer.ts",
+        "src/native/contracts.ts",
+        "src/native/claude-identity.ts",
+        "src/native/errors.ts",
+        "src/native/prompts.ts",
+        "src/native/courier-program.ts",
+        "src/reply-context.ts",
+        "src/agent-message.ts",
+        "src/watcher-notice.ts",
+        "src/agent-presentation.ts",
+        "src/agent-attachment.ts",
+        "src/acknowledgment.ts",
+        "src/acknowledgment/contracts.ts",
+        "src/acknowledgment/constants.ts",
+        "src/acknowledgment/receipts.ts",
+        "src/acknowledgment/delivery.ts",
+        "src/acknowledgment/watch.ts",
+        "src/acknowledgment/pickup.ts",
+        "src/claude-channel.ts",
+        "src/claude/channel-contracts.ts",
+        "src/claude/default-mcp.ts",
+        "src/claude/socket-ownership.ts",
+        "src/claude/socket-ownership/bound-identity.ts",
+        "src/claude/socket-ownership/lock.ts",
+        "src/claude/socket-ownership/lock-owner.ts",
+        "src/claude/socket-ownership/path.ts",
+        "src/claude/socket-ownership/quarantine.ts",
+        "src/claude/socket-ownership/rendezvous.ts",
+        "src/claude/socket-ownership/types.ts",
+        "src/discord/handoff-fence.ts",
+        "src/discord/decision.ts",
+        "src/discord-interaction.ts",
+        "src/state/interaction.ts",
+        "src/state/interaction/constants.ts",
+        "src/state/interaction/contracts.ts",
+        "src/state/interaction/origin.ts",
+        "src/state/process-owner-evidence.ts",
+        "src/board-text.ts",
+        "src/state/board-refresh.ts",
+        "src/state/readback-instant.ts",
+        "src/state/board-refresh/receipt-projection.ts",
+        "src/state/board-refresh/contracts.ts",
+        "src/discord/board-refresh.ts",
+        "src/board-refresh.ts",
+        "src/state/direct-post.ts",
+        "src/state/direct-post/contracts.ts",
+        "src/state/direct-post/recovery.ts",
+        "src/state/direct-post/receipt-queries.ts",
+        "src/state/direct-post/file-preparation.ts",
+        "src/state/direct-post/outcome-identity.ts",
+        "src/state/native-reply-file.ts",
+        "src/direct-post-file.ts",
+        "src/state/agent-completion.ts",
+        "src/state/agent-completion/contracts.ts",
+        "src/state/agent-request-target-evidence.ts",
+        "src/state/agent-request-withdrawal.ts",
+        "src/state/watcher-notice.ts",
+        "src/state/watcher-notice/contracts.ts",
+        "src/state/ordinary-binding.ts",
+        "src/state/ordinary-binding/contracts.ts",
+        "src/ordinary/constants.ts",
+        "src/state/thread-enrollment.ts",
+        "src/discord/thread-enrollment.ts",
+        "src/discord/history-access.ts",
+        "src/direct-post.ts",
+        "src/direct-post/contracts.ts",
+        "src/direct-post/source.ts",
+        "src/direct-post/delivery-identity.ts",
+        "src/direct-post/request-values.ts",
+        "src/decision-canonical.ts",
+        "src/decision-canonical/contracts.ts",
+        "src/decision-canonical/process.ts",
+        "src/decision-present.ts",
+        "src/state/decision.ts",
+        "src/state/courier-route/index.ts",
+        "src/state/courier-route/guard-refusal.ts",
+        "src/state/courier-route/input.ts",
+        "src/discord/recovery-fetch.ts",
+        "src/state/agent-routing.ts",
+        "src/peer/resolution.ts",
+        "src/peer/town-hall-plan.ts",
+        "src/peer/town-hall-room-parts.ts",
+        "src/discord/reconciliation-lookups.ts",
+        "src/discord/native-proof-recovery.ts",
+        "src/state/courier-route/attempt.ts",
+        "src/state/courier-route/constants.ts",
+        "src/state/courier-route/envelope.ts",
+        "src/state/courier-route/forward.ts",
+        "src/state/courier-route/recovery.ts",
+        "src/state/courier-route/route.ts",
+        "src/state/courier-route/types.ts",
+        "src/state/decision/handlers.ts",
+        "src/state/decision/index.ts",
+        "src/state/decision/reducer.ts",
+        "src/state/decision/types.ts",
+        "src/state/town-hall-journal/index.ts",
+        "src/state/town-hall-journal/types.ts",
+        "src/state/town-hall-journal/repository.ts",
+        "src/state/town-hall-publication/index.ts",
+        "src/state/town-hall-publication/types.ts",
+        "src/state/town-hall-publication/projection.ts",
+        "src/state/town-hall-publication/repository.ts",
+        "src/state/town-hall-publication/context.ts"
+      ]
+    },
+    "tsconfig.typecheck.json": {
+      "extends": "./tsconfig.json",
+      "compilerOptions": {
+        "noEmit": true,
+        "rootDir": "."
+      },
+      "include": [
+        "src/topic.ts",
+        "src/attachments.ts",
+        "src/ordinary-codex.ts",
+        "src/ordinary-bind/channel-resolution.ts",
+        "src/ordinary-bind/gateway-capability.ts",
+        "src/native-transcript.ts",
+        "src/native.ts",
+        "src/native/codex-provider.ts",
+        "src/native/claude-provider.ts",
+        "src/native/observation.ts",
+        "src/native/final-answer.ts",
+        "src/native/contracts.ts",
+        "src/native/claude-identity.ts",
+        "src/native/errors.ts",
+        "src/native/prompts.ts",
+        "src/native/courier-program.ts",
+        "src/reply-context.ts",
+        "test/types/reply-context-types.ts",
+        "src/agent-message.ts",
+        "src/watcher-notice.ts",
+        "src/agent-presentation.ts",
+        "src/agent-attachment.ts",
+        "src/acknowledgment.ts",
+        "src/acknowledgment/contracts.ts",
+        "src/acknowledgment/constants.ts",
+        "src/acknowledgment/receipts.ts",
+        "src/acknowledgment/delivery.ts",
+        "src/acknowledgment/watch.ts",
+        "src/acknowledgment/pickup.ts",
+        "src/claude-channel.ts",
+        "src/claude/channel-contracts.ts",
+        "src/claude/default-mcp.ts",
+        "src/claude/socket-ownership.ts",
+        "src/claude/socket-ownership/bound-identity.ts",
+        "src/claude/socket-ownership/lock.ts",
+        "src/claude/socket-ownership/lock-owner.ts",
+        "src/claude/socket-ownership/path.ts",
+        "src/claude/socket-ownership/quarantine.ts",
+        "src/claude/socket-ownership/rendezvous.ts",
+        "src/claude/socket-ownership/types.ts",
+        "test/types/socket-ownership.ts",
+        "src/discord/handoff-fence.ts",
+        "src/discord/decision.ts",
+        "src/discord-interaction.ts",
+        "src/state/interaction.ts",
+        "src/state/interaction/constants.ts",
+        "src/state/interaction/contracts.ts",
+        "src/state/interaction/origin.ts",
+        "src/state/process-owner-evidence.ts",
+        "src/board-text.ts",
+        "src/state/board-refresh.ts",
+        "src/state/readback-instant.ts",
+        "src/state/board-refresh/receipt-projection.ts",
+        "src/state/board-refresh/contracts.ts",
+        "src/discord/board-refresh.ts",
+        "src/board-refresh.ts",
+        "src/state/direct-post.ts",
+        "src/state/direct-post/contracts.ts",
+        "src/state/direct-post/recovery.ts",
+        "src/state/direct-post/receipt-queries.ts",
+        "src/state/direct-post/file-preparation.ts",
+        "src/state/direct-post/outcome-identity.ts",
+        "src/state/native-reply-file.ts",
+        "test/types/native-reply-file-types.ts",
+        "src/direct-post-file.ts",
+        "src/state/agent-completion.ts",
+        "src/state/agent-completion/contracts.ts",
+        "src/state/agent-request-target-evidence.ts",
+        "src/state/agent-request-withdrawal.ts",
+        "src/state/watcher-notice.ts",
+        "src/state/watcher-notice/contracts.ts",
+        "src/state/ordinary-binding.ts",
+        "src/state/ordinary-binding/contracts.ts",
+        "src/ordinary/constants.ts",
+        "src/state/thread-enrollment.ts",
+        "src/discord/thread-enrollment.ts",
+        "src/discord/history-access.ts",
+        "src/direct-post.ts",
+        "src/direct-post/contracts.ts",
+        "src/direct-post/source.ts",
+        "src/direct-post/delivery-identity.ts",
+        "src/direct-post/request-values.ts",
+        "src/decision-canonical.ts",
+        "src/decision-canonical/contracts.ts",
+        "src/decision-canonical/process.ts",
+        "src/decision-present.ts",
+        "src/state/decision.ts",
+        "src/state/courier-route/index.ts",
+        "src/state/courier-route/guard-refusal.ts",
+        "src/state/courier-route/input.ts",
+        "test/courier-route-types.ts",
+        "test/topic-types.ts",
+        "test/types/attachments.ts",
+        "test/types/agent-presentation.ts",
+        "test/types/agent-attachment.ts",
+        "test/types/agent-completion-types.ts",
+        "test/ordinary-codex-types.ts",
+        "test/ordinary-claude-types.ts",
+        "test/ordinary-channel-resolution-types.ts",
+        "test/gateway-capability-types.ts",
+        "test/native-transcript-types.ts",
+        "test/native-types.ts",
+        "test/agent-message-types.ts",
+        "test/watcher-notice-types.ts",
+        "test/acknowledgment-types.ts",
+        "test/claude-channel-types.ts",
+        "test/handoff-fence-types.ts",
+        "test/cs-interaction-types.ts",
+        "test/board-refresh-types.ts",
+        "test/direct-post-state-types.ts",
+        "test/ordinary-binding-types.ts",
+        "test/issue-thread-types.ts",
+        "test/direct-post-types.ts",
+        "test/decision-types.ts",
+        "test/discord-decision-types.ts",
+        "src/discord/recovery-fetch.ts",
+        "src/state/agent-routing.ts",
+        "src/peer/resolution.ts",
+        "src/peer/town-hall-plan.ts",
+        "src/peer/town-hall-room-parts.ts",
+        "test/types/town-hall-room-parts-types.ts",
+        "test/types/peer-resolution-types.ts",
+        "src/discord/reconciliation-lookups.ts",
+        "test/discord/recovery-fetch-consumer-types.ts",
+        "src/discord/native-proof-recovery.ts",
+        "test/discord/native-proof-recovery-types.ts",
+        "test/discord/native-proof-recovery-consumer-types.ts",
+        "test/discord/native-proof-recovery-public-types.ts",
+        "test/discord/native-proof-recovery-contract-types.ts",
+        "test/discord/recovery-fetch-types.ts",
+        "src/state/courier-route/attempt.ts",
+        "src/state/courier-route/constants.ts",
+        "src/state/courier-route/envelope.ts",
+        "src/state/courier-route/forward.ts",
+        "src/state/courier-route/recovery.ts",
+        "src/state/courier-route/route.ts",
+        "src/state/courier-route/types.ts",
+        "src/state/decision/handlers.ts",
+        "src/state/decision/index.ts",
+        "src/state/decision/reducer.ts",
+        "src/state/decision/types.ts",
+        "src/state/town-hall-journal/index.ts",
+        "src/state/town-hall-journal/types.ts",
+        "src/state/town-hall-journal/repository.ts",
+        "test/types/town-hall-journal-types.ts",
+        "src/state/town-hall-publication/index.ts",
+        "src/state/town-hall-publication/types.ts",
+        "src/state/town-hall-publication/projection.ts",
+        "src/state/town-hall-publication/repository.ts",
+        "src/state/town-hall-publication/context.ts",
+        "test/types/town-hall-publication-types.ts",
+        "test/types/town-hall-publication-parts-types.ts"
+      ]
+    }
+  },
+  "package": {
+    "name": "discord-surface",
+    "version": "0.1.0",
+    "private": true,
+    "type": "commonjs",
+    "engines": {
+      "node": ">=22.13.0 <23.0.0"
+    },
+    "bin": {
+      "discord-surface": "src/cli.js"
+    },
+    "files": [
+      "README.md",
+      "INSTALL.md",
+      "src/",
+      "dist/"
+    ],
+    "scripts": {
+      "build": "tsc -p tsconfig.json",
+      "typecheck": "tsc -p tsconfig.typecheck.json",
+      "package-smoke": "node scripts/package-smoke.js",
+      "start": "node src/cli.js start",
+      "prepack": "npm run build",
+      "test": "npm run build && npm run typecheck && node --test --test-concurrency=1 test/agent-message.test.js test/agent-message-intake.test.js test/agent-message-sender.test.js test/agent-message-routing.test.js test/agent-message-results.test.js test/agent-routing-migration.test.js test/agent-routing-retry.test.js test/agent-routing-result.test.js test/agent-completion.test.js test/agent-request-withdrawal.test.js test/agent-attachment-metadata.test.js test/agent-attachment-recovery.test.js test/agent-attachment-cancellation.test.js test/agent-attachment-fetch.test.js test/agent-attachment-readiness.test.js test/agent-attachment-scoped-recovery.test.js test/agent-attachment-stale-generation.test.js test/courier-route.test.js test/courier-guard.test.js test/courier-input.test.js test/courier-input-wiring.test.js test/gateway-courier-identity.test.js test/topic.test.js test/attachments.test.js test/surface-intake.test.js test/surface-ack-delivery.test.js test/surface-ack-recovery.test.js test/surface-owner-admission.test.js test/surface-owner-observation.test.js test/surface-gateway-transport.test.js test/surface-claude-delivery.test.js test/surface-reply-authorization.test.js test/surface-native-observation.test.js test/surface-schema.test.js test/surface-recovery-custody.test.js test/surface-startup-recovery.test.js test/surface-recovered-observer.test.js test/surface-owner-ordering.test.js test/surface-static-handoff.test.js test/surface-handoff-transactions.test.js test/successor-custody.test.js test/surface-handoff-process.test.js test/surface-provision.test.js test/surface-liaison.test.js test/native-transcript.test.js test/native-prompts.test.js test/direct-post.test.js test/direct-post-publication.test.js test/direct-post-recovery.test.js test/direct-post-diagnostics.test.js test/native-reply-file-delivery.test.js test/native-reply-file-custody.test.js test/native-reply-file-cli.test.js test/cli-repeated-flags.test.js test/native-reply-file-staging.test.js test/native-reply-file-concurrency.test.js test/native-reply-file-capacity.test.js test/native-reply-file-retry.test.js test/board-refresh-basic.test.js test/board-refresh-recovery.test.js test/board-refresh-lifecycle.test.js test/board-refresh-contention.test.js test/board-recovery-timestamps.test.js test/topic-recovery-timestamps.test.js test/ordinary-channel-resolution.test.js test/ordinary-codex-contracts.test.js test/ordinary-codex-binding.test.js test/ordinary-codex-proof-recovery.test.js test/ordinary-codex-adoption.test.js test/ordinary-codex-relocation.test.js test/ordinary-codex-handoff.test.js test/ordinary-codex-handoff-fences.test.js test/ordinary-codex-teardown.test.js test/ordinary-codex-identity.test.js test/ordinary-codex-preflight.test.js test/ordinary-codex-reconnect.test.js test/ordinary-codex-checkpoints.test.js test/ordinary-codex-wake.test.js test/ordinary-claude.test.js test/qualified-adoption-reader-bind.test.js test/qualified-adoption-parent-child.test.js test/qualified-adoption-native-inventory.test.js test/claude-conductor-attach.test.js test/claude-socket-recovery.test.js test/claude-socket-recovery-fallback.test.js test/claude-socket-recovery-namespace.test.js test/claude-socket-recovery-preparation.test.js test/claude-socket-recovery-locks.test.js test/claude-socket-recovery-lifecycle.test.js test/claude-socket-recovery-qualification.test.js test/claude-socket-recovery-cleanup.test.js test/claude-pickup-contract.test.js test/cs-interaction.test.js test/issue-thread-state.test.js test/issue-thread-admission.test.js test/issue-thread-recovery.test.js test/issue-thread-custody.test.js test/issue-thread-checkpoint.test.js test/intake-recovery.test.js test/intake-recovery-followup.test.js test/intake-reconcile-deadline.test.js test/intake-closing-custody.test.js test/discord-decision.test.js test/decision-canonical.test.js test/decision-present.test.js test/decision-state.test.js test/decision-state-winner.test.js test/decision-state-interaction.test.js test/decision-native.test.js test/watcher-notice.test.js test/claude-socket-lock-custody.test.js test/fixture-publication.test.js test/acknowledgment-ownership.test.js test/state-interaction-ownership.test.js test/claude-socket-terminal-custody.test.js test/claude-listener-terminal-custody.test.js test/successor-authority.test.js test/courier-retirement-order.test.js test/courier-public-recovery.test.js test/watcher-retired-recovery.test.js test/courier-guard-recovery.test.js test/courier-unloaded-delivery.test.js test/native-proof-classification.test.js test/native-proof-handoff.test.js test/native-proof-interruption.test.js test/native-proof-lifecycle.test.js test/native-proof-scheduled-retry.test.js test/native-proof-shared-deadline.test.js test/peer-resolution.test.js test/town-hall-plan.test.js test/town-hall-journal.test.js test/town-hall-publication.test.js test/peer-caller.test.js test/peer-service-caller.test.js test/peer-service-custody.test.js test/peer-service-routing.test.js test/peer-service-readiness.test.js test/peer-inventory.test.js test/peer-mcp.test.js test/peer-post.test.js test/direct-post-attempt-projection.test.js test/peer-attempt-result.test.js test/direct-post-reader-inventory.test.js test/binding-retirement-custody.test.js test/binding-retirement-policy.test.js test/binding-retirement-writer-inventory.test.js test/peer-source-inventory.test.js test/peer-source-snapshot.test.js test/reply-context.test.js test/claude-submitted-reoffer.test.js test/cli-native-completion-owner.test.js test/cli-provision-owner.test.js test/cli-binding-owner.test.js test/cli-recovery-owner.test.js test/state-message-recovery-owner.test.js test/cli-command-cleanup.test.js test/cli-command-cleanup-owner.test.js test/gateway-live-attachment-owner.test.js test/state-transport-receipt-owner.test.js test/state-provision-intent-owner.test.js test/state-intake-watermark-owner.test.js test/codex-watcher-notice.test.js test/codex-watcher-caller.test.js test/production-owner-registration.test.js test/gateway-transport-receipt-owner.test.js test/gateway-recovery-waiter-owner.test.js test/cli-board-refresh-owner.test.js test/packet-field-owner.test.js test/town-hall-publication-parts.test.js test/process-owner-identity.test.js test/town-hall-room-parts.test.js test/owner-probe-custody.test.js test/process-owner-evidence.test.js test/self-refusal/owner.test.js test/process-owner-alias.test.js test/gateway-failed-start-custody.test.js test/intake-startup-isolation.test.js test/intake-startup-composition.test.js test/intake-submitted-wake.test.js test/gateway-lifecycle-owner.test.js test/state-readiness-owner.test.js test/state-configuration-owner.test.js"
+    },
+    "dependencies": {
+      "@modelcontextprotocol/sdk": "1.30.0",
+      "discord.js": "14.27.0",
+      "zod": "3.25.76"
+    },
+    "devDependencies": {
+      "typescript": "5.9.3"
+    }
+  }
+}
