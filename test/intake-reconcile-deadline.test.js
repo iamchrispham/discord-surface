@@ -1,5 +1,29 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+// Install a delegating observer on the lookup owner export BEFORE the fixture
+// loads src/discord.js: the gateway destructures storeReconciliationSnapshot at
+// load time, so patching afterwards would never reach the production call.
+const lookups = require('../dist/discord/reconciliation-lookups');
+const originalStoreReconciliationSnapshot = lookups.storeReconciliationSnapshot;
+let observedSnapshotGateway = null;
+const reconciliationSnapshotHandoffs = [];
+lookups.storeReconciliationSnapshot = (...args) => {
+  const [owner, destinationId, consumerId, channel, connection] = args;
+  if (observedSnapshotGateway &&
+      owner === observedSnapshotGateway.client &&
+      destinationId === '1000' &&
+      consumerId === '101' &&
+      connection?.gateway === observedSnapshotGateway &&
+      connection.epoch === observedSnapshotGateway.connectionEpoch) {
+    reconciliationSnapshotHandoffs.push({ owner, destinationId, consumerId, channel, connection });
+  }
+  return originalStoreReconciliationSnapshot(...args);
+};
+test.after(() => {
+  lookups.storeReconciliationSnapshot = originalStoreReconciliationSnapshot;
+  observedSnapshotGateway = null;
+  reconciliationSnapshotHandoffs.length = 0;
+});
 const { fixture } = require('./helpers/intake-recovery-fixture');
 const { getReconciliationLookup } = require('../dist/discord/reconciliation-lookups');
 
@@ -369,8 +393,16 @@ test('T5.1: adopted late settlement replies once', { timeout: 4000 }, async t =>
   assert.equal(pending.fetches, 1, 'T5.1: the reconnect adopts the outstanding lookup');
   assert.equal(f.state.getMessage('101').state, 'reply_ready', 'T5.1: the adopted deadline keeps custody held');
 
+  // Observe only the current adopted gateway/epoch handoff for this exact
+  // destination+consumer, then settle the promise while observation is live.
+  observedSnapshotGateway = f.gateway;
+  reconciliationSnapshotHandoffs.length = 0;
+  t.after(() => { observedSnapshotGateway = null; });
   pending.release();
   await lookup.catch(() => {});
+  assert.ok(reconciliationSnapshotHandoffs.length >= 1,
+    'T5.1: the adopted waiter stores its current snapshot handoff before the fallback drain');
+  observedSnapshotGateway = null;
   await drain();
   assert.equal(f.state.getMessage('101').state, 'replied', 'T5.1: late settlement wakes the adopted waiter');
   assert.equal(f.replies.length, 1, 'T5.1: exactly one saved reply');

@@ -165,12 +165,15 @@ async function pendingScenario(t, secondDeadline) {
     let captured = null;
     const realSetTimeout = globalThis.setTimeout;
     globalThis.setTimeout = (callback, delay, ...rest) => {
-      const timer = realSetTimeout(() => {
-        captured.fired();
-        callback();
-      }, delay, ...rest);
       let markFired;
-      captured = { timer, fired: new Promise(resolve => { markFired = resolve; }), markFired };
+      const fired = new Promise(resolve => { markFired = resolve; });
+      const timer = realSetTimeout(function(...args) {
+        // Delegate first with the real callback's own `this` and args; its thrown
+        // error must propagate. Resolve the captured completion in finally so the
+        // drain still observes completion when the callback throws.
+        try { return callback.apply(this, args); } finally { markFired(); }
+      }, delay, ...rest);
+      captured = { timer, fired, markFired };
       return timer;
     };
     let result;
