@@ -375,7 +375,8 @@ test('T4: stop returns without awaiting a stuck lookup and later settlement is i
 // at its deadline; a reconnect pass adopts the SAME unresolved promise, gives up
 // again, and then the original promise settles. The adopted waiter must still
 // retain late-settlement interest and deliver once.
-test('T5.1: adopted late settlement replies once', { timeout: 4000 }, async t => {
+test('T5: shared recovery deadline', { timeout: 4000 }, async t => {
+  await t.test('T5.1: adopted late settlement replies once', async t => {
   const f = fixture(t);
   seedReplyReady(f, '101', '1000');
   f.enableDelivery();
@@ -408,12 +409,12 @@ test('T5.1: adopted late settlement replies once', { timeout: 4000 }, async t =>
   assert.equal(f.replies.length, 1, 'T5.1: exactly one saved reply');
   assert.equal(pending.fetches, 1, 'T5.1: no second speculative fetch');
   assert.equal(f.dispatched.length, 0, 'T5.1: no native redispatch');
-});
+  });
 
 // T5.2: stale-only settlement. After the original wait expires and the gateway
 // reopens, the promise settles while NO new pass has attached a current waiter,
 // so nothing may act and no retry storm may start.
-test('T5.2: stale-only settlement preserves custody', { timeout: 4000 }, async t => {
+  await t.test('T5.2: stale-only settlement preserves custody', async t => {
   const f = fixture(t);
   seedReplyReady(f, '102', '1000');
   f.enableDelivery();
@@ -433,12 +434,12 @@ test('T5.2: stale-only settlement preserves custody', { timeout: 4000 }, async t
   assert.equal(f.dispatched.length, 0, 'T5.2: no native redispatch');
   assert.equal(f.state.getMessage('102').state, 'reply_ready', 'T5.2: custody stays held');
   assert.equal(pending.fetches, 1, 'T5.2: settlement does not start a retry storm');
-});
+  });
 
 // T5.3: authority fencing by binding generation. An adopted waiter is current,
 // but the fixture binding generation moves +1 before settlement, so the late
 // continuation must refuse without sending or dispatching.
-test('T5.3: changed generation refuses late settlement', { timeout: 4000 }, async t => {
+  await t.test('T5.3: changed generation refuses late settlement', async t => {
   const f = fixture(t);
   seedReplyReady(f, '103', '1000');
   f.enableDelivery();
@@ -460,12 +461,12 @@ test('T5.3: changed generation refuses late settlement', { timeout: 4000 }, asyn
   assert.equal(f.replies.length, 0, 'T5.3: a stale generation must not send');
   assert.equal(f.dispatched.length, 0, 'T5.3: a stale generation must not dispatch');
   assert.equal(f.state.getMessage('103').state, 'reply_ready', 'T5.3: custody stays held');
-});
+  });
 
 // T5.4: authority fencing by revoked permission. The adopted waiter is current,
 // but the fixture destination stops granting send permission before settlement,
 // so the late continuation must refuse.
-test('T5.4: revoked permission refuses late settlement', { timeout: 4000 }, async t => {
+  await t.test('T5.4: revoked permission refuses late settlement', async t => {
   const f = fixture(t);
   seedReplyReady(f, '104', '1000');
   f.enableDelivery();
@@ -487,11 +488,11 @@ test('T5.4: revoked permission refuses late settlement', { timeout: 4000 }, asyn
   assert.equal(f.replies.length, 0, 'T5.4: revoked permission must not send');
   assert.equal(f.dispatched.length, 0, 'T5.4: revoked permission must not dispatch');
   assert.equal(f.state.getMessage('104').state, 'reply_ready', 'T5.4: custody stays held');
-});
+  });
 
 // T5.5: repeated-deadline guard. Two consecutive adopted deadline expiries must
 // keep charging the same single unresolved lookup, not start a new one.
-test('T5.5: repeated deadlines share one lookup', { timeout: 4000 }, async t => {
+  await t.test('T5.5: repeated deadlines share one lookup', async t => {
   const f = fixture(t);
   seedReplyReady(f, '105', '1000');
   f.enableDelivery();
@@ -507,12 +508,12 @@ test('T5.5: repeated deadlines share one lookup', { timeout: 4000 }, async t => 
   assert.equal(pending.fetches, 1, 'T5.5: one SDK promise per destination across adopted deadlines');
   assert.equal(f.state.getMessage('105').state, 'reply_ready');
   assert.equal(f.replies.length, 0);
-});
+  });
 
 // T5.6: success guard. An adopted pass that is still within its deadline when
 // the original promise settles must deliver exactly once with no second
 // speculative fetch.
-test('T5.6: timely adopted success replies once', { timeout: 4000 }, async t => {
+  await t.test('T5.6: timely adopted success replies once', async t => {
   const f = fixture(t);
   seedReplyReady(f, '106', '1000');
   f.enableDelivery();
@@ -534,6 +535,7 @@ test('T5.6: timely adopted success replies once', { timeout: 4000 }, async t => 
   assert.equal(f.replies.length, 1, 'T5.6: delivers exactly once');
   assert.equal(pending.fetches, 1, 'T5.6: no second speculative fetch');
   assert.equal(f.dispatched.length, 0, 'T5.6: no native redispatch');
+  });
 });
 
 test('T6: an immediate rejection does not self-retry; an explicit later call may deliver', { timeout: 4000 }, async t => {
