@@ -129,6 +129,11 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     if (typeof assertCallerCurrent !== 'function') return;
     await assertCallerCurrent(signal);
   };
+  const callerBindingCurrent = () => {
+    if (typeof bindingCurrent !== 'function') return true;
+    try { return bindingCurrent(); }
+    catch { return false; }
+  };
   const binding = watcherNotice
     ? watcherNotice.binding
     : resolveDirectBinding(state, { nativeId, generation: generationValue(generation), channelId, provider, ordinary });
@@ -224,6 +229,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       if (!legacyMarker || typeof legacyMarker !== 'object' || Array.isArray(legacyMarker) ||
           !migratedPacket || typeof migratedPacket !== 'object' || Array.isArray(migratedPacket)) {
         await revalidateCaller();
+        if (!callerBindingCurrent()) throw new BindingError('direct post binding is no longer current');
         return legacy.result;
       }
       if (!isAgentSourcePromotion(legacy.packet, migratedPacket, binding.channelId) ||
@@ -231,6 +237,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         throw new BindingError('direct post request identity conflicts with existing custody');
       }
       await revalidateCaller();
+      if (!callerBindingCurrent()) throw new BindingError('direct post binding is no longer current');
       return legacy.result;
     }
     if (!isLegacyRetryableOutcome(legacy.outcome)) {
@@ -344,9 +351,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   };
   const currentReady = () => {
     if (!currentBinding()) return false;
-    if (typeof bindingCurrent !== 'function') return true;
-    try { return bindingCurrent(); }
-    catch { return false; }
+    return callerBindingCurrent();
   };
   const currentDestination = () => {
     if (deliveryTarget === null || typeof agentDestinationCurrent !== 'function') return true;

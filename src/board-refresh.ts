@@ -277,6 +277,14 @@ export async function runBoardRefresh({
   const admission = state.beginBoardRefresh(meta, prepared.revision);
   if (admission.status !== 'admitted') {
     await revalidateCaller();
+    if (!isBindingCurrent()) {
+      return {
+        ...resultFromAdmission(admission, binding),
+        status: BOARD_OUTCOMES.STALE,
+        outcome: BOARD_OUTCOMES.STALE,
+        reason: 'binding readiness changed before board refresh admission'
+      };
+    }
     return resultFromAdmission(admission, binding);
   }
   if (!admission.attemptId) throw new Error('board refresh admission lacks an attempt ID');
