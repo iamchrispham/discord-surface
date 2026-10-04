@@ -173,6 +173,18 @@ test('existing handler delegation accepted', () => {
   assert.equal(matches(insert('newForward(...args) { return configurationHandlers.getConfig.apply(this, args); }')), true);
 });
 
+test('lazy factory delegation accepted', () => {
+  assert.equal(matches(insert('newForward(...args) { return schemaHandlers.createSchema.apply(this, args); }')), true);
+});
+
+test('direct state argument delegation accepted', () => {
+  assert.equal(matches(insert('newForward(...args) { return provisionIntentHandlers.beginProvisionIntent(this, ...args); }')), true);
+});
+
+test('cooked method name collision refused', () => {
+  assert.equal(!matches(insert('g\\u0065tConfig() { return configurationHandlers.getConfig(this); }')), true);
+});
+
 test('missing handler method refused', () => {
   assert.equal(!matches(insert('newForward(...args) { return configurationHandlers.noSuchMethod.apply(this, args); }')), true);
 });
