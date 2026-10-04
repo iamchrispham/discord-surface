@@ -6,54 +6,14 @@ const ts = require('typescript');
 
 const SRC_ROOT = path.join(__dirname, '..', '..', 'src');
 
-// ===========================================================================
-// CLASS CENSUS: process-owner liveness probes and legacy destructive checks
-// ===========================================================================
-// Class. Every production PID liveness probe -- a `process.kill(pid, 0)`
-// invocation (direct, aliased, property/element access) -- and every legacy
-// destructive owner check -- a `directPostOwnerAlive` invocation -- must be
-// inventoried through its resolved lexical alias, or refused as an
-// `unclassified process probe` / `legacy directPostOwnerAlive callsite`
-// violation when a potential probe cannot be resolved. Resolution is
-// symbol-based over the TypeScript checker, never identifier spelling.
-//
-// Owner. parseOwnerSites/staticValue in this file; consumed by
-// inventoryProcessOwnerSites and the two suites
-// test/process-owner-evidence.test.js (scenario inventory.cjs) and
-// test/process-owner-alias.test.js.
-//
-// Resolved shapes (a symbol resolves to a SET of possible static atoms; any
-// possible probe wins):
-//   - const/let/var initializer alias (`const probe = process.kill`)
-//   - assignment-after-declaration / reassignment (`let probe; probe =
-//     process.kill`) -- all assignments in the file are indexed class-first,
-//     not flow-ordered, so a later ordinary assignment cannot erase a probe
-//   - object destructuring, rename `{ kill: probe } = process` and shorthand
-//     `{ kill } = process`
-//   - mutable process-object alias (`let proc = process; proc.kill(pid, 0)`)
-//   - zero-signal alias (`let signal = 0; process.kill(pid, signal)`)
-//   - alias chains (`let second = first`)
-//   - cyclic aliases (`let a = b; let b = a`) terminate via a bounded per-path
-//     visited set of nodes and symbols; a probe-valued assignment in the cycle
-//     still yields the kill and violation
-//   - conditional/logical value unions (`flag ? process.kill : other`,
-//     `a || b`) contribute every branch conservatively
-//   - detected-but-unsupported sources (`.bind`/`.call`/`.apply` directly on a
-//     probe-valued expression) still yield a kill/violation rather than being
-//     silently dropped
-//
-// Negative controls (must stay non-probes):
-//   - same-name lexical shadow (`const process = { kill() {} }`) and an inner
-//     shadow of an outer probe alias
-//   - ordinary mutable function reassignment without process.kill
-//   - nonzero-only signal (`9`, or `9` reassigned to `10`)
-//   - uninitialized never-assigned alias, and an absent initializer (no crash,
-//     no classification by name)
-//
-// Boundary. This is a static parse of source text only. Values assigned
-// outside the parsed source at runtime are outside this guarantee. Fixture
-// source is read and parsed as text, never executed.
-// ===========================================================================
+// Static owner-site inventory. Invariant: every statically detected PID
+// liveness probe (`process.kill(pid, 0)` in any resolved lexical form) and
+// every legacy destructive `directPostOwnerAlive` call must surface through
+// lexical binding identity or become a violation. Resolution is checker-symbol
+// based, never identifier spelling; any possibly-probe value wins. This reads
+// source text only -- fixture snippets are never executed, and an expression
+// that cannot be resolved statically is refused rather than guessed at or
+// evaluated at runtime.
 
 const PRESERVED_PROBES = new Map([
   ['state/intake.js\u0000processAlive', 'independent EPERM-hold sibling probe, deferred from this class fix'],
@@ -120,24 +80,51 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
   const checker = program.getTypeChecker();
   const kills = [];
   const legacyCalls = [];
+  // Per-file parse refusals. Merged into the caller's violation list in
+  // occurrence order so a nested generated-source scan keeps its own order.
+  const violations = [];
 
-  // Class-first assignment index: every `=` whose left is an Identifier, keyed
-  // by the checker symbol of the left. A mutable symbol is resolved over its
-  // initializer AND every assignment anywhere in the file, regardless of flow
-  // order, so a possible probe can never be erased by an ordinary reassignment.
+  // Class-first assignment index keyed by the checker symbol of the left-hand
+  // side. Covers plain `name = ...` and object-destructuring assignment
+  // `({ kill: probe } = process)`, where each target identifier receives the
+  // named property of the right-hand side -- not the whole right-hand side, and
+  // never the pattern's text. A mutable symbol is resolved over its initializer
+  // AND every assignment anywhere in the file, regardless of flow order, so a
+  // possible probe cannot be erased by a later ordinary assignment.
   const assignments = new Map();
-  const recordAssignment = (symbol, right) => {
+  const recordAssignment = (symbol, value) => {
     if (!symbol) return;
     const existing = assignments.get(symbol);
-    if (existing) existing.push(right);
-    else assignments.set(symbol, [right]);
+    if (existing) existing.push(value);
+    else assignments.set(symbol, [value]);
   };
   const indexRightHandSide = expression => {
     if (!expression) return;
     if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-      const left = expression.left;
+      const left = ts.isParenthesizedExpression(expression.left) ? expression.left.expression : expression.left;
       if (ts.isIdentifier(left)) {
-        recordAssignment(checker.getSymbolAtLocation(left), expression.right);
+        recordAssignment(checker.getSymbolAtLocation(left), { source: expression.right });
+      } else if (ts.isObjectLiteralExpression(left)) {
+        for (const property of left.properties) {
+          let target = null;
+          let name = null;
+          if (ts.isPropertyAssignment(property)) {
+            name = ts.isIdentifier(property.name) ? property.name.text
+              : ts.isStringLiteral(property.name) ? property.name.text : null;
+            // Resolve the target identifier node directly; its symbol is the
+            // lexical place, which is what a call-site identifier resolves to.
+            target = ts.isIdentifier(property.initializer) ? checker.getSymbolAtLocation(property.initializer)
+              : ts.isParenthesizedExpression(property.initializer) && ts.isIdentifier(property.initializer.expression)
+                ? checker.getSymbolAtLocation(property.initializer.expression) : null;
+          } else if (ts.isShorthandPropertyAssignment(property)) {
+            name = property.name.text;
+            // For shorthand, `getSymbolAtLocation(property.name)` returns the
+            // shorthand property symbol, not the assigned variable; the value
+            // symbol is the lexical place the call site uses.
+            target = checker.getShorthandAssignmentValueSymbol(property);
+          }
+          if (target) recordAssignment(target, { source: expression.right, name });
+        }
       }
     }
     ts.forEachChild(expression, indexRightHandSide);
@@ -145,6 +132,18 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
   indexRightHandSide(sourceFile);
 
   const hasAtom = (set, atom) => Boolean(set) && set.has(atom);
+
+  // True only for a symbol bound by an object-destructuring pattern
+  // (BindingElement), whose possible values are the pattern sources of its
+  // enclosing parameter or variable declaration. Returns false for plain
+  // variables, which resolve through their own initializer.
+  function bindingSources(declaration) {
+    if (!ts.isBindingElement(declaration) || !ts.isObjectBindingPattern(declaration.parent)) return false;
+    const container = declaration.parent.parent;
+    if (ts.isVariableDeclaration(container)) return container.initializer ? [container.initializer] : false;
+    if (ts.isParameter(container)) return container.initializer ? [container.initializer] : false;
+    return false;
+  }
 
   // Resolve a node to a set of static atoms. `visited` is a per-path set of
   // nodes/symbols; revisiting a node terminates the walk instead of looping, so
@@ -230,8 +229,26 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     const addFrom = valueNode => {
       for (const atom of resolveSet(valueNode, symbolSeen)) result.add(atom);
     };
+    // An assignment record either replaces the whole value (`name = expr`) or
+    // destructures a named property off the source (`({ kill: probe } = src)`).
+    // The named form resolves the property, never the whole source.
+    const addFromAssignment = entry => {
+      if (!entry.name) {
+        addFrom(entry.source);
+        return;
+      }
+      if (entry.name === 'directPostOwnerAlive') {
+        result.add(LEGACY_OWNER);
+        return;
+      }
+      if (entry.name === 'kill' && hasAtom(resolveSet(entry.source, symbolSeen), PROCESS_OBJECT)) {
+        result.add(PID_PROBE);
+      }
+    };
 
     if (ts.isVariableDeclaration(declaration)) {
+      addFrom(declaration.initializer);
+    } else if (ts.isParameter(declaration)) {
       addFrom(declaration.initializer);
     } else if (ts.isBindingElement(declaration) && ts.isObjectBindingPattern(declaration.parent)) {
       addFromBindingElement(declaration, symbolSeen, result);
@@ -242,15 +259,18 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       return empty;
     }
 
-    for (const assigned of assignments.get(symbol) || []) addFrom(assigned);
+    for (const assigned of assignments.get(symbol) || []) addFromAssignment(assigned);
     return result;
   }
 
   function addFromBindingElement(binding, visited, result) {
-    const pattern = binding.parent;
-    const variable = pattern.parent;
-    const source = ts.isVariableDeclaration(variable) ? variable.initializer : null;
-    const sourceSet = resolveSet(source, visited);
+    const sources = bindingSources(binding);
+    const sourceSet = new Set();
+    if (sources) {
+      for (const source of sources) {
+        for (const atom of resolveSet(source, visited)) sourceSet.add(atom);
+      }
+    }
     const name = binding.propertyName
       ? (ts.isIdentifier(binding.propertyName) ? binding.propertyName.text
         : ts.isStringLiteral(binding.propertyName) ? binding.propertyName.text : null)
@@ -280,6 +300,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
         if (callee.name.text === 'call') signal = node.arguments[2];
         else if (ts.isArrayLiteralExpression(node.arguments[1])) signal = node.arguments[1].elements[1];
         if (signal && hasAtom(staticValue(signal), 0)) kills.push({ file: fileName, owner });
+        // A resolved probe applied to a list this parse cannot see is refused,
+        // never guessed: an identifier or `arguments` (the default-parameter
+        // shape) could carry a zero signal at runtime, so it must not be
+        // silently dropped, and it must not fabricate a kill.
+        if (callee.name.text === 'apply' && node.arguments[1] &&
+          !ts.isArrayLiteralExpression(node.arguments[1])) {
+          violations.push(`unsupported process probe ${fileName}:${owner}`);
+        }
       } else if (!method) {
         const resolved = staticValue(callee);
         const isProbe = hasAtom(resolved, PID_PROBE);
@@ -293,11 +321,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       const nested = parseOwnerSites(fileName, node.text, enclosingOwner(node));
       kills.push(...nested.kills);
       legacyCalls.push(...nested.legacyCalls);
+      violations.push(...nested.violations);
     }
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
-  return { kills, legacyCalls };
+  return { kills, legacyCalls, violations };
 }
 
 function inventoryProcessOwnerSites(root) {
@@ -316,6 +345,7 @@ function inventoryProcessOwnerSites(root) {
       legacyCalls.push(`${site.file}\u0000${site.owner}`);
       violations.push(`legacy directPostOwnerAlive callsite ${site.file}:${site.owner}`);
     }
+    violations.push(...parsed.violations);
   }
   return { kills, legacyCalls, violations };
 }

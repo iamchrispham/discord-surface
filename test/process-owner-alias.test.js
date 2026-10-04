@@ -116,3 +116,39 @@ assert.equal(result.kills.length, 8);
 assert.deepEqual(result.legacyCalls, []);
 assert.deepEqual(result.violations, []);
 });
+
+test("default probe function", () => {
+  runFixture("function newProbe(pid, probe = process.kill) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("default process object", () => {
+  runFixture("function newProbe(pid, proc = process) { proc.kill(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("default zero signal", () => {
+  runFixture("function newProbe(pid, signal = 0) { process.kill(pid, signal); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("default destructured probe", () => {
+  runFixture("function newProbe(pid, { kill: probe } = process) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("nonliteral apply list refuses", () => {
+  runFixture("function newProbe(pid) { const args = [pid, 0]; process.kill.apply(null, args); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("arguments apply refuses", () => {
+  runFixture("function newProbe(pid, signal = 0) { process.kill.apply(null, arguments); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("destructuring assignment probe", () => {
+  runFixture("let probe; ({ kill: probe } = process); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("ordinary default function stays empty", () => {
+  runFixture("function newProbe(pid, probe = () => true) { probe(pid, 0); }", [], []);
+});
+
+test("nonzero default signal stays empty", () => {
+  runFixture("function newProbe(pid, signal = 9) { process.kill(pid, signal); }", [], []);
+});
