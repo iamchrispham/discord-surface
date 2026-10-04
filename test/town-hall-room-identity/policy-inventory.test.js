@@ -40,7 +40,8 @@ function regexInput(node) {
       return parent.parent.arguments[0] || null;
     }
     if (ts.isCallExpression(parent) && parent.arguments[0] === current &&
-        ts.isPropertyAccessExpression(parent.expression) && parent.expression.name.text === 'match') {
+        ts.isPropertyAccessExpression(parent.expression) &&
+        ['match', 'search'].includes(parent.expression.name.text)) {
       return parent.expression.expression;
     }
     if (ts.isCallExpression(parent) && ts.isPropertyAccessExpression(parent.expression) &&
@@ -290,7 +291,7 @@ function legacyRoomDigitPolicies(records) {
   for (const { file, text } of records) {
     const ast = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
     const bindings = collectBindings(ast);
-    const numeric = /\\[dD]|\[(?:\^)?0-9\]/;
+    const numeric = /\\[dD]|\[(?:\^)?(?:0-9|0123456789)\]/;
     const visit = node => {
       let pattern = null;
       if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
@@ -384,26 +385,43 @@ function roomDigitPolicies(records) {
           info.functions.set(node.name.text, fn);
           info.functionDefs.push(fn);
         }
-      } else if (ts.isFunctionDeclaration(node) && node.name) {
-        const fn = {
-          info,
-          node,
-          name: node.name.text,
-          calls: [],
-        };
-        info.functions.set(node.name.text, fn);
-        info.functionDefs.push(fn);
-      } else if (ts.isMethodDeclaration(node) && node.name && ts.isObjectLiteralExpression(node.parent)) {
-        const owner = node.parent.parent;
-        if (ts.isVariableDeclaration(owner) && ts.isIdentifier(owner.name) &&
-            (ts.isIdentifier(node.name) || ts.isStringLiteralLike(node.name))) {
-          const property = node.name.text;
-          const key = `${owner.name.text}.${property}`;
+      } else if (ts.isFunctionDeclaration(node)) {
+        const name = node.name?.text ||
+          (node.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword) ? 'default' : null);
+        if (name) {
           const fn = {
             info,
             node,
+            name,
+            calls: [],
+          };
+          info.functions.set(name, fn);
+          info.functionDefs.push(fn);
+        }
+      } else if ((ts.isMethodDeclaration(node) || ts.isPropertyAssignment(node)) && node.name &&
+          (ts.isObjectLiteralExpression(node.parent) || ts.isClassDeclaration(node.parent))) {
+        const owner = node.parent.parent;
+        const property = node.name.text;
+        let key = null;
+        let ownerDeclaration = null;
+        if (ts.isObjectLiteralExpression(node.parent) && ts.isVariableDeclaration(owner) &&
+            ts.isIdentifier(owner.name) &&
+            (ts.isMethodDeclaration(node) || ts.isFunctionExpression(node.initializer) ||
+              ts.isArrowFunction(node.initializer))) {
+          key = `${owner.name.text}.${property}`;
+          ownerDeclaration = owner;
+        } else if (ts.isClassDeclaration(node.parent) && node.parent.name &&
+            ts.isMethodDeclaration(node) &&
+            node.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword)) {
+          key = `${node.parent.name.text}.${property}`;
+          ownerDeclaration = node.parent;
+        }
+        if (key) {
+          const fn = {
+            info,
+            node: ts.isPropertyAssignment(node) ? node.initializer : node,
             name: key,
-            ownerDeclaration: owner,
+            ownerDeclaration,
             calls: [],
           };
           const methods = info.objectMethods.get(key) || [];
@@ -559,11 +577,12 @@ function roomDigitPolicies(records) {
             : imported);
         }
       }
-      if (ts.isFunctionDeclaration(statement) && statement.name &&
+      if (ts.isFunctionDeclaration(statement) &&
           statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
-        info.exports.set(statement.name.text, statement.name.text);
+        const exportedName = statement.name?.text || 'default';
+        info.exports.set(exportedName, exportedName);
         if (statement.modifiers.some(modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword)) {
-          info.exports.set('default', statement.name.text);
+          info.exports.set('default', exportedName);
         }
       }
       if (ts.isVariableStatement(statement) &&
@@ -734,7 +753,8 @@ function roomDigitPolicies(records) {
             (parent.name.text === 'test' || parent.name.text === 'exec') && ts.isCallExpression(parent.parent)) {
           if (parent.parent.arguments[0]) inputs.push(parent.parent.arguments[0]);
         } else if (ts.isCallExpression(parent) && parent.arguments[0] === current &&
-            ts.isPropertyAccessExpression(parent.expression) && parent.expression.name.text === 'match') {
+            ts.isPropertyAccessExpression(parent.expression) &&
+            ['match', 'search'].includes(parent.expression.name.text)) {
           inputs.push(parent.expression.expression);
         }
       }
@@ -745,7 +765,7 @@ function roomDigitPolicies(records) {
   };
 
   const sites = legacyRoomDigitPolicies(records);
-  const numeric = /\\[dD]|\\[(?:\\^)?0-9\\]/;
+  const numeric = /\\[dD]|\\[(?:\\^)?(?:0-9|0123456789)\\]/;
   for (const info of infos) {
     const legacyBindings = collectBindings(info.ast);
     const visit = node => {
@@ -863,6 +883,14 @@ test('room policy inventory records only town-hall room validators', () => {
   assert.notDeepEqual(roomDigitPolicies([...records, inline]), expectedPolicies);
   const constructor = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return new RegExp('^[0-9]{1,21}$').test(room.guildId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, constructor]), expectedPolicies);
+  const expandedAsciiDigits = {
+    file: 'peer/future-room.ts',
+    text: String.raw`function validateRoom(room) { return /^[0123456789]{1,21}$/.test(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, expandedAsciiDigits]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
   const directCall = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return RegExp('^[0-9]{1,21}$').test(room.channelId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, directCall]), expectedPolicies);
   const destructuredRoomField = {
@@ -934,6 +962,39 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/object-method-validator.ts': 1
   });
+  const functionPropertyValidator = {
+    file: 'peer/function-property-validator.ts',
+    text: String.raw`const validators = {
+      validateGuildId: value => /^\d{1,21}$/.test(value)
+    };
+    function validateRoom(room) { return validators.validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, functionPropertyValidator]), {
+    ...expectedPolicies,
+    'peer/function-property-validator.ts': 1
+  });
+  const functionExpressionPropertyValidator = {
+    file: 'peer/function-expression-property-validator.ts',
+    text: String.raw`const validators = {
+      validateChannelId: function (value) { return /^\d{1,21}$/.test(value); }
+    };
+    function validateRoom(room) { return validators.validateChannelId(room.channelId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, functionExpressionPropertyValidator]), {
+    ...expectedPolicies,
+    'peer/function-expression-property-validator.ts': 1
+  });
+  const classValidator = {
+    file: 'peer/class-validator.ts',
+    text: String.raw`class Validators {
+      static validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    }
+    function validateRoom(room) { return Validators.validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, classValidator]), {
+    ...expectedPolicies,
+    'peer/class-validator.ts': 1
+  });
   const renamedParameter = { file: 'peer/future-room.ts', text: String.raw`function validateTownHallRoom(candidate) {
     return /^\d{1,21}$/.test(candidate.guildId);
   }` };
@@ -963,6 +1024,30 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/future-room.ts': 1
   });
+  const searchRoomField = { file: 'peer/future-room.ts', text: String.raw`function validateTownHallRoom(candidate) {
+    return candidate.guildId.search(/^\d{1,21}$/) !== -1;
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, searchRoomField]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
+  const anonymousDefaultValidator = {
+    file: 'peer/anonymous-default-validator.ts',
+    text: String.raw`export default function (value) { return /^\d{1,21}$/.test(value); }`
+  };
+  const anonymousDefaultConsumer = {
+    file: 'peer/anonymous-default-consumer.ts',
+    text: String.raw`import validateGuildId from './anonymous-default-validator';
+    function validateRoom(room) { return validateGuildId(room.channelId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    anonymousDefaultValidator,
+    anonymousDefaultConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/anonymous-default-validator.ts': 1
+  });
   const unrelatedMatch = { file: 'peer/snowflake.ts', text: String.raw`function inspect(candidate) {
     return candidate.guildId.match(/^\d{1,21}$/);
   }` };
@@ -971,6 +1056,10 @@ test('room policy inventory records only town-hall room validators', () => {
     return /^\d{1,21}$/.exec(candidate.channelId);
   }` };
   assert.deepEqual(roomDigitPolicies([...records, unrelatedExec]), expectedPolicies);
+  const unrelatedSearch = { file: 'peer/snowflake.ts', text: String.raw`function inspect(candidate) {
+    return candidate.guildId.search(/^\d{1,21}$/) !== -1;
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, unrelatedSearch]), expectedPolicies);
   const unrelatedBounded = { file: 'peer/snowflake.ts', text: String.raw`function validateId(value) { return /^\d{1,20}$/.test(value); }` };
   assert.deepEqual(roomDigitPolicies([...records, unrelatedBounded]), expectedPolicies);
   const unrelatedOwnerPattern = { file: 'peer/town-hall-plan.ts', text: String.raw`function isTownHallRoom(value) { return /^\d{1,20}$/.test(value); }` };
