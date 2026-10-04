@@ -335,6 +335,7 @@ function roomDigitPolicies(records) {
     bindings: [],
     functions: new Map(),
     functionDefs: [],
+    objectMethods: new Map(),
     imports: new Map(),
     exports: new Map(),
   }));
@@ -392,6 +393,24 @@ function roomDigitPolicies(records) {
         };
         info.functions.set(node.name.text, fn);
         info.functionDefs.push(fn);
+      } else if (ts.isMethodDeclaration(node) && node.name && ts.isObjectLiteralExpression(node.parent)) {
+        const owner = node.parent.parent;
+        if (ts.isVariableDeclaration(owner) && ts.isIdentifier(owner.name) &&
+            (ts.isIdentifier(node.name) || ts.isStringLiteralLike(node.name))) {
+          const property = node.name.text;
+          const key = `${owner.name.text}.${property}`;
+          const fn = {
+            info,
+            node,
+            name: key,
+            ownerDeclaration: owner,
+            calls: [],
+          };
+          const methods = info.objectMethods.get(key) || [];
+          methods.push(fn);
+          info.objectMethods.set(key, methods);
+          info.functionDefs.push(fn);
+        }
       } else if (ts.isParameter(node)) {
         const fn = enclosingFunction(node);
         addPatternBindings(node.name, null, info, {
@@ -512,6 +531,16 @@ function roomDigitPolicies(records) {
               info.exports.set(property.name.text, property.initializer.text);
             }
           }
+        } else if (target === 'default' &&
+            (ts.isFunctionExpression(node.right) || ts.isArrowFunction(node.right))) {
+          const fn = {
+            info,
+            node: node.right,
+            name: node.right.name?.text || 'default',
+            calls: [],
+          };
+          info.exports.set(target, fn);
+          info.functionDefs.push(fn);
         }
       }
       ts.forEachChild(node, commonJsExportVisit);
@@ -521,7 +550,13 @@ function roomDigitPolicies(records) {
     for (const statement of info.ast.statements) {
       if (ts.isExportDeclaration(statement) && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
         for (const element of statement.exportClause.elements) {
-          info.exports.set(element.name.text, element.propertyName?.text || element.name.text);
+          const imported = element.propertyName?.text || element.name.text;
+          const specifier = statement.moduleSpecifier && ts.isStringLiteralLike(statement.moduleSpecifier)
+            ? statement.moduleSpecifier.text
+            : null;
+          info.exports.set(element.name.text, specifier
+            ? { kind: 'reexport', specifier, imported }
+            : imported);
         }
       }
       if (ts.isFunctionDeclaration(statement) && statement.name &&
@@ -548,13 +583,27 @@ function roomDigitPolicies(records) {
     }
     return null;
   };
+  const resolveExportedFunction = (info, name, seen = new Set()) => {
+    const marker = `${info.file}\u0000${name}`;
+    if (seen.has(marker)) return null;
+    seen.add(marker);
+    const exported = info.exports.get(name);
+    if (exported && typeof exported === 'object') {
+      if (exported.node) return exported;
+      if (exported.kind === 'reexport') {
+        const target = resolveModule(info, exported.specifier);
+        return target ? resolveExportedFunction(target, exported.imported, seen) : null;
+      }
+    }
+    const localName = typeof exported === 'string' ? exported : name;
+    return info.functions.get(localName) || null;
+  };
   const resolveImported = (info, name) => {
     const imported = info.imports.get(name);
     if (!imported || imported.namespace) return null;
     const target = resolveModule(info, imported.specifier);
     if (!target) return null;
-    const exported = target.exports.get(imported.imported) || imported.imported;
-    return target.functions.get(exported) || null;
+    return resolveExportedFunction(target, imported.imported);
   };
   for (const info of infos) {
     for (const [name, imported] of info.imports) {
@@ -587,11 +636,18 @@ function roomDigitPolicies(records) {
       return info.functions.get(expression.text) || resolveImported(info, expression.text);
     }
     if (ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.expression)) {
+      const key = `${expression.expression.text}.${expression.name.text}`;
+      const ownerBinding = findBinding(info, expression.expression.text, expression.expression);
+      const localMethods = info.objectMethods.get(key) || [];
+      const localMethod = localMethods
+        .filter(method => !ownerBinding || method.ownerDeclaration === ownerBinding.declaration)
+        .sort((left, right) =>
+          scopeDepth(nearestLexicalScope(right.node)) - scopeDepth(nearestLexicalScope(left.node)))[0];
+      if (localMethod) return localMethod;
       const imported = info.imports.get(expression.expression.text);
       if (imported?.namespace || imported?.commonJs) {
         const target = resolveModule(info, imported.specifier);
-        const exported = target?.exports.get(expression.name.text) || expression.name.text;
-        return target?.functions.get(exported) || null;
+        return target ? resolveExportedFunction(target, expression.name.text) : null;
       }
     }
     return null;
@@ -616,7 +672,7 @@ function roomDigitPolicies(records) {
   const bindingCalls = (binding, fallbackInfo) => {
     if (!binding.function) return [];
     const ownerInfo = binding.ownerInfo || fallbackInfo;
-    const functionInfo = [...ownerInfo.functions.values()].find(candidate => candidate.node === binding.function);
+    const functionInfo = ownerInfo.functionDefs.find(candidate => candidate.node === binding.function);
     return functionInfo?.calls || [];
   };
   const objectIsRoom = (node, info, seen = new Set()) => {
@@ -767,6 +823,42 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/commonjs-room-helper.js': 1
   });
+  const directCommonJsFunctionHelper = {
+    file: 'peer/direct-commonjs-room-helper.js',
+    text: String.raw`module.exports = function validateGuildId(value) {
+      return /^\d{1,21}$/.test(value);
+    }`
+  };
+  const directCommonJsFunctionConsumer = {
+    file: 'peer/direct-commonjs-room-consumer.js',
+    text: String.raw`const validateGuildId = require('./direct-commonjs-room-helper');
+    function validateRoom(room) { return validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    directCommonJsFunctionHelper,
+    directCommonJsFunctionConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/direct-commonjs-room-helper.js': 1
+  });
+  const directCommonJsArrowHelper = {
+    file: 'peer/direct-commonjs-arrow-helper.js',
+    text: String.raw`module.exports = value => /^\d{1,21}$/.test(value);`
+  };
+  const directCommonJsArrowConsumer = {
+    file: 'peer/direct-commonjs-arrow-consumer.js',
+    text: String.raw`const validateGuildId = require('./direct-commonjs-arrow-helper');
+    function validateRoom(room) { return validateGuildId(room.channelId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    directCommonJsArrowHelper,
+    directCommonJsArrowConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/direct-commonjs-arrow-helper.js': 1
+  });
   const inline = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return /^\d{1,20}$/.test(room.guildId); }` };
   assert.notDeepEqual(roomDigitPolicies([...records, inline]), expectedPolicies);
   const constructor = { file: 'peer/future-room.ts', text: String.raw`function validateRoom(room) { return new RegExp('^[0-9]{1,21}$').test(room.guildId); }` };
@@ -809,6 +901,38 @@ test('room policy inventory records only town-hall room validators', () => {
   assert.deepEqual(roomDigitPolicies([...records, importedRoomHelper, importedRoomConsumer]), {
     ...expectedPolicies,
     'peer/future-helper.ts': 1
+  });
+  const barrelRoomHelper = {
+    file: 'peer/barrel-room.ts',
+    text: 'export function validateGuildId(value) { return /^\\d{1,21}$/.test(value); }'
+  };
+  const barrelRoom = {
+    file: 'peer/barrel.ts',
+    text: "export { validateGuildId } from './barrel-room';"
+  };
+  const barrelRoomConsumer = {
+    file: 'peer/barrel-consumer.ts',
+    text: "import { validateGuildId } from './barrel'; function validateRoom(room) { return validateGuildId(room.guildId); }"
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    barrelRoomHelper,
+    barrelRoom,
+    barrelRoomConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/barrel-room.ts': 1
+  });
+  const objectMethodValidator = {
+    file: 'peer/object-method-validator.ts',
+    text: String.raw`const validators = {
+      validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    };
+    function validateRoom(room) { return validators.validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, objectMethodValidator]), {
+    ...expectedPolicies,
+    'peer/object-method-validator.ts': 1
   });
   const renamedParameter = { file: 'peer/future-room.ts', text: String.raw`function validateTownHallRoom(candidate) {
     return /^\d{1,21}$/.test(candidate.guildId);
