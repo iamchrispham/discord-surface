@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { resolvePeerCaller, createCallerAssertion } = require('./caller');
+const { resolvePeerCaller, createCallerAssertion, sameCallerAddress } = require('./caller');
 const { resolvePeerBinding, validatePeerSelector, requireReadyPeer } = require('../../dist/peer/resolution');
 const { AGENT_ROUTING_VERSION, resolveAgentReplyRequest, resolveAgentReplyRequestMatch } = require('../../dist/state/agent-routing');
 const { readTextFile, resolveAgentAddress, runDirectPost } = require('../direct-post');
@@ -250,10 +250,10 @@ function createPeerService(context) {
         channels = listed;
       }
       const source = await caller(signal);
-      if (source.channelId !== initial.channelId || canonicalNativeId(source.nativeId) !== canonicalNativeId(initial.nativeId) || source.generation !== initial.generation) {
+      if (!sameCallerAddress(source, initial)) {
         throw new Error('peer caller changed during resolution');
       }
-      const assertCallerCurrent = createCallerAssertion(state, provider, callerDependencies, source);
+      const assertCallerCurrent = createCallerAssertion(state, provider, callerDependencies, initial);
       let agentTarget = null;
       let destination = null;
       let destinationBinding = null;

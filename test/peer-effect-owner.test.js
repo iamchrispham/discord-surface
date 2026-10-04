@@ -434,6 +434,9 @@ test('the effect-owner inventory is sensitive to new or removed network calls an
   const sources = realSources();
   assert.deepEqual(ownerViolations(sources), [], 'the real source passes the combined inventory');
 
+  const ordinaryAlias = { ...sources, 'src/direct-post.ts': `${sources['src/direct-post.ts']}\nconst ordinarySource = JSON.stringify; const ordinaryAlias = ordinarySource; ordinaryAlias({});\n` };
+  assert.deepEqual(ownerViolations(ordinaryAlias), [], 'ordinary local aliases are not transport effects');
+
   const mutants = [
     ['second fetch inside channel loader', 'src/peer/server.js',
       '      loadChannels: async signal => {',
@@ -461,7 +464,13 @@ test('the effect-owner inventory is sensitive to new or removed network calls an
       '  await fetchDiscordChannel({ token, channelId: agentTarget.channelId, fetchImpl, signal, timeoutMs });\n  const channel = await fetchDiscordChannel({'],
     ['raw fetch added to peer service', 'src/peer/service.js',
       '      const initial = await caller(signal);',
-      "      await fetch('https://discord.com/api/v10/users/@me');\n      const initial = await caller(signal);"]
+      "      await fetch('https://discord.com/api/v10/users/@me');\n      const initial = await caller(signal);"],
+    ['aliased extra channel fetch', 'src/peer/server.js',
+      '      loadChannels: async signal => {',
+      "      loadChannels: async signal => { const request = fetch; await request('https://example.invalid/extra');"],
+    ['aliased extra send', 'src/direct-post.ts',
+      'const sent = await sendDiscordMessage({',
+      "const send = sendDiscordMessage; await send({});\n      const sent = await sendDiscordMessage({"]
   ];
   const results = [];
   for (const [name, file, needle, replacement] of mutants) {

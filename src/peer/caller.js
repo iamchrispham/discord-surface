@@ -6,6 +6,14 @@ function canonicalNativeId(value) {
   return typeof value === 'string' ? value.toLowerCase() : value;
 }
 
+function sameCallerAddress(left, right) {
+  return left?.provider === right?.provider &&
+    left?.guildId === right?.guildId &&
+    left?.channelId === right?.channelId &&
+    canonicalNativeId(left?.nativeId) === canonicalNativeId(right?.nativeId) &&
+    left?.generation === right?.generation;
+}
+
 function abortError(signal) {
   return signal?.reason instanceof Error ? signal.reason : new Error('peer server is closing');
 }
@@ -31,11 +39,7 @@ function createCallerAssertion(state, provider, dependencies = {}, capturedCalle
   });
   return async function assertCallerCurrent(signal) {
     const current = await resolvePeerCaller(state, provider, dependencies, signal);
-    if (current.provider !== expected.provider ||
-        current.guildId !== expected.guildId ||
-        current.channelId !== expected.channelId ||
-        canonicalNativeId(current.nativeId) !== expected.nativeId ||
-        current.generation !== expected.generation) {
+    if (!sameCallerAddress(current, expected)) {
       throw new Error('native caller must be revalidated: peer caller changed');
     }
   };
@@ -83,4 +87,4 @@ async function resolvePeerCaller(state, provider, dependencies = {}, signal) {
   return bindings[0];
 }
 
-module.exports = { resolvePeerCaller, createCallerAssertion };
+module.exports = { resolvePeerCaller, createCallerAssertion, sameCallerAddress };

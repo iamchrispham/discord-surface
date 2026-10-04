@@ -233,6 +233,61 @@ test('peer send refuses after destination lookup', async t => {
   assert.equal(directPostRows(f.state, 'effect-send-get').attempts.length, 0, 'no direct-post attempt after the caller changed');
 });
 
+test('peer send keeps the captured guild through the second caller resolution', async t => {
+  const scenarios = [
+    { name: 'channelId', peer: { channelId: '201' }, mutateAt: 2 },
+    { name: 'channelName', peer: { channelName: 'general' }, mutateAt: 4 }
+  ];
+  const failures = [];
+  for (const scenario of scenarios) {
+    const changed = fixture(t);
+    changed.enroll('102');
+    addRecipient(changed);
+    let resolutions = 0;
+    let requests = 0;
+    const peer = service(changed, {
+      callerDependencies: { resolveClaudeCaller: async () => {
+        resolutions += 1;
+        if (resolutions === scenario.mutateAt) {
+          changed.state.setConfig({ guildId: '200' });
+          changed.state.db.prepare("UPDATE bindings SET guild_id='200' WHERE channel_id='101'").run();
+        }
+        return { harness: 'claude-code', sessionId: ORIGINAL };
+      } },
+      loadChannels: async () => [{ id: '201', guildId: '100', name: 'general' }],
+      fetchImpl: async () => {
+        requests += 1;
+        return response({ id: '10001', channel_id: '201' });
+      }
+    });
+    const dedupeKey = `effect-send-second-resolution-${scenario.name}`;
+    const refused = await nativeRefusal(peer.send({ peer: scenario.peer, text: 'hello', dedupe_key: dedupeKey }));
+    const attempts = directPostRows(changed.state, dedupeKey).attempts.length;
+    if (!refused || requests !== 0 || attempts !== 0) {
+      failures.push(`${scenario.name}: refused=${refused} requests=${requests} attempts=${attempts}`);
+    }
+  }
+  assert.deepEqual(failures, [], `a guild change during source resolution must refuse on both paths: ${failures.join('; ')}`);
+
+  for (const scenario of scenarios) {
+    const stable = fixture(t);
+    stable.enroll('102');
+    addRecipient(stable);
+    let requests = 0;
+    const peer = service(stable, {
+      loadChannels: async () => [{ id: '201', guildId: '100', name: 'general' }],
+      fetchImpl: async (url, options) => {
+        requests += 1;
+        if (options?.method === 'POST') return response({ id: '10001', channel_id: '202', author: { id: 'bot', bot: true }, content: 'hello' });
+        return response({ id: '202', guild_id: '100' });
+      }
+    });
+    const result = await peer.send({ peer: scenario.peer, text: 'hello', dedupe_key: `effect-send-second-resolution-stable-${scenario.name}` });
+    assert.equal(result.status, 'sent', `${scenario.name} stable caller publishes`);
+    assert.ok(requests > 0, `${scenario.name} stable caller reaches the transport`);
+  }
+});
+
 test('board refuses after installation lookup', async t => {
   await boardBoundary(t, 1, 'effect-board-installation', 'effect-board-installation-seed')();
 });

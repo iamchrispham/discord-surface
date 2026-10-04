@@ -69,10 +69,12 @@ function calleeName(node) {
   return null;
 }
 
-// local alias -> canonical imported name, resolved from ES imports and CommonJS
-// require destructuring, so `import { sendDiscordMessage as send }` still counts.
+// local alias -> canonical imported name, resolved from ES imports, CommonJS
+// require destructuring, and identifier assignments, so local transport aliases
+// remain inside the declared effect inventory.
 function importedAliases(sourceFile) {
   const aliases = new Map();
+  const localAliases = new Map();
   const visit = node => {
     if (ts.isImportDeclaration(node) && node.importClause?.namedBindings &&
         ts.isNamedImports(node.importClause.namedBindings)) {
@@ -90,9 +92,26 @@ function importedAliases(sourceFile) {
         }
       }
     }
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer &&
+        ts.isIdentifier(node.initializer)) {
+      localAliases.set(node.name.text, node.initializer.text);
+    }
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
+  const resolve = (name, seen = new Set()) => {
+    if (seen.has(name)) return name;
+    const imported = aliases.get(name);
+    if (imported !== undefined) return imported;
+    const target = localAliases.get(name);
+    if (target === undefined) return name;
+    const nextSeen = new Set(seen);
+    nextSeen.add(name);
+    const canonical = resolve(target, nextSeen);
+    aliases.set(name, canonical);
+    return canonical;
+  };
+  for (const name of localAliases.keys()) resolve(name);
   return aliases;
 }
 
@@ -242,7 +261,7 @@ function serverFetchViolations(sources) {
   const file = 'src/peer/server.js';
   const text = sources[file];
   if (typeof text !== 'string') return [`${file}: source is missing`];
-  const sites = callSites(parse(file, text)).filter(site => site.name === 'fetch');
+  const sites = callSites(parse(file, text)).filter(site => site.canonical === 'fetch' || site.name === 'fetch');
   const violations = [];
   if (sites.length !== 1) violations.push(`${file}: fetch expected 1, found ${sites.length}`);
   for (const site of sites) {
