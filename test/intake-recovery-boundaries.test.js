@@ -538,7 +538,8 @@ for (const control of LEGACY_NEGATIVE_CONTROLS) {
 }
 
 const SOURCE_FILE_PATTERN = /\.(?:js|ts)$/;
-const CLASSIFIER_PATTERN = /\b(?:classifyRecoveryDeadline|recoveryDeadlineClassifier)\s*\(/;
+const DEADLINE_TRIGGER_PATTERN = /\b(?:DEADLINE|deadlineReached)\b|\bDate\.now\(\)\s*>=\s*deadline\b/;
+const GAP_DECISION_PATTERN = /\b(?:READINESS\.GAP|THREAD_STATES\.GAP)\b|\?\s*['"]gap['"]|\breturn\s+['"]gap['"]/;
 
 const collectSourceFiles = directory => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
   const absolute = path.join(directory, entry.name);
@@ -555,37 +556,62 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
   const lines = source.split(/\r?\n/);
   const offenders = [];
   for (let index = 0; index < lines.length; index += 1) {
-    if (!/\b(?:DEADLINE|deadlineReached)\b/.test(lines[index])) continue;
+    if (!DEADLINE_TRIGGER_PATTERN.test(lines[index])) continue;
     const window = lines.slice(index, index + 4).join('\n');
-    if (!/\b(?:READINESS\.GAP|THREAD_STATES\.GAP)\b|\?\s*['"]gap['"]/.test(window)) continue;
-    if (CLASSIFIER_PATTERN.test(window)) continue;
+    if (!GAP_DECISION_PATTERN.test(window)) continue;
     offenders.push(`${relative}:${index + 1}`);
   }
   return offenders;
 });
 
-test('deadline policy inventory has no direct deadline-to-gap decision outside its classifier', () => {
+test('deadline policy inventory has no direct deadline-to-gap decision', () => {
   const sourceRoot = path.join(__dirname, '../src');
   const offenders = findDeadlineGapOffenders(readSourceInventory(sourceRoot));
-  assert.deepEqual(offenders, [], 'new deadline decisions must use the shared recovery classifier');
+  assert.deepEqual(offenders, [], 'new deadline decisions must not map expiry directly to a history gap');
 });
 
-test('deadline policy inventory catches a new source owner and permits classifier and ordinary deadlines', () => {
+test('deadline policy inventory catches new owners while allowing unavailable classifiers and ordinary deadlines', () => {
   const entries = [
     {
       relative: 'discord/new-owner.js',
       source: "const state = deadlineReached ? READINESS.GAP : READINESS.READY;"
     },
     {
-      relative: 'discord/recovery-classifier.js',
-      source: "function classifyRecoveryDeadline(deadlineReached) { return deadlineReached ? READINESS.GAP : READINESS.READY; }"
+      relative: 'discord/decoy-classifier.js',
+      source: "function recoveryDeadlineClassifier(deadlineReached) { return deadlineReached ? READINESS.GAP : READINESS.READY; }"
+    },
+    {
+      relative: 'discord/adjacent-classifier-call.js',
+      source: "if (deadlineReached) { classifyRecoveryFailure(error); return READINESS.GAP; }"
+    },
+    {
+      relative: 'discord/new-timestamp-owner.js',
+      source: "if (Date.now() >= deadline) return READINESS.GAP;"
+    },
+    {
+      relative: 'discord/new-string-timestamp-owner.js',
+      source: "if (Date.now() >= deadline) return 'gap';"
+    },
+    {
+      relative: 'discord/recovery-fetch.ts',
+      source: "function classifyRecoveryFailure(deadlineReached) { return deadlineReached ? READINESS.UNAVAILABLE : READINESS.READY; }"
     },
     {
       relative: 'discord/ordinary-deadline.js',
       source: "if (deadlineReached) return RETRY;"
+    },
+    {
+      relative: 'discord/ordinary-timestamp.js',
+      source: "if (Date.now() >= deadline) return RETRY;"
     }
   ];
-  assert.deepEqual(findDeadlineGapOffenders(entries), ['discord/new-owner.js:1']);
+  assert.deepEqual(findDeadlineGapOffenders(entries), [
+    'discord/new-owner.js:1',
+    'discord/decoy-classifier.js:1',
+    'discord/adjacent-classifier-call.js:1',
+    'discord/new-timestamp-owner.js:1',
+    'discord/new-string-timestamp-owner.js:1'
+  ]);
 });
 
 test('pre-adoption retry classifier sites stay in the audited owners', () => {
