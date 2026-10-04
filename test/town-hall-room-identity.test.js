@@ -332,6 +332,31 @@ test('matching malformed room identifiers are refused at both boundaries', () =>
   }
 });
 
+test('room guard rejects accessor descriptors with inherited value fields', () => {
+  const { isTownHallRoom } = require('../dist/peer/town-hall-plan');
+  const accessorRoom = {};
+  for (const [key, value] of [['guildId', GUILD], ['channelId', CHANNEL]]) {
+    Object.defineProperty(accessorRoom, key, {
+      get() { return { value }; },
+      configurable: true,
+      enumerable: true
+    });
+  }
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'value');
+  Object.defineProperty(Object.prototype, 'value', {
+    value: GUILD,
+    configurable: true,
+    enumerable: false,
+    writable: true
+  });
+  try {
+    assert.equal(isTownHallRoom(accessorRoom), false);
+  } finally {
+    if (previous) Object.defineProperty(Object.prototype, 'value', previous);
+    else delete Object.prototype.value;
+  }
+});
+
 test('room identifier length boundaries preserve valid matches', () => {
   const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
   for (const id of ['0', '1'.repeat(20)]) {

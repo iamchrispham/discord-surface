@@ -73,7 +73,7 @@ function hasExactOwnKeys(value: object, keys: readonly string[]): boolean {
 
 function ownDataProperty(value: object, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
-  if (!descriptor || !('value' in descriptor)) throw invalid();
+  if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) throw invalid();
   return descriptor.value;
 }
 

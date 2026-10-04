@@ -402,6 +402,7 @@ function roomDigitPolicies(records) {
     objectMethods: new Map(),
     imports: new Map(),
     exports: new Map(),
+    starExports: [],
   }));
   const byFile = new Map(infos.map(info => [info.file, info]));
 
@@ -639,15 +640,19 @@ function roomDigitPolicies(records) {
     commonJsExportVisit(info.ast);
 
     for (const statement of info.ast.statements) {
-      if (ts.isExportDeclaration(statement) && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
-        for (const element of statement.exportClause.elements) {
-          const imported = element.propertyName?.text || element.name.text;
-          const specifier = statement.moduleSpecifier && ts.isStringLiteralLike(statement.moduleSpecifier)
-            ? statement.moduleSpecifier.text
-            : null;
-          info.exports.set(element.name.text, specifier
-            ? { kind: 'reexport', specifier, imported }
-            : imported);
+      if (ts.isExportDeclaration(statement)) {
+        const specifier = statement.moduleSpecifier && ts.isStringLiteralLike(statement.moduleSpecifier)
+          ? statement.moduleSpecifier.text
+          : null;
+        if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+          for (const element of statement.exportClause.elements) {
+            const imported = element.propertyName?.text || element.name.text;
+            info.exports.set(element.name.text, specifier
+              ? { kind: 'reexport', specifier, imported }
+              : imported);
+          }
+        } else if (!statement.exportClause && specifier) {
+          info.starExports.push(specifier);
         }
       }
       if (ts.isExportAssignment(statement)) {
@@ -707,6 +712,11 @@ function roomDigitPolicies(records) {
         const target = resolveModule(info, exported.specifier);
         return target ? resolveExportedFunction(target, exported.imported, seen) : null;
       }
+    }
+    for (const specifier of info.starExports) {
+      const target = resolveModule(info, specifier);
+      const resolved = target ? resolveExportedFunction(target, name, seen) : null;
+      if (resolved) return resolved;
     }
     const localName = typeof exported === 'string' ? exported : name;
     return info.functions.get(localName) || null;
@@ -1105,6 +1115,27 @@ test('room policy inventory records only town-hall room validators', () => {
   ]), {
     ...expectedPolicies,
     'peer/barrel-room.ts': 1
+  });
+  const wildcardBarrelRoomHelper = {
+    file: 'peer/wildcard-barrel-room.ts',
+    text: 'export function validateGuildId(value) { return /^\\d{1,21}$/.test(value); }'
+  };
+  const wildcardBarrelRoom = {
+    file: 'peer/wildcard-barrel.ts',
+    text: "export * from './wildcard-barrel-room';"
+  };
+  const wildcardBarrelRoomConsumer = {
+    file: 'peer/wildcard-barrel-consumer.ts',
+    text: "import { validateGuildId } from './wildcard-barrel'; function validateRoom(room) { return validateGuildId(room.guildId); }"
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    wildcardBarrelRoomHelper,
+    wildcardBarrelRoom,
+    wildcardBarrelRoomConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/wildcard-barrel-room.ts': 1
   });
   const objectMethodValidator = {
     file: 'peer/object-method-validator.ts',
