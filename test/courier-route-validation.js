@@ -140,3 +140,97 @@ test('persisted wrong recipient stays stale without parent fallback', async t =>
   assert.equal(f.state.getCourierAttempt(f.message.id), null);
   assert.equal(f.state.listReceipts().some(row => row.kind === 'courier-rejection' && JSON.parse(row.detail).reason === 'stale'), true);
 });
+
+function disposableCourierState(t, parentNativeId) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-courier-case-'));
+  const sessionRoot = path.join(dir, 'sessions');
+  fs.mkdirSync(sessionRoot, { recursive: true });
+  const state = new SurfaceState(path.join(dir, 'surface.sqlite'));
+  t.after(() => {
+    try { state.close(); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  state.setConfig({ operatorId: 'operator', guildId: '100', secretFile: path.join(dir, 'secret') });
+  const binding = state.bind({
+    channelId: '1000',
+    guildId: '100',
+    provider: 'codex',
+    nativeId: parentNativeId,
+    workspace: dir,
+    sessionRoot
+  }, { intakeCutoff: '100' });
+  state.enrollThread({ threadId: '2000', parentChannelId: '1000', guildId: '100', adoptionCutoff: '100' }, binding);
+  state.setThreadBaseline('2000', null, binding);
+  state.markThreadBoundary('2000', THREAD_STATES.READY, 'courier case fixture', null, null, binding);
+  return { dir, sessionRoot, state, binding };
+}
+
+function courierRouteInput(f, { routeId, courierNativeId }) {
+  return {
+    routeId,
+    routeGeneration: 1,
+    guildId: '100',
+    parentChannelId: '1000',
+    deliveryChannelId: '2000',
+    target: {
+      guildId: '100',
+      channelId: '2000',
+      provider: 'codex',
+      nativeId: f.binding.nativeId,
+      generation: f.binding.generation
+    },
+    courier: {
+      provider: 'codex',
+      nativeId: courierNativeId,
+      workspace: f.dir,
+      sessionRoot: f.sessionRoot,
+      recipientThreadId: f.binding.nativeId,
+      hostId: 'host-local'
+    }
+  };
+}
+
+test('courier route registration refuses a lowercase courier of an uppercase parent session', t => {
+  const parentNative = 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA';
+  const courierNative = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const f = disposableCourierState(t, parentNative);
+
+  assert.throws(
+    () => f.state.registerCourierRoute(courierRouteInput(f, { routeId: 'case-route-lower-courier', courierNativeId: courierNative })),
+    /courier identity must differ from parent native identity/
+  );
+  assert.deepEqual(f.state.listCourierRoutes(), []);
+  assert.equal(f.state.listReceipts().some(row => row.kind === 'courier-route'), false);
+});
+
+test('courier route registration refuses an uppercase courier of a lowercase parent session', t => {
+  const parentNative = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const courierNative = 'BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB';
+  const f = disposableCourierState(t, parentNative);
+
+  assert.throws(
+    () => f.state.registerCourierRoute(courierRouteInput(f, { routeId: 'case-route-upper-courier', courierNativeId: courierNative })),
+    /courier identity must differ from parent native identity/
+  );
+  assert.deepEqual(f.state.listCourierRoutes(), []);
+  assert.equal(f.state.listReceipts().some(row => row.kind === 'courier-route'), false);
+});
+
+test('courier route registration keeps exact spelling for genuinely distinct sessions', t => {
+  const parentNative = 'CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC';
+  const courierNative = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const f = disposableCourierState(t, parentNative);
+
+  const registered = f.state.registerCourierRoute(
+    courierRouteInput(f, { routeId: 'distinct-session-route', courierNativeId: courierNative })
+  );
+  assert.ok(registered);
+  assert.equal(registered.target.nativeId, parentNative);
+  assert.equal(registered.target.generation, f.binding.generation);
+  assert.equal(registered.courier.nativeId, courierNative);
+  assert.equal(registered.courier.recipientThreadId, parentNative);
+  const listed = f.state.listCourierRoutes().filter(route => route.routeId === 'distinct-session-route');
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].target.nativeId, parentNative);
+  assert.equal(listed[0].courier.nativeId, courierNative);
+});
