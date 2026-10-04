@@ -10,7 +10,8 @@ const {
   encodeTownHallChild,
   decodeTownHallChild,
   validateTownHallChild,
-  TOWN_HALL_CHILD_CONTRACT
+  TOWN_HALL_CHILD_CONTRACT,
+  TOWN_HALL_CHILD_KINDS
 } = require('../src/town-hall-child.js');
 const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
 const {
@@ -21,6 +22,8 @@ const {
 
 const TOKEN = 'town-hall-child-disposable-credential';
 const ORDINARY_DOMAIN = 'discord-tether/agent-message/v1';
+const PACKET_ID_PREFIX = 'townhall_';
+const PACKET_ID_DOMAIN = 'discord-surface/town-hall-child/v1';
 
 const PACKET_ERROR = 'invalid town-hall child packet';
 const CREDENTIAL_ERROR = 'town-hall child credential unavailable';
@@ -50,9 +53,24 @@ function address(overrides = {}) {
   return { ...SOURCE, ...overrides };
 }
 
+function packetIdFor(packet) {
+  const canonical = addressValue => ({
+    ...addressValue,
+    nativeId: addressValue.nativeId.toLowerCase()
+  });
+  return PACKET_ID_PREFIX + crypto.createHash('sha256')
+    .update(JSON.stringify([
+      PACKET_ID_DOMAIN,
+      canonical(packet.source),
+      packet.broadcastId,
+      canonical(packet.target)
+    ]))
+    .digest('hex');
+}
+
 function validPacket(overrides = {}) {
-  return {
-    id: `townhall_${'a'.repeat(64)}`,
+  const packet = {
+    id: null,
     kind: 'request',
     source: { ...SOURCE },
     target: { ...TARGET },
@@ -67,6 +85,16 @@ function validPacket(overrides = {}) {
     roomMessageId: ROOM_MESSAGE_ID,
     ...overrides
   };
+  if (!Object.prototype.hasOwnProperty.call(overrides, 'id')) {
+    const sourceReady = packet.source && typeof packet.source.nativeId === 'string';
+    const targetReady = packet.target && typeof packet.target.nativeId === 'string';
+    if (sourceReady && targetReady && typeof packet.broadcastId === 'string') {
+      packet.id = packetIdFor(packet);
+    } else {
+      packet.id = `${PACKET_ID_PREFIX}${'a'.repeat(64)}`;
+    }
+  }
+  return packet;
 }
 
 function planInput(overrides = {}) {
@@ -188,6 +216,7 @@ test('planner-derived child round trips every signed field', () => {
   assert.equal(TOWN_HALL_CHILD_CONTRACT.DOMAIN, 'discord-tether/town-hall-child/v1');
   assert.equal(TOWN_HALL_CHILD_CONTRACT.PURPOSE, 'town-hall-child/v1');
   assert.equal(TOWN_HALL_CHILD_CONTRACT.ROUTING_VERSION, 2);
+  assert.equal(TOWN_HALL_CHILD_KINDS.REQUEST, 'request');
   assert.equal(TOWN_HALL_CHILD_CONTRACT.MAX_TEXT_BYTES, 10000);
   assert.equal(TOWN_HALL_CHILD_CONTRACT.MAX_ENCODED_LENGTH, 81350);
   assert.ok(Object.isFrozen(TOWN_HALL_CHILD_CONTRACT));
@@ -234,6 +263,15 @@ test('planner-derived child round trips every signed field', () => {
   packet.text = 'mutated caller text';
   assert.equal(decoded.target.channelId, TARGET.channelId);
   assert.equal(decoded.text, 'child instruction text');
+});
+
+test('packet ID binds the frozen recipient identity', () => {
+  const packet = validPacket();
+  const otherRecipient = validPacket({ target: { ...TARGET, channelId: '301' } });
+  assert.notEqual(packet.id, otherRecipient.id);
+  const reused = { ...packet, id: otherRecipient.id };
+  expectError(() => validateTownHallChild(reused), PACKET_ERROR);
+  expectError(() => encodeTownHallChild(reused, TOKEN), PACKET_ERROR);
 });
 
 test('canonical encoder ignores caller property order', () => {
@@ -371,7 +409,7 @@ test('maximum NUL instruction fits exact attachment bound', () => {
   const targetChannel = `${'8'.repeat(19)}6`;
   const text = '\u0000'.repeat(10000);
   const packet = {
-    id: `townhall_${'a'.repeat(64)}`,
+    id: null,
     kind: 'request',
     source: {
       guildId: guild, channelId: sourceChannel, provider: 'claude',
@@ -391,6 +429,7 @@ test('maximum NUL instruction fits exact attachment bound', () => {
     room: { guildId: guild, channelId: roomChannel },
     roomMessageId: '1'.repeat(20)
   };
+  packet.id = packetIdFor(packet);
 
   assert.equal(Buffer.byteLength(text, 'utf8'), 10000);
   assert.equal(Buffer.byteLength(JSON.stringify(packet), 'utf8'), 60958);
@@ -768,11 +807,16 @@ test('stale target addresses refuse without returning a packet', () => {
       return true;
     });
     assert.equal(result, undefined);
-    assert.equal(decodeTownHallChild(wire, TOKEN, { ...variant.target }).id, packet.id, `variant ${field} must itself decode`);
+    assert.equal(decodeTownHallChild(wire, TOKEN, { ...variant.target }).id, variant.id, `variant ${field} must itself decode`);
   }
 
   const control = decodeTownHallChild(encodeTownHallChild(packet, TOKEN), TOKEN, target);
   assert.deepEqual(control.target, { ...TARGET });
+  const uppercaseTarget = { ...TARGET, nativeId: TARGET_UUID.toUpperCase() };
+  assert.deepEqual(
+    decodeTownHallChild(encodeTownHallChild(packet, TOKEN), TOKEN, uppercaseTarget).target,
+    { ...TARGET }
+  );
 
   const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   const testTokens = String(packageJson.scripts.test).split(/\s+/);

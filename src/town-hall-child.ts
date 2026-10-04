@@ -9,10 +9,14 @@ import {
 
 const PREFIX = 'discord-tether:town-hall:v1:';
 const DOMAIN = 'discord-tether/town-hall-child/v1';
-const PURPOSE = 'town-hall-child/v1';
-const ROUTING_VERSION = 2;
+const PACKET_ID_PREFIX = 'townhall_' as const;
+const PACKET_ID_DOMAIN = 'discord-surface/town-hall-child/v1' as const;
 const MAX_TEXT_BYTES = 10000;
 const MAX_ENCODED_LENGTH = 81350;
+
+export const TOWN_HALL_CHILD_KINDS = Object.freeze({
+  REQUEST: 'request' as const
+});
 
 const ROOT_FIELDS = Object.freeze([
   'id',
@@ -36,12 +40,14 @@ const ROOM_FIELDS = Object.freeze(['guildId', 'channelId'] as const);
 export const TOWN_HALL_CHILD_CONTRACT = Object.freeze({
   PREFIX,
   DOMAIN,
-  PURPOSE,
-  ROUTING_VERSION,
+  PURPOSE: 'town-hall-child/v1' as const,
+  ROUTING_VERSION: 2 as const,
   MAX_TEXT_BYTES,
   MAX_ENCODED_LENGTH,
   ROOT_FIELDS
 } as const);
+
+export type TownHallChildKind = typeof TOWN_HALL_CHILD_KINDS[keyof typeof TOWN_HALL_CHILD_KINDS];
 
 export interface TownHallChildAddress {
   readonly guildId: string;
@@ -58,13 +64,13 @@ export interface TownHallChildRoom {
 
 export interface TownHallChildPacket {
   readonly id: string;
-  readonly kind: 'request';
+  readonly kind: TownHallChildKind;
   readonly source: TownHallChildAddress;
   readonly target: TownHallChildAddress;
   readonly replyTo: null;
-  readonly routingVersion: 2;
+  readonly routingVersion: typeof TOWN_HALL_CHILD_CONTRACT.ROUTING_VERSION;
   readonly text: string;
-  readonly purpose: 'town-hall-child/v1';
+  readonly purpose: typeof TOWN_HALL_CHILD_CONTRACT.PURPOSE;
   readonly broadcastId: string;
   readonly journalKey: string;
   readonly planFingerprint: string;
@@ -72,7 +78,7 @@ export interface TownHallChildPacket {
   readonly roomMessageId: string;
 }
 
-const ID_PATTERN = /^townhall_[0-9a-f]{64}$/;
+const ID_PATTERN = new RegExp(`^${PACKET_ID_PREFIX}[0-9a-f]{64}$`);
 const BROADCAST_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
 const HEX64_PATTERN = /^[0-9a-f]{64}$/;
 const SNOWFLAKE_PATTERN = /^\d{1,20}$/;
@@ -99,6 +105,25 @@ function invalidSignature(): Error {
 
 function staleTarget(): Error {
   return new Error('town-hall child target is stale or mismatched');
+}
+
+function canonicalAddress(address: TownHallChildAddress): TownHallChildAddress {
+  return { ...address, nativeId: address.nativeId.toLowerCase() };
+}
+
+function packetIdFor(
+  source: TownHallChildAddress,
+  broadcastId: string,
+  target: TownHallChildAddress
+): string {
+  return PACKET_ID_PREFIX + crypto.createHash('sha256')
+    .update(JSON.stringify([
+      PACKET_ID_DOMAIN,
+      canonicalAddress(source),
+      broadcastId,
+      canonicalAddress(target)
+    ]))
+    .digest('hex');
 }
 
 /**
@@ -160,10 +185,10 @@ function snapshotPacket(packet: unknown): TownHallChildPacket {
   if (source === null || target === null || room === null) throw invalid();
 
   if (typeof values.id !== 'string' || !ID_PATTERN.test(values.id)) throw invalid();
-  if (values.kind !== 'request') throw invalid();
+  if (values.kind !== TOWN_HALL_CHILD_KINDS.REQUEST) throw invalid();
   if (values.replyTo !== null) throw invalid();
-  if (values.routingVersion !== ROUTING_VERSION) throw invalid();
-  if (values.purpose !== PURPOSE) throw invalid();
+  if (values.routingVersion !== TOWN_HALL_CHILD_CONTRACT.ROUTING_VERSION) throw invalid();
+  if (values.purpose !== TOWN_HALL_CHILD_CONTRACT.PURPOSE) throw invalid();
   if (typeof values.broadcastId !== 'string' || !BROADCAST_ID_PATTERN.test(values.broadcastId)) throw invalid();
   if (typeof values.journalKey !== 'string' || !HEX64_PATTERN.test(values.journalKey)) throw invalid();
   if (typeof values.planFingerprint !== 'string' || !HEX64_PATTERN.test(values.planFingerprint)) throw invalid();
@@ -174,16 +199,17 @@ function snapshotPacket(packet: unknown): TownHallChildPacket {
   if (source.guildId !== target.guildId || source.guildId !== room.guildId) throw invalid();
   if (room.channelId === source.channelId || room.channelId === target.channelId) throw invalid();
   if (sameAgentSession(source, target)) throw invalid();
+  if (values.id !== packetIdFor(source, values.broadcastId, target)) throw invalid();
 
   return {
     id: values.id,
-    kind: 'request',
+    kind: TOWN_HALL_CHILD_KINDS.REQUEST,
     source,
     target,
     replyTo: null,
-    routingVersion: ROUTING_VERSION,
+    routingVersion: TOWN_HALL_CHILD_CONTRACT.ROUTING_VERSION,
     text,
-    purpose: PURPOSE,
+    purpose: TOWN_HALL_CHILD_CONTRACT.PURPOSE,
     broadcastId: values.broadcastId,
     journalKey: values.journalKey,
     planFingerprint: values.planFingerprint,
@@ -241,6 +267,6 @@ export function decodeTownHallChild(
     throw invalidEncoding();
   }
   const packet = snapshotPacket(parsed);
-  if (!sameAddress(packet.target, target)) throw staleTarget();
+  if (!sameAddress(canonicalAddress(packet.target), canonicalAddress(target))) throw staleTarget();
   return packet;
 }
