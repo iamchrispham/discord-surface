@@ -470,7 +470,10 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   }
 
   const declaringFiles = sourceFiles(path.join(root, 'src'))
-    .filter(filePath => declaredNames(parse(fs.readFileSync(filePath, 'utf8'))).includes('captureProcessOwnerIdentity'))
+    .filter(filePath => declaredNames(parse(
+      fs.readFileSync(filePath, 'utf8'),
+      path.extname(filePath) === '.ts' ? ts.ScriptKind.TS : ts.ScriptKind.JS
+    )).includes('captureProcessOwnerIdentity'))
     .map(filePath => path.relative(root, filePath));
   assert.deepEqual(declaringFiles, [path.relative(root, ownerPath)]);
 
