@@ -452,6 +452,79 @@ test('duplicate announcement revalidates without network', async t => {
   assert.equal(outcomes[0].detail.nonce, nonce, 'the original nonce is unchanged');
 });
 
+test('cached peer send returns stale when destination readiness changes during revalidation', async t => {
+  const f = fixture(t);
+  f.enroll('102');
+  addRecipient(f);
+  let revokeReadiness = false;
+  let resolutions = 0;
+  let posts = 0;
+  const peer = service(f, {
+    callerDependencies: { resolveClaudeCaller: async () => {
+      resolutions += 1;
+      if (revokeReadiness && resolutions > 2) {
+        const destination = f.state.getBinding('201');
+        f.state.setBindingReadiness('201', READINESS.GAP, 'destination readiness changed during cached disclosure', destination);
+      }
+      return { harness: 'claude-code', sessionId: ORIGINAL };
+    } },
+    fetchImpl: async (url, options) => {
+      if (options.method === 'GET') return response({ id: '202', guild_id: '100' });
+      posts += 1;
+      return response({ id: '10001', channel_id: '202' });
+    }
+  });
+  const input = { peer: { channelId: '201' }, text: 'hello', dedupe_key: 'effect-send-cached-readiness' };
+  const first = await peer.send(input);
+  assert.equal(first.status, 'sent');
+
+  revokeReadiness = true;
+  resolutions = 0;
+  const replay = await peer.send(input);
+  assert.equal(replay.status, 'stale');
+  assert.equal(replay.parts[0].status, 'stale');
+  assert.equal(posts, 1, 'the cached replay does not send again');
+});
+
+test('cached board result returns stale when binding readiness changes during revalidation', async t => {
+  const f = fixture(t);
+  const textFile = messageFile(t, f, 'effect-board-cached-readiness.txt');
+  fs.writeFileSync(textFile, 'Initial board');
+  let revokeReadiness = false;
+  let resolutions = 0;
+  let patches = 0;
+  const peer = service(f, {
+    callerDependencies: { resolveClaudeCaller: async () => {
+      resolutions += 1;
+      if (revokeReadiness && resolutions > 1) {
+        const binding = f.state.getBinding('101');
+        f.state.setBindingReadiness('101', READINESS.GAP, 'binding readiness changed during cached disclosure', binding);
+      }
+      return { harness: 'claude-code', sessionId: ORIGINAL };
+    } },
+    fetchImpl: async (url, options) => {
+      if (options.method === 'GET' && url.endsWith('/users/@me')) return response({ id: 'bot' });
+      if (options.method === 'GET' && url.endsWith('/channels/101')) return response({ id: '101', guild_id: '100' });
+      if (options.method === 'GET') return response({ id: '10001', channel_id: '101', author: { id: 'bot', bot: true }, content: 'Initial board' });
+      if (options.method === 'POST') return response({ id: '10001', channel_id: '101', author: { id: 'bot', bot: true }, content: 'Initial board' });
+      patches += 1;
+      return response({ id: '10001', channel_id: '101', author: { id: 'bot', bot: true }, content: 'Updated board' });
+    }
+  });
+  await peer.post({ role: 'announce', text_file: textFile, dedupe_key: 'effect-board-cached-readiness-seed' });
+  fs.writeFileSync(textFile, 'Updated board');
+  const input = { role: 'board', message_id: '10001', text_file: textFile, dedupe_key: 'effect-board-cached-readiness' };
+  const first = await peer.post(input);
+  assert.equal(first.status, 'applied');
+
+  revokeReadiness = true;
+  resolutions = 0;
+  const replay = await peer.post(input);
+  assert.equal(replay.status, 'stale');
+  assert.equal(replay.outcome, 'stale');
+  assert.equal(patches, 1, 'the cached replay does not PATCH again');
+});
+
 test('cancelled peer call starts no network or attempt', async t => {
   const f = fixture(t);
   f.enroll('102');

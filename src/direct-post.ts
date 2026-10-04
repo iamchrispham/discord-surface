@@ -374,6 +374,10 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         // A stored duplicate or historical result performs no network effect,
         // but the authenticated caller must still be current before disclosure.
         await revalidateCaller();
+        if (!currentReady() || !currentDestination()) {
+          parts.push({ index: partIndex, status: 'stale', messageId: null });
+          break;
+        }
         parts.push({ index: partIndex, status: existing.status, messageId: existing.outcome?.messageId || null });
         if (existing.status !== 'sent') break;
         continue;

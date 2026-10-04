@@ -179,6 +179,11 @@ export async function runBoardRefresh({
     if (typeof assertCallerCurrent !== 'function') return;
     await assertCallerCurrent(signal);
   };
+  const isBindingCurrent = () => {
+    if (typeof bindingCurrent !== 'function') return true;
+    try { return bindingCurrent(); }
+    catch { return false; }
+  };
   const existing = state.inspectBoardRequest(requestId, target);
   if (existing?.attempt?.payloadHash && existing.attempt.payloadHash !== payloadHash &&
       (typeof existing.attempt.content !== 'string' || !boardTextEquivalent(existing.attempt.content, content))) {
@@ -188,15 +193,18 @@ export async function runBoardRefresh({
     // A stored historical or duplicate result has no network effect, but the
     // authenticated caller must still be current before it is disclosed.
     await revalidateCaller();
+    if (!isBindingCurrent()) {
+      return {
+        ...resultFromAdmission(existing),
+        status: BOARD_OUTCOMES.STALE,
+        outcome: BOARD_OUTCOMES.STALE,
+        reason: 'binding readiness changed before cached board result disclosure'
+      };
+    }
     return resultFromAdmission(existing);
   }
 
   const binding = resolveBinding(state, { nativeId, generation: ownerGeneration, channelId });
-  const isBindingCurrent = () => {
-    if (typeof bindingCurrent !== 'function') return true;
-    try { return bindingCurrent(); }
-    catch { return false; }
-  };
 
   // Capture before the asynchronous preflight GETs. Admission compares this value inside BEGIN IMMEDIATE.
   const prepared = state.captureBoardRevision(target);
