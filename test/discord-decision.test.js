@@ -724,6 +724,41 @@ test('long-answer projection failure does not dispatch native work', { timeout: 
   assert.equal(f.state.listDecisionPendingWork().length, 1);
 });
 
+test('deleted question projection is terminal and releases long-answer native custody', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId: 'deleted-question', presentationId: f.presentation.presentationId, selectedKey: 'approve',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel'), applicationId: 'application', token: 'deleted-token'
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.importDecisionWinner('deleted-question', {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'answer-deleted',
+    answer: 'x'.repeat(4097)
+  }).accepted, true);
+
+  f.gateway.projectDecisionMessage = async () => {
+    throw Object.assign(new Error('Unknown Message'), { code: 10008, status: 404 });
+  };
+  await f.gateway.decisionConsumer.recover(new AbortController().signal);
+
+  const click = f.state.getDecisionClick('deleted-question');
+  assert.equal(click?.projectionOutcome, 'rejected');
+  assert.equal(click?.nativeReturn?.outcome, 'submitted');
+  assert.equal(click?.state, 'terminal');
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+  assert.equal(click?.token, null);
+});
+
 test('unknown projection remains retryable after native submission and closes custody when sent', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const admitted = f.state.admitDecisionClickAndBeginCallback({

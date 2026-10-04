@@ -549,7 +549,7 @@ export function createDecisionHandlers(): DecisionHandlers {
           if (!projectionRetryable(click.projectionOutcome)) return { accepted: false, reason: DECISION_REASONS.PROJECTION_OUTCOME_CONFLICT, click: mutableClickOutput(click) };
         }
         append(state, DECISION_RECEIPT_KINDS.PROJECTION_OUTCOME, { interactionId: id, outcome: nextOutcome });
-        if (nextOutcome === DECISION_TRANSPORT_OUTCOMES.SENT && click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED) {
+        if (click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED && !projectionRetryable(nextOutcome)) {
           releaseToken(state, id);
         }
         return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
@@ -577,7 +577,7 @@ export function createDecisionHandlers(): DecisionHandlers {
         append(state, DECISION_RECEIPT_KINDS.NATIVE_OUTCOME, { interactionId: id, outcome: nextOutcome });
         if (nextOutcome !== DECISION_NATIVE_OUTCOMES.IN_FLIGHT &&
           !(nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED &&
-            click.projectionOutcome !== null && click.projectionOutcome !== DECISION_TRANSPORT_OUTCOMES.SENT)) {
+            click.projectionOutcome !== null && projectionRetryable(click.projectionOutcome))) {
           releaseToken(state, id);
         }
         return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };

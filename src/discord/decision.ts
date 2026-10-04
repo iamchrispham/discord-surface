@@ -226,6 +226,23 @@ function transportOutcome(value: unknown): DecisionTransportOutcome {
     : DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
 }
 
+function isUnknownDiscordMessageError(error: unknown): boolean {
+  const candidate = record(error);
+  const rawError = record(candidate?.rawError);
+  const code = candidate?.code ?? rawError?.code;
+  const status = candidate?.status ?? candidate?.statusCode ?? rawError?.status ?? rawError?.statusCode;
+  const message = candidate?.message ?? rawError?.message;
+  return String(code) === '10008' ||
+    (Number(status) === 404 && typeof message === 'string' && message.toLowerCase() === 'unknown message');
+}
+
+function projectionErrorOutcome(error: unknown): DecisionTransportOutcome {
+  const candidate = record(error);
+  if (candidate && 'outcome' in candidate) return transportOutcome(candidate.outcome);
+  if (isUnknownDiscordMessageError(error)) return DECISION_TRANSPORT_OUTCOMES.REJECTED;
+  return DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
+}
+
 function canonicalReference(value: unknown, qid: string, generation: string): string | null {
   const candidate = record(value);
   const evidenceName = candidate?.evidence_name;
@@ -434,7 +451,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       return recorded.click?.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT ||
         state.getDecisionClick(click.interactionId)?.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT;
     } catch (error) {
-      const outcome = transportOutcome((error as { outcome?: unknown })?.outcome);
+      const outcome = projectionErrorOutcome(error);
       if (outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT && (error as { retryable?: unknown })?.retryable === true) {
         state.recordDecisionProjectionOutcome(click.interactionId, outcome);
         return false;
@@ -504,7 +521,8 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     }
     const projected = await project(current, presentation, signal);
     current = state.getDecisionClick(click.interactionId) || current;
-    if (!projected && current.canonical?.answer && current.canonical.answer.length > DECISION_EMBED_DESCRIPTION_LIMIT) {
+    if (!projected && current.canonical?.answer && current.canonical.answer.length > DECISION_EMBED_DESCRIPTION_LIMIT &&
+      projectionOutcomeRetryable(current.projectionOutcome)) {
       return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
     }
     const nativeResult = await native(current, signal);
