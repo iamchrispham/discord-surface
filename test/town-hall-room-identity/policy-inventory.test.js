@@ -264,6 +264,7 @@ function roomFieldSubject(node, sourceFile, bindings) {
     hasRoomFieldAlias(scope, subject, sourceFile, bindings) ||
     (townHallContext && (isRoomField(subject) ||
       hasBoundAlias(scope, subject, sourceFile, bindings, isRoomField) ||
+      hasRoomKeyAlias(scope, subject, sourceFile, bindings) ||
       hasRoomFieldCall(scope, sourceFile, bindings, isRoomField))) ||
     hasRoomFieldCall(scope, sourceFile, bindings);
 }
@@ -479,11 +480,21 @@ function roomDigitPolicies(records) {
     const expression = unwrapPolicyExpression(node);
     if (!expression) return null;
     if (ts.isIdentifier(expression)) {
+      const binding = findBinding(info, expression.text, expression);
       const candidates = info.functionDefs.filter(candidate => candidate.name === expression.text &&
-        isAncestor(nearestLexicalScope(candidate.node), expression));
+        isAncestor(nearestLexicalScope(candidate.node), expression) &&
+        (!binding || candidate.node === binding.declaration || candidate.node === binding.source));
       candidates.sort((left, right) =>
         scopeDepth(nearestLexicalScope(right.node)) - scopeDepth(nearestLexicalScope(left.node)));
-      return candidates[0] || info.functions.get(expression.text) || resolveImported(info, expression.text);
+      if (candidates[0]) return candidates[0];
+      if (binding) {
+        const local = info.functions.get(expression.text);
+        if (local && (local.node === binding.declaration || local.node === binding.source)) {
+          return local;
+        }
+        return null;
+      }
+      return info.functions.get(expression.text) || resolveImported(info, expression.text);
     }
     if (ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.expression)) {
       const imported = info.imports.get(expression.expression.text);
@@ -505,12 +516,12 @@ function roomDigitPolicies(records) {
     visit(info.ast);
   }
 
-  const findBinding = (info, name, node) => {
+  function findBinding(info, name, node) {
     const bindings = info.bindings.filter(binding => binding.name === name &&
       (!binding.scope || isAncestor(binding.scope, node) || binding.scope === node));
     bindings.sort((left, right) => scopeDepth(right.scope) - scopeDepth(left.scope));
     return bindings[0] || null;
-  };
+  }
   const bindingCalls = (binding, fallbackInfo) => {
     if (!binding.function) return [];
     const ownerInfo = binding.ownerInfo || fallbackInfo;
@@ -569,7 +580,8 @@ function roomDigitPolicies(records) {
     if (!declaration) return inputs;
     const name = declaration.name.text;
     const visit = current => {
-      if (ts.isIdentifier(current) && current.text === name && current !== declaration.name) {
+      if (ts.isIdentifier(current) && current.text === name && current !== declaration.name &&
+          findBinding(info, name, current)?.declaration === declaration) {
         const parent = current.parent;
         if (ts.isPropertyAccessExpression(parent) && parent.expression === current &&
             (parent.name.text === 'test' || parent.name.text === 'exec') && ts.isCallExpression(parent.parent)) {
@@ -654,6 +666,15 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/future-room.ts': 1
   });
+  const shadowedRegex = {
+    file: 'peer/snowflake.ts',
+    text: String.raw`const ROOM_ID = /^\d+$/;
+    function validateRoom(room) {
+      const ROOM_ID = /^not-a-room$/;
+      return ROOM_ID.test(room.guildId);
+    }`
+  };
+  assert.deepEqual(roomDigitPolicies([...records, shadowedRegex]), expectedPolicies);
   const importedRoomHelper = {
     file: 'peer/future-helper.ts',
     text: 'export function validateGuildId(value) { return /^\\d{1,21}$/.test(value); }'
@@ -670,6 +691,14 @@ test('room policy inventory records only town-hall room validators', () => {
     return /^\d{1,21}$/.test(candidate.guildId);
   }` };
   assert.deepEqual(roomDigitPolicies([...records, renamedParameter]), {
+    ...expectedPolicies,
+    'peer/future-room.ts': 1
+  });
+  const guardedRoomKeyAlias = { file: 'peer/future-room.ts', text: String.raw`function validateTownHallRoom(candidate) {
+    const id = ownDataProperty(candidate, 'guildId');
+    return /^\d{1,21}$/.test(id);
+  }` };
+  assert.deepEqual(roomDigitPolicies([...records, guardedRoomKeyAlias]), {
     ...expectedPolicies,
     'peer/future-room.ts': 1
   });
@@ -745,6 +774,7 @@ test('room policy inventory records only town-hall room validators', () => {
   });
   const shadowedBound = { file: 'peer/snowflake.ts', text: String.raw`const isDigits = value => /^\d+$/.test(value) && value.length <= 20;
   function inspect(room) { return isDigits(room.guildId); }
+  function shadowed(room, isDigits) { return isDigits(room.guildId); }
   function unrelated(user, isDigits) { return isDigits(user.id); }
   function unrelatedHelper(user) {
     const isDigits = value => /^\d+$/.test(value) && value.length <= 20;
