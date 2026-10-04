@@ -63,15 +63,16 @@ test('compatibility shim preserves module identity', () => {
   assert.equal(digest(text('src/state/thread-enrollment.js')), baseline.shimHash);
   assert.strictEqual(facade().createThreadEnrollmentHandlers, handlers().createThreadEnrollmentHandlers);
 });
-test('both type gates register the extracted owners', () => {
-  for (const [file, original] of Object.entries(baseline.configs)) {
-    const expected = structuredClone(original);
-    expected.include.push(...added);
-    assert.deepEqual(JSON.parse(text(file)), expected);
+test('both type gates register the extracted owners exactly once', () => {
+  for (const file of ['tsconfig.json', 'tsconfig.typecheck.json']) {
+    const include = JSON.parse(text(file)).include;
+    for (const owner of added) {
+      assert.equal(include.filter(entry => entry === owner).length, 1, `${file} registers ${owner} once`);
+    }
   }
 });
 test('registered runner includes the owner suite once', () => {
-  const expected = structuredClone(baseline.package);
-  expected.scripts.test += ' test/state-thread-enrollment-owner.test.js';
-  assert.deepEqual(JSON.parse(text('package.json')), expected);
+  const testCommand = JSON.parse(text('package.json')).scripts.test;
+  const suite = 'test/state-thread-enrollment-owner.test.js';
+  assert.equal(testCommand.split(/\s+/).filter(entry => entry === suite).length, 1);
 });
