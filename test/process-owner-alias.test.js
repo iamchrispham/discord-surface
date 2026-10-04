@@ -59,6 +59,7 @@ runFixture("const process = { kill() {} }; function newProbe(pid) { process.kill
 
 test("nonzero signal and ordinary mutable function are not probes", () => {
 runFixture("function newProbe(pid) { process.kill(pid, 9); }", [], []);
+runFixture("function newProbe(pid) { process.kill(pid, `SIGTERM`); }", [], []);
 runFixture("let probe = () => true; function newProbe(pid) { probe(pid, 0); }", [], []);
 });
 
@@ -175,11 +176,18 @@ test("CommonJS process origins retain module and destructured probes", () => {
 test("ES module process origins retain namespace and named probes", () => {
   runFixture("import * as proc from 'node:process'; function newProbe(pid) { proc.kill(pid, 0); }", ["private-alias.ts\u0000newProbe"], ["unclassified process probe private-alias.ts:newProbe"], 'private-alias.ts');
   runFixture("import { kill as probe } from 'node:process'; function newProbe(pid) { probe(pid, 0); }", ["private-alias.ts\u0000newProbe"], ["unclassified process probe private-alias.ts:newProbe"], 'private-alias.ts');
+  runFixture("import proc from 'node:process'; function newProbe(pid) { proc.kill(pid, 0); }", ["private-alias.ts\u0000newProbe"], ["unclassified process probe private-alias.ts:newProbe"], 'private-alias.ts');
+  runFixture("import proc from 'process'; function newProbe(pid) { proc.kill(pid, 0); }", ["private-alias.ts\u0000newProbe"], ["unclassified process probe private-alias.ts:newProbe"], 'private-alias.ts');
 });
 
 test("array binding probes retain indexed process origins", () => {
   runFixture("const [probe] = [process.kill]; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("function invoke([probe], pid) { probe(pid, 0); } invoke([process.kill], 1);", ["private-alias.js\u0000invoke"], ["unclassified process probe private-alias.js:invoke"]);
+  runFixture("let probe; [probe] = [process.kill]; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("constructor arguments populate function parameters", () => {
+  runFixture("function Runner(probe, pid) { probe(pid, 0); } new Runner(process.kill, 1234);", ["private-alias.js\u0000Runner"], ["unclassified process probe private-alias.js:Runner"]);
 });
 
 test("destructured probe invocation methods remain unsupported", () => {
@@ -199,6 +207,9 @@ test("TypeScript-only wrappers retain probe identity", () => {
 test("forwarded callback APIs retain process probes", () => {
   runFixture("function newProbe(pid) { setImmediate(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("function newProbe(pid) { process.nextTick(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe() { setTimeout(process.kill, 10, 1234, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe() { setInterval(process.kill, 10, 1234, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("import { setImmediate } from './transport.js'; function newProbe() { setImmediate(process.kill, 1234, 0); }", [], [], 'private-alias.ts');
 });
 
 test("nonliteral apply list refuses", () => {

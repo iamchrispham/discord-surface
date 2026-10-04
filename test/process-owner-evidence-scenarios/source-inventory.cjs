@@ -156,6 +156,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       if (!importDeclaration || !ts.isStringLiteral(importDeclaration.moduleSpecifier)) continue;
       if (importDeclaration.moduleSpecifier.text !== 'node:process' &&
         importDeclaration.moduleSpecifier.text !== 'process') continue;
+      const importClause = importDeclaration.importClause;
+      if (importClause?.name && (declaration === importClause || declaration === importClause.name)) {
+        return PROCESS_OBJECT;
+      }
       if (ts.isNamespaceImport(declaration)) return PROCESS_OBJECT;
       if (ts.isImportSpecifier(declaration)) {
         const importedName = declaration.propertyName || declaration.name;
@@ -223,6 +227,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
           }
           if (target) recordAssignment(target, { source: expression.right, name });
         }
+      } else if (ts.isArrayLiteralExpression(left) && ts.isArrayLiteralExpression(expression.right)) {
+        for (let index = 0; index < left.elements.length; index += 1) {
+          const target = left.elements[index];
+          const source = expression.right.elements[index];
+          if (ts.isIdentifier(target) && source && !ts.isSpreadElement(source)) {
+            recordAssignment(checker.getSymbolAtLocation(target), { source });
+          }
+        }
       } else if (ts.isPropertyAccessExpression(left) || ts.isElementAccessExpression(left)) {
         for (const propertySymbol of propertySymbols(left, false)) {
           recordAssignment(propertySymbol, { source: expression.right });
@@ -288,7 +300,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     return [];
   };
   const indexParameterArguments = node => {
-    if (ts.isCallExpression(node)) {
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
       const parameters = callableParameters(node.expression);
       for (let index = 0; index < parameters.length; index += 1) {
         const argument = node.arguments[index];
@@ -353,6 +365,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     if (transparent) return resolveSet(transparent, seen);
     if (ts.isNumericLiteral(node)) return new Set([Number(node.text)]);
     if (ts.isStringLiteral(node)) return new Set([node.text]);
+    if (ts.isNoSubstitutionTemplateLiteral(node)) return new Set([node.text]);
     // Branching and short-circuit expressions contribute a value union, not an
     // evaluation: any possible probe/zero branch is kept. This stays a bounded
     // structural walk rather than an interpreter.
@@ -696,7 +709,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
 
   function isForwardingCallbackApi(callee) {
     if (ts.isIdentifier(callee) && FORWARDED_CALLBACK_APIS.has(callee.text)) {
-      return !symbolDeclaration(checker.getSymbolAtLocation(callee));
+      const symbol = checker.getSymbolAtLocation(callee);
+      const imported = (symbol?.declarations || []).some(declaration => {
+        let parent = declaration;
+        while (parent && !ts.isImportDeclaration(parent)) parent = parent.parent;
+        return Boolean(parent);
+      });
+      return !imported && !symbolDeclaration(symbol);
     }
     return ts.isPropertyAccessExpression(callee) && callee.name.text === 'nextTick' &&
       hasAtom(staticValue(callee.expression), PROCESS_OBJECT);
@@ -712,7 +731,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       violations.push(`unsupported process probe ${fileName}:${owner}`);
       return;
     }
-    const signal = node.arguments[2];
+    const callee = node.expression;
+    const usesDelay = ts.isIdentifier(callee) &&
+      (callee.text === 'setTimeout' || callee.text === 'setInterval');
+    const signal = node.arguments[usesDelay ? 3 : 2];
     const values = signal ? staticValue(signal) : new Set();
     if (hasAtom(values, 0)) kills.push({ file: fileName, owner });
     if (values.size === 0 || (signal && mayBeUnresolved(signal))) {
