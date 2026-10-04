@@ -168,6 +168,26 @@ test("object property probes retain their literal origin", () => {
   runFixture("const deps = { kill: process.kill }; function newProbe(pid) { deps.kill(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
 
+test("receiver parameter writes retain the concrete object identity", () => {
+  runFixture("function install(receiver) { receiver.probe = process.kill; } const state = {}; install(state); function newProbe(pid) { state.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function install(receiver) { receiver.probe = () => true; } const state = {}; install(state); function newProbe(pid) { state.probe(pid, 0); }", [], []);
+  runFixture("function install(receiver) { receiver.probe = process.kill; } const state = {}; install(state); function ordinary(pid) { state.probe(pid); }", [], []);
+});
+
+test("class-field callables retain parameters and returned probe aliases", () => {
+  runFixture("class Helpers { invoke = (probe, pid) => probe(pid, 0); } const helpers = new Helpers(); helpers.invoke(process.kill, 1);", ["private-alias.js\u0000invoke"], ["unclassified process probe private-alias.js:invoke"]);
+  runFixture("class Helpers { invoke = (probe, pid) => probe(pid, 9); } const helpers = new Helpers(); helpers.invoke(process.kill, 1);", [], []);
+  runFixture("class Helpers { invoke = (probe, pid) => probe(pid); } const helpers = new Helpers(); helpers.invoke(process.kill, 1);", [], []);
+  runFixture("class Helpers { getProbe = () => process.kill; } const helpers = new Helpers(); function newProbe(pid) { helpers.getProbe()(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("class Helpers { identity = value => value; } const helpers = new Helpers(); const probe = helpers.identity(process.kill); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("object and class getters retain returned probe origins", () => {
+  runFixture("const deps = { get probe() { return process.kill; } }; function newProbe(pid) { deps.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("class Helpers { get probe() { return process.kill; } } const deps = new Helpers(); function newProbe(pid) { deps.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const deps = { get probe() { return () => true; } }; function newProbe(pid) { deps.probe(pid, 0); }", [], []);
+});
+
 test("CommonJS process origins retain module and destructured probes", () => {
   runFixture("const processModule = require('node:process'); function newProbe(pid) { processModule.kill(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("const { kill: probe } = require('node:process'); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
@@ -209,6 +229,9 @@ test("forwarded callback APIs retain process probes", () => {
   runFixture("function newProbe(pid) { process.nextTick(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("function newProbe() { setTimeout(process.kill, 10, 1234, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("function newProbe() { setInterval(process.kill, 10, 1234, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const schedule = setImmediate; function newProbe(pid) { schedule(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("let schedule; schedule = setImmediate; function newProbe(pid) { schedule(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const setImmediate = () => {}; const schedule = setImmediate; function newProbe(pid) { schedule(process.kill, pid, 0); }", [], []);
   runFixture("import { setImmediate } from './transport.js'; function newProbe() { setImmediate(process.kill, 1234, 0); }", [], [], 'private-alias.ts');
 });
 
@@ -359,6 +382,12 @@ test("unresolved direct signal refuses", () => {
 test("logical member assignment probe alias", () => {
   runFixture("const obj = { probe: undefined }; obj.probe ??= process.kill; function newProbe(pid) { obj.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("const obj = { probe: undefined }; obj.probe ||= process.kill; function newProbe(pid) { obj.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("object spreads retain statically resolvable probe properties", () => {
+  runFixture("const base = { probe: process.kill }; const deps = { ...base }; function newProbe(pid) { deps.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const deps = { ...{ probe: process.kill } }; function newProbe(pid) { deps.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const base = { probe: () => true }; const deps = { ...base }; function newProbe(pid) { deps.probe(pid, 0); }", [], []);
 });
 
 test("Reflect ordinary control", () => {
