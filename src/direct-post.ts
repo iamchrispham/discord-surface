@@ -229,6 +229,21 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     }
     catch { return false; }
   };
+  let address = canonicalAddress(binding);
+  let allowUnreadyAgentRoute = agentKind === KINDS.RESULT && address.channelId !== binding.channelId;
+  const currentBinding = () => {
+    if (!watcherNotice) return state.directPostBindingCurrent(binding, operatorId, address.channelId, allowUnreadyAgentRoute);
+    try {
+      state.authorizeWatcherNoticeSend?.(watcherNotice.packet);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const currentReady = () => {
+    if (!currentBinding()) return false;
+    return callerBindingCurrent();
+  };
   if (legacy) {
     if (legacyChildAddress !== null && agentThreadId !== null && agentThreadId !== legacyChildAddress.channelId) {
       throw new BindingError('direct post request identity conflicts with existing custody');
@@ -243,7 +258,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       if (!legacyMarker || typeof legacyMarker !== 'object' || Array.isArray(legacyMarker) ||
           !migratedPacket || typeof migratedPacket !== 'object' || Array.isArray(migratedPacket)) {
         await revalidateCaller();
-        if (!callerBindingCurrent() || !currentDestination()) throw new BindingError('direct post binding is no longer current');
+        if (!currentReady() || !currentDestination()) throw new BindingError('direct post binding is no longer current');
         return legacy.result;
       }
       if (!isAgentSourcePromotion(legacy.packet, migratedPacket, binding.channelId) ||
@@ -251,7 +266,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         throw new BindingError('direct post request identity conflicts with existing custody');
       }
       await revalidateCaller();
-      if (!callerBindingCurrent() || !currentDestination()) throw new BindingError('direct post binding is no longer current');
+      if (!currentReady() || !currentDestination()) throw new BindingError('direct post binding is no longer current');
       return legacy.result;
     }
     if (!isLegacyRetryableOutcome(legacy.outcome)) {
@@ -260,7 +275,6 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     legacyPacket = legacy.packet;
   }
 
-  let address = canonicalAddress(binding);
   if (!watcherNotice && isAgentMessage) {
     const resolvedAddress = resolveAgentAddress(state, binding, agentThreadId);
     if (legacyChildAddress !== null && !sameAddress(resolvedAddress, legacyChildAddress)) {
@@ -268,6 +282,7 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
     }
     address = resolvedAddress;
   }
+  allowUnreadyAgentRoute = agentKind === KINDS.RESULT && address.channelId !== binding.channelId;
   if (legacyPacket?.kind === KINDS.REQUEST) verifyAgentAddress(agentTarget, token);
   if (watcherNotice) {
     if (agentThreadId !== null || agentTarget !== null || agentKind === KINDS.RESULT || agentReplyTo !== null) {
@@ -353,20 +368,6 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
   const parts: DirectPostPartResult[] = [];
   let claimedAny = false;
   let recorded = false;
-  const allowUnreadyAgentRoute = agentKind === KINDS.RESULT && address.channelId !== binding.channelId;
-  const currentBinding = () => {
-    if (!watcherNotice) return state.directPostBindingCurrent(binding, operatorId, address.channelId, allowUnreadyAgentRoute);
-    try {
-      state.authorizeWatcherNoticeSend?.(watcherNotice.packet);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  const currentReady = () => {
-    if (!currentBinding()) return false;
-    return callerBindingCurrent();
-  };
   for (let partIndex = 0; partIndex < source.parts.length; partIndex += 1) {
     if (signal?.aborted) {
       parts.push({ index: partIndex, status: 'not_sent', messageId: null });
@@ -404,19 +405,24 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
         destinationRejection.capture(error);
       }
       if (destinationRejection.rejected) {
+        let preflightResult: ReturnType<typeof state.recordDirectPostPreflight>;
         if (!currentBinding() || !currentDestination()) {
-          const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
-          parts.push({ index: partIndex, status: stale.outcome, messageId: null });
+          preflightResult = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
         } else {
-          const preflight = state.recordDirectPostPreflight(meta, outcomeFor(destinationRejection.reason), {
+          preflightResult = state.recordDirectPostPreflight(meta, outcomeFor(destinationRejection.reason), {
             status: errorStatus(destinationRejection.reason) || null, error: errorMessage(destinationRejection.reason).slice(0, 300)
           });
-          parts.push({ index: partIndex, status: preflight.outcome, messageId: null });
         }
         // The transport classification above is already persisted. The caller
         // assertion is deliberately outside that classification path, so its
         // refusal escapes instead of being rewritten as a transport outcome.
         await revalidateCaller();
+        if (!currentReady() || !currentDestination()) {
+          const stale = state.recordDirectPostPreflight(meta, 'stale', { reason: 'binding changed during destination lookup' });
+          parts.push({ index: partIndex, status: stale.outcome, messageId: null });
+        } else {
+          parts.push({ index: partIndex, status: preflightResult.outcome, messageId: null });
+        }
         break;
       }
       await revalidateCaller();
