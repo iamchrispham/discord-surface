@@ -504,12 +504,14 @@ async function runDirectPost(input: DirectPostInput): Promise<DirectPostResult> 
       const recordedOutcome = state.recordDirectPostOutcome(requestId, claim.attemptId, outcome, { status: errorStatus(mutationRejection.reason) || null, error: errorMessage(mutationRejection.reason).slice(0, 300) });
       parts.push({ index: partIndex, status: recordedOutcome.outcome, messageId: recordedOutcome.messageId || null });
       await revalidateCaller();
+      if (!currentReady() || !currentDestination()) throw new BindingError('binding changed after direct post');
       break;
     }
     // The sent receipt is persisted above. The post-effect assertion runs
     // outside the transport catch so a refusal cannot overwrite sent evidence,
     // drop the message ID, resend or continue multipart.
     await revalidateCaller();
+    if (!currentReady() || !currentDestination()) throw new BindingError('binding changed after direct post');
   }
   const status = parts.every(part => part.status === 'sent') ? 'sent' : parts.find(part => part.status !== 'sent')?.status || 'not_sent';
   const duplicate = !claimedAny && parts.length > 0 && parts.every(part => part.status === 'sent');

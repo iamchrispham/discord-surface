@@ -397,6 +397,46 @@ test('board retains applied evidence after caller changes', async t => {
   assert.equal(admission.revision, 1);
 });
 
+test('board refresh refuses disclosure when binding readiness changes after the effect', async t => {
+  for (const scenario of [
+    { name: 'applied', outcome: 'applied' },
+    { name: 'unknown', outcome: 'unknown' }
+  ]) {
+    const f = fixture(t);
+    const textFile = messageFile(t, f, `effect-board-post-readiness-${scenario.name}.txt`);
+    fs.writeFileSync(textFile, 'Initial board');
+    let patches = 0;
+    const networkError = new Error('simulated board transport failure');
+    const peer = service(f, {
+      callerDependencies: identity(() => ORIGINAL),
+      fetchImpl: async (url, options) => {
+        if (options?.method === 'POST') return response({ id: '10001', channel_id: '101', author: { id: 'bot', bot: true }, content: 'Initial board' });
+        if (options?.method === 'PATCH') {
+          patches += 1;
+          const binding = f.state.getBinding('101');
+          f.state.setBindingReadiness('101', READINESS.GAP, `${scenario.name} readiness changed after board refresh`, binding);
+          if (scenario.name === 'unknown') throw networkError;
+          return response({ id: '10001', channel_id: '101', author: { id: 'bot', bot: true }, content: 'Updated board' });
+        }
+        if (url.endsWith('/users/@me')) return response({ id: 'bot' });
+        if (url.endsWith('/channels/101')) return response({ id: '101', guild_id: '100' });
+        return response({ id: '10001', channel_id: '101', author: { id: 'bot', bot: true }, content: 'Initial board' });
+      }
+    });
+    const seedKey = `effect-board-post-readiness-${scenario.name}-seed`;
+    const requestId = `effect-board-post-readiness-${scenario.name}`;
+    const seeded = await peer.post({ role: 'announce', text_file: textFile, dedupe_key: seedKey });
+    assert.equal(seeded.status, 'sent');
+    fs.writeFileSync(textFile, 'Updated board');
+    const refused = await nativeRefusal(peer.post({ role: 'board', message_id: '10001', text_file: textFile, dedupe_key: requestId }));
+    assert.equal(refused, true, `${scenario.name} result must not cross a revoked board binding`);
+    assert.equal(patches, 1, `${scenario.name} applies one PATCH attempt`);
+    const outcomes = boardReceipts(f.state, requestId).filter(row => row.kind === 'board-refresh-outcome');
+    assert.equal(outcomes.length, 1, `${scenario.name} outcome is persisted before refusal`);
+    assert.equal(outcomes[0].detail.outcome, scenario.outcome);
+  }
+});
+
 test('unknown announcement retains outcome after caller changes', async t => {
   const f = fixture(t);
   const textFile = messageFile(t, f, 'effect-announce-unknown.txt');
@@ -419,6 +459,37 @@ test('unknown announcement retains outcome after caller changes', async t => {
   assert.equal(rows.outcomes[0].detail.outcome, 'unknown', 'the unknown classification is retained');
   assert.equal(rows.outcomes[0].detail.nonce, nonce, 'the original nonce is retained');
   assert.equal(posts, 1, 'one POST');
+});
+
+test('peer send refuses disclosure when destination readiness changes after the effect', async t => {
+  for (const scenario of [
+    { name: 'sent', outcome: 'sent' },
+    { name: 'unknown', outcome: 'unknown' }
+  ]) {
+    const f = fixture(t);
+    f.enroll('102');
+    addRecipient(f);
+    let posts = 0;
+    const networkError = new Error('simulated transport failure');
+    const peer = service(f, {
+      callerDependencies: identity(() => ORIGINAL),
+      fetchImpl: async (url, options) => {
+        if (options?.method === 'GET') return response({ id: '202', guild_id: '100' });
+        posts += 1;
+        const binding = f.state.getBinding('201');
+        f.state.setBindingReadiness('201', READINESS.GAP, `${scenario.name} readiness changed after peer send`, binding);
+        if (scenario.name === 'unknown') throw networkError;
+        return response({ id: '10001', channel_id: '202' });
+      }
+    });
+    const requestId = `effect-send-post-readiness-${scenario.name}`;
+    const refused = await nativeRefusal(peer.send({ peer: { channelId: '201' }, text: 'hello', dedupe_key: requestId }));
+    assert.equal(refused, true, `${scenario.name} result must not cross a revoked destination binding`);
+    assert.equal(posts, 1, `${scenario.name} sends exactly one network request`);
+    const outcomes = directPostRows(f.state, requestId).outcomes;
+    assert.equal(outcomes.length, 1, `${scenario.name} outcome is persisted before refusal`);
+    assert.equal(outcomes[0].detail.outcome, scenario.outcome);
+  }
 });
 
 test('duplicate announcement revalidates without network', async t => {

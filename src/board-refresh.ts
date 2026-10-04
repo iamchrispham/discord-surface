@@ -349,6 +349,7 @@ export async function runBoardRefresh({
     // The existing failure or unknown classification is saved. Revalidate after
     // the effect, outside that transport classification, then expose the result.
     await revalidateCaller();
+    if (!isBindingCurrent()) throw new Error('binding changed after board refresh');
     return {
       ...resultFromAdmission(admission, binding),
       status: recorded.outcome,
@@ -359,6 +360,7 @@ export async function runBoardRefresh({
   // Applied evidence is already persisted. A refusal here must not rewrite it
   // or trigger a resend.
   await revalidateCaller();
+  if (!isBindingCurrent()) throw new Error('binding changed after board refresh');
   return {
     ...resultFromAdmission(admission, binding),
     status: applied!.outcome,
