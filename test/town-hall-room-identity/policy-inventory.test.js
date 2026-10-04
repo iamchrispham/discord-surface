@@ -8,6 +8,11 @@ const ts = require('typescript');
 
 const PROJECT_ROOT = path.join(__dirname, '..', '..');
 
+function createSourceFile(file, text) {
+  return ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true,
+    ts.getScriptKindFromFileName(file));
+}
+
 function isRoomField(node) {
   if (!node) return false;
   let object;
@@ -289,7 +294,7 @@ function isSplitRoomDigitPolicy(node, sourceFile, pattern, bindings) {
 function legacyRoomDigitPolicies(records) {
   const sites = {};
   for (const { file, text } of records) {
-    const ast = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+    const ast = createSourceFile(file, text);
     const bindings = collectBindings(ast);
     const numeric = /\\[dD]|\[(?:\^)?(?:0-9|0123456789)\]/;
     const visit = node => {
@@ -332,7 +337,7 @@ function policyPropertyKey(node) {
 function roomDigitPolicies(records) {
   const infos = records.map(({ file, text }) => ({
     file,
-    ast: ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true),
+    ast: createSourceFile(file, text),
     bindings: [],
     functions: new Map(),
     functionDefs: [],
@@ -587,6 +592,10 @@ function roomDigitPolicies(records) {
             : imported);
         }
       }
+      if (ts.isExportAssignment(statement) &&
+          (ts.isFunctionExpression(statement.expression) || ts.isArrowFunction(statement.expression))) {
+        indexCommonJsFunction('default', statement.expression);
+      }
       if (ts.isFunctionDeclaration(statement) &&
           statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
         const exportedName = statement.name?.text || 'default';
@@ -607,7 +616,21 @@ function roomDigitPolicies(records) {
   const resolveModule = (info, specifier) => {
     if (!specifier || !specifier.startsWith('.')) return null;
     const base = path.posix.normalize(path.posix.join(path.posix.dirname(info.file), specifier));
-    for (const candidate of [base, base + '.ts', base + '.js', base + '/index.ts', base + '/index.js']) {
+    for (const candidate of [
+      base,
+      base + '.ts',
+      base + '.js',
+      base + '.cts',
+      base + '.mts',
+      base + '.cjs',
+      base + '.mjs',
+      base + '/index.ts',
+      base + '/index.js',
+      base + '/index.cts',
+      base + '/index.mts',
+      base + '/index.cjs',
+      base + '/index.mjs',
+    ]) {
       if (byFile.has(candidate)) return byFile.get(candidate);
     }
     return null;
@@ -806,10 +829,10 @@ test('room policy inventory records only town-hall room validators', () => {
   const references = {};
   const records = [];
   for (const relative of fs.readdirSync(src, { recursive: true })) {
-    if (!/\.(?:ts|js)$/.test(relative)) continue;
+    if (!/\.(?:[cm]?[tj]s)$/.test(relative)) continue;
     const text = fs.readFileSync(path.join(src, relative), 'utf8');
     records.push({ file: relative.split(path.sep).join('/'), text });
-    const ast = ts.createSourceFile(relative, text, ts.ScriptTarget.Latest, true);
+    const ast = createSourceFile(relative, text);
     const count = countIdentifierReferences(ast, 'isTownHallRoom');
     if (count) references[relative.split(path.sep).join('/')] = count;
   }
@@ -1079,6 +1102,40 @@ test('room policy inventory records only town-hall room validators', () => {
   ]), {
     ...expectedPolicies,
     'peer/anonymous-default-validator.ts': 1
+  });
+  const defaultExpressionValidator = {
+    file: 'peer/default-expression-validator.ts',
+    text: String.raw`export default (value) => /^\d{1,21}$/.test(value);`
+  };
+  const defaultExpressionConsumer = {
+    file: 'peer/default-expression-consumer.ts',
+    text: String.raw`import validateGuildId from './default-expression-validator';
+    function validateRoom(room) { return validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    defaultExpressionValidator,
+    defaultExpressionConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/default-expression-validator.ts': 1
+  });
+  const moduleSpecificValidator = {
+    file: 'peer/module-specific-room-validator.cts',
+    text: String.raw`export function validateGuildId(value) { return /^\d{1,21}$/.test(value); }`
+  };
+  const moduleSpecificConsumer = {
+    file: 'peer/module-specific-room-consumer.cjs',
+    text: String.raw`const { validateGuildId } = require('./module-specific-room-validator');
+    function validateRoom(room) { return validateGuildId(room.channelId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    moduleSpecificValidator,
+    moduleSpecificConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/module-specific-room-validator.cts': 1
   });
   const unrelatedMatch = { file: 'peer/snowflake.ts', text: String.raw`function inspect(candidate) {
     return candidate.guildId.match(/^\d{1,21}$/);

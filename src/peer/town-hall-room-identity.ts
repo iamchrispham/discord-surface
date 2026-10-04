@@ -17,10 +17,17 @@ export function validateTownHallRoomIdentity(response: unknown, expected: TownHa
     if (!isRecord(response) || !isRecord(expected)) return false;
     if (!RESPONSE_REQUIRED.every(key => ownDataProperty(response, key))) return false;
     if (!EXPECTED_REQUIRED.every(key => ownDataProperty(expected, key))) return false;
+    const expectedChannelDescriptor = Object.getOwnPropertyDescriptor(expected, 'channelId');
+    const expectedGuildDescriptor = Object.getOwnPropertyDescriptor(expected, 'guildId');
+    if (!expectedChannelDescriptor || !expectedGuildDescriptor ||
+        !Object.hasOwn(expectedChannelDescriptor, 'value') ||
+        !Object.hasOwn(expectedGuildDescriptor, 'value')) return false;
+    const expectedChannelId = expectedChannelDescriptor.value;
+    const expectedGuildId = expectedGuildDescriptor.value;
     if (!isTownHallRoom(expected)) return false;
 
-    if (response.id !== expected.channelId) return false;
-    if (response.guild_id !== expected.guildId) return false;
+    if (response.id !== expectedChannelId) return false;
+    if (response.guild_id !== expectedGuildId) return false;
     if (response.type !== 0) return false;
     if (typeof response.topic !== 'string') return false;
 

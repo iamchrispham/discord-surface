@@ -211,6 +211,20 @@ test('13 accessor or absent expected fields are refused without getter calls, an
   assert.equal(JSON.stringify(frozenRoom), roomBefore);
 });
 
+test('expected proxy getters cannot replace validated descriptor values', () => {
+  const expected = new Proxy(room(), {
+    get(target, key) {
+      if (key === 'guildId') return OTHER_GUILD;
+      if (key === 'channelId') return OTHER_CHANNEL;
+      return Reflect.get(target, key);
+    }
+  });
+  assert.equal(validateTownHallRoomIdentity(response({
+    guild_id: OTHER_GUILD,
+    id: OTHER_CHANNEL
+  }), expected), false);
+});
+
 test('14 isolated shared-owner sentinel plus registration assertions', () => {
   const validResponse = response();
   const validRoom = room();
