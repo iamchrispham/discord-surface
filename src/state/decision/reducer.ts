@@ -281,11 +281,15 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         guildId: text(detail.guildId, 'guildId', 128),
         channelId: text(detail.channelId, 'channelId', 128),
         messageId: text(detail.messageId, 'messageId', 256),
+        applicationId: optionalText(detail.applicationId, 'applicationId', 256),
+        token: optionalText(detail.token, 'token', 512),
         binding: normalizeBinding(detail.binding),
         state: detail.authorizationPending === true ? DECISION_STATES.AUTHORIZATION_PENDING : DECISION_STATES.CLICK_ADMITTED,
         authorizationOutcome: null,
         callbackAttempted: false,
         callbackOutcome: null,
+        rejectionAttempted: false,
+        rejectionOutcome: null,
         canonical: null,
         projectionOutcome: null,
         nativeReturn: null,
@@ -326,6 +330,13 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         }
       }
       click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.REJECTION_ATTEMPT) {
+      click.rejectionAttempted = true;
+      click.rejectionOutcome = null;
+      click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.REJECTION_OUTCOME) {
+      click.rejectionOutcome = outcome(detail.outcome);
+      click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.CANONICAL_IMPORT) {
       const source = winnerSource(detail.source);
       const materialized = detail.materialized === true;
@@ -343,7 +354,10 @@ export function snapshot(state: DecisionStateStore): Snapshot {
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.PROJECTION_OUTCOME) {
       click.projectionOutcome = outcome(detail.outcome);
-      if (click.nativeReturn) click.state = click.nativeReturn.state;
+      if (click.nativeReturn) click.state = click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT &&
+        click.nativeReturn.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED
+        ? DECISION_STATES.TERMINAL
+        : click.nativeReturn.state;
       else click.state = click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN
         ? DECISION_STATES.UNKNOWN
         : DECISION_STATES.TERMINAL;

@@ -552,6 +552,17 @@ test('authorization cancellation leaves pending custody and ignores a late chann
   recoveredState.close();
 });
 
+test('authorization lookup failure remains pending for recovery', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.authorizeDecisionInteraction = async () => null;
+  const result = await f.gateway.handleInteraction(component(f.presentation, 'unknown-authorization', 0), new AbortController().signal);
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.click?.state, 'authorization_pending');
+  assert.equal(f.callbacks.length, 1);
+  assert.equal(f.state.listDecisionPendingWork().length, 1);
+});
+
 test('Embed Links loss leaves a short-answer projection retryable', { timeout: 30000 }, async t => {
   const f = await fixture(t, { embedLinks: false });
   f.gateway.started = true;
@@ -585,6 +596,30 @@ test('known-unsent long-answer projection retries after Attach Files returns', {
   f.setAttachFiles(true);
   await f.gateway.projectDecisionMessage({ click: admitted.click, presentation: f.presentation, answer }, new AbortController().signal);
   assert.equal(f.edits.length, 1);
+});
+
+test('long-answer projection failure does not dispatch native work', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { attachFiles: false });
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId: 'blocked-long-answer', presentationId: f.presentation.presentationId, selectedKey: 'approve',
+    actorId: 'operator', guildId: 'guild', channelId: 'channel', messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.importDecisionWinner('blocked-long-answer', {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'answer-1',
+    answer: 'x'.repeat(4097)
+  }).accepted, true);
+
+  await f.gateway.decisionConsumer.recover(new AbortController().signal);
+  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.state.getDecisionClick('blocked-long-answer')?.nativeReturn?.outcome, null);
+  assert.equal(f.state.listDecisionPendingWork().length, 1);
 });
 
 test('a full-length decision keeps every prompt character after selection', { timeout: 30000 }, async t => {

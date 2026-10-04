@@ -97,8 +97,15 @@ function requireClickInput(input: DecisionClickInput): NormalizedClickInput {
     guildId: text(input?.guildId, 'guildId', 128),
     channelId: text(input?.channelId, 'channelId', 128),
     messageId: text(input?.messageId, 'messageId', 256),
-    binding: normalizeBinding(input?.binding)
+    binding: normalizeBinding(input?.binding),
+    ...(input?.applicationId === undefined ? {} : { applicationId: text(input.applicationId, 'applicationId', 256) }),
+    ...(input?.token === undefined ? {} : { token: text(input.token, 'token', 512) })
   };
+}
+
+function pending(click: MutableClick): boolean {
+  return PENDING_STATES.has(click.state) ||
+    (click.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED && click.rejectionOutcome !== DECISION_TRANSPORT_OUTCOMES.SENT);
 }
 
 function admitClickInTransaction(
@@ -115,7 +122,7 @@ function admitClickInTransaction(
     return {
       accepted: false,
       duplicate: true,
-      continuing: PENDING_STATES.has(existing.state),
+      continuing: pending(existing),
       click: mutableClickOutput(existing)
     };
   }
@@ -148,6 +155,8 @@ function admitClickInTransaction(
     channelId: input.channelId,
     messageId: input.messageId,
     binding: presentation.binding,
+    ...(input.applicationId ? { applicationId: input.applicationId } : {}),
+    ...(input.token ? { token: input.token } : {}),
     ...(authorizationPending ? { authorizationPending: true } : {})
   });
   if (beginCallback) append(state, DECISION_RECEIPT_KINDS.CALLBACK_ATTEMPT, { interactionId: input.interactionId });
@@ -346,9 +355,7 @@ export function createDecisionHandlers(): DecisionHandlers {
         append(state, DECISION_RECEIPT_KINDS.AUTHORIZATION_OUTCOME, { interactionId: id, outcome: nextOutcome });
         return {
           accepted: true,
-          click: nextOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED
-            ? null
-            : mutableClickOutput(clickFor(state, id) as MutableClick)
+          click: mutableClickOutput(clickFor(state, id) as MutableClick)
         };
       });
     },
@@ -384,6 +391,45 @@ export function createDecisionHandlers(): DecisionHandlers {
           return { accepted: false, reason: DECISION_REASONS.CALLBACK_OUTCOME_CONFLICT, click: mutableClickOutput(click) };
         }
         append(state, DECISION_RECEIPT_KINDS.CALLBACK_OUTCOME, { interactionId: id, outcome: nextOutcome });
+        return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
+      });
+    },
+
+    beginRejectionFollowup(state, interactionId) {
+      const id = text(interactionId, 'interactionId', 256);
+      return state.transaction(() => {
+        const click = clickFor(state, id);
+        if (!click) return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+        if (click.authorizationOutcome !== DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+          return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
+        }
+        if (click.rejectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT) {
+          return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
+        }
+        if (click.rejectionAttempted && click.rejectionOutcome === null) {
+          return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
+        }
+        append(state, DECISION_RECEIPT_KINDS.REJECTION_ATTEMPT, { interactionId: id });
+        return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
+      });
+    },
+
+    recordRejectionOutcome(state, interactionId, rawOutcome) {
+      const id = text(interactionId, 'interactionId', 256);
+      const nextOutcome = outcome(rawOutcome);
+      return state.transaction(() => {
+        const click = clickFor(state, id);
+        if (!click) return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
+        if (click.authorizationOutcome !== DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+          return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
+        }
+        if (!click.rejectionAttempted) {
+          return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
+        }
+        if (click.rejectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT) {
+          return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
+        }
+        append(state, DECISION_RECEIPT_KINDS.REJECTION_OUTCOME, { interactionId: id, outcome: nextOutcome });
         return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
       });
     },
@@ -500,7 +546,7 @@ export function createDecisionHandlers(): DecisionHandlers {
 
     pendingWork(state) {
       const current = snapshot(state);
-      return [...current.clicks.values()].filter(click => PENDING_STATES.has(click.state)).map(mutableClickOutput);
+      return [...current.clicks.values()].filter(pending).map(mutableClickOutput);
     }
   };
 }

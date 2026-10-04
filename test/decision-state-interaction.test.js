@@ -5,7 +5,10 @@ const os = require('node:os');
 const path = require('node:path');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { claudeEvent, codexPrompt } = require('../src/native');
-const { DECISION_REASONS: DOMAIN_DECISION_REASONS } = require('../src/state/decision');
+const {
+  DECISION_AUTHORIZATION_OUTCOMES,
+  DECISION_REASONS: DOMAIN_DECISION_REASONS
+} = require('../src/state/decision');
 const {
   DECISION_NATIVE_OUTCOMES,
   DECISION_RECEIPT_KINDS,
@@ -47,6 +50,46 @@ test('native return advances from in-flight to submitted across reopen', () => {
     const conflict = fixtureState.state.recordDecisionNativeReturnOutcome('interaction-1', DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED);
     assert.equal(conflict.accepted, false);
     assert.equal(conflict.reason, 'native-outcome-conflict');
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
+test('denied rejection follow-up stays pending across restart until sent', () => {
+  const fixtureState = fixture();
+  try {
+    const { state, dbPath } = fixtureState;
+    presented(state);
+    assert.equal(state.admitDecisionClickAndBeginAuthorization({ ...click(state), applicationId: 'application', token: 'token' }).accepted, true);
+    assert.equal(state.recordDecisionAuthorizationOutcome('interaction-1', DECISION_AUTHORIZATION_OUTCOMES.DENIED).accepted, true);
+    assert.equal(state.beginDecisionRejectionFollowup('interaction-1').accepted, true);
+    assert.equal(state.recordDecisionRejectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED).accepted, true);
+    assert.equal(state.listDecisionPendingWork().length, 1);
+
+    state.close();
+    fixtureState.state = new SurfaceState(dbPath);
+    const recovered = fixtureState.state.listDecisionPendingWork()[0];
+    assert.equal(recovered.token, 'token');
+    assert.equal(fixtureState.state.beginDecisionRejectionFollowup('interaction-1').accepted, true);
+    assert.equal(fixtureState.state.recordDecisionRejectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+    assert.equal(fixtureState.state.listDecisionPendingWork().length, 0);
+  } finally {
+    closeFixture(fixtureState);
+  }
+});
+
+test('successful projection closes custody after native submission', () => {
+  const fixtureState = fixture();
+  try {
+    const { state } = fixtureState;
+    presented(state);
+    assert.equal(state.admitDecisionClick(click(state)).accepted, true);
+    assert.equal(state.importDecisionWinner('interaction-1', materializedWinner()).accepted, true);
+    assert.equal(state.recordDecisionNativeReturnOutcome('interaction-1', DECISION_NATIVE_OUTCOMES.SUBMITTED).accepted, true);
+    assert.equal(state.getDecisionClick('interaction-1')?.state, DECISION_STATES.MATERIALIZED_PROJECTION_PENDING);
+    assert.equal(state.recordDecisionProjectionOutcome('interaction-1', DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+    assert.equal(state.getDecisionClick('interaction-1')?.state, DECISION_STATES.TERMINAL);
+    assert.equal(state.listDecisionPendingWork().length, 0);
   } finally {
     closeFixture(fixtureState);
   }

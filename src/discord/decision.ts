@@ -85,6 +85,8 @@ export interface DecisionConsumerState {
     channelId: string;
     messageId: string;
     binding: DecisionBindingInput;
+    applicationId?: string;
+    token?: string;
   }): {
     accepted: boolean;
     duplicate?: boolean;
@@ -101,6 +103,8 @@ export interface DecisionConsumerState {
     channelId: string;
     messageId: string;
     binding: DecisionBindingInput;
+    applicationId?: string;
+    token?: string;
   }): {
     accepted: boolean;
     duplicate?: boolean;
@@ -109,6 +113,8 @@ export interface DecisionConsumerState {
     click: DecisionClick | null;
   };
   recordDecisionAuthorizationOutcome(interactionId: string, outcome: DecisionAuthorizationOutcome): unknown;
+  beginDecisionRejectionFollowup(interactionId: string): unknown;
+  recordDecisionRejectionOutcome(interactionId: string, outcome: DecisionTransportOutcome): unknown;
   getDecisionClick(interactionId: string): DecisionClick | null;
   recordDecisionCallbackOutcome(interactionId: string, outcome: DecisionTransportOutcome): unknown;
   importDecisionWinner(interactionId: string, result: DecisionCanonicalResult): {
@@ -138,7 +144,7 @@ export interface DecisionConsumerOptions {
   state: DecisionConsumerState;
   interactionFetch?: InteractionFetch;
   callbackTimeoutMs?: number;
-  authorize?: (input: DecisionAuthorizationInput, signal?: AbortSignal) => Promise<boolean>;
+  authorize?: (input: DecisionAuthorizationInput, signal?: AbortSignal) => Promise<boolean | null>;
   reject?: (interaction: ParsedComponentInteraction, reason: DecisionReason, signal?: AbortSignal, deferred?: boolean) => Promise<InteractionCallbackResult>;
   waitForDispatch?: (channelId: string, signal?: AbortSignal) => Promise<boolean>;
   processAccepted?: (message: DecisionMessage, signal?: AbortSignal, options?: Record<string, unknown>) => Promise<unknown>;
@@ -284,9 +290,60 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   const resolveRoute = options.resolveRoute || resolveCanonicalRoute;
   const runCanonical = options.runCanonical || runCanonicalOperation;
 
-  async function authorizationAllowed(input: DecisionAuthorizationInput, signal?: AbortSignal): Promise<boolean> {
+  async function authorizationAllowed(input: DecisionAuthorizationInput, signal?: AbortSignal): Promise<boolean | null> {
     if (typeof options.authorize !== 'function') return true;
-    try { return await options.authorize(input, signal); } catch { return false; }
+    try {
+      const result = await options.authorize(input, signal);
+      return typeof result === 'boolean' ? result : null;
+    } catch { return null; }
+  }
+
+  function authorizationTransition(interactionId: string, outcome: DecisionAuthorizationOutcome): { outcome: DecisionAuthorizationOutcome | null; click: DecisionClick | null } {
+    let transition: { click?: DecisionClick | null } | null = null;
+    try { transition = state.recordDecisionAuthorizationOutcome(interactionId, outcome) as { click?: DecisionClick | null }; } catch {}
+    const click = transition?.click || state.getDecisionClick(interactionId);
+    return { outcome: click?.authorizationOutcome || null, click };
+  }
+
+  function rejectionInteraction(click: DecisionClick): ParsedComponentInteraction | null {
+    if (!click.applicationId || !click.token) return null;
+    return {
+      id: click.interactionId,
+      guildId: click.guildId,
+      channelId: click.channelId,
+      userId: click.actorId,
+      token: click.token,
+      applicationId: click.applicationId,
+      messageId: click.messageId,
+      componentType: 2,
+      customId: '',
+      presentationId: click.presentationId
+    };
+  }
+
+  async function deliverRejection(click: DecisionClick, signal?: AbortSignal, interaction: ParsedComponentInteraction | null = null): Promise<InteractionCallbackResult | null> {
+    const begin = state.beginDecisionRejectionFollowup(click.interactionId) as { accepted?: boolean; click?: DecisionClick | null };
+    if (!begin.accepted) return null;
+    const target = interaction || rejectionInteraction(click);
+    let result: InteractionCallbackResult;
+    if (!target) {
+      result = { outcome: DECISION_TRANSPORT_OUTCOMES.NOT_SENT, reason: 'decision rejection interaction custody is unavailable' };
+    } else {
+      try {
+        result = options.reject
+          ? await options.reject(target, DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE, signal, true)
+          : await sendInteractionFollowup(target, {
+            signal,
+            fetchImpl: interactionFetch,
+            content: authorizationRejectionMessage(DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE),
+            timeoutMs: callbackTimeoutMs
+          });
+      } catch (error) {
+        result = { outcome: DECISION_TRANSPORT_OUTCOMES.UNKNOWN, reason: String((error as Error)?.message || error).slice(0, 200) };
+      }
+    }
+    try { state.recordDecisionRejectionOutcome(click.interactionId, transportOutcome(result.outcome)); } catch {}
+    return result;
   }
 
   async function routeFor(presentation: DecisionPresentation, signal?: AbortSignal): Promise<CanonicalRoute | null> {
@@ -346,19 +403,21 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     return imported.click?.canonical || state.getDecisionClick(current.interactionId)?.canonical || null;
   }
 
-  async function project(click: DecisionClick, presentation: DecisionPresentation, signal?: AbortSignal): Promise<void> {
-    if (click.projectionOutcome || !click.canonical?.materialized || !click.canonical.answer) return;
+  async function project(click: DecisionClick, presentation: DecisionPresentation, signal?: AbortSignal): Promise<boolean> {
+    if (click.projectionOutcome || !click.canonical?.materialized || !click.canonical.answer) return true;
     if (typeof options.project !== 'function') {
       state.recordDecisionProjectionOutcome(click.interactionId, DECISION_TRANSPORT_OUTCOMES.NOT_SENT);
-      return;
+      return false;
     }
     try {
       await options.project({ click, presentation, answer: click.canonical.answer }, signal);
       state.recordDecisionProjectionOutcome(click.interactionId, DECISION_TRANSPORT_OUTCOMES.SENT);
+      return true;
     } catch (error) {
       const outcome = transportOutcome((error as { outcome?: unknown })?.outcome);
-      if (outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT && (error as { retryable?: unknown })?.retryable === true) return;
+      if (outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT && (error as { retryable?: unknown })?.retryable === true) return false;
       state.recordDecisionProjectionOutcome(click.interactionId, outcome);
+      return false;
     }
   }
 
@@ -384,14 +443,30 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     let current = state.getDecisionClick(click.interactionId) || click;
     if (current.state === DECISION_STATES.AUTHORIZATION_PENDING) {
       const allowed = await authorizationAllowed(current, signal);
-      if (signal?.aborted) {
+      if (signal?.aborted || allowed === null) {
         return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
       }
       if (!allowed) {
-        return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
+        const transition = authorizationTransition(current.interactionId, DECISION_AUTHORIZATION_OUTCOMES.DENIED);
+        if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) {
+          current = state.getDecisionClick(current.interactionId) || current;
+        } else if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+          await deliverRejection(transition.click || current, signal);
+          return { handled: true, accepted: false, reason: DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE, click: null, message: safeMessage(state, current.interactionId) };
+        } else {
+          return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
+        }
+      } else {
+        const transition = authorizationTransition(current.interactionId, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED);
+        if (transition.outcome !== DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) {
+          if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+            await deliverRejection(transition.click || current, signal);
+            return { handled: true, accepted: false, reason: DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE, click: null, message: safeMessage(state, current.interactionId) };
+          }
+          return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
+        }
+        current = state.getDecisionClick(current.interactionId) || current;
       }
-      state.recordDecisionAuthorizationOutcome(current.interactionId, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED);
-      current = state.getDecisionClick(current.interactionId) || current;
     }
     let canonical: DecisionCanonicalResult | null = null;
     try {
@@ -404,8 +479,11 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     if (current.canonical?.source === DECISION_WINNER_SOURCES.CLAIM && !current.canonical.materialized) {
       return { handled: true, accepted: true, click: current, canonical: current.canonical, message: null };
     }
-    await project(current, presentation, signal);
+    const projected = await project(current, presentation, signal);
     current = state.getDecisionClick(click.interactionId) || current;
+    if (!projected && current.canonical?.answer && current.canonical.answer.length > DECISION_EMBED_DESCRIPTION_LIMIT) {
+      return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
+    }
     const nativeResult = await native(current, signal);
     return { handled: true, accepted: true, click: state.getDecisionClick(click.interactionId) || current, canonical: current.canonical, message: safeMessage(state, click.interactionId), native: nativeResult };
   }
@@ -427,7 +505,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       guildId: parsed.guildId,
       channelId: parsed.channelId,
       messageId: parsed.messageId,
-      binding
+      binding,
+      applicationId: parsed.applicationId,
+      token: parsed.token
     }) : state.admitDecisionClickAndBeginAuthorization({
       interactionId: parsed.id,
       presentationId: presentation.presentationId,
@@ -436,7 +516,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       guildId: parsed.guildId,
       channelId: parsed.channelId,
       messageId: parsed.messageId,
-      binding
+      binding,
+      applicationId: parsed.applicationId,
+      token: parsed.token
     });
     if (!admission.accepted && !(admission.duplicate && admission.continuing && admission.click)) {
       return { ...invalidResult(admission.reason || DECISION_REASONS.INVALID_DECISION_INTERACTION), duplicate: admission.duplicate, click: admission.click };
@@ -448,9 +530,19 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     }
     let click = state.getDecisionClick(parsed.id) || admission.click;
     if (!click) return invalidResult(DECISION_REASONS.UNKNOWN_INTERACTION);
+    if (click.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+      const rejection = await deliverRejection(click, signal, parsed);
+      return {
+        handled: true,
+        accepted: false,
+        reason: DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE,
+        click: null,
+        ...(rejection ? { callback: rejection } : callback ? { callback } : {})
+      };
+    }
     if (click.state === DECISION_STATES.AUTHORIZATION_PENDING) {
       const allowed = await authorizationAllowed(parsed, signal);
-      if (signal?.aborted) {
+      if (signal?.aborted || allowed === null) {
         return {
           handled: true,
           accepted: true,
@@ -460,25 +552,50 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         };
       }
       if (!allowed) {
-        state.recordDecisionAuthorizationOutcome(parsed.id, DECISION_AUTHORIZATION_OUTCOMES.DENIED);
-        const rejection = options.reject
-          ? await options.reject(parsed, DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE, signal, true)
-          : await sendInteractionFollowup(parsed, {
-            signal,
-            fetchImpl: interactionFetch,
-            content: authorizationRejectionMessage(DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE),
-            timeoutMs: callbackTimeoutMs
-          });
-        return {
-          handled: true,
-          accepted: false,
-          reason: DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE,
-          click: null,
-          ...(rejection ? { callback: rejection } : callback ? { callback } : {})
-        };
+        const transition = authorizationTransition(parsed.id, DECISION_AUTHORIZATION_OUTCOMES.DENIED);
+        if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) {
+          click = state.getDecisionClick(parsed.id) || click;
+        } else if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+          const rejection = await deliverRejection(transition.click || click, signal, parsed);
+          return {
+            handled: true,
+            accepted: false,
+            reason: DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE,
+            click: null,
+            ...(rejection ? { callback: rejection } : callback ? { callback } : {})
+          };
+        } else {
+          return {
+            handled: true,
+            accepted: true,
+            click,
+            message: safeMessage(state, click.interactionId),
+            ...(callback ? { callback } : {})
+          };
+        }
+      } else {
+        const transition = authorizationTransition(parsed.id, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED);
+        if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+          const rejection = await deliverRejection(transition.click || click, signal, parsed);
+          return {
+            handled: true,
+            accepted: false,
+            reason: DECISION_REASONS.PRESENTATION_NOT_ADMISSIBLE,
+            click: null,
+            ...(rejection ? { callback: rejection } : callback ? { callback } : {})
+          };
+        }
+        if (transition.outcome !== DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED) {
+          return {
+            handled: true,
+            accepted: true,
+            click,
+            message: safeMessage(state, click.interactionId),
+            ...(callback ? { callback } : {})
+          };
+        }
+        click = state.getDecisionClick(parsed.id) || click;
       }
-      state.recordDecisionAuthorizationOutcome(parsed.id, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED);
-      click = state.getDecisionClick(parsed.id) || click;
     }
     if (options.waitForDispatch && !await options.waitForDispatch(click.channelId, signal)) {
       return {
@@ -505,6 +622,13 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     const remaining: DecisionClick[] = [];
     for (const pendingClick of pending) {
       if (signal?.aborted) { remaining.push(pendingClick); continue; }
+      if (pendingClick.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+        try {
+          await deliverRejection(pendingClick, signal);
+        } catch {}
+        if (state.listDecisionPendingWork().some(click => click.interactionId === pendingClick.interactionId)) remaining.push(pendingClick);
+        continue;
+      }
       if (!bindingInput(state.getBinding(pendingClick.channelId))) {
         remaining.push(pendingClick);
         continue;
@@ -513,8 +637,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       if (stored?.decisionResult && pendingClick.projectionOutcome) continue;
       try {
         const result = await continueClick(pendingClick, signal);
-        if (result.click && state.listDecisionPendingWork().some(click => click.interactionId === pendingClick.interactionId)) {
-          remaining.push(result.click);
+        const unresolved = state.listDecisionPendingWork().find(click => click.interactionId === pendingClick.interactionId);
+        if (unresolved) {
+          remaining.push(result.click || unresolved);
         }
       } catch {
         remaining.push(pendingClick);

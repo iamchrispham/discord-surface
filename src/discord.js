@@ -520,7 +520,7 @@ class DiscordGateway {
   }
 
   async authorizeDecisionInteraction({ channelId }, signal) {
-    if (signal?.aborted || this.stopping) return false;
+    if (signal?.aborted || this.stopping) return null;
     const fetchPromise = Promise.resolve().then(() => this.client.channels?.fetch?.(channelId));
     let timeout;
     let abort;
@@ -533,11 +533,11 @@ class DiscordGateway {
     });
     try {
       const channel = await Promise.race([fetchPromise, abortPromise, timeoutPromise]);
-      if (signal?.aborted || this.stopping || !channel) return false;
+      if (signal?.aborted || this.stopping || !channel) return null;
       const permission = this.historyPermission(channel, { requireSend: true });
-      return permission.known && permission.allowed;
+      return permission.known ? permission.allowed : null;
     } catch {
-      return false;
+      return null;
     } finally {
       if (timeout) clearTimeout(timeout);
       if (signal && abort) signal.removeEventListener('abort', abort);

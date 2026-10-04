@@ -1124,6 +1124,14 @@ class SurfaceState {
     return decisionHandlers.recordCallbackOutcome(this, interactionId, outcome);
   }
 
+  beginDecisionRejectionFollowup(interactionId) {
+    return decisionHandlers.beginRejectionFollowup(this, interactionId);
+  }
+
+  recordDecisionRejectionOutcome(interactionId, outcome) {
+    return decisionHandlers.recordRejectionOutcome(this, interactionId, outcome);
+  }
+
   importDecisionWinner(interactionId, result) {
     return decisionHandlers.importWinner(this, interactionId, result);
   }
