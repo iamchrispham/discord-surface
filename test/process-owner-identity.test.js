@@ -338,15 +338,31 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   function propertyNameText(name) {
     if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
     if (!ts.isComputedPropertyName(name)) return undefined;
-    let expression = name.expression;
-    while (ts.isParenthesizedExpression(expression)
-      || ts.isAsExpression(expression)
-      || ts.isSatisfiesExpression(expression)
-      || ts.isNonNullExpression(expression)) {
-      expression = expression.expression;
+    function constantStringText(expression) {
+      while (ts.isParenthesizedExpression(expression)
+        || ts.isAsExpression(expression)
+        || ts.isSatisfiesExpression(expression)
+        || ts.isNonNullExpression(expression)) {
+        expression = expression.expression;
+      }
+      if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
+      if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+        const left = constantStringText(expression.left);
+        const right = constantStringText(expression.right);
+        return left === undefined || right === undefined ? undefined : left + right;
+      }
+      if (ts.isTemplateExpression(expression)) {
+        let text = expression.head.text;
+        for (const span of expression.templateSpans) {
+          const value = constantStringText(span.expression);
+          if (value === undefined) return undefined;
+          text += value + span.literal.text;
+        }
+        return text;
+      }
+      return undefined;
     }
-    if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
-    return undefined;
+    return constantStringText(name.expression);
   }
   function declaredNames(ast) {
     const names = [];
@@ -388,6 +404,8 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   const methodControls = [
     ['class method', 'class Example { captureProcessOwnerIdentity() {} }', true],
     ['class string method', "class Example { 'captureProcessOwnerIdentity'() {} }", true],
+    ['class concatenated computed method', "class Example { ['captureProcessOwner' + 'Identity']() {} }", true],
+    ['class interpolated computed method', 'class Example { [`captureProcessOwner${"Identity"}`]() {} }', true],
     ['class static computed method', "class Example { static ['captureProcessOwnerIdentity']() {} }", true],
     ['class static computed template', 'class Example { static [`captureProcessOwnerIdentity`]() {} }', true],
     ['class static computed parenthesized string', "class Example { static [('captureProcessOwnerIdentity')]() {} }", true],
