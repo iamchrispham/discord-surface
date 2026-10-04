@@ -36,6 +36,11 @@ const PRESERVED_PROBES = new Map([
 const PID_PROBE = 'pid-probe';
 const PROCESS_OBJECT = 'process-object';
 const LEGACY_OWNER = 'legacy-owner';
+// A process.kill bind with arguments beyond `thisArg` is only partially
+// visible at the later call site. Refuse it rather than dropping the bound
+// arguments and silently accepting a zero-signal probe.
+const BOUND_PROBE = 'bound-process-probe';
+const BOUND_REFLECT_APPLY = 'bound-reflect-apply';
 // Indirect `.call`/`.apply` of a probe: invoking one is refused, never guessed.
 const CALL_METHOD = 'probe-call-method';
 const APPLY_METHOD = 'probe-apply-method';
@@ -43,6 +48,8 @@ const INVOCATION_METHODS = [CALL_METHOD, APPLY_METHOD];
 // Global `Reflect.apply`: invoking it on a probe is refused.
 const REFLECT_OBJECT = 'reflect-object';
 const REFLECT_APPLY = 'reflect-apply';
+const REFLECT_CALL_METHOD = 'reflect-call-method';
+const REFLECT_APPLY_METHOD = 'reflect-apply-method';
 
 function sourceFiles(root) {
   const found = [];
@@ -99,15 +106,27 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
   // AND every assignment anywhere in the file, regardless of flow order, so a
   // possible probe cannot be erased by a later ordinary assignment.
   const assignments = new Map();
+  const parameterArguments = new Map();
   const recordAssignment = (symbol, value) => {
     if (!symbol) return;
     const existing = assignments.get(symbol);
     if (existing) existing.push(value);
     else assignments.set(symbol, [value]);
   };
+  const recordParameterArgument = (symbol, value) => {
+    if (!symbol || !value) return;
+    const existing = parameterArguments.get(symbol);
+    if (existing) existing.push(value);
+    else parameterArguments.set(symbol, [value]);
+  };
   const indexRightHandSide = expression => {
     if (!expression) return;
-    if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    const operator = ts.isBinaryExpression(expression) ? expression.operatorToken.kind : null;
+    const isAssignment = operator === ts.SyntaxKind.EqualsToken ||
+      operator === ts.SyntaxKind.BarBarEqualsToken ||
+      operator === ts.SyntaxKind.QuestionQuestionEqualsToken ||
+      operator === ts.SyntaxKind.AmpersandAmpersandEqualsToken;
+    if (ts.isBinaryExpression(expression) && isAssignment) {
       const left = ts.isParenthesizedExpression(expression.left) ? expression.left.expression : expression.left;
       if (ts.isIdentifier(left)) {
         recordAssignment(checker.getSymbolAtLocation(left), { source: expression.right });
@@ -132,13 +151,52 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
           }
           if (target) recordAssignment(target, { source: expression.right, name });
         }
+      } else if (ts.isPropertyAccessExpression(left) || ts.isElementAccessExpression(left)) {
+        const propertySymbol = ts.isPropertyAccessExpression(left)
+          ? checker.getSymbolAtLocation(left.name)
+          : checker.getSymbolAtLocation(left);
+        recordAssignment(propertySymbol, { source: expression.right });
       }
     }
     ts.forEachChild(expression, indexRightHandSide);
   };
   indexRightHandSide(sourceFile);
 
+  const callableParameters = callee => {
+    if (!ts.isIdentifier(callee)) return [];
+    const symbol = checker.getSymbolAtLocation(callee);
+    const declaration = symbol && symbol.valueDeclaration;
+    if (declaration && (ts.isFunctionDeclaration(declaration) || ts.isFunctionExpression(declaration) ||
+      ts.isArrowFunction(declaration) || ts.isMethodDeclaration(declaration))) {
+      return declaration.parameters;
+    }
+    if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer &&
+      (ts.isFunctionExpression(declaration.initializer) || ts.isArrowFunction(declaration.initializer))) {
+      return declaration.initializer.parameters;
+    }
+    return [];
+  };
+  const indexParameterArguments = node => {
+    if (ts.isCallExpression(node)) {
+      const parameters = callableParameters(node.expression);
+      for (let index = 0; index < parameters.length; index += 1) {
+        const argument = node.arguments[index];
+        if (argument && !ts.isSpreadElement(argument)) {
+          recordParameterArgument(checker.getSymbolAtLocation(parameters[index].name), argument);
+        }
+      }
+    }
+    ts.forEachChild(node, indexParameterArguments);
+  };
+  indexParameterArguments(sourceFile);
+
   const hasAtom = (set, atom) => Boolean(set) && set.has(atom);
+
+  function accessNames(node, visited) {
+    if (ts.isPropertyAccessExpression(node)) return new Set([node.name.text]);
+    if (ts.isElementAccessExpression(node)) return staticValue(node.argumentExpression, visited);
+    return new Set();
+  }
 
   // True only for a symbol bound by an object-destructuring pattern
   // (BindingElement), whose possible values are the pattern sources of its
@@ -187,26 +245,43 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
     }
 
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-      let name = null;
-      if (ts.isElementAccessExpression(node)) {
-        if (ts.isStringLiteral(node.argumentExpression)) name = node.argumentExpression.text;
-        else return empty;
-      } else {
-        name = node.name.text;
-      }
+      const names = accessNames(node, seen);
+      if (!names.size) return empty;
       const receiver = resolveSet(node.expression, seen);
-      if (name === 'directPostOwnerAlive') return new Set([LEGACY_OWNER]);
-      if (name === 'kill' && hasAtom(receiver, PROCESS_OBJECT)) return new Set([PID_PROBE]);
-      if (hasAtom(receiver, PID_PROBE)) {
-        if (name === 'bind') return new Set([PID_PROBE]);
-        if (name === 'call') return new Set([CALL_METHOD]);
-        if (name === 'apply') return new Set([APPLY_METHOD]);
+      const result = new Set();
+      for (const name of names) {
+        if (name === 'directPostOwnerAlive') result.add(LEGACY_OWNER);
+        if (name === 'kill' && hasAtom(receiver, PROCESS_OBJECT)) result.add(PID_PROBE);
+        if (hasAtom(receiver, PID_PROBE)) {
+          if (name === 'bind') result.add(PID_PROBE);
+          if (name === 'call') result.add(CALL_METHOD);
+          if (name === 'apply') result.add(APPLY_METHOD);
+        }
+        if (hasAtom(receiver, REFLECT_OBJECT) && name === 'apply') result.add(REFLECT_APPLY);
+        if (hasAtom(receiver, REFLECT_APPLY)) {
+          if (name === 'bind') result.add(REFLECT_APPLY);
+          if (name === 'call') result.add(REFLECT_CALL_METHOD);
+          if (name === 'apply') result.add(REFLECT_APPLY_METHOD);
+        }
+        if (hasAtom(receiver, BOUND_PROBE) &&
+          (name === 'bind' || name === 'call' || name === 'apply')) result.add(BOUND_PROBE);
+        if (hasAtom(receiver, BOUND_REFLECT_APPLY) &&
+          (name === 'bind' || name === 'call' || name === 'apply')) result.add(BOUND_REFLECT_APPLY);
+        if ((hasAtom(receiver, REFLECT_CALL_METHOD) || hasAtom(receiver, REFLECT_APPLY_METHOD)) &&
+          (name === 'bind' || name === 'call' || name === 'apply')) result.add(BOUND_REFLECT_APPLY);
+        const methods = INVOCATION_METHODS.filter(atom => hasAtom(receiver, atom));
+        if (name === 'bind') {
+          for (const method of methods) result.add(method);
+        }
+        if ((name === 'call' || name === 'apply') && methods.length) result.add(APPLY_METHOD);
       }
-      if (hasAtom(receiver, REFLECT_OBJECT) && name === 'apply') return new Set([REFLECT_APPLY]);
-      const methods = INVOCATION_METHODS.filter(atom => hasAtom(receiver, atom));
-      if (name === 'bind') return new Set(methods);
-      if ((name === 'call' || name === 'apply') && methods.length) return new Set([APPLY_METHOD]);
-      return empty;
+      const propertySymbol = ts.isPropertyAccessExpression(node)
+        ? checker.getSymbolAtLocation(node.name)
+        : checker.getSymbolAtLocation(node);
+      for (const assigned of assignments.get(propertySymbol) || []) {
+        for (const atom of resolveSet(assigned.source, seen)) result.add(atom);
+      }
+      return result;
     }
 
     if (ts.isCallExpression(node)) {
@@ -214,10 +289,29 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       // result is still a potential liveness probe. `.call`/`.apply` are
       // invocations themselves, handled at the call visitor with shifted args.
       const callee = node.expression;
-      if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'bind') {
+      const names = accessNames(callee, seen);
+      if (names.has('bind')) {
         const receiver = resolveSet(callee.expression, seen);
-        if (hasAtom(receiver, PID_PROBE)) return new Set([PID_PROBE]);
-        return new Set(INVOCATION_METHODS.filter(atom => hasAtom(receiver, atom)));
+        const result = new Set();
+        if (hasAtom(receiver, PID_PROBE)) {
+          result.add(node.arguments.length > 1 ? BOUND_PROBE : PID_PROBE);
+        }
+        if (hasAtom(receiver, BOUND_PROBE)) result.add(BOUND_PROBE);
+        for (const method of INVOCATION_METHODS) {
+          if (hasAtom(receiver, method)) result.add(method);
+        }
+        if (hasAtom(receiver, REFLECT_APPLY)) {
+          result.add(node.arguments.length > 1 ? BOUND_REFLECT_APPLY : REFLECT_APPLY);
+        }
+        if (hasAtom(receiver, BOUND_REFLECT_APPLY) || hasAtom(receiver, REFLECT_CALL_METHOD) ||
+          hasAtom(receiver, REFLECT_APPLY_METHOD)) result.add(BOUND_REFLECT_APPLY);
+        return result;
+      }
+      if (names.has('call') || names.has('apply')) {
+        const receiver = resolveSet(callee.expression, seen);
+        if (hasAtom(receiver, REFLECT_APPLY)) return new Set([REFLECT_APPLY]);
+        if (hasAtom(receiver, BOUND_REFLECT_APPLY) || hasAtom(receiver, REFLECT_CALL_METHOD) ||
+          hasAtom(receiver, REFLECT_APPLY_METHOD)) return new Set([BOUND_REFLECT_APPLY]);
       }
       return empty;
     }
@@ -255,6 +349,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       if (entry.name === 'kill' && hasAtom(resolveSet(entry.source, symbolSeen), PROCESS_OBJECT)) {
         result.add(PID_PROBE);
       }
+      const sourceSet = resolveSet(entry.source, symbolSeen);
+      if (entry.name === 'apply' && hasAtom(sourceSet, REFLECT_OBJECT)) result.add(REFLECT_APPLY);
+      if (entry.name === 'call' && hasAtom(sourceSet, REFLECT_APPLY)) result.add(REFLECT_CALL_METHOD);
+      if (entry.name === 'apply' && hasAtom(sourceSet, REFLECT_APPLY)) result.add(REFLECT_APPLY_METHOD);
       for (const atom of literalProperty(entry.source, entry.name, symbolSeen)) result.add(atom);
     };
 
@@ -271,8 +369,29 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       return empty;
     }
 
+    for (const argument of parameterArguments.get(symbol) || []) addFrom(argument);
     for (const assigned of assignments.get(symbol) || []) addFromAssignment(assigned);
     return result;
+  }
+
+  // Logical signal expressions keep their known branch values, but an
+  // unresolved short-circuit operand still represents a possible zero at
+  // runtime and must be refused rather than accepted as the known branch.
+  function mayBeUnresolved(node, visited = new Set()) {
+    if (!node || visited.has(node)) return true;
+    const seen = new Set(visited).add(node);
+    if (ts.isParenthesizedExpression(node)) return mayBeUnresolved(node.expression, seen);
+    if (ts.isNumericLiteral(node) || ts.isStringLiteral(node)) return false;
+    if (ts.isConditionalExpression(node)) {
+      return mayBeUnresolved(node.whenTrue, seen) || mayBeUnresolved(node.whenFalse, seen);
+    }
+    if (ts.isBinaryExpression(node) &&
+      (node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+        node.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+        node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) {
+      return mayBeUnresolved(node.left, seen) || mayBeUnresolved(node.right, seen);
+    }
+    return staticValue(node).size === 0;
   }
 
   // Named property of a literal object origin, reached directly or through
@@ -335,38 +454,86 @@ function parseOwnerSites(fileName, text, generatedOwner = null) {
       return;
     }
     if (name === 'kill' && hasAtom(sourceSet, PROCESS_OBJECT)) result.add(PID_PROBE);
+    if (name === 'apply' && hasAtom(sourceSet, REFLECT_OBJECT)) result.add(REFLECT_APPLY);
+    if (name === 'call' && hasAtom(sourceSet, REFLECT_APPLY)) result.add(REFLECT_CALL_METHOD);
+    if (name === 'apply' && hasAtom(sourceSet, REFLECT_APPLY)) result.add(REFLECT_APPLY_METHOD);
   }
 
   const visit = node => {
     if (ts.isCallExpression(node)) {
       const owner = generatedOwner || enclosingOwner(node);
       const callee = node.expression;
-      const method = ts.isPropertyAccessExpression(callee) &&
-        (callee.name.text === 'bind' || callee.name.text === 'call' || callee.name.text === 'apply') &&
-        hasAtom(staticValue(callee.expression), PID_PROBE);
-      if (method && callee.name.text !== 'bind') {
+      const calleeNames = accessNames(callee);
+      const calleeReceiver = ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)
+        ? staticValue(callee.expression)
+        : new Set();
+      const method = calleeNames.size === 1 &&
+        (calleeNames.has('bind') || calleeNames.has('call') || calleeNames.has('apply')) &&
+        hasAtom(calleeReceiver, PID_PROBE);
+      const methodName = calleeNames.size === 1 ? [...calleeNames][0] : null;
+      if (method && methodName !== 'bind') {
         // `.call(thisArg, pid, signal)` / `.apply(thisArg, [pid, signal])` shift
         // the arguments. A signal this parse cannot resolve (absent, nonliteral
         // list, unknown value) is refused: never guessed, never evaluated.
         const list = node.arguments[1];
-        const signal = callee.name.text === 'call' ? node.arguments[2]
+        const signal = methodName === 'call' ? node.arguments[2]
           : list && ts.isArrayLiteralExpression(list) ? list.elements[1] : undefined;
         const values = signal ? staticValue(signal) : new Set();
         if (hasAtom(values, 0)) kills.push({ file: fileName, owner });
-        else if (values.size === 0) violations.push(`unsupported process probe ${fileName}:${owner}`);
+        if (values.size === 0 || (signal && mayBeUnresolved(signal))) {
+          violations.push(`unsupported process probe ${fileName}:${owner}`);
+        }
+      } else if (calleeNames.size === 1 &&
+        (calleeNames.has('call') || calleeNames.has('apply')) &&
+        hasAtom(calleeReceiver, REFLECT_APPLY)) {
+        const target = calleeNames.has('call')
+          ? node.arguments[1]
+          : node.arguments[1] && ts.isArrayLiteralExpression(node.arguments[1])
+            ? node.arguments[1].elements[0]
+            : undefined;
+        const probeTarget = target && staticValue(target);
+        if (probeTarget && [PID_PROBE, BOUND_PROBE, ...INVOCATION_METHODS, REFLECT_APPLY]
+          .some(atom => hasAtom(probeTarget, atom))) {
+          violations.push(`unsupported process probe ${fileName}:${owner}`);
+        }
       } else if (!method) {
         const resolved = staticValue(callee);
-        const isBind = ts.isPropertyAccessExpression(callee) && callee.name.text === 'bind';
+        const isBind = calleeNames.has('bind');
+        if (!isBind && (hasAtom(resolved, BOUND_PROBE) || hasAtom(resolved, BOUND_REFLECT_APPLY))) {
+          violations.push(`unsupported process probe ${fileName}:${owner}`);
+        }
+        if (hasAtom(resolved, REFLECT_CALL_METHOD)) {
+          const target = node.arguments[1] && staticValue(node.arguments[1]);
+          if (target && [PID_PROBE, BOUND_PROBE, BOUND_REFLECT_APPLY, ...INVOCATION_METHODS, REFLECT_APPLY]
+            .some(atom => hasAtom(target, atom))) {
+            violations.push(`unsupported process probe ${fileName}:${owner}`);
+          }
+        }
+        if (hasAtom(resolved, REFLECT_APPLY_METHOD)) {
+          const list = node.arguments[1];
+          const target = list && ts.isArrayLiteralExpression(list) && list.elements[0]
+            ? staticValue(list.elements[0]) : null;
+          if (target && [PID_PROBE, BOUND_PROBE, BOUND_REFLECT_APPLY, ...INVOCATION_METHODS, REFLECT_APPLY]
+            .some(atom => hasAtom(target, atom))) {
+            violations.push(`unsupported process probe ${fileName}:${owner}`);
+          }
+        }
         const isProbe = hasAtom(resolved, PID_PROBE);
-        if (isProbe && node.arguments.length >= 2 && hasAtom(staticValue(node.arguments[1]), 0)) {
-          kills.push({ file: fileName, owner });
+        if (isProbe && !isBind) {
+          const signal = node.arguments[1];
+          const values = signal ? staticValue(signal) : new Set();
+          if (hasAtom(values, 0)) kills.push({ file: fileName, owner });
+          if (values.size === 0 || (signal && mayBeUnresolved(signal))) {
+            violations.push(`unsupported process probe ${fileName}:${owner}`);
+          }
         }
         if (!isBind && INVOCATION_METHODS.some(atom => hasAtom(resolved, atom))) {
           violations.push(`unsupported process probe ${fileName}:${owner}`);
         }
         const probeTarget = node.arguments[0] && staticValue(node.arguments[0]);
         if (hasAtom(resolved, REFLECT_APPLY) && probeTarget &&
-          [PID_PROBE, ...INVOCATION_METHODS].some(atom => hasAtom(probeTarget, atom))) {
+          [PID_PROBE, BOUND_PROBE, BOUND_REFLECT_APPLY, ...INVOCATION_METHODS, REFLECT_APPLY]
+            .some(atom => hasAtom(probeTarget, atom))) {
           violations.push(`unsupported process probe ${fileName}:${owner}`);
         }
         if (hasAtom(resolved, LEGACY_OWNER)) legacyCalls.push({ file: fileName, owner });

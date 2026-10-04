@@ -110,6 +110,10 @@ runFixture("function newProbe(pid) { process.kill.apply(null, [pid, 0]); }", ["p
 runFixture("const probe = process.kill.bind(null); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
 
+test("static element key resolves process kill", () => {
+runFixture("const key = 'kill'; function newProbe(pid) { process[key](pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
 test("declared production probe inventory remains valid", () => {
 const result = inventoryProcessOwnerSites(SRC_ROOT);
 assert.equal(result.kills.length, 8);
@@ -145,6 +149,11 @@ test("destructuring assignment probe", () => {
   runFixture("let probe; ({ kill: probe } = process); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
 
+test("logical assignment probe alias", () => {
+runFixture("let probe; probe ??= process.kill; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+runFixture("let probe; probe ||= process.kill; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
 test("ordinary default function stays empty", () => {
   runFixture("function newProbe(pid, probe = () => true) { probe(pid, 0); }", [], []);
 });
@@ -159,6 +168,13 @@ test("bound apply invocation refuses", () => {
 
 test("bound call invocation refuses", () => {
   runFixture("const invoke = process.kill.call.bind(process.kill); function newProbe(pid) { invoke(null, pid, 0); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("partially bound process kill refuses", () => {
+  runFixture("function newProbe(pid) { const probe = process.kill.bind(null, pid); probe(0); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid) { const probe = process.kill.bind(null, pid); probe.call(null, 0); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid) { const probe = process.kill.bind(null, pid); probe.apply(null, [0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid) { const probe = process.kill.bind(null, pid); const next = probe.bind(null); next(0); }", [], ["unsupported process probe private-alias.js:newProbe"]);
 });
 
 test("destructured literal zero signal", () => {
@@ -219,6 +235,35 @@ test("Reflect direct probe refuses", () => {
 
 test("Reflect probe alias refuses", () => {
   runFixture("const probe=process.kill;function newProbe(pid){Reflect.apply(probe,null,[pid,0]);}", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("Reflect callable origin survives finite wrappers", () => {
+  runFixture("const invoke = Reflect.apply.bind(Reflect); function newProbe(pid) { invoke(process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("const invoke = Reflect.apply.call(Reflect); function newProbe(pid) { invoke(process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("const invoke = Reflect.apply.apply(Reflect, [Reflect]); function newProbe(pid) { invoke(process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("const { apply } = Reflect; function newProbe(pid) { apply(process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("const invoke = Reflect.apply.bind(Reflect, process.kill); function newProbe(pid) { invoke(null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("const invoke = Reflect.apply.call; function newProbe(pid) { invoke(Reflect, process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("const invoke = Reflect.apply.apply; function newProbe(pid) { invoke(Reflect, [process.kill, null, [pid, 0]]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("let invoke; ({ apply: invoke } = Reflect); function newProbe(pid) { invoke(process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("const invoke = Reflect.apply['bind'](Reflect); function newProbe(pid) { invoke(process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("const invoke = Reflect.apply['call'](Reflect); function newProbe(pid) { invoke(process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("const invoke = Reflect.apply['apply'](Reflect, [Reflect]); function newProbe(pid) { invoke(process.kill, null, [pid, 0]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("nested Reflect probe target refuses", () => {
+  runFixture("function newProbe(pid) { Reflect.apply(Reflect.apply, Reflect, [process.kill, null, [pid, 0]]); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("unresolved direct signal refuses", () => {
+  runFixture("function newProbe(pid, signal) { process.kill(pid, signal); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid, signal) { process.kill(pid, signal ?? 9); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid, signal) { process.kill(pid, signal && 9); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+});
+
+test("logical member assignment probe alias", () => {
+  runFixture("const obj = { probe: undefined }; obj.probe ??= process.kill; function newProbe(pid) { obj.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const obj = { probe: undefined }; obj.probe ||= process.kill; function newProbe(pid) { obj.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
 
 test("Reflect ordinary control", () => {
