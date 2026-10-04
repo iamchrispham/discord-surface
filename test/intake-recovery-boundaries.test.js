@@ -755,14 +755,24 @@ const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex) => {
 
 const valueHasGap = (tokens, start, end, pairs) => {
   if (start >= end) return false;
-  if (isGapValueAt(tokens, start)) return true;
-  if (tokens[start].value === '{') {
-    const closingIndex = pairs.get(start);
-    return closingIndex !== undefined && closingIndex < end
-      ? objectHasTopLevelStateGap(tokens, start, closingIndex)
+  let valueStart = start;
+  let valueEnd = end;
+  while (tokens[valueEnd - 1]?.value === ';') valueEnd -= 1;
+  while (tokens[valueStart]?.value === '(') {
+    const closingIndex = pairs.get(valueStart);
+    if (closingIndex !== valueEnd - 1) break;
+    valueStart += 1;
+    valueEnd = closingIndex;
+  }
+  if (valueStart >= valueEnd) return false;
+  if (isGapValueAt(tokens, valueStart)) return true;
+  if (tokens[valueStart].value === '{') {
+    const closingIndex = pairs.get(valueStart);
+    return closingIndex !== undefined && closingIndex < valueEnd
+      ? objectHasTopLevelStateGap(tokens, valueStart, closingIndex)
       : false;
   }
-  return expressionHasGap(tokens, start, end);
+  return expressionHasGap(tokens, valueStart, valueEnd);
 };
 
 const findStatementEnd = (tokens, start, end) => {
@@ -885,13 +895,22 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) =>
 
 const isBoundaryWriter = value => /boundary|readiness/i.test(value);
 
-const callHasGapArgument = (tokens, opening, closing, pairs) => {
+const BOUNDARY_WRITER_STATE_ARGUMENTS = new Map([
+  ['markIntakeBoundary', 1],
+  ['recordBoundary', 2],
+  ['recordOwnedBoundary', 2]
+]);
+
+const boundaryWriterStateArgument = value => BOUNDARY_WRITER_STATE_ARGUMENTS.get(value) ?? 1;
+
+const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument) => {
   let argumentStart = opening + 1;
   let argumentIndex = 0;
   let parenDepth = 0;
   let braceDepth = 0;
   let bracketDepth = 0;
-  const check = argumentEnd => argumentIndex < 2 && valueHasGap(tokens, argumentStart, argumentEnd, pairs);
+  const check = argumentEnd => argumentIndex === stateArgument
+    && valueHasGap(tokens, argumentStart, argumentEnd, pairs);
   for (let index = opening + 1; index < closing; index += 1) {
     const value = tokens[index].value;
     if (value === '(') parenDepth += 1;
@@ -928,7 +947,7 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges) => {
       continue;
     }
     if (token.type === 'identifier' && OUTCOME_NAMES.has(token.value)
-      && tokens[index - 1]?.value !== '.' && tokens[index + 1]?.value === '=') {
+      && tokens[index + 1]?.value === '=') {
       const statementEnd = findStatementEnd(tokens, index + 2, end);
       if (valueHasGap(tokens, index + 2, statementEnd, pairs)) return true;
       index = Math.max(index, statementEnd - 1);
@@ -937,7 +956,8 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges) => {
     if (token.type === 'identifier' && isBoundaryWriter(token.value)
       && tokens[index + 1]?.value === '(' && tokens[index - 1]?.value !== 'function') {
       const closing = pairs.get(index + 1);
-      if (closing !== undefined && closing < end && callHasGapArgument(tokens, index + 1, closing, pairs)) return true;
+      if (closing !== undefined && closing < end
+        && callHasGapArgument(tokens, index + 1, closing, pairs, boundaryWriterStateArgument(token.value))) return true;
     }
   }
   return false;
@@ -1007,6 +1027,18 @@ test('deadline policy inventory scans complete outcomes and ignores unrelated ga
       ].join('\n')
     },
     {
+      relative: 'discord/member-assignment.js',
+      source: 'if (deadlineReached) result.state = READINESS.GAP;'
+    },
+    {
+      relative: 'discord/parenthesized-return.js',
+      source: 'if (deadlineReached) return (READINESS.GAP);'
+    },
+    {
+      relative: 'discord/parenthesized-object-return.js',
+      source: "if (deadlineReached) return ({ state: 'gap' });"
+    },
+    {
       relative: 'discord/unavailable-owner.js',
       source: [
         'if (deadlineReached) {',
@@ -1054,6 +1086,9 @@ test('deadline policy inventory scans complete outcomes and ignores unrelated ga
   assert.deepEqual(findDeadlineGapOffenders(entries), [
     'discord/multiline-owner.js:1',
     'discord/multiline-assignment.js:1',
+    'discord/member-assignment.js:1',
+    'discord/parenthesized-return.js:1',
+    'discord/parenthesized-object-return.js:1',
     'discord/nested-gap.js:1'
   ]);
 });
@@ -1122,6 +1157,14 @@ test('deadline policy inventory binds lexical and persistence controls to the de
       source: 'if (deadlineReached) state.markIntakeBoundary(id, READINESS.GAP, detail);'
     },
     {
+      relative: 'discord/owned-boundary-gap.js',
+      source: 'if (deadlineReached) state.recordBoundary(binding, null, READINESS.GAP, detail);'
+    },
+    {
+      relative: 'discord/owned-boundary-owned-gap.js',
+      source: 'if (deadlineReached) state.recordOwnedBoundary(binding, null, READINESS.GAP, detail);'
+    },
+    {
       relative: 'discord/persistence-safe.js',
       source: "if (deadlineReached) state.markIntakeBoundary(id, READINESS.UNAVAILABLE, 'gap');"
     }
@@ -1132,7 +1175,9 @@ test('deadline policy inventory binds lexical and persistence controls to the de
     'discord/regex-brace.js:1',
     'discord/template-return.js:1',
     'discord/template-property.js:1',
-    'discord/persistence-gap.js:1'
+    'discord/persistence-gap.js:1',
+    'discord/owned-boundary-gap.js:1',
+    'discord/owned-boundary-owned-gap.js:1'
   ]);
 });
 
