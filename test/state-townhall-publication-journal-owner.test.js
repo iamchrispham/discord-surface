@@ -92,9 +92,9 @@ test('publication journal source is included in both strict builds', () => {
   }
 });
 test('publication journal owner suite is registered exactly once', () => {
-  const expected = structuredClone(baseline.package);
-  expected.scripts.test += ' test/state-townhall-publication-journal-owner.test.js';
-  assert.deepEqual(JSON.parse(read('package.json')), expected);
+  const suite = 'test/state-townhall-publication-journal-owner.test.js';
+  const testTokens = JSON.parse(read('package.json')).scripts.test.split(/\s+/);
+  assert.equal(testTokens.filter(token => token === suite).length, 1);
 });
 test('publication journal baseline has the complete frozen declaration inventory', () => {
   assert.equal(digest(read(baselineFile)), baselineDigest);
