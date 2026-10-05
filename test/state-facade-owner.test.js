@@ -154,6 +154,11 @@ test('ordered call accepted when recorded in baseline', () => {
   assert.equal(matchesWithAddedBaseline(text), true);
 });
 
+test('rest call accepted when recorded in baseline', () => {
+  const text = insert('newForward(...args) { return configurationHandlers.setConfig.call(this, ...args); }');
+  assert.equal(matchesWithAddedBaseline(text), true);
+});
+
 test('fixed delegate cannot omit required handler arguments', () => {
   const thisBound = insert('newForward() { return configurationHandlers.setConfig.call(this); }');
   const stateBound = insert('newForward() { return provisionIntentHandlers.beginProvisionIntent(this); }');
@@ -216,9 +221,9 @@ test('noncallable spread returned handler overwrite refused', () => {
   assert.equal(matchesWithCandidateBaseline(text), false);
 });
 
-test('callable returned handler override remains eligible', () => {
+test('inline factory cannot approve callable returned handler override', () => {
   const text = returnedHandlerSource('{ hidden: 0, hidden(state, value) {} }');
-  assert.equal(matchesWithCandidateBaseline(text), true);
+  assert.equal(matchesWithCandidateBaseline(text), false);
 });
 
 test('arbitrary call refused', () => {
