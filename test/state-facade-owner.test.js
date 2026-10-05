@@ -29,6 +29,33 @@ function matchesWithAddedBaseline(text, methodName = 'newForward') {
   return matchesInventory(text, baselineWith(text, methodName));
 }
 
+function matchesWithCandidateBaseline(text) {
+  return matchesInventory(text, compact(inventory(text)));
+}
+
+function baselineWithBody(text, methodName) {
+  const candidate = compact(inventory(text));
+  return {
+    ...baseline,
+    bodies: { ...baseline.bodies, [methodName]: candidate.bodies[methodName] }
+  };
+}
+
+function matchesWithAddedBodyBaseline(text, methodName = 'newInline') {
+  return matchesInventory(text, baselineWithBody(text, methodName));
+}
+
+function returnedHandlerSource(objectLiteral) {
+  return source.replace(
+    'class SurfaceState {',
+    `function createFakeHandlers() { return ${objectLiteral}; }
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {
+newForward(value) { return fakeHandlers.hidden(this, value); }
+`
+  );
+}
+
 const insert = body => source.replace('class SurfaceState {', `class SurfaceState {\n${body}\n`);
 
 function alterBody(name) {
@@ -172,6 +199,26 @@ test('baseline accepted', () => {
 
 test('new inline body refused', () => {
   assert.equal(!matches(insert('newInline() { const value = Date.now(); return value; }')), true);
+});
+
+test('new inline body cannot be approved by extending the baseline', () => {
+  const text = insert('newInline() { return Date.now(); }');
+  assert.equal(matchesWithAddedBodyBaseline(text), false);
+});
+
+test('noncallable direct returned handler overwrite refused', () => {
+  const text = returnedHandlerSource('{ hidden(state, value) {}, hidden: 0 }');
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('noncallable spread returned handler overwrite refused', () => {
+  const text = returnedHandlerSource('{ hidden(state, value) {}, ...{ hidden: 0 } }');
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('callable returned handler override remains eligible', () => {
+  const text = returnedHandlerSource('{ hidden: 0, hidden(state, value) {} }');
+  assert.equal(matchesWithCandidateBaseline(text), true);
 });
 
 test('arbitrary call refused', () => {

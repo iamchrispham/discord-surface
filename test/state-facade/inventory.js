@@ -161,7 +161,8 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
       if (ts.isMethodDeclaration(property)) descriptor = callableDescriptor(property);
       else if (ts.isShorthandPropertyAssignment(property)) descriptor = resolveValue(property.name);
       else if (ts.isPropertyAssignment(property)) descriptor = resolveValue(property.initializer);
-      if (descriptor) methods.set(name, descriptor);
+      // Keep noncallable values so later properties shadow earlier handlers.
+      methods.set(name, descriptor);
     }
     return methods;
   };
@@ -423,11 +424,13 @@ function inventory(text) {
     }
   }
   const handlerMethodDescriptors = Object.fromEntries([...handlerFactories].map(([name, factory]) => [name, importedFactoryMethods(source, factory)]));
-  const handlerMethods = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name, [...methods.keys()].sort()]));
+  const callableMethods = methods => [...methods].filter(([, descriptor]) => descriptor);
+  const handlerMethods = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
+    callableMethods(methods).map(([method]) => method).sort()]));
   const handlerContracts = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
-    Object.fromEntries([...methods].map(([method, descriptor]) => [method, descriptor.style]))]));
+    Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.style]))]));
   const handlerRequiredArguments = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
-    Object.fromEntries([...methods].map(([method, descriptor]) => [method, descriptor.requiredArguments]))]));
+    Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.requiredArguments]))]));
   const classHeader = tokens(text.slice(owner.getStart(source), owner.members.pos));
   const topLevel = source.statements.filter(node => node !== owner).map(node => tokens(node.getText(source)));
   const bodies = Object.create(null);
@@ -538,10 +541,69 @@ const PRIOR_UNSUPPORTED_FORWARDING_SHAPES = new Map([
 
 const PRIOR_UNSUPPORTED_FORWARDING_NAMES = new Set(PRIOR_UNSUPPORTED_FORWARDING_SHAPES.keys());
 
+const PRIOR_SURFACE_METHOD_NAMES = new Set([
+  'constructor',
+  'bindOrdinary',
+  'bindOrdinaryClaude',
+  'rebindOrdinary',
+  'rebindOrdinaryClaude',
+  'isOrdinaryBindingRecord',
+  'isOrdinaryBinding',
+  'hasOrdinaryPreflight',
+  'recordOrdinaryPreflight',
+  'findOrdinaryHandoff',
+  'handoffOrdinary',
+  'transaction',
+  '_bindOrdinaryClaude',
+  '_rebindOrdinaryClaude',
+  '_isOrdinaryBindingRecord',
+  '_isOrdinaryBinding',
+  '_hasOrdinaryPreflight',
+  '_recordOrdinaryPreflight',
+  'setThreadBoundaryObserver',
+  '_notifyThreadBoundaryTransition',
+  '_hasActiveThreadEnrollments',
+  'markThreadBoundary',
+  'noteThreadMessage',
+  '_findOrdinaryHandoff',
+  'hasUnresolved',
+  'hasDispatching',
+  'hasSubmitted',
+  'hasUncertain',
+  'hasUnresolvedBindingPost',
+  'hasUnresolvedOrdinaryPost',
+  'reject',
+  'listIntakeWatermarks',
+  'pauseOrdinaryHandoffIntake',
+  'restoreOrdinaryHandoffIntake',
+  'recoverInterruptedOrdinaryHandoffIntake',
+  'reconcileIntake',
+  'acceptDiscordMessage',
+  'acceptDecisionInteraction',
+  'isInteractionMessage',
+  'recoverInteractionCallbacksInTransaction',
+  'directPostRows',
+  'getBindingReadinessReceipt',
+  'listAgentCompletionReceipts',
+  'listAgentMessageReceiptIds',
+  'releaseDirectPostFilePreparation',
+  'directPostOwnerIdentity',
+  'directPostOwnerEvidence',
+  'directPostOwnerAlive',
+  'directPostBindingCurrent',
+  'listReceipts',
+  'receipt',
+  'auditReceipt',
+  'failNextIntake',
+  'close'
+]);
+
 function matches(text, baseline) {
   try {
     const raw = inventory(text);
     const candidate = compact(raw);
+    if (Object.keys(candidate.bodies).some(name =>
+      !PRIOR_SURFACE_METHOD_NAMES.has(name) && !baseline.forwarding.includes(name))) return false;
     if (JSON.stringify(candidate.handlers) !== JSON.stringify(baseline.handlers) ||
         JSON.stringify(candidate.forwarding) !== JSON.stringify(baseline.forwarding) ||
         JSON.stringify(candidate.topLevel) !== JSON.stringify(baseline.topLevel) ||
