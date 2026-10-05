@@ -226,6 +226,49 @@ test('inline factory cannot approve callable returned handler override', () => {
   assert.equal(matchesWithCandidateBaseline(text), false);
 });
 
+test('conditional factory branches must all resolve to a companion', () => {
+  const text = source.replace(
+    'class SurfaceState {',
+    `function createFakeHandlers() {
+  if (process.env.FAKE_HANDLER) return { hidden() {} };
+  return createConfigurationHandlers({});
+}
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {
+newForward(...args) { return fakeHandlers.getConfig.apply(this, args); }
+`
+  );
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('nested companion factories are resolved per return branch', () => {
+  const text = source.replace(
+    'class SurfaceState {',
+    `function createNestedHandlers() { return createConfigurationHandlers({}); }
+function createFakeHandlers() {
+  if (process.env.FAKE_HANDLER) return createNestedHandlers();
+  return createNestedHandlers();
+}
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {
+newForward(...args) { return fakeHandlers.getConfig.apply(this, args); }
+`
+  );
+  assert.equal(matchesWithCandidateBaseline(text), true);
+});
+
+test('returned bare factory function cannot approve a handler wrapper', () => {
+  const text = source.replace(
+    'class SurfaceState {',
+    `function createFakeHandlers() { return createConfigurationHandlers; }
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {
+newForward(...args) { return fakeHandlers.getConfig.apply(this, args); }
+`
+  );
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
 test('arbitrary call refused', () => {
   assert.equal(!matches(insert('newInline() { return arbitrary(this); }')), true);
 });
@@ -274,6 +317,16 @@ test('lazy factory delegation accepted when recorded in baseline', () => {
 
 test('composed factory delegation accepted when recorded in baseline', () => {
   const text = insert('newForward(...args) { return courierRouteHandlers.claimCourierForward(this, ...args); }');
+  assert.equal(matchesWithAddedBaseline(text), true);
+});
+
+test('fixed delegation preserves optional handler parameters', () => {
+  const text = insert('newForward() { return topicPublicationHandlers.listTopicPublications.call(this); }');
+  assert.equal(matchesWithAddedBaseline(text), false);
+});
+
+test('fixed delegation accepts the full optional handler surface', () => {
+  const text = insert('newForward(channelId) { return topicPublicationHandlers.listTopicPublications.call(this, channelId); }');
   assert.equal(matchesWithAddedBaseline(text), true);
 });
 

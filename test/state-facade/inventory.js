@@ -42,6 +42,8 @@ function inventory(text) {
     Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.style]))]));
   const handlerRequiredArguments = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
     Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.requiredArguments]))]));
+  const handlerParameterCounts = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
+    Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.parameterCount]))]));
   const classHeader = tokens(text.slice(owner.getStart(source), owner.members.pos));
   const topLevel = source.statements.filter(node => node !== owner).map(node => tokens(node.getText(source)));
   const bodies = Object.create(null);
@@ -84,6 +86,7 @@ function inventory(text) {
     else bodies[name] = crypto.createHash('sha256').update(JSON.stringify(tokens(method.getText(source)))).digest('hex');
   }
   return { handlers: [...handlers].sort(), unapprovedHandlers, handlerMethods, handlerContracts, handlerRequiredArguments,
+    handlerParameterCounts,
     forwarding: forwarding.sort(), delegationBodies, topLevel, classHeader, bodies };
 }
 
@@ -248,7 +251,7 @@ function matches(text, baseline) {
       if (!ts.isPropertyAccessExpression(target) || !ts.isIdentifier(target.expression) ||
           !raw.handlerMethods[target.expression.text]?.includes(target.name.text)) return false;
       const style = raw.handlerContracts[target.expression.text]?.[target.name.text];
-      const requiredArguments = raw.handlerRequiredArguments[target.expression.text]?.[target.name.text] || 0;
+      const parameterCount = raw.handlerParameterCounts[target.expression.text]?.[target.name.text] || 0;
       const parameterNames = method.parameters.map(parameter => parameter.name.text);
       const argumentTexts = call.arguments.slice(1).map(argument => argument.getText(parsed));
       const restApply = dispatch.name.text === 'apply' && method.parameters.length === 1 &&
@@ -271,15 +274,15 @@ function matches(text, baseline) {
       const argumentsSpread = dispatch.name.text !== 'call' && dispatch.name.text !== 'apply' &&
         call.arguments[0]?.kind === ts.SyntaxKind.ThisKeyword &&
         argumentTexts.length === 1 && argumentTexts[0] === '...arguments';
+      const parameterSurfaceCovered = grandfatheredParameterShape || method.parameters.length >= parameterCount;
       let matchesStyle = false;
       if (style === INVOCATION_STYLES.THIS) {
         matchesStyle = (restApply || restCall || orderedCall || argumentsApply) &&
-          (restApply || restCall || argumentsApply || method.parameters.length >= requiredArguments);
+          (restApply || restCall || argumentsApply || parameterSurfaceCovered);
       }
       else if (style === INVOCATION_STYLES.STATE) {
         matchesStyle = (directCall || argumentsSpread) &&
-          (argumentsSpread || method.parameters.some(parameter => parameter.dotDotDotToken) ||
-            method.parameters.length >= requiredArguments);
+          (argumentsSpread || method.parameters.some(parameter => parameter.dotDotDotToken) || parameterSurfaceCovered);
       }
       if (!matchesStyle) return false;
     }

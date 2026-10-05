@@ -91,7 +91,7 @@ function callableDescriptor(node) {
   const postStateParameters = style === INVOCATION_STYLES.STATE ? parameters.slice(1) : parameters;
   const requiredArguments = postStateParameters.filter(parameter =>
     !parameter.initializer && !parameter.dotDotDotToken).length;
-  return { style, requiredArguments };
+  return { style, requiredArguments, parameterCount: postStateParameters.length };
 }
 
 function collectFactoryMethods(factory, source, resolveExpression = () => new Map(), resolveImportedValue = () => null) {
@@ -118,7 +118,11 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
       const descriptor = resolveValue(expression.expression.expression);
       if (!descriptor) return null;
       const boundArguments = Math.max(0, expression.arguments.length - 1);
-      return { ...descriptor, requiredArguments: Math.max(0, descriptor.requiredArguments - boundArguments) };
+      return {
+        ...descriptor,
+        requiredArguments: Math.max(0, descriptor.requiredArguments - boundArguments),
+        parameterCount: Math.max(0, descriptor.parameterCount - boundArguments)
+      };
     }
     if (!ts.isPropertyAccessExpression(expression)) return null;
     const receiver = expression.expression;
@@ -251,10 +255,15 @@ function resolveModulePath(modulePath, sourcePath) {
   }
 }
 
-function calledFactory(expression) {
-  let target = ts.isCallExpression(expression) ? expression.expression : expression;
+function calledFactory(expression, requireCall = false) {
+  let candidate = expression;
+  while (ts.isParenthesizedExpression(candidate)) candidate = candidate.expression;
+  const actualCall = ts.isCallExpression(candidate);
+  if (requireCall && !actualCall) return null;
+  let target = actualCall ? candidate.expression : candidate;
   while (ts.isParenthesizedExpression(target)) target = target.expression;
   if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.CommaToken) target = target.right;
+  while (ts.isParenthesizedExpression(target)) target = target.expression;
   if (ts.isIdentifier(target)) return { name: target.text, receiver: null };
   if (ts.isPropertyAccessExpression(target)) return { name: target.name.text, receiver: target.expression };
   return null;
@@ -386,9 +395,18 @@ function moduleFactoryMethods(filePath, factoryName, seen) {
 
 function returnedExpressions(factory) {
   const body = factory.body;
-  return body && ts.isBlock(body)
-    ? body.statements.filter(statement => ts.isReturnStatement(statement)).map(statement => statement.expression).filter(Boolean)
-    : [body];
+  if (!body || !ts.isBlock(body)) return body ? [body] : [];
+  const expressions = [];
+  const visit = node => {
+    if (node !== body && ts.isFunctionLike(node)) return;
+    if (ts.isReturnStatement(node)) {
+      if (node.expression) expressions.push(node.expression);
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(body);
+  return expressions;
 }
 
 function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new Set()) {
@@ -405,18 +423,19 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
     const modulePath = directRequire(exportedReceiver) || directRequire(exported) || reexportedModulePath(source);
     return !!(modulePath && resolveModulePath(modulePath, sourcePath));
   }
-  for (const expression of returnedExpressions(factory)) {
-    const called = calledFactory(expression);
-    if (!called) continue;
+  const expressions = returnedExpressions(factory);
+  if (!expressions.length) return false;
+  return expressions.every(expression => {
+    const called = calledFactory(expression, true);
+    if (!called) return false;
     const binding = called.receiver && ts.isIdentifier(called.receiver)
       ? bindings.get(called.receiver.text)
       : bindings.get(called.name);
     const modulePath = directRequire(called.receiver) || binding?.modulePath;
     if (modulePath && resolveModulePath(modulePath, sourcePath)) return true;
-    if (factoryDeclaration(source, called.name) &&
-        factoryResolvesToCompanion(source, sourcePath, called.name, seen)) return true;
-  }
-  return false;
+    return factoryDeclaration(source, called.name) &&
+      factoryResolvesToCompanion(source, sourcePath, called.name, new Set(seen));
+  });
 }
 
 function factoryMethods(source, factoryName) {
