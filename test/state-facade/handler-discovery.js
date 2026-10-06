@@ -28,6 +28,10 @@ function factoryDeclaration(source, factoryName) {
   return null;
 }
 
+function isAsyncFactory(node) {
+  return !!node?.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword);
+}
+
 function usesThisExpression(node) {
   let usesThis = false;
   const visit = current => {
@@ -525,13 +529,54 @@ function returnedExpressions(factory) {
   const visit = node => {
     if (node !== body && ts.isFunctionLike(node)) return;
     if (ts.isReturnStatement(node)) {
-      if (node.expression) expressions.push(node.expression);
+      expressions.push(node.expression || null);
       return;
     }
     ts.forEachChild(node, visit);
   };
   visit(body);
   return expressions;
+}
+
+function statementsCanFallThrough(statements) {
+  let canFallThrough = true;
+  for (const statement of statements) {
+    if (!canFallThrough) return false;
+    canFallThrough = statementCanFallThrough(statement);
+  }
+  return canFallThrough;
+}
+
+function switchCanFallThrough(statement) {
+  const clauses = statement.caseBlock.clauses;
+  if (!clauses.some(clause => ts.isDefaultClause(clause))) return true;
+  const clauseCanFallThrough = index => {
+    if (index >= clauses.length) return true;
+    if (!statementsCanFallThrough(clauses[index].statements)) return false;
+    return clauseCanFallThrough(index + 1);
+  };
+  return clauses.some((_, index) => clauseCanFallThrough(index));
+}
+
+function statementCanFallThrough(statement) {
+  if (ts.isBlock(statement)) return statementsCanFallThrough(statement.statements);
+  if (ts.isReturnStatement(statement) || ts.isThrowStatement(statement) ||
+      ts.isBreakStatement(statement) || ts.isContinueStatement(statement)) return false;
+  if (ts.isIfStatement(statement)) {
+    return statementCanFallThrough(statement.thenStatement) ||
+      (statement.elseStatement ? statementCanFallThrough(statement.elseStatement) : true);
+  }
+  if (ts.isSwitchStatement(statement)) return switchCanFallThrough(statement);
+  if (ts.isTryStatement(statement)) {
+    const tryCanFallThrough = statementCanFallThrough(statement.tryBlock);
+    const catchCanFallThrough = statement.catchClause
+      ? statementCanFallThrough(statement.catchClause.block)
+      : false;
+    if (statement.finallyBlock && !statementCanFallThrough(statement.finallyBlock)) return false;
+    return tryCanFallThrough || catchCanFallThrough;
+  }
+  if (ts.isLabeledStatement(statement)) return statementCanFallThrough(statement.statement);
+  return true;
 }
 
 function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new Set()) {
@@ -548,8 +593,10 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
     const modulePath = directRequire(exportedReceiver) || directRequire(exported) || reexportedModulePath(source);
     return !!(modulePath && resolveModulePath(modulePath, sourcePath));
   }
+  if (isAsyncFactory(factory)) return false;
+  if (factory.body && ts.isBlock(factory.body) && statementCanFallThrough(factory.body)) return false;
   const expressions = returnedExpressions(factory);
-  if (!expressions.length) return false;
+  if (!expressions.length || expressions.some(expression => !expression)) return false;
   return expressions.every(expression => {
     const called = calledFactory(expression, true);
     if (!called) return false;

@@ -263,6 +263,8 @@ function matches(text, baseline) {
         JSON.stringify(argumentTexts) === JSON.stringify(parameterNames);
       const argumentsApply = dispatch.name.text === 'apply' && method.parameters.every(parameter => !parameter.dotDotDotToken) &&
         argumentTexts.length === 1 && argumentTexts[0] === 'arguments';
+      const argumentsCall = dispatch.name.text === 'call' &&
+        argumentTexts.length === 1 && argumentTexts[0] === '...arguments';
       const directCall = dispatch.name.text !== 'call' && dispatch.name.text !== 'apply' &&
         call.arguments[0]?.kind === ts.SyntaxKind.ThisKeyword &&
         argumentTexts.length === parameterNames.length &&
@@ -277,8 +279,8 @@ function matches(text, baseline) {
       const parameterSurfaceCovered = grandfatheredParameterShape || method.parameters.length >= parameterCount;
       let matchesStyle = false;
       if (style === INVOCATION_STYLES.THIS) {
-        matchesStyle = (restApply || restCall || orderedCall || argumentsApply) &&
-          (restApply || restCall || argumentsApply || parameterSurfaceCovered);
+        matchesStyle = (restApply || restCall || orderedCall || argumentsApply || argumentsCall) &&
+          (restApply || restCall || argumentsApply || argumentsCall || parameterSurfaceCovered);
       }
       else if (style === INVOCATION_STYLES.STATE) {
         matchesStyle = (directCall || argumentsSpread) &&

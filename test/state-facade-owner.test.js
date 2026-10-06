@@ -10,6 +10,8 @@ const ts = require('typescript');
 
 const { compact, inventory, matches: matchesInventory } = require('./state-facade/inventory');
 
+const { discoverFactory } = require('./state-facade/handler-discovery');
+
 const baseline = require('./state-facade/baseline.json');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/state.js'), 'utf8');
@@ -55,6 +57,34 @@ newForward(value) { return fakeHandlers.hidden(this, value); }
 `
   );
 }
+
+test('rejects asynchronous companion factories', () => {
+  const asyncFactory = returnedHandlerSource('createConfigurationHandlers({})')
+    .replace('function createFakeHandlers()', 'async function createFakeHandlers()');
+  const asyncExpression = source.replace(
+    'class SurfaceState {',
+    `const createFakeHandlers = async () => createConfigurationHandlers({});
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`
+  );
+  assert.equal(discoverFactory(ts.createSourceFile('async-factory.js', asyncFactory, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS), 'createFakeHandlers').approved, false);
+  assert.equal(discoverFactory(ts.createSourceFile('async-expression.js', asyncExpression, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS), 'createFakeHandlers').approved, false);
+});
+
+test('rejects companion factories with an implicit fallthrough', () => {
+  const fallthroughFactory = source.replace(
+    'class SurfaceState {',
+    `function createFakeHandlers() { if (enabled) return createConfigurationHandlers({}); }
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`
+  );
+  assert.equal(discoverFactory(ts.createSourceFile('fallthrough-factory.js', fallthroughFactory, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS), 'createFakeHandlers').approved, false);
+});
+
+test('accepts arguments-object call forwarding for this-bound handlers', () => {
+  const candidate = insert('newForward(value) { return configurationHandlers.setConfig.call(this, ...arguments); }');
+  assert.equal(matchesWithAddedBaseline(candidate), true);
+});
 
 const insert = body => source.replace('class SurfaceState {', `class SurfaceState {\n${body}\n`);
 
