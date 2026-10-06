@@ -28,7 +28,7 @@ function factoryDeclaration(source, factoryName) {
   return null;
 }
 
-function invocationStyle(node) {
+function usesThisExpression(node) {
   let usesThis = false;
   const visit = current => {
     if (current !== node && ts.isFunctionLike(current) && !ts.isArrowFunction(current)) return;
@@ -36,6 +36,11 @@ function invocationStyle(node) {
     ts.forEachChild(current, visit);
   };
   visit(node);
+  return usesThis;
+}
+
+function invocationStyle(node) {
+  const usesThis = usesThisExpression(node);
   const parameters = (node.parameters || []).filter(parameter =>
     !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'));
   const first = parameters[0];
@@ -51,10 +56,22 @@ function invocationStyle(node) {
   return INVOCATION_STYLES.PURE;
 }
 
+function isScopeNode(node) {
+  return ts.isSourceFile(node) || ts.isBlock(node) || ts.isFunctionLike(node) ||
+    ts.isModuleBlock(node) || ts.isCaseBlock(node) || ts.isCatchClause(node) ||
+    ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node);
+}
+
+function scopeNode(node) {
+  let current = node;
+  while (current && !isScopeNode(current)) current = current.parent;
+  return current;
+}
+
 function callableDeclarations(source, factory) {
-  const declarations = new Map();
+  const declarations = [];
   const add = (name, declaration) => {
-    if (name) declarations.set(name, declaration);
+    if (name) declarations.push({ name, declaration, scope: scopeNode(declaration.parent) });
   };
   const visitSource = node => {
     if (ts.isFunctionDeclaration(node)) {
@@ -83,57 +100,144 @@ function callableDeclarations(source, factory) {
   return declarations;
 }
 
+function declarationForIdentifier(declarations, identifier, source) {
+  if (!identifier || !ts.isIdentifier(identifier)) return null;
+  const scopes = [];
+  let current = scopeNode(identifier);
+  while (current) {
+    scopes.push(current);
+    current = current.parent;
+    while (current && !isScopeNode(current)) current = current.parent;
+  }
+  const useStart = identifier.getStart(source);
+  for (const scope of scopes) {
+    const candidates = declarations.filter(item => item.scope === scope && item.name === identifier.text &&
+      (ts.isFunctionDeclaration(item.declaration) || item.declaration.getStart(source) <= useStart));
+    if (candidates.length) return candidates[candidates.length - 1].declaration;
+  }
+  return null;
+}
+
+function rootIdentifier(expression) {
+  let current = expression;
+  while (current && ts.isParenthesizedExpression(current)) current = current.expression;
+  if (current && ts.isIdentifier(current)) return current;
+  if (current && (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current))) {
+    return rootIdentifier(current.expression);
+  }
+  return null;
+}
+
+function mutatedDeclarations(factory, declarations, source) {
+  const mutated = new Set();
+  const assignmentOperators = new Set([
+    ts.SyntaxKind.EqualsToken,
+    ts.SyntaxKind.PlusEqualsToken,
+    ts.SyntaxKind.MinusEqualsToken,
+    ts.SyntaxKind.AsteriskEqualsToken,
+    ts.SyntaxKind.AsteriskAsteriskEqualsToken,
+    ts.SyntaxKind.SlashEqualsToken,
+    ts.SyntaxKind.PercentEqualsToken,
+    ts.SyntaxKind.LessThanLessThanEqualsToken,
+    ts.SyntaxKind.GreaterThanGreaterThanEqualsToken,
+    ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken,
+    ts.SyntaxKind.AmpersandEqualsToken,
+    ts.SyntaxKind.BarEqualsToken,
+    ts.SyntaxKind.CaretEqualsToken,
+    ts.SyntaxKind.BarBarEqualsToken,
+    ts.SyntaxKind.AmpersandAmpersandEqualsToken,
+    ts.SyntaxKind.QuestionQuestionEqualsToken
+  ]);
+  const mark = expression => {
+    const identifier = rootIdentifier(expression);
+    const declaration = declarationForIdentifier(declarations, identifier, source);
+    if (declaration) mutated.add(declaration);
+  };
+  const visit = node => {
+    if (node !== factory && ts.isFunctionLike(node)) return;
+    if (ts.isBinaryExpression(node) && assignmentOperators.has(node.operatorToken.kind)) mark(node.left);
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+        [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator)) {
+      mark(node.operand);
+    }
+    if (ts.isDeleteExpression(node)) mark(node.expression);
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.name.text === 'assign' && node.arguments.length) {
+      mark(node.arguments[0]);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(factory);
+  return mutated;
+}
+
 function callableDescriptor(node) {
   if (!node || !ts.isFunctionLike(node)) return null;
   const parameters = (node.parameters || []).filter(parameter =>
     !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'));
   const style = invocationStyle(node);
-  const postStateParameters = style === INVOCATION_STYLES.STATE ? parameters.slice(1) : parameters;
+  const stateParameterIndex = style === INVOCATION_STYLES.STATE
+    ? parameters.findIndex(parameter => ts.isIdentifier(parameter.name) && ['state', 'surface'].includes(parameter.name.text))
+    : -1;
+  const postStateParameters = style === INVOCATION_STYLES.STATE
+    ? parameters.slice(stateParameterIndex + 1)
+    : parameters;
   const requiredArguments = postStateParameters.filter(parameter =>
     !parameter.initializer && !parameter.dotDotDotToken).length;
-  return { style, requiredArguments, parameterCount: postStateParameters.length };
+  return {
+    style,
+    requiredArguments,
+    parameterCount: postStateParameters.length,
+    stateParameterIndex,
+    usesThis: usesThisExpression(node)
+  };
 }
 
 function collectFactoryMethods(factory, source, resolveExpression = () => new Map(), resolveImportedValue = () => null) {
   const methods = new Map();
   const declarations = callableDeclarations(source, factory);
+  const mutated = mutatedDeclarations(factory, declarations, source);
   const resolving = new Set();
+  const resolveBinding = identifier => declarationForIdentifier(declarations, identifier, source);
   const resolveValue = expression => {
     if (!expression) return null;
     const direct = callableDescriptor(expression);
     if (direct) return direct;
     if (ts.isIdentifier(expression)) {
-      if (resolving.has(expression.text)) return null;
-      const declaration = declarations.get(expression.text);
+      const declaration = resolveBinding(expression);
       if (!declaration) return null;
-      resolving.add(expression.text);
+      if (resolving.has(declaration)) return null;
+      resolving.add(declaration);
       const resolved = ts.isVariableDeclaration(declaration)
         ? resolveValue(declaration.initializer)
         : callableDescriptor(declaration);
-      resolving.delete(expression.text);
+      resolving.delete(declaration);
       return resolved;
     }
     if (ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression) &&
         expression.expression.name.text === 'bind') {
       const descriptor = resolveValue(expression.expression.expression);
-      if (!descriptor) return null;
+      if (!descriptor || descriptor.style !== INVOCATION_STYLES.STATE || descriptor.usesThis) return null;
       const boundArguments = Math.max(0, expression.arguments.length - 1);
-      return {
-        ...descriptor,
-        requiredArguments: Math.max(0, descriptor.requiredArguments - boundArguments),
-        parameterCount: Math.max(0, descriptor.parameterCount - boundArguments)
-      };
+      if (expression.arguments.slice(1).some(argument => ts.isSpreadElement(argument)) ||
+          boundArguments !== descriptor.stateParameterIndex) return null;
+      return { ...descriptor, stateParameterIndex: 0 };
     }
     if (!ts.isPropertyAccessExpression(expression)) return null;
     const receiver = expression.expression;
     if (ts.isIdentifier(receiver)) {
-      const imported = resolveImportedValue(receiver.text, expression.name.text);
-      if (imported) return imported;
-      const declaration = declarations.get(receiver.text);
+      const declaration = resolveBinding(receiver);
       if (declaration && ts.isVariableDeclaration(declaration)) {
         const resolved = resolveExpression(declaration.initializer);
-        return resolved.get(expression.name.text) || null;
+        const local = resolved.get(expression.name.text);
+        if (local) return local;
+        const initializer = declaration.initializer;
+        const isRequire = initializer && ts.isCallExpression(initializer) &&
+          ts.isIdentifier(initializer.expression) && initializer.expression.text === 'require';
+        if (!isRequire) return null;
       }
+      const imported = resolveImportedValue(receiver.text, expression.name.text);
+      if (imported) return imported;
     }
     if (ts.isCallExpression(receiver)) {
       const resolved = resolveExpression(receiver);
@@ -164,8 +268,9 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
     while (ts.isParenthesizedExpression(current)) current = current.expression;
     if (ts.isObjectLiteralExpression(current)) return collectObject(current);
     if (ts.isIdentifier(current)) {
-      const declaration = declarations.get(current.text);
+      const declaration = resolveBinding(current);
       if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        if (mutated.has(declaration)) return new Map();
         const key = declaration.getStart(source);
         if (seen.has(key)) return new Map();
         const next = new Set(seen);
@@ -176,11 +281,31 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
     return resolveExpression(current);
   };
   const body = factory.body;
-  const returns = body && ts.isBlock(body)
-    ? body.statements.filter(statement => ts.isReturnStatement(statement)).map(statement => statement.expression).filter(Boolean)
-    : [body];
-  for (const expression of returns) {
-    for (const [method, descriptor] of resolveReturnedExpression(expression)) methods.set(method, descriptor);
+  const returns = [];
+  const collectReturns = node => {
+    if (!node) return;
+    if (node !== factory && ts.isFunctionLike(node)) return;
+    if (ts.isReturnStatement(node)) {
+      returns.push(node.expression || null);
+      return;
+    }
+    ts.forEachChild(node, collectReturns);
+  };
+  if (body && ts.isBlock(body)) collectReturns(body);
+  else if (body) returns.push(body);
+  const branchMethods = returns.map(expression => resolveReturnedExpression(expression));
+  if (!branchMethods.length) return methods;
+  const [first, ...rest] = branchMethods;
+  for (const [method, descriptor] of first) {
+    if (!descriptor) continue;
+    if (rest.every(branch => {
+      const candidate = branch.get(method);
+      return candidate && candidate.style === descriptor.style &&
+        candidate.requiredArguments === descriptor.requiredArguments &&
+        candidate.parameterCount === descriptor.parameterCount;
+    })) {
+      methods.set(method, descriptor);
+    }
   }
   return methods;
 }
