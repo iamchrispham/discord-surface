@@ -53,9 +53,7 @@ function invocationStyle(node) {
   if (first && ts.isIdentifier(first.name) && ['state', 'surface'].includes(first.name.text)) {
     return INVOCATION_STYLES.STATE;
   }
-  if (hasStateParameter && !usesThis) {
-    return INVOCATION_STYLES.STATE;
-  }
+  if (hasStateParameter && !usesThis) return INVOCATION_STYLES.STATE;
   if (usesThis) return INVOCATION_STYLES.THIS;
   return INVOCATION_STYLES.PURE;
 }
@@ -72,10 +70,23 @@ function scopeNode(node) {
   return current;
 }
 
+function isVarDeclaration(declaration) {
+  const list = declaration?.parent;
+  if (!list || !ts.isVariableDeclarationList(list)) return false;
+  return (list.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) === 0;
+}
+
+function declarationScope(declaration) {
+  if (!isVarDeclaration(declaration)) return scopeNode(declaration.parent);
+  let current = declaration.parent;
+  while (current && !ts.isSourceFile(current) && !ts.isFunctionLike(current)) current = current.parent;
+  return current;
+}
+
 function callableDeclarations(source, factory) {
   const declarations = [];
   const add = (name, declaration) => {
-    if (name) declarations.push({ name, declaration, scope: scopeNode(declaration.parent) });
+    if (name) declarations.push({ name, declaration, scope: declarationScope(declaration) });
   };
   const visitSource = node => {
     if (ts.isFunctionDeclaration(node)) {
@@ -90,6 +101,7 @@ function callableDeclarations(source, factory) {
   };
   visitSource(source);
   const visitFactory = node => {
+    if (!node) return;
     if (node !== factory && ts.isFunctionLike(node)) {
       if (ts.isFunctionDeclaration(node)) add(node.name?.text, node);
       return;
@@ -134,6 +146,7 @@ function rootIdentifier(expression) {
 
 function mutatedDeclarations(factory, declarations, source) {
   const mutated = new Set();
+  const aliases = new Map();
   const assignmentOperators = new Set([
     ts.SyntaxKind.EqualsToken,
     ts.SyntaxKind.PlusEqualsToken,
@@ -157,9 +170,34 @@ function mutatedDeclarations(factory, declarations, source) {
     const declaration = declarationForIdentifier(declarations, identifier, source);
     if (declaration) mutated.add(declaration);
   };
+  const link = (left, right) => {
+    const leftDeclaration = declarationForIdentifier(declarations, rootIdentifier(left), source);
+    const rightDeclaration = declarationForIdentifier(declarations, rootIdentifier(right), source);
+    if (!leftDeclaration || !rightDeclaration || leftDeclaration === rightDeclaration) return;
+    if (!aliases.has(leftDeclaration)) aliases.set(leftDeclaration, new Set());
+    if (!aliases.has(rightDeclaration)) aliases.set(rightDeclaration, new Set());
+    aliases.get(leftDeclaration).add(rightDeclaration);
+    aliases.get(rightDeclaration).add(leftDeclaration);
+  };
+  const varDeclarations = new Map();
+  for (const item of declarations) {
+    if (!isVarDeclaration(item.declaration)) continue;
+    const key = `${item.scope?.pos}:${item.name}`;
+    if (!varDeclarations.has(key)) varDeclarations.set(key, []);
+    varDeclarations.get(key).push(item.declaration);
+  }
+  for (const items of varDeclarations.values()) {
+    for (const declaration of items.slice(1)) mutated.add(declaration);
+  }
   const visit = node => {
     if (node !== factory && ts.isFunctionLike(node)) return;
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      link(node.name, node.initializer);
+    }
     if (ts.isBinaryExpression(node) && assignmentOperators.has(node.operatorToken.kind)) mark(node.left);
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      link(node.left, node.right);
+    }
     if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
         [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator)) {
       mark(node.operand);
@@ -172,7 +210,24 @@ function mutatedDeclarations(factory, declarations, source) {
     ts.forEachChild(node, visit);
   };
   visit(factory);
+  const pending = [...mutated];
+  while (pending.length) {
+    const declaration = pending.pop();
+    for (const alias of aliases.get(declaration) || []) {
+      if (mutated.has(alias)) continue;
+      mutated.add(alias);
+      pending.push(alias);
+    }
+  }
   return mutated;
+}
+
+function mutatedBindingNames(source, names) {
+  const declarations = callableDeclarations(source, null);
+  const mutated = mutatedDeclarations(source, declarations, source);
+  return new Set(declarations
+    .filter(item => names.has(item.name) && mutated.has(item.declaration))
+    .map(item => item.name));
 }
 
 function callableDescriptor(node) {
@@ -210,6 +265,7 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
     if (ts.isIdentifier(expression)) {
       const declaration = resolveBinding(expression);
       if (!declaration) return null;
+      if (mutated.has(declaration)) return null;
       if (resolving.has(declaration)) return null;
       resolving.add(declaration);
       const resolved = ts.isVariableDeclaration(declaration)
@@ -232,6 +288,7 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
     if (ts.isIdentifier(receiver)) {
       const declaration = resolveBinding(receiver);
       if (declaration && ts.isVariableDeclaration(declaration)) {
+        if (mutated.has(declaration)) return null;
         const resolved = resolveExpression(declaration.initializer);
         const local = resolved.get(expression.name.text);
         if (local) return local;
@@ -461,12 +518,53 @@ function reexportedModulePath(source) {
   return result;
 }
 
+function moduleFactoryAllowed(filePath, factoryName, seen = new Set()) {
+  const key = `${filePath}:${factoryName}`;
+  if (seen.has(key)) return false;
+  seen.add(key);
+  try {
+    const text = fs.readFileSync(filePath, 'utf8');
+    const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const exported = exportedFactoryExpression(source, factoryName);
+    const bindings = requireBindings(source);
+    if (!exported) {
+      const modulePath = reexportedModulePath(source);
+      const importedPath = modulePath && resolveModulePath(modulePath, filePath);
+      return !!(importedPath && moduleFactoryAllowed(importedPath, factoryName, seen));
+    }
+    let candidate = exported;
+    while (ts.isParenthesizedExpression(candidate)) candidate = candidate.expression;
+    const exportedName = ts.isIdentifier(candidate) ? candidate.text : factoryName;
+    const local = factoryDeclaration(source, exportedName);
+    const factory = local || (ts.isFunctionLike(candidate) ? candidate : null);
+    if (factory) {
+      return !isAsyncFactory(factory) &&
+        (!factory.body || !ts.isBlock(factory.body) || !statementCanFallThrough(factory.body));
+    }
+    const receiver = ts.isPropertyAccessExpression(candidate) ? candidate.expression : null;
+    let binding = null;
+    if (ts.isIdentifier(candidate)) binding = bindings.get(candidate.text);
+    else if (receiver && ts.isIdentifier(receiver)) binding = bindings.get(receiver.text);
+    const modulePath = binding?.modulePath || directRequire(receiver) || directRequire(candidate);
+    const importedPath = modulePath && resolveModulePath(modulePath, filePath);
+    if (!importedPath) return false;
+    const importedName = ts.isPropertyAccessExpression(candidate)
+      ? candidate.name.text
+      : binding?.exportName || factoryName;
+    return moduleFactoryAllowed(importedPath, importedName, seen);
+  }
+  catch {
+    return false;
+  }
+}
+
 function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
   const key = `${sourcePath}:${factoryName}`;
   if (seen.has(key)) return new Map();
   seen.add(key);
   const factory = factoryDeclaration(source, factoryName);
   if (!factory) return null;
+  if (isAsyncFactory(factory)) return null;
   const bindings = requireBindings(source);
   const resolveExpression = expression => {
     const called = calledFactory(expression);
@@ -496,6 +594,7 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
 
 function moduleFactoryMethods(filePath, factoryName, seen) {
   try {
+    if (filePath !== stateSourcePath && !moduleFactoryAllowed(filePath, factoryName)) return new Map();
     const importedText = fs.readFileSync(filePath, 'utf8');
     const importedSource = ts.createSourceFile(filePath, importedText, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const local = factoryMethodsFromSource(importedSource, filePath, factoryName, seen);
@@ -538,45 +637,63 @@ function returnedExpressions(factory) {
   return expressions;
 }
 
-function statementsCanFallThrough(statements) {
-  let canFallThrough = true;
-  for (const statement of statements) {
-    if (!canFallThrough) return false;
-    canFallThrough = statementCanFallThrough(statement);
-  }
-  return canFallThrough;
-}
-
 function switchCanFallThrough(statement) {
   const clauses = statement.caseBlock.clauses;
   if (!clauses.some(clause => ts.isDefaultClause(clause))) return true;
   const clauseCanFallThrough = index => {
     if (index >= clauses.length) return true;
-    if (!statementsCanFallThrough(clauses[index].statements)) return false;
-    return clauseCanFallThrough(index + 1);
+    const flow = statementFlow({ statements: clauses[index].statements });
+    if (flow.breaks) return true;
+    return flow.normal && clauseCanFallThrough(index + 1);
   };
   return clauses.some((_, index) => clauseCanFallThrough(index));
 }
 
-function statementCanFallThrough(statement) {
-  if (ts.isBlock(statement)) return statementsCanFallThrough(statement.statements);
-  if (ts.isReturnStatement(statement) || ts.isThrowStatement(statement) ||
-      ts.isBreakStatement(statement) || ts.isContinueStatement(statement)) return false;
+function statementFlow(statement) {
+  if (statement?.statements) {
+    let normal = true;
+    let breaks = false;
+    for (const child of statement.statements) {
+      if (!normal) break;
+      const flow = statementFlow(child);
+      breaks = breaks || flow.breaks;
+      normal = flow.normal;
+    }
+    return { normal, breaks };
+  }
+  if (ts.isBlock(statement)) return statementFlow({ statements: statement.statements });
+  if (ts.isReturnStatement(statement) || ts.isThrowStatement(statement) || ts.isContinueStatement(statement)) {
+    return { normal: false, breaks: false };
+  }
+  if (ts.isBreakStatement(statement)) return { normal: false, breaks: true };
   if (ts.isIfStatement(statement)) {
-    return statementCanFallThrough(statement.thenStatement) ||
-      (statement.elseStatement ? statementCanFallThrough(statement.elseStatement) : true);
+    const thenFlow = statementFlow(statement.thenStatement);
+    const elseFlow = statement.elseStatement ? statementFlow(statement.elseStatement) : { normal: true, breaks: false };
+    return {
+      normal: thenFlow.normal || elseFlow.normal,
+      breaks: thenFlow.breaks || elseFlow.breaks
+    };
   }
-  if (ts.isSwitchStatement(statement)) return switchCanFallThrough(statement);
+  if (ts.isSwitchStatement(statement)) return { normal: switchCanFallThrough(statement), breaks: false };
   if (ts.isTryStatement(statement)) {
-    const tryCanFallThrough = statementCanFallThrough(statement.tryBlock);
-    const catchCanFallThrough = statement.catchClause
-      ? statementCanFallThrough(statement.catchClause.block)
-      : false;
-    if (statement.finallyBlock && !statementCanFallThrough(statement.finallyBlock)) return false;
-    return tryCanFallThrough || catchCanFallThrough;
+    const tryFlow = statementFlow(statement.tryBlock);
+    const catchFlow = statement.catchClause
+      ? statementFlow(statement.catchClause.block)
+      : { normal: false, breaks: false };
+    const combined = {
+      normal: tryFlow.normal || catchFlow.normal,
+      breaks: tryFlow.breaks || catchFlow.breaks
+    };
+    if (!statement.finallyBlock) return combined;
+    const finallyFlow = statementFlow(statement.finallyBlock);
+    return finallyFlow.normal ? combined : finallyFlow;
   }
-  if (ts.isLabeledStatement(statement)) return statementCanFallThrough(statement.statement);
-  return true;
+  if (ts.isLabeledStatement(statement)) return statementFlow(statement.statement);
+  return { normal: true, breaks: false };
+}
+
+function statementCanFallThrough(statement) {
+  return statementFlow(statement).normal;
 }
 
 function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new Set()) {
@@ -587,11 +704,18 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
   const factory = factoryDeclaration(source, factoryName);
   if (!factory) {
     const binding = bindings.get(factoryName);
-    if (binding?.modulePath && resolveModulePath(binding.modulePath, sourcePath)) return true;
+    if (binding?.modulePath) {
+      const importedPath = resolveModulePath(binding.modulePath, sourcePath);
+      if (importedPath && moduleFactoryAllowed(importedPath, binding.exportName || factoryName)) return true;
+    }
     const exported = exportedFactoryExpression(source, factoryName);
     const exportedReceiver = exported && ts.isPropertyAccessExpression(exported) ? exported.expression : null;
     const modulePath = directRequire(exportedReceiver) || directRequire(exported) || reexportedModulePath(source);
-    return !!(modulePath && resolveModulePath(modulePath, sourcePath));
+    const importedPath = modulePath && resolveModulePath(modulePath, sourcePath);
+    const importedName = exported && ts.isPropertyAccessExpression(exported)
+      ? exported.name.text
+      : factoryName;
+    return !!(importedPath && moduleFactoryAllowed(importedPath, importedName));
   }
   if (isAsyncFactory(factory)) return false;
   if (factory.body && ts.isBlock(factory.body) && statementCanFallThrough(factory.body)) return false;
@@ -604,20 +728,31 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
       ? bindings.get(called.receiver.text)
       : bindings.get(called.name);
     const modulePath = directRequire(called.receiver) || binding?.modulePath;
-    if (modulePath && resolveModulePath(modulePath, sourcePath)) return true;
+    if (modulePath) {
+      const importedPath = resolveModulePath(modulePath, sourcePath);
+      const importedName = called.receiver && ts.isPropertyAccessExpression(called.receiver)
+        ? called.name
+        : binding?.exportName || called.name;
+      if (importedPath && moduleFactoryAllowed(importedPath, importedName)) return true;
+    }
     return factoryDeclaration(source, called.name) &&
       factoryResolvesToCompanion(source, sourcePath, called.name, new Set(seen));
   });
 }
 
 function factoryMethods(source, factoryName) {
-  const methods = factoryMethodsFromSource(source, stateSourcePath, factoryName, new Set());
+  const sourcePath = path.isAbsolute(source.fileName) ? source.fileName : stateSourcePath;
+  const methods = factoryMethodsFromSource(source, sourcePath, factoryName, new Set());
   return methods?.size ? methods : null;
 }
 
 function importedFactoryMethods(source, factoryName) {
-  if (!factoryResolvesToCompanion(source, stateSourcePath, factoryName)) return null;
-  return factoryMethods(source, factoryName) || moduleFactoryMethods(stateSourcePath, factoryName, new Set());
+  const sourcePath = path.isAbsolute(source.fileName) ? source.fileName : stateSourcePath;
+  if (!factoryResolvesToCompanion(source, sourcePath, factoryName)) return null;
+  const local = factoryMethods(source, factoryName);
+  if (local) return local;
+  const imported = moduleFactoryMethods(sourcePath, factoryName, new Set());
+  return imported.size ? imported : null;
 }
 
 function discoverFactory(source, factoryName) {
@@ -625,4 +760,4 @@ function discoverFactory(source, factoryName) {
   return { methods: methods || new Map(), approved: methods !== null };
 }
 
-module.exports = { INVOCATION_STYLES, discoverFactory };
+module.exports = { INVOCATION_STYLES, discoverFactory, mutatedBindingNames };

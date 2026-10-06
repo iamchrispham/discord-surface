@@ -4,6 +4,8 @@ const assert = require('node:assert/strict');
 
 const fs = require('node:fs');
 
+const os = require('node:os');
+
 const path = require('node:path');
 
 const ts = require('typescript');
@@ -58,6 +60,22 @@ newForward(value) { return fakeHandlers.hidden(this, value); }
   );
 }
 
+function discoverTempFactory(companionSource) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-discovery-'));
+  try {
+    fs.writeFileSync(path.join(root, 'companion.js'), companionSource);
+    const ownerPath = path.join(root, 'owner.js');
+    const ownerSource = ts.createSourceFile(ownerPath, `const { createFakeHandlers } = require('./companion');
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {`, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    return discoverFactory(ownerSource, 'createWrapper');
+  }
+  finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 test('rejects asynchronous companion factories', () => {
   const asyncFactory = returnedHandlerSource('createConfigurationHandlers({})')
     .replace('function createFakeHandlers()', 'async function createFakeHandlers()');
@@ -71,6 +89,83 @@ class SurfaceState {`
   assert.equal(discoverFactory(ts.createSourceFile('async-expression.js', asyncExpression, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS), 'createFakeHandlers').approved, false);
 });
 
+test('rejects asynchronous imported companion factories', () => {
+  const discovery = discoverTempFactory(`async function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects unexported imported companion factories', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = {};`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects imported companion factories with reassigned callable identifiers', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  let hidden = (state, value) => value;
+  hidden = 0;
+  return { hidden };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects imported companion factories with function-scoped var overwrites', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  var hidden = (state, value) => value;
+  { var hidden = 0; }
+  return { hidden };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects imported companion factories with aliased object mutations', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  const handlers = { hidden(state, value) {} };
+  const alias = handlers;
+  alias.hidden = 0;
+  return handlers;
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('keeps later unbound state parameters marked unsafe', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  return { hidden(deps, state, value) {} };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, true);
+  assert.equal(discovery.methods.get('hidden').stateParameterIndex, 1);
+});
+
+test('rejects facade forwarding to an unbound later-state handler', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-inventory-'));
+  try {
+    fs.writeFileSync(path.join(root, 'companion.js'), `function createFakeHandlers() {
+  return { hidden(deps, state, value) {} };
+}
+module.exports = { createFakeHandlers };`);
+    const ownerPath = path.join(root, 'owner.js');
+    const text = source.replace(
+      'class SurfaceState {',
+      `const { createFakeHandlers } = require('./companion');
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {
+newForward(value) { return fakeHandlers.hidden(this, value); }
+`
+    );
+    const candidate = compact(inventory(text, ownerPath));
+    assert.equal(matchesInventory(text, candidate, ownerPath), false);
+  }
+  finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('rejects companion factories with an implicit fallthrough', () => {
   const fallthroughFactory = source.replace(
     'class SurfaceState {',
@@ -79,6 +174,21 @@ const fakeHandlers = createFakeHandlers();
 class SurfaceState {`
   );
   assert.equal(discoverFactory(ts.createSourceFile('fallthrough-factory.js', fallthroughFactory, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS), 'createFakeHandlers').approved, false);
+});
+
+test('rejects switch breaks that fall through the factory', () => {
+  const switchBreak = source.replace(
+    'class SurfaceState {',
+    `function createFakeHandlers() {
+  switch (enabled) {
+    case true: break;
+    default: return createConfigurationHandlers({});
+  }
+}
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {`
+  );
+  assert.equal(discoverFactory(ts.createSourceFile('switch-break-factory.js', switchBreak, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS), 'createFakeHandlers').approved, false);
 });
 
 test('accepts arguments-object call forwarding for this-bound handlers', () => {
@@ -153,6 +263,13 @@ test('changed top-level behavior refused', () => {
 
 test('existing factory initializer change refused', () => {
   assert.equal(!matches(source.replace('const configurationHandlers = createConfigurationHandlers(', 'const configurationHandlers = createFakeHandlers(')), true);
+});
+
+test('reassigned handler singleton refused', () => {
+  const text = source
+    .replace('const configurationHandlers = createConfigurationHandlers(', 'let configurationHandlers = createConfigurationHandlers(')
+    .replace('const ordinaryBindingHandlers = createOrdinaryBindingHandlers({', 'configurationHandlers = {};\nconst ordinaryBindingHandlers = createOrdinaryBindingHandlers({');
+  assert.equal(!matches(text), true);
 });
 
 test('existing delegate retarget refused', () => {
@@ -399,6 +516,10 @@ test('comment-only change accepted', () => {
 
 test('changed retained body refused', () => {
   assert.equal(!matches(alterBody('directPostOwnerIdentity')), true);
+});
+
+test('removed retained method refused', () => {
+  assert.equal(!matches(removeMethod('directPostOwnerIdentity')), true);
 });
 
 test('changed constructor refused', () => {

@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 
 const ts = require('typescript');
 
-const { INVOCATION_STYLES, discoverFactory } = require('./handler-discovery');
+const { INVOCATION_STYLES, discoverFactory, mutatedBindingNames } = require('./handler-discovery');
 
 function tokens(text) {
   const scanner = ts.createScanner(ts.ScriptTarget.Latest, true, ts.LanguageVariant.Standard, text);
@@ -13,8 +13,8 @@ function tokens(text) {
   return result;
 }
 
-function inventory(text) {
-  const source = ts.createSourceFile('state.js', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+function inventory(text, fileName = 'state.js') {
+  const source = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   assert.equal(source.parseDiagnostics.length, 0);
   const owner = source.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'SurfaceState');
   assert.ok(owner);
@@ -33,7 +33,10 @@ function inventory(text) {
   }
   const handlerDiscoveries = [...handlerFactories].map(([name, factory]) => [name, discoverFactory(source, factory)]);
   const handlerMethodDescriptors = Object.fromEntries(handlerDiscoveries.map(([name, discovery]) => [name, discovery.methods]));
-  const unapprovedHandlers = handlerDiscoveries.filter(([, discovery]) => !discovery.approved).map(([name]) => name);
+  const mutatedHandlers = mutatedBindingNames(source, new Set(handlerFactories.keys()));
+  const unapprovedHandlers = handlerDiscoveries
+    .filter(([name, discovery]) => !discovery.approved || mutatedHandlers.has(name))
+    .map(([name]) => name);
   for (const name of unapprovedHandlers) handlers.delete(name);
   const callableMethods = methods => [...(methods || [])].filter(([, descriptor]) => descriptor);
   const handlerMethods = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
@@ -44,6 +47,8 @@ function inventory(text) {
     Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.requiredArguments]))]));
   const handlerParameterCounts = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
     Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.parameterCount]))]));
+  const handlerStateParameterIndexes = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
+    Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.stateParameterIndex]))]));
   const classHeader = tokens(text.slice(owner.getStart(source), owner.members.pos));
   const topLevel = source.statements.filter(node => node !== owner).map(node => tokens(node.getText(source)));
   const bodies = Object.create(null);
@@ -86,7 +91,7 @@ function inventory(text) {
     else bodies[name] = crypto.createHash('sha256').update(JSON.stringify(tokens(method.getText(source)))).digest('hex');
   }
   return { handlers: [...handlers].sort(), unapprovedHandlers, handlerMethods, handlerContracts, handlerRequiredArguments,
-    handlerParameterCounts,
+    handlerParameterCounts, handlerStateParameterIndexes,
     forwarding: forwarding.sort(), delegationBodies, topLevel, classHeader, bodies };
 }
 
@@ -212,11 +217,15 @@ const PRIOR_SURFACE_METHOD_NAMES = new Set([
   'close'
 ]);
 
-function matches(text, baseline) {
+function matches(text, baseline, fileName = 'state.js') {
   try {
-    const raw = inventory(text);
+    const raw = inventory(text, fileName);
     if (raw.unapprovedHandlers.length) return false;
     const candidate = compact(raw);
+    const candidateMethodNames = new Set([...Object.keys(candidate.bodies), ...candidate.forwarding]);
+    for (const name of PRIOR_SURFACE_METHOD_NAMES) {
+      if (!candidateMethodNames.has(name)) return false;
+    }
     if (Object.keys(candidate.bodies).some(name =>
       !PRIOR_SURFACE_METHOD_NAMES.has(name) && !baseline.forwarding.includes(name))) return false;
     if (JSON.stringify(candidate.handlers) !== JSON.stringify(baseline.handlers) ||
@@ -227,7 +236,7 @@ function matches(text, baseline) {
     for (const name of baseline.forwarding) {
       if (JSON.stringify(candidate.delegationBodies[name]) !== JSON.stringify(baseline.delegationBodies[name])) return false;
     }
-    const parsed = ts.createSourceFile('state.js', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const parsed = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const owner = parsed.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'SurfaceState');
     const priorUnsupportedForwarding = PRIOR_UNSUPPORTED_FORWARDING_NAMES;
     for (const method of owner.members) {
@@ -283,7 +292,8 @@ function matches(text, baseline) {
           (restApply || restCall || argumentsApply || argumentsCall || parameterSurfaceCovered);
       }
       else if (style === INVOCATION_STYLES.STATE) {
-        matchesStyle = (directCall || argumentsSpread) &&
+        const stateParameterIndex = raw.handlerStateParameterIndexes[target.expression.text]?.[target.name.text];
+        matchesStyle = stateParameterIndex === 0 && (directCall || argumentsSpread) &&
           (argumentsSpread || method.parameters.some(parameter => parameter.dotDotDotToken) || parameterSurfaceCovered);
       }
       if (!matchesStyle) return false;
