@@ -26,7 +26,7 @@ test('direct-home permission decisions stay in their shared owner', () => {
    }
    return result;
   }
-  
+
   const directory = path.join(__dirname, '../src/claude/socket-ownership');
   const sources = {};
   function collect(root, prefix = '') {
