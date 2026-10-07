@@ -701,13 +701,23 @@ const findTokenPairs = tokens => {
   return pairs;
 };
 
+const isGapEnumElementAt = (tokens, index) => {
+  const object = tokens[index]?.value;
+  const property = tokens[index + 2];
+  return (object === 'READINESS' || object === 'THREAD_STATES')
+    && tokens[index + 1]?.value === '['
+    && (property?.type === 'string' || property?.type === 'template')
+    && property.value === 'GAP'
+    && tokens[index + 3]?.value === ']';
+};
+
 const isGapValueAt = (tokens, index) => {
   const token = tokens[index];
   if (!token) return false;
   if ((token.type === 'string' || token.type === 'template') && token.value === 'gap') return true;
   return (token.value === 'READINESS' || token.value === 'THREAD_STATES')
-    && tokens[index + 1]?.value === '.'
-    && tokens[index + 2]?.value === 'GAP';
+    && ((tokens[index + 1]?.value === '.' && tokens[index + 2]?.value === 'GAP')
+      || isGapEnumElementAt(tokens, index));
 };
 
 const findDelimitedEnd = (tokens, start, end, closingValue) => {
@@ -734,6 +744,7 @@ const gapValueEnd = (tokens, index) => {
   if ((tokens[index]?.type === 'string' || tokens[index]?.type === 'template')) return index + 1;
   if ((tokens[index]?.value === 'READINESS' || tokens[index]?.value === 'THREAD_STATES')
     && tokens[index + 1]?.value === '.' && tokens[index + 2]?.value === 'GAP') return index + 3;
+  if (isGapEnumElementAt(tokens, index)) return index + 4;
   return index + 1;
 };
 
@@ -861,6 +872,27 @@ const findControlledStatementEnd = (tokens, start, end, pairs, includeElse = tru
 
 const findFunctionRanges = (tokens, pairs) => {
   const ranges = [];
+  const classBodies = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens[index].value !== 'class') continue;
+    for (let body = index + 1; body < tokens.length; body += 1) {
+      if (tokens[body].value === '{') {
+        const closing = pairs.get(body);
+        if (closing !== undefined) classBodies.push({ opening: body, closing });
+        break;
+      }
+      if ([';', '}'].includes(tokens[body].value)) break;
+    }
+  }
+  const controlHeaders = new Set(['if', 'for', 'while', 'switch', 'catch', 'with']);
+  const isClassMethod = parameterOpening => {
+    const methodName = tokens[parameterOpening - 1];
+    if (!methodName || (methodName.type !== 'identifier' && methodName.value !== ']')
+      || controlHeaders.has(methodName.value)) return false;
+    return classBodies.some(({ opening, closing }) => (
+      opening < parameterOpening && parameterOpening < closing
+    ));
+  };
   for (let opening = 0; opening < tokens.length; opening += 1) {
     if (tokens[opening].value !== '{') continue;
     const closing = pairs.get(opening);
@@ -880,6 +912,9 @@ const findFunctionRanges = (tokens, pairs) => {
         break;
       }
       start -= 1;
+    }
+    if (isClassMethod(parameterOpening)) {
+      ranges.push({ start: parameterOpening - 1, opening, closing });
     }
   }
   const findArrowExpressionEnd = start => {
@@ -972,7 +1007,28 @@ const isNegatedDeadlineCondition = (tokens, conditionStart, triggerIndex) => {
     }
     return false;
   };
-  return negated || scanForInequality(triggerIndex - 1, -1) || scanForInequality(triggerIndex + 1, 1);
+  const isNegatedBooleanComparison = index => {
+    const operator = tokens[index]?.value;
+    const left = tokens[index - 1]?.value;
+    const right = tokens[index + 1]?.value;
+    const equalityToFalse = (operator === '==' || operator === '===')
+      && (left === 'false' || right === 'false');
+    const inequalityFromTrue = (operator === '!=' || operator === '!==')
+      && (left === 'true' || right === 'true');
+    return equalityToFalse || inequalityFromTrue;
+  };
+  const scanForNegatedBooleanComparison = (start, step) => {
+    for (let index = start; index >= conditionStart && index < tokens.length; index += step) {
+      if (isNegatedBooleanComparison(index)) return true;
+      if (['&&', '||', '?', ':', ')'].includes(tokens[index].value)) break;
+    }
+    return false;
+  };
+  return negated
+    || scanForInequality(triggerIndex - 1, -1)
+    || scanForInequality(triggerIndex + 1, 1)
+    || scanForNegatedBooleanComparison(triggerIndex - 1, -1)
+    || scanForNegatedBooleanComparison(triggerIndex + 1, 1);
 };
 
 const branchRange = (tokens, start, end, pairs) => {
@@ -1296,6 +1352,16 @@ const findVariableDeclarations = (tokens, pairs, lexicalScopes) => {
 };
 
 const findFunctionParameterBindings = (tokens, pairs, lexicalScopes, functionRanges) => functionRanges.flatMap(range => {
+  if (tokens[range.start]?.value === '=>') {
+    const parameter = tokens[range.start - 1];
+    if (parameter?.type === 'identifier') {
+      return [{
+        name: parameter.value,
+        index: range.start - 1,
+        scope: lexicalScopePath(lexicalScopes, range.opening + 1)
+      }];
+    }
+  }
   let parameterOpening = -1;
   for (let index = range.start; index < range.opening; index += 1) {
     if (tokens[index].value === '(' && pairs.get(index) < range.opening) parameterOpening = index;
@@ -1436,6 +1502,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
   for (const alias of deadlineAliases) {
     for (let index = 0; index < tokens.length; index += 1) {
       if (index === alias.index || tokens[index].value !== alias.name || tokens[index - 1]?.value === '.') continue;
+      if (lexicalBindings.some(binding => binding.name === alias.name && binding.index === index)) continue;
       const binding = resolveVisibleBinding(lexicalBindings, alias.name, index, lexicalScopes);
       if (!binding || binding.index !== alias.index) continue;
       if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
@@ -1510,6 +1577,28 @@ test('deadline policy inventory follows inequality polarity', () => {
   assert.deepEqual(offenders, ['strict-inequality.js:1', 'loose-inequality.js:1']);
 });
 
+test('deadline policy inventory follows explicit boolean deadline polarity', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'explicit-false-gap.js',
+      source: 'if (deadlineReached === false) return READINESS.READY; else return READINESS.GAP;'
+    },
+    {
+      relative: 'explicit-false-consequent-gap.js',
+      source: 'if (deadlineReached === false) return READINESS.GAP; else return READINESS.READY;'
+    },
+    {
+      relative: 'explicit-true-gap.js',
+      source: 'if (deadlineReached !== true) return READINESS.READY; else return READINESS.GAP;'
+    },
+    {
+      relative: 'explicit-true-consequent-gap.js',
+      source: 'if (deadlineReached !== true) return READINESS.GAP; else return READINESS.READY;'
+    }
+  ]);
+  assert.deepEqual(offenders, ['explicit-false-gap.js:1', 'explicit-true-gap.js:1']);
+});
+
 test('deadline aliases remain scoped to their lexical declaration', () => {
   const offenders = findDeadlineGapOffenders([{
     relative: 'deadline-alias-scope.js',
@@ -1552,12 +1641,71 @@ test('deadline policy inventory respects nested alias shadowing', () => {
   assert.deepEqual(offenders, []);
 });
 
+test('deadline aliases remain shadowed by concise arrow parameters', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'deadline-alias-concise-arrow.js',
+    source: [
+      'const expired = Date.now() >= deadline;',
+      'const choose = expired => expired ? READINESS.GAP : READINESS.READY;'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, []);
+});
+
+test('deadline policy inventory ignores gap returns declared in class methods', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'deadline-class-method.js',
+    source: [
+      'if (deadlineReached) {',
+      '  class Policy {',
+      '    constructor() { return READINESS.GAP; }',
+      '    fallback() { return READINESS.GAP; }',
+      '  }',
+      '  return READINESS.UNAVAILABLE;',
+      '}'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, []);
+});
+
 test('deadline policy inventory catches object-shaped gap decisions', () => {
   const offenders = findDeadlineGapOffenders([{
     relative: 'discord/inbound-recovery.js',
     source: "if (Date.now() >= deadline) return { ready: false, state: 'gap', detail: 'history unavailable' };"
   }]);
   assert.deepEqual(offenders, ['discord/inbound-recovery.js:1']);
+});
+
+test('deadline policy inventory recognizes computed gap constants', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/computed-return.js',
+      source: "if (deadlineReached) return READINESS['GAP'];"
+    },
+    {
+      relative: 'discord/computed-template-return.js',
+      source: 'if (deadlineReached) return THREAD_STATES[`GAP`];'
+    },
+    {
+      relative: 'discord/computed-object-return.js',
+      source: "if (deadlineReached) return { state: READINESS['GAP'] };"
+    },
+    {
+      relative: 'discord/computed-writer.js',
+      source: "if (deadlineReached) state.markIntakeBoundary(id, READINESS['GAP'], detail);"
+    },
+    {
+      relative: 'discord/computed-template-writer.js',
+      source: 'if (deadlineReached) state.markIntakeBoundary(id, THREAD_STATES[`GAP`], detail);'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/computed-return.js:1',
+    'discord/computed-template-return.js:1',
+    'discord/computed-object-return.js:1',
+    'discord/computed-writer.js:1',
+    'discord/computed-template-writer.js:1'
+  ]);
 });
 
 test('deadline policy inventory scans complete outcomes and ignores unrelated gaps', () => {
