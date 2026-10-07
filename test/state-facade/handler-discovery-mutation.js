@@ -162,26 +162,24 @@ function mutatedBindingNames(source, names) {
 }
 
 function factoryDeclaration(source, factoryName) {
-  let candidate = null;
-  let binding = null;
+  const bindings = [];
   for (const statement of source.statements) {
     if (ts.isFunctionDeclaration(statement) && statement.name?.text === factoryName) {
-      candidate = statement;
-      binding = statement;
-      break;
+      bindings.push({ candidate: statement, binding: statement });
+      continue;
     }
     if (!ts.isVariableStatement(statement)) continue;
     for (const declaration of statement.declarationList.declarations) {
-      if (ts.isIdentifier(declaration.name) && declaration.name.text === factoryName &&
-          declaration.initializer && (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer))) {
-        candidate = declaration.initializer;
-        binding = declaration;
-        break;
-      }
+      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== factoryName) continue;
+      const candidate = declaration.initializer &&
+        (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer))
+        ? declaration.initializer
+        : null;
+      bindings.push({ candidate, binding: declaration });
     }
-    if (candidate) break;
   }
-  if (!candidate) return null;
+  if (bindings.length !== 1 || !bindings[0].candidate) return null;
+  const [{ candidate, binding }] = bindings;
   const declarations = callableDeclarations(source, null);
   const mutated = mutatedDeclarations(source, declarations, source);
   return mutated.has(binding) ? null : candidate;

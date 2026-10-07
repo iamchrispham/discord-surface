@@ -171,7 +171,7 @@ function callableDeclarations(source, factory) {
       return;
     }
     if (ts.isFunctionLike(node)) return;
-    if (ts.isVariableDeclaration(node) && node.initializer) {
+    if (ts.isVariableDeclaration(node)) {
       if (ts.isIdentifier(node.name)) add(node.name.text, node);
       else for (const identifier of bindingIdentifiers(node.name)) add(identifier.text, identifier);
     }
@@ -190,7 +190,7 @@ function callableDeclarations(source, factory) {
       return;
     }
     if (ts.isFunctionDeclaration(node)) add(node.name?.text, node);
-    if (ts.isVariableDeclaration(node) && node.initializer) {
+    if (ts.isVariableDeclaration(node)) {
       if (ts.isIdentifier(node.name)) add(node.name.text, node);
       else for (const identifier of bindingIdentifiers(node.name)) add(identifier.text, identifier);
     }

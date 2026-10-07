@@ -19,6 +19,7 @@ function inventory(text, fileName = 'state.js') {
   const owner = source.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'SurfaceState');
   assert.ok(owner);
   const exportedOwner = exportedClassDeclaration(source, 'SurfaceState');
+  const ownerPrototypeMutated = !!exportedOwner && exportedPrototypeMutated(source, exportedOwner, 'SurfaceState');
   const handlers = new Set();
   const handlerFactories = new Map();
   for (const statement of source.statements) {
@@ -95,7 +96,7 @@ function inventory(text, fileName = 'state.js') {
   }
   return { handlers: [...handlers].sort(), unapprovedHandlers, handlerMethods, handlerContracts, handlerRequiredArguments,
     handlerParameterCounts, handlerStateParameterIndexes,
-    handlerRestParameters, ownerMatchesExport: owner === exportedOwner,
+    handlerRestParameters, ownerMatchesExport: owner === exportedOwner, ownerPrototypeMutated,
     forwarding: forwarding.sort(), delegationBodies, topLevel, classHeader, bodies };
 }
 
@@ -239,9 +240,10 @@ function exportedClassDeclaration(source, exportName) {
   const isModuleExports = node => ts.isPropertyAccessExpression(node) &&
     ts.isIdentifier(node.expression) && node.expression.text === 'module' &&
     node.name.text === 'exports';
+  let exportsAliasValid = true;
   const isNamedExport = node => ts.isPropertyAccessExpression(node) &&
     (isModuleExports(node.expression) ||
-      (ts.isIdentifier(node.expression) && node.expression.text === 'exports')) &&
+      (exportsAliasValid && ts.isIdentifier(node.expression) && node.expression.text === 'exports')) &&
     node.name.text === exportName;
   const expressionForProperty = property => {
     if (ts.isShorthandPropertyAssignment(property)) return property.name;
@@ -301,7 +303,9 @@ function exportedClassDeclaration(source, exportName) {
     const { left, right } = statement.expression;
     if (isNamedExport(left)) {
       exported = right;
-    } else if (isModuleExports(left)) {
+    }
+    if (isModuleExports(left)) {
+      exportsAliasValid = false;
       if (!ts.isObjectLiteralExpression(right)) {
         exported = null;
         continue;
@@ -310,18 +314,57 @@ function exportedClassDeclaration(source, exportName) {
         (ts.isShorthandPropertyAssignment(candidate) && candidate.name.text === exportName) ||
         (ts.isPropertyAssignment(candidate) && candidate.name &&
           ts.isIdentifier(candidate.name) && candidate.name.text === exportName));
-      exported = property && expressionForProperty(property);
+      exported = property ? expressionForProperty(property) : null;
     }
   }
   if (bindingReassigned) return null;
-  if (ts.isClassExpression(exported)) return exported;
+  if (exported && ts.isClassExpression(exported)) return exported;
   return exported && ts.isIdentifier(exported) ? declarations.get(exported.text) || null : null;
+}
+
+function exportedPrototypeMutated(source, owner, ownerName) {
+  if (!owner) return false;
+  const isPrototypeObject = node => ts.isPropertyAccessExpression(node) &&
+    ts.isIdentifier(node.expression) && node.expression.text === ownerName && node.name.text === 'prototype';
+  const isPrototypeMember = node => {
+    if (!node) return false;
+    if (isPrototypeObject(node)) return true;
+    return (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+      isPrototypeObject(node.expression);
+  };
+  const assignmentStart = ts.SyntaxKind.FirstAssignment;
+  const assignmentEnd = ts.SyntaxKind.LastAssignment;
+  let mutated = false;
+  const visit = node => {
+    if (mutated) return;
+    if (node.getStart(source) > owner.end) {
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind >= assignmentStart &&
+          node.operatorToken.kind <= assignmentEnd && isPrototypeMember(node.left)) {
+        mutated = true;
+        return;
+      }
+      if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node) || ts.isDeleteExpression(node)) &&
+          isPrototypeMember(node.operand || node.expression)) {
+        mutated = true;
+        return;
+      }
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+          ['assign', 'defineProperty', 'defineProperties', 'setPrototypeOf'].includes(node.expression.name.text) &&
+          node.arguments.length > 0 && isPrototypeObject(node.arguments[0])) {
+        mutated = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return mutated;
 }
 
 function matches(text, baseline, fileName = 'state.js') {
   try {
     const raw = inventory(text, fileName);
-    if (raw.unapprovedHandlers.length || !raw.ownerMatchesExport) return false;
+    if (raw.unapprovedHandlers.length || !raw.ownerMatchesExport || raw.ownerPrototypeMutated) return false;
     const candidate = compact(raw);
     const candidateMethodNames = new Set([...Object.keys(candidate.bodies), ...candidate.forwarding]);
     const requiredSurfaceMethodNames = new Set([...PRIOR_SURFACE_METHOD_NAMES, ...baseline.forwarding]);

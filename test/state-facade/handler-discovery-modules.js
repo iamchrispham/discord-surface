@@ -141,7 +141,8 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
   const resolveExpression = expression => {
     const called = calledFactory(expression);
     if (!called) return new Map();
-    const local = factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen));
+    const local = called.receiver ? null :
+      factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen));
     if (local?.size) return local;
     const binding = called.receiver
       ? (ts.isIdentifier(called.receiver) ? bindings.get(called.receiver.text, called.receiver) : null)

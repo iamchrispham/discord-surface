@@ -881,3 +881,60 @@ finally { if (disabled) break outer; }
 module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
 });
+
+test('rejects an uninitialized hoisted handler binding', () => {
+  const discovery = discoverTempFactory(`const hidden = (state, value) => value;
+function createFakeHandlers() {
+  return { hidden };
+  var hidden;
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects asynchronous export getters', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+Object.defineProperty(exports, 'createFakeHandlers', {
+  get: async function () { return createFakeHandlers; }
+});`);
+  assert.equal(discovery.approved, false);
+});
+
+test('resolves receiver-qualified factories before local names', () => {
+  const discovery = discoverTempFactoryFiles({
+    'helpers.js': `function createInner() { return {}; }
+module.exports = { createInner };`,
+    'companion.js': `const helpers = require('./helpers');
+function createInner() { return { hidden(state, value) {} }; }
+function createFakeHandlers() { return helpers.createInner(); }
+module.exports = { createFakeHandlers };`
+  }, `const { createFakeHandlers } = require('./companion');
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects duplicate factory declarations', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+function createFakeHandlers() { return {}; }
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects a stale exports alias after replacing module exports', () => {
+  const exportStart = source.lastIndexOf('module.exports =');
+  const text = source.slice(0, exportStart) + `module.exports = { Other: true };
+exports.SurfaceState = SurfaceState;
+`;
+  assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('rejects exported owner prototype mutations', () => {
+  for (const mutation of [
+    'delete SurfaceState.prototype.getConfig;',
+    'SurfaceState.prototype.getConfig = () => null;'
+  ]) {
+    assert.equal(matchesWithCandidateBaseline(`${source}\n${mutation}`), false);
+  }
+});

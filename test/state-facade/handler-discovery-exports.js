@@ -36,10 +36,14 @@ function exportedFactoryExpression(source, factoryName, allowDefault = false) {
     if (!ts.isObjectLiteralExpression(node)) return null;
     for (const property of node.properties) {
       if (propertyName(property.name) !== 'get' || !property.initializer || !ts.isFunctionLike(property.initializer)) continue;
+      if (property.initializer.asteriskToken ||
+          property.initializer.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+        return { rejected: true };
+      }
       const body = property.initializer.body;
       if (!body || !ts.isBlock(body)) continue;
       const statement = body.statements.find(item => ts.isReturnStatement(item) && item.expression);
-      if (statement) return statement.expression;
+      if (statement) return { expression: statement.expression };
     }
     return null;
   };
@@ -79,7 +83,8 @@ function exportedFactoryExpression(source, factoryName, allowDefault = false) {
         ts.isIdentifier(node.arguments[0]) && node.arguments[0].text === 'exports' &&
         ts.isStringLiteral(node.arguments[1]) && node.arguments[1].text === factoryName &&
         isTopLevelExpression(node)) {
-      result = getterExpression(node.arguments[2]);
+      const getter = getterExpression(node.arguments[2]);
+      result = getter?.rejected ? null : getter?.expression || null;
     }
     ts.forEachChild(node, visit);
   };
