@@ -683,6 +683,19 @@ const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
   return valueHasGapOutcome(tokens, wrapperOpening + 1, wrapperClosing, pairs, aliases);
 };
 
+const outcomeAssignmentValueStart = (tokens, index) => {
+  if (tokens[index]?.type !== 'identifier' || tokens[index - 1]?.value === '.') return null;
+  if (tokens[index + 1]?.value === '.'
+    && OUTCOME_NAMES.has(tokens[index + 2]?.value)
+    && tokens[index + 3]?.value === '=') return index + 4;
+  if (tokens[index + 1]?.value === '['
+    && ['string', 'template'].includes(tokens[index + 2]?.type)
+    && OUTCOME_NAMES.has(tokens[index + 2]?.value)
+    && tokens[index + 3]?.value === ']'
+    && tokens[index + 4]?.value === '=') return index + 5;
+  return null;
+};
+
 const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, aliases = new Set()) => {
   if (stateArgument === undefined) return false;
   let argumentStart = opening + 1;
@@ -728,11 +741,10 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       index = Math.max(index, statementEnd - 1);
       continue;
     }
-    if (token.type === 'identifier' && tokens[index + 1]?.value === '.'
-      && OUTCOME_NAMES.has(tokens[index + 2]?.value)
-      && tokens[index + 3]?.value === '=') {
-      const statementEnd = findStatementEnd(tokens, index + 4, end);
-      if (valueHasGapOutcome(tokens, index + 4, statementEnd, pairs, knownAliases)) return true;
+    const assignmentValueStart = outcomeAssignmentValueStart(tokens, index);
+    if (assignmentValueStart !== null) {
+      const statementEnd = findStatementEnd(tokens, assignmentValueStart, end);
+      if (valueHasGapOutcome(tokens, assignmentValueStart, statementEnd, pairs, knownAliases)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
@@ -799,7 +811,7 @@ const isLexicallyVisible = (declarationScope, useScope) => declarationScope.ever
   (scope, index) => useScope[index] === scope
 );
 
-const findVariableDeclarations = (tokens, pairs, lexicalScopes) => {
+const findVariableDeclarations = (tokens, pairs, lexicalScopes, functionRanges = []) => {
   const declarations = [];
   for (let index = 0; index < tokens.length; index += 1) {
     if (!['const', 'let', 'var'].includes(tokens[index].value)) continue;
@@ -807,10 +819,15 @@ const findVariableDeclarations = (tokens, pairs, lexicalScopes) => {
     const equalsIndex = nameIndex + 1;
     if (tokens[nameIndex]?.type !== 'identifier' || tokens[equalsIndex]?.value !== '=') continue;
     const statementEnd = findStatementEnd(tokens, equalsIndex + 1, tokens.length);
+    const functionScope = functionRanges
+      .filter(range => !range.expression && range.opening < nameIndex && nameIndex < range.closing)
+      .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening))[0];
     declarations.push({
       name: tokens[nameIndex].value,
       index: nameIndex,
-      scope: lexicalScopePath(lexicalScopes, nameIndex),
+      scope: tokens[index].value === 'var' && functionScope
+        ? lexicalScopePath(lexicalScopes, functionScope.opening + 1)
+        : lexicalScopePath(lexicalScopes, nameIndex),
       expressionStart: equalsIndex + 1,
       expressionEnd: statementEnd
     });
@@ -818,36 +835,96 @@ const findVariableDeclarations = (tokens, pairs, lexicalScopes) => {
   return declarations;
 };
 
-const findFunctionParameterBindings = (tokens, pairs, lexicalScopes, functionRanges) => functionRanges.flatMap(range => {
-  if (tokens[range.start]?.value === '=>') {
-    const parameter = tokens[range.start - 1];
-    if (parameter?.type === 'identifier') {
-      return [{
-        name: parameter.value,
-        index: range.start - 1,
-        scope: lexicalScopePath(lexicalScopes, range.opening + 1)
-      }];
+const topLevelToken = (tokens, start, end, target) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === target) return index;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return -1;
+};
+
+const topLevelSegments = (tokens, start, end) => {
+  const segments = [];
+  let segmentStart = start;
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (value === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      segments.push([segmentStart, index]);
+      segmentStart = index + 1;
     }
   }
-  let parameterOpening = -1;
-  for (let index = range.start; index < range.opening; index += 1) {
-    if (tokens[index].value === '(' && pairs.get(index) < range.opening) parameterOpening = index;
+  segments.push([segmentStart, end]);
+  return segments;
+};
+
+const parameterBindingIndexes = (tokens, pairs, start, end) => {
+  while (start < end && tokens[start].value === '...') start += 1;
+  const equalsIndex = topLevelToken(tokens, start, end, '=');
+  if (equalsIndex >= 0) end = equalsIndex;
+  if (start >= end) return [];
+  if (tokens[start].value === '{' || tokens[start].value === '[') {
+    const closing = pairs.get(start);
+    const patternEnd = closing !== undefined && closing < end ? closing : end;
+    return topLevelSegments(tokens, start + 1, patternEnd).flatMap(([segmentStart, segmentEnd]) => {
+      while (segmentStart < segmentEnd && tokens[segmentStart].value === '...') segmentStart += 1;
+      const colonIndex = topLevelToken(tokens, segmentStart, segmentEnd, ':');
+      return parameterBindingIndexes(
+        tokens,
+        pairs,
+        colonIndex >= 0 ? colonIndex + 1 : segmentStart,
+        segmentEnd
+      );
+    });
   }
-  if (parameterOpening < 0) return [];
-  const parameterClosing = pairs.get(parameterOpening);
-  if (parameterClosing === undefined || parameterClosing >= range.opening) return [];
+  return tokens[start].type === 'identifier'
+    ? [{ name: tokens[start].value, index: start }]
+    : [];
+};
+
+const findFunctionParameterBindings = (tokens, pairs, lexicalScopes, functionRanges) => functionRanges.flatMap(range => {
   const scope = lexicalScopePath(lexicalScopes, range.opening + 1);
-  return tokens.slice(parameterOpening + 1, parameterClosing).flatMap((token, offset) => {
-    const index = parameterOpening + 1 + offset;
-    const previous = tokens[index - 1]?.value;
-    return token.type === 'identifier' && ['(', ',', '...'].includes(previous)
-      ? [{ name: token.value, index, scope }]
-      : [];
-  });
+  if (tokens[range.start]?.value === '=>') {
+    const previousIndex = range.start - 1;
+    if (tokens[previousIndex]?.type === 'identifier') {
+      return [{ name: tokens[previousIndex].value, index: previousIndex, scope }];
+    }
+    if (tokens[previousIndex]?.value === ')') {
+      const parameterOpening = pairs.get(previousIndex);
+      if (parameterOpening !== undefined) {
+        return parameterBindingIndexes(tokens, pairs, parameterOpening + 1, previousIndex)
+          .map(binding => ({ ...binding, scope }));
+      }
+    }
+    return [];
+  }
+  const parameterClosing = range.opening - 1;
+  const parameterOpening = tokens[parameterClosing]?.value === ')' ? pairs.get(parameterClosing) : undefined;
+  if (parameterOpening === undefined || parameterClosing >= range.opening) return [];
+  return topLevelSegments(tokens, parameterOpening + 1, parameterClosing).flatMap(([start, end]) => (
+    parameterBindingIndexes(tokens, pairs, start, end).map(binding => ({ ...binding, scope }))
+  ));
 });
 
 const collectLexicalBindings = (tokens, pairs, lexicalScopes, functionRanges) => [
-  ...findVariableDeclarations(tokens, pairs, lexicalScopes),
+  ...findVariableDeclarations(tokens, pairs, lexicalScopes, functionRanges),
   ...findFunctionParameterBindings(tokens, pairs, lexicalScopes, functionRanges)
 ];
 
@@ -862,7 +939,7 @@ const resolveVisibleBinding = (bindings, name, useIndex, lexicalScopes, useScope
 };
 
 const visibleGapAliasesAt = (tokens, limit, pairs, lexicalScopes, functionRanges, baseAliases = new Set()) => {
-  const declarations = findVariableDeclarations(tokens, pairs, lexicalScopes)
+  const declarations = findVariableDeclarations(tokens, pairs, lexicalScopes, functionRanges)
     .filter(declaration => declaration.index < limit)
     .sort((left, right) => left.index - right.index);
   const bindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
@@ -1108,6 +1185,51 @@ test('deadline policy inventory respects nested alias shadowing', () => {
   assert.deepEqual(offenders, []);
 });
 
+test('deadline aliases remain visible across blocks when declared with var', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'deadline-var-alias.js',
+      source: [
+        'function recover() {',
+        '  {',
+        '    var expired = deadlineReached;',
+        '  }',
+        '  if (expired) return READINESS.GAP;',
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'deadline-var-alias-through-outcome.js',
+      source: [
+        'function recover() {',
+        '  {',
+        '    var expired = deadlineReached;',
+        '    var nextState = READINESS.GAP;',
+        '  }',
+        '  if (expired) return nextState;',
+        '}'
+      ].join('\n')
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'deadline-var-alias.js:5',
+    'deadline-var-alias-through-outcome.js:6'
+  ]);
+});
+
+test('deadline aliases remain shadowed by destructured parameter bindings', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'deadline-alias-destructured-parameter.js',
+    source: [
+      'const expired = deadlineReached;',
+      'function nested({ expired } = createDefaults()) {',
+      '  if (expired) return READINESS.GAP;',
+      '}'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, []);
+});
+
 test('deadline aliases remain shadowed by concise arrow parameters', () => {
   const offenders = findDeadlineGapOffenders([{
     relative: 'deadline-alias-concise-arrow.js',
@@ -1202,6 +1324,14 @@ test('deadline policy inventory scans complete outcomes and ignores unrelated ga
       source: 'if (deadlineReached) result.state = READINESS.GAP;'
     },
     {
+      relative: 'discord/computed-member-assignment.js',
+      source: "if (deadlineReached) { result['state'] = READINESS.GAP; return result; }"
+    },
+    {
+      relative: 'discord/computed-template-member-assignment.js',
+      source: 'if (deadlineReached) { result[`state`] = READINESS.GAP; return result; }'
+    },
+    {
       relative: 'discord/braced-member-assignment.js',
       source: [
         'if (deadlineReached) {',
@@ -1283,6 +1413,8 @@ test('deadline policy inventory scans complete outcomes and ignores unrelated ga
     'discord/multiline-owner.js:1',
     'discord/multiline-assignment.js:1',
     'discord/member-assignment.js:1',
+    'discord/computed-member-assignment.js:1',
+    'discord/computed-template-member-assignment.js:1',
     'discord/braced-member-assignment.js:1',
     'discord/parenthesized-return.js:1',
     'discord/wrapped-return.js:1',
@@ -1485,8 +1617,8 @@ test('deadline policy inventory follows aliases and selected control arms', () =
 
 test('pre-adoption retry classifier sites stay in the audited owners', () => {
   const registered = JSON.parse(fs.readFileSync(path.join(__dirname, '../../package.json'), 'utf8')).scripts.test.split(/\s+/);
-  assert.equal(registered.filter(value => value === 'test/intake-recovery-boundaries.test.js').length, 1,
-    'the retry-classifier inventory must execute exactly once in npm test');
+  assert.equal(registered.filter(value => value === 'test/policy/intake-recovery-policy.test.js').length, 1,
+    'the focused recovery policy inventory must execute exactly once in npm test');
   const sourceRoot = path.join(__dirname, '../../src');
   const sites = new Map();
   for (const { relative, source } of readSourceInventory(sourceRoot)) {
