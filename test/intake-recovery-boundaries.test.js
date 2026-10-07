@@ -714,13 +714,33 @@ const findDelimitedEnd = (tokens, start, end, closingValue) => {
   return end;
 };
 
-const expressionHasGap = (tokens, start, end) => {
+const COMPARISON_OPERATORS = new Set(['==', '===', '!=', '!==', '>', '>=', '<', '<=']);
+
+const gapValueEnd = (tokens, index) => {
+  if ((tokens[index]?.type === 'string' || tokens[index]?.type === 'template')) return index + 1;
+  if ((tokens[index]?.value === 'READINESS' || tokens[index]?.value === 'THREAD_STATES')
+    && tokens[index + 1]?.value === '.' && tokens[index + 2]?.value === 'GAP') return index + 3;
+  return index + 1;
+};
+
+const isComparisonOperand = (tokens, index, start, end) => {
+  let left = index - 1;
+  while (left >= start && (tokens[left]?.value === '.' || tokens[left]?.type === 'identifier')) left -= 1;
+  if (left >= start && COMPARISON_OPERATORS.has(tokens[left]?.value)) return true;
+  let right = gapValueEnd(tokens, index);
+  while (right < end && (tokens[right]?.value === '.' || tokens[right]?.type === 'identifier')) right += 1;
+  return right < end && COMPARISON_OPERATORS.has(tokens[right]?.value);
+};
+
+const expressionHasGap = (tokens, start, end, aliases = new Set()) => {
   let parenDepth = 0;
   let braceDepth = 0;
   let bracketDepth = 0;
   for (let index = start; index < end; index += 1) {
     const value = tokens[index].value;
-    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && isGapValueAt(tokens, index)) return true;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && !isComparisonOperand(tokens, index, start, end)
+      && (isGapValueAt(tokens, index) || (tokens[index].type === 'identifier' && aliases.has(value)))) return true;
     if (value === '(') parenDepth += 1;
     else if (value === ')') parenDepth -= 1;
     else if (value === '{') braceDepth += 1;
@@ -731,7 +751,7 @@ const expressionHasGap = (tokens, start, end) => {
   return false;
 };
 
-const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex) => {
+const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, aliases = new Set()) => {
   let parenDepth = 0;
   let braceDepth = 0;
   let bracketDepth = 0;
@@ -741,7 +761,7 @@ const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex) => {
       && OUTCOME_NAMES.has(value) && tokens[index + 1]?.value === ':') {
       const valueStart = index + 2;
       const valueEnd = findDelimitedEnd(tokens, valueStart, closingIndex, '}');
-      if (expressionHasGap(tokens, valueStart, valueEnd)) return true;
+      if (valueHasGap(tokens, valueStart, valueEnd, pairs, aliases)) return true;
     }
     if (value === '(') parenDepth += 1;
     else if (value === ')') parenDepth -= 1;
@@ -753,7 +773,7 @@ const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex) => {
   return false;
 };
 
-const valueHasGap = (tokens, start, end, pairs) => {
+const valueHasGap = (tokens, start, end, pairs, aliases = new Set()) => {
   if (start >= end) return false;
   let valueStart = start;
   let valueEnd = end;
@@ -765,14 +785,17 @@ const valueHasGap = (tokens, start, end, pairs) => {
     valueEnd = closingIndex;
   }
   if (valueStart >= valueEnd) return false;
-  if (isGapValueAt(tokens, valueStart)) return true;
+  if (isGapValueAt(tokens, valueStart)
+    && !isComparisonOperand(tokens, valueStart, valueStart, valueEnd)) return true;
+  if (tokens[valueStart].type === 'identifier' && aliases.has(tokens[valueStart].value)
+    && !isComparisonOperand(tokens, valueStart, valueStart, valueEnd)) return true;
   if (tokens[valueStart].value === '{') {
     const closingIndex = pairs.get(valueStart);
     return closingIndex !== undefined && closingIndex < valueEnd
-      ? objectHasTopLevelStateGap(tokens, valueStart, closingIndex)
+      ? objectHasTopLevelStateGap(tokens, valueStart, closingIndex, pairs, aliases)
       : false;
   }
-  return expressionHasGap(tokens, valueStart, valueEnd);
+  return expressionHasGap(tokens, valueStart, valueEnd, aliases);
 };
 
 const findStatementEnd = (tokens, start, end) => {
@@ -798,7 +821,7 @@ const findStatementEnd = (tokens, start, end) => {
   return end;
 };
 
-const findControlledStatementEnd = (tokens, start, end, pairs) => {
+const findControlledStatementEnd = (tokens, start, end, pairs, includeElse = true) => {
   if (start >= end) return end;
   if (tokens[start].value === '{') return Math.min(end, (pairs.get(start) ?? end - 1) + 1);
   if (tokens[start].value === 'if' && tokens[start + 1]?.value === '(') {
@@ -808,7 +831,7 @@ const findControlledStatementEnd = (tokens, start, end, pairs) => {
     const bodyEnd = tokens[bodyStart]?.value === '{'
       ? Math.min(end, (pairs.get(bodyStart) ?? end - 1) + 1)
       : findControlledStatementEnd(tokens, bodyStart, end, pairs);
-    if (tokens[bodyEnd]?.value === 'else') return findControlledStatementEnd(tokens, bodyEnd + 1, end, pairs);
+    if (includeElse && tokens[bodyEnd]?.value === 'else') return findControlledStatementEnd(tokens, bodyEnd + 1, end, pairs);
     return bodyEnd;
   }
   return findStatementEnd(tokens, start, end);
@@ -837,6 +860,44 @@ const findFunctionRanges = (tokens, pairs) => {
       start -= 1;
     }
   }
+  const findArrowExpressionEnd = start => {
+    let parenDepth = 0;
+    let braceDepth = 0;
+    let bracketDepth = 0;
+    const statementLine = tokens[start]?.line;
+    const asiStarters = new Set(['function', 'const', 'let', 'var', 'if', 'return', 'for', 'while', 'switch', 'try', 'throw', 'class', 'export', 'import']);
+    for (let index = start; index < tokens.length; index += 1) {
+      const value = tokens[index].value;
+      if (index > start && tokens[index].line > statementLine && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+        && asiStarters.has(value) && ['identifier', 'string', 'template', 'number'].includes(tokens[index - 1]?.type)) return index;
+      if (value === '(') parenDepth += 1;
+      else if (value === ')') {
+        if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+        parenDepth -= 1;
+      } else if (value === '{') braceDepth += 1;
+      else if (value === '}') {
+        if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+        braceDepth -= 1;
+      } else if (value === '[') bracketDepth += 1;
+      else if (value === ']') bracketDepth -= 1;
+      else if (value === ';' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index + 1;
+      else if (value === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) return index;
+    }
+    return tokens.length;
+  };
+  for (let arrow = 0; arrow < tokens.length; arrow += 1) {
+    if (tokens[arrow].value !== '=>' || tokens[arrow + 1]?.value === '{') continue;
+    const bodyStart = arrow + 1;
+    const bodyEnd = findArrowExpressionEnd(bodyStart);
+    ranges.push({
+      start: arrow,
+      opening: bodyStart,
+      closing: bodyEnd - 1,
+      bodyStart,
+      bodyEnd,
+      expression: true
+    });
+  }
   return ranges;
 };
 
@@ -855,11 +916,14 @@ const findIfDecision = (tokens, triggerIndex, pairs) => {
 
 const findFunctionDecision = (ranges, triggerIndex) => {
   const containing = ranges
-    .filter(range => range.opening < triggerIndex && triggerIndex < range.closing)
+    .filter(range => range.expression
+      ? range.bodyStart <= triggerIndex && triggerIndex < range.bodyEnd
+      : range.opening < triggerIndex && triggerIndex < range.closing)
     .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening));
   if (containing[0]) return containing[0];
   return ranges
-    .filter(range => range.start < triggerIndex && triggerIndex < range.opening)
+    .filter(range => range.start < triggerIndex
+      && (range.expression ? triggerIndex < range.bodyStart : triggerIndex < range.opening))
     .sort((left, right) => left.opening - right.opening)[0] || null;
 };
 
@@ -869,28 +933,152 @@ const findStatementRange = (tokens, triggerIndex) => {
   return { start, end: findStatementEnd(tokens, start, tokens.length), opening: null };
 };
 
+const isNegatedDeadlineCondition = (tokens, conditionStart, triggerIndex) => {
+  let cursor = triggerIndex - 1;
+  while (cursor >= conditionStart && tokens[cursor].value === '(') cursor -= 1;
+  let negated = false;
+  while (cursor >= conditionStart && tokens[cursor].value === '!') {
+    negated = !negated;
+    cursor -= 1;
+    while (cursor >= conditionStart && tokens[cursor].value === '(') cursor -= 1;
+  }
+  return negated;
+};
+
+const branchRange = (tokens, start, end, pairs) => {
+  if (start >= end) return { start, end, opening: null };
+  if (tokens[start].value !== '{') return { start, end, opening: null };
+  const closing = pairs.get(start);
+  if (closing === undefined || closing >= end) return { start: start + 1, end, opening: start };
+  return { start: start + 1, end: closing, opening: start };
+};
+
+const findConditionalExpressionDecision = (tokens, triggerIndex, start, end, pairs) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let questionIndex;
+  for (let index = triggerIndex + 1; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (value === '?' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      questionIndex = index;
+      break;
+    }
+  }
+  if (questionIndex === undefined) return null;
+  let nestedQuestions = 0;
+  let colonIndex;
+  parenDepth = 0;
+  braceDepth = 0;
+  bracketDepth = 0;
+  for (let index = questionIndex + 1; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === '?') nestedQuestions += 1;
+    else if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === ':') {
+      if (nestedQuestions === 0) {
+        colonIndex = index;
+        break;
+      }
+      nestedQuestions -= 1;
+    }
+  }
+  if (colonIndex === undefined) return null;
+  const negated = isNegatedDeadlineCondition(tokens, start, triggerIndex);
+  const selectedStart = negated ? colonIndex + 1 : questionIndex + 1;
+  const selectedEnd = negated ? end : colonIndex;
+  return { ...branchRange(tokens, selectedStart, selectedEnd, pairs), opening: null };
+};
+
+const findSwitchDecision = (tokens, triggerIndex, pairs) => {
+  let best = null;
+  for (let index = triggerIndex - 1; index >= 0; index -= 1) {
+    if (tokens[index].value !== 'switch' || tokens[index + 1]?.value !== '(') continue;
+    const conditionEnd = pairs.get(index + 1);
+    const opening = conditionEnd === undefined ? undefined : conditionEnd + 1;
+    const closing = opening === undefined ? undefined : pairs.get(opening);
+    if (opening === undefined || tokens[opening]?.value !== '{' || closing === undefined
+      || triggerIndex <= opening || triggerIndex >= closing) continue;
+    if (!best || closing - opening < best.closing - best.opening) best = { opening, closing };
+  }
+  if (!best) return null;
+  const labels = [];
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  for (let index = best.opening + 1; index < best.closing; index += 1) {
+    const value = tokens[index].value;
+    if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+    else if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0 && (value === 'case' || value === 'default')) {
+      let colon = index + 1;
+      while (colon < best.closing && tokens[colon].value !== ':') colon += 1;
+      labels.push({ index, start: Math.min(colon + 1, best.closing) });
+      index = colon;
+    }
+  }
+  const matchingLabels = labels.filter(candidate => candidate.index <= triggerIndex);
+  const label = matchingLabels[matchingLabels.length - 1];
+  if (!label) return null;
+  const labelPosition = labels.indexOf(label);
+  const next = labels[labelPosition + 1];
+  return { start: label.start, end: next?.index ?? best.closing, opening: best.opening };
+};
+
 const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) => {
   const ifDecision = findIfDecision(tokens, triggerIndex, pairs);
   if (ifDecision) {
-    const bodyStart = ifDecision.closingCondition + 1;
-    if (tokens[bodyStart]?.value === '{') {
-      return {
-        start: bodyStart + 1,
-        end: pairs.get(bodyStart) ?? tokens.length,
-        opening: bodyStart
-      };
-    }
-    return {
-      start: bodyStart,
-      end: findControlledStatementEnd(tokens, bodyStart, tokens.length, pairs),
-      opening: null
-    };
+    const conditionStart = ifDecision.start + 2;
+    const consequentStart = ifDecision.closingCondition + 1;
+    const consequentEnd = findControlledStatementEnd(tokens, consequentStart, tokens.length, pairs, false);
+    const alternateStart = tokens[consequentEnd]?.value === 'else' ? consequentEnd + 1 : consequentEnd;
+    const negated = isNegatedDeadlineCondition(tokens, conditionStart, triggerIndex);
+    if (negated && alternateStart === consequentEnd) return { start: consequentEnd, end: consequentEnd, opening: null };
+    return branchRange(
+      tokens,
+      negated ? alternateStart : consequentStart,
+      negated ? findControlledStatementEnd(tokens, alternateStart, tokens.length, pairs) : consequentEnd,
+      pairs
+    );
   }
+  const switchDecision = findSwitchDecision(tokens, triggerIndex, pairs);
+  if (switchDecision) return switchDecision;
   const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
   if (functionDecision) {
+    if (functionDecision.expression) {
+      return findConditionalExpressionDecision(
+        tokens,
+        triggerIndex,
+        functionDecision.bodyStart,
+        functionDecision.bodyEnd,
+        pairs
+      ) || { start: functionDecision.bodyStart, end: functionDecision.bodyEnd, opening: null };
+    }
+    const statement = findStatementRange(tokens, triggerIndex);
+    const conditional = findConditionalExpressionDecision(tokens, triggerIndex, statement.start, statement.end, pairs);
+    if (conditional) return conditional;
+    if (triggerIndex < functionDecision.opening) {
+      return { start: functionDecision.opening, end: functionDecision.opening, opening: null };
+    }
     return { start: functionDecision.opening + 1, end: functionDecision.closing, opening: functionDecision.opening };
   }
-  return findStatementRange(tokens, triggerIndex);
+  const statement = findStatementRange(tokens, triggerIndex);
+  return findConditionalExpressionDecision(tokens, triggerIndex, statement.start, statement.end, pairs) || statement;
 };
 
 const isBoundaryWriter = value => /boundary|readiness/i.test(value);
@@ -903,14 +1091,14 @@ const BOUNDARY_WRITER_STATE_ARGUMENTS = new Map([
 
 const boundaryWriterStateArgument = value => BOUNDARY_WRITER_STATE_ARGUMENTS.get(value) ?? 1;
 
-const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument) => {
+const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, aliases = new Set()) => {
   let argumentStart = opening + 1;
   let argumentIndex = 0;
   let parenDepth = 0;
   let braceDepth = 0;
   let bracketDepth = 0;
   const check = argumentEnd => argumentIndex === stateArgument
-    && valueHasGap(tokens, argumentStart, argumentEnd, pairs);
+    && valueHasGap(tokens, argumentStart, argumentEnd, pairs, aliases);
   for (let index = opening + 1; index < closing; index += 1) {
     const value = tokens[index].value;
     if (value === '(') parenDepth += 1;
@@ -928,7 +1116,8 @@ const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument) => {
   return check(closing);
 };
 
-const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges) => {
+const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, aliases = new Set()) => {
+  const knownAliases = new Set(aliases);
   const nestedFunctionStarts = new Map(functionRanges
     .filter(range => range.opening !== opening && range.start >= start && range.opening < end)
     .map(range => [range.start, range]));
@@ -942,14 +1131,16 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges) => {
     if (token.value === 'return') {
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
-      if (valueHasGap(tokens, expressionStart, statementEnd, pairs)) return true;
+      if (valueHasGap(tokens, expressionStart, statementEnd, pairs, knownAliases)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
-    if (token.type === 'identifier' && OUTCOME_NAMES.has(token.value)
+    if (token.type === 'identifier' && tokens[index - 1]?.value !== '.'
       && tokens[index + 1]?.value === '=') {
       const statementEnd = findStatementEnd(tokens, index + 2, end);
-      if (valueHasGap(tokens, index + 2, statementEnd, pairs)) return true;
+      const assignedGap = valueHasGap(tokens, index + 2, statementEnd, pairs, knownAliases);
+      if (assignedGap) knownAliases.add(token.value);
+      if (assignedGap && OUTCOME_NAMES.has(token.value)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
@@ -957,10 +1148,10 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges) => {
       && tokens[index + 1]?.value === '(' && tokens[index - 1]?.value !== 'function') {
       const closing = pairs.get(index + 1);
       if (closing !== undefined && closing < end
-        && callHasGapArgument(tokens, index + 1, closing, pairs, boundaryWriterStateArgument(token.value))) return true;
+        && callHasGapArgument(tokens, index + 1, closing, pairs, boundaryWriterStateArgument(token.value), knownAliases)) return true;
     }
   }
-  return false;
+  return opening === null && valueHasGap(tokens, start, end, pairs, knownAliases);
 };
 
 const isDeadlineTriggerAt = (tokens, index) => {
@@ -975,16 +1166,66 @@ const isDeadlineTriggerAt = (tokens, index) => {
     && tokens[index + 6]?.value === 'deadline';
 };
 
+const findAssignedAlias = (tokens, triggerIndex) => {
+  if (tokens[triggerIndex - 1]?.value === '=>' || tokens[triggerIndex + 1]?.value === '=>') return null;
+  let statementStart = triggerIndex;
+  while (statementStart > 0 && ![';', '{', '}'].includes(tokens[statementStart - 1].value)) statementStart -= 1;
+  for (let index = statementStart; index < triggerIndex; index += 1) {
+    if (tokens[index].value === '=>') return null;
+    if (tokens[index].value !== '=' || tokens[index - 1]?.type !== 'identifier' || tokens[index - 2]?.value === '.') continue;
+    return { name: tokens[index - 1].value, index: index - 1 };
+  }
+  return null;
+};
+
+const isConditionalDeadlineUse = (tokens, triggerIndex, pairs, functionRanges) => {
+  if (findIfDecision(tokens, triggerIndex, pairs) || findSwitchDecision(tokens, triggerIndex, pairs)) return true;
+  const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
+  if (functionDecision?.expression) {
+    return Boolean(findConditionalExpressionDecision(
+      tokens,
+      triggerIndex,
+      functionDecision.bodyStart,
+      functionDecision.bodyEnd,
+      pairs
+    ));
+  }
+  const statement = findStatementRange(tokens, triggerIndex);
+  return Boolean(findConditionalExpressionDecision(tokens, triggerIndex, statement.start, statement.end, pairs));
+};
+
 const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source }) => {
   const tokens = tokenizeSource(source);
   const pairs = findTokenPairs(tokens);
   const functionRanges = findFunctionRanges(tokens, pairs);
   const lines = new Set();
+  const deadlineAliases = new Map();
   for (let index = 0; index < tokens.length; index += 1) {
     if (!isDeadlineTriggerAt(tokens, index)) continue;
+    const alias = findAssignedAlias(tokens, index);
+    if (alias) {
+      deadlineAliases.set(alias.name, alias);
+      if (isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) {
+        const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
+        if (hasGapOutcome(tokens, decision.start, decision.end, decision.opening, pairs, functionRanges)) {
+          lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
+        }
+      }
+      continue;
+    }
     const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
     if (hasGapOutcome(tokens, decision.start, decision.end, decision.opening, pairs, functionRanges)) {
       lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
+    }
+  }
+  for (const alias of deadlineAliases.values()) {
+    for (let index = 0; index < tokens.length; index += 1) {
+      if (index === alias.index || tokens[index].value !== alias.name || tokens[index - 1]?.value === '.') continue;
+      if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
+      const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
+      if (hasGapOutcome(tokens, decision.start, decision.end, decision.opening, pairs, functionRanges)) {
+        lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
+      }
     }
   }
   return [...lines].sort((left, right) => left - right).map(line => `${relative}:${line}`);
@@ -1222,6 +1463,63 @@ test('deadline policy inventory catches new owners while allowing unavailable cl
     'discord/adjacent-classifier-call.js:1',
     'discord/new-timestamp-owner.js:1',
     'discord/new-string-timestamp-owner.js:1'
+  ]);
+});
+
+test('deadline policy inventory follows aliases and selected control arms', () => {
+  const entries = [
+    {
+      relative: 'discord/parenthesized-object-property.js',
+      source: 'if (deadlineReached) return { state: (READINESS.GAP) };'
+    },
+    {
+      relative: 'discord/concise-arrow-gap.js',
+      source: 'const decide = deadlineReached => deadlineReached ? READINESS.GAP : READINESS.READY;'
+    },
+    {
+      relative: 'discord/aliased-classifier-gap.js',
+      source: 'const nextState = deadlineReached ? READINESS.GAP : READINESS.READY;'
+    },
+    {
+      relative: 'discord/aliased-writer-gap.js',
+      source: 'if (deadlineReached) { const nextState = READINESS.GAP; recordBoundary(binding, null, nextState, detail); }'
+    },
+    {
+      relative: 'discord/negated-deadline-gap.js',
+      source: 'if (!deadlineReached) return READINESS.READY; else return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/aliased-deadline-gap.js',
+      source: 'const expired = Date.now() >= deadline; if (expired) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/comparison-gap-negative.js',
+      source: 'if (deadlineReached) return current === READINESS.GAP ? READINESS.UNAVAILABLE : READINESS.PENDING;'
+    },
+    {
+      relative: 'discord/non-deadline-else-negative.js',
+      source: 'if (deadlineReached) return READINESS.UNAVAILABLE; else return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/switch-arm-negative.js',
+      source: 'switch (kind) { case DEADLINE: return READINESS.UNAVAILABLE; default: return READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/normal-ternary-negative.js',
+      source: 'function decide() { return Date.now() >= deadline ? READINESS.UNAVAILABLE : READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/parameter-ternary-negative.js',
+      source: 'function decide(deadlineReached) { return deadlineReached ? READINESS.UNAVAILABLE : READINESS.GAP; }'
+    }
+  ];
+  assert.deepEqual(findDeadlineGapOffenders(entries), [
+    'discord/parenthesized-object-property.js:1',
+    'discord/concise-arrow-gap.js:1',
+    'discord/aliased-classifier-gap.js:1',
+    'discord/aliased-writer-gap.js:1',
+    'discord/negated-deadline-gap.js:1',
+    'discord/aliased-deadline-gap.js:1'
   ]);
 });
 
