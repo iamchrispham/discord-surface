@@ -417,11 +417,22 @@ function isSplitRoomDigitPolicy(node, sourceFile, pattern, bindings) {
 
 function hasAsciiDigitPattern(pattern) {
   if (/\\[dD]/.test(pattern)) return true;
+  if (/\\p\{(?:Decimal_Number|Nd)\}/.test(pattern)) return true;
   const classes = pattern.match(/\[(?:\^)?([^\]]*)\]/g) || [];
   return classes.some(characterClass => {
     const body = characterClass.replace(/^\[\^?/, '').replace(/\]$/, '');
     return /[0-9]-[0-9]/.test(body) || /[0-9]{2,}/.test(body);
   });
+}
+
+function resolveStringValue(expression, bindings, seen = new Set()) {
+  const value = unwrapPolicyExpression(expression);
+  if (ts.isStringLiteralLike(value)) return value.text;
+  if (!ts.isIdentifier(value)) return null;
+  const binding = resolveBinding(value, bindings);
+  if (!binding || seen.has(binding) || !binding.initializer) return null;
+  seen.add(binding);
+  return resolveStringValue(binding.initializer, bindings, seen);
 }
 
 function legacyRoomDigitPolicies(records) {
@@ -434,8 +445,8 @@ function legacyRoomDigitPolicies(records) {
       if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
       else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
           ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
-          node.arguments?.length && ts.isStringLiteralLike(node.arguments[0])) {
-        pattern = node.arguments[0].text;
+          node.arguments?.length) {
+        pattern = resolveStringValue(node.arguments[0], bindings);
       }
       const roomPolicy = pattern !== null && hasAsciiDigitPattern(pattern) &&
         (isTownHallRoomOwner(node, ast, bindings) || roomFieldSubject(node, ast, bindings) ||
@@ -632,6 +643,24 @@ function roomDigitPolicies(records) {
     importVisit(info.ast);
 
     const commonJsImport = node => {
+      if (
+        ts.isImportEqualsDeclaration(node) &&
+        ts.isExternalModuleReference(node.moduleReference) &&
+        node.moduleReference.expression &&
+        ts.isStringLiteralLike(node.moduleReference.expression)
+      ) {
+        const name = node.name.text;
+        const specifier = node.moduleReference.expression.text;
+        info.imports.set(name, { specifier, imported: 'default', commonJs: true });
+        info.bindings.push({
+          name,
+          kind: 'commonjs-import',
+          declaration: node.name,
+          scope: info.ast,
+          specifier,
+          imported: 'default',
+        });
+      }
       if (ts.isVariableStatement(node)) {
         for (const declaration of node.declarationList.declarations) {
           const initializer = declaration.initializer;
@@ -731,13 +760,15 @@ function roomDigitPolicies(records) {
       info.exports.set(exportName, fn);
       info.functionDefs.push(fn);
     };
+    const regexBindings = collectBindings(info.ast);
     const regexExpression = expression => {
       const value = unwrapPolicyExpression(expression);
       if (ts.isRegularExpressionLiteral(value)) return { node: value, pattern: value.text };
       if ((ts.isNewExpression(value) || ts.isCallExpression(value)) &&
           ts.isIdentifier(value.expression) && value.expression.text === 'RegExp' &&
-          value.arguments?.length && ts.isStringLiteralLike(value.arguments[0])) {
-        return { node: value, pattern: value.arguments[0].text };
+          value.arguments?.length) {
+        const pattern = resolveStringValue(value.arguments[0], regexBindings);
+        if (pattern !== null) return { node: value, pattern };
       }
       return null;
     };
@@ -803,6 +834,8 @@ function roomDigitPolicies(records) {
           indexCommonJsFunction('default', statement.expression);
         } else if (regexExpression(statement.expression)) {
           indexCommonJsRegex('default', statement.expression);
+        } else if (statement.isExportEquals && ts.isIdentifier(statement.expression)) {
+          info.exports.set('default', statement.expression.text);
         } else if (!statement.isExportEquals && ts.isObjectLiteralExpression(statement.expression)) {
           for (const property of statement.expression.properties) {
             if (ts.isMethodDeclaration(property) &&
@@ -1344,8 +1377,8 @@ function roomDigitPolicies(records) {
       if (ts.isRegularExpressionLiteral(node)) pattern = node.text;
       else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
           ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
-          node.arguments?.length && ts.isStringLiteralLike(node.arguments[0])) {
-        pattern = node.arguments[0].text;
+          node.arguments?.length) {
+        pattern = resolveStringValue(node.arguments[0], legacyBindings);
       }
       if (pattern !== null && hasAsciiDigitPattern(pattern)) {
         const legacyPolicy = isTownHallRoomOwner(node, info.ast, legacyBindings) ||
@@ -1971,6 +2004,110 @@ test('room policy inventory records only town-hall room validators', () => {
     namespaceRegexHelper,
     namespaceRegexNegativeConsumer,
   ]), expectedPolicies);
+  const cjsRuntimeRegexHelper = {
+    file: 'peer/cjs-runtime-room-regex.cts',
+    text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const cjsRuntimeRegexConsumer = {
+    file: 'peer/cjs-runtime-room-consumer.cts',
+    text: "import { ROOM_ID } from './cjs-runtime-room-regex.cjs'; function validateRoom(room) { return ROOM_ID.test(room.guildId); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    cjsRuntimeRegexHelper,
+    cjsRuntimeRegexConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/cjs-runtime-room-regex.cts': 1,
+  });
+  const cjsRuntimeRegexNegativeConsumer = {
+    file: 'peer/cjs-runtime-room-negative-consumer.cts',
+    text: "import { ROOM_ID } from './cjs-runtime-room-regex.cjs'; function inspectRoom(room) { return ROOM_ID.test(room.name); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    cjsRuntimeRegexHelper,
+    cjsRuntimeRegexNegativeConsumer,
+  ]), expectedPolicies);
+  const mjsRuntimeRegexHelper = {
+    file: 'peer/mjs-runtime-room-regex.mts',
+    text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const mjsRuntimeRegexConsumer = {
+    file: 'peer/mjs-runtime-room-consumer.mts',
+    text: "import { ROOM_ID } from './mjs-runtime-room-regex.mjs'; function validateRoom(room) { return ROOM_ID.test(room.guildId); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    mjsRuntimeRegexHelper,
+    mjsRuntimeRegexConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/mjs-runtime-room-regex.mts': 1,
+  });
+  const importEqualsRegexHelper = {
+    file: 'peer/import-equals-room-regex.cts',
+    text: String.raw`const ROOM_ID = /^\d{1,21}$/; export = ROOM_ID;`,
+  };
+  const importEqualsRegexConsumer = {
+    file: 'peer/import-equals-room-consumer.cts',
+    text: "import ROOM_ID = require('./import-equals-room-regex.cjs'); function validateRoom(room) { return ROOM_ID.test(room.guildId); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importEqualsRegexHelper,
+    importEqualsRegexConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/import-equals-room-regex.cts': 1,
+  });
+  const importEqualsRegexNegativeConsumer = {
+    file: 'peer/import-equals-room-negative-consumer.cts',
+    text: "import ROOM_ID = require('./import-equals-room-regex.cjs'); function inspectRoom(room) { return ROOM_ID.test(room.name); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importEqualsRegexHelper,
+    importEqualsRegexNegativeConsumer,
+  ]), expectedPolicies);
+  const boundRegexStringRoom = {
+    file: 'peer/bound-regex-string-room.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      const SOURCE = '^\\d{1,21}$';
+      const ROOM_ID = new RegExp(SOURCE);
+      return ROOM_ID.test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, boundRegexStringRoom]), {
+    ...expectedPolicies,
+    'peer/bound-regex-string-room.ts': 1,
+  });
+  const boundRegexStringNegativeRoom = {
+    file: 'peer/bound-regex-string-negative-room.ts',
+    text: String.raw`function inspectRoom(room) {
+      const SOURCE = '^\\d{1,21}$';
+      const ROOM_ID = new RegExp(SOURCE);
+      return ROOM_ID.test(room.name);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, boundRegexStringNegativeRoom]), expectedPolicies);
+  const unicodeDecimalRoom = {
+    file: 'peer/unicode-decimal-room.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return /^\p{Decimal_Number}{1,20}$/u.test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, unicodeDecimalRoom]), {
+    ...expectedPolicies,
+    'peer/unicode-decimal-room.ts': 1,
+  });
+  const unicodeDecimalNegativeRoom = {
+    file: 'peer/unicode-decimal-negative-room.ts',
+    text: String.raw`function inspectRoom(room) {
+      return /^\p{Decimal_Number}{1,20}$/u.test(room.name);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, unicodeDecimalNegativeRoom]), expectedPolicies);
   const shadowedRegex = {
     file: 'peer/snowflake.ts',
     text: String.raw`const ROOM_ID = /^\d+$/;
