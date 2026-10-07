@@ -423,11 +423,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       return Boolean(node.body);
     }
     if (ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)) {
-      const initializer = node.initializer && unwrapExpression(node.initializer);
-      return Boolean(initializer)
-        && (ts.isFunctionExpression(initializer)
-          || ts.isArrowFunction(initializer)
-          || ts.isClassExpression(initializer));
+      return Boolean(node.initializer) && isImplementationExpression(node.initializer);
     }
     return false;
   }
@@ -442,7 +438,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       }
       if (ts.isFunctionExpression(node) && node.name) names.push(node.name.text);
       if ((ts.isClassDeclaration(node) || ts.isClassExpression(node)) && node.name) {
-        if (!hasDeclareModifier(node)) names.push(node.name.text);
+        if (!hasDeclareModifier(node) && !hasAmbientAncestor(node)) names.push(node.name.text);
       }
       if (ts.isVariableDeclaration(node)
         && ts.isIdentifier(node.name)
@@ -500,6 +496,15 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   assert.equal(declaredNames(ownerAst).filter(name => name === 'captureProcessOwnerIdentity').length, 1);
 
   const methodControls = [
+    ['ambient namespace class', 'declare namespace Types { export class captureProcessOwnerIdentity {} }', false, ts.ScriptKind.TS],
+    ['runtime class declaration', 'class captureProcessOwnerIdentity {}', true],
+    ['runtime namespace class', 'namespace Types { export class captureProcessOwnerIdentity {} }', true, ts.ScriptKind.TS],
+    ['class wrapped function member', 'class Example { captureProcessOwnerIdentity = (function () {}); }', true],
+    ['class arrow member', 'class Example { captureProcessOwnerIdentity = () => null; }', true],
+    ['class anonymous class member', 'class Example { captureProcessOwnerIdentity = class {}; }', true],
+    ['class value member', 'class Example { captureProcessOwnerIdentity = null; }', false],
+    ['class alias member', 'class Example { captureProcessOwnerIdentity = importedCapture; }', false],
+    ['ambient namespace member', 'declare namespace Types { export class Example { captureProcessOwnerIdentity = () => null; } }', false, ts.ScriptKind.TS],
     ['class method', 'class Example { captureProcessOwnerIdentity() {} }', true],
     ['class string method', "class Example { 'captureProcessOwnerIdentity'() {} }", true],
     ['class concatenated computed method', "class Example { ['captureProcessOwner' + 'Identity']() {} }", true],
