@@ -132,6 +132,97 @@ module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
 });
 
+test('rejects array destructuring writes to callable bindings', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  let hidden = (state, value) => value;
+  [hidden] = [0];
+  return { hidden };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects object destructuring writes to callable bindings', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  let hidden = (state, value) => value;
+  ({ hidden } = { hidden: 0 });
+  return { hidden };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects destructured property writes to returned handlers', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  const handlers = { hidden(state, value) {} };
+  [handlers.hidden] = [0];
+  return handlers;
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects mutations through destructured handler aliases', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  const handlers = { hidden(state, value) {} };
+  const [alias] = [handlers];
+  alias.hidden = 0;
+  return handlers;
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects generator companion factories', () => {
+  const discovery = discoverTempFactory(`function* createFakeHandlers() {
+  return { hidden(state, value) {} };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects reassigned exported factory bindings', () => {
+  const discovery = discoverTempFactory(`let createFakeHandlers = () => ({ hidden(state, value) {} });
+createFakeHandlers = () => ({});
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects factory branches with different state positions', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  if (enabled) return { hidden(state, value) {} };
+  return { hidden(deps, state, value) {} };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects shadowed arguments-object forwarding', () => {
+  const text = insert('newForward(arguments) { return configurationHandlers.setConfig.call(this, ...arguments); }');
+  assert.equal(matchesWithAddedBaseline(text), false);
+});
+
+test('keeps the first export-star factory owner', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-export-star-'));
+  try {
+    fs.writeFileSync(path.join(root, 'first.js'), `function createFakeHandlers() { return {}; }
+module.exports = { createFakeHandlers };`);
+    fs.writeFileSync(path.join(root, 'second.js'), `function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = { createFakeHandlers };`);
+    fs.writeFileSync(path.join(root, 'companion.js'), `__exportStar(require('./first'), exports);
+__exportStar(require('./second'), exports);`);
+    const ownerPath = path.join(root, 'owner.js');
+    const ownerSource = ts.createSourceFile(ownerPath, `const { createFakeHandlers } = require('./companion');
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {`, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    assert.equal(discoverFactory(ownerSource, 'createWrapper').approved, false);
+  }
+  finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('keeps later unbound state parameters marked unsafe', () => {
   const discovery = discoverTempFactory(`function createFakeHandlers() {
   return { hidden(deps, state, value) {} };

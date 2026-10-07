@@ -15,21 +15,33 @@ function propertyName(name) {
 }
 
 function factoryDeclaration(source, factoryName) {
+  let candidate = null;
+  let binding = null;
   for (const statement of source.statements) {
-    if (ts.isFunctionDeclaration(statement) && statement.name?.text === factoryName) return statement;
+    if (ts.isFunctionDeclaration(statement) && statement.name?.text === factoryName) {
+      candidate = statement;
+      binding = statement;
+      break;
+    }
     if (!ts.isVariableStatement(statement)) continue;
     for (const declaration of statement.declarationList.declarations) {
       if (ts.isIdentifier(declaration.name) && declaration.name.text === factoryName &&
           declaration.initializer && (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer))) {
-        return declaration.initializer;
+        candidate = declaration.initializer;
+        binding = declaration;
+        break;
       }
     }
+    if (candidate) break;
   }
-  return null;
+  if (!candidate) return null;
+  const declarations = callableDeclarations(source, null);
+  const mutated = mutatedDeclarations(source, declarations, source);
+  return mutated.has(binding) ? null : candidate;
 }
 
 function isAsyncFactory(node) {
-  return !!node?.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword);
+  return !!node?.asteriskToken || !!node?.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword);
 }
 
 function usesThisExpression(node) {
@@ -70,8 +82,15 @@ function scopeNode(node) {
   return current;
 }
 
+function variableDeclarationNode(declaration) {
+  let current = declaration;
+  while (current && !ts.isVariableDeclaration(current)) current = current.parent;
+  return current;
+}
+
 function isVarDeclaration(declaration) {
-  const list = declaration?.parent;
+  const variable = variableDeclarationNode(declaration);
+  const list = variable?.parent;
   if (!list || !ts.isVariableDeclarationList(list)) return false;
   return (list.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) === 0;
 }
@@ -81,6 +100,126 @@ function declarationScope(declaration) {
   let current = declaration.parent;
   while (current && !ts.isSourceFile(current) && !ts.isFunctionLike(current)) current = current.parent;
   return current;
+}
+
+function targetExpressions(expression) {
+  const targets = [];
+  const visit = node => {
+    if (!node) return;
+    if (ts.isParenthesizedExpression(node)) {
+      visit(node.expression);
+      return;
+    }
+    if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      targets.push(node);
+      return;
+    }
+    if (ts.isBindingElement(node)) {
+      visit(node.name);
+      return;
+    }
+    if (ts.isShorthandPropertyAssignment(node)) {
+      visit(node.name);
+      return;
+    }
+    if (ts.isPropertyAssignment(node)) {
+      visit(node.initializer);
+      return;
+    }
+    if (ts.isSpreadElement(node) || ts.isSpreadAssignment(node)) {
+      visit(node.expression);
+      return;
+    }
+    if (ts.isArrayBindingPattern(node) || ts.isObjectBindingPattern(node) ||
+        ts.isArrayLiteralExpression(node) || ts.isObjectLiteralExpression(node)) {
+      ts.forEachChild(node, visit);
+    }
+  };
+  visit(expression);
+  return targets;
+}
+
+function bindingIdentifiers(pattern) {
+  return targetExpressions(pattern).filter(ts.isIdentifier);
+}
+
+function unwrapExpression(expression) {
+  let current = expression;
+  while (current && ts.isParenthesizedExpression(current)) current = current.expression;
+  return current;
+}
+
+function arrayElementValue(expression, index) {
+  const value = unwrapExpression(expression);
+  return value && ts.isArrayLiteralExpression(value) ? value.elements[index] || null : value;
+}
+
+function objectPropertyKey(property) {
+  if (ts.isBindingElement(property)) return propertyName(property.propertyName || property.name);
+  if (ts.isShorthandPropertyAssignment(property)) return propertyName(property.name);
+  if (ts.isPropertyAssignment(property)) return propertyName(property.name);
+  return null;
+}
+
+function objectPropertyValue(expression, key) {
+  const value = unwrapExpression(expression);
+  if (!value || !ts.isObjectLiteralExpression(value)) return value;
+  for (const property of value.properties) {
+    if (objectPropertyKey(property) !== key) continue;
+    if (ts.isBindingElement(property)) return property.initializer || property.name;
+    if (ts.isShorthandPropertyAssignment(property)) return property.name;
+    if (ts.isPropertyAssignment(property)) return property.initializer;
+  }
+  return null;
+}
+
+function destructuredBindings(pattern, initializer) {
+  const pairs = [];
+  const walk = (target, value) => {
+    if (!target || !value) return;
+    const current = unwrapExpression(target);
+    if (ts.isIdentifier(current)) {
+      pairs.push([current, value]);
+      return;
+    }
+    if (ts.isBindingElement(current)) {
+      walk(current.name, current.initializer ? value : value);
+      return;
+    }
+    if (ts.isArrayBindingPattern(current) || ts.isArrayLiteralExpression(current)) {
+      current.elements.forEach((element, index) => {
+        if (!element) return;
+        const selected = ts.isSpreadElement(element)
+          ? value
+          : arrayElementValue(value, index);
+        walk(element, selected);
+      });
+      return;
+    }
+    if (ts.isObjectBindingPattern(current) || ts.isObjectLiteralExpression(current)) {
+      const properties = ts.isObjectBindingPattern(current) ? current.elements : current.properties;
+      for (const property of properties) {
+        const key = objectPropertyKey(property);
+        const selected = key === null ? value : objectPropertyValue(value, key);
+        if (ts.isSpreadAssignment(property) || ts.isSpreadElement(property)) {
+          walk(property.expression, value);
+        }
+        else if (ts.isBindingElement(property)) walk(property, selected);
+        else if (ts.isShorthandPropertyAssignment(property)) walk(property.name, selected);
+        else if (ts.isPropertyAssignment(property)) walk(property.initializer, selected);
+      }
+    }
+  };
+  walk(pattern, initializer);
+  return pairs;
+}
+
+function bindingInitializer(identifier) {
+  let current = identifier;
+  while (current && !ts.isVariableDeclaration(current)) current = current.parent;
+  if (!current?.initializer) return null;
+  return destructuredBindings(current.name, current.initializer)
+    .find(([binding]) => binding === identifier)?.[1] || null;
 }
 
 function callableDeclarations(source, factory) {
@@ -94,8 +233,9 @@ function callableDeclarations(source, factory) {
       return;
     }
     if (ts.isFunctionLike(node)) return;
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-      add(node.name.text, node);
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      if (ts.isIdentifier(node.name)) add(node.name.text, node);
+      else for (const identifier of bindingIdentifiers(node.name)) add(identifier.text, identifier);
     }
     ts.forEachChild(node, visitSource);
   };
@@ -107,8 +247,9 @@ function callableDeclarations(source, factory) {
       return;
     }
     if (ts.isFunctionDeclaration(node)) add(node.name?.text, node);
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-      add(node.name.text, node);
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      if (ts.isIdentifier(node.name)) add(node.name.text, node);
+      else for (const identifier of bindingIdentifiers(node.name)) add(identifier.text, identifier);
     }
     ts.forEachChild(node, visitFactory);
   };
@@ -166,9 +307,11 @@ function mutatedDeclarations(factory, declarations, source) {
     ts.SyntaxKind.QuestionQuestionEqualsToken
   ]);
   const mark = expression => {
-    const identifier = rootIdentifier(expression);
-    const declaration = declarationForIdentifier(declarations, identifier, source);
-    if (declaration) mutated.add(declaration);
+    for (const target of targetExpressions(expression)) {
+      const identifier = rootIdentifier(target);
+      const declaration = declarationForIdentifier(declarations, identifier, source);
+      if (declaration) mutated.add(declaration);
+    }
   };
   const link = (left, right) => {
     const leftDeclaration = declarationForIdentifier(declarations, rootIdentifier(left), source);
@@ -178,6 +321,14 @@ function mutatedDeclarations(factory, declarations, source) {
     if (!aliases.has(rightDeclaration)) aliases.set(rightDeclaration, new Set());
     aliases.get(leftDeclaration).add(rightDeclaration);
     aliases.get(rightDeclaration).add(leftDeclaration);
+  };
+  const linkDestructured = (pattern, initializer) => {
+    const pairs = destructuredBindings(pattern, initializer);
+    if (pairs.length) {
+      for (const [left, right] of pairs) link(left, right);
+      return;
+    }
+    link(pattern, initializer);
   };
   const varDeclarations = new Map();
   for (const item of declarations) {
@@ -191,12 +342,12 @@ function mutatedDeclarations(factory, declarations, source) {
   }
   const visit = node => {
     if (node !== factory && ts.isFunctionLike(node)) return;
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-      link(node.name, node.initializer);
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      linkDestructured(node.name, node.initializer);
     }
     if (ts.isBinaryExpression(node) && assignmentOperators.has(node.operatorToken.kind)) mark(node.left);
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-      link(node.left, node.right);
+      linkDestructured(node.left, node.right);
     }
     if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
         [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator)) {
@@ -268,9 +419,10 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
       if (mutated.has(declaration)) return null;
       if (resolving.has(declaration)) return null;
       resolving.add(declaration);
-      const resolved = ts.isVariableDeclaration(declaration)
-        ? resolveValue(declaration.initializer)
-        : callableDescriptor(declaration);
+      let resolved;
+      if (ts.isVariableDeclaration(declaration)) resolved = resolveValue(declaration.initializer);
+      else if (ts.isIdentifier(declaration)) resolved = resolveValue(bindingInitializer(declaration));
+      else resolved = callableDescriptor(declaration);
       resolving.delete(declaration);
       return resolved;
     }
@@ -363,7 +515,8 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
       const candidate = branch.get(method);
       return candidate && candidate.style === descriptor.style &&
         candidate.requiredArguments === descriptor.requiredArguments &&
-        candidate.parameterCount === descriptor.parameterCount;
+        candidate.parameterCount === descriptor.parameterCount &&
+        candidate.stateParameterIndex === descriptor.stateParameterIndex;
     })) {
       methods.set(method, descriptor);
     }
@@ -506,16 +659,34 @@ function exportedFactoryExpression(source, factoryName) {
   return result;
 }
 
-function reexportedModulePath(source) {
-  let result = null;
+function reexportedModulePaths(source) {
+  const paths = [];
   const visit = node => {
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === '__exportStar') {
-      result = directRequire(node.arguments[0]) || result;
+      const modulePath = directRequire(node.arguments[0]);
+      if (modulePath) paths.push(modulePath);
     }
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return result;
+  return paths;
+}
+
+function moduleExportsFactory(filePath, factoryName, seen = new Set()) {
+  if (seen.has(filePath)) return false;
+  seen.add(filePath);
+  try {
+    const text = fs.readFileSync(filePath, 'utf8');
+    const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    if (exportedFactoryExpression(source, factoryName)) return true;
+    return reexportedModulePaths(source).some(modulePath => {
+      const importedPath = resolveModulePath(modulePath, filePath);
+      return !!(importedPath && moduleExportsFactory(importedPath, factoryName, new Set(seen)));
+    });
+  }
+  catch {
+    return false;
+  }
 }
 
 function moduleFactoryAllowed(filePath, factoryName, seen = new Set()) {
@@ -528,9 +699,13 @@ function moduleFactoryAllowed(filePath, factoryName, seen = new Set()) {
     const exported = exportedFactoryExpression(source, factoryName);
     const bindings = requireBindings(source);
     if (!exported) {
-      const modulePath = reexportedModulePath(source);
-      const importedPath = modulePath && resolveModulePath(modulePath, filePath);
-      return !!(importedPath && moduleFactoryAllowed(importedPath, factoryName, seen));
+      for (const modulePath of reexportedModulePaths(source)) {
+        const importedPath = resolveModulePath(modulePath, filePath);
+        if (importedPath && moduleExportsFactory(importedPath, factoryName)) {
+          return moduleFactoryAllowed(importedPath, factoryName, seen);
+        }
+      }
+      return false;
     }
     let candidate = exported;
     while (ts.isParenthesizedExpression(candidate)) candidate = candidate.expression;
@@ -607,14 +782,22 @@ function moduleFactoryMethods(filePath, factoryName, seen) {
       : null;
     const binding = bindings.get(exportedName || factoryName) || receiverBinding;
     const exportedReceiver = exported && ts.isPropertyAccessExpression(exported) ? exported.expression : null;
-    const modulePath = binding?.modulePath || directRequire(exportedReceiver) || directRequire(exported) || reexportedModulePath(importedSource);
-    if (!modulePath) return new Map();
-    const importedPath = resolveModulePath(modulePath, filePath);
-    if (!importedPath) return new Map();
-    const importedName = exported && ts.isPropertyAccessExpression(exported)
-      ? exported.name.text
-      : binding?.exportName || factoryName;
-    return moduleFactoryMethods(importedPath, importedName, seen);
+    const modulePath = binding?.modulePath || directRequire(exportedReceiver) || directRequire(exported);
+    if (modulePath) {
+      const importedPath = resolveModulePath(modulePath, filePath);
+      if (!importedPath) return new Map();
+      const importedName = exported && ts.isPropertyAccessExpression(exported)
+        ? exported.name.text
+        : binding?.exportName || factoryName;
+      return moduleFactoryMethods(importedPath, importedName, seen);
+    }
+    for (const reexportPath of reexportedModulePaths(importedSource)) {
+      const reexportedPath = resolveModulePath(reexportPath, filePath);
+      if (reexportedPath && moduleExportsFactory(reexportedPath, factoryName)) {
+        return moduleFactoryMethods(reexportedPath, factoryName, seen);
+      }
+    }
+    return new Map();
   }
   catch {
     return new Map();
@@ -710,12 +893,21 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
     }
     const exported = exportedFactoryExpression(source, factoryName);
     const exportedReceiver = exported && ts.isPropertyAccessExpression(exported) ? exported.expression : null;
-    const modulePath = directRequire(exportedReceiver) || directRequire(exported) || reexportedModulePath(source);
-    const importedPath = modulePath && resolveModulePath(modulePath, sourcePath);
     const importedName = exported && ts.isPropertyAccessExpression(exported)
       ? exported.name.text
       : factoryName;
-    return !!(importedPath && moduleFactoryAllowed(importedPath, importedName));
+    const modulePath = directRequire(exportedReceiver) || directRequire(exported);
+    if (modulePath) {
+      const importedPath = resolveModulePath(modulePath, sourcePath);
+      return !!(importedPath && moduleFactoryAllowed(importedPath, importedName));
+    }
+    for (const reexportPath of reexportedModulePaths(source)) {
+      const importedPath = resolveModulePath(reexportPath, sourcePath);
+      if (importedPath && moduleExportsFactory(importedPath, factoryName)) {
+        return moduleFactoryAllowed(importedPath, factoryName);
+      }
+    }
+    return false;
   }
   if (isAsyncFactory(factory)) return false;
   if (factory.body && ts.isBlock(factory.body) && statementCanFallThrough(factory.body)) return false;

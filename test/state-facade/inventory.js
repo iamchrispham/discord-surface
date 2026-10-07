@@ -263,6 +263,8 @@ function matches(text, baseline, fileName = 'state.js') {
       const parameterCount = raw.handlerParameterCounts[target.expression.text]?.[target.name.text] || 0;
       const parameterNames = method.parameters.map(parameter => parameter.name.text);
       const argumentTexts = call.arguments.slice(1).map(argument => argument.getText(parsed));
+      const argumentsShadowed = method.parameters.some(parameter =>
+        ts.isIdentifier(parameter.name) && parameter.name.text === 'arguments');
       const restApply = dispatch.name.text === 'apply' && method.parameters.length === 1 &&
         !!method.parameters[0].dotDotDotToken && argumentTexts.length === 1 && argumentTexts[0] === parameterNames[0];
       const restCall = dispatch.name.text === 'call' && method.parameters.length === 1 &&
@@ -271,9 +273,9 @@ function matches(text, baseline, fileName = 'state.js') {
       const orderedCall = dispatch.name.text === 'call' && method.parameters.every(parameter => !parameter.dotDotDotToken) &&
         JSON.stringify(argumentTexts) === JSON.stringify(parameterNames);
       const argumentsApply = dispatch.name.text === 'apply' && method.parameters.every(parameter => !parameter.dotDotDotToken) &&
-        argumentTexts.length === 1 && argumentTexts[0] === 'arguments';
+        !argumentsShadowed && argumentTexts.length === 1 && argumentTexts[0] === 'arguments';
       const argumentsCall = dispatch.name.text === 'call' &&
-        argumentTexts.length === 1 && argumentTexts[0] === '...arguments';
+        !argumentsShadowed && argumentTexts.length === 1 && argumentTexts[0] === '...arguments';
       const directCall = dispatch.name.text !== 'call' && dispatch.name.text !== 'apply' &&
         call.arguments[0]?.kind === ts.SyntaxKind.ThisKeyword &&
         argumentTexts.length === parameterNames.length &&
@@ -284,7 +286,7 @@ function matches(text, baseline, fileName = 'state.js') {
         });
       const argumentsSpread = dispatch.name.text !== 'call' && dispatch.name.text !== 'apply' &&
         call.arguments[0]?.kind === ts.SyntaxKind.ThisKeyword &&
-        argumentTexts.length === 1 && argumentTexts[0] === '...arguments';
+        !argumentsShadowed && argumentTexts.length === 1 && argumentTexts[0] === '...arguments';
       const parameterSurfaceCovered = grandfatheredParameterShape || method.parameters.length >= parameterCount;
       let matchesStyle = false;
       if (style === INVOCATION_STYLES.THIS) {
