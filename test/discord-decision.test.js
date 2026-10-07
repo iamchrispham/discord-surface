@@ -608,6 +608,86 @@ test('authorization lookup failure remains pending for recovery', { timeout: 300
   assert.deepEqual([...recoveryCalls[0].channelIds], ['channel']);
 });
 
+test('decision recovery defers an unknown-authorization wake until an external pass', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const interactionId = 'recovery-unknown-authorization';
+  const admitted = f.state.admitDecisionClickAndBeginAuthorization({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel'),
+    applicationId: 'application',
+    token: 'recovery-unknown-token'
+  });
+  assert.equal(admitted.accepted, true);
+  let attempts = 0;
+  f.gateway.authorizeDecisionInteraction = async () => {
+    attempts += 1;
+    return null;
+  };
+
+  await f.gateway.startDecisionRecovery(new AbortController().signal, new Set(['channel']));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 1);
+  assert.equal(f.state.getDecisionClick(interactionId)?.state, 'authorization_pending');
+
+  f.gateway.authorizeDecisionInteraction = async () => {
+    attempts += 1;
+    return true;
+  };
+  await f.gateway.startDecisionRecovery(new AbortController().signal, new Set(['channel']));
+  assert.equal(attempts, 2);
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
+test('generic recovery waits for an active decision pass without a materialized projection', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const interactionId = '9001';
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  const ordinary = f.state.acceptDiscordMessage({
+    id: interactionId,
+    guildId: 'guild',
+    channelId: 'channel',
+    authorId: 'operator',
+    isBot: false,
+    attachments: [],
+    content: 'accepted decision message'
+  });
+  assert.equal(ordinary.accepted, true);
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  f.gateway.decisionConsumer.recover = () => held;
+  const reconciliation = f.gateway.reconcilePending();
+  await waitForCondition(() => Boolean(f.gateway.decisionRecoveryPromise), 'decision recovery did not start');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.dispatches.length, 0);
+
+  release([]);
+  await reconciliation;
+  assert.equal(f.dispatches.length, 1);
+});
+
 test('duplicate denial waits for the initial component defer', { timeout: 30000 }, async t => {
   let releaseCallback;
   const callbackGate = new Promise(resolve => { releaseCallback = resolve; });
@@ -635,6 +715,36 @@ test('duplicate denial waits for the initial component defer', { timeout: 30000 
   assert.match(f.callbacks[0].url, /token-defer-race-initial/);
   assert.match(f.callbacks[1].url, /token-defer-race-initial/);
   assert.doesNotMatch(f.callbacks[1].url, /token-defer-race-duplicate/);
+});
+
+test('decision recovery waits for the initial component defer before rejection', { timeout: 30000 }, async t => {
+  let releaseCallback;
+  const callbackGate = new Promise(resolve => { releaseCallback = resolve; });
+  const f = await fixture(t, {
+    callback: async (_url, options) => {
+      const body = JSON.parse(options.body);
+      if (body.type === 6) await callbackGate;
+      return { ok: true, status: 204, body: { async cancel() {} } };
+    }
+  });
+  f.gateway.authorizeDecisionInteraction = async () => false;
+  const first = f.gateway.handleInteraction(
+    component(f.presentation, 'recovery-defer-race', 0, { token: 'token-recovery-defer-initial' }),
+    new AbortController().signal
+  );
+  await waitForCondition(() => f.callbacks.length === 1, 'initial component defer did not start');
+  const recovery = f.gateway.decisionConsumer.recover(new AbortController().signal);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.callbacks.length, 1);
+
+  releaseCallback();
+  await Promise.all([first, recovery]);
+  assert.equal(f.callbacks.length, 2);
+  assert.equal(f.callbacks[0].body.type, 6);
+  assert.equal(f.callbacks[1].body.flags, 64);
+  assert.match(f.callbacks[0].url, /token-recovery-defer-initial/);
+  assert.match(f.callbacks[1].url, /token-recovery-defer-initial/);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
 });
 
 test('persisted denial wins an authorization race and prevents native dispatch', { timeout: 30000 }, async t => {

@@ -25,16 +25,28 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
         (!selectedChannels || selectedChannels.has(message.channelId) || selectedChannels.has(message.deliveryChannelId)) &&
         (!readyOnly || this.state.getMessageRoute(message.deliveryChannelId || message.channelId)?.ready ||
           isHeldDurable(message));
+      const pendingDecisions = new Map((this.state.listDecisionPendingWork?.() || [])
+        .map(click => [click.interactionId, click]));
       const decisionProjectionPending = message => {
-        const click = this.state.listDecisionPendingWork?.().find(candidate => candidate.interactionId === message.id);
+        const click = pendingDecisions.get(message.id);
         const retryable = click?.projectionOutcome == null || [
           DECISION_TRANSPORT_OUTCOMES.NOT_SENT,
           DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED,
           DECISION_TRANSPORT_OUTCOMES.UNKNOWN
         ].includes(click.projectionOutcome);
-        return Boolean(click?.canonical?.materialized && retryable);
+        return Boolean(click?.canonical?.materialized && click.canonical.answer?.length > 4096 && retryable);
       };
-      this.startDecisionRecovery(signal, selectedChannels);
+      const decisionRecovery = Promise.resolve(this.startDecisionRecovery(signal, selectedChannels));
+      let decisionRecoverySettled = false;
+      const settleDecisionRecovery = async () => {
+        if (decisionRecoverySettled) return;
+        await decisionRecovery;
+        decisionRecoverySettled = true;
+        const unresolved = new Map((this.state.listDecisionPendingWork?.() || [])
+          .map(click => [click.interactionId, click]));
+        pendingDecisions.clear();
+        for (const [interactionId, click] of unresolved) pendingDecisions.set(interactionId, click);
+      };
       const candidates = this.state.recoveryCandidates(before).filter(allowed);
       const retryOrder = messageIds ? new Map(messageIds.map((messageId, index) => [messageId, index])) : null;
       const ordered = candidates.sort((a, b) => {
@@ -329,6 +341,7 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
             ).finally(() => signal?.removeEventListener('abort', relayAbort));
           };
           if (message.state === 'accepted') {
+            if (pendingDecisions.has(message.id)) await settleDecisionRecovery();
             if (decisionProjectionPending(message)) {
               blockedOwners.add(key);
               continue;

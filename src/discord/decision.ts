@@ -164,7 +164,7 @@ export interface DecisionConsumerOptions {
   callbackTimeoutMs?: number;
   authorize?: (input: DecisionAuthorizationInput, signal?: AbortSignal) => Promise<boolean | null>;
   reject?: (interaction: ParsedComponentInteraction, reason: DecisionReason, signal?: AbortSignal, deferred?: boolean) => Promise<InteractionCallbackResult>;
-  scheduleRecovery?: (channelIds: Set<string>) => unknown;
+  scheduleRecovery?: (channelIds: Set<string>, options?: { deferIfActive?: boolean }) => unknown;
   waitForDispatch?: (channelId: string, signal?: AbortSignal) => Promise<boolean>;
   processAccepted?: (message: DecisionMessage, signal?: AbortSignal, options?: Record<string, unknown>) => Promise<unknown>;
   project?: (input: DecisionProjectionInput, signal?: AbortSignal) => Promise<unknown>;
@@ -343,6 +343,17 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     return { outcome: click?.authorizationOutcome || null, click };
   }
 
+  async function awaitCallbackOutcome(click: DecisionClick): Promise<DecisionClick> {
+    let current = state.getDecisionClick(click.interactionId) || click;
+    if (!current.callbackAttempted || current.callbackOutcome) return current;
+    const waiter = callbackWaiters.get(current.interactionId);
+    if (waiter) {
+      try { await waiter; } catch {}
+      current = state.getDecisionClick(current.interactionId) || current;
+    }
+    return current;
+  }
+
   function rejectionInteraction(click: DecisionClick): ParsedComponentInteraction | null {
     if (!click.applicationId || !click.token) return null;
     return {
@@ -360,6 +371,8 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   }
 
   async function deliverRejection(click: DecisionClick, signal?: AbortSignal, interaction: ParsedComponentInteraction | null = null): Promise<InteractionCallbackResult | null> {
+    click = await awaitCallbackOutcome(click);
+    if (click.callbackAttempted && !click.callbackOutcome) return null;
     const begin = state.beginDecisionRejectionFollowup(click.interactionId) as { accepted?: boolean; click?: DecisionClick | null };
     if (!begin.accepted) return null;
     const target = rejectionInteraction(click) || interaction;
@@ -481,13 +494,14 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     return result;
   }
 
-  async function continueClick(click: DecisionClick, signal?: AbortSignal): Promise<DecisionConsumerResult> {
+  async function continueClick(click: DecisionClick, signal?: AbortSignal, { recovery = false } = {}): Promise<DecisionConsumerResult> {
     const presentation = state.getDecisionPresentation(click.presentationId);
     if (!presentation) return invalidResult(DECISION_REASONS.UNKNOWN_PRESENTATION);
     let current = state.getDecisionClick(click.interactionId) || click;
     if (current.state === DECISION_STATES.AUTHORIZATION_PENDING) {
       const allowed = await authorizationAllowed(current, signal);
       if (signal?.aborted || allowed === null) {
+        if (allowed === null && !signal?.aborted) options.scheduleRecovery?.(new Set([current.channelId]), { deferIfActive: recovery });
         return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
       }
       if (!allowed) {
@@ -593,21 +607,8 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     }
     let click = state.getDecisionClick(parsed.id) || admission.click;
     if (!click) return invalidResult(DECISION_REASONS.UNKNOWN_INTERACTION);
-    if (admission.duplicate && admission.continuing && click.callbackAttempted && !click.callbackOutcome) {
-      const waiter = callbackWaiters.get(parsed.id);
-      if (!waiter) {
-        options.scheduleRecovery?.(new Set([click.channelId]));
-        return {
-          handled: true,
-          accepted: true,
-          duplicate: true,
-          continuing: true,
-          click,
-          message: safeMessage(state, click.interactionId)
-        };
-      }
-      try { await waiter; } catch {}
-      click = state.getDecisionClick(parsed.id) || click;
+    if (admission.duplicate && admission.continuing) {
+      click = await awaitCallbackOutcome(click);
       if (click.callbackAttempted && !click.callbackOutcome) {
         options.scheduleRecovery?.(new Set([click.channelId]));
         return {
@@ -720,9 +721,14 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   async function recover(signal?: AbortSignal, channelIds: Set<string> | null = null): Promise<DecisionClick[]> {
     const pending = state.listDecisionPendingWork().filter(click => !channelIds || channelIds.has(click.channelId));
     const remaining: DecisionClick[] = [];
-    for (const pendingClick of pending) {
+    for (let pendingClick of pending) {
       if (signal?.aborted) { remaining.push(pendingClick); continue; }
       if (pendingClick.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+        pendingClick = await awaitCallbackOutcome(pendingClick);
+        if (pendingClick.callbackAttempted && !pendingClick.callbackOutcome) {
+          remaining.push(pendingClick);
+          continue;
+        }
         try {
           await deliverRejection(pendingClick, signal);
         } catch {}
@@ -736,7 +742,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       const stored = safeMessage(state, pendingClick.interactionId);
       if (stored?.decisionResult && pendingClick.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT) continue;
       try {
-        const result = await continueClick(pendingClick, signal);
+        const result = await continueClick(pendingClick, signal, { recovery: true });
         const unresolved = state.listDecisionPendingWork().find(click => click.interactionId === pendingClick.interactionId);
         if (unresolved) {
           remaining.push(result.click || unresolved);

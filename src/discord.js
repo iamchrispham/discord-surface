@@ -250,6 +250,7 @@ class DiscordGateway {
     this.decisionRecoveryController = null;
     this.queuedDecisionRecoveryAll = false;
     this.queuedDecisionRecoveryChannels = new Set();
+    this.queuedDecisionRecoveryDeferred = false;
     this.recoveryFollowupPromise = null;
     this.recoveryFollowupScope = null;
     this.recoveryActiveWaiters = new Set();
@@ -372,7 +373,7 @@ class DiscordGateway {
       callbackTimeoutMs: this.interactionCallbackTimeoutMs,
       authorize: (input, signal) => this.authorizeDecisionInteraction(input, signal),
       reject: (interaction, reason, signal, deferred) => this.sendInteractionRejection(interaction, reason, signal, deferred),
-      scheduleRecovery: channelIds => this.startDecisionRecovery(undefined, channelIds),
+      scheduleRecovery: (channelIds, options) => this.startDecisionRecovery(undefined, channelIds, options),
       waitForDispatch: (channelId, signal) => this.waitForInteractionDispatch({ channelId }, signal),
       processAccepted: (message, signal, options) => this.consumer.processAccepted(message, signal, options),
       project: (input, signal) => this.projectDecisionMessage(input, signal)
@@ -1832,7 +1833,7 @@ class DiscordGateway {
 
   _reconcilePending(before, signal, ...args) { return pendingReconciliation.reconcilePending.apply(this, arguments); }
 
-  startDecisionRecovery(signal, channelIds = null) {
+  startDecisionRecovery(signal, channelIds = null, { deferIfActive = false } = {}) {
     if (this.stopping || !this.decisionConsumer) return this.decisionRecoveryPromise;
     if (this.decisionRecoveryPromise) {
       if (signal?.aborted) return this.decisionRecoveryPromise;
@@ -1840,8 +1841,16 @@ class DiscordGateway {
       else if (!this.queuedDecisionRecoveryAll) {
         for (const channelId of channelIds) this.queuedDecisionRecoveryChannels.add(channelId);
       }
+      if (deferIfActive) this.queuedDecisionRecoveryDeferred = true;
       return this.decisionRecoveryPromise;
     }
+    if (this.queuedDecisionRecoveryAll) channelIds = null;
+    else if (channelIds !== null && this.queuedDecisionRecoveryChannels.size) {
+      channelIds = new Set([...channelIds, ...this.queuedDecisionRecoveryChannels]);
+    }
+    this.queuedDecisionRecoveryAll = false;
+    this.queuedDecisionRecoveryChannels.clear();
+    this.queuedDecisionRecoveryDeferred = false;
     const controller = new AbortController();
     const relayAbort = () => controller.abort();
     if (signal?.aborted) controller.abort();
@@ -1862,14 +1871,20 @@ class DiscordGateway {
         this.decisionRecoveryPromise = null;
         const queuedAll = this.queuedDecisionRecoveryAll;
         const queuedChannels = new Set(this.queuedDecisionRecoveryChannels);
-        this.queuedDecisionRecoveryAll = false;
-        this.queuedDecisionRecoveryChannels.clear();
-        if (!this.stopping && (queuedAll || queuedChannels.size > 0)) {
+        const queuedDeferred = this.queuedDecisionRecoveryDeferred;
+        if (!this.stopping && !queuedDeferred && (queuedAll || queuedChannels.size > 0)) {
+          this.queuedDecisionRecoveryAll = false;
+          this.queuedDecisionRecoveryChannels.clear();
+          this.queuedDecisionRecoveryDeferred = false;
           queueMicrotask(() => {
             if (!this.stopping && !this.decisionRecoveryPromise) {
               this.startDecisionRecovery(undefined, queuedAll ? null : queuedChannels);
             }
           });
+        } else if (!queuedDeferred) {
+          this.queuedDecisionRecoveryAll = false;
+          this.queuedDecisionRecoveryChannels.clear();
+          this.queuedDecisionRecoveryDeferred = false;
         }
       }
       if (this.decisionRecoveryController === controller) this.decisionRecoveryController = null;

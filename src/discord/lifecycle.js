@@ -136,6 +136,7 @@ function createGatewayLifecycleHandlers({
     this.pendingRecoveryChannels.clear();
     this.queuedDecisionRecoveryAll = false;
     this.queuedDecisionRecoveryChannels.clear();
+    this.queuedDecisionRecoveryDeferred = false;
     for (const request of this.pendingRecoveryRequests.splice(0)) request.waiter?.stop?.();
     this.recoveryRetryScheduledChannels.clear();
     this.closingCustodyRetries.clear();
