@@ -8,6 +8,24 @@ const stateSourcePath = path.resolve(__dirname, '../../src/state.js');
 
 const INVOCATION_STYLES = Object.freeze({ THIS: 'this', STATE: 'state', PURE: 'pure' });
 
+// These pre-existing helpers intentionally use their handler object as a receiver while taking state explicitly.
+const LEGACY_DUAL_HANDLER_NAMES = new Set([
+  'hasOrdinaryPreflight',
+  'excludeDirectPost',
+  'setIntakeCutoff'
+]);
+
+const LEGACY_DUAL_HANDLER_ROOTS = [
+  path.resolve(__dirname, '../../src'),
+  path.resolve(__dirname, '../../dist')
+];
+
+function isLegacyDualHandler(node) {
+  const fileName = path.resolve(node.getSourceFile().fileName);
+  return LEGACY_DUAL_HANDLER_NAMES.has(node.name?.text) &&
+    LEGACY_DUAL_HANDLER_ROOTS.some(root => fileName === root || fileName.startsWith(`${root}${path.sep}`));
+}
+
 function propertyName(name) {
   if (!name) return null;
   if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
@@ -271,7 +289,8 @@ function declarationForIdentifier(declarations, identifier, source) {
   const useStart = identifier.getStart(source);
   for (const scope of scopes) {
     const candidates = declarations.filter(item => item.scope === scope && item.name === identifier.text &&
-      (ts.isFunctionDeclaration(item.declaration) || item.declaration.getStart(source) <= useStart));
+      (ts.isFunctionDeclaration(item.declaration) || isVarDeclaration(item.declaration) ||
+        item.declaration.getStart(source) <= useStart));
     if (candidates.length) return candidates[candidates.length - 1].declaration;
   }
   return null;
@@ -357,7 +376,8 @@ function mutatedDeclarations(factory, declarations, source) {
     }
     if (ts.isDeleteExpression(node)) mark(node.expression);
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
-        node.expression.name.text === 'assign' && node.arguments.length) {
+        ['assign', 'defineProperty', 'defineProperties'].includes(node.expression.name.text) &&
+        node.arguments.length) {
       mark(node.arguments[0]);
     }
     if (ts.isForInStatement(node) || ts.isForOfStatement(node)) mark(node.initializer);
@@ -389,6 +409,9 @@ function callableDescriptor(node) {
   if (ts.isArrowFunction(node) && usesThisExpression(node)) return null;
   const parameters = (node.parameters || []).filter(parameter =>
     !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'));
+  if (usesThisExpression(node) && parameters.some(parameter =>
+      ts.isIdentifier(parameter.name) && ['state', 'surface'].includes(parameter.name.text)) &&
+      !isLegacyDualHandler(node)) return null;
   const style = invocationStyle(node);
   const stateParameterIndex = style === INVOCATION_STYLES.STATE
     ? parameters.findIndex(parameter => ts.isIdentifier(parameter.name) && ['state', 'surface'].includes(parameter.name.text))
@@ -615,7 +638,7 @@ function requireBindings(source) {
   const markReassignments = node => {
     if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind) && ts.isIdentifier(node.left)) {
       const binding = resolve(node.left.text, node.left);
-      if (binding && scopeNode(node.left) === binding.scope) binding.reassigned = true;
+      if (binding) binding.reassigned = true;
     }
     ts.forEachChild(node, markReassignments);
   };
@@ -665,8 +688,11 @@ function directRequire(receiver) {
 
 function exportedFactoryExpression(source, factoryName, allowDefault = false) {
   let result = null;
+  let exportsAliasValid = true;
   const isModuleExports = node => ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
     node.expression.text === 'module' && node.name.text === 'exports';
+  const isExportsAlias = node => ts.isPropertyAccessExpression(node) &&
+    ts.isIdentifier(node.expression) && node.expression.text === 'exports';
   const isNamedExport = node => ts.isPropertyAccessExpression(node) &&
     ((ts.isIdentifier(node.expression) && node.expression.text === 'exports') || isModuleExports(node.expression)) &&
     node.name.text === factoryName;
@@ -696,8 +722,9 @@ function exportedFactoryExpression(source, factoryName, allowDefault = false) {
   const visit = node => {
     if (node !== source && ts.isFunctionLike(node)) return;
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && isTopLevelExpression(node)) {
-      if (isNamedExport(node.left)) result = node.right;
+      if (isNamedExport(node.left) && (!isExportsAlias(node.left) || exportsAliasValid)) result = node.right;
       if (isModuleExports(node.left)) {
+        exportsAliasValid = false;
         result = null;
         if (ts.isObjectLiteralExpression(node.right)) {
           for (const property of node.right.properties) {

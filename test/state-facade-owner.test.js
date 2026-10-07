@@ -127,6 +127,21 @@ class SurfaceState {`);
   assert.equal(discovery.approved, false);
 });
 
+test('rejects require receivers reassigned from child scopes', () => {
+  const discovery = discoverTempFactoryFiles({
+    'helpers.js': `function hidden(state, value) { return value; }
+module.exports = { hidden };`,
+    'companion.js': `let helpers = require('./helpers');
+if (disabled) { helpers = {}; }
+function createFakeHandlers() { return { hidden: helpers.hidden }; }
+module.exports = { createFakeHandlers };`
+  }, `const { createFakeHandlers } = require('./companion');
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {`);
+  assert.equal(discovery.approved, false);
+});
+
 test('accepts an unchanged callable binding before a write census', () => {
   const discovery = discoverTempFactory(`function createFakeHandlers() {
   let hidden = (state, value) => value;
@@ -210,6 +225,13 @@ module.exports = {};`);
   assert.equal(discovery.approved, false);
 });
 
+test('ignores exports alias writes after replacing module exports', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = {};
+exports.createFakeHandlers = createFakeHandlers;`);
+  assert.equal(discovery.approved, false);
+});
+
 test('rejects a named import from a default module export', () => {
   const discovery = discoverTempFactoryFiles({
     'companion.js': `function createFakeHandlers() { return { hidden(state, value) {} }; }
@@ -245,6 +267,14 @@ module.exports = { createFakeHandlers };`);
   assert.equal(discovery.methods.get('hidden').hasRestParameter, true);
 });
 
+test('rejects handlers that require both state and a receiver', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  return { hidden(state, value) { return this.write(value); } };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
 test('rejects imported companion factories with reassigned callable identifiers', () => {
   const discovery = discoverTempFactory(`function createFakeHandlers() {
   let hidden = (state, value) => value;
@@ -265,11 +295,31 @@ module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
 });
 
+test('resolves hoisted local bindings before outer callables', () => {
+  const discovery = discoverTempFactory(`const hidden = (state, value) => value;
+function createFakeHandlers() {
+  return { hidden };
+  var hidden = 0;
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
 test('rejects imported companion factories with aliased object mutations', () => {
   const discovery = discoverTempFactory(`function createFakeHandlers() {
   const handlers = { hidden(state, value) {} };
   const alias = handlers;
   alias.hidden = 0;
+  return handlers;
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects descriptor mutations of returned handlers', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  const handlers = { hidden(state, value) {} };
+  Object.defineProperty(handlers, 'hidden', { value: 0 });
   return handlers;
 }
 module.exports = { createFakeHandlers };`);
