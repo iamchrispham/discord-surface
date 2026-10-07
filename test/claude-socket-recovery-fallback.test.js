@@ -378,3 +378,54 @@ test('a foreign shared-temp namespace cannot preempt the owner-controlled root',
   assert.equal(path.dirname(path.dirname(probe.lockPath)), ownerRoot,
     'the lock must stay under the owner-controlled root');
 });
+
+for (const mode of [0o700, 0o750, 0o755]) {
+  test(`published direct home remains reusable at mode ${mode.toString(8)}`, t => {
+    fs.chmodSync(SUITE_HOME_ROOT, mode);
+    t.after(() => fs.chmodSync(SUITE_HOME_ROOT, 0o700));
+    const socket = socketPath(t);
+    const first = acquireSocketLockWithPath(t, socket);
+    assert.throws(() => acquireSocketLock(socket), /already in progress/);
+    first.release();
+    const second = acquireSocketLockWithPath(t, socket);
+    assert.equal(second.lockPath, first.lockPath);
+    second.release();
+  });
+}
+
+for (const mode of [0o775, 0o757, 0o555]) {
+  test(`published direct home refuses changed permissions ${mode.toString(8)}`, t => {
+    const socket = socketPath(t);
+    acquireSocketLock(socket)();
+    fs.chmodSync(SUITE_HOME_ROOT, mode);
+    t.after(() => fs.chmodSync(SUITE_HOME_ROOT, 0o700));
+    assert.throws(() => acquireSocketLock(socket), /direct-home target is unusable/);
+  });
+}
+
+test('published direct home refuses a changed owner', t => {
+  const socket = socketPath(t);
+  acquireSocketLock(socket)();
+  const original = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    const stats = original(target, ...args);
+    if (String(target) !== SUITE_HOME_ROOT) return stats;
+    const foreign = Object.create(stats);
+    Object.defineProperty(foreign, 'uid', { value: stats.uid + 1 });
+    return foreign;
+  });
+  assert.throws(() => acquireSocketLock(socket), /direct-home target is unusable/);
+});
+
+test('published direct home refuses a replacement symlink', t => {
+  const originalHome = path.join(SUITE_TEMP_ROOT, 'original-home');
+  const socket = socketPath(t);
+  acquireSocketLock(socket)();
+  fs.renameSync(SUITE_HOME_ROOT, originalHome);
+  fs.symlinkSync(originalHome, SUITE_HOME_ROOT);
+  t.after(() => {
+    fs.unlinkSync(SUITE_HOME_ROOT);
+    fs.renameSync(originalHome, SUITE_HOME_ROOT);
+  });
+  assert.throws(() => acquireSocketLock(socket), /direct-home target is unusable/);
+});
