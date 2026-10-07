@@ -557,10 +557,24 @@ const REGEX_PREFIXES = new Set(['(', '{', '[', ',', ';', ':', '=', '==', '===', 
 
 const tokenizeSource = source => {
   const tokens = [];
+  const newlineOffsets = [];
+  for (let offset = 0; offset < source.length; offset += 1) {
+    if (source[offset] === '\n') newlineOffsets.push(offset);
+  }
+  const lineAt = offset => {
+    let low = 0;
+    let high = newlineOffsets.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (newlineOffsets[middle] < offset) low = middle + 1;
+      else high = middle;
+    }
+    return low + 1;
+  };
   let index = 0;
   let previous = null;
   const push = (type, value, start, end) => {
-    const token = { type, value, start, end, line: source.slice(0, start).split(/\r?\n/).length };
+    const token = { type, value, start, end, line: lineAt(start) };
     tokens.push(token);
     previous = token;
   };
@@ -1036,8 +1050,14 @@ const findSwitchDecision = (tokens, triggerIndex, pairs) => {
   const label = matchingLabels[matchingLabels.length - 1];
   if (!label) return null;
   const labelPosition = labels.indexOf(label);
-  const next = labels[labelPosition + 1];
-  return { start: label.start, end: next?.index ?? best.closing, opening: best.opening };
+  let start = label.start;
+  let nextLabelPosition = labelPosition + 1;
+  while (nextLabelPosition < labels.length && start === labels[nextLabelPosition].index) {
+    start = labels[nextLabelPosition].start;
+    nextLabelPosition += 1;
+  }
+  const next = labels[nextLabelPosition];
+  return { start, end: next?.index ?? best.closing, opening: best.opening };
 };
 
 const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) => {
