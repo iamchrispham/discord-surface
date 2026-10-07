@@ -479,8 +479,18 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
       const entryPath = path.join(dir, entry.name);
       if (entry.isDirectory()) return sourceFiles(entryPath);
-      return /\.(?:js|ts)$/.test(entry.name) ? [entryPath] : [];
+      return /\.(?:[cm]?js|jsx|[cm]?ts|tsx)$/.test(entry.name) ? [entryPath] : [];
     });
+  }
+  function sourceScriptKind(filePath) {
+    switch (path.extname(filePath)) {
+      case '.jsx': return ts.ScriptKind.JSX;
+      case '.tsx': return ts.ScriptKind.TSX;
+      case '.ts':
+      case '.cts':
+      case '.mts': return ts.ScriptKind.TS;
+      default: return ts.ScriptKind.JS;
+    }
   }
 
   const ownerSource = fs.readFileSync(ownerPath, 'utf8');
@@ -571,10 +581,24 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   const declaringFiles = sourceFiles(path.join(root, 'src'))
     .filter(filePath => declaredNames(parse(
       fs.readFileSync(filePath, 'utf8'),
-      path.extname(filePath) === '.ts' ? ts.ScriptKind.TS : ts.ScriptKind.JS
+      sourceScriptKind(filePath)
     )).includes('captureProcessOwnerIdentity'))
     .map(filePath => path.relative(root, filePath));
   assert.deepEqual(declaringFiles, [path.relative(root, ownerPath)]);
+
+  const cjsFixtureDirectory = fs.mkdtempSync(path.join(path.dirname(ownerPath), '.process-owner-census-'));
+  try {
+    const cjsFixturePath = path.join(cjsFixtureDirectory, 'capture-owner.cjs');
+    fs.writeFileSync(cjsFixturePath, 'function captureProcessOwnerIdentity(pid) { return pid; }');
+    const cjsDeclaringFiles = sourceFiles(cjsFixtureDirectory)
+      .filter(filePath => declaredNames(parse(
+        fs.readFileSync(filePath, 'utf8'),
+        sourceScriptKind(filePath)
+      )).includes('captureProcessOwnerIdentity'));
+    assert.deepEqual(cjsDeclaringFiles, [cjsFixturePath]);
+  } finally {
+    fs.rmSync(cjsFixtureDirectory, { recursive: true, force: true });
+  }
 
   const stateAst = parse(fs.readFileSync(statePath, 'utf8'));
   const imports = stateAst.statements.filter(statement => ts.isVariableStatement(statement)
@@ -623,8 +647,12 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       || node.expression.name.text !== 'defineProperty'
       || node.arguments.length < 2) return null;
     if (!isSurfaceStateReceiver(node.arguments[0])) return null;
-    return staticAssignmentPropertyName(node.arguments[1]);
+    return staticStringText(node.arguments[1]);
   };
+  const concatenatedDefineProperty = parse(
+    "Object.defineProperty(SurfaceState.prototype, 'directPostOwner' + 'Identity', { value() {} });"
+  ).statements[0].expression;
+  assert.equal(definePropertyName(concatenatedDefineProperty), 'directPostOwnerIdentity');
   const objectAssignProperties = node => {
     if (!ts.isCallExpression(node)
       || !ts.isPropertyAccessExpression(node.expression)
