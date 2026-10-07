@@ -367,12 +367,42 @@ module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
 });
 
+test('rejects handler objects mutated by local helpers', () => {
+  const discovery = discoverTempFactory(`function rewriteHandlers(handlers) {
+  handlers.hidden = 0;
+}
+function createFakeHandlers() {
+  const handlers = { hidden(state, value) {} };
+  rewriteHandlers(handlers);
+  return handlers;
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
 test('rejects generator companion factories', () => {
   const discovery = discoverTempFactory(`function* createFakeHandlers() {
   return { hidden(state, value) {} };
 }
 module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
+});
+
+test('rejects asynchronous and generator handler callables', () => {
+  for (const method of [
+    'hidden: async (state, value) => value',
+    '*hidden(state, value) { return value; }'
+  ]) {
+    const text = source.replace(
+      'class SurfaceState {',
+      `function createFakeHandlers() { return { ${method} }; }
+const fakeHandlers = createFakeHandlers();
+class SurfaceState {
+newForward(...args) { return fakeHandlers.hidden.apply(this, args); }
+`
+    );
+    assert.equal(matchesWithCandidateBaseline(text), false);
+  }
 });
 
 test('rejects reassigned exported factory bindings', () => {
@@ -565,6 +595,10 @@ test('existing delegate removal refused', () => {
   assert.equal(!matches(removeMethod('getConfig')), true);
 });
 
+test('existing forwarding delegate removal refused', () => {
+  assert.equal(!matches(removeMethod('acceptInteraction')), true);
+});
+
 test('swapped arguments refused', () => {
   assert.equal(!matches(insert('newForward(a, b) { return configurationHandlers.setConfig.call(this, b, a); }')), true);
 });
@@ -637,6 +671,11 @@ test('baseline accepted', () => {
 test('rejects an exported constructor that differs from the inventoried owner', () => {
   const text = source.replace('module.exports = {', 'class ActualState { constructor() {} }\nmodule.exports = { SurfaceState: ActualState,');
   assert.equal(matchesWithCandidateBaseline(text), false);
+});
+
+test('rejects a reassigned exported owner binding', () => {
+  const text = source.replace('module.exports = {', 'SurfaceState = class {}\nmodule.exports = {');
+  assert.equal(matches(text), false);
 });
 
 test('new inline body refused', () => {

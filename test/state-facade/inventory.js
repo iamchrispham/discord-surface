@@ -249,6 +249,51 @@ function exportedClassDeclaration(source, exportName) {
     return null;
   };
 
+  const writesBinding = target => {
+    if (!target) return false;
+    if (ts.isIdentifier(target)) return target.text === exportName;
+    if (ts.isBindingElement(target)) return writesBinding(target.name);
+    if (ts.isArrayBindingPattern(target) || ts.isArrayLiteralExpression(target)) {
+      return target.elements.some(element => writesBinding(ts.isSpreadElement(element) ? element.expression : element));
+    }
+    if (ts.isObjectBindingPattern(target) || ts.isObjectLiteralExpression(target)) {
+      const properties = ts.isObjectBindingPattern(target) ? target.elements : target.properties;
+      return properties.some(property => {
+        if (ts.isBindingElement(property)) return writesBinding(property.name);
+        if (ts.isShorthandPropertyAssignment(property)) return property.name.text === exportName;
+        if (ts.isPropertyAssignment(property)) return writesBinding(property.initializer);
+        if (ts.isSpreadAssignment(property)) return writesBinding(property.expression);
+        return false;
+      });
+    }
+    return false;
+  };
+
+  let bindingReassigned = false;
+  const assignmentStart = ts.SyntaxKind.FirstAssignment;
+  const assignmentEnd = ts.SyntaxKind.LastAssignment;
+  const findBindingWrites = node => {
+    if (bindingReassigned) return;
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind >= assignmentStart &&
+        node.operatorToken.kind <= assignmentEnd && writesBinding(node.left)) {
+      bindingReassigned = true;
+      return;
+    }
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+        writesBinding(node.operand)) {
+      bindingReassigned = true;
+      return;
+    }
+    if (ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+      if (writesBinding(node.initializer)) {
+        bindingReassigned = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, findBindingWrites);
+  };
+  findBindingWrites(source);
+
   let exported = null;
   for (const statement of source.statements) {
     if (!ts.isExpressionStatement(statement) || !ts.isBinaryExpression(statement.expression) ||
@@ -268,6 +313,7 @@ function exportedClassDeclaration(source, exportName) {
       exported = property && expressionForProperty(property);
     }
   }
+  if (bindingReassigned) return null;
   if (ts.isClassExpression(exported)) return exported;
   return exported && ts.isIdentifier(exported) ? declarations.get(exported.text) || null : null;
 }
@@ -278,7 +324,8 @@ function matches(text, baseline, fileName = 'state.js') {
     if (raw.unapprovedHandlers.length || !raw.ownerMatchesExport) return false;
     const candidate = compact(raw);
     const candidateMethodNames = new Set([...Object.keys(candidate.bodies), ...candidate.forwarding]);
-    for (const name of PRIOR_SURFACE_METHOD_NAMES) {
+    const requiredSurfaceMethodNames = new Set([...PRIOR_SURFACE_METHOD_NAMES, ...baseline.forwarding]);
+    for (const name of requiredSurfaceMethodNames) {
       if (!candidateMethodNames.has(name)) return false;
     }
     if (Object.keys(candidate.bodies).some(name =>

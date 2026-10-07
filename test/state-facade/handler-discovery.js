@@ -351,6 +351,50 @@ function mutatedDeclarations(factory, declarations, source) {
     }
     link(pattern, initializer);
   };
+  const localHelper = declaration => {
+    if (!declaration) return null;
+    if (ts.isFunctionDeclaration(declaration)) return declaration;
+    if (!ts.isVariableDeclaration(declaration)) return null;
+    const value = unwrapExpression(declaration.initializer);
+    return value && ts.isFunctionLike(value) ? value : null;
+  };
+  const helperMutatesParameter = (helper, parameterIndex) => {
+    const parameters = helper.parameters || [];
+    const lastParameter = parameters[parameters.length - 1];
+    const parameter = parameters[parameterIndex] || (lastParameter?.dotDotDotToken ? lastParameter : null);
+    if (!parameter) return false;
+    if (!ts.isIdentifier(parameter.name)) return true;
+    const parameterName = parameter.name.text;
+    let mutatedParameter = false;
+    const visitHelper = node => {
+      if (mutatedParameter) return;
+      if (node !== helper && ts.isFunctionLike(node)) return;
+      if (ts.isBinaryExpression(node) && assignmentOperators.has(node.operatorToken.kind) &&
+          rootIdentifier(node.left)?.text === parameterName) {
+        mutatedParameter = true;
+        return;
+      }
+      if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node) ||
+          ts.isDeleteExpression(node)) && rootIdentifier(node.operand || node.expression)?.text === parameterName) {
+        mutatedParameter = true;
+        return;
+      }
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+          ['assign', 'defineProperty', 'defineProperties'].includes(node.expression.name.text) &&
+          rootIdentifier(node.arguments[0])?.text === parameterName) {
+        mutatedParameter = true;
+        return;
+      }
+      if ((ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
+          rootIdentifier(node.initializer)?.text === parameterName) {
+        mutatedParameter = true;
+        return;
+      }
+      ts.forEachChild(node, visitHelper);
+    };
+    visitHelper(helper.body || helper);
+    return mutatedParameter;
+  };
   const varDeclarations = new Map();
   for (const item of declarations) {
     if (!isVarDeclaration(item.declaration)) continue;
@@ -380,6 +424,15 @@ function mutatedDeclarations(factory, declarations, source) {
         node.arguments.length) {
       mark(node.arguments[0]);
     }
+    if (ts.isCallExpression(node)) {
+      const helper = declarationForIdentifier(declarations, rootIdentifier(node.expression), source);
+      const helperFunction = localHelper(helper);
+      if (helperFunction) {
+        node.arguments.forEach((argument, index) => {
+          if (helperMutatesParameter(helperFunction, index)) mark(argument);
+        });
+      }
+    }
     if (ts.isForInStatement(node) || ts.isForOfStatement(node)) mark(node.initializer);
     ts.forEachChild(node, visit);
   };
@@ -406,6 +459,7 @@ function mutatedBindingNames(source, names) {
 
 function callableDescriptor(node) {
   if (!node || !ts.isFunctionLike(node)) return null;
+  if (node.asteriskToken || node.modifiers?.length) return null;
   if (ts.isArrowFunction(node) && usesThisExpression(node)) return null;
   const parameters = (node.parameters || []).filter(parameter =>
     !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'));
