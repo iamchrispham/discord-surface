@@ -90,6 +90,20 @@ function createLocalModuleResolver(files) {
         if (exported) addExport(element.name.text, { binding: element.name.text });
       }
     };
+    const recordFunction = (declaration, exported = false) => {
+      const isDefault = declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword);
+      if (!declaration.name) {
+        if (exported && isDefault) {
+          module.defaultExport = declaration;
+        }
+        return;
+      }
+      addBinding(declaration.name.text, declaration);
+      if (exported && !isDefault) addExport(declaration.name.text, { binding: declaration.name.text });
+      if (isDefault) {
+        module.defaultExport = declaration;
+      }
+    };
     const recordImport = declaration => {
       if (!ts.isStringLiteral(declaration.moduleSpecifier)) return;
       const specifier = declaration.moduleSpecifier.text;
@@ -178,6 +192,10 @@ function createLocalModuleResolver(files) {
       if (ts.isVariableStatement(statement)) {
         const exported = statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword);
         for (const declaration of statement.declarationList.declarations) recordVariable(declaration, exported);
+      }
+      if (ts.isFunctionDeclaration(statement)) {
+        const exported = statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword);
+        recordFunction(statement, exported);
       }
       if (ts.isExportDeclaration(statement)) {
         const moduleSpecifier = statement.moduleSpecifier;
@@ -281,14 +299,43 @@ function createLocalModuleResolver(files) {
     return returns;
   };
 
-  const evaluate = (expression, currentPath, visited = new Set()) => {
+  const callableParameterBindings = (callable, argumentsList, callerPath) => {
+    const bindings = new Map();
+    for (let index = 0; index < (callable.parameters || []).length; index += 1) {
+      const parameter = callable.parameters[index];
+      const argument = argumentsList?.[index];
+      if (!argument) continue;
+      if (ts.isIdentifier(parameter.name)) {
+        bindings.set(parameter.name.text, { expression: argument, currentPath: callerPath });
+        continue;
+      }
+      if (ts.isObjectBindingPattern(parameter.name)) {
+        for (const element of parameter.name.elements) {
+          if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+          const property = element.propertyName && (ts.isIdentifier(element.propertyName) ||
+            ts.isStringLiteral(element.propertyName)) ? element.propertyName.text : element.name.text;
+          bindings.set(element.name.text, { expression: argument, name: property, currentPath: callerPath });
+        }
+      }
+    }
+    return bindings;
+  };
+
+  const evaluate = (expression, currentPath, visited = new Set(), parameterBindings = new Map()) => {
     const node = unwrap(expression);
     if (!node || visited.has(node)) return new Set();
     const seen = new Set(visited).add(node);
-    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node)) {
       return new Set([{ callable: node, modulePath: currentPath }]);
     }
     if (ts.isIdentifier(node)) {
+      const parameter = parameterBindings.get(node.text);
+      if (parameter) {
+        if (parameter.name) {
+          return evaluateProperty(parameter.expression, parameter.name, parameter.currentPath, seen);
+        }
+        return evaluate(parameter.expression, parameter.currentPath, seen, parameter.bindings || new Map());
+      }
       const module = currentPath && scanModule(currentPath);
       const imported = module?.imports.get(node.text);
       if (imported) {
@@ -315,7 +362,7 @@ function createLocalModuleResolver(files) {
       const name = propertyName(node) || (ts.isElementAccessExpression(node)
         ? staticPropertyValue(node.argumentExpression, currentPath, seen) : null);
       if (!name) return new Set();
-      const receiver = evaluate(node.expression, currentPath, seen);
+      const receiver = evaluate(node.expression, currentPath, seen, parameterBindings);
       const result = new Set();
       if (name === 'kill' && receiver.has(PROCESS_OBJECT)) result.add(PID_PROBE);
       for (const atom of receiver) {
@@ -325,13 +372,14 @@ function createLocalModuleResolver(files) {
       return result;
     }
     if (ts.isCallExpression(node)) {
-      const callableAtoms = evaluate(node.expression, currentPath, seen);
+      const callableAtoms = evaluate(node.expression, currentPath, seen, parameterBindings);
       const result = new Set();
       for (const atom of callableAtoms) {
         if (!atom || !atom.callable) continue;
         const callablePath = atom.modulePath || currentPath;
+        const nestedBindings = callableParameterBindings(atom.callable, node.arguments || [], currentPath);
         for (const returnExpression of callableReturnExpressions(atom.callable)) {
-          for (const returnAtom of evaluate(returnExpression, callablePath, seen)) result.add(returnAtom);
+          for (const returnAtom of evaluate(returnExpression, callablePath, seen, nestedBindings)) result.add(returnAtom);
         }
       }
       if (result.size) return result;
@@ -352,7 +400,7 @@ function createLocalModuleResolver(files) {
       return result;
     }
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
-      return evaluate(node.right, currentPath, seen);
+      return evaluate(node.right, currentPath, seen, parameterBindings);
     }
     return new Set();
   };
@@ -380,14 +428,23 @@ function createLocalModuleResolver(files) {
     if (name === 'default' && module.defaultExport) {
       for (const atom of evaluate(module.defaultExport, module.path, seen)) result.add(atom);
     }
-    for (const wildcardPath of module.wildcardExports || []) {
-      for (const atom of resolveExport(wildcardPath, name, seen)) result.add(atom);
+    if (!values.length) {
+      for (const wildcardPath of module.wildcardExports || []) {
+        for (const atom of resolveExport(wildcardPath, name, seen)) result.add(atom);
+      }
     }
     return result;
   };
 
   const evaluateBinding = (name, currentPath, visited) => {
     const module = scanModule(currentPath);
+    const imported = module?.imports.get(name);
+    if (imported) {
+      if (imported.builtin === 'node:process' || imported.builtin === 'process') {
+        return imported.name === 'kill' ? new Set([PID_PROBE]) : new Set([PROCESS_OBJECT]);
+      }
+      return resolveExport(imported.modulePath, imported.name, visited);
+    }
     const bindings = module?.bindings.get(name) || [];
     const result = new Set();
     for (const binding of bindings) {
@@ -416,13 +473,18 @@ function createLocalModuleResolver(files) {
       }
       return result;
     },
-    resolveCall(atoms, visited = new Set()) {
+    resolveCall(atoms, argumentsList = [], callerPath = null, visited = new Set()) {
+      if (argumentsList instanceof Set) {
+        visited = argumentsList;
+        argumentsList = [];
+      }
       const result = new Set();
       for (const atom of atoms || []) {
         if (!atom || !atom.callable) continue;
-        const callablePath = atom.modulePath;
+        const callablePath = atom.modulePath || callerPath;
+        const parameterBindings = callableParameterBindings(atom.callable, argumentsList, callerPath);
         for (const returnExpression of callableReturnExpressions(atom.callable)) {
-          for (const returnAtom of evaluate(returnExpression, callablePath, visited)) result.add(returnAtom);
+          for (const returnAtom of evaluate(returnExpression, callablePath, visited, parameterBindings)) result.add(returnAtom);
         }
       }
       return result;

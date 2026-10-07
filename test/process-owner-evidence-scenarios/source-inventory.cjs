@@ -131,7 +131,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   const indexMemberAssignment = (access, value) => {
     const names = staticPropertyNames(access, true);
     if (!names.length) return;
-    for (const receiver of receiverSymbols(access.expression)) {
+    const receivers = receiverSymbols(access.expression);
+    for (const constructor of prototypeConstructorSymbols(access.expression)) receivers.add(constructor);
+    for (const receiver of receivers) {
       let byName = memberAssignments.get(receiver);
       if (!byName) {
         byName = new Map();
@@ -191,6 +193,44 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       for (const nested of receiverSymbols(source, seen)) symbols.add(nested);
     }
     return symbols;
+  };
+  const prototypeConstructorSymbols = node => {
+    const target = node && (ts.isParenthesizedExpression(node) ? node.expression : node);
+    let constructor = null;
+    if (ts.isPropertyAccessExpression(target) && target.name.text === 'prototype') {
+      constructor = target.expression;
+    } else if (ts.isElementAccessExpression(target) && ts.isStringLiteral(target.argumentExpression) &&
+      target.argumentExpression.text === 'prototype') {
+      constructor = target.expression;
+    }
+    const symbol = constructor && checker.getSymbolAtLocation(constructor);
+    return symbol ? new Set([symbol]) : new Set();
+  };
+  const instanceConstructorSymbols = (node, visited = new Set()) => {
+    const target = node && (ts.isParenthesizedExpression(node) ? node.expression : node);
+    if (!target) return new Set();
+    if (ts.isNewExpression(target)) {
+      const symbol = checker.getSymbolAtLocation(target.expression);
+      return symbol ? new Set([symbol]) : new Set();
+    }
+    if (!ts.isIdentifier(target)) return new Set();
+    const symbol = checker.getSymbolAtLocation(target);
+    if (!symbol || visited.has(symbol)) return new Set();
+    const seen = new Set(visited).add(symbol);
+    const result = new Set();
+    const directDeclaration = symbol.valueDeclaration || symbol.declarations?.[0];
+    if (directDeclaration && (ts.isFunctionDeclaration(directDeclaration) ||
+      ts.isClassDeclaration(directDeclaration))) return new Set([symbol]);
+    const declaration = symbolDeclaration(symbol);
+    if (declaration && (ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) &&
+      declaration.initializer) {
+      for (const nested of instanceConstructorSymbols(declaration.initializer, seen)) result.add(nested);
+    }
+    for (const assigned of assignments.get(symbol) || []) {
+      const source = assigned && assigned.source ? assigned.source : assigned;
+      for (const nested of instanceConstructorSymbols(source, seen)) result.add(nested);
+    }
+    return result;
   };
   const processImportAtom = symbol => {
     for (const declaration of symbol?.declarations || []) {
@@ -912,7 +952,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           for (const atom of resolveSet(assigned.source, seen)) result.add(atom);
         }
       }
-      for (const receiverSymbol of receiverSymbols(node.expression)) {
+      const receivers = receiverSymbols(node.expression);
+      for (const constructor of instanceConstructorSymbols(node.expression)) receivers.add(constructor);
+      for (const constructor of prototypeConstructorSymbols(node.expression)) receivers.add(constructor);
+      for (const receiverSymbol of receivers) {
         const byName = memberAssignments.get(receiverSymbol);
         if (!byName) continue;
         for (const name of names) {
@@ -974,7 +1017,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       }
       const result = new Set();
       if (moduleResolver?.resolveCall) {
-        for (const atom of moduleResolver.resolveCall(resolveSet(callee, seen), seen)) result.add(atom);
+        for (const atom of moduleResolver.resolveCall(
+          resolveSet(callee, seen), expandCallArguments(node.arguments) || [], virtualPath, seen)) {
+          result.add(atom);
+        }
       }
       for (const expression of callableReturnExpressions(callee, seen)) {
         for (const atom of resolveSet(expression, seen)) result.add(atom);
@@ -1280,6 +1326,61 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     return found;
   }
 
+  function valueMayBeUndefined(node, visited = new Set()) {
+    if (!node || visited.has(node)) return true;
+    const seen = new Set(visited).add(node);
+    const transparent = transparentExpression(node);
+    if (transparent) return valueMayBeUndefined(transparent, seen);
+    if (ts.isIdentifier(node) && node.text === 'undefined') return true;
+    if (ts.isNumericLiteral(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ||
+      ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isClassExpression(node) ||
+      ts.isObjectLiteralExpression(node) || ts.isArrayLiteralExpression(node) || ts.isNewExpression(node)) {
+      return false;
+    }
+    if (ts.isIdentifier(node)) {
+      const symbol = checker.getSymbolAtLocation(node);
+      const directDeclaration = symbol?.valueDeclaration || symbol?.declarations?.[0];
+      if (directDeclaration && (ts.isFunctionDeclaration(directDeclaration) ||
+        ts.isClassDeclaration(directDeclaration))) return false;
+      const declaration = symbolDeclaration(symbol);
+      if (!declaration || visited.has(symbol)) return true;
+      const symbolSeen = new Set(seen).add(symbol);
+      const sources = [];
+      if ((ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) && declaration.initializer) {
+        sources.push(declaration.initializer);
+      } else if (ts.isBindingElement(declaration)) {
+        const bindingSourcesList = bindingSources(declaration, symbolSeen);
+        if (bindingSourcesList) {
+          for (const source of bindingSourcesList) sources.push(source);
+        }
+        if (declaration.initializer) sources.push(declaration.initializer);
+      }
+      for (const assigned of assignments.get(symbol) || []) {
+        sources.push(assigned && assigned.source ? assigned.source : assigned);
+      }
+      if (!sources.length) return true;
+      return sources.some(source => valueMayBeUndefined(source, symbolSeen));
+    }
+    const values = resolveSet(node, seen);
+    if (values.has(UNDEFINED_VALUE)) return true;
+    if (values.size) return false;
+    return ts.isCallExpression(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node);
+  }
+
+  function bindingDefaultMayApply(binding, sources, visited) {
+    if (!sources) return true;
+    if (ts.isArrayBindingPattern(binding.parent)) {
+      return sources.some(source => valueMayBeUndefined(source, visited));
+    }
+    const name = bindingPropertyName(binding);
+    if (!name) return true;
+    for (const source of sources) {
+      const origins = propertyOriginNodes(source, name, visited);
+      if (!origins.length || origins.some(origin => valueMayBeUndefined(origin, visited))) return true;
+    }
+    return false;
+  }
+
   function addFromBindingElement(binding, visited, result) {
     const sources = bindingSources(binding);
     const sourceSet = new Set();
@@ -1289,7 +1390,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       }
     }
     const name = bindingPropertyName(binding);
-    if (binding.initializer) {
+    if (binding.initializer && bindingDefaultMayApply(binding, sources, visited)) {
       for (const atom of resolveSet(binding.initializer, visited)) result.add(atom);
     }
     if (sources) {

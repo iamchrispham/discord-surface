@@ -205,6 +205,13 @@ test("class-field callables retain parameters and returned probe aliases", () =>
   runFixture("class Helpers { identity = value => value; } const helpers = new Helpers(); const probe = helpers.identity(process.kill); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
 
+test("prototype writes apply to constructed class and function instances", () => {
+  runFixture("class Runner {} Runner.prototype.probe = process.kill; function newProbe(pid) { new Runner().probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function Runner() {} Runner.prototype.probe = process.kill; function newProbe(pid) { new Runner().probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("class Runner {} Runner.prototype.probe = process.kill; const runner = new Runner(); function newProbe(pid) { runner.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function Runner() {} Runner.prototype.probe = process.kill; const runner = new Runner(); function newProbe(pid) { runner.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
 test("object and class getters retain returned probe origins", () => {
   runFixture("const deps = { get probe() { return process.kill; } }; function newProbe(pid) { deps.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("class Helpers { get probe() { return process.kill; } } const deps = new Helpers(); function newProbe(pid) { deps.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
@@ -251,6 +258,41 @@ test("local module exports retain probe provenance across files", () => {
     'probe.ts': "export const probe = process.kill;",
     'use.ts': "import { probe } from './probe'; function newProbe(pid) { probe(pid, 0); }"
   }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'probe.ts': "export function getProbe() { return process.kill; }",
+    'use.ts': "import { getProbe } from './probe'; function newProbe(pid) { getProbe()(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'probe.ts': "function getProbe() { return process.kill; } export { getProbe };",
+    'use.ts': "import { getProbe } from './probe'; function newProbe(pid) { getProbe()(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'probe.ts': "export const identity = value => value;",
+    'use.ts': "import { identity } from './probe'; function newProbe(pid) { identity(process.kill)(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'probe.ts': "export const probe = process.kill;",
+    'ordinary.ts': "export const probe = () => true;",
+    'barrel.ts': "export * from './probe'; export { probe } from './ordinary';",
+    'use.ts': "import { probe } from './barrel'; function ordinary(pid) { probe(pid, 0); }"
+  }, [], []);
+  runFilesFixture({
+    'probe.ts': "export const probe = process.kill;",
+    'barrel.ts': "import { probe } from './probe'; export { probe };",
+    'use.ts': "import { probe } from './barrel'; function newProbe(pid) { probe(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'probe.ts': "const probe = process.kill; export default probe;",
+    'barrel.ts': "import probe from './probe'; export { probe };",
+    'use.ts': "import { probe } from './barrel'; function newProbe(pid) { probe(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+});
+
+test("destructuring defaults do not override present ordinary values", () => {
+  runFixture("const ordinary = () => true; const { probe = process.kill } = { probe: ordinary }; function newProbe(pid) { probe(pid, 0); }", [], []);
+  runFixture("function ordinary() {} const { probe = process.kill } = { probe: ordinary }; function newProbe(pid) { probe(pid, 0); }", [], []);
+  runFixture("const ordinary = () => true; const [probe = process.kill] = [ordinary]; function newProbe(pid) { probe(pid, 0); }", [], []);
+  runFixture("function ordinary() {} const [probe = process.kill] = [ordinary]; function newProbe(pid) { probe(pid, 0); }", [], []);
 });
 
 test("destructured probe invocation methods remain unsupported", () => {
