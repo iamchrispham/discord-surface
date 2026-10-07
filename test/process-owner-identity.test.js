@@ -496,6 +496,16 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     }
     return null;
   };
+  const isSurfaceStateReceiver = expression => {
+    if (ts.isIdentifier(expression)) return expression.text === 'SurfaceState';
+    return ts.isPropertyAccessExpression(expression)
+      && ts.isIdentifier(expression.expression)
+      && expression.expression.text === 'SurfaceState'
+      && expression.name.text === 'prototype';
+  };
+  const targetsSurfaceState = expression => (ts.isPropertyAccessExpression(expression)
+    || ts.isElementAccessExpression(expression))
+    && isSurfaceStateReceiver(expression.expression);
   const definePropertyName = node => {
     if (!ts.isCallExpression(node)
       || !ts.isPropertyAccessExpression(node.expression)
@@ -513,6 +523,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       && propertyNameText(node.name) === 'directPostOwnerIdentity') facade.push(node);
     if (ts.isBinaryExpression(node)
       && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && targetsSurfaceState(node.left)
       && staticAssignmentPropertyName(node.left) === 'directPostOwnerIdentity') facade.push(node);
     if (definePropertyName(node) === 'directPostOwnerIdentity') facade.push(node);
   });
