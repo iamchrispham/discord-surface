@@ -52,10 +52,44 @@ function requireBindings(source) {
     return null;
   };
   const isAssignmentOperator = kind => kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment;
-  const markReassignments = node => {
-    if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind) && ts.isIdentifier(node.left)) {
-      const binding = resolve(node.left.text, node.left);
+  const markBindingTarget = target => {
+    if (ts.isParenthesizedExpression(target)) {
+      markBindingTarget(target.expression);
+      return;
+    }
+    if (ts.isIdentifier(target)) {
+      const binding = resolve(target.text, target);
       if (binding) binding.reassigned = true;
+      return;
+    }
+    if (ts.isArrayLiteralExpression(target) || ts.isArrayBindingPattern(target)) {
+      for (const element of target.elements) {
+        if (ts.isOmittedExpression(element)) continue;
+        if (ts.isBindingElement(element)) markBindingTarget(element.name);
+        else markBindingTarget(ts.isSpreadElement(element) ? element.expression : element);
+      }
+      return;
+    }
+    if (ts.isObjectLiteralExpression(target) || ts.isObjectBindingPattern(target)) {
+      for (const property of target.properties) {
+        if (ts.isShorthandPropertyAssignment(property)) markBindingTarget(property.name);
+        else if (ts.isPropertyAssignment(property)) markBindingTarget(property.initializer);
+        else if (ts.isBindingElement(property)) markBindingTarget(property.name);
+        else if (ts.isSpreadAssignment(property)) markBindingTarget(property.expression);
+      }
+    }
+  };
+  const markReassignments = node => {
+    if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind)) {
+      markBindingTarget(node.left);
+    }
+    if ((ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
+        !ts.isVariableDeclarationList(node.initializer)) {
+      markBindingTarget(node.initializer);
+    }
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+        (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) {
+      markBindingTarget(node.operand);
     }
     ts.forEachChild(node, markReassignments);
   };

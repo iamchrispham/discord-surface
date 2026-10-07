@@ -280,14 +280,12 @@ function exportedFactoryExpression(source, factoryName, allowDefault = false) {
 
 function reexportedModulePaths(source) {
   const paths = [];
-  const visit = node => {
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === '__exportStar') {
-      const modulePath = directRequire(node.arguments[0]);
-      if (modulePath) paths.push(modulePath);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(source);
+  for (const statement of source.statements) {
+    if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression) ||
+        !ts.isIdentifier(statement.expression.expression) || statement.expression.expression.text !== '__exportStar') continue;
+    const modulePath = directRequire(statement.expression.arguments[0]);
+    if (modulePath) paths.push(modulePath);
+  }
   return paths;
 }
 

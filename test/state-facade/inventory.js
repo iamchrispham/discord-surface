@@ -298,25 +298,88 @@ function exportedClassDeclaration(source, exportName) {
 
   const topLevelExportAssignments = new Set();
   let exportMutated = false;
-  const isExportObject = node => (ts.isIdentifier(node) && node.text === 'exports') || isModuleExports(node);
+  const propertyName = node => {
+    if (ts.isPropertyAccessExpression(node)) return node.name.text;
+    if (ts.isElementAccessExpression(node) &&
+        (ts.isStringLiteral(node.argumentExpression) || ts.isNoSubstitutionTemplateLiteral(node.argumentExpression))) {
+      return node.argumentExpression.text;
+    }
+    return null;
+  };
+  const isComputedModuleExports = node => ts.isElementAccessExpression(node) &&
+    ts.isIdentifier(node.expression) && node.expression.text === 'module' &&
+    propertyName(node) === 'exports';
+  const exportObjectAliases = new Set();
+  const isDirectExportObject = node =>
+    (ts.isIdentifier(node) && node.text === 'exports') ||
+    isModuleExports(node) ||
+    isComputedModuleExports(node);
+  const isExportObject = node => {
+    if (ts.isParenthesizedExpression(node)) return isExportObject(node.expression);
+    return isDirectExportObject(node) ||
+      (ts.isIdentifier(node) && exportObjectAliases.has(node.text));
+  };
+  const addAliasTargets = target => {
+    if (ts.isParenthesizedExpression(target)) return addAliasTargets(target.expression);
+    if (ts.isIdentifier(target)) {
+      if (target.text === 'exports' || exportObjectAliases.has(target.text)) return false;
+      exportObjectAliases.add(target.text);
+      return true;
+    }
+    if (ts.isArrayLiteralExpression(target)) {
+      let added = false;
+      for (const element of target.elements) {
+        if (!ts.isOmittedExpression(element)) added = addAliasTargets(element) || added;
+      }
+      return added;
+    }
+    return false;
+  };
+  let aliasesChanged = true;
+  while (aliasesChanged) {
+    aliasesChanged = false;
+    const findExportObjectAliases = node => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer &&
+          isExportObject(node.initializer) && !exportObjectAliases.has(node.name.text)) {
+        exportObjectAliases.add(node.name.text);
+        aliasesChanged = true;
+      }
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind >= assignmentStart &&
+          node.operatorToken.kind <= assignmentEnd && isExportObject(node.right)) {
+        aliasesChanged = addAliasTargets(node.left) || aliasesChanged;
+      }
+      ts.forEachChild(node, findExportObjectAliases);
+    };
+    findExportObjectAliases(source);
+  }
+  const isExportName = node => propertyName(node) === exportName && isExportObject(node.expression);
+  const exportObjectEscapes = node => {
+    if (isExportObject(node)) return true;
+    if (ts.isParenthesizedExpression(node) || ts.isSpreadElement(node) || ts.isSpreadAssignment(node)) {
+      return exportObjectEscapes(node.expression);
+    }
+    if (ts.isArrayLiteralExpression(node)) return node.elements.some(exportObjectEscapes);
+    if (ts.isObjectLiteralExpression(node)) {
+      return node.properties.some(property => {
+        if (ts.isShorthandPropertyAssignment(property)) return isExportObject(property.name);
+        if (ts.isPropertyAssignment(property)) return exportObjectEscapes(property.initializer);
+        return ts.isSpreadAssignment(property) && exportObjectEscapes(property.expression);
+      });
+    }
+    return false;
+  };
   const isExportMutation = node => {
-    if (ts.isDeleteExpression(node)) return isNamedExport(node.expression);
+    if (ts.isDeleteExpression(node)) return isExportName(node.expression);
     if (ts.isBinaryExpression(node) && node.operatorToken.kind >= assignmentStart &&
         node.operatorToken.kind <= assignmentEnd &&
-        (isNamedExport(node.left) || isModuleExports(node.left))) {
+        (isExportName(node.left) || isModuleExports(node.left) || isComputedModuleExports(node.left))) {
       return !topLevelExportAssignments.has(node);
     }
     if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
-        isNamedExport(node.operand)) {
+        isExportName(node.operand)) {
       return true;
     }
-    if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression)) return false;
-    const method = node.expression.name.text;
-    if (method !== 'defineProperty' && method !== 'defineProperties' && method !== 'assign') return false;
-    if (!node.arguments.length || !isExportObject(node.arguments[0])) return false;
-    if (method !== 'defineProperty') return true;
-    const property = node.arguments[1];
-    return !property || !ts.isStringLiteral(property) || property.text === exportName;
+    return ts.isCallExpression(node) && node.arguments.some(exportObjectEscapes);
   };
 
   let exported = null;
@@ -443,9 +506,12 @@ function matches(text, baseline, fileName = 'state.js') {
     const priorUnsupportedForwarding = PRIOR_UNSUPPORTED_FORWARDING_NAMES;
     for (const method of owner.members) {
       const name = ts.isConstructorDeclaration(method) ? 'constructor' : method.name?.text;
-      if (!candidate.forwarding.includes(name)) continue;
-      if (ts.isConstructorDeclaration(method)) return false;
       const hasUnsupportedModifiers = !!method.modifiers?.length;
+      if (!candidate.forwarding.includes(name)) {
+        if (hasUnsupportedModifiers) return false;
+        continue;
+      }
+      if (ts.isConstructorDeclaration(method)) return false;
       const hasUnsupportedParameters = method.parameters.some(parameter =>
         parameter.initializer || !ts.isIdentifier(parameter.name));
       const exactLegacyParameterShape = JSON.stringify(parameterShape(method, parsed)) ===
