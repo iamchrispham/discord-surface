@@ -92,6 +92,21 @@ function nearestLexicalScope(node) {
   return current;
 }
 
+function nearestVariableScope(node) {
+  let current = node.parent;
+  while (current && !ts.isFunctionLike(current) && !ts.isSourceFile(current)) current = current.parent;
+  return current;
+}
+
+function variableDeclarationScope(node) {
+  const declarationList = node.parent;
+  if (ts.isVariableDeclarationList(declarationList) &&
+      !(declarationList.flags & ts.NodeFlags.BlockScoped)) {
+    return nearestVariableScope(node);
+  }
+  return nearestLexicalScope(node);
+}
+
 function collectBindings(sourceFile) {
   const bindings = [];
   const addPatternBindings = (pattern, declaration, scope) => {
@@ -124,9 +139,14 @@ function collectBindings(sourceFile) {
       declaration = node;
       name = node.name.text;
     }
-    if (declaration) bindings.push({ declaration, name, scope: nearestLexicalScope(declaration) });
+    if (declaration) {
+      const scope = ts.isVariableDeclaration(declaration)
+        ? variableDeclarationScope(declaration)
+        : nearestLexicalScope(declaration);
+      bindings.push({ declaration, name, scope });
+    }
     if (ts.isVariableDeclaration(node) && !ts.isIdentifier(node.name)) {
-      addPatternBindings(node.name, node, nearestLexicalScope(node));
+      addPatternBindings(node.name, node, variableDeclarationScope(node));
     } else if (ts.isParameter(node) && !ts.isIdentifier(node.name)) {
       addPatternBindings(node.name, node, nearestLexicalScope(node));
     }
@@ -488,7 +508,7 @@ function roomDigitPolicies(records) {
   for (const info of infos) {
     const visit = node => {
       if (ts.isVariableDeclaration(node)) {
-        const scope = nearestLexicalScope(node);
+        const scope = variableDeclarationScope(node);
         addPatternBindings(node.name, node.initializer || null, info, {
           declaration: node,
           scope,
@@ -2285,6 +2305,25 @@ test('room policy inventory records only town-hall room validators', () => {
   }
   function inspect(user) { return isSnowflake(user.guildId); }` };
   assert.deepEqual(roomDigitPolicies([...records, ordinaryCall]), expectedPolicies);
+  const blockHoistedVarRoomValidator = {
+    file: 'peer/block-hoisted-var-room-validator.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      { var id = room.guildId; }
+      return /^\d{1,21}$/.test(id);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, blockHoistedVarRoomValidator]), {
+    ...expectedPolicies,
+    'peer/block-hoisted-var-room-validator.ts': 1,
+  });
+  const blockHoistedVarNegativeControl = {
+    file: 'peer/block-hoisted-var-negative-control.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      { var id = room.name; }
+      return /^\d{1,21}$/.test(id);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, blockHoistedVarNegativeControl]), expectedPolicies);
   const runtimeCtsHelper = {
     file: 'peer/runtime-room-helper.cts',
     text: String.raw`export function validateGuildId(value) { return /^\d{1,21}$/.test(value); }`,

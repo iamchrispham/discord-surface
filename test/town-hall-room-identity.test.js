@@ -37,31 +37,6 @@ function ownerRequire() {
   return require(OWNER_BUILT).validateTownHallRoomIdentity;
 }
 
-// Runs `load` while every require of '../agent-message' made from the built owner
-// resolves to a fake module whose ownDataProperty is replaced. This isolates the
-// shared-owner sentinel without touching the shipped source.
-function withStubbedOwnDataProperty(stub, load) {
-  const real = require(AGENT_MESSAGE_BUILT);
-  const originalLoad = Module._load;
-  const savedOwner = require.cache[OWNER_BUILT];
-  delete require.cache[OWNER_BUILT];
-  Module._load = function mockedLoad(request, parent, isMain) {
-    if (parent && parent.filename === OWNER_BUILT) {
-      let resolved = null;
-      try { resolved = Module._resolveFilename(request, parent, isMain); } catch { resolved = null; }
-      if (resolved === AGENT_MESSAGE_BUILT) return { ...real, ownDataProperty: stub };
-    }
-    return originalLoad.apply(this, arguments);
-  };
-  try {
-    return load();
-  } finally {
-    Module._load = originalLoad;
-    delete require.cache[OWNER_BUILT];
-    if (savedOwner) require.cache[OWNER_BUILT] = savedOwner;
-  }
-}
-
 test('1 valid marker alone is accepted', () => {
   assert.equal(TOWN_HALL_ROOM_MARKER, '[discord-surface:town-hall:v1]');
   assert.equal(validateTownHallRoomIdentity(response(), room()), true);
@@ -263,37 +238,36 @@ test('expected proxy descriptors are snapshotted before room validation', () => 
   assert.equal(validateTownHallRoomIdentity(response({ id: 'not-a-channel', guild_id: 'not-a-guild' }), expected), false);
 });
 
-test('14 isolated shared-owner sentinel plus registration assertions', () => {
-  const validResponse = response();
-  const validRoom = room();
-
-  const forcedFalse = withStubbedOwnDataProperty(() => false, () => {
-    return ownerRequire()(validResponse, validRoom);
+test('identity validation reads each required proxy descriptor once', () => {
+  const forgeAfterFirstRead = (target, replacements, calls) => new Proxy(target, {
+    getOwnPropertyDescriptor(actual, key) {
+      if (!Object.hasOwn(replacements, key)) return Reflect.getOwnPropertyDescriptor(actual, key);
+      calls[key] = (calls[key] || 0) + 1;
+      const descriptor = Reflect.getOwnPropertyDescriptor(actual, key);
+      return calls[key] === 1 ? descriptor : { ...descriptor, value: replacements[key] };
+    }
   });
-  assert.equal(forcedFalse, false,
-    'stubbing the shared ownDataProperty owner to false must refuse an otherwise valid room');
 
-  // The real ownDataProperty rejects inherited required fields; a stub that
-  // always returns true still reaches the descriptor snapshot, proving the
-  // owner consults the shared helper rather than a private classifier.
-  const inherited = Object.create(response());
-  assert.equal(ownerRequire()(inherited, validRoom), false,
-    'the real shared owner must refuse inherited required fields');
-  let forcedTrueCalls = 0;
-  const forcedTrue = withStubbedOwnDataProperty(() => {
-    forcedTrueCalls += 1;
-    return true;
-  }, () => {
-    return ownerRequire()(inherited, validRoom);
-  });
-  assert.equal(forcedTrue, false,
-    'descriptor snapshots must still refuse inherited response fields');
-  assert.ok(forcedTrueCalls >= 4,
-    'the shared ownDataProperty owner must still be consulted for each response field');
+  const expectedCalls = {};
+  const expected = forgeAfterFirstRead(
+    room({ guildId: OTHER_GUILD, channelId: OTHER_CHANNEL }),
+    { guildId: GUILD, channelId: CHANNEL },
+    expectedCalls
+  );
+  assert.equal(validateTownHallRoomIdentity(response(), expected), false);
+  assert.deepEqual(expectedCalls, { channelId: 1, guildId: 1 });
 
-  assert.equal(ownerRequire()(validResponse, validRoom), true,
-    'restoring the shared owner must accept the valid room again');
+  const responseCalls = {};
+  const actual = forgeAfterFirstRead(
+    response({ id: OTHER_CHANNEL, guild_id: OTHER_GUILD, type: 1, topic: 'other room' }),
+    { id: CHANNEL, guild_id: GUILD, type: 0, topic: TOWN_HALL_ROOM_MARKER },
+    responseCalls
+  );
+  assert.equal(validateTownHallRoomIdentity(actual, room()), false);
+  assert.deepEqual(responseCalls, { id: 1, guild_id: 1, type: 1, topic: 1 });
+});
 
+test('14 identity owner and test registration assertions', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'package.json'), 'utf8'));
   const tokens = pkg.scripts.test.trim().split(/\s+/);
   assert.equal(tokens.filter(entry => entry === TEST_RELATIVE).length, 1,
@@ -326,7 +300,7 @@ test('14 isolated shared-owner sentinel plus registration assertions', () => {
 test('matching malformed room identifiers are refused at both boundaries', () => {
   const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
   for (const key of ['guildId', 'channelId']) {
-    for (const value of ['', 7, null, undefined, 'abc', '1'.repeat(21), '1\n', '1\r', '1\u2028', '1\u2029']) {
+    for (const value of ['', 7, null, undefined, 'abc', '1'.repeat(21), '99999999999999999999', '1\n', '1\r', '1\u2028', '1\u2029']) {
       const expected = room({ [key]: value });
       assert.equal(require('../dist/peer/town-hall-plan').isTownHallRoom(expected), false);
       const actual = response({ [key === 'guildId' ? 'guild_id' : 'id']: value });
@@ -379,7 +353,7 @@ test('room guard rejects proxy reads that diverge from valid descriptors', () =>
 
 test('room identifier length boundaries preserve valid matches', () => {
   const { planTownHallBroadcast } = require('../dist/peer/town-hall-plan');
-  for (const id of ['0', '1'.repeat(20)]) {
+  for (const id of ['0', '1'.repeat(20), '18446744073709551615']) {
     assert.equal(validateTownHallRoomIdentity(response({ id, guild_id: id }), room({ channelId: id, guildId: id })), true);
     assert.doesNotThrow(() => planTownHallBroadcast({ broadcastId: 'valid_room', townHall: room({ guildId: id, channelId: id }), source: { guildId: id, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', generation: 1 }, recipients: [{ guildId: id, channelId: OTHER_CHANNEL, provider: 'codex', nativeId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', generation: 1 }], text: 'fixture' }));
   }

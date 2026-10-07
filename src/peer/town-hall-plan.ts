@@ -22,6 +22,8 @@ export interface TownHallRoom {
   readonly channelId: string;
 }
 
+const UINT64_MAX = 18446744073709551615n;
+
 export function isTownHallRoom(value: unknown): boolean {
   try {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -37,7 +39,9 @@ export function isTownHallRoom(value: unknown): boolean {
     const observableChannelId = (value as { channelId: unknown }).channelId;
     return guildId === observableGuildId && channelId === observableChannelId &&
       typeof guildId === 'string' && /^\d{1,20}$/.test(guildId) &&
-      typeof channelId === 'string' && /^\d{1,20}$/.test(channelId);
+      BigInt(guildId) <= UINT64_MAX &&
+      typeof channelId === 'string' && /^\d{1,20}$/.test(channelId) &&
+      BigInt(channelId) <= UINT64_MAX;
   } catch {
     return false;
   }
