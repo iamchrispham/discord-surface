@@ -219,6 +219,24 @@ test('response proxy getters cannot replace validated descriptor values', () => 
   assert.equal(validateTownHallRoomIdentity(actual, room()), false);
 });
 
+test('response proxy reads that diverge from data descriptors are refused', () => {
+  const mismatches = {
+    id: OTHER_CHANNEL,
+    guild_id: OTHER_GUILD,
+    type: 1,
+    topic: 'not a town-hall marker',
+  };
+  for (const [key, value] of Object.entries(mismatches)) {
+    const actual = new Proxy(response(), {
+      get(target, property, receiver) {
+        return property === key ? value : Reflect.get(target, property, receiver);
+      },
+    });
+    assert.equal(validateTownHallRoomIdentity(actual, room()), false,
+      `observable response.${key} must match its data descriptor`);
+  }
+});
+
 test('expected proxy descriptors are snapshotted before room validation', () => {
   const calls = { guildId: 0, channelId: 0 };
   const expected = new Proxy(room(), {

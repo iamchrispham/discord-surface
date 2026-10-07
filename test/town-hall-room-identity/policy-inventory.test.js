@@ -425,17 +425,19 @@ function hasAsciiDigitPattern(pattern) {
   });
 }
 
-function resolveStringValue(expression, bindings, seen = new Set()) {
+function resolveStringValue(expression, bindings, seen = new Set(), resolveImport = null) {
   const value = unwrapPolicyExpression(expression);
   if (ts.isStringLiteralLike(value)) return value.text;
   if (!ts.isIdentifier(value)) return null;
   const binding = resolveBinding(value, bindings);
-  if (!binding || seen.has(binding) || !binding.initializer) return null;
+  if (!binding) return resolveImport ? resolveImport(value, seen) : null;
+  if (seen.has(binding)) return null;
+  if (!binding.initializer) return resolveImport ? resolveImport(value, seen) : null;
   seen.add(binding);
-  return resolveStringValue(binding.initializer, bindings, seen);
+  return resolveStringValue(binding.initializer, bindings, seen, resolveImport);
 }
 
-function legacyRoomDigitPolicies(records) {
+function legacyRoomDigitPolicies(records, resolveImport = null) {
   const sites = {};
   for (const { file, text } of records) {
     const ast = createSourceFile(file, text);
@@ -446,7 +448,8 @@ function legacyRoomDigitPolicies(records) {
       else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
           ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
           node.arguments?.length) {
-        pattern = resolveStringValue(node.arguments[0], bindings);
+        pattern = resolveStringValue(node.arguments[0], bindings, new Set(),
+          resolveImport ? (identifier, seen) => resolveImport(file, identifier, seen) : null);
       }
       const roomPolicy = pattern !== null && hasAsciiDigitPattern(pattern) &&
         (isTownHallRoomOwner(node, ast, bindings) || roomFieldSubject(node, ast, bindings) ||
@@ -1264,9 +1267,10 @@ function roomDigitPolicies(records) {
     const visit = node => {
       if (ts.isIdentifier(node) && node.text === namespaceName) {
         const binding = findBinding(info, namespaceName, node);
+        const isDefaultImport = binding?.kind === 'import' && binding.imported === 'default';
         const isCommonJsNamespace = binding?.kind === 'commonjs-import' &&
           binding.imported === 'default';
-        if (!binding || (binding.kind !== 'namespace-import' && !isCommonJsNamespace)) {
+        if (!binding || (binding.kind !== 'namespace-import' && !isDefaultImport && !isCommonJsNamespace)) {
           ts.forEachChild(node, visit);
           return;
         }
@@ -1369,7 +1373,48 @@ function roomDigitPolicies(records) {
     return result;
   };
 
-  const sites = legacyRoomDigitPolicies(records);
+  function resolveStringExport(info, name, seen = new Set()) {
+    const marker = `${info.file}\u0000${name}`;
+    if (seen.has(marker)) return null;
+    seen.add(marker);
+    const exported = info.exports.get(name);
+    if (exported && typeof exported === 'object') {
+      if (exported.kind === 'reexport') {
+        const target = resolveModule(info, exported.specifier);
+        return target ? resolveStringExport(target, exported.imported, seen) : null;
+      }
+      return null;
+    }
+    const localName = typeof exported === 'string' ? exported : name;
+    let declaration = findBinding(info, localName, info.ast)?.declaration;
+    if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) {
+      declaration = null;
+      const visit = node => {
+        if (declaration || !ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) ||
+            node.name.text !== localName || !node.initializer) {
+          ts.forEachChild(node, visit);
+          return;
+        }
+        declaration = node;
+      };
+      visit(info.ast);
+    }
+    if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return null;
+    return resolveStringValue(declaration.initializer, collectBindings(info.ast), seen,
+      (identifier, nestedSeen) => resolveImportedString(info, identifier, nestedSeen));
+  }
+
+  function resolveImportedString(info, identifier, seen) {
+    const imported = info.imports.get(identifier.text);
+    if (!imported || imported.namespace || !imported.specifier || !imported.imported) return null;
+    const target = resolveModule(info, imported.specifier);
+    return target ? resolveStringExport(target, imported.imported, seen) : null;
+  }
+
+  const sites = legacyRoomDigitPolicies(records, (file, identifier, seen) => {
+    const info = byFile.get(file);
+    return info ? resolveImportedString(info, identifier, seen) : null;
+  });
   for (const info of infos) {
     const legacyBindings = collectBindings(info.ast);
     const visit = node => {
@@ -1378,7 +1423,8 @@ function roomDigitPolicies(records) {
       else if ((ts.isNewExpression(node) || ts.isCallExpression(node)) &&
           ts.isIdentifier(node.expression) && node.expression.text === 'RegExp' &&
           node.arguments?.length) {
-        pattern = resolveStringValue(node.arguments[0], legacyBindings);
+        pattern = resolveStringValue(node.arguments[0], legacyBindings, new Set(),
+          (identifier, seen) => resolveImportedString(info, identifier, seen));
       }
       if (pattern !== null && hasAsciiDigitPattern(pattern)) {
         const legacyPolicy = isTownHallRoomOwner(node, info.ast, legacyBindings) ||
@@ -1404,10 +1450,10 @@ function roomDigitPolicies(records) {
   for (const consumer of infos) {
     const consumerBindings = collectBindings(consumer.ast);
     for (const [localName, imported] of consumer.imports) {
-      const commonJsDefault = imported.commonJs && imported.imported === 'default';
+      const defaultImport = imported.imported === 'default';
       const references = imported.namespace
         ? namespaceRegexInputs(consumer, localName)
-        : commonJsDefault
+        : defaultImport
           ? [
             ...importedRegexInputs(consumer, localName, imported)
               .map(input => ({ importedName: imported.imported, input })),
@@ -1484,6 +1530,9 @@ test('room policy inventory records only town-hall room validators', () => {
   const commonJsNamespaceReferenceFixture = ts.createSourceFile('peer/commonjs-namespace-reference-fixture.cjs', String.raw`const plan = require('./town-hall-plan');
   plan.isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(commonJsNamespaceReferenceFixture, 'isTownHallRoom'), 1);
+  const importEqualsNamespaceReferenceFixture = ts.createSourceFile('peer/import-equals-namespace-reference-fixture.cts', String.raw`import plan = require('./town-hall-plan.cjs');
+  plan.isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
+  assert.equal(countIdentifierReferences(importEqualsNamespaceReferenceFixture, 'isTownHallRoom'), 1);
   const destructuredShadowReferenceFixture = ts.createSourceFile('peer/destructured-shadow-reference-fixture.ts', String.raw`export function isTownHallRoom(room) { return room; }
   function parameterShadow({ isTownHallRoom }) { return isTownHallRoom({}); }
   function localShadow() {
@@ -2004,6 +2053,31 @@ test('room policy inventory records only town-hall room validators', () => {
     namespaceRegexHelper,
     namespaceRegexNegativeConsumer,
   ]), expectedPolicies);
+  const defaultObjectRegexHelper = {
+    file: 'peer/default-object-room-regex.ts',
+    text: String.raw`export default { ROOM_ID: /^\d{1,21}$/ };`,
+  };
+  const defaultObjectRegexConsumer = {
+    file: 'peer/default-object-room-regex-consumer.ts',
+    text: "import patterns from './default-object-room-regex'; function validateTownHallRoom(room) { return patterns.ROOM_ID.test(room.guildId); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    defaultObjectRegexHelper,
+    defaultObjectRegexConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/default-object-room-regex.ts': 1,
+  });
+  const defaultObjectRegexNegativeConsumer = {
+    file: 'peer/default-object-room-regex-negative-consumer.ts',
+    text: "import patterns from './default-object-room-regex'; function inspectRoom(room) { return patterns.ROOM_ID.test(room.name); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    defaultObjectRegexHelper,
+    defaultObjectRegexNegativeConsumer,
+  ]), expectedPolicies);
   const cjsRuntimeRegexHelper = {
     file: 'peer/cjs-runtime-room-regex.cts',
     text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`,
@@ -2028,6 +2102,31 @@ test('room policy inventory records only town-hall room validators', () => {
     ...records,
     cjsRuntimeRegexHelper,
     cjsRuntimeRegexNegativeConsumer,
+  ]), expectedPolicies);
+  const cjsRequireRuntimeRegexHelper = {
+    file: 'peer/cjs-require-room-regex.cts',
+    text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const cjsRequireRuntimeRegexConsumer = {
+    file: 'peer/cjs-require-room-consumer.cts',
+    text: "const patterns = require('./cjs-require-room-regex.cjs'); function validateTownHallRoom(room) { return patterns.ROOM_ID.test(room.guildId); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    cjsRequireRuntimeRegexHelper,
+    cjsRequireRuntimeRegexConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/cjs-require-room-regex.cts': 1,
+  });
+  const cjsRequireRuntimeRegexNegativeConsumer = {
+    file: 'peer/cjs-require-room-negative-consumer.cts',
+    text: "const patterns = require('./cjs-require-room-regex.cjs'); function inspectRoom(room) { return patterns.ROOM_ID.test(room.name); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    cjsRequireRuntimeRegexHelper,
+    cjsRequireRuntimeRegexNegativeConsumer,
   ]), expectedPolicies);
   const mjsRuntimeRegexHelper = {
     file: 'peer/mjs-runtime-room-regex.mts',
@@ -2091,6 +2190,31 @@ test('room policy inventory records only town-hall room validators', () => {
     }`,
   };
   assert.deepEqual(roomDigitPolicies([...records, boundRegexStringNegativeRoom]), expectedPolicies);
+  const importedRegexStringHelper = {
+    file: 'peer/imported-room-regex-source.ts',
+    text: String.raw`export const ROOM_ID_SOURCE = '^\\d{1,21}$';`,
+  };
+  const importedRegexStringConsumer = {
+    file: 'peer/imported-room-regex-source-consumer.ts',
+    text: "import { ROOM_ID_SOURCE } from './imported-room-regex-source'; function validateRoom(room) { return new RegExp(ROOM_ID_SOURCE).test(room.guildId); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importedRegexStringHelper,
+    importedRegexStringConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/imported-room-regex-source-consumer.ts': 1,
+  });
+  const importedRegexStringNegativeConsumer = {
+    file: 'peer/imported-room-regex-source-negative-consumer.ts',
+    text: "import { ROOM_ID_SOURCE } from './imported-room-regex-source'; function inspectRoom(room) { return new RegExp(ROOM_ID_SOURCE).test(room.name); }",
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importedRegexStringHelper,
+    importedRegexStringNegativeConsumer,
+  ]), expectedPolicies);
   const unicodeDecimalRoom = {
     file: 'peer/unicode-decimal-room.ts',
     text: String.raw`function validateTownHallRoom(room) {

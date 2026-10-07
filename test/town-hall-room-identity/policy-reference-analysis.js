@@ -121,6 +121,9 @@ function countIdentifierReferences(sourceFile, name) {
         imports.push({ declaration: named.name, name: named.name.text, scope: sourceFile, namespace: true });
       }
     }
+    if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+      imports.push({ declaration: node.name, name: node.name.text, scope: sourceFile, namespace: true });
+    }
     if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer) &&
         ts.isIdentifier(node.initializer.expression) && node.initializer.expression.text === 'require' &&
         node.initializer.arguments.length === 1 && ts.isStringLiteralLike(node.initializer.arguments[0])) {

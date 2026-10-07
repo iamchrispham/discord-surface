@@ -30,10 +30,14 @@ export function validateTownHallRoomIdentity(response: unknown, expected: TownHa
         !Object.hasOwn(responseGuildIdDescriptor, 'value') ||
         !Object.hasOwn(responseTypeDescriptor, 'value') ||
         !Object.hasOwn(responseTopicDescriptor, 'value')) return false;
-    const responseId = responseIdDescriptor.value;
-    const responseGuildId = responseGuildIdDescriptor.value;
-    const responseType = responseTypeDescriptor.value;
-    const responseTopic = responseTopicDescriptor.value;
+    const responseId = response.id;
+    const responseGuildId = response.guild_id;
+    const responseType = response.type;
+    const responseTopic = response.topic;
+    if (responseId !== responseIdDescriptor.value ||
+        responseGuildId !== responseGuildIdDescriptor.value ||
+        responseType !== responseTypeDescriptor.value ||
+        responseTopic !== responseTopicDescriptor.value) return false;
 
     if (responseId !== expectedChannelId) return false;
     if (responseGuildId !== expectedGuildId) return false;
