@@ -356,6 +356,23 @@ test("local module exports retain probe provenance across files", () => {
     'use.js': "const probe = require('./probe.cjs'); function newProbe(pid) { probe(pid, 0); }"
   }, ["use.js\u0000newProbe"], ["unclassified process probe use.js:newProbe"]);
   runFilesFixture({
+    'producer.js': "export const getProbe = (value = process.kill) => value;",
+    'use.js': "import { getProbe } from './producer.js'; getProbe(undefined)(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    'producer.js': "export function getProbe() { let probe; probe = process.kill; return probe; }",
+    'use.js': "import { getProbe } from './producer.js'; getProbe()(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    'producer.js': "export class Runner { constructor(probe, pid) { probe(pid, 0); } }",
+    'use.js': "import { Runner } from './producer.js'; new Runner(process.kill, 1);"
+  }, [], ["unsupported process probe use.js:null"]);
+  runFilesFixture({
+    'probe/package.json': JSON.stringify({ main: 'owner.js' }),
+    'probe/owner.js': "module.exports = process.kill;",
+    'use.js': "const probe = require('./probe'); probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
     'producer.js': "export const ownerAlive = ({ directPostOwnerAlive() {} }).directPostOwnerAlive;",
     'use.js': "import { ownerAlive } from './producer.js'; ownerAlive();"
   }, [], ["legacy directPostOwnerAlive callsite use.js:null"], ["use.js\u0000null"]);

@@ -35,9 +35,30 @@ function createLocalModuleResolver(files) {
     const extension = path.extname(base);
     const stem = extension && ['.js', '.jsx', '.cjs', '.mjs', '.ts', '.tsx'].includes(extension)
       ? base.slice(0, -extension.length) : base;
-    const candidates = [base, stem, `${stem}.js`, `${stem}.ts`, `${stem}.tsx`, `${stem}.cjs`, `${stem}.mjs`,
-      path.join(stem, 'index.js'), path.join(stem, 'index.ts')];
-    return candidates.find(candidate => moduleByPath.has(path.resolve(candidate))) || null;
+    const candidates = [base, stem, `${stem}.js`, `${stem}.ts`, `${stem}.tsx`, `${stem}.cjs`, `${stem}.mjs`];
+    const direct = candidates.find(candidate => moduleByPath.has(path.resolve(candidate)));
+    if (direct) return path.resolve(direct);
+    const packagePath = path.join(base, 'package.json');
+    const fs = require('node:fs');
+    if (fs.existsSync(packagePath)) {
+      try {
+        const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+        if (typeof packageJson.main === 'string' && packageJson.main) {
+          const packageBase = path.resolve(base, packageJson.main);
+          const packageExtension = path.extname(packageBase);
+          const packageStem = packageExtension && ['.js', '.jsx', '.cjs', '.mjs', '.ts', '.tsx']
+            .includes(packageExtension) ? packageBase.slice(0, -packageExtension.length) : packageBase;
+          const packageCandidates = [packageBase, packageStem, `${packageStem}.js`, `${packageStem}.ts`,
+            `${packageStem}.tsx`, `${packageStem}.cjs`, `${packageStem}.mjs`];
+          const entry = packageCandidates.find(candidate => moduleByPath.has(path.resolve(candidate)));
+          if (entry) return path.resolve(entry);
+        }
+      } catch {
+        return null;
+      }
+    }
+    const indexCandidates = [path.join(stem, 'index.js'), path.join(stem, 'index.ts')];
+    return indexCandidates.find(candidate => moduleByPath.has(path.resolve(candidate))) || null;
   };
 
   const moduleAtom = modulePath => `${MODULE_OBJECT_PREFIX}${modulePath}`;
@@ -430,7 +451,10 @@ function createLocalModuleResolver(files) {
     for (let index = 0; index < (callable.parameters || []).length; index += 1) {
       const parameter = callable.parameters[index];
       const suppliedArgument = argumentsList === null ? undefined : argumentsList?.[index];
-      const argument = suppliedArgument ?? parameter.initializer;
+      const suppliedNode = unwrap(suppliedArgument);
+      const explicitUndefined = Boolean(suppliedNode) &&
+        ts.isIdentifier(suppliedNode) && suppliedNode.text === 'undefined';
+      const argument = suppliedArgument === undefined || explicitUndefined ? parameter.initializer : suppliedArgument;
       if (!argument) continue;
       if (ts.isIdentifier(parameter.name)) {
         bindings.set(parameter.name.text, { expression: argument, currentPath: callerPath });
@@ -475,6 +499,13 @@ function createLocalModuleResolver(files) {
         if (ts.isVariableDeclaration(child) && ts.isIdentifier(child.name) && child.name.text === name) {
           found = true;
           if (child.initializer) sources.push(child.initializer);
+        }
+        if (ts.isBinaryExpression(child) && child.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+          const left = unwrap(child.left);
+          if (ts.isIdentifier(left) && left.text === name) {
+            found = true;
+            sources.push(child.right);
+          }
         }
         ts.forEachChild(child, collect);
       };

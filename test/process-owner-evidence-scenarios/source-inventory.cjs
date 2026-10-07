@@ -1693,6 +1693,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   }
 
   const visit = node => {
+    if (ts.isNewExpression(node)) {
+      const importedClass = [...staticValue(node.expression)].some(atom => atom?.classDeclaration);
+      const argumentsList = expandCallArguments(node.arguments);
+      const hasProbeArgument = argumentsList?.some(argument => hasAtom(staticValue(argument), PID_PROBE));
+      if (importedClass && (argumentsList === null || hasProbeArgument)) {
+        violations.push(`unsupported process probe ${fileName}:${generatedOwner || enclosingOwner(node)}`);
+      }
+    }
     if (ts.isCallExpression(node)) {
       const owner = generatedOwner || enclosingOwner(node);
       const callee = node.expression;
