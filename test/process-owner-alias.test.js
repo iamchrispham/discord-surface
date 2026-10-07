@@ -249,6 +249,14 @@ test("rest parameter elements retain argument provenance", () => {
   runFixture("function invoke(...args) { args[0](123, args[1]); } invoke(process.kill, 0);", ["private-alias.js\u0000invoke"], ["unclassified process probe private-alias.js:invoke"]);
 });
 
+test("finite spread aliases retain argument provenance", () => {
+  runFixture(
+    "function invoke(probe, pid) { probe(pid, 0); } const args = [process.kill, 1]; invoke(...args);",
+    ["private-alias.js\u0000invoke"],
+    ["unclassified process probe private-alias.js:invoke"]
+  );
+});
+
 test("local module exports retain probe provenance across files", () => {
   runFilesFixture({
     'probe.js': "module.exports = { probe: process.kill };",
@@ -328,6 +336,26 @@ test("local module exports retain probe provenance across files", () => {
     'use.js': "import probe from './producer.js'; probe(1, 0);"
   }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
   runFilesFixture({
+    'probe.ts': "const probe = process.kill; export = probe;",
+    'use.ts': "import probe = require('./probe'); function newProbe(pid) { probe(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'producer.ts': "export function getProbe() { const process = { kill() {} }; return process.kill; }",
+    'use.ts': "import { getProbe } from './producer'; function newProbe(pid) { getProbe()(pid, 0); }"
+  }, [], []);
+  runFilesFixture({
+    'producer.ts': "const ordinary = () => true; export let probe = ordinary; { probe = process.kill; }",
+    'use.ts': "import { probe } from './producer'; function newProbe(pid) { probe(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'producer.ts': "const ordinary = () => true; export const probe = Math.random() > 0.5 ? process.kill : ordinary;",
+    'use.ts': "import { probe } from './producer'; function newProbe(pid) { probe(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'probe.cjs': "module.exports = process.kill;",
+    'use.js': "const probe = require('./probe.cjs'); function newProbe(pid) { probe(pid, 0); }"
+  }, ["use.js\u0000newProbe"], ["unclassified process probe use.js:newProbe"]);
+  runFilesFixture({
     'producer.js': "export const ownerAlive = ({ directPostOwnerAlive() {} }).directPostOwnerAlive;",
     'use.js': "import { ownerAlive } from './producer.js'; ownerAlive();"
   }, [], ["legacy directPostOwnerAlive callsite use.js:null"], ["use.js\u0000null"]);
@@ -352,6 +380,15 @@ test("TypeScript-only wrappers retain probe identity", () => {
   runFixture("const probe = process.kill satisfies typeof process.kill; function newProbe(pid) { probe(pid, 0); }", expectedKill, expectedViolation, 'private-alias.ts');
   runFixture("const probe = (process.kill)!; function newProbe(pid) { probe(pid, 0); }", expectedKill, expectedViolation, 'private-alias.ts');
   runFixture("const probe = <typeof process.kill>process.kill; function newProbe(pid) { probe(pid, 0); }", expectedKill, expectedViolation, 'private-alias.ts');
+});
+
+test("named default process imports retain process-object identity", () => {
+  runFixture(
+    "import { default as proc } from 'node:process'; function newProbe(pid) { proc.kill(pid, 0); }",
+    ["private-alias.ts\u0000newProbe"],
+    ["unclassified process probe private-alias.ts:newProbe"],
+    'private-alias.ts'
+  );
 });
 
 test("forwarded callback APIs retain process probes", () => {
@@ -547,8 +584,8 @@ test("finite resolver closes indirect probe gaps", () => {
   );
   runFixture(
     "function newProbe(pid) { const args = [pid, 0]; process.kill(...args); }",
-    [],
-    ["unsupported process probe private-alias.js:newProbe"]
+    ["private-alias.js\u0000newProbe"],
+    ["unclassified process probe private-alias.js:newProbe"]
   );
   runFixture(
     "function invoke(probe, pid) { probe(pid, 0); } let run; run = invoke; run(process.kill, 1);",

@@ -61,7 +61,7 @@ function sourceFiles(root) {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const full = path.join(directory, entry.name);
       if (entry.isDirectory()) walk(full);
-      else if (/\.(?:js|ts)$/.test(entry.name)) found.push(full);
+      else if (/\.(?:js|ts|cjs)$/.test(entry.name)) found.push(full);
     }
   };
   walk(root);
@@ -258,6 +258,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       if (ts.isNamespaceImport(declaration)) return PROCESS_OBJECT;
       if (ts.isImportSpecifier(declaration)) {
         const importedName = declaration.propertyName || declaration.name;
+        if (importedName.text === 'default') return PROCESS_OBJECT;
         if (importedName.text === 'kill') return PID_PROBE;
       }
     }
@@ -287,7 +288,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         const moduleName = reference && ts.isExternalModuleReference(reference)
           ? reference.expression : null;
         if (ts.isStringLiteral(moduleName)) {
-          for (const atom of moduleResolver.resolveImport(virtualPath, moduleName.text, '*')) atoms.add(atom);
+          for (const atom of moduleResolver.resolveImport(
+            virtualPath, moduleName.text, '*', { importEquals: true })) atoms.add(atom);
         }
       }
     }
@@ -591,18 +593,42 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         }
         let source = argument.expression;
         while (ts.isParenthesizedExpression(source)) source = source.expression;
-        if (!ts.isArrayLiteralExpression(source) || !expand(source.elements)) return false;
+        const elements = literalArrayElements(source, new Set(), true);
+        if (!elements || !expand(elements)) return false;
       }
       return true;
     };
     return expand(argumentsList) ? expanded : null;
   };
-  const literalArrayElements = expression => {
-    if (!expression) return null;
+  const literalArrayElements = (expression, visited = new Set(), resolveAliases = false) => {
+    if (!expression || visited.has(expression)) return null;
     let source = expression;
     while (ts.isParenthesizedExpression(source)) source = source.expression;
-    if (!ts.isArrayLiteralExpression(source) || source.elements.some(ts.isSpreadElement)) return null;
-    return source.elements;
+    if (visited.has(source)) return null;
+    const seen = new Set(visited).add(source);
+    if (ts.isArrayLiteralExpression(source)) {
+      return source.elements.some(ts.isSpreadElement) ? null : source.elements;
+    }
+    if (!resolveAliases || !ts.isIdentifier(source)) return null;
+    const symbol = checker.getSymbolAtLocation(source);
+    if (!symbol) return null;
+    const declaration = symbolDeclaration(symbol);
+    if (!declaration) return null;
+    const candidates = [];
+    if ((ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) && declaration.initializer) {
+      candidates.push(declaration.initializer);
+    }
+    for (const assigned of assignments.get(symbol) || []) {
+      if (!assigned.name) candidates.push(assigned.source);
+    }
+    let resolved = null;
+    for (const candidate of candidates) {
+      const elements = literalArrayElements(candidate, seen, true);
+      if (!elements) return null;
+      if (resolved && resolved !== elements) return null;
+      resolved = elements;
+    }
+    return resolved;
   };
   const finiteArrayCallbackMethods = new Set([
     'forEach', 'map', 'filter', 'some', 'every', 'find', 'findIndex', 'flatMap'

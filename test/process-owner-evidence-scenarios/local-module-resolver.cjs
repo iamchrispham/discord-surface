@@ -56,6 +56,7 @@ function createLocalModuleResolver(files) {
       imports: new Map(),
       exports: new Map(),
       defaultExport: null,
+      exportEquals: null,
       wildcardExports: [],
       exportAliases: new Set(['exports'])
     };
@@ -192,9 +193,13 @@ function createLocalModuleResolver(files) {
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module') {
         module.defaultExport = expression.right;
+        module.exportEquals = expression.right;
       }
       if (ts.isElementAccessExpression(left) && name === 'exports' && ts.isIdentifier(left.expression) &&
-        left.expression.text === 'module') module.defaultExport = expression.right;
+        left.expression.text === 'module') {
+        module.defaultExport = expression.right;
+        module.exportEquals = expression.right;
+      }
     };
     const recordExportExpression = expression => {
       if (expression.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isBinaryExpression(expression.right)) {
@@ -204,6 +209,7 @@ function createLocalModuleResolver(files) {
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module') {
         module.defaultExport = expression.right;
+        module.exportEquals = expression.right;
         if (ts.isObjectLiteralExpression(expression.right)) {
           for (const property of expression.right.properties) {
             if (!property.name || (!ts.isPropertyAssignment(property) &&
@@ -216,6 +222,19 @@ function createLocalModuleResolver(files) {
         }
       }
       recordAssignment(expression);
+    };
+    const recordExportAssignment = statement => {
+      if (statement.isExportEquals) {
+        module.exportEquals = statement.expression;
+        module.defaultExport = statement.expression;
+      }
+    };
+    const scanModuleLevel = node => {
+      if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) ||
+        ts.isArrowFunction(node) || ts.isMethodDeclaration(node) ||
+        ts.isClassDeclaration(node) || ts.isClassExpression(node)) return;
+      if (ts.isBinaryExpression(node)) recordAssignment(node);
+      ts.forEachChild(node, scanModuleLevel);
     };
 
     for (const statement of sourceFile.statements) {
@@ -253,8 +272,8 @@ function createLocalModuleResolver(files) {
         }
       }
       if (ts.isExportAssignment(statement)) {
-        if (statement.isExportEquals) module.defaultExport = statement.expression;
-        else {
+        recordExportAssignment(statement);
+        if (!statement.isExportEquals) {
           const snapshotBindings = new Map();
           for (const [name, bindings] of module.bindings) snapshotBindings.set(name, bindings.slice());
           addExport('default', {
@@ -268,6 +287,7 @@ function createLocalModuleResolver(files) {
         if (ts.isBinaryExpression(expression)) recordExportExpression(expression);
       }
     }
+    scanModuleLevel(sourceFile);
     return module;
   };
 
@@ -428,6 +448,49 @@ function createLocalModuleResolver(files) {
     return bindings;
   };
 
+  const localBindingSources = (node, name) => {
+    let current = node.parent;
+    let functionScope = null;
+    while (current && !ts.isSourceFile(current)) {
+      if (ts.isFunctionLike(current)) {
+        functionScope = current;
+        break;
+      }
+      current = current.parent;
+    }
+    if (!functionScope) return null;
+    const scopes = [];
+    current = node.parent;
+    while (current && current !== functionScope) {
+      if (ts.isBlock(current)) scopes.push(current);
+      current = current.parent;
+    }
+    if (functionScope.body && ts.isBlock(functionScope.body)) scopes.push(functionScope.body);
+    for (const scope of scopes) {
+      const sources = [];
+      let found = false;
+      const collect = child => {
+        if (child !== scope && (ts.isBlock(child) || ts.isFunctionLike(child) ||
+          ts.isClassDeclaration(child) || ts.isClassExpression(child))) return;
+        if (ts.isVariableDeclaration(child) && ts.isIdentifier(child.name) && child.name.text === name) {
+          found = true;
+          if (child.initializer) sources.push(child.initializer);
+        }
+        ts.forEachChild(child, collect);
+      };
+      collect(scope);
+      if (scope === functionScope.body) {
+        for (const parameter of functionScope.parameters || []) {
+          if (!ts.isIdentifier(parameter.name) || parameter.name.text !== name) continue;
+          found = true;
+          if (parameter.initializer) sources.push(parameter.initializer);
+        }
+      }
+      if (found) return { sources };
+    }
+    return null;
+  };
+
   const evaluate = (expression, currentPath, visited = new Set(), parameterBindings = new Map(),
     bindingOverrides = new Map()) => {
     if (expression?.namespaceModulePath) return new Set([moduleAtom(expression.namespaceModulePath)]);
@@ -448,6 +511,13 @@ function createLocalModuleResolver(files) {
     if (ts.isMethodDeclaration(node)) {
       return new Set([{ callable: node, modulePath: currentPath }]);
     }
+    if (ts.isConditionalExpression(node)) {
+      const result = evaluate(node.whenTrue, currentPath, seen, parameterBindings, bindingOverrides);
+      for (const atom of evaluate(node.whenFalse, currentPath, seen, parameterBindings, bindingOverrides)) {
+        result.add(atom);
+      }
+      return result;
+    }
     if (ts.isIdentifier(node)) {
       const parameter = parameterBindings.get(node.text);
       if (parameter) {
@@ -455,6 +525,14 @@ function createLocalModuleResolver(files) {
           return evaluateProperty(parameter.expression, parameter.name, parameter.currentPath, seen, bindingOverrides);
         }
         return evaluate(parameter.expression, parameter.currentPath, seen, parameter.bindings || new Map(), bindingOverrides);
+      }
+      const localBinding = localBindingSources(node, node.text);
+      if (localBinding) {
+        const result = new Set();
+        for (const source of localBinding.sources) {
+          for (const atom of evaluate(source, currentPath, seen, parameterBindings, bindingOverrides)) result.add(atom);
+        }
+        return result;
       }
       const module = currentPath && scanModule(currentPath);
       const imported = module?.imports.get(node.text);
@@ -528,6 +606,17 @@ function createLocalModuleResolver(files) {
     return new Set();
   };
 
+  const resolveExportEquals = modulePath => {
+    const module = scanModule(modulePath);
+    if (!module) return new Set();
+    const result = new Set();
+    const expression = module.exportEquals;
+    if (expression) {
+      for (const atom of evaluate(expression, module.path, new Set())) result.add(atom);
+    }
+    return result;
+  };
+
   const resolveExport = (modulePath, name, visited = new Set()) => {
     const module = scanModule(modulePath);
     if (!module || name === '*') return name === '*' && module ? new Set([moduleAtom(module.path)]) : new Set();
@@ -582,9 +671,10 @@ function createLocalModuleResolver(files) {
 
   for (const fullPath of files) scanModule(fullPath);
   return {
-    resolveImport(fromPath, specifier, name) {
+    resolveImport(fromPath, specifier, name, options = {}) {
       const modulePath = resolveRequest(fromPath, specifier);
-      return modulePath ? resolveExport(modulePath, name) : new Set();
+      if (!modulePath) return new Set();
+      return options.importEquals ? resolveExportEquals(modulePath) : resolveExport(modulePath, name);
     },
     resolveRequire(fromPath, specifier) {
       const modulePath = resolveRequest(fromPath, specifier);
