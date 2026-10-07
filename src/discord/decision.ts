@@ -140,7 +140,7 @@ export interface DecisionConsumerState {
   };
   recordDecisionAuthorizationOutcome(interactionId: string, outcome: DecisionAuthorizationOutcome): unknown;
   beginDecisionRejectionFollowup(interactionId: string): unknown;
-  recordDecisionRejectionOutcome(interactionId: string, outcome: DecisionTransportOutcome, retryDeadline?: number | null): unknown;
+  recordDecisionRejectionOutcome(interactionId: string, outcome: DecisionTransportOutcome): unknown;
   getDecisionClick(interactionId: string): DecisionClick | null;
   recordDecisionCallbackOutcome(interactionId: string, outcome: DecisionTransportOutcome): unknown;
   importDecisionWinner(interactionId: string, result: DecisionCanonicalResult): {
@@ -336,7 +336,6 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   const runCanonical = options.runCanonical || runCanonicalOperation;
   const callbackWaiters = new Map<string, Promise<void>>();
   const decisionRecoveryDeadlines = new Map<string, number>();
-  const rejectionRetryAttempts = new Map<string, number>();
 
   function scheduleRecovery(
     channelIds: Set<string>,
@@ -417,9 +416,8 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       const outcome = click.callbackOutcome === DECISION_TRANSPORT_OUTCOMES.REJECTED
         ? DECISION_TRANSPORT_OUTCOMES.REJECTED
         : DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
-      rejectionRetryAttempts.delete(click.interactionId);
       try {
-        state.recordDecisionRejectionOutcome(click.interactionId, outcome, null);
+        state.recordDecisionRejectionOutcome(click.interactionId, outcome);
       } catch {}
       return null;
     }
@@ -449,34 +447,11 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       }
     }
     const outcome = transportOutcome(result.outcome);
-    const retryable = outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT ||
-      outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED;
-    let retryDelayMs = 0;
-    let retryDeadline: number | null = null;
-    let scheduleRetry = false;
-    if (retryable) {
-      if (outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED) {
-        retryDelayMs = decisionRecoveryDelayMs(result.retryAfterMs);
-        retryDeadline = Date.now() + retryDelayMs;
-        rejectionRetryAttempts.delete(click.interactionId);
-        scheduleRetry = !signal?.aborted;
-      } else if (!signal?.aborted) {
-        const attempts = (rejectionRetryAttempts.get(click.interactionId) || 0) + 1;
-        if (attempts <= DECISION_PROJECTION_RETRY_LIMIT) {
-          rejectionRetryAttempts.set(click.interactionId, attempts);
-          scheduleRetry = true;
-          if (attempts > 1) {
-            const exponentialDelay = DECISION_RECOVERY_DEFAULT_DELAY_MS * (2 ** (attempts - 2));
-            retryDelayMs = Math.min(DECISION_PROJECTION_RETRY_MAX_DELAY_MS, exponentialDelay);
-          }
-        } else {
-          rejectionRetryAttempts.delete(click.interactionId);
-        }
-      }
-    } else if (!retryable) {
-      rejectionRetryAttempts.delete(click.interactionId);
-    }
-    try { state.recordDecisionRejectionOutcome(click.interactionId, outcome, retryDeadline); } catch {}
+    const retryDelayMs = outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED
+      ? decisionRecoveryDelayMs(result.retryAfterMs)
+      : 0;
+    const scheduleRetry = outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED && !signal?.aborted;
+    try { state.recordDecisionRejectionOutcome(click.interactionId, outcome); } catch {}
     if (scheduleRetry) {
       scheduleRecovery(new Set([click.channelId]), {
         ...(retryDelayMs > 0 ? { delayMs: retryDelayMs } : {}),
@@ -592,10 +567,10 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     }
   }
 
-  async function native(click: DecisionClick, signal?: AbortSignal): Promise<unknown> {
+  async function native(click: DecisionClick, signal?: AbortSignal, retryKnownUnsubmitted = false): Promise<unknown> {
     const message = safeMessage(state, click.interactionId);
     if (!message || !options.processAccepted || click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED ||
-      click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED ||
+      (click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED && !retryKnownUnsubmitted) ||
       click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.REJECTED) return message;
     const result = await options.processAccepted(message, signal, { continueUntilFinal: false, awaitDispatchOutcome: true });
     const refreshed = safeMessage(state, click.interactionId);
@@ -657,7 +632,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       projectionOutcomeRetryable(current.projectionOutcome)) {
       return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
     }
-    const nativeResult = await native(current, signal);
+    const retryKnownUnsubmitted = recovery && projected &&
+      current.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT;
+    const nativeResult = await native(current, signal, retryKnownUnsubmitted);
     return { handled: true, accepted: true, click: state.getDecisionClick(click.interactionId) || current, canonical: current.canonical, message: safeMessage(state, click.interactionId), native: nativeResult };
   }
 
@@ -838,19 +815,12 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     for (const decisionId of decisionRecoveryDeadlines.keys()) {
       if (!pendingIds.has(decisionId)) decisionRecoveryDeadlines.delete(decisionId);
     }
-    for (const decisionId of rejectionRetryAttempts.keys()) {
-      if (!pendingIds.has(decisionId)) rejectionRetryAttempts.delete(decisionId);
-    }
     const pending = allPending.filter(click => !channelIds || channelIds.has(click.channelId));
     const remaining: DecisionClick[] = [];
     for (let pendingClick of pending) {
       if (signal?.aborted) { remaining.push(pendingClick); continue; }
-      if (typeof pendingClick.rejectionRetryDeadline === 'number' &&
-        !decisionRecoveryDeadlines.has(pendingClick.interactionId)) {
-        decisionRecoveryDeadlines.set(pendingClick.interactionId, pendingClick.rejectionRetryDeadline);
-      }
       const retryDeadline = decisionRecoveryDeadlines.get(pendingClick.interactionId);
-      const enforceRetryDeadline = channelIds !== null || typeof pendingClick.rejectionRetryDeadline === 'number';
+      const enforceRetryDeadline = channelIds !== null;
       if (!enforceRetryDeadline && retryDeadline !== undefined) {
         decisionRecoveryDeadlines.delete(pendingClick.interactionId);
       }

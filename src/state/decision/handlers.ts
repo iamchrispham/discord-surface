@@ -435,16 +435,9 @@ export function createDecisionHandlers(): DecisionHandlers {
       });
     },
 
-    recordRejectionOutcome(state, interactionId, rawOutcome, rawRetryDeadline = null) {
+    recordRejectionOutcome(state, interactionId, rawOutcome) {
       const id = text(interactionId, 'interactionId', 256);
       const nextOutcome = outcome(rawOutcome);
-      if (rawRetryDeadline !== null && rawRetryDeadline !== undefined &&
-        (typeof rawRetryDeadline !== 'number' || !Number.isFinite(rawRetryDeadline) || rawRetryDeadline <= 0)) {
-        throw new DecisionError('retryDeadline must be a positive finite number');
-      }
-      const retryDeadline = rawRetryDeadline === null || rawRetryDeadline === undefined
-        ? null
-        : Math.ceil(rawRetryDeadline);
       return state.transaction(() => {
         const click = clickFor(state, id);
         if (!click) return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
@@ -460,8 +453,7 @@ export function createDecisionHandlers(): DecisionHandlers {
         const tokenHeld = Boolean(click.token);
         append(state, DECISION_RECEIPT_KINDS.REJECTION_OUTCOME, {
           interactionId: id,
-          outcome: nextOutcome,
-          ...(nextOutcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED && retryDeadline !== null ? { retryDeadline } : {})
+          outcome: nextOutcome
         });
         if (rejectionTerminal(nextOutcome)) releaseToken(state, id, tokenHeld);
         return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };

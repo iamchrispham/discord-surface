@@ -284,7 +284,6 @@ export interface DecisionClick {
   callbackOutcome: DecisionTransportOutcome | null;
   rejectionAttempted: boolean;
   rejectionOutcome: DecisionTransportOutcome | null;
-  rejectionRetryDeadline: number | null;
   canonical: DecisionCanonicalResult | null;
   projectionOutcome: DecisionTransportOutcome | null;
   nativeReturn: DecisionNativeReturn | null;
@@ -353,7 +352,7 @@ export interface DecisionHandlers {
   beginCallback(state: DecisionStateStore, interactionId: string): DecisionTransitionResult;
   recordCallbackOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionTransportOutcome): DecisionTransitionResult;
   beginRejectionFollowup(state: DecisionStateStore, interactionId: string): DecisionTransitionResult;
-  recordRejectionOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionTransportOutcome, retryDeadline?: number | null): DecisionTransitionResult;
+  recordRejectionOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionTransportOutcome): DecisionTransitionResult;
   recoverCallbackAttemptsAfterRestart(state: DecisionStateStore): number;
   importWinner(state: DecisionStateStore, interactionId: string, result: DecisionCanonicalResult): DecisionTransitionResult;
   recordProjectionOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionTransportOutcome): DecisionTransitionResult;
@@ -410,7 +409,6 @@ export interface MutableClick {
   callbackOutcome: DecisionTransportOutcome | null;
   rejectionAttempted: boolean;
   rejectionOutcome: DecisionTransportOutcome | null;
-  rejectionRetryDeadline: number | null;
   canonical: DecisionCanonicalResult | null;
   projectionOutcome: DecisionTransportOutcome | null;
   nativeReturn: DecisionNativeReturn | null;

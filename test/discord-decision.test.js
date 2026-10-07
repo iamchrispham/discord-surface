@@ -64,6 +64,7 @@ async function fixture(t, { callback = null, questionText = 'Choose the canonica
   const edits = [];
   const callbacks = [];
   const dispatches = [];
+  const dispatchResults = [];
   const permissionState = { attachFiles, embedLinks };
   const question = {
     id: presentation.messageId,
@@ -91,7 +92,7 @@ async function fixture(t, { callback = null, questionText = 'Choose the canonica
     client,
     providers: {
       codex: {
-        async dispatch(message) { dispatches.push(message); return { status: 'submitted' }; }
+        async dispatch(message) { dispatches.push(message); return dispatchResults.shift() || { status: 'submitted' }; }
       }
     },
     interactionFetch: async (url, options) => {
@@ -105,7 +106,7 @@ async function fixture(t, { callback = null, questionText = 'Choose the canonica
     state.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
-  return { dir, db, state, request, presentation, posts, edits, callbacks, dispatches, gateway, listeners,
+  return { dir, db, state, request, presentation, posts, edits, callbacks, dispatches, dispatchResults, gateway, listeners,
     setAttachFiles(value) { permissionState.attachFiles = value; },
     setEmbedLinks(value) { permissionState.embedLinks = value; } };
 }
@@ -937,7 +938,7 @@ test('decision recovery waits for the initial component defer before rejection',
 });
 
 for (const retryableOutcome of ['rate_limited', 'not_sent']) {
-  test(`retryable rejection outcome schedules decision recovery: ${retryableOutcome}`, { timeout: 30000 }, async t => {
+  test(`rejection recovery preserves custody without an exponential retry service: ${retryableOutcome}`, { timeout: 30000 }, async t => {
     const f = await fixture(t);
     const recoveryCalls = [];
     f.gateway.scheduleDecisionRecovery = (channelIds, options) => {
@@ -956,17 +957,23 @@ for (const retryableOutcome of ['rate_limited', 'not_sent']) {
     );
 
     assert.equal(result.accepted, false);
-    assert.deepEqual(recoveryCalls, [{
+    assert.deepEqual(recoveryCalls, retryableOutcome === 'rate_limited' ? [{
       channelIds: ['channel'],
-      options: {
-        ...(retryableOutcome === 'rate_limited' ? { delayMs: 25 } : {}),
-        decisionId: `retryable-rejection-${retryableOutcome}`
-      }
-    }]);
+      options: { delayMs: 25, decisionId: `retryable-rejection-${retryableOutcome}` }
+    }] : []);
+    const interactionId = `retryable-rejection-${retryableOutcome}`;
+    assert.equal(f.state.getDecisionClick(interactionId)?.rejectionRetryDeadline, undefined);
+    const rejection = f.state.listReceipts()
+      .filter(row => row.kind === DECISION_RECEIPT_KINDS.REJECTION_OUTCOME)
+      .map(row => JSON.parse(row.detail))
+      .find(detail => detail.interactionId === interactionId);
+    assert.equal(rejection.outcome, retryableOutcome);
+    assert.equal('retryDeadline' in rejection, false);
+    assert.equal(f.state.listDecisionPendingWork().some(click => click.interactionId === interactionId), true);
   });
 }
 
-test('duplicate denial waits for its rejection retry deadline', { timeout: 30000 }, async t => {
+test('duplicate denial honors in-memory Retry-After through channel recovery', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const interactionId = 'duplicate-rate-limited-rejection';
   const recoveryCalls = [];
@@ -1148,6 +1155,52 @@ test('failed short projection remains pending after native submission', { timeou
 
   assert.equal(f.edits.length, 1);
   assert.equal(f.state.getDecisionClick('short-projection-retry')?.projectionOutcome, 'sent');
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
+test('known-unsent native delivery resumes after short projection retry', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { questionText: 'q'.repeat(1800), embedLinks: false, attachFiles: false });
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  const interactionId = 'short-projection-known-unsent';
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, 'sent').accepted, true);
+  assert.equal(f.state.importDecisionWinner(interactionId, {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'known-unsent-answer',
+    answer: 'x'.repeat(100)
+  }).accepted, true);
+  f.dispatchResults.push({ status: 'not_submitted' }, { status: 'submitted' });
+
+  await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
+
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.state.getDecisionClick(interactionId)?.projectionOutcome, 'not_sent');
+  assert.equal(f.state.getDecisionClick(interactionId)?.nativeReturn?.outcome, 'not_submitted');
+  assert.equal(f.state.listDecisionPendingWork().length, 1);
+
+  f.setEmbedLinks(true);
+  await f.gateway.reconcilePending();
+
+  assert.equal(f.edits.length, 1);
+  assert.equal(f.dispatches.length, 2);
+  assert.equal(f.state.getDecisionClick(interactionId)?.projectionOutcome, 'sent');
+  assert.equal(f.state.getDecisionClick(interactionId)?.nativeReturn?.outcome, 'submitted');
   assert.equal(f.state.listDecisionPendingWork().length, 0);
 });
 
