@@ -2,7 +2,7 @@ import { createFilePreparationHandlers, assertFilePreparationClaim } from './dir
 import { createDirectPostRecoveryHandlers } from './direct-post/recovery';
 import { projectNewestDirectPostAttempt } from './direct-post/receipt-queries';
 export { queryDirectPostRows, querySentAgentResultRows, projectNewestDirectPostAttempt } from './direct-post/receipt-queries';
-import { DIRECT_POST_OUTCOMES } from './direct-post/contracts';
+import { isDirectPostOutcome } from './direct-post/contracts';
 import type {
   DirectPostOutcome,
   DirectPostPartStatus,
@@ -264,14 +264,14 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
         let definitiveFailure = false;
         for (const projection of projections.values()) {
           const value = projection.outcome?.detail?.outcome as string | undefined;
-          if (!projection.attempt || !value || value === 'unknown' || !(DIRECT_POST_OUTCOMES as readonly string[]).includes(value)) return true;
+          if (!projection.attempt || !value || value === 'unknown' || !isDirectPostOutcome(value)) return true;
           if (value !== 'sent') definitiveFailure = true;
         }
         if (definitiveFailure) continue;
         for (let partIndex = 0; partIndex < request.partCount; partIndex += 1) {
           const projection = projections.get(partIndex);
           const value = projection?.outcome?.detail?.outcome as string | undefined;
-          if (!projection || !projection.attempt || !value || value === 'unknown' || !(DIRECT_POST_OUTCOMES as readonly string[]).includes(value)) return true;
+          if (!projection || !projection.attempt || !value || value === 'unknown' || !isDirectPostOutcome(value)) return true;
         }
       }
       return false;
@@ -288,7 +288,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
 
     recordDirectPostPreflight(state, meta, outcome, detail = {}) {
       validateMeta(meta, BindingError, assertText);
-      if (!DIRECT_POST_OUTCOMES.includes(outcome)) throw new BindingError('invalid direct post outcome');
+      if (!isDirectPostOutcome(outcome)) throw new BindingError('invalid direct post outcome');
       const snapshots = new WeakMap<object, unknown>();
       const canonicalMeta = snapshotCustodyFields(meta, snapshots);
       detail = validatedOutcomeDetail(canonicalMeta, detail, BindingError, snapshots);
@@ -320,7 +320,7 @@ export function createDirectPostHandlers(dependencies: DirectPostDependencies): 
     recordDirectPostOutcome(state, requestId, attemptId, outcome, detail = {}) {
       assertText(requestId, 'requestId', 256);
       assertText(attemptId, 'attemptId', 128);
-      if (!DIRECT_POST_OUTCOMES.includes(outcome)) throw new BindingError('invalid direct post outcome');
+      if (!isDirectPostOutcome(outcome)) throw new BindingError('invalid direct post outcome');
       return state.transaction(() => {
         const rows = state.directPostRows(requestId);
         const attempt = rows.find(row => row.kind === DIRECT_POST_ATTEMPT && row.detail.attemptId === attemptId);

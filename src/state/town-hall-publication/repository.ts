@@ -1,3 +1,4 @@
+import { isDirectPostOutcome } from '../direct-post/contracts';
 import { randomUUID } from 'node:crypto';
 import {
   DIRECT_POST_OUTCOMES,
@@ -108,10 +109,6 @@ function snapshotOwnData(
   if (exact && names.length !== required.length) return null;
   if (!names.every(name => (required as readonly string[]).includes(name))) return null;
   return snapshot;
-}
-
-function isDirectPostOutcome(value: unknown): value is DirectPostOutcome {
-  return typeof value === 'string' && (Object.values(DIRECT_POST_OUTCOMES) as readonly string[]).includes(value);
 }
 
 function isPublicationEvent(value: unknown): value is TownHallPublicationEvent {
