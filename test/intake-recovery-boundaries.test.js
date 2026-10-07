@@ -746,17 +746,25 @@ const isComparisonOperand = (tokens, index, start, end) => {
   return right < end && COMPARISON_OPERATORS.has(tokens[right]?.value);
 };
 
-const expressionHasGap = (tokens, start, end, aliases = new Set()) => {
+const expressionHasGap = (tokens, start, end, aliases = new Set(), allowNestedCalls = false) => {
   let parenDepth = 0;
   let braceDepth = 0;
   let bracketDepth = 0;
+  const callParentheses = [];
   for (let index = start; index < end; index += 1) {
     const value = tokens[index].value;
-    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+    const insideCall = allowNestedCalls && callParentheses.some(Boolean);
+    if ((parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 || insideCall)
       && !isComparisonOperand(tokens, index, start, end)
       && (isGapValueAt(tokens, index) || (tokens[index].type === 'identifier' && aliases.has(value)))) return true;
-    if (value === '(') parenDepth += 1;
-    else if (value === ')') parenDepth -= 1;
+    if (value === '(') {
+      const previous = tokens[index - 1];
+      callParentheses.push(previous?.type === 'identifier' || [')', ']'].includes(previous?.value));
+      parenDepth += 1;
+    } else if (value === ')') {
+      parenDepth -= 1;
+      callParentheses.pop();
+    }
     else if (value === '{') braceDepth += 1;
     else if (value === '}') braceDepth -= 1;
     else if (value === '[') bracketDepth += 1;
@@ -765,7 +773,7 @@ const expressionHasGap = (tokens, start, end, aliases = new Set()) => {
   return false;
 };
 
-const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, aliases = new Set()) => {
+const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, aliases = new Set(), allowNestedCalls = false) => {
   let parenDepth = 0;
   let braceDepth = 0;
   let bracketDepth = 0;
@@ -775,7 +783,7 @@ const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, al
       && OUTCOME_NAMES.has(value) && tokens[index + 1]?.value === ':') {
       const valueStart = index + 2;
       const valueEnd = findDelimitedEnd(tokens, valueStart, closingIndex, '}');
-      if (valueHasGap(tokens, valueStart, valueEnd, pairs, aliases)) return true;
+      if (valueHasGap(tokens, valueStart, valueEnd, pairs, aliases, allowNestedCalls)) return true;
     }
     if (value === '(') parenDepth += 1;
     else if (value === ')') parenDepth -= 1;
@@ -787,7 +795,7 @@ const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, al
   return false;
 };
 
-const valueHasGap = (tokens, start, end, pairs, aliases = new Set()) => {
+const valueHasGap = (tokens, start, end, pairs, aliases = new Set(), allowNestedCalls = false) => {
   if (start >= end) return false;
   let valueStart = start;
   let valueEnd = end;
@@ -806,10 +814,10 @@ const valueHasGap = (tokens, start, end, pairs, aliases = new Set()) => {
   if (tokens[valueStart].value === '{') {
     const closingIndex = pairs.get(valueStart);
     return closingIndex !== undefined && closingIndex < valueEnd
-      ? objectHasTopLevelStateGap(tokens, valueStart, closingIndex, pairs, aliases)
+      ? objectHasTopLevelStateGap(tokens, valueStart, closingIndex, pairs, aliases, allowNestedCalls)
       : false;
   }
-  return expressionHasGap(tokens, valueStart, valueEnd, aliases);
+  return expressionHasGap(tokens, valueStart, valueEnd, aliases, allowNestedCalls);
 };
 
 const findStatementEnd = (tokens, start, end) => {
@@ -1151,14 +1159,22 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
     if (token.value === 'return') {
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
-      if (valueHasGap(tokens, expressionStart, statementEnd, pairs, knownAliases)) return true;
+      if (valueHasGap(tokens, expressionStart, statementEnd, pairs, knownAliases, true)) return true;
+      index = Math.max(index, statementEnd - 1);
+      continue;
+    }
+    if (token.type === 'identifier' && tokens[index + 1]?.value === '.'
+      && OUTCOME_NAMES.has(tokens[index + 2]?.value)
+      && tokens[index + 3]?.value === '=') {
+      const statementEnd = findStatementEnd(tokens, index + 4, end);
+      if (valueHasGap(tokens, index + 4, statementEnd, pairs, knownAliases, true)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
     if (token.type === 'identifier' && tokens[index - 1]?.value !== '.'
       && tokens[index + 1]?.value === '=') {
       const statementEnd = findStatementEnd(tokens, index + 2, end);
-      const assignedGap = valueHasGap(tokens, index + 2, statementEnd, pairs, knownAliases);
+      const assignedGap = valueHasGap(tokens, index + 2, statementEnd, pairs, knownAliases, true);
       if (assignedGap) knownAliases.add(token.value);
       if (assignedGap && OUTCOME_NAMES.has(token.value)) return true;
       index = Math.max(index, statementEnd - 1);
@@ -1177,13 +1193,18 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
 const isDeadlineTriggerAt = (tokens, index) => {
   const value = tokens[index]?.value;
   if (value === 'DEADLINE' || value === 'deadlineReached') return true;
-  return value === 'Date'
-    && tokens[index + 1]?.value === '.'
-    && tokens[index + 2]?.value === 'now'
-    && tokens[index + 3]?.value === '('
-    && tokens[index + 4]?.value === ')'
-    && tokens[index + 5]?.value === '>='
+  const dateNow = offset => tokens[index + offset]?.value === 'Date'
+    && tokens[index + offset + 1]?.value === '.'
+    && tokens[index + offset + 2]?.value === 'now'
+    && tokens[index + offset + 3]?.value === '('
+    && tokens[index + offset + 4]?.value === ')';
+  const directComparison = dateNow(0)
+    && ['>', '>='].includes(tokens[index + 5]?.value)
     && tokens[index + 6]?.value === 'deadline';
+  const reverseComparison = value === 'deadline'
+    && ['<', '<='].includes(tokens[index + 1]?.value)
+    && dateNow(2);
+  return directComparison || reverseComparison;
 };
 
 const findAssignedAlias = (tokens, triggerIndex) => {
@@ -1292,8 +1313,21 @@ test('deadline policy inventory scans complete outcomes and ignores unrelated ga
       source: 'if (deadlineReached) result.state = READINESS.GAP;'
     },
     {
+      relative: 'discord/braced-member-assignment.js',
+      source: [
+        'if (deadlineReached) {',
+        '  result.state = READINESS.GAP;',
+        '  return result;',
+        '}'
+      ].join('\n')
+    },
+    {
       relative: 'discord/parenthesized-return.js',
       source: 'if (deadlineReached) return (READINESS.GAP);'
+    },
+    {
+      relative: 'discord/wrapped-return.js',
+      source: 'if (deadlineReached) return Promise.resolve(READINESS.GAP);'
     },
     {
       relative: 'discord/parenthesized-object-return.js',
@@ -1306,6 +1340,18 @@ test('deadline policy inventory scans complete outcomes and ignores unrelated ga
         "  return { ready: false, state: 'unavailable' };",
         '}'
       ].join('\n')
+    },
+    {
+      relative: 'discord/reversed-timestamp-deadline.js',
+      source: 'if (deadline <= Date.now()) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/reversed-strict-timestamp-deadline.js',
+      source: 'if (deadline < Date.now()) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/strict-timestamp-deadline.js',
+      source: 'if (Date.now() > deadline) return READINESS.GAP;'
     },
     {
       relative: 'discord/retry-owner.js',
@@ -1348,8 +1394,13 @@ test('deadline policy inventory scans complete outcomes and ignores unrelated ga
     'discord/multiline-owner.js:1',
     'discord/multiline-assignment.js:1',
     'discord/member-assignment.js:1',
+    'discord/braced-member-assignment.js:1',
     'discord/parenthesized-return.js:1',
+    'discord/wrapped-return.js:1',
     'discord/parenthesized-object-return.js:1',
+    'discord/reversed-timestamp-deadline.js:1',
+    'discord/reversed-strict-timestamp-deadline.js:1',
+    'discord/strict-timestamp-deadline.js:1',
     'discord/nested-gap.js:1'
   ]);
 });
