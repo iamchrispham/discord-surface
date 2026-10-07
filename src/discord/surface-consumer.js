@@ -200,7 +200,7 @@ function createSurfaceConsumer(options, { recoveryError, recoveryKind, compareDi
     const courierAttempt = state.getCourierAttempt?.(durable.id);
     const retiredCourierAttempt = Boolean(courierAttempt &&
       state.hasRetiredCourierAttempt?.(durable.id, courierAttempt.attempt.receiptId));
-    const selected = !retiredCourierAttempt && selectedCourierRoute(durable)
+    const selected = (!retiredCourierAttempt || isCodexWatcherNotice(durable)) && selectedCourierRoute(durable)
       ? { routeId: courierRoute.routeId }
       : null;
     let dispatchOverride = null;

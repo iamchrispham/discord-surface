@@ -59,7 +59,7 @@ async function runConsumer(f, messageId, signal) {
   return { courier, direct };
 }
 
-test(TUNABLE, { todo: 'Issue267 source recovery pending', timeout: 5000 }, async t => {
+test(TUNABLE, { timeout: 5000 }, async t => {
   const { f, message } = createWatcherFixture(t);
   const { input, claim } = beginPredecessor(f, message);
   retireByUncertainReconciliation(f, message, claim);
@@ -119,7 +119,7 @@ test(TUNABLE, { todo: 'Issue267 source recovery pending', timeout: 5000 }, async
   }
 });
 
-test(PUBLIC, { todo: 'Issue267 source recovery pending', timeout: 5000 }, async t => {
+test(PUBLIC, { timeout: 5000 }, async t => {
   const { f, message } = createWatcherFixture(t, {
     messageId: '9021',
     armKey: 'watcher-retired-public-arm',
@@ -127,6 +127,7 @@ test(PUBLIC, { todo: 'Issue267 source recovery pending', timeout: 5000 }, async 
   });
   const { input, claim } = beginPredecessor(f, message);
   const recovered = retireByPublicRecovery(f, message, claim);
+  const predecessorReceiptId = f.state.getCourierAttempt(message.id).attempt.receiptId;
   assert.equal(recovered.retired, true, 'public recovery did not retire the submitted attempt');
   assert.equal(f.state.hasRetiredCourierAttempt(message.id, f.state.getCourierAttempt(message.id).attempt.receiptId), true, 'retirement receipt is not durable');
   assert.equal(f.state.getMessage(message.id).state, 'accepted', 'accepted custody was not retained');
@@ -144,7 +145,7 @@ test(PUBLIC, { todo: 'Issue267 source recovery pending', timeout: 5000 }, async 
     assert.equal(direct.length, 0, `watcher fell back to direct dispatch ${direct.length} time(s)`);
     const successor = f.state.getCourierAttempt(message.id);
     assert.notEqual(successor.attempt.attemptId, claim.attempt.attemptId, 'successor reused the predecessor identity');
-    assert.equal(f.state.hasRetiredCourierAttempt(message.id, claim.attempt.receiptId), true, 'predecessor retirement was cleared');
+    assert.equal(f.state.hasRetiredCourierAttempt(message.id, predecessorReceiptId), true, 'predecessor retirement was cleared');
     assert.equal(courier[0].prompt.startsWith(input.prompt), true, 'successor envelope dropped the original instruction prefix');
     assert.equal(courier[0].prompt, `${input.prompt}${attemptSuffix(successor.attempt.attemptId)}`, 'successor envelope prompt is not the anchored suffix form');
   } finally {
@@ -310,4 +311,120 @@ test('unanchored courier input preserves its exact forwarding prompt', { timeout
     clear();
     controller.abort();
   }
+});
+
+test('two retirement paths for one predecessor permit one forwarding claim', { timeout: 5000 }, t => {
+  const { f, message } = createWatcherFixture(t);
+  const { input, claim } = beginPredecessor(f, message);
+  retireByPublicRecovery(f, message, claim);
+  assert.equal(f.state.claimDispatch(message.id).claimed, true);
+  f.state.markUncertain(message.id, new Error('fixture repeated reconciliation'));
+  f.state.reconcileUncertain(message.id, 'not_submitted');
+  assert.equal(retirementReceipts(f.state, message.id).length, 2);
+  assert.equal(f.state.claimDispatch(message.id).claimed, true);
+  const successorInput = consumerInput(f, message);
+  const successor = f.state.beginCourierAttempt(message.id, successorInput);
+  assert.equal(successor.accepted, true);
+  assert.equal(successor.attempt.predecessorAttemptId, claim.attempt.attemptId);
+  assert.equal(duplicateBegin(f, message).attempt.attemptId, successor.attempt.attemptId);
+  assert.equal(f.state.authorizeCourierAttempt(message.id, successor.attempt.attemptId, successorInput).authorized, true);
+  const countBefore = receiptCount(f.state);
+  const projected = f.state.readCourierInput(f.route.routeId, message.id, successor.attempt.attemptId, COURIER_NATIVE, f.dir);
+  assert.equal(projected.prompt, `${input.prompt}${attemptSuffix(successor.attempt.attemptId)}`);
+  assert.equal(receiptCount(f.state), countBefore);
+  assert.throws(() => f.state.readCourierInput(f.route.routeId, message.id, claim.attempt.attemptId, COURIER_NATIVE, f.dir), /submission was refused/);
+  assert.throws(() => f.state.claimCourierForward(f.route.routeId, forwardEvent(f, message, input.prompt)), /submission was refused/);
+  const event = forwardEvent(f, message, projected.prompt);
+  assert.equal(f.state.claimCourierForward(f.route.routeId, event).attemptId, successor.attempt.attemptId);
+  assert.equal(forwardClaims(f.state, message.id).length, 1);
+  assert.throws(() => f.state.claimCourierForward(f.route.routeId, event), /not eligible|already claimed/);
+  assert.throws(() => f.state.readCourierInput(f.route.routeId, message.id, successor.attempt.attemptId, COURIER_NATIVE, f.dir), /not eligible|already claimed/);
+  f.state.markSubmitted(message.id);
+  f.state.recordCourierOutcome(message.id, successor.attempt.attemptId, COURIER_OUTCOMES.SUBMITTED);
+  assert.throws(() => f.state.recoverCourierAttempt(message.id, successor.attempt.attemptId), /forward_claimed/);
+  reopen(f);
+  assert.throws(() => f.state.claimCourierForward(f.route.routeId, event), /not eligible|already claimed/);
+  assert.equal(forwardClaims(f.state, message.id).length, 1);
+});
+
+test('a newly retired successor permits another attempt while uncertainty and restart do not', { timeout: 5000 }, t => {
+  const { f, message } = createWatcherFixture(t);
+  const { claim } = beginPredecessor(f, message);
+  retireByPublicRecovery(f, message, claim);
+  const second = duplicateBegin(f, message);
+  assert.equal(second.accepted, true);
+  assert.equal(f.state.claimDispatch(message.id).claimed, true);
+  retireByPublicRecovery(f, message, second);
+  const third = duplicateBegin(f, message);
+  assert.equal(third.accepted, true);
+  assert.equal(third.attempt.predecessorAttemptId, second.attempt.attemptId);
+  assert.notEqual(third.attempt.attemptId, second.attempt.attemptId);
+  assert.throws(() => f.state.recoverCourierAttempt(message.id, claim.attempt.attemptId), /stale_attempt/);
+  assert.equal(f.state.claimDispatch(message.id).claimed, true);
+  f.state.markUncertain(message.id, new Error('fixture successor unknown outcome'));
+  f.state.recordCourierOutcome(message.id, third.attempt.attemptId, COURIER_OUTCOMES.UNCERTAIN);
+  assert.equal(duplicateBegin(f, message).accepted, false);
+  assert.equal(duplicateBegin(f, message).attempt.attemptId, third.attempt.attemptId);
+  reopen(f);
+  f.state.recoverAfterRestart();
+  assert.equal(duplicateBegin(f, message).accepted, false);
+  assert.equal(duplicateBegin(f, message).attempt.attemptId, third.attempt.attemptId);
+  assert.equal(retirementReceipts(f.state, message.id).length, 2);
+});
+
+test('concurrent retired-notice wakes queue only one successor', { timeout: 5000 }, async t => {
+  const { f, message } = createWatcherFixture(t);
+  const { claim } = beginPredecessor(f, message);
+  retireByPublicRecovery(f, message, claim);
+  const courier = [];
+  const direct = [];
+  const consumer = scenarioConsumer(f, { courier, direct });
+  const bound = deadline();
+  try {
+    await Promise.race([
+      Promise.all(Array.from({ length: 4 }, () => consumer.processAccepted(
+        f.state.getMessage(message.id), bound.controller.signal,
+        { continueUntilFinal: false, awaitExisting: false, awaitDispatchOutcome: true }
+      ))),
+      bound.expired
+    ]);
+    assert.equal(courier.length, 1);
+    assert.equal(direct.length, 0);
+    assert.equal(f.state.getCourierAttempt(message.id).attempt.predecessorAttemptId, claim.attempt.attemptId);
+  } finally {
+    bound.clear();
+    bound.controller.abort();
+    consumer.abortNativeWork();
+    await consumer.waitForNativeWork();
+  }
+});
+
+test('successor admission preserves route and acknowledgment fences and refuses prompt overflow', { timeout: 5000 }, t => {
+  const revoked = createWatcherFixture(t);
+  const predecessor = beginPredecessor(revoked.f, revoked.message);
+  retireByPublicRecovery(revoked.f, revoked.message, predecessor.claim);
+  revoked.f.state.revokeCourierRoute(revoked.f.route.routeId, 'fixture route revoked');
+  assert.equal(duplicateBegin(revoked.f, revoked.message).accepted, false);
+  assert.equal(revoked.f.state.getCourierAttempt(revoked.message.id).attempt.attemptId, predecessor.claim.attempt.attemptId);
+
+  const acknowledged = createWatcherFixture(t);
+  const original = beginPredecessor(acknowledged.f, acknowledged.message);
+  retireByPublicRecovery(acknowledged.f, acknowledged.message, original.claim);
+  assert.equal(acknowledged.f.state.claimDispatch(acknowledged.message.id).claimed, true);
+  recordNativeAcknowledgment(acknowledged.f.state, {
+    provider: 'codex', messageId: acknowledged.message.id,
+    nativeId: acknowledged.f.binding.nativeId, generation: acknowledged.f.binding.generation
+  });
+  assert.equal(duplicateBegin(acknowledged.f, acknowledged.message).accepted, false);
+  assert.equal(acknowledged.f.state.getCourierAttempt(acknowledged.message.id).attempt.attemptId, original.claim.attempt.attemptId);
+
+  const overflow = createWatcherFixture(t);
+  const prior = beginPredecessor(overflow.f, overflow.message);
+  retireByPublicRecovery(overflow.f, overflow.message, prior.claim);
+  const before = receiptCount(overflow.f.state);
+  assert.throws(() => overflow.f.state.beginCourierAttempt(overflow.message.id, {
+    ...prior.input, prompt: 'x'.repeat(100000)
+  }), /exceeds 100000/);
+  assert.equal(receiptCount(overflow.f.state), before);
+  assert.equal(overflow.f.state.getCourierAttempt(overflow.message.id).attempt.attemptId, prior.claim.attempt.attemptId);
 });

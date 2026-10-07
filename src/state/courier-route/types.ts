@@ -94,6 +94,7 @@ export interface CourierDispatchInput {
 
 export interface CourierEnvelope {
   type: typeof ENVELOPE_TYPE;
+  predecessorAttemptId?: string;
   attemptId: string;
   messageId: string;
   route: { routeId: string; routeGeneration: number };
@@ -118,6 +119,8 @@ export interface CourierEnvelope {
 
 export interface CourierAttempt {
   attemptId: string;
+  predecessorAttemptId?: string;
+  inputPrompt?: string;
   attemptKey: string;
   state: typeof COURIER_ATTEMPT_STATES[keyof typeof COURIER_ATTEMPT_STATES];
   messageId: string;
@@ -192,6 +195,7 @@ export interface CourierState {
   getBinding(channelId: string): any;
   getThreadEnrollment(threadId: string): any;
   getMessage(messageId: string): CourierMessage | null;
+  hasNativeAcknowledgment(message: CourierMessage): boolean;
   getMessageRoute(deliveryChannelId: string): any;
   currentMessageBinding(message: CourierMessage): any;
   getWatcherNoticeArm?(armKey: string): any;
