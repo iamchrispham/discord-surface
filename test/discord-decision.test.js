@@ -473,6 +473,61 @@ test('callback uncertainty does not cancel canonical settlement or native custod
   assert.equal(decisionMessages(f.state).length, 1);
 });
 
+for (const callbackOutcome of ['rate_limited', 'rejected', 'not_sent', 'unknown']) {
+  test(`rejection recovery keeps ${callbackOutcome} callback custody without a follow-up`, { timeout: 30000 }, async t => {
+    const f = await fixture(t);
+    const interactionId = `rejection-callback-${callbackOutcome}`;
+    const admitted = f.state.admitDecisionClickAndBeginAuthorization({
+      interactionId,
+      presentationId: f.presentation.presentationId,
+      selectedKey: 'hold',
+      actorId: 'operator',
+      guildId: 'guild',
+      channelId: 'channel',
+      messageId: f.presentation.messageId,
+      binding: f.state.getBinding('channel'),
+      applicationId: 'application',
+      token: `token-${interactionId}`
+    });
+    assert.equal(admitted.accepted, true);
+    assert.equal(f.state.recordDecisionAuthorizationOutcome(interactionId, 'denied').accepted, true);
+    assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, callbackOutcome).accepted, true);
+
+    const remaining = await f.gateway.decisionConsumer.recover(new AbortController().signal);
+
+    assert.equal(f.callbacks.length, 0);
+    assert.deepEqual(remaining.map(click => click.interactionId), [interactionId]);
+    assert.equal(remaining[0].callbackOutcome, callbackOutcome);
+  });
+}
+
+test('rejection recovery sends a follow-up only after an accepted callback', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const interactionId = 'rejection-callback-sent';
+  const admitted = f.state.admitDecisionClickAndBeginAuthorization({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'hold',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel'),
+    applicationId: 'application',
+    token: `token-${interactionId}`
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.recordDecisionAuthorizationOutcome(interactionId, 'denied').accepted, true);
+  assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, 'sent').accepted, true);
+
+  const remaining = await f.gateway.decisionConsumer.recover(new AbortController().signal);
+
+  assert.deepEqual(remaining, []);
+  assert.equal(f.callbacks.length, 1);
+  assert.equal(f.callbacks[0].body.flags, 64);
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
 test('recovery resumes an admitted click without repeating its callback and preserves the question target', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const admitted = f.state.admitDecisionClickAndBeginCallback({

@@ -406,7 +406,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
 
   async function deliverRejection(click: DecisionClick, signal?: AbortSignal, interaction: ParsedComponentInteraction | null = null): Promise<InteractionCallbackResult | null> {
     click = await awaitCallbackOutcome(click);
-    if (click.callbackAttempted && !click.callbackOutcome) return null;
+    if (click.callbackOutcome !== DECISION_TRANSPORT_OUTCOMES.SENT) return null;
     const remainingDelay = pendingRecoveryDelay(click.interactionId);
     if (remainingDelay > 0) {
       if (!signal?.aborted) scheduleRecovery(new Set([click.channelId]), { delayMs: remainingDelay, decisionId: click.interactionId });
