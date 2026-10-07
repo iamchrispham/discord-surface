@@ -342,7 +342,8 @@ test('recovery fetch inventory stays covered by parent, child and delivery lifec
     if (count) consumers[relative.split(path.sep).join('/')] = count;
   }
   assert.deepEqual(consumers, {
-    'discord.js': 3,
+    'discord.js': 2,
+    'discord/outbound-delivery.js': 1,
     'discord/pending-reconciliation.js': 1,
     'discord/thread-enrollment.ts': 2
   },
