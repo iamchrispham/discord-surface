@@ -22,6 +22,72 @@ const isIdentifierStart = character => /[A-Za-z_$]/.test(character);
 const isIdentifierPart = character => /[A-Za-z0-9_$]/.test(character);
 const REGEX_PREFIXES = new Set(['(', '{', '[', ',', ';', ':', '=', '==', '===', '!=', '!==', '!', '&&', '||', '??', '?', '=>', 'return', 'case', 'throw', 'else', 'do', 'in', 'of']);
 
+const findTemplateExpressionEnd = (source, start) => {
+  let depth = 1;
+  let index = start;
+  const templateQuote = String.fromCharCode(96);
+  while (index < source.length) {
+    const character = source[index];
+    if (character === '"' || character === "'") {
+      const quote = character;
+      let escaped = false;
+      index += 1;
+      while (index < source.length) {
+        const current = source[index];
+        if (escaped) escaped = false;
+        else if (current === '\\') escaped = true;
+        else if (current === quote) {
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '/') {
+      index += 2;
+      while (index < source.length && source[index] !== '\n') index += 1;
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '*') {
+      const end = source.indexOf('*/', index + 2);
+      index = end === -1 ? source.length : end + 2;
+      continue;
+    }
+    if (character === templateQuote) {
+      index = skipTemplateSource(source, index);
+      continue;
+    }
+    if (character === '{') depth += 1;
+    else if (character === '}') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+    index += 1;
+  }
+  return -1;
+};
+
+const skipTemplateSource = (source, start) => {
+  const templateQuote = String.fromCharCode(96);
+  let index = start + 1;
+  while (index < source.length) {
+    if (source[index] === '\\') {
+      index += 2;
+      continue;
+    }
+    if (source[index] === templateQuote) return index + 1;
+    if (source[index] === '$' && source[index + 1] === '{') {
+      const expressionEnd = findTemplateExpressionEnd(source, index + 2);
+      if (expressionEnd === -1) return source.length;
+      index = expressionEnd + 1;
+      continue;
+    }
+    index += 1;
+  }
+  return source.length;
+};
+
 const tokenizeSource = source => {
   const tokens = [];
   const newlineOffsets = [];
@@ -83,22 +149,38 @@ const tokenizeSource = source => {
     }
     if (character === '`') {
       const start = index;
-      let escaped = false;
       let hasSubstitution = false;
+      const templateQuote = String.fromCharCode(96);
       index += 1;
       while (index < source.length) {
-        const current = source[index];
-        if (escaped) escaped = false;
-        else if (current === '\\') escaped = true;
-        else if (current === '$' && source[index + 1] === '{') hasSubstitution = true;
-        else if (current === '`') {
+        if (source[index] === '\\') {
+          index += 2;
+          continue;
+        }
+        if (source[index] === templateQuote) {
           index += 1;
           break;
         }
+        if (source[index] === '$' && source[index + 1] === '{') {
+          const expressionStart = index + 2;
+          const expressionEnd = findTemplateExpressionEnd(source, expressionStart);
+          if (expressionEnd === -1) {
+            index = source.length;
+            break;
+          }
+          if (!hasSubstitution) push('template-dynamic', null, start, start + 1);
+          hasSubstitution = true;
+          const expressionTokens = tokenizeSource(source.slice(expressionStart, expressionEnd));
+          for (const token of expressionTokens) {
+            push(token.type, token.value, expressionStart + token.start, expressionStart + token.end);
+          }
+          index = expressionEnd + 1;
+          continue;
+        }
         index += 1;
       }
-      const value = source.slice(start + 1, Math.max(start + 1, index - 1));
-      push(hasSubstitution ? 'template-dynamic' : 'template', hasSubstitution ? null : value, start, index);
+      if (hasSubstitution) push('template-dynamic', null, Math.max(start, index - 1), index);
+      else push('template', source.slice(start + 1, Math.max(start + 1, index - 1)), start, index);
       continue;
     }
     if (character === '/' && canStartRegex()) {
@@ -471,36 +553,26 @@ const isNegatedDeadlineCondition = (tokens, conditionStart, triggerIndex) => {
     cursor -= 1;
     while (cursor >= conditionStart && tokens[cursor].value === '(') cursor -= 1;
   }
-  const isInequality = value => value === '!=' || value === '!==';
-  const scanForInequality = (start, step) => {
-    for (let index = start; index >= conditionStart && index < tokens.length; index += step) {
-      if (isInequality(tokens[index].value)) return true;
-      if (['&&', '||', '?', ':', ')'].includes(tokens[index].value)) break;
-    }
-    return false;
-  };
-  const isNegatedBooleanComparison = index => {
+  const isNegatingComparison = index => {
     const operator = tokens[index]?.value;
+    if (operator !== '!=' && operator !== '!==' && operator !== '==' && operator !== '===') return false;
     const left = tokens[index - 1]?.value;
     const right = tokens[index + 1]?.value;
-    const equalityToFalse = (operator === '==' || operator === '===')
-      && (left === 'false' || right === 'false');
-    const inequalityFromTrue = (operator === '!=' || operator === '!==')
-      && (left === 'true' || right === 'true');
-    return equalityToFalse || inequalityFromTrue;
+    const booleanOperand = [left, right].find(value => value === 'true' || value === 'false');
+    if (booleanOperand === undefined) return operator === '!=' || operator === '!==';
+    if (operator === '!=' || operator === '!==') return booleanOperand === 'true';
+    return booleanOperand === 'false';
   };
-  const scanForNegatedBooleanComparison = (start, step) => {
+  const scanForInequality = (start, step) => {
     for (let index = start; index >= conditionStart && index < tokens.length; index += step) {
-      if (isNegatedBooleanComparison(index)) return true;
+      if (isNegatingComparison(index)) return true;
       if (['&&', '||', '?', ':', ')'].includes(tokens[index].value)) break;
     }
     return false;
   };
   return negated
     || scanForInequality(triggerIndex - 1, -1)
-    || scanForInequality(triggerIndex + 1, 1)
-    || scanForNegatedBooleanComparison(triggerIndex - 1, -1)
-    || scanForNegatedBooleanComparison(triggerIndex + 1, 1);
+    || scanForInequality(triggerIndex + 1, 1);
 };
 
 const branchRange = (tokens, start, end, pairs) => {
@@ -624,16 +696,20 @@ const switchArmHasAbruptCompletion = (tokens, start, end, pairs, functionRanges)
   return false;
 };
 
-const findSwitchDecision = (tokens, triggerIndex, pairs, functionRanges) => {
+const findSwitchDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNegated = false) => {
   let best = null;
   for (let index = triggerIndex - 1; index >= 0; index -= 1) {
     if (tokens[index].value !== 'switch' || tokens[index + 1]?.value !== '(') continue;
     const conditionEnd = pairs.get(index + 1);
     const opening = conditionEnd === undefined ? undefined : conditionEnd + 1;
     const closing = opening === undefined ? undefined : pairs.get(opening);
+    const inDiscriminant = conditionEnd !== undefined && triggerIndex >= index + 2 && triggerIndex < conditionEnd;
+    const inBody = opening !== undefined && closing !== undefined && triggerIndex > opening && triggerIndex < closing;
     if (opening === undefined || tokens[opening]?.value !== '{' || closing === undefined
-      || triggerIndex <= opening || triggerIndex >= closing) continue;
-    if (!best || closing - opening < best.closing - best.opening) best = { opening, closing };
+      || (!inDiscriminant && !inBody)) continue;
+    if (!best || closing - opening < best.closing - best.opening) {
+      best = { opening, closing, discriminantStart: index + 2, inDiscriminant };
+    }
   }
   if (!best) return null;
   const labels = [];
@@ -651,12 +727,21 @@ const findSwitchDecision = (tokens, triggerIndex, pairs, functionRanges) => {
     else if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0 && (value === 'case' || value === 'default')) {
       let colon = index + 1;
       while (colon < best.closing && tokens[colon].value !== ':') colon += 1;
-      labels.push({ index, start: Math.min(colon + 1, best.closing) });
+      labels.push({ index, start: Math.min(colon + 1, best.closing), valueStart: index + 1, valueEnd: colon });
       index = colon;
     }
   }
-  const matchingLabels = labels.filter(candidate => candidate.index <= triggerIndex);
-  const label = matchingLabels[matchingLabels.length - 1];
+  let label;
+  if (best.inDiscriminant) {
+    const negated = Boolean(aliasNegated)
+      !== isNegatedDeadlineCondition(tokens, best.discriminantStart, triggerIndex);
+    const expectedCase = negated ? 'false' : 'true';
+    label = labels.find(candidate => candidate.valueEnd === candidate.valueStart + 1
+      && tokens[candidate.valueStart]?.value === expectedCase);
+  } else {
+    const matchingLabels = labels.filter(candidate => candidate.index <= triggerIndex);
+    label = matchingLabels[matchingLabels.length - 1];
+  }
   if (!label) return null;
   let bodyPosition = labels.indexOf(label);
   while (bodyPosition + 1 < labels.length && labels[bodyPosition].start === labels[bodyPosition + 1].index) {
@@ -783,7 +868,7 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, al
   }
   const loopDecision = findLoopDecision(tokens, triggerIndex, pairs, functionRanges);
   if (loopDecision) return loopDecision;
-  const switchDecision = findSwitchDecision(tokens, triggerIndex, pairs, functionRanges);
+  const switchDecision = findSwitchDecision(tokens, triggerIndex, pairs, functionRanges, aliasNegated);
   if (switchDecision) return switchDecision;
   const statement = findStatementRange(tokens, triggerIndex);
   const shortCircuit = findShortCircuitDecision(tokens, triggerIndex, statement.start, statement.end, pairs);
@@ -1729,6 +1814,14 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
         lexicalScopes,
         functionRanges
       );
+      const knownWriterAliases = visibleBoundaryWriterAliasesAt(
+        tokens,
+        decision.start,
+        pairs,
+        lexicalScopes,
+        lexicalBindings,
+        assignments
+      );
       if (hasGapOutcome(
         tokens,
         decision.start,
@@ -1736,7 +1829,8 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
         decision.opening,
         pairs,
         functionRanges,
-        knownAliases
+        knownAliases,
+        knownWriterAliases
       )) {
         lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
       }
@@ -2700,6 +2794,38 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     const nonDeadlineCall = `const persist = state.markIntakeBoundary.bind(state); if (!deadlineReached) persist(id, READINESS.GAP, detail);`;
     regressionAssert.equal(offendersFor(boundWriter).length, 1);
     regressionAssert.equal(offendersFor(nonDeadlineCall).length, 0);
+  });
+
+  regressionTest('deadline policy inventory follows bound writers through deadline aliases', () => {
+    const boundWriter = 'const expired = deadlineReached; const persist = state.markIntakeBoundary.bind(state); if (expired) persist(id, READINESS.GAP, detail);';
+    const nonDeadlineCall = 'const expired = deadlineReached; const persist = state.markIntakeBoundary.bind(state); if (!expired) persist(id, READINESS.GAP, detail);';
+    regressionAssert.equal(offendersFor(boundWriter).length, 1);
+    regressionAssert.equal(offendersFor(nonDeadlineCall).length, 0);
+  });
+
+  regressionTest('deadline policy inventory tokenizes executable template substitutions', () => {
+    const templateQuote = String.fromCharCode(96);
+    const source = 'if (deadlineReached) ' + templateQuote + String.fromCharCode(36)
+      + '{state.markIntakeBoundary(id, READINESS.GAP, detail)}' + templateQuote + ';';
+    regressionAssert.equal(offendersFor(source).length, 1);
+  });
+
+  regressionTest('deadline policy inventory preserves inequality polarity against false', () => {
+    const expiryGap = 'if (deadlineReached !== false) return READINESS.GAP; else return READINESS.READY;';
+    const nonExpiryGap = 'if (deadlineReached !== false) return READINESS.READY; else return READINESS.GAP;';
+    regressionAssert.equal(offendersFor(expiryGap).length, 1);
+    regressionAssert.equal(offendersFor(nonExpiryGap).length, 0);
+  });
+
+  regressionTest('deadline policy inventory selects boolean switch arms for direct and aliased triggers', () => {
+    const directGap = 'switch (deadlineReached) { case true: return READINESS.GAP; case false: return READINESS.READY; }';
+    const directSafe = 'switch (deadlineReached) { case true: return READINESS.READY; case false: return READINESS.GAP; }';
+    const aliasedGap = 'const expired = deadlineReached; switch (expired) { case true: return READINESS.GAP; case false: return READINESS.READY; }';
+    const aliasedSafe = 'const expired = deadlineReached; switch (expired) { case true: return READINESS.READY; case false: return READINESS.GAP; }';
+    regressionAssert.equal(offendersFor(directGap).length, 1);
+    regressionAssert.equal(offendersFor(directSafe).length, 0);
+    regressionAssert.equal(offendersFor(aliasedGap).length, 1);
+    regressionAssert.equal(offendersFor(aliasedSafe).length, 0);
   });
 
   regressionTest('deadline policy inventory maps handler boundary state arguments', () => {
