@@ -296,11 +296,35 @@ function exportedClassDeclaration(source, exportName) {
   };
   findBindingWrites(source);
 
+  const topLevelExportAssignments = new Set();
+  let exportMutated = false;
+  const isExportObject = node => (ts.isIdentifier(node) && node.text === 'exports') || isModuleExports(node);
+  const isExportMutation = node => {
+    if (ts.isDeleteExpression(node)) return isNamedExport(node.expression);
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind >= assignmentStart &&
+        node.operatorToken.kind <= assignmentEnd &&
+        (isNamedExport(node.left) || isModuleExports(node.left))) {
+      return !topLevelExportAssignments.has(node);
+    }
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+        isNamedExport(node.operand)) {
+      return true;
+    }
+    if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression)) return false;
+    const method = node.expression.name.text;
+    if (method !== 'defineProperty' && method !== 'defineProperties' && method !== 'assign') return false;
+    if (!node.arguments.length || !isExportObject(node.arguments[0])) return false;
+    if (method !== 'defineProperty') return true;
+    const property = node.arguments[1];
+    return !property || !ts.isStringLiteral(property) || property.text === exportName;
+  };
+
   let exported = null;
   for (const statement of source.statements) {
     if (!ts.isExpressionStatement(statement) || !ts.isBinaryExpression(statement.expression) ||
         statement.expression.operatorToken.kind !== ts.SyntaxKind.EqualsToken) continue;
     const { left, right } = statement.expression;
+    if (isNamedExport(left) || isModuleExports(left)) topLevelExportAssignments.add(statement.expression);
     if (isNamedExport(left)) {
       exported = right;
     }
@@ -317,7 +341,16 @@ function exportedClassDeclaration(source, exportName) {
       exported = property ? expressionForProperty(property) : null;
     }
   }
-  if (bindingReassigned) return null;
+  const findExportMutations = node => {
+    if (exportMutated) return;
+    if (isExportMutation(node)) {
+      exportMutated = true;
+      return;
+    }
+    ts.forEachChild(node, findExportMutations);
+  };
+  findExportMutations(source);
+  if (bindingReassigned || exportMutated) return null;
   if (exported && ts.isClassExpression(exported)) return exported;
   return exported && ts.isIdentifier(exported) ? declarations.get(exported.text) || null : null;
 }

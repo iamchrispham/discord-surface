@@ -189,6 +189,15 @@ exports.SurfaceState = SurfaceState;
   assert.equal(matchesWithCandidateBaseline(text), false);
 });
 
+test('rejects non-assignment export mutations', () => {
+  for (const mutation of [
+    'delete module.exports.SurfaceState;',
+    "Object.defineProperty(module.exports, 'SurfaceState', { value: class {} });"
+  ]) {
+    assert.equal(matchesWithCandidateBaseline(`${source}\n${mutation}`), false);
+  }
+});
+
 test('rejects exported owner prototype mutations', () => {
   for (const mutation of [
     'delete SurfaceState.prototype.getConfig;',

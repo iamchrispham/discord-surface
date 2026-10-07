@@ -176,6 +176,18 @@ class SurfaceState {`);
   assert.equal(discovery.approved, false);
 });
 
+test('inventories the exported factory target', () => {
+  const discovery = discoverTempFactoryFiles({
+    'companion.js': `function createFakeHandlers() { return { hidden(state, value) {} }; }
+function actualFactory() { return {}; }
+module.exports = { createFakeHandlers: actualFactory };`
+  }, `const { createFakeHandlers } = require('./companion');
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {`);
+  assert.equal(discovery.approved, false);
+});
+
 test('rejects a helper overwritten after its named export', () => {
   const discovery = discoverTempFactoryFiles({
     'helpers.js': `function hidden(state, value) { return value; }

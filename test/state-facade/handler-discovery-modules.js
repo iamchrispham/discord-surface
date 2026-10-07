@@ -212,11 +212,14 @@ function moduleFactoryMethods(filePath, factoryName, seen, allowDefault = false)
     if (filePath !== stateSourcePath && !moduleFactoryAllowed(filePath, factoryName, new Set(), allowDefault)) return new Map();
     const importedText = fs.readFileSync(filePath, 'utf8');
     const importedSource = ts.createSourceFile(filePath, importedText, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    const local = factoryMethodsFromSource(importedSource, filePath, factoryName, seen);
-    if (local?.size) return local;
     const bindings = requireBindings(importedSource);
     const exported = exportedFactoryExpression(importedSource, factoryName, allowDefault);
     const exportedName = exported && ts.isIdentifier(exported) ? exported.text : null;
+    const inventoryName = exportedName || (!exported ? factoryName : null);
+    const local = inventoryName
+      ? factoryMethodsFromSource(importedSource, filePath, inventoryName, seen)
+      : null;
+    if (local?.size) return local;
     const receiverBinding = exported && ts.isPropertyAccessExpression(exported) && ts.isIdentifier(exported.expression)
       ? bindings.get(exported.expression.text, exported.expression)
       : null;
