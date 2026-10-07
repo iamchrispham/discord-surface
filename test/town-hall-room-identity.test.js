@@ -293,7 +293,7 @@ test('14 isolated shared-owner sentinel plus registration assertions', () => {
   assert.equal(tokens.filter(entry => entry === POLICY_TEST_RELATIVE).length, 1,
     'the policy inventory companion must be registered exactly once');
   assert.equal(pkg.scripts['test:town-hall-room-policy'],
-    'node --test --test-concurrency=1 test/town-hall-room-identity/policy-inventory.test.js');
+    'node --test --test-concurrency=1 test/town-hall-room-identity/policy-inventory.test.js test/town-hall-room-identity/policy-reference-analysis.test.js');
 
   const tsconfig = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'tsconfig.json'), 'utf8'));
   assert.equal(tsconfig.include.filter(entry => entry === OWNER_RELATIVE).length, 1,

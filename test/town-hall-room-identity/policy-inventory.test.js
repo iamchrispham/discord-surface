@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const ts = require('typescript');
+const { countIdentifierReferences } = require('./policy-reference-analysis');
 
 const PROJECT_ROOT = path.join(__dirname, '..', '..');
 
@@ -135,76 +136,6 @@ function collectBindings(sourceFile) {
   return bindings;
 }
 
-function countIdentifierReferences(sourceFile, name) {
-  const bindings = collectBindings(sourceFile);
-  const importBindings = [];
-  const collectImportBindings = node => {
-    if (ts.isImportDeclaration(node) && node.importClause) {
-      const scope = sourceFile;
-      if (node.importClause.name) {
-        importBindings.push({
-          declaration: node.importClause.name,
-          name: node.importClause.name.text,
-          scope,
-        });
-      }
-      if (node.importClause.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
-        for (const element of node.importClause.namedBindings.elements) {
-          importBindings.push({
-            declaration: element.name,
-            name: element.name.text,
-            importedName: element.propertyName?.text || element.name.text,
-            scope,
-          });
-        }
-      }
-    }
-    ts.forEachChild(node, collectImportBindings);
-  };
-  collectImportBindings(sourceFile);
-  bindings.push(...importBindings);
-  const candidates = bindings.filter(binding => binding.name === name &&
-    binding.scope === sourceFile);
-  const target = candidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&
-    binding.declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) ||
-    candidates[0] || null;
-  const importedTarget = target || importBindings.find(binding => binding.importedName === name) || null;
-  if (!importedTarget) return 0;
-  const targetName = importedTarget.name;
-  let count = 0;
-  const visit = node => {
-    if (ts.isIdentifier(node) && node.text === targetName &&
-        node !== importedTarget.declaration.name &&
-        isSemanticIdentifierReference(node) &&
-        resolveBinding(node, bindings) === importedTarget.declaration) count += 1;
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return count;
-}
-
-function isSemanticIdentifierReference(node) {
-  const parent = node.parent;
-  if (!parent) return true;
-  if (ts.isPropertyAccessExpression(parent) && parent.name === node) return false;
-  if (ts.isQualifiedName(parent) && parent.right === node) return false;
-  if (ts.isBindingElement(parent) && (parent.propertyName === node || parent.name === node)) return false;
-  if ((ts.isImportSpecifier(parent) || ts.isNamespaceImport(parent) ||
-      ts.isImportClause(parent)) && parent.name === node) return false;
-  if (ts.isImportSpecifier(parent) && parent.propertyName === node) return false;
-  if ((ts.isPropertyAssignment(parent) || ts.isPropertyDeclaration(parent) ||
-      ts.isPropertySignature(parent) || ts.isMethodDeclaration(parent) ||
-      ts.isMethodSignature(parent) || ts.isGetAccessorDeclaration(parent) ||
-      ts.isSetAccessorDeclaration(parent)) && parent.name === node) {
-    return false;
-  }
-  if ((ts.isInterfaceDeclaration(parent) || ts.isTypeAliasDeclaration(parent) ||
-      ts.isEnumDeclaration(parent) || ts.isModuleDeclaration(parent)) && parent.name === node) {
-    return false;
-  }
-  return true;
-}
-
 function isAncestor(ancestor, node) {
   let current = node;
   while (current) {
@@ -262,12 +193,14 @@ function hasBoundAlias(scope, subject, sourceFile, bindings, matches) {
   if (!ts.isIdentifier(subject)) return false;
   const subjectBinding = resolveBinding(subject, bindings);
   if (!subjectBinding) return false;
-  if (ts.isVariableDeclaration(subjectBinding) && matches(subjectBinding.initializer)) return true;
+  if (ts.isVariableDeclaration(subjectBinding) &&
+      matches(unwrapPolicyExpression(subjectBinding.initializer))) return true;
   let found = false;
   const visit = node => {
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
         ts.isIdentifier(node.left) && node.left.text === subject.text &&
-        resolveBinding(node.left, bindings) === subjectBinding && matches(node.right)) {
+        resolveBinding(node.left, bindings) === subjectBinding &&
+        matches(unwrapPolicyExpression(node.right))) {
       found = true;
     }
     ts.forEachChild(node, visit);
@@ -282,12 +215,32 @@ function isRoomKeyLookup(node) {
     ts.isStringLiteralLike(node.arguments[1]) && ['guildId', 'channelId'].includes(node.arguments[1].text));
 }
 
+function isDescriptorRoomLookup(node) {
+  return Boolean(node && ts.isCallExpression(node) && node.arguments.length === 2 &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'Object' &&
+    node.expression.name.text === 'getOwnPropertyDescriptor' &&
+    ts.isStringLiteralLike(node.arguments[1]) && ['guildId', 'channelId'].includes(node.arguments[1].text));
+}
+
 function hasRoomFieldAlias(scope, subject, sourceFile, bindings) {
   return hasBoundAlias(scope, subject, sourceFile, bindings, isNamedRoomField);
 }
 
 function hasRoomKeyAlias(scope, subject, sourceFile, bindings) {
   return hasBoundAlias(scope, subject, sourceFile, bindings, isRoomKeyLookup);
+}
+
+function hasDescriptorRoomAlias(scope, subject, sourceFile, bindings) {
+  if (!ts.isIdentifier(subject)) return false;
+  const valueBinding = resolveBinding(subject, bindings);
+  if (!valueBinding || !ts.isVariableDeclaration(valueBinding) ||
+      !valueBinding.initializer || !ts.isPropertyAccessExpression(valueBinding.initializer) ||
+      valueBinding.initializer.name.text !== 'value' ||
+      !ts.isIdentifier(valueBinding.initializer.expression)) return false;
+  const descriptorBinding = resolveBinding(valueBinding.initializer.expression, bindings);
+  return Boolean(descriptorBinding && ts.isVariableDeclaration(descriptorBinding) &&
+    isDescriptorRoomLookup(unwrapPolicyExpression(descriptorBinding.initializer)));
 }
 
 function hasSplitRoomLengthBound(scope, subject, sourceFile) {
@@ -342,7 +295,10 @@ function isRoomPolicyFile(sourceFile) {
 }
 
 function isTownHallContextName(name, sourceFile) {
-  return isTownHallName(name) || (isGenericRoomValidatorName(name) && isRoomPolicyFile(sourceFile));
+  const fileName = sourceFile?.fileName || '';
+  const neutralFile = /(?:ordinary|voice|snowflake)/i.test(fileName);
+  return isTownHallName(name) ||
+    (isGenericRoomValidatorName(name) && !neutralFile && isRoomPolicyFile(sourceFile));
 }
 
 function hasTownHallDeclarationContext(scope, sourceFile) {
@@ -401,8 +357,7 @@ function isNeutralRoomPolicy(scope) {
   const ownerName = scope?.name && ts.isIdentifier(scope.name)
     ? scope.name.text
     : owner ? bindingName(owner) : null;
-  const fileName = scope?.getSourceFile?.().fileName || scope?.fileName || '';
-  return /snowflake/i.test(ownerName || '') || /(?:^|[\\/])snowflake\.[cm]?[tj]s$/.test(fileName);
+  return /snowflake/i.test(ownerName || '');
 }
 
 function roomFieldSubject(node, sourceFile, bindings) {
@@ -427,11 +382,13 @@ function isTownHallRoomOwner(node, sourceFile, bindings) {
   const owner = scope && functionBinding(scope);
   if (!owner || bindingName(owner) !== 'isTownHallRoom') return false;
   const subject = regexInput(node);
-  return Boolean(subject && hasRoomKeyAlias(scope, subject, sourceFile, bindings));
+  return Boolean(subject && (hasRoomKeyAlias(scope, subject, sourceFile, bindings) ||
+    hasDescriptorRoomAlias(scope, subject, sourceFile, bindings)));
 }
 
 function isSplitRoomDigitPolicy(node, sourceFile, pattern, bindings) {
-  if (!/(?:\\[dD]|\[0-9\])(?:\+|\*|\{1,\})/.test(pattern)) return false;
+  if (!hasAsciiDigitPattern(pattern) ||
+      !/(?:\\[dD]|\[[^\]]+\])(?:\+|\*|\{\d+(?:,\d*)?\})/.test(pattern)) return false;
   const subject = regexInput(node);
   if (!subject) return false;
   const scope = enclosingFunction(node) || sourceFile;
@@ -476,7 +433,8 @@ function legacyRoomDigitPolicies(records) {
 function unwrapPolicyExpression(node) {
   let current = node;
   while (current && (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) ||
-      ts.isTypeAssertionExpression(current) || ts.isNonNullExpression(current))) {
+      ts.isTypeAssertionExpression(current) || ts.isNonNullExpression(current) ||
+      (typeof ts.isSatisfiesExpression === 'function' && ts.isSatisfiesExpression(current)))) {
     current = current.expression;
   }
   return current;
@@ -565,6 +523,7 @@ function roomDigitPolicies(records) {
         const property = node.name.text;
         let key = null;
         let ownerDeclaration = null;
+        let instance = false;
         if (ts.isObjectLiteralExpression(node.parent) && ts.isVariableDeclaration(owner) &&
             ts.isIdentifier(owner.name) &&
             (ts.isMethodDeclaration(node) || ts.isFunctionExpression(node.initializer) ||
@@ -572,10 +531,10 @@ function roomDigitPolicies(records) {
           key = `${owner.name.text}.${property}`;
           ownerDeclaration = owner;
         } else if (ts.isClassDeclaration(node.parent) && node.parent.name &&
-            ts.isMethodDeclaration(node) &&
-            node.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword)) {
+            ts.isMethodDeclaration(node)) {
           key = `${node.parent.name.text}.${property}`;
           ownerDeclaration = node.parent;
+          instance = !node.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword);
         }
         if (key) {
           const fn = {
@@ -583,6 +542,7 @@ function roomDigitPolicies(records) {
             node: ts.isPropertyAssignment(node) ? node.initializer : node,
             name: key,
             ownerDeclaration,
+            instance,
             calls: [],
           };
           const methods = info.objectMethods.get(key) || [];
@@ -610,6 +570,14 @@ function roomDigitPolicies(records) {
         const specifier = node.moduleSpecifier.text;
         if (node.importClause?.name) {
           info.imports.set(node.importClause.name.text, { specifier, imported: 'default' });
+          info.bindings.push({
+            name: node.importClause.name.text,
+            kind: 'import',
+            declaration: node.importClause.name,
+            scope: info.ast,
+            specifier,
+            imported: 'default',
+          });
         }
         if (node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
           for (const element of node.importClause.namedBindings.elements) {
@@ -617,10 +585,26 @@ function roomDigitPolicies(records) {
               specifier,
               imported: element.propertyName?.text || element.name.text,
             });
+            info.bindings.push({
+              name: element.name.text,
+              kind: 'import',
+              declaration: element.name,
+              scope: info.ast,
+              specifier,
+              imported: element.propertyName?.text || element.name.text,
+            });
           }
         }
         if (node.importClause?.namedBindings && ts.isNamespaceImport(node.importClause.namedBindings)) {
-          info.imports.set(node.importClause.namedBindings.name.text, { specifier, namespace: true });
+          const name = node.importClause.namedBindings.name.text;
+          info.imports.set(name, { specifier, namespace: true });
+          info.bindings.push({
+            name,
+            kind: 'namespace-import',
+            declaration: node.importClause.namedBindings.name,
+            scope: info.ast,
+            specifier,
+          });
         }
       }
       ts.forEachChild(node, importVisit);
@@ -658,6 +642,15 @@ function roomDigitPolicies(records) {
           if (!specifier) continue;
           if (ts.isIdentifier(declaration.name)) {
             info.imports.set(declaration.name.text, { specifier, imported, commonJs: true });
+            info.bindings.push({
+              name: declaration.name.text,
+              kind: 'commonjs-import',
+              declaration: declaration.name,
+              scope: info.ast,
+              source: initializer,
+              specifier,
+              imported,
+            });
           } else if (ts.isObjectBindingPattern(declaration.name)) {
             for (const element of declaration.name.elements) {
               if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
@@ -665,6 +658,15 @@ function roomDigitPolicies(records) {
                 ? element.propertyName.text
                 : element.name.text;
               info.imports.set(element.name.text, { specifier, imported: propertyName, commonJs: true });
+              info.bindings.push({
+                name: element.name.text,
+                kind: 'commonjs-import',
+                declaration: element.name,
+                scope: info.ast,
+                source: initializer,
+                specifier,
+                imported: propertyName,
+              });
             }
           }
         }
@@ -709,11 +711,27 @@ function roomDigitPolicies(records) {
       info.exports.set(exportName, fn);
       info.functionDefs.push(fn);
     };
+    const regexExpression = expression => {
+      const value = unwrapPolicyExpression(expression);
+      if (ts.isRegularExpressionLiteral(value)) return { node: value, pattern: value.text };
+      if ((ts.isNewExpression(value) || ts.isCallExpression(value)) &&
+          ts.isIdentifier(value.expression) && value.expression.text === 'RegExp' &&
+          value.arguments?.length && ts.isStringLiteralLike(value.arguments[0])) {
+        return { node: value, pattern: value.arguments[0].text };
+      }
+      return null;
+    };
+    const indexCommonJsRegex = (exportName, expression) => {
+      const regex = regexExpression(expression);
+      if (regex) info.exports.set(exportName, { kind: 'regex', ...regex });
+    };
     const commonJsExportVisit = node => {
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const target = commonJsExportTarget(node.left);
         if (target && ts.isIdentifier(node.right)) {
           info.exports.set(target, node.right.text);
+        } else if (target && regexExpression(node.right)) {
+          indexCommonJsRegex(target, node.right);
         } else if (target === 'default' && ts.isObjectLiteralExpression(node.right)) {
           for (const property of node.right.properties) {
             if (ts.isShorthandPropertyAssignment(property)) {
@@ -729,6 +747,10 @@ function roomDigitPolicies(records) {
                 (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) &&
                 (ts.isFunctionExpression(property.initializer) || ts.isArrowFunction(property.initializer))) {
               indexCommonJsFunction(property.name.text, property.initializer);
+            } else if (ts.isPropertyAssignment(property) &&
+                (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) &&
+                regexExpression(property.initializer)) {
+              indexCommonJsRegex(property.name.text, property.initializer);
             }
           }
         } else if (target &&
@@ -759,6 +781,8 @@ function roomDigitPolicies(records) {
       if (ts.isExportAssignment(statement)) {
         if (ts.isFunctionExpression(statement.expression) || ts.isArrowFunction(statement.expression)) {
           indexCommonJsFunction('default', statement.expression);
+        } else if (regexExpression(statement.expression)) {
+          indexCommonJsRegex('default', statement.expression);
         } else if (!statement.isExportEquals && ts.isObjectLiteralExpression(statement.expression)) {
           for (const property of statement.expression.properties) {
             if (ts.isMethodDeclaration(property) &&
@@ -772,6 +796,10 @@ function roomDigitPolicies(records) {
                 (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) &&
                 (ts.isFunctionExpression(property.initializer) || ts.isArrowFunction(property.initializer))) {
               indexCommonJsFunction(property.name.text, property.initializer);
+            } else if (ts.isPropertyAssignment(property) &&
+                (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) &&
+                regexExpression(property.initializer)) {
+              indexCommonJsRegex(property.name.text, property.initializer);
             }
           }
         } else if (ts.isIdentifier(statement.expression)) {
@@ -798,7 +826,11 @@ function roomDigitPolicies(records) {
   const resolveModule = (info, specifier) => {
     if (!specifier || !specifier.startsWith('.')) return null;
     const base = path.posix.normalize(path.posix.join(path.posix.dirname(info.file), specifier));
-    for (const candidate of [
+    const sourceCandidates = [];
+    const extension = path.posix.extname(base);
+    if (extension === '.cjs') sourceCandidates.push(base.slice(0, -4) + '.cts');
+    if (extension === '.mjs') sourceCandidates.push(base.slice(0, -4) + '.mts');
+    sourceCandidates.push(
       base,
       base + '.ts',
       base + '.js',
@@ -812,7 +844,8 @@ function roomDigitPolicies(records) {
       base + '/index.mts',
       base + '/index.cjs',
       base + '/index.mjs',
-    ]) {
+    );
+    for (const candidate of sourceCandidates) {
       if (byFile.has(candidate)) return byFile.get(candidate);
     }
     return null;
@@ -894,20 +927,57 @@ function roomDigitPolicies(records) {
       return info.functions.get(expression.text) || resolveImported(info, expression.text);
     }
     if ((ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) &&
-        ts.isIdentifier(expression.expression)) {
+        (ts.isIdentifier(expression.expression) || ts.isNewExpression(expression.expression) ||
+          (ts.isCallExpression(expression.expression) && ts.isIdentifier(expression.expression.expression)))) {
       const property = policyPropertyKey(expression);
       if (!property) return null;
-      const key = expression.expression.text + '.' + property;
-      const ownerBinding = findBinding(info, expression.expression.text, expression.expression);
-      const localMethods = info.objectMethods.get(key) || [];
-      const localMethod = localMethods
-        .filter(method => !ownerBinding || method.ownerDeclaration === ownerBinding.declaration)
-        .sort((left, right) =>
-          scopeDepth(nearestLexicalScope(right.node)) - scopeDepth(nearestLexicalScope(left.node)))[0];
-      if (localMethod) return localMethod;
-      const imported = info.imports.get(expression.expression.text);
-      if (imported?.namespace || imported?.commonJs || imported?.imported === 'default') {
-        const target = resolveModule(info, imported.specifier);
+      let receiverName = null;
+      let receiverBinding = null;
+      let receiverClass = null;
+      if (ts.isIdentifier(expression.expression)) {
+        receiverName = expression.expression.text;
+        receiverBinding = findBinding(info, receiverName, expression.expression);
+        if (receiverBinding?.source && ts.isNewExpression(receiverBinding.source) &&
+            ts.isIdentifier(receiverBinding.source.expression)) {
+          receiverClass = receiverBinding.source.expression.text;
+        }
+      } else if (ts.isNewExpression(expression.expression) &&
+          ts.isIdentifier(expression.expression.expression)) {
+        receiverClass = expression.expression.expression.text;
+      }
+      if (receiverClass) {
+        const localMethods = info.objectMethods.get(`${receiverClass}.${property}`) || [];
+        const localMethod = localMethods
+          .filter(method => method.instance &&
+            (!receiverBinding || method.ownerDeclaration === receiverBinding.declaration ||
+              method.ownerDeclaration?.name?.text === receiverClass))
+          .sort((left, right) =>
+            scopeDepth(nearestLexicalScope(right.node)) - scopeDepth(nearestLexicalScope(left.node)))[0];
+        if (localMethod) return localMethod;
+      }
+      if (receiverName) {
+        const key = receiverName + '.' + property;
+        const localMethods = info.objectMethods.get(key) || [];
+        const localMethod = localMethods
+          .filter(method => !method.instance &&
+            (!receiverBinding || method.ownerDeclaration === receiverBinding.declaration))
+          .sort((left, right) =>
+            scopeDepth(nearestLexicalScope(right.node)) - scopeDepth(nearestLexicalScope(left.node)))[0];
+        if (localMethod) return localMethod;
+        const imported = info.imports.get(receiverName);
+        const importBinding = receiverBinding?.kind;
+        if (imported && (!receiverBinding || importBinding === 'namespace-import' ||
+            importBinding === 'commonjs-import' || imported.imported === 'default')) {
+          const target = resolveModule(info, imported.specifier);
+          return target ? resolveExportedFunction(target, property) : null;
+        }
+      }
+      if (ts.isCallExpression(expression.expression) &&
+          ts.isIdentifier(expression.expression.expression) &&
+          expression.expression.expression.text === 'require' &&
+          expression.expression.arguments.length === 1 &&
+          ts.isStringLiteralLike(expression.expression.arguments[0])) {
+        const target = resolveModule(info, expression.expression.arguments[0].text);
         return target ? resolveExportedFunction(target, property) : null;
       }
     }
@@ -927,7 +997,9 @@ function roomDigitPolicies(records) {
   function findBinding(info, name, node) {
     const bindings = info.bindings.filter(binding => binding.name === name &&
       (!binding.scope || isAncestor(binding.scope, node) || binding.scope === node));
-    bindings.sort((left, right) => scopeDepth(right.scope) - scopeDepth(left.scope));
+    const priority = binding => ['import', 'namespace-import', 'commonjs-import'].includes(binding.kind) ? 1 : 0;
+    bindings.sort((left, right) =>
+      scopeDepth(right.scope) - scopeDepth(left.scope) || priority(right) - priority(left));
     return bindings[0] || null;
   }
   const bindingCalls = (binding, fallbackInfo) => {
@@ -993,8 +1065,15 @@ function roomDigitPolicies(records) {
     const inputs = [];
     const direct = regexInput(node);
     if (direct) inputs.push(direct);
-    const propertyAssignment = node.parent && ts.isPropertyAssignment(node.parent) &&
-      node.parent.initializer === node ? node.parent : null;
+    let propertyAssignment = node.parent;
+    while (propertyAssignment &&
+        (ts.isParenthesizedExpression(propertyAssignment) || ts.isAsExpression(propertyAssignment) ||
+          ts.isTypeAssertionExpression(propertyAssignment) || ts.isNonNullExpression(propertyAssignment) ||
+          (typeof ts.isSatisfiesExpression === 'function' && ts.isSatisfiesExpression(propertyAssignment)))) {
+      propertyAssignment = propertyAssignment.parent;
+    }
+    propertyAssignment = propertyAssignment && ts.isPropertyAssignment(propertyAssignment) &&
+      isAncestor(propertyAssignment.initializer, node) ? propertyAssignment : null;
     const objectLiteral = propertyAssignment?.parent && ts.isObjectLiteralExpression(propertyAssignment.parent)
       ? propertyAssignment.parent
       : null;
@@ -1020,8 +1099,12 @@ function roomDigitPolicies(records) {
       };
       visitObject(info.ast);
     }
-    const declaration = node.parent && ts.isVariableDeclaration(node.parent) &&
-      node.parent.initializer === node && ts.isIdentifier(node.parent.name) ? node.parent : null;
+    let declaration = node.parent;
+    while (declaration && !ts.isVariableDeclaration(declaration) && declaration.parent) {
+      declaration = declaration.parent;
+    }
+    declaration = declaration && ts.isVariableDeclaration(declaration) &&
+      ts.isIdentifier(declaration.name) && isAncestor(declaration.initializer, node) ? declaration : null;
     if (!declaration) return inputs;
     const seenDeclarations = new Set();
     const collectDeclarationInputs = currentDeclaration => {
@@ -1064,9 +1147,9 @@ function roomDigitPolicies(records) {
     const visit = node => {
       if (ts.isIdentifier(node) && node.text === localName) {
         const binding = findBinding(info, localName, node);
-        const requireBinding = binding?.source && ts.isCallExpression(binding.source) &&
-          ts.isIdentifier(binding.source.expression) && binding.source.expression.text === 'require';
-        const importedBinding = !binding || imported.commonJs || requireBinding;
+        const importedBinding = binding &&
+          (binding.kind === 'import' || binding.kind === 'commonjs-import') &&
+          binding.imported === imported.imported && binding.specifier === imported.specifier;
         if (importedBinding) {
           const parent = node.parent;
           if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
@@ -1095,7 +1178,8 @@ function roomDigitPolicies(records) {
     const inputs = [];
     const visit = node => {
       if (ts.isIdentifier(node) && node.text === namespaceName) {
-        if (findBinding(info, namespaceName, node)) {
+        const binding = findBinding(info, namespaceName, node);
+        if (!binding || binding.kind !== 'namespace-import') {
           ts.forEachChild(node, visit);
           return;
         }
@@ -1113,6 +1197,53 @@ function roomDigitPolicies(records) {
     return inputs;
   };
 
+  const resolveRegexValue = (info, expression, name, seen = new Set()) => {
+    const value = unwrapPolicyExpression(expression);
+    if (!value) return null;
+    if (ts.isRegularExpressionLiteral(value)) {
+      let declaration = value.parent;
+      while (declaration && !ts.isVariableDeclaration(declaration) && declaration.parent) {
+        declaration = declaration.parent;
+      }
+      return { info, name, declaration: declaration || value, pattern: value.text };
+    }
+    if ((ts.isNewExpression(value) || ts.isCallExpression(value)) &&
+        ts.isIdentifier(value.expression) && value.expression.text === 'RegExp' &&
+        value.arguments?.length && ts.isStringLiteralLike(value.arguments[0])) {
+      let declaration = value.parent;
+      while (declaration && !ts.isVariableDeclaration(declaration) && declaration.parent) {
+        declaration = declaration.parent;
+      }
+      return { info, name, declaration: declaration || value, pattern: value.arguments[0].text };
+    }
+    if (ts.isIdentifier(value)) {
+      const binding = findBinding(info, value.text, value);
+      if (binding?.declaration && ts.isVariableDeclaration(binding.declaration) &&
+          binding.declaration.initializer && !seen.has(binding.declaration)) {
+        seen.add(binding.declaration);
+        return resolveRegexValue(info, binding.declaration.initializer, name, seen);
+      }
+      return null;
+    }
+    if (ts.isPropertyAccessExpression(value) || ts.isElementAccessExpression(value)) {
+      const property = policyPropertyKey(value);
+      const owner = value.expression;
+      if (!property || !ts.isIdentifier(owner)) return null;
+      const ownerBinding = findBinding(info, owner.text, owner);
+      const initializer = ownerBinding?.declaration?.initializer;
+      const object = unwrapPolicyExpression(initializer);
+      if (!object || !ts.isObjectLiteralExpression(object)) return null;
+      const propertyNode = object.properties.find(candidate => {
+        if (!ts.isPropertyAssignment(candidate) && !ts.isMethodDeclaration(candidate)) return false;
+        const key = candidate.name;
+        return (ts.isIdentifier(key) || ts.isStringLiteralLike(key)) && key.text === property;
+      });
+      if (!propertyNode || !ts.isPropertyAssignment(propertyNode)) return null;
+      return resolveRegexValue(info, propertyNode.initializer, name, seen);
+    }
+    return null;
+  };
+
   const resolveRegexExport = (info, name, seen = new Set()) => {
     const marker = `${info.file}\u0000${name}`;
     if (seen.has(marker)) return null;
@@ -1123,6 +1254,7 @@ function roomDigitPolicies(records) {
         const target = resolveModule(info, exported.specifier);
         return target ? resolveRegexExport(target, exported.imported, seen) : null;
       }
+      if (exported.kind === 'regex') return { ...exported, info, name };
       return null;
     }
     for (const specifier of info.starExports) {
@@ -1131,6 +1263,11 @@ function roomDigitPolicies(records) {
       if (resolved) return resolved;
     }
     const localName = typeof exported === 'string' ? exported : name;
+    const binding = findBinding(info, localName, info.ast);
+    if (binding?.declaration && ts.isVariableDeclaration(binding.declaration) &&
+        binding.declaration.initializer) {
+      return resolveRegexValue(info, binding.declaration.initializer, name);
+    }
     let result = null;
     const visit = node => {
       if (result || !ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name) ||
@@ -1138,15 +1275,7 @@ function roomDigitPolicies(records) {
         ts.forEachChild(node, visit);
         return;
       }
-      const initializer = node.initializer;
-      if (ts.isRegularExpressionLiteral(initializer)) {
-        result = { info, name, declaration: node, pattern: initializer.text };
-      } else if ((ts.isNewExpression(initializer) || ts.isCallExpression(initializer)) &&
-          ts.isIdentifier(initializer.expression) &&
-          initializer.expression.text === 'RegExp' && initializer.arguments.length &&
-          ts.isStringLiteralLike(initializer.arguments[0])) {
-        result = { info, name, declaration: node, pattern: initializer.arguments[0].text };
-      }
+      result = resolveRegexValue(info, node.initializer, name);
       ts.forEachChild(node, visit);
     };
     visit(info.ast);
@@ -1201,8 +1330,10 @@ function roomDigitPolicies(records) {
         const roomContext = isTownHallContext(scope, consumer.ast, consumerBindings) ||
           hasContextualParameterCall(binding);
         if (isNeutralRoomPolicy(scope) || !roomContext || !expressionIsRoomField(input, consumer)) continue;
-        const key = `${resolved.info.file}\u0000${resolved.declaration.pos}`;
-        const localInputs = regexInputs(resolved.declaration.initializer, resolved.info);
+        const key = `${resolved.info.file}\u0000${resolved.declaration?.pos ?? resolved.pattern}`;
+        const localInputs = resolved.declaration && ts.isVariableDeclaration(resolved.declaration)
+          ? regexInputs(resolved.declaration.initializer, resolved.info)
+          : [];
         if (localInputs.some(input => expressionIsRoomField(input, resolved.info))) {
           countedRegexExports.add(key);
           continue;
@@ -1421,12 +1552,12 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/named-commonjs-room-helper.js': 2
   });
-  const bracketedCommonJsHelper = {
+  const reviewBracketedCommonJsHelper = {
     file: 'peer/bracketed-commonjs-room-helper.js',
     text: String.raw`exports['validateGuildId'] = value => /^\d{1,21}$/.test(value);
     module.exports['validateChannelId'] = value => /^\d{1,21}$/.test(value);`
   };
-  const bracketedCommonJsConsumer = {
+  const reviewBracketedCommonJsConsumer = {
     file: 'peer/bracketed-commonjs-room-consumer.js',
     text: String.raw`const { validateGuildId, validateChannelId } = require('./bracketed-commonjs-room-helper');
     function validateRoom(room) {
@@ -1435,8 +1566,8 @@ test('room policy inventory records only town-hall room validators', () => {
   };
   assert.deepEqual(roomDigitPolicies([
     ...records,
-    bracketedCommonJsHelper,
-    bracketedCommonJsConsumer,
+    reviewBracketedCommonJsHelper,
+    reviewBracketedCommonJsConsumer,
   ]), {
     ...expectedPolicies,
     'peer/bracketed-commonjs-room-helper.js': 2
@@ -2019,6 +2150,206 @@ test('room policy inventory records only town-hall room validators', () => {
   }
   function inspect(user) { return isSnowflake(user.guildId); }` };
   assert.deepEqual(roomDigitPolicies([...records, ordinaryCall]), expectedPolicies);
+  const runtimeCtsHelper = {
+    file: 'peer/runtime-room-helper.cts',
+    text: String.raw`export function validateGuildId(value) { return /^\d{1,21}$/.test(value); }`,
+  };
+  const runtimeCjsConsumer = {
+    file: 'peer/runtime-room-consumer.cjs',
+    text: String.raw`const { validateGuildId } = require('./runtime-room-helper.cjs');
+    function validateTownHallRoom(room) { return validateGuildId(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    runtimeCtsHelper,
+    runtimeCjsConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/runtime-room-helper.cts': 1,
+  });
+  const runtimeMtsHelper = {
+    file: 'peer/runtime-mts-helper.mts',
+    text: String.raw`export function validateGuildId(value) { return /^\d{1,21}$/.test(value); }`,
+  };
+  const runtimeMjsConsumer = {
+    file: 'peer/runtime-mjs-consumer.mjs',
+    text: String.raw`import { validateGuildId } from './runtime-mts-helper.mjs';
+    function validateTownHallRoom(room) { return validateGuildId(room.channelId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    runtimeMtsHelper,
+    runtimeMjsConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/runtime-mts-helper.mts': 1,
+  });
+  const directCommonJsRegex = {
+    file: 'peer/direct-commonjs-regex.cjs',
+    text: String.raw`module.exports = /^\d{1,21}$/;`,
+  };
+  const directCommonJsRegexConsumer = {
+    file: 'peer/direct-commonjs-regex-consumer.cjs',
+    text: String.raw`const ROOM_ID = require('./direct-commonjs-regex.cjs');
+    function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    directCommonJsRegex,
+    directCommonJsRegexConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/direct-commonjs-regex.cjs': 1,
+  });
+  const directCommonJsMemberHelper = {
+    file: 'peer/direct-commonjs-member.cjs',
+    text: String.raw`module.exports = { validateGuildId(value) {
+      return /^\d{1,21}$/.test(value);
+    } };`,
+  };
+  const directCommonJsMemberConsumer = {
+    file: 'peer/direct-commonjs-member-consumer.cjs',
+    text: String.raw`function validateTownHallRoom(room) {
+      return require('./direct-commonjs-member.cjs').validateGuildId(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    directCommonJsMemberHelper,
+    directCommonJsMemberConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/direct-commonjs-member.cjs': 1,
+  });
+  const instanceValidator = {
+    file: 'peer/instance-validator.ts',
+    text: String.raw`class Validators {
+      validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    }
+    function validateTownHallRoom(room) {
+      return new Validators().validateGuildId(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, instanceValidator]), {
+    ...expectedPolicies,
+    'peer/instance-validator.ts': 1,
+  });
+  const typedRegexValidator = {
+    file: 'peer/typed-regex-validator.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      const first = /^\d{1,21}$/ satisfies RegExp;
+      const second = /^\d{1,21}$/ as RegExp;
+      return first.test(room.guildId) && second.test(room.channelId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, typedRegexValidator]), {
+    ...expectedPolicies,
+    'peer/typed-regex-validator.ts': 2,
+  });
+  const ordinaryGenericRoom = {
+    file: 'peer/ordinary.ts',
+    text: String.raw`function validateRoom(room) {
+      return /^\d{1,20}$/.test(room.guildId);
+    }`,
+  };
+  const voiceGenericRoom = {
+    file: 'other/voice-room.ts',
+    text: String.raw`function validateRoom(room) {
+      return /^\d{1,20}$/.test(room.guildId);
+    }`,
+  };
+  const snowflakeTownHallRoom = {
+    file: 'peer/snowflake.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return /^\d{1,20}$/.test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    ordinaryGenericRoom,
+    voiceGenericRoom,
+    snowflakeTownHallRoom,
+  ]), {
+    ...expectedPolicies,
+    'peer/snowflake.ts': 1,
+  });
+  const reviewInlineCommonJsObject = {
+    file: 'peer/inline-commonjs-object.cjs',
+    text: String.raw`module.exports = {
+      validateGuildId(value) { return /^\d{1,21}$/.test(value); },
+      validateChannelId: value => /^\d{1,21}$/.test(value),
+    };`,
+  };
+  const reviewInlineCommonJsObjectConsumer = {
+    file: 'peer/inline-commonjs-object-consumer.cjs',
+    text: String.raw`const { validateGuildId, validateChannelId } =
+      require('./inline-commonjs-object.cjs');
+    function validateTownHallRoom(room) {
+      return validateGuildId(room.guildId) && validateChannelId(room.channelId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    reviewInlineCommonJsObject,
+    reviewInlineCommonJsObjectConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/inline-commonjs-object.cjs': 2,
+  });
+  const bracketedCommonJsHelper = {
+    file: 'peer/bracketed-commonjs-helper.cjs',
+    text: String.raw`exports['validateGuildId'] = value => /^\d{1,21}$/.test(value);`,
+  };
+  const bracketedCommonJsConsumer = {
+    file: 'peer/bracketed-commonjs-consumer.cjs',
+    text: String.raw`const { validateGuildId } = require('./bracketed-commonjs-helper.cjs');
+    function validateTownHallRoom(room) { return validateGuildId(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    bracketedCommonJsHelper,
+    bracketedCommonJsConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/bracketed-commonjs-helper.cjs': 1,
+  });
+  const reviewExportEqualsHelper = {
+    file: 'peer/export-equals-helper.cts',
+    text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }
+    export = validateGuildId;`,
+  };
+  const reviewExportEqualsConsumer = {
+    file: 'peer/export-equals-consumer.cjs',
+    text: String.raw`const validateGuildId = require('./export-equals-helper.cjs');
+    function validateTownHallRoom(room) { return validateGuildId(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    reviewExportEqualsHelper,
+    reviewExportEqualsConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/export-equals-helper.cts': 1,
+  });
+  const importedRegexShadowConsumer = {
+    file: 'peer/imported-regex-shadow-consumer.ts',
+    text: String.raw`import { ROOM_ID } from './imported-room-regex';
+    function validateTownHallRoom(ROOM_ID, room) { return ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importedRegexHelper,
+    importedRegexShadowConsumer,
+  ]), expectedPolicies);
+  const namespaceShadowReferenceFixture = ts.createSourceFile(
+    'peer/namespace-shadow-reference-fixture.ts',
+    String.raw`import * as plan from './town-hall-plan';
+    function shadow(plan) { return plan.isTownHallRoom({}); }
+    plan.isTownHallRoom({});`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(namespaceShadowReferenceFixture, 'isTownHallRoom'), 1);
   const copied = records.map(record => record.file === 'peer/town-hall-room-identity.ts'
     ? { ...record, text: record.text + inline.text } : record);
   assert.notDeepEqual(roomDigitPolicies(copied), expectedPolicies);
