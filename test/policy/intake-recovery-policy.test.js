@@ -559,6 +559,29 @@ const findConditionalExpressionDecision = (tokens, triggerIndex, start, end, pai
   return { ...branchRange(tokens, selectedStart, selectedEnd, pairs), opening: null };
 };
 
+const findShortCircuitDecision = (tokens, triggerIndex, start, end, pairs) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  const conditionStart = ['return', 'throw'].includes(tokens[start]?.value) ? start + 1 : start;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && index > triggerIndex && (value === '&&' || value === '||')) {
+      const negated = isNegatedDeadlineCondition(tokens, conditionStart, triggerIndex);
+      const expirySelectsRight = value === '&&' ? !negated : negated;
+      if (expirySelectsRight) return branchRange(tokens, index + 1, end, pairs);
+    }
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return null;
+};
+
 const isDirectSwitchAbruptCompletion = (tokens, index, start, pairs) => {
   if (index === start || [';', ':', '}'].includes(tokens[index - 1]?.value)) return true;
   if (tokens[index - 1]?.value !== ')') return false;
@@ -566,17 +589,33 @@ const isDirectSwitchAbruptCompletion = (tokens, index, start, pairs) => {
   return !['if', 'for', 'while', 'switch', 'with', 'catch'].includes(tokens[opening - 1]?.value);
 };
 
-const switchArmHasAbruptCompletion = (tokens, start, end, pairs) => {
+const switchArmHasAbruptCompletion = (tokens, start, end, pairs, functionRanges) => {
   let braceDepth = 0;
   let parenDepth = 0;
   let bracketDepth = 0;
+  const controlledBlocks = [];
   for (let index = start; index < end; index += 1) {
+    const functionRange = functionRanges.find(range => range.opening === index);
+    if (functionRange) {
+      index = functionRange.closing;
+      continue;
+    }
     const value = tokens[index].value;
-    if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0
+    if (braceDepth <= 1 && !controlledBlocks.includes(true) && parenDepth === 0 && bracketDepth === 0
       && ['break', 'continue', 'return', 'throw'].includes(value)
       && isDirectSwitchAbruptCompletion(tokens, index, start, pairs)) return true;
-    if (value === '{') braceDepth += 1;
-    else if (value === '}') braceDepth -= 1;
+    if (value === '{') {
+      let isControlled = ['else', 'do'].includes(tokens[index - 1]?.value);
+      if (tokens[index - 1]?.value === ')') {
+        const headerOpening = pairs.get(index - 1);
+        isControlled = ['if', 'for', 'while', 'switch', 'catch', 'with'].includes(tokens[headerOpening - 1]?.value);
+      }
+      controlledBlocks.push(isControlled);
+      braceDepth += 1;
+    } else if (value === '}') {
+      braceDepth -= 1;
+      controlledBlocks.pop();
+    }
     else if (value === '(') parenDepth += 1;
     else if (value === ')') parenDepth -= 1;
     else if (value === '[') bracketDepth += 1;
@@ -585,7 +624,7 @@ const switchArmHasAbruptCompletion = (tokens, start, end, pairs) => {
   return false;
 };
 
-const findSwitchDecision = (tokens, triggerIndex, pairs) => {
+const findSwitchDecision = (tokens, triggerIndex, pairs, functionRanges) => {
   let best = null;
   for (let index = triggerIndex - 1; index >= 0; index -= 1) {
     if (tokens[index].value !== 'switch' || tokens[index + 1]?.value !== '(') continue;
@@ -628,7 +667,7 @@ const findSwitchDecision = (tokens, triggerIndex, pairs) => {
   for (let index = bodyPosition; index < labels.length; index += 1) {
     const next = labels[index + 1];
     const armEnd = next?.index ?? best.closing;
-    if (switchArmHasAbruptCompletion(tokens, labels[index].start, armEnd, pairs)) {
+    if (switchArmHasAbruptCompletion(tokens, labels[index].start, armEnd, pairs, functionRanges)) {
       end = armEnd;
       break;
     }
@@ -644,7 +683,10 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) =>
     const consequentEnd = findControlledStatementEnd(tokens, consequentStart, tokens.length, pairs, false);
     const alternateStart = tokens[consequentEnd]?.value === 'else' ? consequentEnd + 1 : consequentEnd;
     const negated = isNegatedDeadlineCondition(tokens, conditionStart, triggerIndex);
-    if (negated && alternateStart === consequentEnd) return { start: consequentEnd, end: consequentEnd, opening: null };
+    if (negated && alternateStart === consequentEnd) {
+      const fallthroughEnd = findControlledStatementEnd(tokens, consequentEnd, tokens.length, pairs);
+      return branchRange(tokens, consequentEnd, fallthroughEnd, pairs);
+    }
     return branchRange(
       tokens,
       negated ? alternateStart : consequentStart,
@@ -652,8 +694,11 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) =>
       pairs
     );
   }
-  const switchDecision = findSwitchDecision(tokens, triggerIndex, pairs);
+  const switchDecision = findSwitchDecision(tokens, triggerIndex, pairs, functionRanges);
   if (switchDecision) return switchDecision;
+  const statement = findStatementRange(tokens, triggerIndex);
+  const shortCircuit = findShortCircuitDecision(tokens, triggerIndex, statement.start, statement.end, pairs);
+  if (shortCircuit) return shortCircuit;
   const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
   if (functionDecision) {
     if (functionDecision.expression) {
@@ -665,7 +710,6 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) =>
         pairs
       ) || { start: functionDecision.bodyStart, end: functionDecision.bodyEnd, opening: null };
     }
-    const statement = findStatementRange(tokens, triggerIndex);
     const conditional = findConditionalExpressionDecision(tokens, triggerIndex, statement.start, statement.end, pairs);
     if (conditional) return conditional;
     if (triggerIndex < functionDecision.opening) {
@@ -673,7 +717,6 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) =>
     }
     return { start: functionDecision.opening + 1, end: functionDecision.closing, opening: functionDecision.opening };
   }
-  const statement = findStatementRange(tokens, triggerIndex);
   return findConditionalExpressionDecision(tokens, triggerIndex, statement.start, statement.end, pairs) || statement;
 };
 
@@ -1242,7 +1285,10 @@ const visibleGapAliasesAt = (tokens, limit, pairs, lexicalScopes, functionRanges
 };
 
 const isConditionalDeadlineUse = (tokens, triggerIndex, pairs, functionRanges) => {
-  if (findIfDecision(tokens, triggerIndex, pairs) || findSwitchDecision(tokens, triggerIndex, pairs)) return true;
+  if (findIfDecision(tokens, triggerIndex, pairs)
+    || findSwitchDecision(tokens, triggerIndex, pairs, functionRanges)) return true;
+  const statement = findStatementRange(tokens, triggerIndex);
+  if (findShortCircuitDecision(tokens, triggerIndex, statement.start, statement.end, pairs)) return true;
   const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
   if (functionDecision?.expression) {
     return Boolean(findConditionalExpressionDecision(
@@ -1253,7 +1299,6 @@ const isConditionalDeadlineUse = (tokens, triggerIndex, pairs, functionRanges) =
       pairs
     ));
   }
-  const statement = findStatementRange(tokens, triggerIndex);
   return Boolean(findConditionalExpressionDecision(tokens, triggerIndex, statement.start, statement.end, pairs));
 };
 
@@ -2146,6 +2191,113 @@ test('gap aliases do not cross a shadowing parameter binding', () => {
     source: 'let next = READINESS.GAP; function audit(next) { if (deadlineReached) return next; }'
   }]);
   assert.deepEqual(offenders, []);
+});
+
+test('deadline policy inventory follows expiry after negated no-else guards', () => {
+  const entries = [
+    {
+      relative: 'discord/negated-guard-fallthrough.js',
+      source: 'if (!deadlineReached) return READINESS.READY; return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/false-guard-fallthrough.js',
+      source: 'if (deadlineReached === false) return READINESS.READY; return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/inequality-guard-fallthrough.js',
+      source: 'if (deadlineReached !== DEADLINE) return READINESS.READY; return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/negated-guard-ready-fallthrough.js',
+      source: 'if (!deadlineReached) return READINESS.READY; return READINESS.READY;'
+    }
+  ];
+  assert.deepEqual(findDeadlineGapOffenders(entries), [
+    'discord/negated-guard-fallthrough.js:1',
+    'discord/false-guard-fallthrough.js:1',
+    'discord/inequality-guard-fallthrough.js:1'
+  ]);
+});
+
+test('deadline policy inventory honors abrupt completion in braced switch arms', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/braced-switch-break.js',
+      source: [
+        'switch (kind) {',
+        '  case DEADLINE: { audit(); break; }',
+        '  case RETRY: return READINESS.GAP;',
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/conditional-braced-switch-break.js',
+      source: [
+        'switch (kind) {',
+        '  case DEADLINE: { if (shouldExit) break; }',
+        '  case RETRY: return READINESS.GAP;',
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/nested-conditional-switch-break.js',
+      source: [
+        'switch (kind) {',
+        '  case DEADLINE: { if (shouldExit) { break; } }',
+        '  case RETRY: return READINESS.GAP;',
+        '}'
+      ].join('\n')
+    },
+    {
+      relative: 'discord/nested-function-switch-break.js',
+      source: [
+        'switch (kind) {',
+        '  case DEADLINE: function audit() { break; }',
+        '  case RETRY: return READINESS.GAP;',
+        '}'
+      ].join('\n')
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/conditional-braced-switch-break.js:2',
+    'discord/nested-conditional-switch-break.js:2',
+    'discord/nested-function-switch-break.js:2'
+  ]);
+});
+
+test('deadline policy inventory inspects short-circuit expiry branches', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/and-gap-return.js',
+      source: 'function outcome() { return deadlineReached && READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/or-negated-gap-return.js',
+      source: 'function outcome() { return !deadlineReached || READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/and-boundary-writer.js',
+      source: 'function outcome() { deadlineReached && state.markIntakeBoundary(id, READINESS.GAP, detail); }'
+    },
+    {
+      relative: 'discord/or-negated-boundary-writer.js',
+      source: 'function outcome() { !deadlineReached || state.markIntakeBoundary(id, READINESS.GAP, detail); }'
+    },
+    {
+      relative: 'discord/and-negated-gap-control.js',
+      source: 'function outcome() { !deadlineReached && READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/or-gap-control.js',
+      source: 'function outcome() { deadlineReached || READINESS.GAP; }'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/and-gap-return.js:1',
+    'discord/or-negated-gap-return.js:1',
+    'discord/and-boundary-writer.js:1',
+    'discord/or-negated-boundary-writer.js:1'
+  ]);
 });
 
 test('pre-adoption retry classifier sites stay in the audited owners', () => {
