@@ -350,6 +350,38 @@ test('delayed decision recovery wakes each channel at its own deadline', { timeo
   assert.deepEqual(calls, [['channel-a'], ['channel-b']]);
 });
 
+test('decision recovery does not retry a later deadline in an early channel wake', { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  const attempts = [];
+  for (const interactionId of ['short-retry', 'long-retry']) {
+    const admitted = f.state.admitDecisionClickAndBeginAuthorization({
+      interactionId,
+      presentationId: f.presentation.presentationId,
+      selectedKey: 'hold',
+      actorId: 'operator',
+      guildId: 'guild',
+      channelId: 'channel',
+      messageId: f.presentation.messageId,
+      binding: f.state.getBinding('channel'),
+      applicationId: 'application',
+      token: `token-${interactionId}`
+    });
+    assert.equal(admitted.accepted, true);
+    assert.equal(f.state.recordDecisionAuthorizationOutcome(interactionId, 'denied').accepted, true);
+    assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, 'sent').accepted, true);
+  }
+  f.gateway.sendInteractionRejection = async interaction => {
+    attempts.push(interaction.id);
+    return { outcome: 'rate_limited', retryAfterMs: interaction.id === 'short-retry' ? 25 : 180 };
+  };
+
+  await f.gateway.decisionConsumer.recover(new AbortController().signal);
+  assert.deepEqual(attempts, ['short-retry', 'long-retry']);
+  await waitForCondition(() => attempts.filter(id => id === 'short-retry').length >= 2,
+    'short retry did not wake');
+  assert.equal(attempts.filter(id => id === 'long-retry').length, 1);
+});
+
 test('losing projection refuses binding and config drift during question fetch', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.started = true;
@@ -865,7 +897,10 @@ for (const retryableOutcome of ['rate_limited', 'not_sent']) {
     assert.equal(result.accepted, false);
     assert.deepEqual(recoveryCalls, [{
       channelIds: ['channel'],
-      ...(retryableOutcome === 'rate_limited' ? { options: { delayMs: 25 } } : { options: undefined })
+      options: {
+        ...(retryableOutcome === 'rate_limited' ? { delayMs: 25 } : {}),
+        decisionId: `retryable-rejection-${retryableOutcome}`
+      }
     }]);
   });
 }
@@ -1006,7 +1041,10 @@ test('failed short projection remains pending after native submission', { timeou
   assert.equal(f.state.getDecisionClick('short-projection-retry')?.projectionOutcome, 'not_sent');
   assert.equal(f.state.getDecisionClick('short-projection-retry')?.state, 'materialized_projection_pending');
   assert.equal(f.state.listDecisionPendingWork().length, 1);
-  assert.deepEqual(recoveryCalls, [{ channelIds: ['channel'], options: { delayMs: 1000 } }]);
+  assert.deepEqual(recoveryCalls, [{
+    channelIds: ['channel'],
+    options: { delayMs: 1000, decisionId: 'short-projection-retry' }
+  }]);
 
   f.setEmbedLinks(true);
   f.setAttachFiles(true);
@@ -1382,6 +1420,24 @@ test('rejection followup distinguishes pre-send and post-send cancellation', { t
   });
   assert.equal(rateLimited.outcome, 'rate_limited');
   assert.equal(rateLimited.retryAfterMs, 4500);
+});
+
+test('rejection followup keeps a received rate limit when metadata cleanup times out', { timeout: 30000 }, async t => {
+  const interaction = { applicationId: 'application', token: 'transport-timeout-token' };
+  const result = await sendInteractionFollowup(interaction, {
+    timeoutMs: 20,
+    fetchImpl: async () => ({
+      ok: false,
+      status: 429,
+      headers: { get() { return null; } },
+      async json() { return new Promise(() => {}); },
+      body: { cancel() { return new Promise(() => {}); } }
+    })
+  });
+
+  assert.equal(result.outcome, 'rate_limited');
+  assert.equal(result.statusCode, 429);
+  assert.equal(result.retryAfterMs, undefined);
 });
 
 test('a full-length decision keeps every prompt character after selection', { timeout: 30000 }, async t => {

@@ -172,7 +172,7 @@ export interface DecisionConsumerOptions {
   callbackTimeoutMs?: number;
   authorize?: (input: DecisionAuthorizationInput, signal?: AbortSignal) => Promise<boolean | null>;
   reject?: (interaction: ParsedComponentInteraction, reason: DecisionReason, signal?: AbortSignal, deferred?: boolean) => Promise<InteractionCallbackResult>;
-  scheduleRecovery?: (channelIds: Set<string>, options?: { deferIfActive?: boolean; delayMs?: number }) => unknown;
+  scheduleRecovery?: (channelIds: Set<string>, options?: { deferIfActive?: boolean; delayMs?: number; decisionId?: string }) => unknown;
   waitForDispatch?: (channelId: string, signal?: AbortSignal) => Promise<boolean>;
   processAccepted?: (message: DecisionMessage, signal?: AbortSignal, options?: Record<string, unknown>) => Promise<unknown>;
   project?: (input: DecisionProjectionInput, signal?: AbortSignal) => Promise<unknown>;
@@ -335,6 +335,23 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   const resolveRoute = options.resolveRoute || resolveCanonicalRoute;
   const runCanonical = options.runCanonical || runCanonicalOperation;
   const callbackWaiters = new Map<string, Promise<void>>();
+  const decisionRecoveryDeadlines = new Map<string, number>();
+
+  function scheduleRecovery(
+    channelIds: Set<string>,
+    recoveryOptions: { deferIfActive?: boolean; delayMs?: number; decisionId?: string } | undefined = undefined
+  ): unknown {
+    const decisionId = recoveryOptions?.decisionId;
+    if (typeof decisionId === 'string' && decisionId.length > 0) {
+      const delay = Number(recoveryOptions?.delayMs);
+      if (Number.isFinite(delay) && delay > 0) {
+        decisionRecoveryDeadlines.set(decisionId, Date.now() + Math.ceil(delay));
+      } else {
+        decisionRecoveryDeadlines.delete(decisionId);
+      }
+    }
+    return options.scheduleRecovery?.(channelIds, recoveryOptions);
+  }
 
   async function authorizationAllowed(input: DecisionAuthorizationInput, signal?: AbortSignal): Promise<boolean | null> {
     if (typeof options.authorize !== 'function') return true;
@@ -410,7 +427,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       const recoveryOptions = outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED
         ? { delayMs: decisionRecoveryDelayMs(result.retryAfterMs) }
         : undefined;
-      options.scheduleRecovery?.(new Set([click.channelId]), recoveryOptions);
+      scheduleRecovery(new Set([click.channelId]), { ...recoveryOptions, decisionId: click.interactionId });
     }
     return result;
   }
@@ -509,7 +526,8 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         if (attempts <= DECISION_PROJECTION_RETRY_LIMIT) {
           const requestedDelay = decisionRecoveryDelayMs((error as { retryAfterMs?: unknown })?.retryAfterMs);
           const exponentialDelay = DECISION_RECOVERY_DEFAULT_DELAY_MS * (2 ** (attempts - 1));
-          options.scheduleRecovery?.(new Set([click.channelId]), {
+          scheduleRecovery(new Set([click.channelId]), {
+            decisionId: click.interactionId,
             delayMs: Math.min(DECISION_PROJECTION_RETRY_MAX_DELAY_MS, Math.max(requestedDelay, exponentialDelay))
           });
         }
@@ -543,7 +561,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     if (current.state === DECISION_STATES.AUTHORIZATION_PENDING) {
       const allowed = await authorizationAllowed(current, signal);
       if (signal?.aborted || allowed === null) {
-        if (allowed === null && !signal?.aborted) options.scheduleRecovery?.(new Set([current.channelId]), { deferIfActive: recovery });
+        if (allowed === null && !signal?.aborted) scheduleRecovery(new Set([current.channelId]), { deferIfActive: recovery, decisionId: current.interactionId });
         return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
       }
       if (!allowed) {
@@ -652,7 +670,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     if (admission.duplicate && admission.continuing) {
       click = await awaitCallbackOutcome(click);
       if (click.callbackAttempted && !click.callbackOutcome) {
-        options.scheduleRecovery?.(new Set([click.channelId]));
+        scheduleRecovery(new Set([click.channelId]), { decisionId: click.interactionId });
         return {
           handled: true,
           accepted: true,
@@ -685,7 +703,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         };
       }
       if (allowed === null) {
-        options.scheduleRecovery?.(new Set([click.channelId]));
+        scheduleRecovery(new Set([click.channelId]), { decisionId: click.interactionId });
         return {
           handled: true,
           accepted: true,
@@ -761,10 +779,32 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   }
 
   async function recover(signal?: AbortSignal, channelIds: Set<string> | null = null): Promise<DecisionClick[]> {
-    const pending = state.listDecisionPendingWork().filter(click => !channelIds || channelIds.has(click.channelId));
+    const allPending = state.listDecisionPendingWork();
+    const pendingIds = new Set(allPending.map(click => click.interactionId));
+    for (const decisionId of decisionRecoveryDeadlines.keys()) {
+      if (!pendingIds.has(decisionId)) decisionRecoveryDeadlines.delete(decisionId);
+    }
+    const pending = allPending.filter(click => !channelIds || channelIds.has(click.channelId));
+    const enforceRetryDeadlines = channelIds !== null;
     const remaining: DecisionClick[] = [];
     for (let pendingClick of pending) {
       if (signal?.aborted) { remaining.push(pendingClick); continue; }
+      const retryDeadline = decisionRecoveryDeadlines.get(pendingClick.interactionId);
+      if (!enforceRetryDeadlines && retryDeadline !== undefined) {
+        decisionRecoveryDeadlines.delete(pendingClick.interactionId);
+      }
+      if (enforceRetryDeadlines && retryDeadline !== undefined) {
+        const remainingDelay = retryDeadline - Date.now();
+        if (remainingDelay > 0) {
+          remaining.push(pendingClick);
+          scheduleRecovery(new Set([pendingClick.channelId]), {
+            delayMs: remainingDelay,
+            decisionId: pendingClick.interactionId
+          });
+          continue;
+        }
+        decisionRecoveryDeadlines.delete(pendingClick.interactionId);
+      }
       if (pendingClick.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
         pendingClick = await awaitCallbackOutcome(pendingClick);
         if (pendingClick.callbackAttempted && !pendingClick.callbackOutcome) {

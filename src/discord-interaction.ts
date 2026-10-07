@@ -262,11 +262,15 @@ async function readRetryAfterMs(response: InteractionCallbackFetchResponse, dead
   const headerValue = typeof headers?.get === 'function'
     ? headers.get('retry-after') ?? headers.get('Retry-After')
     : headers?.['retry-after'] ?? headers?.['Retry-After'];
-  const headerSeconds = Number(headerValue);
+  const headerSeconds = headerValue === null || headerValue === undefined ||
+    (typeof headerValue === 'string' && headerValue.trim().length === 0)
+    ? Number.NaN
+    : Number(headerValue);
   if (Number.isFinite(headerSeconds) && headerSeconds >= 0) return Math.ceil(headerSeconds * 1000);
   try {
     const body = await Promise.race([response.json?.() || Promise.resolve(null), deadline]);
-    const bodySeconds = Number((body as { retry_after?: unknown } | null)?.retry_after);
+    const rawBodySeconds = (body as { retry_after?: unknown } | null)?.retry_after;
+    const bodySeconds = rawBodySeconds === null || rawBodySeconds === undefined ? Number.NaN : Number(rawBodySeconds);
     return Number.isFinite(bodySeconds) && bodySeconds >= 0 ? Math.ceil(bodySeconds * 1000) : null;
   } catch {
     return null;
@@ -425,7 +429,11 @@ export async function sendInteractionFollowup(
     const response = await Promise.race([request, deadline]);
     const status = responseStatus(response);
     const retryAfterMs = status === 429 ? await readRetryAfterMs(response, deadline) : null;
-    await Promise.race([cancelBody(response), deadline]);
+    try {
+      await Promise.race([cancelBody(response), deadline]);
+    } catch (error) {
+      if (status !== 429) throw error;
+    }
     return response?.ok === true
       ? { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }) }
       : { outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
