@@ -1312,10 +1312,32 @@ const isDeadlineTriggerAt = (tokens, index) => {
         && tokens[memberEnd + 3]?.value === '(');
   }
   const deadlineOperandEnd = start => {
-    if (tokens[start]?.type !== 'identifier') return null;
-    let end = start + 1;
+    let operandStart = start;
+    let openingParentheses = 0;
+    while (tokens[operandStart]?.value === '(') {
+      openingParentheses += 1;
+      operandStart += 1;
+    }
+    if (tokens[operandStart]?.type !== 'identifier') return null;
+    let end = operandStart + 1;
     while (['.', '?.'].includes(tokens[end]?.value) && tokens[end + 1]?.type === 'identifier') end += 2;
-    return /deadline/i.test(tokens[end - 1]?.value) ? end : null;
+    if (!/deadline/i.test(tokens[end - 1]?.value)) return null;
+
+    if (openingParentheses > 0) {
+      for (let index = 0; index < openingParentheses; index += 1) {
+        if (tokens[end + index]?.value !== ')') return null;
+      }
+      return end + openingParentheses;
+    }
+
+    let closingParentheses = 0;
+    while (tokens[end + closingParentheses]?.value === ')') closingParentheses += 1;
+    let precedingParentheses = 0;
+    while (tokens[start - precedingParentheses - 1]?.value === '(') precedingParentheses += 1;
+    let wrappedParentheses = Math.min(closingParentheses, precedingParentheses);
+    while (wrappedParentheses > 0
+      && tokens[start - wrappedParentheses - 1]?.type === 'identifier') wrappedParentheses -= 1;
+    return end + wrappedParentheses;
   };
   const dateNow = offset => tokens[index + offset]?.value === 'Date'
     && tokens[index + offset + 1]?.value === '.'
@@ -2042,6 +2064,23 @@ test('deadline policy inventory follows remaining-budget aliases', () => {
     source: 'function readiness(deadline) { const remaining = deadline - Date.now(); if (remaining <= 0) return READINESS.GAP; }'
   }]);
   assert.deepEqual(offenders, ['discord/deadline-remaining-gap.js:1']);
+});
+
+test('deadline policy inventory recognizes parenthesized operands in both comparison directions', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-parenthesized-direct-gap.js',
+      source: 'if (Date.now() >= (deadline)) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/deadline-parenthesized-reverse-gap.js',
+      source: 'if ((deadline) <= Date.now()) return READINESS.GAP;'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-parenthesized-direct-gap.js:1',
+    'discord/deadline-parenthesized-reverse-gap.js:1'
+  ]);
 });
 
 test('deadline policy inventory ignores non-mutating boundary-shaped calls', () => {
