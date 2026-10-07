@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const Module = require('node:module');
@@ -10,7 +11,8 @@ const { facadeOwnerInventory } = require('./helpers/facade-owner-inventory.cjs')
 const {
   GATEWAY_PATH, OWNER_PATH, METHOD_HASHES, DEPENDENCY_NAMES,
   sourceFile, methodOf, hasExactFacade, classStateInventory, exactOwnerContract, withFakeTimers,
-  schedulerReceiver, ownerFromText
+  schedulerReceiver, ownerFromText, EXPECTED_SCHEDULER_CALLSITES,
+  schedulerCallsiteInventory, assertSchedulerCallsiteInventory
 } = require('./helpers/handoff-scheduler-owner.cjs');
 
 test('handoff scheduler owner preserves exact bodies, dependencies, facade shape and inventory', () => {
@@ -66,6 +68,48 @@ test('handoff scheduler owner preserves exact bodies, dependencies, facade shape
   assert.deepEqual(classStateInventory(gateway), []);
   assert.equal(methodOf(sourceFile(GATEWAY_PATH, gateway), 'scheduleDeferredHandoffRecovery').parameters.length, 1);
   assert.equal(methodOf(sourceFile(GATEWAY_PATH, gateway), 'schedulePendingHandoffRecoveryPoll').parameters.length, 0);
+});
+
+test('public scheduler inventory pins source owners and rejects only new scheduler references', () => {
+  assert.deepEqual(assertSchedulerCallsiteInventory(), EXPECTED_SCHEDULER_CALLSITES);
+  const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-scheduler-inventory-'));
+  const expected = [
+    { file: 'bracket.ts', owner: 'bracketSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
+    { file: 'dot.js', owner: 'dotSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+    { file: 'forwarded.cjs', owner: 'forwardedSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
+    { file: 'grouped.js', owner: 'groupedSite', scheduler: 'scheduleDeferredHandoffRecovery' },
+    { file: 'optional.mjs', owner: 'optionalBracketSite', scheduler: 'schedulePendingHandoffRecoveryPoll' },
+    { file: 'optional.mjs', owner: 'optionalSite', scheduler: 'scheduleDeferredHandoffRecovery' }
+  ];
+
+  try {
+    fs.writeFileSync(path.join(sourceRoot, 'bracket.ts'),
+      "function bracketSite(gateway: any) { gateway['schedulePendingHandoffRecoveryPoll'](); }\n");
+    fs.writeFileSync(path.join(sourceRoot, 'dot.js'),
+      "function dotSite(gateway) { gateway.scheduleDeferredHandoffRecovery('dot'); }\n");
+    fs.writeFileSync(path.join(sourceRoot, 'forwarded.cjs'),
+      'function forwardedSite(gateway) { (gateway.schedulePendingHandoffRecoveryPoll).apply(gateway, []); }\n');
+    fs.writeFileSync(path.join(sourceRoot, 'grouped.js'),
+      "function groupedSite(gateway) { (gateway).scheduleDeferredHandoffRecovery('grouped'); }\n");
+    fs.writeFileSync(path.join(sourceRoot, 'optional.mjs'),
+      "function optionalBracketSite(gateway) { (gateway)?.['schedulePendingHandoffRecoveryPoll']?.(); }\n" +
+      "function optionalSite(gateway) { gateway?.scheduleDeferredHandoffRecovery?.('optional'); }\n");
+    assert.deepEqual(schedulerCallsiteInventory(sourceRoot), expected);
+    assert.deepEqual(assertSchedulerCallsiteInventory(sourceRoot, expected), expected);
+
+    const newConsumer = path.join(sourceRoot, 'audit-new-consumer.js');
+    fs.writeFileSync(newConsumer,
+      "exports.auditScheduler = gateway => gateway?.scheduleDeferredHandoffRecovery?.('audit-new-site');\n");
+    assert.throws(() => assertSchedulerCallsiteInventory(sourceRoot, expected),
+      error => error.code === 'ERR_ASSERTION' &&
+        error.message.includes('public scheduler callsite inventory changed'));
+    fs.rmSync(newConsumer);
+
+    fs.writeFileSync(path.join(sourceRoot, 'audit-ordinary.js'), "exports.value = 'unrelated';\n");
+    assert.doesNotThrow(() => assertSchedulerCallsiteInventory(sourceRoot, expected));
+  } finally {
+    fs.rmSync(sourceRoot, { recursive: true, force: true });
+  }
 });
 
 test('public scheduler facades preserve receiver, extra arguments, synchronous return and thrown identity', () => {

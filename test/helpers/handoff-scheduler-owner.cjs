@@ -7,6 +7,7 @@ const Module = require('node:module');
 const path = require('node:path');
 const ts = require('typescript');
 const { facadeOwnerInventory } = require('./facade-owner-inventory.cjs');
+const schedulerCallsiteContract = require('./scheduler-callsite-inventory.cjs');
 
 const GATEWAY_PATH = path.resolve(__dirname, '..', '..', 'src', 'discord.js');
 const OWNER_PATH = path.resolve(__dirname, '..', '..', 'src', 'discord', 'handoff-scheduler.js');
@@ -29,7 +30,6 @@ const HANDOFF_STATE_FIELDS = new Set([
   'pendingHandoffRecoveryChannels',
   'deferredHandoffRecoveryDelayMs'
 ]);
-
 function sourceFile(fileName, text) {
   return ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
 }
@@ -242,3 +242,5 @@ module.exports = {
   sourceFile, methodOf, hasExactFacade, classStateInventory, exactOwnerContract,
   withFakeTimers, schedulerReceiver, ownerFromText
 };
+
+Object.assign(module.exports, schedulerCallsiteContract);
