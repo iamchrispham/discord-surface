@@ -257,11 +257,16 @@ const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, al
   let bracketDepth = 0;
   for (let index = openingIndex + 1; index < closingIndex; index += 1) {
     const value = tokens[index].value;
-    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
-      && OUTCOME_NAMES.has(value) && tokens[index + 1]?.value === ':') {
-      const valueStart = index + 2;
-      const valueEnd = findDelimitedEnd(tokens, valueStart, closingIndex, '}');
-      if (valueHasGap(tokens, valueStart, valueEnd, pairs, aliases, allowNestedCalls)) return true;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && OUTCOME_NAMES.has(value)) {
+      if (tokens[index + 1]?.value === ':') {
+        const valueStart = index + 2;
+        const valueEnd = findDelimitedEnd(tokens, valueStart, closingIndex, '}');
+        if (valueHasGap(tokens, valueStart, valueEnd, pairs, aliases, allowNestedCalls)) return true;
+      } else if (tokens[index].type === 'identifier'
+        && aliases.has(value)
+        && [',', '}'].includes(tokens[index + 1]?.value)) {
+        return true;
+      }
     }
     if (value === '(') parenDepth += 1;
     else if (value === ')') parenDepth -= 1;
@@ -666,8 +671,14 @@ const trimExpressionRange = (tokens, start, end, pairs) => {
   return { start, end };
 };
 
+const isReadinessVocabulary = value => value === 'READINESS'
+  || value === 'THREAD_STATES'
+  || /(?:^|_)READINESS$/.test(value)
+  || /Readiness$/.test(value);
+
 const isGapMemberExpression = (tokens, start, end) => end - start === 3
   && tokens[start]?.type === 'identifier'
+  && isReadinessVocabulary(tokens[start].value)
   && tokens[start + 1]?.value === '.'
   && tokens[start + 2]?.value === 'GAP';
 
@@ -728,6 +739,46 @@ const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, alia
   return check(closing);
 };
 
+const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases) => {
+  const nestedFunctionStarts = new Map(functionRanges
+    .filter(range => range.start >= start && range.opening < end)
+    .map(range => [range.start, range]));
+  for (let index = start; index < end; index += 1) {
+    const nestedFunction = nestedFunctionStarts.get(index);
+    if (nestedFunction) {
+      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction)) {
+        const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
+        const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
+        if (hasBoundaryWriterGap(tokens, bodyStart, bodyEnd, pairs, functionRanges, aliases)) return true;
+      }
+      index = nestedFunction.closing;
+      continue;
+    }
+    if (tokens[index]?.type !== 'identifier' || !isBoundaryWriter(tokens[index].value)) continue;
+    if (tokens[index - 1]?.value === 'function') continue;
+    const opening = boundaryWriterCallOpening(tokens, index);
+    const closing = opening === null ? undefined : pairs.get(opening);
+    if (closing !== undefined && closing < end
+      && callHasGapArgument(tokens, opening, closing, pairs, boundaryWriterStateArgument(tokens[index].value), aliases)) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const isImmediatelyInvokedFunction = (tokens, pairs, range) => {
+  let next = range.closing + 1;
+  while (tokens[next]?.value === ')') {
+    const opening = pairs.get(next);
+    if (opening === undefined) return false;
+    const preceding = tokens[opening - 1];
+    if (preceding?.type === 'identifier' || [')', ']', '.', '?.'].includes(preceding?.value)) return false;
+    next += 1;
+  }
+  if (tokens[next]?.value === '?.') next += 1;
+  return tokens[next]?.value === '(';
+};
+
 const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, aliases = new Set()) => {
   const knownAliases = new Set(aliases);
   const nestedFunctionStarts = new Map(functionRanges
@@ -736,6 +787,11 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
   for (let index = start; index < end; index += 1) {
     const nestedFunction = nestedFunctionStarts.get(index);
     if (nestedFunction) {
+      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction)) {
+        const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
+        const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
+        if (hasGapOutcome(tokens, bodyStart, bodyEnd, nestedFunction.opening, pairs, functionRanges, knownAliases)) return true;
+      }
       index = nestedFunction.closing;
       continue;
     }
@@ -744,6 +800,7 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
       if (valueHasGapOutcome(tokens, expressionStart, statementEnd, pairs, knownAliases)) return true;
+      if (hasBoundaryWriterGap(tokens, expressionStart, statementEnd, pairs, functionRanges, knownAliases)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
@@ -776,7 +833,24 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
 
 const isDeadlineTriggerAt = (tokens, index) => {
   const value = tokens[index]?.value;
-  if (value === 'DEADLINE' || value === 'deadlineReached') return true;
+  if (value === 'deadlineReached') return true;
+  if (value === 'DEADLINE') {
+    let memberStart = index;
+    while (tokens[memberStart - 1]?.value === '.' && tokens[memberStart - 2]?.type === 'identifier') {
+      memberStart -= 2;
+    }
+    let memberEnd = index + 1;
+    while (tokens[memberEnd]?.value === '.' && tokens[memberEnd + 1]?.type === 'identifier') memberEnd += 2;
+    return COMPARISON_OPERATORS.has(tokens[memberStart - 1]?.value)
+      || COMPARISON_OPERATORS.has(tokens[memberEnd]?.value)
+      || tokens[memberStart - 1]?.value === 'case';
+  }
+  const deadlineOperandEnd = start => {
+    if (tokens[start]?.type !== 'identifier') return null;
+    let end = start + 1;
+    while (['.', '?.'].includes(tokens[end]?.value) && tokens[end + 1]?.type === 'identifier') end += 2;
+    return /deadline/i.test(tokens[end - 1]?.value) ? end : null;
+  };
   const dateNow = offset => tokens[index + offset]?.value === 'Date'
     && tokens[index + offset + 1]?.value === '.'
     && tokens[index + offset + 2]?.value === 'now'
@@ -784,10 +858,11 @@ const isDeadlineTriggerAt = (tokens, index) => {
     && tokens[index + offset + 4]?.value === ')';
   const directComparison = dateNow(0)
     && ['>', '>='].includes(tokens[index + 5]?.value)
-    && tokens[index + 6]?.value === 'deadline';
-  const reverseComparison = value === 'deadline'
-    && ['<', '<='].includes(tokens[index + 1]?.value)
-    && dateNow(2);
+    && deadlineOperandEnd(index + 6) !== null;
+  const reverseOperandEnd = deadlineOperandEnd(index);
+  const reverseComparison = reverseOperandEnd !== null
+    && ['<', '<='].includes(tokens[reverseOperandEnd]?.value)
+    && dateNow(reverseOperandEnd + 1 - index);
   return directComparison || reverseComparison;
 };
 
@@ -1040,7 +1115,15 @@ const visibleGapAliasesAt = (tokens, limit, pairs, lexicalScopes, functionRanges
         assignment.index + 1,
         lexicalScopes
       );
-      if (!binding || !isLexicallyVisible(binding.scope, useScope)) return null;
+      const bindingAtUse = resolveVisibleBinding(
+        bindings,
+        assignment.name,
+        limit,
+        lexicalScopes,
+        useScope
+      );
+      if (!binding || !bindingAtUse || binding.index !== bindingAtUse.index
+        || !isLexicallyVisible(binding.scope, useScope)) return null;
       return {
         ...assignment,
         bindingIndex: binding.index,
@@ -1823,6 +1906,63 @@ test('deadline policy inventory follows aliases and selected control arms', () =
     'discord/negated-deadline-gap.js:1',
     'discord/aliased-deadline-gap.js:1'
   ]);
+});
+
+test('deadline policy inventory recognizes member-qualified deadline operands', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/member-qualified-deadline.js',
+      source: 'if (Date.now() >= options.deadline) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/reversed-member-qualified-deadline.js',
+      source: 'if (options.deadline <= Date.now()) return READINESS.GAP;'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/member-qualified-deadline.js:1',
+    'discord/reversed-member-qualified-deadline.js:1'
+  ]);
+});
+
+test('deadline policy inventory resolves shorthand outcome properties', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/shorthand-gap-outcome.js',
+    source: 'const state = READINESS.GAP; if (deadlineReached) return { state };'
+  }]);
+  assert.deepEqual(offenders, ['discord/shorthand-gap-outcome.js:1']);
+});
+
+test('deadline policy inventory inspects boundary writers in returned expressions', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/returned-boundary-writer.js',
+    source: 'if (deadlineReached) return recordBoundary(binding, null, READINESS.GAP, detail);'
+  }]);
+  assert.deepEqual(offenders, ['discord/returned-boundary-writer.js:1']);
+});
+
+test('deadline policy inventory inspects boundary writers in invoked nested functions', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/invoked-boundary-writer.js',
+    source: 'if (deadlineReached) { (() => recordBoundary(binding, null, READINESS.GAP, detail))(); }'
+  }]);
+  assert.deepEqual(offenders, ['discord/invoked-boundary-writer.js:1']);
+});
+
+test('deadline policy inventory ignores unrelated enum GAP values', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/layout-gap.js',
+    source: 'if (deadlineReached) return LAYOUT.GAP;'
+  }]);
+  assert.deepEqual(offenders, []);
+});
+
+test('gap aliases do not cross a shadowing parameter binding', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/parameter-shadowed-gap-alias.js',
+    source: 'let next = READINESS.GAP; function audit(next) { if (deadlineReached) return next; }'
+  }]);
+  assert.deepEqual(offenders, []);
 });
 
 test('pre-adoption retry classifier sites stay in the audited owners', () => {
