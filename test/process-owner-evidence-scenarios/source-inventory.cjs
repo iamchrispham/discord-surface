@@ -128,11 +128,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     pendingMemberAssignments.push({ access, value });
   };
   const hasAtom = (set, atom) => Boolean(set) && set.has(atom);
-  const indexMemberAssignment = (access, value) => {
-    const names = staticPropertyNames(access, true);
+  const indexMemberAssignmentsForTarget = (target, names, value) => {
     if (!names.length) return;
-    const receivers = receiverSymbols(access.expression);
-    for (const constructor of prototypeConstructorSymbols(access.expression)) receivers.add(constructor);
+    const receivers = receiverSymbols(target);
+    for (const constructor of prototypeConstructorSymbols(target)) receivers.add(constructor);
     for (const receiver of receivers) {
       let byName = memberAssignments.get(receiver);
       if (!byName) {
@@ -145,6 +144,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         else byName.set(String(name), [value]);
       }
     }
+  };
+  const indexMemberAssignment = (access, value) => {
+    indexMemberAssignmentsForTarget(access.expression, staticPropertyNames(access, true), value);
   };
   const recordParameterArgument = (symbol, value, name = null) => {
     if (!symbol || !value) return;
@@ -360,6 +362,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       operator === ts.SyntaxKind.AmpersandAmpersandEqualsToken;
     if (ts.isBinaryExpression(expression) && isAssignment) {
       const left = ts.isParenthesizedExpression(expression.left) ? expression.left.expression : expression.left;
+      const logicalAssignmentSkipsRight = operator === ts.SyntaxKind.BarBarEqualsToken &&
+        isDefinitelyTruthy(left) || operator === ts.SyntaxKind.QuestionQuestionEqualsToken &&
+        isDefinitelyNonNullish(left) || operator === ts.SyntaxKind.AmpersandAmpersandEqualsToken &&
+        isDefinitelyFalsy(left);
+      if (logicalAssignmentSkipsRight) {
+        indexRightHandSide(expression.left);
+        return;
+      }
       if (ts.isIdentifier(left)) {
         recordAssignment(checker.getSymbolAtLocation(left), { source: expression.right });
       } else if (ts.isObjectLiteralExpression(left)) {
@@ -402,6 +412,31 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           }
         }
         recordMemberAssignment(left, { source: expression.right });
+      }
+    }
+    if (ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression) &&
+      ts.isIdentifier(expression.expression.expression) && expression.expression.expression.text === 'Object' &&
+      expression.expression.name.text === 'assign') {
+      const objectSymbol = checker.getSymbolAtLocation(expression.expression.expression);
+      const shadowed = objectSymbol?.declarations?.some(declaration =>
+        declaration.getSourceFile() === sourceFile && !isAmbientDeclaration(declaration));
+      if (!shadowed) {
+        const target = expression.arguments[0];
+        if (target) {
+          for (const source of expression.arguments.slice(1)) {
+            const object = ts.isParenthesizedExpression(source) ? source.expression : source;
+            if (!ts.isObjectLiteralExpression(object)) continue;
+            for (const property of object.properties) {
+              if (!property.name || (!ts.isPropertyAssignment(property) &&
+                !ts.isShorthandPropertyAssignment(property))) continue;
+              const name = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ||
+                ts.isNumericLiteral(property.name) ? property.name.text : null;
+              if (name === null) continue;
+              const value = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
+              indexMemberAssignmentsForTarget(target, [name], { source: value });
+            }
+          }
+        }
       }
     }
     ts.forEachChild(expression, indexRightHandSide);
@@ -906,9 +941,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       for (const name of names) {
         if (name === 'process' && hasAtom(receiver, GLOBAL_OBJECT)) result.add(PROCESS_OBJECT);
         for (const atom of receiver) {
-          const modulePath = moduleResolver?.modulePathFromAtom(atom);
-          if (!modulePath) continue;
-          for (const resolved of moduleResolver.resolveExport(modulePath, String(name), seen)) result.add(resolved);
+          if (moduleResolver?.resolveProperty) {
+            for (const resolved of moduleResolver.resolveProperty([atom], String(name), virtualPath, seen)) {
+              result.add(resolved);
+            }
+          } else {
+            const modulePath = moduleResolver?.modulePathFromAtom(atom);
+            if (!modulePath) continue;
+            for (const resolved of moduleResolver.resolveExport(modulePath, String(name), seen)) result.add(resolved);
+          }
         }
         if (name === 'directPostOwnerAlive') result.add(LEGACY_OWNER);
         if (hasAtom(receiver, LEGACY_OWNER) &&
@@ -974,6 +1015,11 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         }
       }
       return result;
+    }
+
+    if (ts.isNewExpression(node)) {
+      const constructors = resolveSet(node.expression, seen);
+      return moduleResolver?.resolveNew ? moduleResolver.resolveNew(constructors) : empty;
     }
 
     if (ts.isCallExpression(node)) {
@@ -1365,6 +1411,116 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (values.has(UNDEFINED_VALUE)) return true;
     if (values.size) return false;
     return ts.isCallExpression(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node);
+  }
+
+  function staticTruthiness(node, visited = new Set()) {
+    if (!node || visited.has(node)) return null;
+    const seen = new Set(visited).add(node);
+    const transparent = transparentExpression(node);
+    if (transparent) return staticTruthiness(transparent, seen);
+    if (node.kind === ts.SyntaxKind.TrueKeyword || ts.isFunctionExpression(node) ||
+      ts.isArrowFunction(node) || ts.isClassExpression(node) || ts.isObjectLiteralExpression(node) ||
+      ts.isArrayLiteralExpression(node) || ts.isNewExpression(node)) return true;
+    if (node.kind === ts.SyntaxKind.FalseKeyword || node.kind === ts.SyntaxKind.NullKeyword) return false;
+    if (ts.isNumericLiteral(node)) return Number(node.text) === 0 ? false : true;
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text.length > 0;
+    if (ts.isConditionalExpression(node)) {
+      const whenTrue = staticTruthiness(node.whenTrue, seen);
+      const whenFalse = staticTruthiness(node.whenFalse, seen);
+      return whenTrue === whenFalse ? whenTrue : null;
+    }
+    if (ts.isBinaryExpression(node)) {
+      const operator = node.operatorToken.kind;
+      if (operator === ts.SyntaxKind.EqualsToken) return staticTruthiness(node.right, seen);
+      if (operator === ts.SyntaxKind.BarBarToken) {
+        const left = staticTruthiness(node.left, seen);
+        return left === true ? true : left === false ? staticTruthiness(node.right, seen) : null;
+      }
+      if (operator === ts.SyntaxKind.AmpersandAmpersandToken) {
+        const left = staticTruthiness(node.left, seen);
+        return left === false ? false : left === true ? staticTruthiness(node.right, seen) : null;
+      }
+    }
+    if (!ts.isIdentifier(node)) return null;
+    if (node.text === 'undefined') return false;
+    const symbol = checker.getSymbolAtLocation(node);
+    const directDeclaration = symbol?.valueDeclaration || symbol?.declarations?.[0];
+    if (directDeclaration && (ts.isFunctionDeclaration(directDeclaration) ||
+      ts.isClassDeclaration(directDeclaration))) return true;
+    const declaration = symbolDeclaration(symbol);
+    if (!declaration || visited.has(symbol)) return null;
+    const symbolSeen = new Set(seen).add(symbol);
+    const sources = [];
+    if ((ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) && declaration.initializer) {
+      sources.push(declaration.initializer);
+    }
+    for (const argument of parameterArguments.get(symbol) || []) {
+      sources.push(argument && argument.source ? argument.source : argument);
+    }
+    for (const assigned of assignments.get(symbol) || []) {
+      sources.push(assigned && assigned.source ? assigned.source : assigned);
+    }
+    if (!sources.length) return null;
+    const states = sources.map(source => staticTruthiness(source, symbolSeen));
+    if (states.every(state => state === true)) return true;
+    if (states.every(state => state === false)) return false;
+    return null;
+  }
+
+  function staticNullishness(node, visited = new Set()) {
+    if (!node || visited.has(node)) return null;
+    const seen = new Set(visited).add(node);
+    const transparent = transparentExpression(node);
+    if (transparent) return staticNullishness(transparent, seen);
+    if (node.kind === ts.SyntaxKind.NullKeyword ||
+      ts.isIdentifier(node) && node.text === 'undefined') return true;
+    if (node.kind === ts.SyntaxKind.TrueKeyword || node.kind === ts.SyntaxKind.FalseKeyword ||
+      ts.isNumericLiteral(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ||
+      ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isClassExpression(node) ||
+      ts.isObjectLiteralExpression(node) || ts.isArrayLiteralExpression(node) || ts.isNewExpression(node)) return false;
+    if (ts.isConditionalExpression(node)) {
+      const whenTrue = staticNullishness(node.whenTrue, seen);
+      const whenFalse = staticNullishness(node.whenFalse, seen);
+      return whenTrue === whenFalse ? whenTrue : null;
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      return staticNullishness(node.right, seen);
+    }
+    if (!ts.isIdentifier(node)) return null;
+    const symbol = checker.getSymbolAtLocation(node);
+    const directDeclaration = symbol?.valueDeclaration || symbol?.declarations?.[0];
+    if (directDeclaration && (ts.isFunctionDeclaration(directDeclaration) ||
+      ts.isClassDeclaration(directDeclaration))) return false;
+    const declaration = symbolDeclaration(symbol);
+    if (!declaration || visited.has(symbol)) return null;
+    const symbolSeen = new Set(seen).add(symbol);
+    const sources = [];
+    if ((ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) && declaration.initializer) {
+      sources.push(declaration.initializer);
+    }
+    for (const argument of parameterArguments.get(symbol) || []) {
+      sources.push(argument && argument.source ? argument.source : argument);
+    }
+    for (const assigned of assignments.get(symbol) || []) {
+      sources.push(assigned && assigned.source ? assigned.source : assigned);
+    }
+    if (!sources.length) return null;
+    const states = sources.map(source => staticNullishness(source, symbolSeen));
+    if (states.every(state => state === false)) return false;
+    if (states.every(state => state === true)) return true;
+    return null;
+  }
+
+  function isDefinitelyTruthy(node) {
+    return staticTruthiness(node) === true;
+  }
+
+  function isDefinitelyFalsy(node) {
+    return staticTruthiness(node) === false;
+  }
+
+  function isDefinitelyNonNullish(node) {
+    return staticNullishness(node) === false;
   }
 
   function bindingDefaultMayApply(binding, sources, visited) {

@@ -55,7 +55,8 @@ function createLocalModuleResolver(files) {
       imports: new Map(),
       exports: new Map(),
       defaultExport: null,
-      wildcardExports: []
+      wildcardExports: [],
+      exportAliases: new Set(['exports'])
     };
     modules.set(resolvedPath, module);
 
@@ -71,9 +72,28 @@ function createLocalModuleResolver(files) {
       if (existing) existing.push(value);
       else module.exports.set(name, [value]);
     };
+    const isExportObjectExpression = expression => {
+      const node = unwrap(expression);
+      if (!node) return false;
+      if (ts.isIdentifier(node)) return module.exportAliases.has(node.text);
+      if (ts.isPropertyAccessExpression(node)) {
+        return node.name.text === 'exports' && ts.isIdentifier(node.expression) &&
+          node.expression.text === 'module';
+      }
+      if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression)) {
+        const name = unwrap(node.argumentExpression);
+        return node.expression.text === 'module' &&
+          (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) && name.text === 'exports';
+      }
+      return false;
+    };
+    const recordExportAlias = (name, expression) => {
+      if (name && isExportObjectExpression(expression)) module.exportAliases.add(name);
+    };
     const recordVariable = (declaration, exported = false) => {
       if (ts.isIdentifier(declaration.name)) {
         addBinding(declaration.name.text, declaration.initializer);
+        recordExportAlias(declaration.name.text, declaration.initializer);
         if (exported) {
           // Exported bindings are live. Resolve through every recorded value,
           // including later assignments, instead of freezing the initializer.
@@ -103,6 +123,16 @@ function createLocalModuleResolver(files) {
       if (isDefault) {
         module.defaultExport = declaration;
       }
+    };
+    const recordClass = (declaration, exported = false) => {
+      const isDefault = declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword);
+      if (!declaration.name) {
+        if (exported && isDefault) module.defaultExport = declaration;
+        return;
+      }
+      addBinding(declaration.name.text, declaration);
+      if (exported && !isDefault) addExport(declaration.name.text, { binding: declaration.name.text });
+      if (isDefault) module.defaultExport = declaration;
     };
     const recordImport = declaration => {
       if (!ts.isStringLiteral(declaration.moduleSpecifier)) return;
@@ -148,15 +178,14 @@ function createLocalModuleResolver(files) {
     const recordAssignment = expression => {
       if (!ts.isBinaryExpression(expression) || expression.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return;
       const left = unwrap(expression.left);
-      if (ts.isIdentifier(left)) addBinding(left.text, expression.right);
+      if (ts.isIdentifier(left)) {
+        addBinding(left.text, expression.right);
+        recordExportAlias(left.text, expression.right);
+      }
       const name = propertyName(left);
       if (!name || !ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) return;
       const receiver = left.expression;
-      if (ts.isIdentifier(receiver) && receiver.text === 'exports') addExport(name, expression.right);
-      if (ts.isPropertyAccessExpression(receiver) && receiver.name.text === 'exports' &&
-        ts.isIdentifier(receiver.expression) && receiver.expression.text === 'module') {
-        addExport(name, expression.right);
-      }
+      if (isExportObjectExpression(receiver)) addExport(name, expression.right);
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module') {
         module.defaultExport = expression.right;
@@ -196,6 +225,10 @@ function createLocalModuleResolver(files) {
       if (ts.isFunctionDeclaration(statement)) {
         const exported = statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword);
         recordFunction(statement, exported);
+      }
+      if (ts.isClassDeclaration(statement)) {
+        const exported = statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword);
+        recordClass(statement, exported);
       }
       if (ts.isExportDeclaration(statement)) {
         const moduleSpecifier = statement.moduleSpecifier;
@@ -299,6 +332,63 @@ function createLocalModuleResolver(files) {
     return returns;
   };
 
+  const classPropertyExpressions = (declaration, name, staticMember) => {
+    const expressions = [];
+    for (const member of declaration.members || []) {
+      if (!member.name) continue;
+      const memberName = ts.isIdentifier(member.name) || ts.isStringLiteral(member.name) ||
+        ts.isNumericLiteral(member.name) ? member.name.text : null;
+      if (memberName !== String(name)) continue;
+      const isStatic = member.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword) || false;
+      if (isStatic !== staticMember) continue;
+      if (ts.isPropertyDeclaration(member) && member.initializer) expressions.push(member.initializer);
+      else if (ts.isMethodDeclaration(member) || ts.isGetAccessorDeclaration(member)) expressions.push(member);
+    }
+    return expressions;
+  };
+
+  const resolveClassProperty = (atom, name, currentPath, visited) => {
+    if (!atom?.classDeclaration) return new Set();
+    const result = new Set();
+    for (const expression of classPropertyExpressions(atom.classDeclaration, name, !atom.instance)) {
+      if (ts.isGetAccessorDeclaration(expression)) {
+        for (const returnExpression of callableReturnExpressions(expression)) {
+          for (const nested of evaluate(returnExpression, atom.modulePath || currentPath, visited)) result.add(nested);
+        }
+      } else if (ts.isMethodDeclaration(expression)) {
+        result.add({ callable: expression, modulePath: atom.modulePath || currentPath });
+      } else {
+        for (const nested of evaluate(expression, atom.modulePath || currentPath, visited)) result.add(nested);
+      }
+    }
+    return result;
+  };
+
+  const resolveProperty = (atoms, name, currentPath, visited = new Set()) => {
+    const result = new Set();
+    for (const atom of atoms || []) {
+      const modulePath = modulePathFromAtom(atom);
+      if (modulePath) {
+        for (const nested of resolveExport(modulePath, String(name), visited)) result.add(nested);
+      } else {
+        for (const nested of resolveClassProperty(atom, name, currentPath, visited)) result.add(nested);
+      }
+    }
+    return result;
+  };
+
+  const resolveNew = atoms => {
+    const result = new Set();
+    for (const atom of atoms || []) {
+      if (atom?.classDeclaration) result.add({
+        classDeclaration: atom.classDeclaration,
+        modulePath: atom.modulePath,
+        instance: true
+      });
+    }
+    return result;
+  };
+
   const callableParameterBindings = (callable, argumentsList, callerPath) => {
     const bindings = new Map();
     for (let index = 0; index < (callable.parameters || []).length; index += 1) {
@@ -325,7 +415,13 @@ function createLocalModuleResolver(files) {
     const node = unwrap(expression);
     if (!node || visited.has(node)) return new Set();
     const seen = new Set(visited).add(node);
+    if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      return new Set([{ classDeclaration: node, modulePath: currentPath, instance: false }]);
+    }
     if (ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node)) {
+      return new Set([{ callable: node, modulePath: currentPath }]);
+    }
+    if (ts.isMethodDeclaration(node)) {
       return new Set([{ callable: node, modulePath: currentPath }]);
     }
     if (ts.isIdentifier(node)) {
@@ -366,11 +462,11 @@ function createLocalModuleResolver(files) {
       const result = new Set();
       if (name === 'kill' && receiver.has(PROCESS_OBJECT)) result.add(PID_PROBE);
       for (const atom of receiver) {
-        const modulePath = modulePathFromAtom(atom);
-        if (modulePath) for (const nested of resolveExport(modulePath, String(name), seen)) result.add(nested);
+        for (const nested of resolveProperty([atom], String(name), currentPath, seen)) result.add(nested);
       }
       return result;
     }
+    if (ts.isNewExpression(node)) return resolveNew(evaluate(node.expression, currentPath, seen, parameterBindings));
     if (ts.isCallExpression(node)) {
       const callableAtoms = evaluate(node.expression, currentPath, seen, parameterBindings);
       const result = new Set();
@@ -490,6 +586,8 @@ function createLocalModuleResolver(files) {
       return result;
     },
     resolveExport,
+    resolveProperty,
+    resolveNew,
     modulePathFromAtom,
     moduleAtom
   };

@@ -286,6 +286,18 @@ test("local module exports retain probe provenance across files", () => {
     'barrel.ts': "import probe from './probe'; export { probe };",
     'use.ts': "import { probe } from './barrel'; function newProbe(pid) { probe(pid, 0); }"
   }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'probe.js': "const api = module.exports; api.probe = process.kill;",
+    'use.js': "const { probe } = require('./probe'); function newProbe(pid) { probe(pid, 0); }"
+  }, ["use.js\u0000newProbe"], ["unclassified process probe use.js:newProbe"]);
+  runFilesFixture({
+    'probe.ts': "export class Helpers { static probe = process.kill; }",
+    'use.ts': "import { Helpers } from './probe'; function newProbe(pid) { Helpers.probe(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'probe.ts': "export class Helpers { probe = process.kill; }",
+    'use.ts': "import { Helpers } from './probe'; const helpers = new Helpers(); function newProbe(pid) { helpers.probe(pid, 0); }"
+  }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
 });
 
 test("destructuring defaults do not override present ordinary values", () => {
@@ -333,8 +345,15 @@ test("destructuring assignment probe", () => {
 });
 
 test("logical assignment probe alias", () => {
-runFixture("let probe; probe ??= process.kill; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
-runFixture("let probe; probe ||= process.kill; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("let probe; probe ??= process.kill; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("let probe; probe ||= process.kill; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("let probe = () => true; probe ||= process.kill; function newProbe(pid) { probe(pid, 0); }", [], []);
+  runFixture("let probe = () => true; probe ??= process.kill; function newProbe(pid) { probe(pid, 0); }", [], []);
+});
+
+test("bounded Object.assign probe alias", () => {
+  runFixture("const deps = {}; Object.assign(deps, { probe: process.kill }); function newProbe(pid) { deps.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const Object = { assign() {} }; const deps = {}; Object.assign(deps, { probe: process.kill }); function ordinary(pid) { deps.probe(pid, 0); }", [], []);
 });
 
 test("ordinary default function stays empty", () => {
