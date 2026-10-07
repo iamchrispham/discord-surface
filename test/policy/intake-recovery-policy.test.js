@@ -796,6 +796,24 @@ const findAssignedAlias = (tokens, triggerIndex) => {
   return null;
 };
 
+const findIdentifierAssignments = (tokens, lexicalScopes) => tokens.flatMap((token, index) => {
+  if (token.value !== '=' || tokens[index - 1]?.type !== 'identifier' || tokens[index - 2]?.value === '.') {
+    return [];
+  }
+  return [{
+    name: tokens[index - 1].value,
+    index: index - 1,
+    scope: lexicalScopePath(lexicalScopes, index - 1)
+  }];
+});
+
+const resolveVisibleAssignment = (assignments, name, index, lexicalScopes, bindingIndex) => assignments
+  .filter(assignment => assignment.name === name
+    && assignment.index < index
+    && assignment.bindingIndex === bindingIndex
+    && isLexicallyVisible(assignment.scope, lexicalScopePath(lexicalScopes, index)))
+  .sort((left, right) => right.index - left.index)[0];
+
 const findLexicalScopes = (tokens, pairs) => tokens.flatMap((token, opening) => {
   if (token.value !== '{') return [];
   const closing = pairs.get(opening);
@@ -811,26 +829,48 @@ const isLexicallyVisible = (declarationScope, useScope) => declarationScope.ever
   (scope, index) => useScope[index] === scope
 );
 
+const findDeclarationEquals = (tokens, start, end) => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === '=') return index;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && value === ';') return -1;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return -1;
+};
+
 const findVariableDeclarations = (tokens, pairs, lexicalScopes, functionRanges = []) => {
   const declarations = [];
   for (let index = 0; index < tokens.length; index += 1) {
     if (!['const', 'let', 'var'].includes(tokens[index].value)) continue;
-    const nameIndex = index + 1;
-    const equalsIndex = nameIndex + 1;
-    if (tokens[nameIndex]?.type !== 'identifier' || tokens[equalsIndex]?.value !== '=') continue;
-    const statementEnd = findStatementEnd(tokens, equalsIndex + 1, tokens.length);
+    const equalsIndex = findDeclarationEquals(tokens, index + 1, tokens.length);
+    if (equalsIndex < 0) continue;
+    const declarationEnd = findStatementEnd(tokens, equalsIndex + 1, tokens.length);
+    const bindingIndexes = parameterBindingIndexes(tokens, pairs, index + 1, equalsIndex);
     const functionScope = functionRanges
-      .filter(range => !range.expression && range.opening < nameIndex && nameIndex < range.closing)
+      .filter(range => !range.expression && range.opening < index && index < range.closing)
       .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening))[0];
-    declarations.push({
-      name: tokens[nameIndex].value,
-      index: nameIndex,
-      scope: tokens[index].value === 'var' && functionScope
-        ? lexicalScopePath(lexicalScopes, functionScope.opening + 1)
-        : lexicalScopePath(lexicalScopes, nameIndex),
-      expressionStart: equalsIndex + 1,
-      expressionEnd: statementEnd
-    });
+    for (const binding of bindingIndexes) {
+      const nameIndex = binding.index;
+      if (tokens[nameIndex]?.type !== 'identifier') continue;
+      declarations.push({
+        name: tokens[nameIndex].value,
+        index: nameIndex,
+        scope: tokens[index].value === 'var' && functionScope
+          ? lexicalScopePath(lexicalScopes, functionScope.opening + 1)
+          : lexicalScopePath(lexicalScopes, index),
+        expressionStart: equalsIndex + 1,
+        expressionEnd: declarationEnd
+      });
+    }
   }
   return declarations;
 };
@@ -990,6 +1030,19 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
   const functionRanges = findFunctionRanges(tokens, pairs);
   const lexicalScopes = findLexicalScopes(tokens, pairs);
   const lexicalBindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const assignments = findIdentifierAssignments(tokens, lexicalScopes).map(assignment => {
+    const binding = resolveVisibleBinding(
+      lexicalBindings,
+      assignment.name,
+      assignment.index + 1,
+      lexicalScopes
+    );
+    return {
+      ...assignment,
+      bindingIndex: binding?.index,
+      scope: binding?.scope || assignment.scope
+    };
+  });
   const lines = new Set();
   const deadlineAliases = [];
   for (let index = 0; index < tokens.length; index += 1) {
@@ -998,6 +1051,12 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
     if (alias) {
       deadlineAliases.push({
         ...alias,
+        bindingIndex: resolveVisibleBinding(
+          lexicalBindings,
+          alias.name,
+          alias.index + 1,
+          lexicalScopes
+        )?.index,
         scope: lexicalScopePath(lexicalScopes, alias.index)
       });
       if (isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) {
@@ -1048,7 +1107,15 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       if (index === alias.index || tokens[index].value !== alias.name || tokens[index - 1]?.value === '.') continue;
       if (lexicalBindings.some(binding => binding.name === alias.name && binding.index === index)) continue;
       const binding = resolveVisibleBinding(lexicalBindings, alias.name, index, lexicalScopes);
-      if (!binding || binding.index !== alias.index) continue;
+      if (!binding || binding.index !== alias.bindingIndex) continue;
+      const assignment = resolveVisibleAssignment(
+        assignments,
+        alias.name,
+        index,
+        lexicalScopes,
+        binding.index
+      );
+      if (!assignment || assignment.index !== alias.index) continue;
       if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
       const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
       const knownAliases = visibleGapAliasesAt(
@@ -1095,6 +1162,36 @@ test('deadline policy inventory ignores non-mutating boundary-shaped calls', () 
   const offenders = findDeadlineGapOffenders([{
     relative: 'discord/readiness-predicate.js',
     source: 'if (deadlineReached) { assertReadiness(binding, READINESS.GAP); return READINESS.UNAVAILABLE; }'
+  }]);
+  assert.deepEqual(offenders, []);
+});
+
+test('deadline policy inventory follows aliases assigned after declaration', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-alias-mutation.js',
+    source: [
+      'function readiness(deadline) {',
+      '  let expired = false;',
+      '  expired = Date.now() >= deadline;',
+      '  if (expired) return READINESS.GAP;',
+      '}'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-alias-mutation.js:4']);
+});
+
+test('deadline policy inventory registers destructured local shadow bindings', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/destructured-shadow.js',
+    source: [
+      'function readiness(flags) {',
+      '  const expired = deadlineReached;',
+      '  {',
+      '    const { expired } = flags;',
+      '    if (expired) return READINESS.GAP;',
+      '  }',
+      '}'
+    ].join('\n')
   }]);
   assert.deepEqual(offenders, []);
 });
