@@ -296,6 +296,28 @@ test('queues a channel-scoped decision recovery requested during an active pass'
   assert.deepEqual(calls, [['channel-a'], ['channel-b']]);
 });
 
+test('a normal recovery request wakes a pass that also has deferred work', { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  const calls = [];
+  let releaseFirst;
+  const firstPass = new Promise(resolve => { releaseFirst = resolve; });
+  f.gateway.decisionConsumer.recover = async (_signal, channelIds) => {
+    calls.push(channelIds ? [...channelIds] : null);
+    if (calls.length === 1) await firstPass;
+    return [];
+  };
+
+  const first = f.gateway.startDecisionRecovery(undefined, new Set(['channel-a']));
+  await waitForCondition(() => calls.length === 1, 'first decision recovery did not start');
+  f.gateway.startDecisionRecovery(undefined, new Set(['channel-deferred']), { deferIfActive: true });
+  f.gateway.startDecisionRecovery(undefined, new Set(['channel-live']));
+
+  releaseFirst();
+  await first;
+  await waitForCondition(() => calls.length === 2, 'normal queued recovery did not wake the follow-up pass');
+  assert.deepEqual(calls, [['channel-a'], ['channel-deferred', 'channel-live']]);
+});
+
 test('losing projection refuses binding and config drift during question fetch', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.started = true;
@@ -688,6 +710,48 @@ test('generic recovery waits for an active decision pass without a materialized 
   assert.equal(f.dispatches.length, 1);
 });
 
+test('decision recovery join is bounded by the reconciliation deadline', { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  f.gateway.recoveryTimeoutMs = 50;
+  const interactionId = '9002';
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.acceptDiscordMessage({
+    id: interactionId,
+    guildId: 'guild',
+    channelId: 'channel',
+    authorId: 'operator',
+    isBot: false,
+    attachments: [],
+    content: 'accepted decision message'
+  }).accepted, true);
+
+  let releaseDecisionRecovery;
+  const stalledDecisionRecovery = new Promise(resolve => { releaseDecisionRecovery = resolve; });
+  f.gateway.decisionConsumer.recover = () => stalledDecisionRecovery;
+  const reconciliation = f.gateway.reconcilePending();
+  await waitForCondition(() => Boolean(f.gateway.decisionRecoveryPromise), 'decision recovery did not start');
+  const decisionPass = f.gateway.decisionRecoveryPromise;
+
+  await reconciliation;
+  assert.equal(f.dispatches.length, 0);
+
+  releaseDecisionRecovery([]);
+  await decisionPass;
+});
+
 test('duplicate denial waits for the initial component defer', { timeout: 30000 }, async t => {
   let releaseCallback;
   const callbackGate = new Promise(resolve => { releaseCallback = resolve; });
@@ -746,6 +810,27 @@ test('decision recovery waits for the initial component defer before rejection',
   assert.match(f.callbacks[1].url, /token-recovery-defer-initial/);
   assert.equal(f.state.listDecisionPendingWork().length, 0);
 });
+
+for (const retryableOutcome of ['rate_limited', 'not_sent']) {
+  test(`retryable rejection outcome schedules decision recovery: ${retryableOutcome}`, { timeout: 30000 }, async t => {
+    const f = await fixture(t);
+    const recoveryCalls = [];
+    f.gateway.startDecisionRecovery = (_signal, channelIds) => {
+      recoveryCalls.push(channelIds ? [...channelIds] : null);
+      return Promise.resolve([]);
+    };
+    f.gateway.authorizeDecisionInteraction = async () => false;
+    f.gateway.sendInteractionRejection = async () => ({ outcome: retryableOutcome });
+
+    const result = await f.gateway.handleInteraction(
+      component(f.presentation, `retryable-rejection-${retryableOutcome}`, 0),
+      new AbortController().signal
+    );
+
+    assert.equal(result.accepted, false);
+    assert.deepEqual(recoveryCalls, [['channel']]);
+  });
+}
 
 test('persisted denial wins an authorization race and prevents native dispatch', { timeout: 30000 }, async t => {
   const f = await fixture(t);

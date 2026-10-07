@@ -255,6 +255,7 @@ class DiscordGateway {
     this.recoveryFollowupScope = null;
     this.recoveryActiveWaiters = new Set();
     this.recoveryRetryScheduledChannels = new Set();
+    this.queuedDecisionRecoveryNonDeferred = false;
     this.closingCustodyRetries = new Map();
     this.pendingRecoveryChannels = new Set();
     this.pendingRecoveryRequests = [];
@@ -1842,6 +1843,7 @@ class DiscordGateway {
         for (const channelId of channelIds) this.queuedDecisionRecoveryChannels.add(channelId);
       }
       if (deferIfActive) this.queuedDecisionRecoveryDeferred = true;
+      else this.queuedDecisionRecoveryNonDeferred = true;
       return this.decisionRecoveryPromise;
     }
     if (this.queuedDecisionRecoveryAll) channelIds = null;
@@ -1851,6 +1853,7 @@ class DiscordGateway {
     this.queuedDecisionRecoveryAll = false;
     this.queuedDecisionRecoveryChannels.clear();
     this.queuedDecisionRecoveryDeferred = false;
+    this.queuedDecisionRecoveryNonDeferred = false;
     const controller = new AbortController();
     const relayAbort = () => controller.abort();
     if (signal?.aborted) controller.abort();
@@ -1872,10 +1875,12 @@ class DiscordGateway {
         const queuedAll = this.queuedDecisionRecoveryAll;
         const queuedChannels = new Set(this.queuedDecisionRecoveryChannels);
         const queuedDeferred = this.queuedDecisionRecoveryDeferred;
-        if (!this.stopping && !queuedDeferred && (queuedAll || queuedChannels.size > 0)) {
+        const queuedNonDeferred = this.queuedDecisionRecoveryNonDeferred;
+        if (!this.stopping && (queuedNonDeferred || !queuedDeferred) && (queuedAll || queuedChannels.size > 0)) {
           this.queuedDecisionRecoveryAll = false;
           this.queuedDecisionRecoveryChannels.clear();
           this.queuedDecisionRecoveryDeferred = false;
+          this.queuedDecisionRecoveryNonDeferred = false;
           queueMicrotask(() => {
             if (!this.stopping && !this.decisionRecoveryPromise) {
               this.startDecisionRecovery(undefined, queuedAll ? null : queuedChannels);
@@ -1885,6 +1890,7 @@ class DiscordGateway {
           this.queuedDecisionRecoveryAll = false;
           this.queuedDecisionRecoveryChannels.clear();
           this.queuedDecisionRecoveryDeferred = false;
+          this.queuedDecisionRecoveryNonDeferred = false;
         }
       }
       if (this.decisionRecoveryController === controller) this.decisionRecoveryController = null;

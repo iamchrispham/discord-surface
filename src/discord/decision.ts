@@ -393,7 +393,14 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         result = { outcome: DECISION_TRANSPORT_OUTCOMES.UNKNOWN, reason: String((error as Error)?.message || error).slice(0, 200) };
       }
     }
-    try { state.recordDecisionRejectionOutcome(click.interactionId, transportOutcome(result.outcome)); } catch {}
+    const outcome = transportOutcome(result.outcome);
+    try { state.recordDecisionRejectionOutcome(click.interactionId, outcome); } catch {}
+    if (!signal?.aborted && (
+      outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT ||
+      outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED
+    )) {
+      options.scheduleRecovery?.(new Set([click.channelId]));
+    }
     return result;
   }
 

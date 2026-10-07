@@ -40,7 +40,12 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
       let decisionRecoverySettled = false;
       const settleDecisionRecovery = async () => {
         if (decisionRecoverySettled) return;
-        await decisionRecovery;
+        try {
+          await waitForRecoveryOperation(() => decisionRecovery, signal, deadline);
+        } catch (error) {
+          const kind = recoveryKind(error);
+          if (kind !== CODEX_VALIDATION_KINDS.DEADLINE && kind !== CODEX_VALIDATION_KINDS.STOPPED) throw error;
+        }
         decisionRecoverySettled = true;
         const unresolved = new Map((this.state.listDecisionPendingWork?.() || [])
           .map(click => [click.interactionId, click]));
