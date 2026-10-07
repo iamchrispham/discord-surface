@@ -964,7 +964,15 @@ const isNegatedDeadlineCondition = (tokens, conditionStart, triggerIndex) => {
     cursor -= 1;
     while (cursor >= conditionStart && tokens[cursor].value === '(') cursor -= 1;
   }
-  return negated;
+  const isInequality = value => value === '!=' || value === '!==';
+  const scanForInequality = (start, step) => {
+    for (let index = start; index >= conditionStart && index < tokens.length; index += step) {
+      if (isInequality(tokens[index].value)) return true;
+      if (['&&', '||', '?', ':', ')'].includes(tokens[index].value)) break;
+    }
+    return false;
+  };
+  return negated || scanForInequality(triggerIndex - 1, -1) || scanForInequality(triggerIndex + 1, 1);
 };
 
 const branchRange = (tokens, start, end, pairs) => {
@@ -1112,6 +1120,7 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) =>
 const isBoundaryWriter = value => /boundary|readiness/i.test(value);
 
 const BOUNDARY_WRITER_STATE_ARGUMENTS = new Map([
+  ['boundary', 0],
   ['markIntakeBoundary', 1],
   ['recordBoundary', 2],
   ['recordOwnedBoundary', 2]
@@ -1219,6 +1228,21 @@ const findAssignedAlias = (tokens, triggerIndex) => {
   return null;
 };
 
+const findLexicalScopes = (tokens, pairs) => tokens.flatMap((token, opening) => {
+  if (token.value !== '{') return [];
+  const closing = pairs.get(opening);
+  return closing === undefined ? [] : [{ opening, closing }];
+});
+
+const lexicalScopePath = (scopes, index) => scopes
+  .filter(scope => scope.opening < index && index < scope.closing)
+  .sort((left, right) => left.opening - right.opening)
+  .map(scope => scope.opening);
+
+const isLexicallyVisible = (declarationScope, useScope) => declarationScope.every(
+  (scope, index) => useScope[index] === scope
+);
+
 const isConditionalDeadlineUse = (tokens, triggerIndex, pairs, functionRanges) => {
   if (findIfDecision(tokens, triggerIndex, pairs) || findSwitchDecision(tokens, triggerIndex, pairs)) return true;
   const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
@@ -1239,13 +1263,17 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
   const tokens = tokenizeSource(source);
   const pairs = findTokenPairs(tokens);
   const functionRanges = findFunctionRanges(tokens, pairs);
+  const lexicalScopes = findLexicalScopes(tokens, pairs);
   const lines = new Set();
-  const deadlineAliases = new Map();
+  const deadlineAliases = [];
   for (let index = 0; index < tokens.length; index += 1) {
     if (!isDeadlineTriggerAt(tokens, index)) continue;
     const alias = findAssignedAlias(tokens, index);
     if (alias) {
-      deadlineAliases.set(alias.name, alias);
+      deadlineAliases.push({
+        ...alias,
+        scope: lexicalScopePath(lexicalScopes, alias.index)
+      });
       if (isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) {
         const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
         if (hasGapOutcome(tokens, decision.start, decision.end, decision.opening, pairs, functionRanges)) {
@@ -1259,9 +1287,10 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
     }
   }
-  for (const alias of deadlineAliases.values()) {
+  for (const alias of deadlineAliases) {
     for (let index = 0; index < tokens.length; index += 1) {
       if (index === alias.index || tokens[index].value !== alias.name || tokens[index - 1]?.value === '.') continue;
+      if (!isLexicallyVisible(alias.scope, lexicalScopePath(lexicalScopes, index))) continue;
       if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
       const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
       if (hasGapOutcome(tokens, decision.start, decision.end, decision.opening, pairs, functionRanges)) {
@@ -1276,6 +1305,47 @@ test('deadline policy inventory has no direct deadline-to-gap decision', () => {
   const sourceRoot = path.join(__dirname, '../src');
   const offenders = findDeadlineGapOffenders(readSourceInventory(sourceRoot));
   assert.deepEqual(offenders, [], 'new deadline decisions must not map expiry directly to a history gap');
+});
+
+test('deadline policy inventory maps local boundary state arguments', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/thread-enrollment.ts',
+    source: [
+      'function boundary(state, detail) { persist(state, detail); }',
+      'if (deadlineReached) boundary(THREAD_STATES.GAP, detail);'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, ['discord/thread-enrollment.ts:2']);
+});
+
+test('deadline policy inventory follows inequality polarity', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'strict-inequality.js',
+      source: 'if (kind !== CODEX_VALIDATION_KINDS.DEADLINE) return READINESS.READY; else return READINESS.GAP;'
+    },
+    {
+      relative: 'loose-inequality.js',
+      source: 'if (kind != CODEX_VALIDATION_KINDS.DEADLINE) return READINESS.READY; else return READINESS.GAP;'
+    }
+  ]);
+  assert.deepEqual(offenders, ['strict-inequality.js:1', 'loose-inequality.js:1']);
+});
+
+test('deadline aliases remain scoped to their lexical declaration', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'deadline-alias-scope.js',
+    source: [
+      'function first() {',
+      '  const expired = Date.now() >= deadline;',
+      '  if (expired) return READINESS.GAP;',
+      '}',
+      'function second(expired) {',
+      '  if (expired) return READINESS.GAP;',
+      '}'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, ['deadline-alias-scope.js:3']);
 });
 
 test('deadline policy inventory catches object-shaped gap decisions', () => {
