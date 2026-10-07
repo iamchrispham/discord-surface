@@ -61,15 +61,19 @@ newForward(value) { return fakeHandlers.hidden(this, value); }
 }
 
 function discoverTempFactory(companionSource) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-discovery-'));
-  try {
-    fs.writeFileSync(path.join(root, 'companion.js'), companionSource);
-    const ownerPath = path.join(root, 'owner.js');
-    const ownerSource = ts.createSourceFile(ownerPath, `const { createFakeHandlers } = require('./companion');
+  return discoverTempFactoryFiles({ 'companion.js': companionSource }, `const { createFakeHandlers } = require('./companion');
 function createWrapper() { return createFakeHandlers({}); }
 const fakeHandlers = createWrapper();
-class SurfaceState {`, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    return discoverFactory(ownerSource, 'createWrapper');
+class SurfaceState {`);
+}
+
+function discoverTempFactoryFiles(files, ownerSource) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-surface-discovery-'));
+  try {
+    for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(root, name), text);
+    const ownerPath = path.join(root, 'owner.js');
+    const parsed = ts.createSourceFile(ownerPath, ownerSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    return discoverFactory(parsed, 'createWrapper');
   }
   finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -99,6 +103,124 @@ test('rejects unexported imported companion factories', () => {
   const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
 module.exports = {};`);
   assert.equal(discovery.approved, false);
+});
+
+test('accepts an unchanged callable binding before a write census', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  let hidden = (state, value) => value;
+  return { hidden };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, true);
+});
+
+test('rejects for-of writes to callable bindings', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  let hidden = (state, value) => value;
+  for (hidden of [0]) {}
+  return { hidden };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('accepts an untouched destructured handler alias', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  const handlers = { hidden(state, value) {} };
+  const [alias = handlers] = [];
+  return handlers;
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, true);
+});
+
+test('rejects writes through a destructured default alias', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  const handlers = { hidden(state, value) {} };
+  const [alias = handlers] = [];
+  alias.hidden = 0;
+  return handlers;
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('resolves require bindings from the lexical scope at the call site', () => {
+  const discovery = discoverTempFactoryFiles({
+    'companion.js': `function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = { createFakeHandlers };`,
+    'other.js': `function createFakeHandlers() { return {}; }
+module.exports = { createFakeHandlers };`
+  }, `const { createFakeHandlers } = require('./companion');
+{
+  const { createFakeHandlers } = require('./other');
+}
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {`);
+  assert.equal(discovery.approved, true);
+  assert.equal(discovery.methods.has('hidden'), true);
+});
+
+test('rejects lexical-this arrow handlers', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  return { hidden: value => this.write(value) };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects a labeled break that falls through a companion factory', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  outer: {
+    if (disabled) break outer;
+    return { hidden(state, value) {} };
+  }
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('clears a factory removed by a later module export', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = { createFakeHandlers };
+module.exports = {};`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects a named import from a default module export', () => {
+  const discovery = discoverTempFactoryFiles({
+    'companion.js': `function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = createFakeHandlers;`
+  }, `const { createFakeHandlers } = require('./companion');
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects a helper overwritten after its named export', () => {
+  const discovery = discoverTempFactoryFiles({
+    'helpers.js': `function hidden(state, value) { return value; }
+module.exports = { hidden };
+module.exports.hidden = 0;`,
+    'companion.js': `const helpers = require('./helpers');
+function createFakeHandlers() { return { hidden: helpers.hidden }; }
+module.exports = { createFakeHandlers };`
+  }, `const { createFakeHandlers } = require('./companion');
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {`);
+  assert.equal(discovery.approved, false);
+});
+
+test('records rest parameters on this-bound handlers', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  return { hidden(...values) { return this.write(...values); } };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, true);
+  assert.equal(discovery.methods.get('hidden').hasRestParameter, true);
 });
 
 test('rejects imported companion factories with reassigned callable identifiers', () => {
@@ -438,6 +560,11 @@ test('computed method refused', () => {
 
 test('baseline accepted', () => {
   assert.equal(matches(source), true);
+});
+
+test('rejects an exported constructor that differs from the inventoried owner', () => {
+  const text = source.replace('module.exports = {', 'class ActualState { constructor() {} }\nmodule.exports = { SurfaceState: ActualState,');
+  assert.equal(matchesWithCandidateBaseline(text), false);
 });
 
 test('new inline body refused', () => {

@@ -18,6 +18,7 @@ function inventory(text, fileName = 'state.js') {
   assert.equal(source.parseDiagnostics.length, 0);
   const owner = source.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'SurfaceState');
   assert.ok(owner);
+  const exportedOwner = exportedClassDeclaration(source, 'SurfaceState');
   const handlers = new Set();
   const handlerFactories = new Map();
   for (const statement of source.statements) {
@@ -47,6 +48,8 @@ function inventory(text, fileName = 'state.js') {
     Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.requiredArguments]))]));
   const handlerParameterCounts = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
     Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.parameterCount]))]));
+  const handlerRestParameters = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
+    Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.hasRestParameter]))]));
   const handlerStateParameterIndexes = Object.fromEntries(Object.entries(handlerMethodDescriptors).map(([name, methods]) => [name,
     Object.fromEntries(callableMethods(methods).map(([method, descriptor]) => [method, descriptor.stateParameterIndex]))]));
   const classHeader = tokens(text.slice(owner.getStart(source), owner.members.pos));
@@ -92,6 +95,7 @@ function inventory(text, fileName = 'state.js') {
   }
   return { handlers: [...handlers].sort(), unapprovedHandlers, handlerMethods, handlerContracts, handlerRequiredArguments,
     handlerParameterCounts, handlerStateParameterIndexes,
+    handlerRestParameters, ownerMatchesExport: owner === exportedOwner,
     forwarding: forwarding.sort(), delegationBodies, topLevel, classHeader, bodies };
 }
 
@@ -271,7 +275,7 @@ function exportedClassDeclaration(source, exportName) {
 function matches(text, baseline, fileName = 'state.js') {
   try {
     const raw = inventory(text, fileName);
-    if (raw.unapprovedHandlers.length) return false;
+    if (raw.unapprovedHandlers.length || !raw.ownerMatchesExport) return false;
     const candidate = compact(raw);
     const candidateMethodNames = new Set([...Object.keys(candidate.bodies), ...candidate.forwarding]);
     for (const name of PRIOR_SURFACE_METHOD_NAMES) {
@@ -313,6 +317,7 @@ function matches(text, baseline, fileName = 'state.js') {
           !raw.handlerMethods[target.expression.text]?.includes(target.name.text)) return false;
       const style = raw.handlerContracts[target.expression.text]?.[target.name.text];
       const parameterCount = raw.handlerParameterCounts[target.expression.text]?.[target.name.text] || 0;
+      const hasRestParameter = raw.handlerRestParameters[target.expression.text]?.[target.name.text] || false;
       const parameterNames = method.parameters.map(parameter => parameter.name.text);
       const argumentTexts = call.arguments.slice(1).map(argument => argument.getText(parsed));
       const argumentsShadowed = method.parameters.some(parameter =>
@@ -342,13 +347,15 @@ function matches(text, baseline, fileName = 'state.js') {
       const parameterSurfaceCovered = grandfatheredParameterShape || method.parameters.length >= parameterCount;
       let matchesStyle = false;
       if (style === INVOCATION_STYLES.THIS) {
-        matchesStyle = (restApply || restCall || orderedCall || argumentsApply || argumentsCall) &&
-          (restApply || restCall || argumentsApply || argumentsCall || parameterSurfaceCovered);
+        const completeRestForwarding = restApply || restCall || argumentsApply || argumentsCall;
+        matchesStyle = (completeRestForwarding || orderedCall) &&
+          (completeRestForwarding || (!hasRestParameter && parameterSurfaceCovered));
       }
       else if (style === INVOCATION_STYLES.STATE) {
         const stateParameterIndex = raw.handlerStateParameterIndexes[target.expression.text]?.[target.name.text];
+        const completeRestForwarding = argumentsSpread || method.parameters.some(parameter => parameter.dotDotDotToken);
         matchesStyle = stateParameterIndex === 0 && (directCall || argumentsSpread) &&
-          (argumentsSpread || method.parameters.some(parameter => parameter.dotDotDotToken) || parameterSurfaceCovered);
+          (completeRestForwarding || (!hasRestParameter && parameterSurfaceCovered));
       }
       if (!matchesStyle) return false;
     }

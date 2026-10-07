@@ -176,14 +176,16 @@ function objectPropertyValue(expression, key) {
 function destructuredBindings(pattern, initializer) {
   const pairs = [];
   const walk = (target, value) => {
-    if (!target || !value) return;
+    if (!target) return;
     const current = unwrapExpression(target);
+    if (!value && !ts.isBindingElement(current)) return;
     if (ts.isIdentifier(current)) {
       pairs.push([current, value]);
       return;
     }
     if (ts.isBindingElement(current)) {
-      walk(current.name, current.initializer ? value : value);
+      const selected = value || current.initializer;
+      walk(current.name, selected);
       return;
     }
     if (ts.isArrayBindingPattern(current) || ts.isArrayLiteralExpression(current)) {
@@ -358,6 +360,7 @@ function mutatedDeclarations(factory, declarations, source) {
         node.expression.name.text === 'assign' && node.arguments.length) {
       mark(node.arguments[0]);
     }
+    if (ts.isForInStatement(node) || ts.isForOfStatement(node)) mark(node.initializer);
     ts.forEachChild(node, visit);
   };
   visit(factory);
@@ -383,6 +386,7 @@ function mutatedBindingNames(source, names) {
 
 function callableDescriptor(node) {
   if (!node || !ts.isFunctionLike(node)) return null;
+  if (ts.isArrowFunction(node) && usesThisExpression(node)) return null;
   const parameters = (node.parameters || []).filter(parameter =>
     !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'));
   const style = invocationStyle(node);
@@ -398,6 +402,7 @@ function callableDescriptor(node) {
     style,
     requiredArguments,
     parameterCount: postStateParameters.length,
+    hasRestParameter: postStateParameters.some(parameter => !!parameter.dotDotDotToken),
     stateParameterIndex,
     usesThis: usesThisExpression(node)
   };
@@ -449,7 +454,7 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
           ts.isIdentifier(initializer.expression) && initializer.expression.text === 'require';
         if (!isRequire) return null;
       }
-      const imported = resolveImportedValue(receiver.text, expression.name.text);
+      const imported = resolveImportedValue(receiver.text, expression.name.text, receiver);
       if (imported) return imported;
     }
     if (ts.isCallExpression(receiver)) {
@@ -516,6 +521,7 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
       return candidate && candidate.style === descriptor.style &&
         candidate.requiredArguments === descriptor.requiredArguments &&
         candidate.parameterCount === descriptor.parameterCount &&
+        candidate.hasRestParameter === descriptor.hasRestParameter &&
         candidate.stateParameterIndex === descriptor.stateParameterIndex;
     })) {
       methods.set(method, descriptor);
@@ -538,9 +544,9 @@ function moduleCallableDescriptor(filePath, methodName, seen = new Set()) {
     if (!exported) return null;
     const bindings = requireBindings(source);
     const receiverBinding = exported && ts.isPropertyAccessExpression(exported) && ts.isIdentifier(exported.expression)
-      ? bindings.get(exported.expression.text)
+      ? bindings.get(exported.expression.text, exported.expression)
       : null;
-    const binding = bindings.get(exportedName || methodName) || receiverBinding;
+    const binding = (exportedName ? bindings.get(exportedName, exported) : null) || receiverBinding || bindings.get(methodName);
     const exportedReceiver = exported && ts.isPropertyAccessExpression(exported) ? exported.expression : null;
     const modulePath = binding?.modulePath || directRequire(exportedReceiver) || directRequire(exported);
     if (!modulePath) return null;
@@ -557,7 +563,10 @@ function moduleCallableDescriptor(filePath, methodName, seen = new Set()) {
 }
 
 function requireBindings(source) {
-  const bindings = new Map();
+  const bindings = [];
+  const addBinding = (name, declaration, modulePath, exportName) => {
+    bindings.push({ name, declaration, scope: declarationScope(declaration), modulePath, exportName });
+  };
   const visit = node => {
     if (node !== source && ts.isFunctionLike(node)) return;
     if (ts.isVariableStatement(node)) {
@@ -567,7 +576,7 @@ function requireBindings(source) {
             declaration.initializer.arguments.length !== 1 || !ts.isStringLiteral(declaration.initializer.arguments[0])) continue;
         const modulePath = declaration.initializer.arguments[0].text;
         if (ts.isIdentifier(declaration.name)) {
-          bindings.set(declaration.name.text, { modulePath, exportName: null });
+          addBinding(declaration.name.text, declaration, modulePath, null);
           continue;
         }
         if (!ts.isObjectBindingPattern(declaration.name)) continue;
@@ -575,14 +584,40 @@ function requireBindings(source) {
           if (!ts.isBindingElement(element)) continue;
           const imported = propertyName(element.propertyName || element.name);
           const local = ts.isIdentifier(element.name) ? element.name.text : null;
-          if (imported && local) bindings.set(local, { modulePath, exportName: imported });
+          if (imported && local) addBinding(local, element.name, modulePath, imported);
         }
       }
     }
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return bindings;
+  const scopeChain = identifier => {
+    const scopes = [];
+    let current = scopeNode(identifier);
+    while (current) {
+      scopes.push(current);
+      current = current.parent;
+      while (current && !isScopeNode(current)) current = current.parent;
+    }
+    return scopes;
+  };
+  const resolve = (name, identifier) => {
+    if (!identifier || !ts.isIdentifier(identifier)) return null;
+    const useStart = identifier.getStart(source);
+    for (const scope of scopeChain(identifier)) {
+      const candidates = bindings.filter(binding => binding.name === name && binding.scope === scope &&
+        binding.declaration.getStart(source) <= useStart);
+      if (candidates.length) return candidates[candidates.length - 1];
+    }
+    return null;
+  };
+  return {
+    get(name, identifier = null) {
+      if (identifier) return resolve(name, identifier);
+      const topLevel = bindings.filter(binding => binding.name === name && binding.scope === source);
+      return (topLevel.length ? topLevel : bindings.filter(binding => binding.name === name)).at(-1) || null;
+    }
+  };
 }
 
 function resolveModulePath(modulePath, sourcePath) {
@@ -604,8 +639,8 @@ function calledFactory(expression, requireCall = false) {
   while (ts.isParenthesizedExpression(target)) target = target.expression;
   if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.CommaToken) target = target.right;
   while (ts.isParenthesizedExpression(target)) target = target.expression;
-  if (ts.isIdentifier(target)) return { name: target.text, receiver: null };
-  if (ts.isPropertyAccessExpression(target)) return { name: target.name.text, receiver: target.expression };
+  if (ts.isIdentifier(target)) return { name: target.text, receiver: null, target };
+  if (ts.isPropertyAccessExpression(target)) return { name: target.name.text, receiver: target.expression, target };
   return null;
 }
 
@@ -615,12 +650,13 @@ function directRequire(receiver) {
   return receiver.arguments[0].text;
 }
 
-function exportedFactoryExpression(source, factoryName) {
+function exportedFactoryExpression(source, factoryName, allowDefault = false) {
   let result = null;
   const isModuleExports = node => ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
     node.expression.text === 'module' && node.name.text === 'exports';
-  const isNamedExport = node => ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
-    node.expression.text === 'exports' && node.name.text === factoryName;
+  const isNamedExport = node => ts.isPropertyAccessExpression(node) &&
+    ((ts.isIdentifier(node.expression) && node.expression.text === 'exports') || isModuleExports(node.expression)) &&
+    node.name.text === factoryName;
   const getterExpression = node => {
     if (!ts.isObjectLiteralExpression(node)) return null;
     for (const property of node.properties) {
@@ -636,13 +672,14 @@ function exportedFactoryExpression(source, factoryName) {
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
       if (isNamedExport(node.left)) result = node.right;
       if (isModuleExports(node.left)) {
+        result = null;
         if (ts.isObjectLiteralExpression(node.right)) {
           for (const property of node.right.properties) {
             if (propertyName(property.name) !== factoryName) continue;
             result = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
           }
         }
-        else {
+        else if (allowDefault || directRequire(node.right)) {
           result = node.right;
         }
       }
@@ -690,20 +727,20 @@ function moduleExportsFactory(filePath, factoryName, seen = new Set()) {
   }
 }
 
-function moduleFactoryAllowed(filePath, factoryName, seen = new Set()) {
+function moduleFactoryAllowed(filePath, factoryName, seen = new Set(), allowDefault = false) {
   const key = `${filePath}:${factoryName}`;
   if (seen.has(key)) return false;
   seen.add(key);
   try {
     const text = fs.readFileSync(filePath, 'utf8');
     const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    const exported = exportedFactoryExpression(source, factoryName);
+    const exported = exportedFactoryExpression(source, factoryName, allowDefault);
     const bindings = requireBindings(source);
     if (!exported) {
       for (const modulePath of reexportedModulePaths(source)) {
         const importedPath = resolveModulePath(modulePath, filePath);
         if (importedPath && moduleExportsFactory(importedPath, factoryName)) {
-          return moduleFactoryAllowed(importedPath, factoryName, seen);
+          return moduleFactoryAllowed(importedPath, factoryName, seen, false);
         }
       }
       return false;
@@ -719,15 +756,16 @@ function moduleFactoryAllowed(filePath, factoryName, seen = new Set()) {
     }
     const receiver = ts.isPropertyAccessExpression(candidate) ? candidate.expression : null;
     let binding = null;
-    if (ts.isIdentifier(candidate)) binding = bindings.get(candidate.text);
-    else if (receiver && ts.isIdentifier(receiver)) binding = bindings.get(receiver.text);
+    if (ts.isIdentifier(candidate)) binding = bindings.get(candidate.text, candidate);
+    else if (receiver && ts.isIdentifier(receiver)) binding = bindings.get(receiver.text, receiver);
     const modulePath = binding?.modulePath || directRequire(receiver) || directRequire(candidate);
     const importedPath = modulePath && resolveModulePath(modulePath, filePath);
     if (!importedPath) return false;
     const importedName = ts.isPropertyAccessExpression(candidate)
       ? candidate.name.text
       : binding?.exportName || factoryName;
-    return moduleFactoryAllowed(importedPath, importedName, seen);
+    const importedDefault = !ts.isPropertyAccessExpression(candidate) && !binding?.exportName && allowDefault;
+    return moduleFactoryAllowed(importedPath, importedName, seen, importedDefault);
   }
   catch {
     return false;
@@ -748,8 +786,8 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
     const local = factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen));
     if (local?.size) return local;
     const binding = called.receiver
-      ? (ts.isIdentifier(called.receiver) ? bindings.get(called.receiver.text) : null)
-      : bindings.get(called.name);
+      ? (ts.isIdentifier(called.receiver) ? bindings.get(called.receiver.text, called.receiver) : null)
+      : bindings.get(called.name, called.target);
     const modulePath = directRequire(called.receiver) || binding?.modulePath;
     if (!modulePath) return new Map();
     const importedPath = resolveModulePath(modulePath, sourcePath);
@@ -757,10 +795,11 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
     const importedName = called.receiver && ts.isPropertyAccessExpression(called.receiver)
       ? called.name
       : binding?.exportName || called.name;
-    return moduleFactoryMethods(importedPath, importedName, new Set(seen));
+    const allowDefault = !called.receiver && !binding?.exportName;
+    return moduleFactoryMethods(importedPath, importedName, new Set(seen), allowDefault);
   };
-  const resolveImportedValue = (receiverName, methodName) => {
-    const binding = bindings.get(receiverName);
+  const resolveImportedValue = (receiverName, methodName, receiver) => {
+    const binding = bindings.get(receiverName, receiver);
     if (!binding) return null;
     const importedPath = resolveModulePath(binding.modulePath, sourcePath);
     return importedPath ? moduleCallableDescriptor(importedPath, methodName) : null;
@@ -768,20 +807,20 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
   return collectFactoryMethods(factory, source, resolveExpression, resolveImportedValue);
 }
 
-function moduleFactoryMethods(filePath, factoryName, seen) {
+function moduleFactoryMethods(filePath, factoryName, seen, allowDefault = false) {
   try {
-    if (filePath !== stateSourcePath && !moduleFactoryAllowed(filePath, factoryName)) return new Map();
+    if (filePath !== stateSourcePath && !moduleFactoryAllowed(filePath, factoryName, new Set(), allowDefault)) return new Map();
     const importedText = fs.readFileSync(filePath, 'utf8');
     const importedSource = ts.createSourceFile(filePath, importedText, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const local = factoryMethodsFromSource(importedSource, filePath, factoryName, seen);
     if (local?.size) return local;
     const bindings = requireBindings(importedSource);
-    const exported = exportedFactoryExpression(importedSource, factoryName);
+    const exported = exportedFactoryExpression(importedSource, factoryName, allowDefault);
     const exportedName = exported && ts.isIdentifier(exported) ? exported.text : null;
     const receiverBinding = exported && ts.isPropertyAccessExpression(exported) && ts.isIdentifier(exported.expression)
-      ? bindings.get(exported.expression.text)
+      ? bindings.get(exported.expression.text, exported.expression)
       : null;
-    const binding = bindings.get(exportedName || factoryName) || receiverBinding;
+    const binding = (exportedName ? bindings.get(exportedName, exported) : null) || receiverBinding || bindings.get(factoryName);
     const exportedReceiver = exported && ts.isPropertyAccessExpression(exported) ? exported.expression : null;
     const modulePath = binding?.modulePath || directRequire(exportedReceiver) || directRequire(exported);
     if (modulePath) {
@@ -790,7 +829,10 @@ function moduleFactoryMethods(filePath, factoryName, seen) {
       const importedName = exported && ts.isPropertyAccessExpression(exported)
         ? exported.name.text
         : binding?.exportName || factoryName;
-      return moduleFactoryMethods(importedPath, importedName, seen);
+      const importedDefault = !exported || !ts.isPropertyAccessExpression(exported)
+        ? !binding?.exportName && allowDefault
+        : false;
+      return moduleFactoryMethods(importedPath, importedName, seen, importedDefault);
     }
     for (const reexportPath of reexportedModulePaths(importedSource)) {
       const reexportedPath = resolveModulePath(reexportPath, filePath);
@@ -827,7 +869,7 @@ function switchCanFallThrough(statement) {
   const clauseCanFallThrough = index => {
     if (index >= clauses.length) return true;
     const flow = statementFlow({ statements: clauses[index].statements });
-    if (flow.breaks) return true;
+    if (flow.breaks.size) return true;
     return flow.normal && clauseCanFallThrough(index + 1);
   };
   return clauses.some((_, index) => clauseCanFallThrough(index));
@@ -836,44 +878,60 @@ function switchCanFallThrough(statement) {
 function statementFlow(statement) {
   if (statement?.statements) {
     let normal = true;
-    let breaks = false;
+    const breaks = new Set();
     for (const child of statement.statements) {
       if (!normal) break;
       const flow = statementFlow(child);
-      breaks = breaks || flow.breaks;
+      for (const target of flow.breaks) breaks.add(target);
       normal = flow.normal;
     }
     return { normal, breaks };
   }
   if (ts.isBlock(statement)) return statementFlow({ statements: statement.statements });
   if (ts.isReturnStatement(statement) || ts.isThrowStatement(statement) || ts.isContinueStatement(statement)) {
-    return { normal: false, breaks: false };
+    return { normal: false, breaks: new Set() };
   }
-  if (ts.isBreakStatement(statement)) return { normal: false, breaks: true };
+  if (ts.isBreakStatement(statement)) {
+    return { normal: false, breaks: new Set([statement.label?.text || null]) };
+  }
   if (ts.isIfStatement(statement)) {
     const thenFlow = statementFlow(statement.thenStatement);
-    const elseFlow = statement.elseStatement ? statementFlow(statement.elseStatement) : { normal: true, breaks: false };
+    const elseFlow = statement.elseStatement ? statementFlow(statement.elseStatement) : { normal: true, breaks: new Set() };
+    const breaks = new Set([...thenFlow.breaks, ...elseFlow.breaks]);
     return {
       normal: thenFlow.normal || elseFlow.normal,
-      breaks: thenFlow.breaks || elseFlow.breaks
+      breaks
     };
   }
-  if (ts.isSwitchStatement(statement)) return { normal: switchCanFallThrough(statement), breaks: false };
+  if (ts.isSwitchStatement(statement)) {
+    const breaks = new Set();
+    for (const clause of statement.caseBlock.clauses) {
+      const flow = statementFlow({ statements: clause.statements });
+      for (const target of flow.breaks) if (target !== null) breaks.add(target);
+    }
+    return { normal: switchCanFallThrough(statement), breaks };
+  }
   if (ts.isTryStatement(statement)) {
     const tryFlow = statementFlow(statement.tryBlock);
     const catchFlow = statement.catchClause
       ? statementFlow(statement.catchClause.block)
-      : { normal: false, breaks: false };
+      : { normal: false, breaks: new Set() };
     const combined = {
       normal: tryFlow.normal || catchFlow.normal,
-      breaks: tryFlow.breaks || catchFlow.breaks
+      breaks: new Set([...tryFlow.breaks, ...catchFlow.breaks])
     };
     if (!statement.finallyBlock) return combined;
     const finallyFlow = statementFlow(statement.finallyBlock);
     return finallyFlow.normal ? combined : finallyFlow;
   }
-  if (ts.isLabeledStatement(statement)) return statementFlow(statement.statement);
-  return { normal: true, breaks: false };
+  if (ts.isLabeledStatement(statement)) {
+    const flow = statementFlow(statement.statement);
+    if (!flow.breaks.has(statement.label.text)) return flow;
+    const breaks = new Set(flow.breaks);
+    breaks.delete(statement.label.text);
+    return { normal: true, breaks };
+  }
+  return { normal: true, breaks: new Set() };
 }
 
 function statementCanFallThrough(statement) {
@@ -890,7 +948,7 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
     const binding = bindings.get(factoryName);
     if (binding?.modulePath) {
       const importedPath = resolveModulePath(binding.modulePath, sourcePath);
-      if (importedPath && moduleFactoryAllowed(importedPath, binding.exportName || factoryName)) return true;
+      if (importedPath && moduleFactoryAllowed(importedPath, binding.exportName || factoryName, new Set(), !binding.exportName)) return true;
     }
     const exported = exportedFactoryExpression(source, factoryName);
     const exportedReceiver = exported && ts.isPropertyAccessExpression(exported) ? exported.expression : null;
@@ -900,7 +958,7 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
     const modulePath = directRequire(exportedReceiver) || directRequire(exported);
     if (modulePath) {
       const importedPath = resolveModulePath(modulePath, sourcePath);
-      return !!(importedPath && moduleFactoryAllowed(importedPath, importedName));
+      return !!(importedPath && moduleFactoryAllowed(importedPath, importedName, new Set(), false));
     }
     for (const reexportPath of reexportedModulePaths(source)) {
       const importedPath = resolveModulePath(reexportPath, sourcePath);
@@ -918,15 +976,16 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
     const called = calledFactory(expression, true);
     if (!called) return false;
     const binding = called.receiver && ts.isIdentifier(called.receiver)
-      ? bindings.get(called.receiver.text)
-      : bindings.get(called.name);
+      ? bindings.get(called.receiver.text, called.receiver)
+      : bindings.get(called.name, called.target);
     const modulePath = directRequire(called.receiver) || binding?.modulePath;
     if (modulePath) {
       const importedPath = resolveModulePath(modulePath, sourcePath);
       const importedName = called.receiver && ts.isPropertyAccessExpression(called.receiver)
         ? called.name
         : binding?.exportName || called.name;
-      if (importedPath && moduleFactoryAllowed(importedPath, importedName)) return true;
+      const allowDefault = !called.receiver && !binding?.exportName;
+      if (importedPath && moduleFactoryAllowed(importedPath, importedName, new Set(), allowDefault)) return true;
     }
     return factoryDeclaration(source, called.name) &&
       factoryResolvesToCompanion(source, sourcePath, called.name, new Set(seen));
