@@ -10,6 +10,8 @@ import type {
   CourierSource
 } from './types';
 
+export class CourierPromptLimitError extends Error {}
+
 function sourceFor(message: CourierMessage): CourierSource {
   if (message.watcherNotice) {
     const provenance = message.watcherNoticeProvenance;
@@ -107,7 +109,7 @@ export function createEnvelope(
   const prompt = predecessorAttemptId
     ? `${input.prompt}\n\n[discord-courier-delivery-attempt:${id}]`
     : input.prompt;
-  if (prompt.length > 100000) throw new Error('courier forwarded prompt exceeds 100000 characters');
+  if (prompt.length > 100000) throw new CourierPromptLimitError('courier forwarded prompt exceeds 100000 characters');
   const body = {
     type: ENVELOPE_TYPE,
     attemptId: id,

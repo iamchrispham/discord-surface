@@ -1,5 +1,5 @@
 import { COURIER_ATTEMPT_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_RESULT_STATUSES } from './constants';
-import { attemptId, attemptKey, createEnvelope, payloadHash } from './envelope';
+import { attemptId, attemptKey, createEnvelope, payloadHash, CourierPromptLimitError } from './envelope';
 import { hasCourierForwardClaim } from './forward';
 import { retiredCourierPredecessor } from './retirement';
 import { findMatchingRoute, isCourierOriginAllowed, type RouteMatch } from './route';
@@ -11,6 +11,7 @@ import type {
   CourierMessage,
   CourierOutcome,
   CourierOutcomeRecord,
+  CourierEnvelope,
   CourierState,
   CourierRoute,
   SqlRow
@@ -128,7 +129,13 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
       const hash = payloadHash(message, input);
       const key = attemptKey(message, route, hash, predecessorAttemptId);
       const id = attemptId(key);
-      const envelope = createEnvelope(message, route, id, hash, input, predecessorAttemptId);
+      let envelope: CourierEnvelope;
+      try {
+        envelope = createEnvelope(message, route, id, hash, input, predecessorAttemptId);
+      } catch (error) {
+        if (error instanceof CourierPromptLimitError) return { accepted: false, status: COURIER_RESULT_STATUSES.CONFLICT, message };
+        throw error;
+      }
       const detail = {
         attemptId: id,
         ...(predecessorAttemptId ? { predecessorAttemptId, inputPrompt: input.prompt } : {}),

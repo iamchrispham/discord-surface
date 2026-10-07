@@ -1,4 +1,4 @@
-import { COURIER_RECEIPT_KINDS, COURIER_RECOVERY_SOURCES } from './constants';
+import { COURIER_RECEIPT_KINDS, COURIER_RECOVERY_SOURCES, COURIER_RECOVERY_TRIGGERS } from './constants';
 import type { CourierDependencies, CourierState, SqlRow } from './types';
 
 export function retiredCourierPredecessor(
@@ -15,12 +15,18 @@ export function retiredCourierPredecessor(
   const retirements = state.db.prepare(`SELECT detail FROM receipts WHERE kind=?
     AND discord_id=? AND id>? AND id<? ORDER BY id`)
     .all(COURIER_RECEIPT_KINDS.RECONCILED_NOT_SUBMITTED, messageId, Number(row.id), beforeReceiptId);
-  const retired = retirements.some(receipt => {
+  let explicit = false;
+  for (const receipt of retirements) {
     const detail = deps.parseJson(receipt.detail, null);
-    if (!detail || Array.isArray(detail)) return false;
+    if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return null;
     // Legacy reconciliation names its attempt by receipt order. Public recovery names it explicitly.
-    return Object.keys(detail).length === 0 ||
-      (detail.source === COURIER_RECOVERY_SOURCES.COURIER_RECOVERY && detail.attemptId === attempt.attemptId);
-  });
-  return retired ? attempt.attemptId : null;
+    if (Object.keys(detail).length === 0) {
+      explicit = true;
+      continue;
+    }
+    if (detail.source !== COURIER_RECOVERY_SOURCES.COURIER_RECOVERY || detail.attemptId !== attempt.attemptId) return null;
+    if (detail.trigger === COURIER_RECOVERY_TRIGGERS.EXPLICIT) explicit = true;
+    else if (detail.trigger != null && detail.trigger !== COURIER_RECOVERY_TRIGGERS.PICKUP_DEADLINE) return null;
+  }
+  return explicit ? attempt.attemptId : null;
 }

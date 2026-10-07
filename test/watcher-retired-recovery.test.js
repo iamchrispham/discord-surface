@@ -422,9 +422,11 @@ test('successor admission preserves route and acknowledgment fences and refuses 
   const prior = beginPredecessor(overflow.f, overflow.message);
   retireByPublicRecovery(overflow.f, overflow.message, prior.claim);
   const before = receiptCount(overflow.f.state);
-  assert.throws(() => overflow.f.state.beginCourierAttempt(overflow.message.id, {
+  const refused = overflow.f.state.beginCourierAttempt(overflow.message.id, {
     ...prior.input, prompt: 'x'.repeat(100000)
-  }), /exceeds 100000/);
+  });
+  assert.equal(refused.accepted, false);
+  assert.equal(refused.status, 'conflict');
   assert.equal(receiptCount(overflow.f.state), before);
   assert.equal(overflow.f.state.getCourierAttempt(overflow.message.id).attempt.attemptId, prior.claim.attempt.attemptId);
 });
