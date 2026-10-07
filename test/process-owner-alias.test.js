@@ -598,6 +598,11 @@ test("review regressions retain finite probe provenance", () => {
     ["private-alias.js\u0000bind"],
     ["unclassified process probe private-alias.js:bind"]
   );
+  runFixture(
+    "function check(pid) { [process.kill].forEach(probe => probe(pid, 0)); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
 });
 
 test("local module exports retain live and built-in origins", () => {
@@ -626,6 +631,18 @@ test("local module exports retain live and built-in origins", () => {
     "probe.ts": "export const probe = process.kill;",
     "use.ts": "import { probe } from './probe.js'; probe(1, 0);"
   }, ["use.ts\u0000null"], ["unclassified process probe use.ts:null"]);
+  runFilesFixture({
+    "probe.js": "export const getProbe = () => process.kill;",
+    "use.js": "import { getProbe } from './probe.js'; getProbe()(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    "probe.js": "exports = module.exports = process.kill;",
+    "use.js": "const probe = require('./probe'); probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    "probe.js": "const require = () => ({ kill() {} }); export const probe = require('node:process').kill;",
+    "use.js": "import { probe } from './probe.js'; probe(1, 0);"
+  }, [], []);
 });
 
 test("legacy owner identity survives invocation methods", () => {

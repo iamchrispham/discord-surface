@@ -151,6 +151,9 @@ function createLocalModuleResolver(files) {
         left.expression.text === 'module') module.defaultExport = expression.right;
     };
     const recordExportExpression = expression => {
+      if (expression.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isBinaryExpression(expression.right)) {
+        recordExportExpression(expression.right);
+      }
       const left = unwrap(expression.left);
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module') {
@@ -261,10 +264,30 @@ function createLocalModuleResolver(files) {
     return null;
   };
 
+  const callableReturnExpressions = callable => {
+    const body = callable.body;
+    if (!body) return [];
+    if (!ts.isBlock(body)) return [body];
+    const returns = [];
+    const visit = node => {
+      if (ts.isReturnStatement(node)) {
+        if (node.expression) returns.push(node.expression);
+        return;
+      }
+      if (ts.isFunctionLike(node) && node !== callable) return;
+      ts.forEachChild(node, visit);
+    };
+    visit(body);
+    return returns;
+  };
+
   const evaluate = (expression, currentPath, visited = new Set()) => {
     const node = unwrap(expression);
     if (!node || visited.has(node)) return new Set();
     const seen = new Set(visited).add(node);
+    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+      return new Set([{ callable: node, modulePath: currentPath }]);
+    }
     if (ts.isIdentifier(node)) {
       const module = currentPath && scanModule(currentPath);
       const imported = module?.imports.get(node.text);
@@ -301,8 +324,22 @@ function createLocalModuleResolver(files) {
       }
       return result;
     }
+    if (ts.isCallExpression(node)) {
+      const callableAtoms = evaluate(node.expression, currentPath, seen);
+      const result = new Set();
+      for (const atom of callableAtoms) {
+        if (!atom || !atom.callable) continue;
+        const callablePath = atom.modulePath || currentPath;
+        for (const returnExpression of callableReturnExpressions(atom.callable)) {
+          for (const returnAtom of evaluate(returnExpression, callablePath, seen)) result.add(returnAtom);
+        }
+      }
+      if (result.size) return result;
+    }
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require' &&
       ts.isStringLiteral(node.arguments[0])) {
+      const currentModule = currentPath && scanModule(currentPath);
+      if (currentModule?.bindings.has('require')) return new Set();
       const specifier = node.arguments[0].text;
       if (specifier === 'node:process' || specifier === 'process') return new Set([PROCESS_OBJECT]);
       const modulePath = currentPath && resolveRequest(currentPath, specifier);
@@ -376,6 +413,17 @@ function createLocalModuleResolver(files) {
       const module = scanModule(modulePath);
       if (module.defaultExport) {
         for (const atom of evaluate(module.defaultExport, modulePath, new Set())) result.add(atom);
+      }
+      return result;
+    },
+    resolveCall(atoms, visited = new Set()) {
+      const result = new Set();
+      for (const atom of atoms || []) {
+        if (!atom || !atom.callable) continue;
+        const callablePath = atom.modulePath;
+        for (const returnExpression of callableReturnExpressions(atom.callable)) {
+          for (const returnAtom of evaluate(returnExpression, callablePath, visited)) result.add(returnAtom);
+        }
       }
       return result;
     },

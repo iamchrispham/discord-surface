@@ -529,8 +529,24 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (!ts.isArrayLiteralExpression(source) || source.elements.some(ts.isSpreadElement)) return null;
     return source.elements;
   };
+  const finiteArrayCallbackMethods = new Set([
+    'forEach', 'map', 'filter', 'some', 'every', 'find', 'findIndex', 'flatMap'
+  ]);
   const indexParameterArguments = node => {
     if (ts.isCallExpression(node)) {
+      const callbackMethod = ts.isPropertyAccessExpression(node.expression)
+        ? node.expression.name.text : null;
+      const callbackElements = callbackMethod && finiteArrayCallbackMethods.has(callbackMethod)
+        ? literalArrayElements(node.expression.expression) : null;
+      const callback = node.arguments && node.arguments[0];
+      if (callbackElements && callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
+        const parameter = callback.parameters[0];
+        if (parameter && ts.isIdentifier(parameter.name)) {
+          for (const element of callbackElements) {
+            if (element) indexParameterBinding(parameter.name, element, parameter);
+          }
+        }
+      }
       const wrapper = invocationWrapperName(node.expression);
       if (wrapper) {
         const parameters = callableParameters(node.expression.expression);
@@ -957,6 +973,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           hasAtom(receiver, REFLECT_APPLY_METHOD)) return new Set([BOUND_REFLECT_APPLY]);
       }
       const result = new Set();
+      if (moduleResolver?.resolveCall) {
+        for (const atom of moduleResolver.resolveCall(resolveSet(callee, seen), seen)) result.add(atom);
+      }
       for (const expression of callableReturnExpressions(callee, seen)) {
         for (const atom of resolveSet(expression, seen)) result.add(atom);
       }
