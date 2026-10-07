@@ -234,7 +234,7 @@ const tokenizeSource = source => {
       push('number', source.slice(start, index), start, index);
       continue;
     }
-    const operator = ['===', '!==', '=>', '>=', '<=', '==', '!=', '&&', '||', '??', '?.', '++', '--'].find(value => source.startsWith(value, index));
+    const operator = ['...', '===', '!==', '=>', '>=', '<=', '==', '!=', '&&', '||', '??', '?.', '++', '--'].find(value => source.startsWith(value, index));
     if (operator) {
       push('operator', operator, index, index + operator.length);
       index += operator.length;
@@ -355,6 +355,12 @@ const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, al
   let bracketDepth = 0;
   for (let index = openingIndex + 1; index < closingIndex; index += 1) {
     const value = tokens[index].value;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && value === '...' && tokens[index + 1]?.value === '{') {
+      const spreadEnd = pairs.get(index + 1);
+      if (spreadEnd !== undefined
+        && objectHasTopLevelStateGap(tokens, index + 1, spreadEnd, pairs, aliases, allowNestedCalls)) return true;
+    }
     const computedKey = value === '[' && tokens[index + 2]?.value === ']';
     const propertyName = computedKey
       ? staticPropertyName(tokens[index + 1])
@@ -605,6 +611,45 @@ const branchRange = (tokens, start, end, pairs) => {
   return { start: start + 1, end: closing, opening: start };
 };
 
+const caughtThrowHandlerEnd = (tokens, throwIndex, pairs) => {
+  for (let index = throwIndex - 1; index >= 0; index -= 1) {
+    if (tokens[index].value !== 'try') continue;
+    const tryOpening = index + 1;
+    if (tokens[tryOpening]?.value !== '{') continue;
+    const tryClosing = pairs.get(tryOpening);
+    if (tryClosing === undefined || throwIndex <= tryOpening || throwIndex >= tryClosing) continue;
+
+    const catchIndex = tryClosing + 1;
+    if (tokens[catchIndex]?.value !== 'catch') continue;
+    let catchOpening = catchIndex + 1;
+    if (tokens[catchOpening]?.value === '(') {
+      const parameterClosing = pairs.get(catchOpening);
+      if (parameterClosing === undefined) continue;
+      catchOpening = parameterClosing + 1;
+    }
+    if (tokens[catchOpening]?.value !== '{') continue;
+    return pairs.get(catchOpening) ?? null;
+  }
+  return null;
+};
+
+const includeCaughtThrowHandlers = (tokens, decision, pairs) => {
+  if (!decision) return decision;
+  let end = decision.end;
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (let index = decision.start; index < end; index += 1) {
+      if (tokens[index]?.value !== 'throw') continue;
+      const handlerEnd = caughtThrowHandlerEnd(tokens, index, pairs);
+      if (handlerEnd === null || handlerEnd <= end) continue;
+      end = handlerEnd;
+      expanded = true;
+    }
+  }
+  return end === decision.end ? decision : { ...decision, end };
+};
+
 const findConditionalExpressionDecision = (tokens, triggerIndex, start, end, pairs) => {
   let parenDepth = 0;
   let braceDepth = 0;
@@ -822,7 +867,7 @@ const findFallthroughStatementsEnd = (tokens, start, end, pairs, functionRanges)
   return cursor;
 };
 
-const findLoopDecision = (tokens, triggerIndex, pairs, functionRanges) => {
+const findLoopDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNegated = false) => {
   for (let index = triggerIndex - 1; index >= 0; index -= 1) {
     if (!['while', 'for'].includes(tokens[index]?.value)) continue;
     const opening = index + 1;
@@ -854,7 +899,10 @@ const findLoopDecision = (tokens, triggerIndex, pairs, functionRanges) => {
 
     const bodyStart = closing + 1;
     const bodyEnd = findControlledStatementEnd(tokens, bodyStart, tokens.length, pairs);
-    if (isNegatedDeadlineCondition(tokens, opening + 1, triggerIndex)) {
+    const deadlineBranchIsNegated = Boolean(
+      isNegatedDeadlineCondition(tokens, opening + 1, triggerIndex)
+    ) !== aliasNegated;
+    if (deadlineBranchIsNegated) {
       const scopeEnd = findFallthroughScopeEnd(tokens, index, pairs, functionRanges);
       const fallthroughEnd = findFallthroughStatementsEnd(
         tokens,
@@ -897,7 +945,7 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, al
       pairs
     );
   }
-  const loopDecision = findLoopDecision(tokens, triggerIndex, pairs, functionRanges);
+  const loopDecision = findLoopDecision(tokens, triggerIndex, pairs, functionRanges, aliasNegated);
   if (loopDecision) return loopDecision;
   const switchDecision = findSwitchDecision(tokens, triggerIndex, pairs, functionRanges, aliasNegated);
   if (switchDecision) return switchDecision;
@@ -1843,7 +1891,11 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
         scope: lexicalScopePath(lexicalScopes, alias.index)
       });
       if (isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) {
-        const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges, aliasNegated);
+        const decision = includeCaughtThrowHandlers(
+          tokens,
+          extractDeadlineDecision(tokens, index, pairs, functionRanges, aliasNegated),
+          pairs
+        );
         const knownAliases = visibleGapAliasesAt(
           tokens,
           decision.start,
@@ -1875,7 +1927,11 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       continue;
     }
     if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
-    const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
+    const decision = includeCaughtThrowHandlers(
+      tokens,
+      extractDeadlineDecision(tokens, index, pairs, functionRanges),
+      pairs
+    );
     const knownAliases = visibleGapAliasesAt(
       tokens,
       decision.start,
@@ -1970,7 +2026,11 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       );
       if (!visibleAssignments.some(candidate => candidate.index === alias.index)) continue;
       if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
-      const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges, alias.negated);
+      const decision = includeCaughtThrowHandlers(
+        tokens,
+        extractDeadlineDecision(tokens, index, pairs, functionRanges, alias.negated),
+        pairs
+      );
       const knownAliases = visibleGapAliasesAt(
         tokens,
         decision.start,
@@ -2114,6 +2174,20 @@ test('deadline policy inventory inspects deadline-controlled loops', () => {
     'discord/deadline-while-gap.js:1',
     'discord/deadline-for-gap.js:1'
   ]);
+});
+
+test('deadline policy inventory honors alias polarity when inspecting loop paths', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-negated-loop-expiry-gap.js',
+      source: 'async function readiness(deadlineReached) { const within = !deadlineReached; while (within) await poll(); return READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/deadline-negated-loop-body-gap.js',
+      source: 'function readiness(deadlineReached) { const within = !deadlineReached; while (within) return READINESS.GAP; return READINESS.UNAVAILABLE; }'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-negated-loop-expiry-gap.js:1']);
 });
 
 test('deadline policy inventory follows remaining-budget aliases', () => {
@@ -2476,6 +2550,28 @@ test('deadline policy inventory catches object-shaped gap decisions', () => {
     source: "if (Date.now() >= deadline) return { ready: false, state: 'gap', detail: 'history unavailable' };"
   }]);
   assert.deepEqual(offenders, ['discord/inbound-recovery.js:1']);
+});
+
+test('deadline policy inventory inspects statically analyzable object spreads', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-spread-gap.js',
+      source: 'if (deadlineReached) return { ...{ state: READINESS.GAP } };'
+    },
+    {
+      relative: 'discord/deadline-spread-ready.js',
+      source: 'if (deadlineReached) return { ...{ state: READINESS.READY } };'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-spread-gap.js:1']);
+});
+
+test('deadline policy inventory follows deadline throws into local catch handlers', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-caught-gap.js',
+    source: 'function readiness(deadlineReached) { try { if (deadlineReached) throw new Error("expired"); } catch { return READINESS.GAP; } }'
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-caught-gap.js:1']);
 });
 
 test('deadline policy inventory inspects Object.assign outcome mutations', () => {
