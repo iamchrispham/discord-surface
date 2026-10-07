@@ -1571,6 +1571,29 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
 
   function forwardedCallbackName(callee, visited = new Set()) {
     if (ts.isParenthesizedExpression(callee)) return forwardedCallbackName(callee.expression, visited);
+    const isTimerRequire = expression => {
+      const node = ts.isParenthesizedExpression(expression) ? expression.expression : expression;
+      return ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require' &&
+        ts.isStringLiteral(node.arguments[0]) &&
+        (node.arguments[0].text === 'node:timers' || node.arguments[0].text === 'timers');
+    };
+    if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
+      let member = null;
+      if (ts.isPropertyAccessExpression(callee)) {
+        member = callee.name.text;
+      } else {
+        let argument = callee.argumentExpression;
+        if (ts.isParenthesizedExpression(argument)) argument = argument.expression;
+        if (ts.isStringLiteral(argument)) member = argument.text;
+      }
+      if (!member || !FORWARDED_CALLBACK_APIS.has(member)) return null;
+      if (isTimerRequire(callee.expression)) return member;
+      const receiverSymbol = checker.getSymbolAtLocation(callee.expression);
+      for (const declaration of receiverSymbol?.declarations || []) {
+        if (ts.isVariableDeclaration(declaration) && isTimerRequire(declaration.initializer)) return member;
+      }
+      return null;
+    }
     if (!ts.isIdentifier(callee)) return null;
     const symbol = checker.getSymbolAtLocation(callee);
     if (symbol && visited.has(symbol)) return null;
@@ -1590,6 +1613,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       }
     }
     if (sawImport) return null;
+    for (const declaration of symbol?.declarations || []) {
+      if (!ts.isBindingElement(declaration)) continue;
+      const variable = declaration.parent?.parent;
+      if (!ts.isVariableDeclaration(variable) || !isTimerRequire(variable.initializer)) continue;
+      const importedName = declaration.propertyName || declaration.name;
+      if (ts.isIdentifier(importedName) && FORWARDED_CALLBACK_APIS.has(importedName.text)) {
+        return importedName.text;
+      }
+    }
     if (FORWARDED_CALLBACK_APIS.has(callee.text) && !symbolDeclaration(symbol)) return callee.text;
     const declaration = symbolDeclaration(symbol);
     if (declaration && (ts.isVariableDeclaration(declaration) || ts.isParameter(declaration) ||
@@ -1606,7 +1638,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   }
 
   function isForwardingCallbackApi(callee) {
-    if (ts.isIdentifier(callee) && forwardedCallbackName(callee)) return true;
+    if ((ts.isIdentifier(callee) || ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) &&
+      forwardedCallbackName(callee)) return true;
     return ts.isPropertyAccessExpression(callee) && callee.name.text === 'nextTick' &&
       hasAtom(staticValue(callee.expression), PROCESS_OBJECT);
   }

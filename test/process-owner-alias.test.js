@@ -298,6 +298,39 @@ test("local module exports retain probe provenance across files", () => {
     'probe.ts': "export class Helpers { probe = process.kill; }",
     'use.ts': "import { Helpers } from './probe'; const helpers = new Helpers(); function newProbe(pid) { helpers.probe(pid, 0); }"
   }, ["use.ts\u0000newProbe"], ["unclassified process probe use.ts:newProbe"]);
+  runFilesFixture({
+    'producer.js': "const api = { probe: process.kill }; module.exports = api;",
+    'use.js': "const producer = require('./producer'); producer.probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    'producer.js': "const api = { probe: process.kill }; module.exports = api;",
+    'use.js': "const { probe } = require('./producer'); probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    'probe.js': "export const probe = process.kill;",
+    'producer.js': "export * as helpers from './probe.js';",
+    'use.js': "import { helpers } from './producer.js'; helpers.probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    'producer.js': "export const identity = (value = process.kill) => value;",
+    'use.js': "import { identity } from './producer.js'; identity()(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    'producer.js': "function ordinary() {} module.exports = { probe: ordinary }; exports = {}; exports.probe = process.kill;",
+    'use.js': "const producer = require('./producer'); producer.probe(1, 0);"
+  }, [], []);
+  runFilesFixture({
+    'producer.js': "const ordinary = () => true; let probe = ordinary; export default probe; probe = process.kill;",
+    'use.js': "import probe from './producer.js'; probe(1, 0);"
+  }, [], []);
+  runFilesFixture({
+    'producer.js': "const ordinary = () => true; let probe = ordinary; export { probe as default }; probe = process.kill;",
+    'use.js': "import probe from './producer.js'; probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    'producer.js': "export const ownerAlive = ({ directPostOwnerAlive() {} }).directPostOwnerAlive;",
+    'use.js': "import { ownerAlive } from './producer.js'; ownerAlive();"
+  }, [], ["legacy directPostOwnerAlive callsite use.js:null"], ["use.js\u0000null"]);
 });
 
 test("destructuring defaults do not override present ordinary values", () => {
@@ -328,6 +361,10 @@ test("forwarded callback APIs retain process probes", () => {
   runFixture("function newProbe() { setInterval(process.kill, 10, 1234, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("const schedule = setImmediate; function newProbe(pid) { schedule(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("let schedule; schedule = setImmediate; function newProbe(pid) { schedule(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const { setImmediate } = require('node:timers'); function newProbe(pid) { setImmediate(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const { setImmediate: schedule } = require('timers'); function newProbe(pid) { schedule(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const timers = require('node:timers'); function newProbe(pid) { timers.setImmediate(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const timers = require('timers'); function newProbe(pid) { timers['setImmediate'](process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
   runFixture("const setImmediate = () => {}; const schedule = setImmediate; function newProbe(pid) { schedule(process.kill, pid, 0); }", [], []);
   runFixture("import { setImmediate } from './transport.js'; function newProbe() { setImmediate(process.kill, 1234, 0); }", [], [], 'private-alias.ts');
 });

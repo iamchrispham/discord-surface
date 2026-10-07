@@ -6,6 +6,7 @@ const ts = require('typescript');
 const MODULE_OBJECT_PREFIX = 'local-module:';
 const PROCESS_OBJECT = 'process-object';
 const PID_PROBE = 'pid-probe';
+const LEGACY_OWNER = 'legacy-owner';
 
 const unwrap = node => {
   let current = node;
@@ -88,7 +89,9 @@ function createLocalModuleResolver(files) {
       return false;
     };
     const recordExportAlias = (name, expression) => {
-      if (name && isExportObjectExpression(expression)) module.exportAliases.add(name);
+      if (!name) return;
+      if (isExportObjectExpression(expression)) module.exportAliases.add(name);
+      else module.exportAliases.delete(name);
     };
     const recordVariable = (declaration, exported = false) => {
       if (ts.isIdentifier(declaration.name)) {
@@ -241,13 +244,24 @@ function createLocalModuleResolver(files) {
             if (modulePath) addExport(exported, { modulePath, name: imported });
             else addExport(exported, { binding: imported });
           }
+        } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause) && modulePath) {
+          const exported = statement.exportClause.name.text;
+          addBinding(exported, { namespaceModulePath: modulePath });
+          addExport(exported, { binding: exported });
         } else if (modulePath) {
           module.wildcardExports.push(modulePath);
         }
       }
       if (ts.isExportAssignment(statement)) {
         if (statement.isExportEquals) module.defaultExport = statement.expression;
-        else addExport('default', statement.expression);
+        else {
+          const snapshotBindings = new Map();
+          for (const [name, bindings] of module.bindings) snapshotBindings.set(name, bindings.slice());
+          addExport('default', {
+            snapshotExpression: statement.expression,
+            snapshotBindings
+          });
+        }
       }
       if (ts.isExpressionStatement(statement)) {
         const expression = unwrap(statement.expression);
@@ -257,7 +271,7 @@ function createLocalModuleResolver(files) {
     return module;
   };
 
-  const evaluateProperty = (expression, name, currentPath, visited) => {
+  const evaluateProperty = (expression, name, currentPath, visited, bindingOverrides = new Map()) => {
     const node = unwrap(expression);
     if (!node || visited.has(node)) return new Set();
     const seen = new Set(visited).add(node);
@@ -277,7 +291,7 @@ function createLocalModuleResolver(files) {
             : null;
         if (key !== name) continue;
         const value = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
-        for (const atom of evaluate(value, currentPath, seen)) result.add(atom);
+        for (const atom of evaluate(value, currentPath, seen, new Map(), bindingOverrides)) result.add(atom);
       }
       return result;
     }
@@ -287,12 +301,14 @@ function createLocalModuleResolver(files) {
       const result = new Set();
       for (const binding of bindings) {
         if (binding && binding.base) {
-          for (const atom of evaluateProperty(binding.base, name, currentPath, seen)) result.add(atom);
+          for (const atom of evaluateProperty(binding.base, name, currentPath, seen, bindingOverrides)) result.add(atom);
+        } else {
+          for (const atom of evaluateProperty(binding, name, currentPath, seen, bindingOverrides)) result.add(atom);
         }
       }
       return result;
     }
-    const atoms = evaluate(node, currentPath, seen);
+    const atoms = evaluate(node, currentPath, seen, new Map(), bindingOverrides);
     const result = new Set();
     for (const atom of atoms) {
       const modulePath = modulePathFromAtom(atom);
@@ -393,7 +409,8 @@ function createLocalModuleResolver(files) {
     const bindings = new Map();
     for (let index = 0; index < (callable.parameters || []).length; index += 1) {
       const parameter = callable.parameters[index];
-      const argument = argumentsList?.[index];
+      const suppliedArgument = argumentsList === null ? undefined : argumentsList?.[index];
+      const argument = suppliedArgument ?? parameter.initializer;
       if (!argument) continue;
       if (ts.isIdentifier(parameter.name)) {
         bindings.set(parameter.name.text, { expression: argument, currentPath: callerPath });
@@ -411,7 +428,14 @@ function createLocalModuleResolver(files) {
     return bindings;
   };
 
-  const evaluate = (expression, currentPath, visited = new Set(), parameterBindings = new Map()) => {
+  const evaluate = (expression, currentPath, visited = new Set(), parameterBindings = new Map(),
+    bindingOverrides = new Map()) => {
+    if (expression?.namespaceModulePath) return new Set([moduleAtom(expression.namespaceModulePath)]);
+    if (expression?.snapshotExpression) {
+      const overrides = new Map(bindingOverrides);
+      overrides.set(currentPath, expression.snapshotBindings);
+      return evaluate(expression.snapshotExpression, currentPath, visited, parameterBindings, overrides);
+    }
     const node = unwrap(expression);
     if (!node || visited.has(node)) return new Set();
     const seen = new Set(visited).add(node);
@@ -428,9 +452,9 @@ function createLocalModuleResolver(files) {
       const parameter = parameterBindings.get(node.text);
       if (parameter) {
         if (parameter.name) {
-          return evaluateProperty(parameter.expression, parameter.name, parameter.currentPath, seen);
+          return evaluateProperty(parameter.expression, parameter.name, parameter.currentPath, seen, bindingOverrides);
         }
-        return evaluate(parameter.expression, parameter.currentPath, seen, parameter.bindings || new Map());
+        return evaluate(parameter.expression, parameter.currentPath, seen, parameter.bindings || new Map(), bindingOverrides);
       }
       const module = currentPath && scanModule(currentPath);
       const imported = module?.imports.get(node.text);
@@ -440,13 +464,15 @@ function createLocalModuleResolver(files) {
         }
         return resolveExport(imported.modulePath, imported.name, seen);
       }
-      const bindings = module?.bindings.get(node.text) || [];
+      const bindings = bindingOverrides.has(currentPath) && bindingOverrides.get(currentPath).has(node.text)
+        ? bindingOverrides.get(currentPath).get(node.text)
+        : module?.bindings.get(node.text) || [];
       const result = new Set();
       for (const binding of bindings) {
         if (binding && binding.base) {
-          for (const atom of evaluateProperty(binding.base, binding.name, currentPath, seen)) result.add(atom);
+          for (const atom of evaluateProperty(binding.base, binding.name, currentPath, seen, bindingOverrides)) result.add(atom);
         } else {
-          for (const atom of evaluate(binding, currentPath, seen)) result.add(atom);
+          for (const atom of evaluate(binding, currentPath, seen, parameterBindings, bindingOverrides)) result.add(atom);
         }
       }
       if (module?.bindings.has(node.text)) return result;
@@ -458,8 +484,9 @@ function createLocalModuleResolver(files) {
       const name = propertyName(node) || (ts.isElementAccessExpression(node)
         ? staticPropertyValue(node.argumentExpression, currentPath, seen) : null);
       if (!name) return new Set();
-      const receiver = evaluate(node.expression, currentPath, seen, parameterBindings);
+      const receiver = evaluate(node.expression, currentPath, seen, parameterBindings, bindingOverrides);
       const result = new Set();
+      if (name === 'directPostOwnerAlive') result.add(LEGACY_OWNER);
       if (name === 'kill' && receiver.has(PROCESS_OBJECT)) result.add(PID_PROBE);
       for (const atom of receiver) {
         for (const nested of resolveProperty([atom], String(name), currentPath, seen)) result.add(nested);
@@ -496,7 +523,7 @@ function createLocalModuleResolver(files) {
       return result;
     }
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
-      return evaluate(node.right, currentPath, seen, parameterBindings);
+      return evaluate(node.right, currentPath, seen, parameterBindings, bindingOverrides);
     }
     return new Set();
   };
