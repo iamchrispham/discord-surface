@@ -403,7 +403,12 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       }
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const name = assignmentPropertyNameText(node.left);
-        if (name) names.push(name);
+        const implementation = unwrapExpression(node.right);
+        if (name && (ts.isFunctionExpression(implementation)
+          || ts.isArrowFunction(implementation)
+          || ts.isClassExpression(implementation))) {
+          names.push(name);
+        }
       }
       if (ts.isCallExpression(node)
         && ts.isPropertyAccessExpression(node.expression)
@@ -467,6 +472,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['object computed wrapped template', '({ [(`captureProcessOwnerIdentity`)]: null });', true],
     ['object computed wrapped as string', "({ [('captureProcessOwnerIdentity' as string)]: null });", true, ts.ScriptKind.TS],
     ['property access assignment', 'exports.captureProcessOwnerIdentity = function () {};', true],
+    ['property access alias assignment', 'handlers.captureProcessOwnerIdentity = captureProcessOwnerIdentity;', false],
     ['string element assignment', "exports['captureProcessOwnerIdentity'] = function () {};", true],
     ['concatenated element assignment', "exports['captureProcessOwner' + 'Identity'] = function () {};", true],
     ['angle-bracket element assignment', "exports[<string>'captureProcessOwnerIdentity'] = function () {};", true, ts.ScriptKind.TS],
