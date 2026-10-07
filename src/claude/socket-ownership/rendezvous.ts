@@ -31,6 +31,13 @@ export function assertLockNamespaceIsUsable(namespacePath: string, owner: number
   }
 }
 
+function isOwnerControlledHome(directory: fs.Stats, owner: number | undefined): boolean {
+  return directory.isDirectory() && !directory.isSymbolicLink() &&
+    (owner === undefined || directory.uid === owner) &&
+    (owner === undefined || (directory.mode & 0o200) !== 0) &&
+    (directory.mode & 0o022) === 0;
+}
+
 function publishedFallbackRoot(root: string, owner: number | undefined): string | undefined {
   let directory: fs.Stats;
   try { directory = fs.statSync(root); } catch (error) {
@@ -79,9 +86,7 @@ function publishedFallbackRoot(root: string, owner: number | undefined): string 
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
       if (directHomeStats) {
-        const directOwnerControlled = owner === undefined || directHomeStats.uid === owner;
-        if (!directHomeStats.isDirectory() || directHomeStats.isSymbolicLink() || !directOwnerControlled ||
-          (directHomeStats.mode & 0o077) !== 0) {
+        if (!isOwnerControlledHome(directHomeStats, owner)) {
           throw new Error('Claude channel direct-home target is unusable');
         }
         if (publishedKind === 'fallback') continue;
@@ -261,10 +266,8 @@ export function ownerControlledNamespaceRoot(deps: RendezvousDependencies): stri
     let directory: fs.Stats;
     try { directory = fs.statSync(root); } catch { continue; }
     if (!directory.isDirectory()) continue;
-    const ownerControlledRoot = owner === undefined || directory.uid === owner;
-    const ownerWritableRoot = owner === undefined || (directory.mode & 0o200) !== 0;
     const fallbackClaimedNow = fallbackClaimed || candidates.some(candidate => fallbackRendezvousClaimed(candidate, owner));
-    if (ownerControlledRoot && ownerWritableRoot && (directory.mode & 0o022) === 0 && !fallbackClaimedNow) {
+    if (isOwnerControlledHome(directory, owner) && !fallbackClaimedNow) {
       try {
         fs.accessSync(root, fs.constants.W_OK | fs.constants.X_OK);
         let published = true;

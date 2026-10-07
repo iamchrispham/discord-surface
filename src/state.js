@@ -7,6 +7,8 @@ const createBindingLifecycleHandlers = (...args) => require('./state/binding-lif
 const createConductorCustodyHandlers = (...args) => require('./state/conductor-custody').createConductorCustodyHandlers(...args);
 const createMessageDispatchHandlers = (...args) => require('./state/message-dispatch').createMessageDispatchHandlers(...args);
 const createTransportReceiptHandlers = (...args) => require('./state/transport-receipts').createTransportReceiptHandlers(...args);
+const { createReadinessHandlers } = require('./state/readiness');
+const { createConfigurationHandlers } = require('./state/configuration');
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const legacyAgentRequestRoute = require('./state/legacy-agent-request-route');
 const { WATCHER_NOTICE_PREFIX, validateWatcherNotice } = require('./watcher-notice');
@@ -118,6 +120,7 @@ const MESSAGE_STATES = Object.freeze({
   AGENT_HANDLED_WITHOUT_POST: 'agent_handled_without_post',
   REJECTED: 'rejected'
 });
+const readinessHandlers = createReadinessHandlers({ parseJson, THREAD_STATES, MESSAGE_STATES, RECOVERY_LIMITS });
 const AGENT_COMPLETION_RECEIPTS = Object.freeze({
   RESULT_CONSUMED: 'result-consumed',
   REQUEST_HANDLED_WITHOUT_POST: 'agent-handled-without-post'
@@ -154,6 +157,7 @@ const { REPLY_LIMIT, splitReply } = require('./reply-text');
 
 class StateCorruptError extends Error {}
 class BindingError extends Error {}
+const configurationHandlers = createConfigurationHandlers({ assertText, BindingError });
 class AuthorizationError extends Error {}
 class StaleGenerationError extends Error {}
 class UnresolvedWorkError extends Error {}
@@ -587,37 +591,11 @@ class SurfaceState {
 
   beginTopicPublication(channelId, publication, expectedBinding) { return topicPublicationHandlers.beginTopicPublication.apply(this, arguments); }
 
-  setConfig(values) {
-    const allowed = ['operatorId', 'guildId', 'secretFile', 'codexCategoryId', 'claudeCategoryId'];
-    const current = this.getConfig();
-    const merged = { ...current };
-    for (const key of allowed) {
-      if (values[key] !== undefined) merged[key] = values[key];
-      if (merged[key] !== undefined) assertText(merged[key], key, 4096);
-    }
-    for (const key of ['operatorId', 'guildId', 'secretFile']) {
-      if (!merged[key]) throw new BindingError(`surface is not configured: missing ${key}`);
-    }
-    return this.transaction(() => {
-      const stmt = this.db.prepare('INSERT INTO config(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
-      for (const [key, value] of Object.entries(merged)) if (allowed.includes(key)) stmt.run(key, value);
-      this.receipt(null, 'configured', { guildId: merged.guildId, operatorId: merged.operatorId });
-      return merged;
-    });
-  }
+  setConfig(values) { return configurationHandlers.setConfig.apply(this, arguments); }
 
-  getConfig() {
-    const rows = this.db.prepare('SELECT key, value FROM config').all();
-    return Object.fromEntries(rows.map(row => [row.key, row.value]));
-  }
+  getConfig() { return configurationHandlers.getConfig.apply(this, arguments); }
 
-  requireConfig() {
-    const config = this.getConfig();
-    for (const key of ['operatorId', 'guildId', 'secretFile']) {
-      if (!config[key]) throw new BindingError(`surface is not configured: missing ${key}`);
-    }
-    return config;
-  }
+  requireConfig() { return configurationHandlers.requireConfig.apply(this, arguments); }
 
   bindingInput(binding, existing = null) {
     return bindingLifecycleHandlers.bindingInput.call(this, binding, existing);
@@ -1456,46 +1434,7 @@ class SurfaceState {
   }
 
   getReadiness() {
-    const config = this.getConfig();
-    const bindings = this.listBindings();
-    const messages = this.listMessages();
-    const watermarks = this.listIntakeWatermarks();
-    const threadEnrollments = this.listThreadEnrollments();
-    const topicCustody = this.listTopicPublications();
-    const topicPublications = new Map();
-    for (const row of this.listReceipts().filter(item => item.kind === 'topic-publication' || item.kind === 'topic-publication-reconciled')) {
-      const detail = parseJson(row.detail, {});
-      if (detail.channelId) topicPublications.set(detail.channelId, { ...detail, recordedAt: row.created_at });
-    }
-    const watermarkGap = watermarks.find(row => row.state === 'gap' || row.state === 'unavailable');
-    const watermarkPending = watermarks.some(row => row.state === 'pending');
-    const activeThreadGap = threadEnrollments.find(row => row.active && [THREAD_STATES.GAP, THREAD_STATES.UNAVAILABLE].includes(row.state));
-    const activeThreadPending = threadEnrollments.some(row => row.active && row.state === THREAD_STATES.PENDING);
-    let connectionBackfill = watermarks.length ? 'bounded-by-discord-watermark' : 'pending';
-    if (watermarkPending || activeThreadPending) connectionBackfill = 'pending';
-    if (activeThreadGap) connectionBackfill = activeThreadGap.state === THREAD_STATES.GAP ? 'unrecoverable-gap' : 'unavailable';
-    if (watermarkGap) connectionBackfill = watermarkGap.state === 'gap' ? 'unrecoverable-gap' : 'unavailable';
-    return {
-      configured: Boolean(config.operatorId && config.guildId && config.secretFile),
-      activeBindings: bindings.filter(binding => binding.active).length,
-      inactiveBindings: bindings.filter(binding => !binding.active).length,
-      pending: messages.filter(message => [MESSAGE_STATES.ACCEPTED, MESSAGE_STATES.SUBMITTED, MESSAGE_STATES.REPLY_READY].includes(message.state)).length,
-      uncertain: messages.filter(message => message.state === MESSAGE_STATES.UNCERTAIN).length,
-      unknownDelivery: messages.filter(message => [MESSAGE_STATES.REPLY_FAILED, MESSAGE_STATES.REPLY_UNKNOWN].includes(message.state)).length,
-      execution: bindings.some(binding => binding.active) ? 'unverified-live' : 'unavailable',
-      limits: {
-        permission: 'unverified-live',
-        nativeApproval: 'unverified-live',
-        quota: 'unverified-live',
-        billing: 'unverified-live',
-        connectionBackfill,
-        recovery: RECOVERY_LIMITS
-      },
-      intakeWatermarks: watermarks.map(row => ({ channelId: row.channel_id, lastSeenId: row.last_seen_id, recoveredThroughId: row.recovered_through_id, state: row.state, gapFrom: row.gap_from, gapTo: row.gap_to, detail: row.detail })),
-      threadEnrollments,
-      legacyTopicPublications: [...topicPublications.values()],
-      legacyTopicPublicationCustody: topicCustody
-    };
+    return readinessHandlers.getReadiness.apply(this, arguments);
   }
 
   receipt(discordId, kind, detail) {

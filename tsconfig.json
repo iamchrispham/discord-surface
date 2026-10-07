@@ -124,6 +124,8 @@
     "src/state/town-hall-publication/types.ts",
     "src/state/town-hall-publication/projection.ts",
     "src/state/town-hall-publication/repository.ts",
-    "src/state/town-hall-publication/context.ts"
+    "src/state/town-hall-publication/context.ts",
+    "src/state/thread-enrollment/contracts.ts",
+    "src/state/thread-enrollment/handlers.ts"
   ]
 }
