@@ -339,13 +339,19 @@ const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, al
   let bracketDepth = 0;
   for (let index = openingIndex + 1; index < closingIndex; index += 1) {
     const value = tokens[index].value;
-    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 && OUTCOME_NAMES.has(value)) {
-      if (tokens[index + 1]?.value === ':') {
-        const valueStart = index + 2;
+    const computedKey = value === '[' && tokens[index + 2]?.value === ']';
+    const propertyName = computedKey
+      ? staticPropertyName(tokens[index + 1])
+      : staticPropertyName(tokens[index]);
+    const colonIndex = computedKey ? index + 3 : index + 1;
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && propertyName !== null && OUTCOME_NAMES.has(propertyName)) {
+      if (tokens[colonIndex]?.value === ':') {
+        const valueStart = colonIndex + 1;
         const valueEnd = findDelimitedEnd(tokens, valueStart, closingIndex, '}');
         if (valueHasGap(tokens, valueStart, valueEnd, pairs, aliases, allowNestedCalls)) return true;
       } else if (tokens[index].type === 'identifier'
-        && aliases.has(value)
+        && aliases.has(propertyName)
         && [',', '}'].includes(tokens[index + 1]?.value)) {
         return true;
       }
@@ -965,14 +971,24 @@ const boundBoundaryWriterStateArgument = (tokens, start, end, pairs) => {
 };
 
 const boundaryWriterCallOpeningAt = (tokens, index) => {
-  if (tokens[index + 1]?.value !== ']') return boundaryWriterCallOpening(tokens, index);
-  const afterProperty = index + 2;
+  if (tokens[index + 1]?.value !== ']') {
+    const callOpening = boundaryWriterCallOpening(tokens, index);
+    if (callOpening !== null) return callOpening;
+  }
+  const afterProperty = tokens[index + 1]?.value === ']' ? index + 2 : index + 1;
   if (tokens[afterProperty]?.value === '(') return afterProperty;
   if (tokens[afterProperty]?.value === '?.' && tokens[afterProperty + 1]?.value === '(') {
     return afterProperty + 1;
   }
+  if (tokens[afterProperty]?.value === '.'
+    && tokens[afterProperty + 1]?.value === 'call'
+    && tokens[afterProperty + 2]?.value === '(') return afterProperty + 2;
   return null;
 };
+
+const boundaryWriterCallArgumentOffsetAt = (tokens, opening) => (
+  tokens[opening - 2]?.value === '.' && tokens[opening - 1]?.value === 'call' ? 1 : 0
+);
 
 const trimExpressionRange = (tokens, start, end, pairs) => {
   while (start < end && tokens[end - 1]?.value === ';') end -= 1;
@@ -1005,6 +1021,9 @@ const destructuredValueHasGapOutcome = (tokens, start, end, propertyPath, pairs)
 const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
   if (expression.start >= expression.end) return false;
+  if (tokens[expression.start]?.value === 'await') {
+    return valueHasGapOutcome(tokens, expression.start + 1, expression.end, pairs, aliases);
+  }
   if (expression.end - expression.start === 1 && aliases.has(tokens[expression.start].value)) return true;
   if (isGapMemberExpression(tokens, expression.start, expression.end)) return true;
   if (valueHasGap(tokens, expression.start, expression.end, pairs, aliases)) return true;
@@ -1100,7 +1119,14 @@ const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases
     const opening = boundaryWriterCallOpeningAt(tokens, index);
     const closing = opening === null ? undefined : pairs.get(opening);
     if (closing !== undefined && closing < end
-      && callHasGapArgument(tokens, opening, closing, pairs, stateArgument, aliases)) {
+      && callHasGapArgument(
+        tokens,
+        opening,
+        closing,
+        pairs,
+        stateArgument + boundaryWriterCallArgumentOffsetAt(tokens, opening),
+        aliases
+      )) {
       return true;
     }
   }
@@ -1214,8 +1240,14 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       && tokens[index - 1]?.value !== 'function') {
       const opening = boundaryWriterCallOpeningAt(tokens, index);
       const closing = opening === null ? undefined : pairs.get(opening);
-      if (closing !== undefined && closing < end
-        && callHasGapArgument(tokens, opening, closing, pairs, stateArgument, knownAliases)) return true;
+      if (closing !== undefined && closing < end && callHasGapArgument(
+        tokens,
+        opening,
+        closing,
+        pairs,
+        stateArgument + boundaryWriterCallArgumentOffsetAt(tokens, opening),
+        knownAliases
+      )) return true;
     }
   }
   return opening === null && valueHasGapOutcome(tokens, start, end, pairs, knownAliases);
@@ -1373,19 +1405,21 @@ const findVariableDeclarations = (tokens, pairs, lexicalScopes, functionRanges =
       .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening))[0];
     for (const [segmentStart, segmentEnd] of topLevelSegments(tokens, index + 1, declarationEnd)) {
       const equalsIndex = topLevelToken(tokens, segmentStart, segmentEnd, '=');
-      if (equalsIndex < 0) continue;
-      const bindingIndexes = parameterBindingIndexes(tokens, pairs, segmentStart, equalsIndex);
+      if (equalsIndex < 0 && tokens[index].value !== 'var') continue;
+      const bindingEnd = equalsIndex < 0 ? segmentEnd : equalsIndex;
+      const bindingIndexes = parameterBindingIndexes(tokens, pairs, segmentStart, bindingEnd);
       for (const binding of bindingIndexes) {
         const nameIndex = binding.index;
         if (tokens[nameIndex]?.type !== 'identifier') continue;
         declarations.push({
           name: tokens[nameIndex].value,
           index: nameIndex,
+          kind: tokens[index].value,
           propertyPath: binding.propertyPath,
           scope: tokens[index].value === 'var' && functionScope
             ? lexicalScopePath(lexicalScopes, functionScope.opening + 1)
             : lexicalScopePath(lexicalScopes, index),
-          expressionStart: equalsIndex + 1,
+          expressionStart: equalsIndex < 0 ? segmentEnd : equalsIndex + 1,
           expressionEnd: segmentEnd
         });
       }
@@ -1513,7 +1547,7 @@ const resolveVisibleBinding = (bindings, name, useIndex, lexicalScopes, useScope
   const scope = useScope || lexicalScopePath(lexicalScopes, useIndex);
   const candidates = bindings
     .filter(binding => binding.name === name
-      && binding.index < useIndex
+      && (binding.index < useIndex || binding.kind === 'var')
       && isLexicallyVisible(binding.scope, scope))
     .sort((left, right) => left.scope.length - right.scope.length || left.index - right.index);
   return candidates[candidates.length - 1] || null;
@@ -1864,6 +1898,30 @@ test('deadline policy inventory recognizes optional boundary writer calls', () =
   assert.deepEqual(offenders, ['discord/optional-boundary-writer.js:1']);
 });
 
+test('deadline policy inventory unwraps awaited gap outcomes', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-awaited-gap.js',
+    source: 'if (deadlineReached) return await Promise.resolve(READINESS.GAP);'
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-awaited-gap.js:1']);
+});
+
+test('deadline policy inventory recognizes static computed outcome keys', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-computed-outcome-key.js',
+    source: "if (deadlineReached) return { ['state']: READINESS.GAP };"
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-computed-outcome-key.js:1']);
+});
+
+test('deadline policy inventory recognizes boundary writers invoked through call', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-call-boundary-writer.js',
+    source: 'if (deadlineReached) state.markIntakeBoundary.call(state, id, READINESS.GAP, detail);'
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-call-boundary-writer.js:1']);
+});
+
 test('deadline policy inventory scans fall-through after negated guards', () => {
   const offenders = findDeadlineGapOffenders([{
     relative: 'discord/deadline-negated-fallthrough.js',
@@ -1982,6 +2040,20 @@ test('deadline policy inventory registers destructured local shadow bindings', (
       '    const { expired } = flags;',
       '    if (expired) return READINESS.GAP;',
       '  }',
+      '}'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, []);
+});
+
+test('deadline aliases remain shadowed by hoisted var declarations', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/hoisted-var-shadow.js',
+    source: [
+      'const expired = deadlineReached;',
+      'function nested() {',
+      '  if (expired) return READINESS.GAP;',
+      '  var expired = false;',
       '}'
     ].join('\n')
   }]);
