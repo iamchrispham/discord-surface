@@ -381,7 +381,14 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       if ((ts.isClassDeclaration(node) || ts.isClassExpression(node)) && node.name) {
         names.push(node.name.text);
       }
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) names.push(node.name.text);
+      if (ts.isVariableDeclaration(node)
+        && ts.isIdentifier(node.name)
+        && node.initializer
+        && (ts.isFunctionExpression(node.initializer)
+          || ts.isArrowFunction(node.initializer)
+          || ts.isClassExpression(node.initializer))) {
+        names.push(node.name.text);
+      }
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const name = assignmentPropertyNameText(node.left);
         if (name) names.push(name);
@@ -502,7 +509,6 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     return null;
   };
   const isSurfaceStateReceiver = expression => {
-    if (ts.isIdentifier(expression)) return expression.text === 'SurfaceState';
     if (ts.isPropertyAccessExpression(expression)) {
       return ts.isIdentifier(expression.expression)
         && expression.expression.text === 'SurfaceState'
