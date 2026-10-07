@@ -680,6 +680,7 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) =>
 const BOUNDARY_WRITER_STATE_ARGUMENTS = new Map([
   ['boundary', 0],
   ['markIntakeBoundary', 1],
+  ['markThreadBoundary', 1],
   ['recordBoundary', 2],
   ['recordOwnedBoundary', 2]
 ]);
@@ -1314,6 +1315,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       }
       continue;
     }
+    if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
     const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
     const knownAliases = visibleGapAliasesAt(
       tokens,
@@ -1332,6 +1334,46 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       knownAliases
     )) {
       lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
+    }
+  }
+  let aliasesAdded = true;
+  while (aliasesAdded) {
+    aliasesAdded = false;
+    for (const assignment of assignments) {
+      if (assignment.bindingIndex === undefined
+        || deadlineAliases.some(alias => alias.index === assignment.index
+          && alias.bindingIndex === assignment.bindingIndex)) continue;
+      const valueEnd = findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, tokens.length);
+      const valueRange = trimExpressionRange(tokens, assignment.equalsIndex + 1, valueEnd, pairs);
+      if (valueRange.end - valueRange.start !== 1) continue;
+      const sourceToken = tokens[valueRange.start];
+      if (sourceToken?.type !== 'identifier') continue;
+      const sourceBinding = resolveVisibleBinding(
+        lexicalBindings,
+        sourceToken.value,
+        valueRange.start,
+        lexicalScopes
+      );
+      if (!sourceBinding) continue;
+      const sourceAlias = deadlineAliases.find(alias => alias.name === sourceToken.value
+        && alias.bindingIndex === sourceBinding.index
+        && alias.index < valueRange.start);
+      if (!sourceAlias) continue;
+      const latestSourceAssignment = resolveVisibleAssignment(
+        assignments,
+        sourceAlias.name,
+        valueRange.start,
+        lexicalScopes,
+        sourceBinding.index
+      );
+      if (latestSourceAssignment?.index !== sourceAlias.index) continue;
+      deadlineAliases.push({
+        name: assignment.name,
+        index: assignment.index,
+        bindingIndex: assignment.bindingIndex,
+        scope: assignment.scope
+      });
+      aliasesAdded = true;
     }
   }
   for (const alias of deadlineAliases) {
@@ -1418,6 +1460,34 @@ test('deadline policy inventory follows aliases assigned after declaration', () 
     ].join('\n')
   }]);
   assert.deepEqual(offenders, ['discord/deadline-alias-mutation.js:4']);
+});
+
+test('deadline policy inventory follows chained deadline aliases', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-alias-chain.js',
+    source: [
+      'function readiness() {',
+      '  const expired = deadlineReached;',
+      '  const timedOut = expired;',
+      '  if (timedOut) return READINESS.GAP;',
+      '}'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-alias-chain.js:4']);
+});
+
+test('deadline policy inventory ignores passive deadline metadata and types', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-metadata.js',
+      source: 'const x = { deadlineReached: false, state: READINESS.GAP };'
+    },
+    {
+      relative: 'discord/deadline-metadata.ts',
+      source: "type RecoveryMeta = { deadlineReached: boolean; state: 'gap' };"
+    }
+  ]);
+  assert.deepEqual(offenders, []);
 });
 
 test('deadline policy inventory resolves destructured enum values', () => {
@@ -1876,6 +1946,10 @@ test('deadline policy inventory binds lexical and persistence controls to the de
       source: 'if (deadlineReached) state.markIntakeBoundary(id, READINESS.GAP, detail);'
     },
     {
+      relative: 'discord/thread-boundary-gap.js',
+      source: 'if (deadlineReached) state.markThreadBoundary(id, THREAD_STATES.GAP, detail);'
+    },
+    {
       relative: 'discord/owned-boundary-gap.js',
       source: 'if (deadlineReached) state.recordBoundary(binding, null, READINESS.GAP, detail);'
     },
@@ -1895,6 +1969,7 @@ test('deadline policy inventory binds lexical and persistence controls to the de
     'discord/template-return.js:1',
     'discord/template-property.js:1',
     'discord/persistence-gap.js:1',
+    'discord/thread-boundary-gap.js:1',
     'discord/owned-boundary-gap.js:1',
     'discord/owned-boundary-owned-gap.js:1'
   ]);
