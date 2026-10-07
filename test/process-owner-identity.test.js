@@ -406,6 +406,31 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       return ts.isPropertyAssignment(property) && isImplementationExpression(property.initializer);
     });
   }
+  function hasAmbientAncestor(node) {
+    for (let current = node.parent; current; current = current.parent) {
+      if (hasDeclareModifier(current)
+        || (current.flags & ts.NodeFlags.Ambient) !== 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+  function isRuntimeMemberImplementation(node) {
+    if (hasAmbientAncestor(node)) return false;
+    if (ts.isMethodDeclaration(node)
+      || ts.isGetAccessorDeclaration(node)
+      || ts.isSetAccessorDeclaration(node)) {
+      return Boolean(node.body);
+    }
+    if (ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)) {
+      const initializer = node.initializer && unwrapExpression(node.initializer);
+      return Boolean(initializer)
+        && (ts.isFunctionExpression(initializer)
+          || ts.isArrowFunction(initializer)
+          || ts.isClassExpression(initializer));
+    }
+    return false;
+  }
   function declaredNames(ast) {
     const names = [];
     walk(ast, node => {
@@ -447,11 +472,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
         const name = staticStringText(node.arguments[1]);
         if (name && isDefinePropertyImplementation(node)) names.push(name);
       }
-      if ((ts.isMethodDeclaration(node)
-        || ts.isPropertyDeclaration(node)
-        || ts.isPropertyAssignment(node)
-        || ts.isGetAccessorDeclaration(node)
-        || ts.isSetAccessorDeclaration(node)) && node.name) {
+      if (isRuntimeMemberImplementation(node) && node.name) {
         const name = propertyNameText(node.name);
         if (name) names.push(name);
       }
@@ -490,15 +511,24 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['class static computed satisfies string', "class Example { static ['captureProcessOwnerIdentity' satisfies string]() {} }", true, ts.ScriptKind.TS],
     ['class static computed non-null string', "class Example { static ['captureProcessOwnerIdentity'!]() {} }", true, ts.ScriptKind.TS],
     ['class static computed angle-bracket string', "class Example { static [<string>'captureProcessOwnerIdentity']() {} }", true, ts.ScriptKind.TS],
-    ['class property', 'class Example { captureProcessOwnerIdentity = null; }', true],
-    ['class static string property', "class Example { static 'captureProcessOwnerIdentity' = null; }", true],
+    ['class null property', 'class Example { captureProcessOwnerIdentity = null; }', false],
+    ['class property alias', 'class Example { captureProcessOwnerIdentity = importedCapture; }', false],
+    ['class function property', 'class Example { captureProcessOwnerIdentity = function () {}; }', true],
+    ['class static string null property', "class Example { static 'captureProcessOwnerIdentity' = null; }", false],
+    ['class static string property alias', "class Example { static 'captureProcessOwnerIdentity' = importedCapture; }", false],
     ['class getter', 'class Example { get captureProcessOwnerIdentity() { return null; } }', true],
     ['object method', '({ captureProcessOwnerIdentity() {} });', true],
-    ['object property', '({ captureProcessOwnerIdentity: null });', true],
-    ['object string property', "({ 'captureProcessOwnerIdentity': null });", true],
-    ['object computed property', "({ ['captureProcessOwnerIdentity']: null });", true],
-    ['object computed wrapped template', '({ [(`captureProcessOwnerIdentity`)]: null });', true],
-    ['object computed wrapped as string', "({ [('captureProcessOwnerIdentity' as string)]: null });", true, ts.ScriptKind.TS],
+    ['object null property', '({ captureProcessOwnerIdentity: null });', false],
+    ['object property alias', '({ captureProcessOwnerIdentity: importedCapture });', false],
+    ['object function property', '({ captureProcessOwnerIdentity: function () {} });', true],
+    ['object string null property', "({ 'captureProcessOwnerIdentity': null });", false],
+    ['object string property alias', "({ 'captureProcessOwnerIdentity': importedCapture });", false],
+    ['object computed null property', "({ ['captureProcessOwnerIdentity']: null });", false],
+    ['object computed property alias', "({ ['captureProcessOwnerIdentity']: importedCapture });", false],
+    ['object computed wrapped template null', '({ [(`captureProcessOwnerIdentity`)]: null });', false],
+    ['object computed wrapped template alias', '({ [(`captureProcessOwnerIdentity`)]: importedCapture });', false],
+    ['object computed wrapped as string null', "({ [('captureProcessOwnerIdentity' as string)]: null });", false, ts.ScriptKind.TS],
+    ['object computed wrapped as string alias', "({ [('captureProcessOwnerIdentity' as string)]: importedCapture });", false, ts.ScriptKind.TS],
     ['property access assignment', 'exports.captureProcessOwnerIdentity = function () {};', true],
     ['property access alias assignment', 'handlers.captureProcessOwnerIdentity = captureProcessOwnerIdentity;', false],
     ['string element assignment', "exports['captureProcessOwnerIdentity'] = function () {};", true],
@@ -518,6 +548,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['defineProperty value implementation', "Object.defineProperty(exports, 'captureProcessOwnerIdentity', { value: function () {} });", true],
     ['defineProperty value alias', "Object.defineProperty(exports, 'captureProcessOwnerIdentity', { value: captureProcessOwnerIdentity });", false],
     ['ambient function declaration', 'declare function captureProcessOwnerIdentity(pid: number): Owner | null;', false, ts.ScriptKind.TS],
+    ['ambient class method', 'declare class Example { captureProcessOwnerIdentity() {} }', false, ts.ScriptKind.TS],
     ['dynamic computed method', 'class Example { static [owner]() {} }', false],
     ['dynamic computed property', '({ [owner]: null });', false],
     ['dynamic wrapped computed method', 'class Example { static [(owner)]() {} }', false],
