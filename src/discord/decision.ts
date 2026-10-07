@@ -882,7 +882,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         continue;
       }
       const stored = safeMessage(state, pendingClick.interactionId);
-      if (stored?.decisionResult && pendingClick.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT) {
+      const projectionEnded = pendingClick.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT ||
+        pendingClick.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.REJECTED;
+      if (stored?.decisionResult && projectionEnded) {
         const reconciledNativeOutcome = nativeOutcomeFor(stored, null);
         if (reconciledNativeOutcome && reconciledNativeOutcome !== pendingClick.nativeReturn?.outcome) {
           try {

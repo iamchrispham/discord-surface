@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { encodeAgentMessage, KINDS } = require('../src/agent-message');
 const { claudeEvent, codexPrompt } = require('../src/native');
+const { createDecisionConsumer } = require('../src/discord/decision');
 const {
   DECISION_AUTHORIZATION_OUTCOMES,
   DECISION_REASONS: DOMAIN_DECISION_REASONS
@@ -141,6 +142,35 @@ test('permanent projection outcomes terminalize submitted native custody', () =>
     } finally {
       closeFixture(fixtureState);
     }
+  }
+});
+
+test('rejected projection reconciles later native success after a not-submitted journal', async () => {
+  const fixtureState = fixture();
+  try {
+    const { state } = fixtureState;
+    presented(state);
+    const interactionId = 'rejected-native-reconcile';
+    assert.equal(state.admitDecisionClick(click(state, { interactionId })).accepted, true);
+    assert.equal(state.importDecisionWinner(interactionId, materializedWinner({ reference: 'answer-rejected-native' })).accepted, true);
+    assert.equal(state.recordDecisionProjectionOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.REJECTED).accepted, true);
+    assert.equal(state.recordDecisionNativeReturnOutcome(interactionId, DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED).accepted, true);
+    assert.equal(state.claimDispatch(interactionId).claimed, true);
+    state.markSubmitted(interactionId);
+
+    const consumer = createDecisionConsumer({
+      state,
+      processAccepted: async () => { throw new Error('native retry should be reconciled from the stored message'); },
+      project: async () => {}
+    });
+    const remaining = await consumer.recover(new AbortController().signal);
+
+    assert.deepEqual(remaining, []);
+    assert.equal(state.getDecisionClick(interactionId)?.nativeReturn?.outcome, DECISION_NATIVE_OUTCOMES.SUBMITTED);
+    assert.equal(state.getDecisionClick(interactionId)?.state, DECISION_STATES.TERMINAL);
+    assert.equal(state.listDecisionPendingWork().length, 0);
+  } finally {
+    closeFixture(fixtureState);
   }
 });
 
