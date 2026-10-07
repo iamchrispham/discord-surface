@@ -858,3 +858,26 @@ test('changed constructor refused', () => {
 test('optional delegation refused', () => {
   assert.equal(!matches(insert('newInline(...args) { return configurationHandlers?.getConfig(this, ...args); }')), true);
 });
+
+test('rejects a factory parameter that shadows an outer callable', () => {
+  const discovery = discoverTempFactory(`const hidden = function hidden(state, value) { return value; };
+function createFakeHandlers(hidden) { return { hidden }; }
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('clears an export overwritten by a value descriptor', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = { createFakeHandlers };
+Object.defineProperty(exports, 'createFakeHandlers', { value: 0 });`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects a conditional finally break over a pending return', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+outer: try { return { hidden(state, value) {} }; }
+finally { if (disabled) break outer; }
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
