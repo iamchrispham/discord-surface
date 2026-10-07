@@ -473,6 +473,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     ['prototype property assignment', 'Example.prototype.captureProcessOwnerIdentity = function () {};', true],
     ['named function expression', 'const other = function captureProcessOwnerIdentity() {};', true],
     ['named class expression', 'const Other = class captureProcessOwnerIdentity {};', true],
+    ['parenthesized class initializer', 'const captureProcessOwnerIdentity = (class {});', true],
     ['parenthesized arrow initializer', 'const captureProcessOwnerIdentity = (() => null);', true],
     ['as-wrapped arrow initializer', 'const captureProcessOwnerIdentity = (() => null) as unknown;', true, ts.ScriptKind.TS],
     ['satisfies-wrapped arrow initializer', 'const captureProcessOwnerIdentity = (() => null) satisfies unknown;', true, ts.ScriptKind.TS],
