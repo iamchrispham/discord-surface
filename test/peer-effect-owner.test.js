@@ -51,6 +51,14 @@ test('transport inventory pins every peer network effect and the channel-list lo
   assert.equal(stable.state.directPostRows('owner-channel-list-stable').length, 0);
 });
 
+test('effect inventory traverses declarations without initializers', () => {
+  const sources = realSources();
+  sources['src/direct-post.ts'] += '\nlet uninitializedInventoryValue: unknown;\ntry { throw new Error(); } catch (inventoryError) {}\n';
+  assert.deepEqual(ownerViolations(sources), []);
+  sources['src/direct-post.ts'] += '\nasync function inventoryProbe() { await sendDiscordMessage(); }\n';
+  assert.notDeepEqual(ownerViolations(sources), []);
+});
+
 test('public peer roles supply the caller assertion from the peer caller owner', () => {
   const sources = realSources();
   assert.deepEqual(wiringViolations(sources), []);
@@ -185,6 +193,50 @@ test('the caller assertion factory compares all five captured identity fields', 
     const { state, provider, deps } = scenario.setup();
     await assert.rejects(createCallerAssertion(state, provider, deps, captured)(),
       REFUSAL, `${scenario.name} replacement must refuse`);
+  }
+});
+
+test('rejected destination GET checks readiness after successful caller revalidation', async t => {
+  const { agentFixture, CLAUDE } = require('./direct-post-fixture');
+  const { runDirectPost } = require('../src/direct-post');
+  const { READINESS } = require('../src/state');
+  const target = require('../src/agent-message').issueAgentAddress({
+    guildId: '100', channelId: '102', provider: 'claude', nativeId: CLAUDE, generation: 1
+  }, 'fixture');
+  for (const mode of ['stable', 'source', 'destination']) {
+    const f = agentFixture(t);
+    const requestId = `rejected-get-ready-${mode}`;
+    fs.writeFileSync(f.textFile, 'readiness after rejected lookup');
+    let fetched = false;
+    let validatedAfterGet = false;
+    let destinationCurrent = true;
+    const methods = [];
+    const result = await runDirectPost({
+      state: f.state, token: 'fixture', nativeId: f.nativeId, generation: 1,
+      agentThreadId: f.agentThreadId, textFile: f.textFile, dedupeKey: requestId,
+      agentTarget: target,
+      agentDestinationCurrent: () => destinationCurrent,
+      assertCallerCurrent: async () => {
+        if (!fetched) return;
+        validatedAfterGet = true;
+        if (mode === 'source') {
+          f.state.setBindingReadiness('101', READINESS.GAP, 'source changed after lookup', f.state.getBinding('101'));
+        }
+        if (mode === 'destination') destinationCurrent = false;
+      },
+      fetchImpl: async (_url, options) => {
+        methods.push(options.method);
+        fetched = true;
+        throw new Error('destination lookup failed');
+      }
+    });
+    assert.equal(validatedAfterGet, true);
+    assert.deepEqual(methods, ['GET']);
+    assert.equal(result.status, mode === 'stable' ? 'not_sent' : 'stale');
+    const snapshot = directSnapshot(f.state, requestId);
+    assert.equal(snapshot.attempts, 0);
+    assert.equal(snapshot.outcomes.at(-1).detail.phase, 'preflight');
+    assert.equal(snapshot.outcomes.at(-1).detail.outcome, mode === 'stable' ? 'not_sent' : 'stale');
   }
 });
 

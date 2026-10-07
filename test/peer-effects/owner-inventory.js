@@ -226,7 +226,7 @@ function callSites(sourceFile) {
   };
 
   const collectObjectPropertyInitializers = node => {
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && ts.isObjectLiteralExpression(node.initializer)) {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
       const properties = new Map();
       for (const property of node.initializer.properties) {
         if (ts.isPropertyAssignment(property)) {
