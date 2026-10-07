@@ -829,6 +829,7 @@ function roomDigitPolicies(records) {
     const sourceCandidates = [];
     const extension = path.posix.extname(base);
     const sourceExtension = {
+      '.js': '.ts',
       '.cjs': '.cts',
       '.mjs': '.mts',
     }[extension];
@@ -1210,7 +1211,9 @@ function roomDigitPolicies(records) {
     const visit = node => {
       if (ts.isIdentifier(node) && node.text === namespaceName) {
         const binding = findBinding(info, namespaceName, node);
-        if (!binding || binding.kind !== 'namespace-import') {
+        const isCommonJsNamespace = binding?.kind === 'commonjs-import' &&
+          binding.imported === 'default';
+        if (!binding || (binding.kind !== 'namespace-import' && !isCommonJsNamespace)) {
           ts.forEachChild(node, visit);
           return;
         }
@@ -1348,10 +1351,17 @@ function roomDigitPolicies(records) {
   for (const consumer of infos) {
     const consumerBindings = collectBindings(consumer.ast);
     for (const [localName, imported] of consumer.imports) {
+      const commonJsDefault = imported.commonJs && imported.imported === 'default';
       const references = imported.namespace
         ? namespaceRegexInputs(consumer, localName)
-        : importedRegexInputs(consumer, localName, imported)
-          .map(input => ({ importedName: imported.imported, input }));
+        : commonJsDefault
+          ? [
+            ...importedRegexInputs(consumer, localName, imported)
+              .map(input => ({ importedName: imported.imported, input })),
+            ...namespaceRegexInputs(consumer, localName),
+          ]
+          : importedRegexInputs(consumer, localName, imported)
+            .map(input => ({ importedName: imported.imported, input }));
       for (const { importedName, input } of references) {
         const target = resolveModule(consumer, imported.specifier);
         const resolved = target && resolveRegexExport(target, importedName);
@@ -1518,6 +1528,33 @@ test('room policy inventory records only town-hall room validators', () => {
     ...records,
     mappedRuntimeCtsHelper,
     mappedRuntimeCjsNegativeConsumer,
+  ]), expectedPolicies);
+  const mappedRuntimeJsRoomHelper = {
+    file: 'peer/runtime-js-room-helper.ts',
+    text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const mappedRuntimeJsRoomConsumer = {
+    file: 'peer/runtime-js-room-consumer.ts',
+    text: String.raw`import { ROOM_ID } from './runtime-js-room-helper.js';
+    function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    mappedRuntimeJsRoomHelper,
+    mappedRuntimeJsRoomConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/runtime-js-room-helper.ts': 1,
+  });
+  const mappedRuntimeJsVoiceConsumer = {
+    file: 'peer/runtime-js-room-voice-consumer.ts',
+    text: String.raw`import { ROOM_ID } from './runtime-js-room-helper.js';
+    function validateVoiceRoom(room) { return ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    mappedRuntimeJsRoomHelper,
+    mappedRuntimeJsVoiceConsumer,
   ]), expectedPolicies);
   const mappedRuntimeMtsHelper = {
     file: 'peer/runtime-extension-room-helper.mts',
@@ -2299,6 +2336,43 @@ test('room policy inventory records only town-hall room validators', () => {
     ...expectedPolicies,
     'peer/direct-commonjs-regex.cjs': 1,
   });
+  const commonJsNamespaceRegexHelper = {
+    file: 'peer/commonjs-namespace-room-patterns.cjs',
+    text: String.raw`module.exports = { ROOM_ID: /^\d{1,21}$/ };`,
+  };
+  const commonJsNamespaceRegexConsumer = {
+    file: 'peer/commonjs-namespace-room-consumer.cjs',
+    text: String.raw`const patterns = require('./commonjs-namespace-room-patterns.cjs');
+    function validateTownHallRoom(room) { return patterns.ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    commonJsNamespaceRegexHelper,
+    commonJsNamespaceRegexConsumer,
+  ]), {
+    ...expectedPolicies,
+    'peer/commonjs-namespace-room-patterns.cjs': 1,
+  });
+  const commonJsNamespaceVoiceConsumer = {
+    file: 'peer/commonjs-namespace-room-voice-consumer.cjs',
+    text: String.raw`const patterns = require('./commonjs-namespace-room-patterns.cjs');
+    function validateVoiceRoom(room) { return patterns.ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    commonJsNamespaceRegexHelper,
+    commonJsNamespaceVoiceConsumer,
+  ]), expectedPolicies);
+  const commonJsNamespaceShadowConsumer = {
+    file: 'peer/commonjs-namespace-room-shadow-consumer.cjs',
+    text: String.raw`const patterns = require('./commonjs-namespace-room-patterns.cjs');
+    function validateTownHallRoom(room, patterns) { return patterns.ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    commonJsNamespaceRegexHelper,
+    commonJsNamespaceShadowConsumer,
+  ]), expectedPolicies);
   const directCommonJsMemberHelper = {
     file: 'peer/direct-commonjs-member.cjs',
     text: String.raw`module.exports = { validateGuildId(value) {
