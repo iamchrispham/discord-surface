@@ -482,6 +482,11 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     && strip(statement.getText(stateAst)) === "const{captureProcessOwnerIdentity}=require('./state/process-owner-capture');");
   assert.equal(imports.length, 1);
   const facade = [];
+  const surfaceStateDeclaration = stateAst.statements.find(statement => ts.isClassDeclaration(statement)
+    && statement.name?.text === 'SurfaceState');
+  const surfaceStateMembers = surfaceStateDeclaration ? Array.from(surfaceStateDeclaration.members) : [];
+  const isSurfaceStateFacadeMember = node => surfaceStateMembers.includes(node)
+    && !(node.modifiers ?? []).some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword);
   const staticAssignmentPropertyName = expression => {
     if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
     if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
@@ -498,10 +503,16 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   };
   const isSurfaceStateReceiver = expression => {
     if (ts.isIdentifier(expression)) return expression.text === 'SurfaceState';
-    return ts.isPropertyAccessExpression(expression)
+    if (ts.isPropertyAccessExpression(expression)) {
+      return ts.isIdentifier(expression.expression)
+        && expression.expression.text === 'SurfaceState'
+        && expression.name.text === 'prototype';
+    }
+    return ts.isElementAccessExpression(expression)
+      && !!expression.argumentExpression
       && ts.isIdentifier(expression.expression)
       && expression.expression.text === 'SurfaceState'
-      && expression.name.text === 'prototype';
+      && staticAssignmentPropertyName(expression.argumentExpression) === 'prototype';
   };
   const targetsSurfaceState = expression => (ts.isPropertyAccessExpression(expression)
     || ts.isElementAccessExpression(expression))
@@ -521,6 +532,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       || ts.isPropertyDeclaration(node)
       || ts.isGetAccessorDeclaration(node)
       || ts.isSetAccessorDeclaration(node))
+      && isSurfaceStateFacadeMember(node)
       && propertyNameText(node.name) === 'directPostOwnerIdentity') facade.push(node);
     if (ts.isBinaryExpression(node)
       && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
@@ -534,22 +546,36 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   const facadeInventoryAst = parse(`class SurfaceState {
     directPostOwnerIdentity() {}
     ['directPostOwner' + 'Identity']() {}
+    static directPostOwnerIdentity() {}
+  }
+  class OtherState {
+    directPostOwnerIdentity() {}
   }
   SurfaceState.prototype.directPostOwnerIdentity = function () {};
+  SurfaceState['prototype'].directPostOwnerIdentity = function () {};
   SurfaceState['directPostOwner' + 'Identity'] = function () {};
   Object.defineProperty(SurfaceState.prototype, 'directPostOwnerIdentity', { value() {} });
+  Object.defineProperty(SurfaceState['prototype'], 'directPostOwnerIdentity', { value() {} });
   Object.defineProperty(SurfaceState.prototype, owner, { value() {} });
   Object.defineProperty(handlers, 'directPostOwnerIdentity', { value() {} });
   `);
   const duplicateFacade = [];
+  const inventorySurfaceStateDeclaration = facadeInventoryAst.statements.find(statement => ts.isClassDeclaration(statement)
+    && statement.name?.text === 'SurfaceState');
+  const inventorySurfaceStateMembers = inventorySurfaceStateDeclaration
+    ? Array.from(inventorySurfaceStateDeclaration.members)
+    : [];
   walk(facadeInventoryAst, node => {
-    if (ts.isMethodDeclaration(node) && propertyNameText(node.name) === 'directPostOwnerIdentity') duplicateFacade.push(node);
+    if (ts.isMethodDeclaration(node)
+      && inventorySurfaceStateMembers.includes(node)
+      && !(node.modifiers ?? []).some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword)
+      && propertyNameText(node.name) === 'directPostOwnerIdentity') duplicateFacade.push(node);
     if (ts.isBinaryExpression(node)
       && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
       && staticAssignmentPropertyName(node.left) === 'directPostOwnerIdentity') duplicateFacade.push(node);
     if (definePropertyName(node) === 'directPostOwnerIdentity') duplicateFacade.push(node);
   });
-  assert.equal(duplicateFacade.length, 5);
+  assert.equal(duplicateFacade.length, 7);
 
   const overridingFacadeMembers = [
     ['class field', 'class State { directPostOwnerIdentity = null; }'],
