@@ -220,6 +220,12 @@ function receiptSites(ts, entries) {
         node.expression.text === 'ORDINARY_RECEIPT_KINDS' && RECEIPT_KINDS.has(node.name.text)) {
         sites.push(`${entry.file}|${ownerOf(ts, node)}|ORDINARY_RECEIPT_KINDS.${node.name.text}`);
       }
+      if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) &&
+        node.expression.text === 'ORDINARY_RECEIPT_KINDS' &&
+        node.argumentExpression && ts.isStringLiteral(node.argumentExpression) &&
+        RECEIPT_KINDS.has(node.argumentExpression.text)) {
+        sites.push(`${entry.file}|${ownerOf(ts, node)}|ORDINARY_RECEIPT_KINDS['${node.argumentExpression.text}']`);
+      }
     });
   }
   return sites.sort();
@@ -346,6 +352,19 @@ test('Claude binding owner inventory pins the factory dispatch, receipt census a
   assert.equal(interpolatedWriterMutant.receiptSites.length, real.receiptSites.length + 1,
     'a constant interpolated receipt writer must be rejected by the inventory');
   assert.notDeepEqual(interpolatedWriterMutant.receiptSites, EXPECTED_RECEIPT_SITES.slice().sort());
+
+  // Mutant: a non-Claude writer using computed vocabulary access must still be rejected.
+  const computedWriterMutantEntries = entries.map(entry => entry.file === 'src/state.js'
+    ? {
+      ...entry,
+      text: entry.text.replace('_recordOrdinaryPreflight(binding, detail = {}) {',
+        "_extraReceiptWriter() { this.receipt(null, ORDINARY_RECEIPT_KINDS['NATIVE_PREFLIGHT'], {}); }\n\n  _recordOrdinaryPreflight(binding, detail = {}) {")
+    }
+    : entry);
+  const computedWriterMutant = renderClaudeInventory(ts, computedWriterMutantEntries);
+  assert.equal(computedWriterMutant.receiptSites.length, real.receiptSites.length + 1,
+    'a computed vocabulary receipt writer must be rejected by the inventory');
+  assert.notDeepEqual(computedWriterMutant.receiptSites, EXPECTED_RECEIPT_SITES.slice().sort());
 
   // Mutant: an in-memory copied private Claude preflight policy with a receipt write
   // must be rejected by the name census and the receipt-site census.
