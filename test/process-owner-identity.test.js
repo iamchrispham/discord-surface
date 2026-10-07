@@ -496,6 +496,15 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     }
     return null;
   };
+  const definePropertyName = node => {
+    if (!ts.isCallExpression(node)
+      || !ts.isPropertyAccessExpression(node.expression)
+      || !ts.isIdentifier(node.expression.expression)
+      || node.expression.expression.text !== 'Object'
+      || node.expression.name.text !== 'defineProperty'
+      || node.arguments.length < 2) return null;
+    return staticAssignmentPropertyName(node.arguments[1]);
+  };
   walk(stateAst, node => {
     if ((ts.isMethodDeclaration(node)
       || ts.isPropertyDeclaration(node)
@@ -505,6 +514,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     if (ts.isBinaryExpression(node)
       && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
       && staticAssignmentPropertyName(node.left) === 'directPostOwnerIdentity') facade.push(node);
+    if (definePropertyName(node) === 'directPostOwnerIdentity') facade.push(node);
   });
   assert.equal(facade.length, 1);
   assert.equal(strip(facade[0].body.getText(stateAst)), '{returncaptureProcessOwnerIdentity.apply(this,arguments);}');
@@ -515,6 +525,8 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   }
   State.prototype.directPostOwnerIdentity = function () {};
   State['directPostOwner' + 'Identity'] = function () {};
+  Object.defineProperty(State.prototype, 'directPostOwnerIdentity', { value() {} });
+  Object.defineProperty(State.prototype, owner, { value() {} });
   `);
   const duplicateFacade = [];
   walk(facadeInventoryAst, node => {
@@ -522,8 +534,9 @@ test('17. process capture has one owner and State delegates raw arguments', () =
     if (ts.isBinaryExpression(node)
       && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
       && staticAssignmentPropertyName(node.left) === 'directPostOwnerIdentity') duplicateFacade.push(node);
+    if (definePropertyName(node) === 'directPostOwnerIdentity') duplicateFacade.push(node);
   });
-  assert.equal(duplicateFacade.length, 4);
+  assert.equal(duplicateFacade.length, 5);
 
   const overridingFacadeMembers = [
     ['class field', 'class State { directPostOwnerIdentity = null; }'],
