@@ -324,8 +324,27 @@ function exportedClassDeclaration(source, exportName) {
 
 function exportedPrototypeMutated(source, owner, ownerName) {
   if (!owner) return false;
-  const isPrototypeObject = node => ts.isPropertyAccessExpression(node) &&
-    ts.isIdentifier(node.expression) && node.expression.text === ownerName && node.name.text === 'prototype';
+  const isPrototypeObject = node => {
+    if (ts.isPropertyAccessExpression(node)) {
+      return ts.isIdentifier(node.expression) && node.expression.text === ownerName && node.name.text === 'prototype';
+    }
+    return ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) &&
+      node.expression.text === ownerName && node.argumentExpression &&
+      ts.isStringLiteral(node.argumentExpression) && node.argumentExpression.text === 'prototype';
+  };
+  const bindingHasPrototypeName = node => {
+    if (ts.isBindingElement(node)) {
+      const property = node.propertyName || node.name;
+      return ts.isIdentifier(property) && property.text === 'prototype';
+    }
+    if (ts.isObjectBindingPattern(node) || ts.isArrayBindingPattern(node)) {
+      return node.elements.some(element => bindingHasPrototypeName(element));
+    }
+    return false;
+  };
+  const isPrototypeDestructure = node => ts.isVariableDeclaration(node) && node.initializer &&
+    ts.isIdentifier(node.initializer) && node.initializer.text === ownerName &&
+    bindingHasPrototypeName(node.name);
   const isPrototypeMember = node => {
     if (!node) return false;
     if (isPrototypeObject(node)) return true;
@@ -338,6 +357,10 @@ function exportedPrototypeMutated(source, owner, ownerName) {
   const visit = node => {
     if (mutated) return;
     if (node.getStart(source) > owner.end) {
+      if (isPrototypeObject(node) || isPrototypeDestructure(node)) {
+        mutated = true;
+        return;
+      }
       if (ts.isBinaryExpression(node) && node.operatorToken.kind >= assignmentStart &&
           node.operatorToken.kind <= assignmentEnd && isPrototypeMember(node.left)) {
         mutated = true;

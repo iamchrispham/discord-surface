@@ -32,6 +32,44 @@ function exportedFactoryExpression(source, factoryName, allowDefault = false) {
   const isNamedExport = node => ts.isPropertyAccessExpression(node) &&
     ((ts.isIdentifier(node.expression) && node.expression.text === 'exports') || isModuleExports(node.expression)) &&
     node.name.text === factoryName;
+  const exportWriteKey = node => {
+    if (isNamedExport(node)) return factoryName;
+    if (isModuleExports(node)) return '*';
+    return null;
+  };
+  const exportWrites = node => {
+    const writes = new Set();
+    const visitWrites = current => {
+      if (current !== node && ts.isFunctionLike(current)) return;
+      if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const key = exportWriteKey(current.left);
+        if (key) writes.add(key);
+      }
+      ts.forEachChild(current, visitWrites);
+    };
+    visitWrites(node);
+    return writes;
+  };
+  const hasConflictingTryCatchWrites = node => {
+    let conflicting = false;
+    const visitTry = current => {
+      if (conflicting) return;
+      if (current !== node && ts.isFunctionLike(current)) return;
+      if (ts.isTryStatement(current) && current.catchClause) {
+        const tryWrites = exportWrites(current.tryBlock);
+        const catchWrites = exportWrites(current.catchClause.block);
+        const tryRewritesFactory = tryWrites.has('*') || tryWrites.has(factoryName);
+        const catchRewritesFactory = catchWrites.has('*') || catchWrites.has(factoryName);
+        if (tryWrites.size && catchWrites.size && (tryRewritesFactory || catchRewritesFactory)) {
+          conflicting = true;
+          return;
+        }
+      }
+      ts.forEachChild(current, visitTry);
+    };
+    visitTry(node);
+    return conflicting;
+  };
   const getterExpression = node => {
     if (!ts.isObjectLiteralExpression(node)) return null;
     for (const property of node.properties) {
@@ -88,6 +126,7 @@ function exportedFactoryExpression(source, factoryName, allowDefault = false) {
     }
     ts.forEachChild(node, visit);
   };
+  if (hasConflictingTryCatchWrites(source)) return null;
   visit(source);
   return result;
 }

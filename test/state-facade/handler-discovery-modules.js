@@ -26,6 +26,40 @@ function isAsyncFactory(node) {
   return !!node?.asteriskToken || !!node?.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword);
 }
 
+function bindingContainsName(node, name) {
+  if (!node) return false;
+  if (ts.isIdentifier(node)) return node.text === name;
+  if (ts.isBindingElement(node)) return bindingContainsName(node.name, name);
+  if (ts.isObjectBindingPattern(node) || ts.isArrayBindingPattern(node)) {
+    return node.elements.some(element => bindingContainsName(element, name));
+  }
+  return false;
+}
+
+function hasFactoryLocalBinding(factory, name) {
+  if (!factory || !name) return false;
+  if (factory.parameters.some(parameter => bindingContainsName(parameter.name, name))) return true;
+  let found = false;
+  const visit = node => {
+    if (found || !node) return;
+    if (node !== factory && ts.isFunctionLike(node)) {
+      if (ts.isFunctionDeclaration(node) && bindingContainsName(node.name, name)) found = true;
+      return;
+    }
+    if (ts.isVariableDeclaration(node) && bindingContainsName(node.name, name)) {
+      found = true;
+      return;
+    }
+    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && bindingContainsName(node.name, name)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(factory.body);
+  return found;
+}
+
 function moduleCallableDescriptor(filePath, methodName, seen = new Set()) {
   const key = `${filePath}:${methodName}`;
   if (seen.has(key)) return null;
@@ -137,13 +171,19 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
   const factory = factoryDeclaration(source, factoryName);
   if (!factory) return null;
   if (isAsyncFactory(factory)) return null;
+  if (factory.body && ts.isBlock(factory.body) && statementCanFallThrough(factory.body)) return null;
   const bindings = requireBindings(source);
   const resolveExpression = expression => {
     const called = calledFactory(expression);
     if (!called) return new Map();
-    const local = called.receiver ? null :
-      factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen));
-    if (local?.size) return local;
+    const localFactory = called.receiver ? null : factoryDeclaration(source, called.name);
+    const local = localFactory
+      ? factoryMethodsFromSource(source, sourcePath, called.name, new Set(seen))
+      : null;
+    if (localFactory) return local || new Map();
+    if (called.receiver && ts.isIdentifier(called.receiver) && hasFactoryLocalBinding(factory, called.receiver.text)) {
+      return new Map();
+    }
     const binding = called.receiver
       ? (ts.isIdentifier(called.receiver) ? bindings.get(called.receiver.text, called.receiver) : null)
       : bindings.get(called.name, called.target);
@@ -158,6 +198,7 @@ function factoryMethodsFromSource(source, sourcePath, factoryName, seen) {
     return moduleFactoryMethods(importedPath, importedName, new Set(seen), allowDefault);
   };
   const resolveImportedValue = (receiverName, methodName, receiver) => {
+    if (hasFactoryLocalBinding(factory, receiverName)) return null;
     const binding = bindings.get(receiverName, receiver);
     if (!binding) return null;
     const importedPath = resolveModulePath(binding.modulePath, sourcePath);
@@ -259,6 +300,7 @@ function factoryResolvesToCompanion(source, sourcePath, factoryName, seen = new 
   return expressions.every(expression => {
     const called = calledFactory(expression, true);
     if (!called) return false;
+    if (called.receiver && ts.isIdentifier(called.receiver) && hasFactoryLocalBinding(factory, called.receiver.text)) return false;
     const binding = called.receiver && ts.isIdentifier(called.receiver)
       ? bindings.get(called.receiver.text, called.receiver)
       : bindings.get(called.name, called.target);

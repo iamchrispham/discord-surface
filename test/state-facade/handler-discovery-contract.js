@@ -138,11 +138,23 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
     }
     return null;
   };
+  const resolveSpreadExpression = expression => {
+    let current = expression;
+    while (ts.isParenthesizedExpression(current)) current = current.expression;
+    if (ts.isIdentifier(current)) {
+      const declaration = resolveBinding(current);
+      if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return null;
+    }
+    const resolved = resolveReturnedExpression(current);
+    return resolved.size ? resolved : null;
+  };
   const collectObject = object => {
     const methods = new Map();
     for (const property of object.properties) {
       if (ts.isSpreadAssignment(property)) {
-        for (const [method, descriptor] of resolveReturnedExpression(property.expression)) methods.set(method, descriptor);
+        const resolved = resolveSpreadExpression(property.expression);
+        if (!resolved) return new Map();
+        for (const [method, descriptor] of resolved) methods.set(method, descriptor);
         continue;
       }
       const name = propertyName(property.name);
