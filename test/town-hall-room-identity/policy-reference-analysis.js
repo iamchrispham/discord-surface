@@ -121,6 +121,23 @@ function countIdentifierReferences(sourceFile, name) {
         imports.push({ declaration: named.name, name: named.name.text, scope: sourceFile, namespace: true });
       }
     }
+    if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer) &&
+        ts.isIdentifier(node.initializer.expression) && node.initializer.expression.text === 'require' &&
+        node.initializer.arguments.length === 1 && ts.isStringLiteralLike(node.initializer.arguments[0])) {
+      if (ts.isIdentifier(node.name)) {
+        const declaration = bindings.find(binding => binding.name === node.name.text &&
+          binding.scope === sourceFile)?.declaration || node.name;
+        imports.push({ declaration, name: node.name.text, scope: sourceFile, namespace: true });
+      } else if (ts.isObjectBindingPattern(node.name)) {
+        for (const element of node.name.elements) {
+          if (!ts.isIdentifier(element.name)) continue;
+          const declaration = bindings.find(binding => binding.name === element.name.text &&
+            binding.scope === sourceFile)?.declaration || element.name;
+          imports.push({ declaration, name: element.name.text, scope: sourceFile,
+            importedName: element.propertyName?.text || element.name.text });
+        }
+      }
+    }
     ts.forEachChild(node, visitImports);
   };
   visitImports(sourceFile);
