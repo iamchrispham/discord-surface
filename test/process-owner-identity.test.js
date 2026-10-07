@@ -513,6 +513,7 @@ test('17. process capture has one owner and State delegates raw arguments', () =
       || node.expression.expression.text !== 'Object'
       || node.expression.name.text !== 'defineProperty'
       || node.arguments.length < 2) return null;
+    if (!isSurfaceStateReceiver(node.arguments[0])) return null;
     return staticAssignmentPropertyName(node.arguments[1]);
   };
   walk(stateAst, node => {
@@ -530,14 +531,15 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   assert.equal(facade.length, 1);
   assert.equal(strip(facade[0].body.getText(stateAst)), '{returncaptureProcessOwnerIdentity.apply(this,arguments);}');
 
-  const facadeInventoryAst = parse(`class State {
+  const facadeInventoryAst = parse(`class SurfaceState {
     directPostOwnerIdentity() {}
     ['directPostOwner' + 'Identity']() {}
   }
-  State.prototype.directPostOwnerIdentity = function () {};
-  State['directPostOwner' + 'Identity'] = function () {};
-  Object.defineProperty(State.prototype, 'directPostOwnerIdentity', { value() {} });
-  Object.defineProperty(State.prototype, owner, { value() {} });
+  SurfaceState.prototype.directPostOwnerIdentity = function () {};
+  SurfaceState['directPostOwner' + 'Identity'] = function () {};
+  Object.defineProperty(SurfaceState.prototype, 'directPostOwnerIdentity', { value() {} });
+  Object.defineProperty(SurfaceState.prototype, owner, { value() {} });
+  Object.defineProperty(handlers, 'directPostOwnerIdentity', { value() {} });
   `);
   const duplicateFacade = [];
   walk(facadeInventoryAst, node => {
