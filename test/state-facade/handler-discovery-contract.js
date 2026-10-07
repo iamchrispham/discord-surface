@@ -9,6 +9,7 @@ const {
   mutatedDeclarations,
   propertyName
 } = require('./handler-discovery-bindings');
+const { statementCanFallThrough } = require('./handler-discovery-flow');
 
 const INVOCATION_STYLES = Object.freeze({ THIS: 'this', STATE: 'state', PURE: 'pure' });
 
@@ -86,7 +87,7 @@ function callableDescriptor(node) {
 function collectFactoryMethods(factory, source, resolveExpression = () => new Map(), resolveImportedValue = () => null) {
   const methods = new Map();
   const declarations = callableDeclarations(source, factory);
-  const mutated = mutatedDeclarations(factory, declarations, source);
+  const mutated = mutatedDeclarations(source, declarations, source, true);
   const resolving = new Set();
   const resolveBinding = identifier => declarationForIdentifier(declarations, identifier, source);
   const resolveValue = expression => {
@@ -157,8 +158,15 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
         for (const [method, descriptor] of resolved) methods.set(method, descriptor);
         continue;
       }
-      const name = propertyName(property.name);
-      if (!name) continue;
+      const computedName = property.name && ts.isComputedPropertyName(property.name) &&
+        (ts.isStringLiteral(property.name.expression) || ts.isNumericLiteral(property.name.expression))
+        ? property.name.expression.text
+        : null;
+      const name = propertyName(property.name) || computedName;
+      if (!name) {
+        if (property.name && ts.isComputedPropertyName(property.name)) return new Map();
+        continue;
+      }
       let descriptor = null;
       if (ts.isMethodDeclaration(property)) descriptor = callableDescriptor(property);
       else if (ts.isShorthandPropertyAssignment(property)) descriptor = resolveValue(property.name);
@@ -190,6 +198,15 @@ function collectFactoryMethods(factory, source, resolveExpression = () => new Ma
   const collectReturns = node => {
     if (!node) return;
     if (node !== factory && ts.isFunctionLike(node)) return;
+    if (ts.isBlock(node) || ts.isSourceFile(node)) {
+      let reachable = true;
+      for (const statement of node.statements) {
+        if (!reachable) break;
+        collectReturns(statement);
+        reachable = statementCanFallThrough(statement);
+      }
+      return;
+    }
     if (ts.isReturnStatement(node)) {
       returns.push(node.expression || null);
       return;

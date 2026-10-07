@@ -28,6 +28,14 @@ module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
 });
 
+test('rejects callable bindings reassigned at module scope', () => {
+  const discovery = discoverTempFactory(`let hidden = (state, value) => value;
+hidden = 0;
+function createFakeHandlers() { return { hidden }; }
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
 test('rejects imported companion factories with function-scoped var overwrites', () => {
   const discovery = discoverTempFactory(`function createFakeHandlers() {
   var hidden = (state, value) => value;
@@ -278,6 +286,100 @@ catch { exports.createFakeHandlers = createFakeHandlers; }`);
   assert.equal(discovery.approved, false);
 });
 
+test('rejects conditional export overwrites', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = { createFakeHandlers };
+if (enabled) module.exports.createFakeHandlers = 0;`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects computed and compound conditional export overwrites', () => {
+  for (const [exportSource, write] of [
+    [
+      'exports.createFakeHandlers = createFakeHandlers;',
+      "if (enabled) exports['createFakeHandlers'] = 0;"
+    ],
+    [
+      'module.exports = { createFakeHandlers };',
+      'module.exports.createFakeHandlers ||= 0;'
+    ],
+    [
+      'module.exports = { createFakeHandlers };',
+      "if (enabled) Object.defineProperty(module.exports, 'createFakeHandlers', { value: 0 });"
+    ],
+    [
+      'module.exports = { createFakeHandlers };',
+      'Object.assign(module.exports, { createFakeHandlers: 0 });'
+    ]
+  ]) {
+    const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+${exportSource}
+${write}`);
+    assert.equal(discovery.approved, false, write);
+  }
+});
+
+test('rejects delete, unary, and defineProperties export overwrites', () => {
+  for (const write of [
+    'if (enabled) delete module.exports.createFakeHandlers;',
+    'if (enabled) ++module.exports.createFakeHandlers;',
+    'if (enabled) Object.defineProperties(module.exports, { createFakeHandlers: { value: 0 } });'
+  ]) {
+    const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = { createFakeHandlers };
+${write}`);
+    assert.equal(discovery.approved, false, write);
+  }
+});
+
+test('rejects static computed and spread export overwrites', () => {
+  for (const [factorySource, exportObject] of [
+    [
+      '',
+      "{ createFakeHandlers, ['createFakeHandlers']: 0 }"
+    ],
+    [
+      'function otherFactory() { return { hidden(state, value) {} }; }',
+      "{ createFakeHandlers, ['createFakeHandlers']: otherFactory }"
+    ],
+    [
+      '',
+      '{ createFakeHandlers, ...overrides }'
+    ]
+  ]) {
+    const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+${factorySource}
+module.exports = ${exportObject};`);
+    assert.equal(discovery.approved, false, exportObject);
+  }
+});
+
+test('accepts stale exports alias writes after replacing module exports', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = { createFakeHandlers };
+if (enabled) exports.createFakeHandlers = 0;`);
+  assert.equal(discovery.approved, true);
+});
+
+test('rejects export getters with a non-callable return path', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+Object.defineProperty(exports, 'createFakeHandlers', {
+  get: function () { if (disabled) return 0; return createFakeHandlers; }
+});`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects getter-local factory shadows', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+Object.defineProperty(exports, 'createFakeHandlers', {
+  get: function () {
+    const createFakeHandlers = 0;
+    return createFakeHandlers;
+  }
+});`);
+  assert.equal(discovery.approved, false);
+});
+
 test('rejects fallthrough in a recursively resolved factory', () => {
   const discovery = discoverTempFactory(`function createInner() {
   if (enabled) return { hidden(state, value) {} };
@@ -295,9 +397,65 @@ module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
 });
 
+test('rejects callable mutations through a called module helper', () => {
+  const discovery = discoverTempFactory(`let hidden = (state, value) => value;
+function clobber() { hidden = 0; }
+function createFakeHandlers() {
+  clobber();
+  return { hidden };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects exported factories mutated through module helpers', () => {
+  const discovery = discoverTempFactory(`let createFakeHandlers = function () { return { hidden(state, value) {} }; };
+function clobber() { createFakeHandlers = 0; }
+clobber();
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('ignores mutations of helper-local shadow bindings', () => {
+  for (const helper of [
+    `function clobber(hidden) { hidden = 0; }`,
+    `function clobber() { let hidden = 0; hidden = 1; }`,
+    `const clobber = hidden => { hidden = 0; };`,
+    `class Clobber { run(hidden) { hidden = 0; } }`
+  ]) {
+    const invocation = helper.startsWith('class') ? 'new Clobber().run();' : 'clobber();';
+    const discovery = discoverTempFactory(`let hidden = (state, value) => value;
+${helper}
+function createFakeHandlers() {
+  ${invocation}
+  return { hidden };
+}
+module.exports = { createFakeHandlers };`);
+    assert.equal(discovery.approved, true, helper);
+  }
+});
+
+test('rejects unresolved computed handler keys', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  const methodName = 'hidden';
+  return { hidden(state, value) {}, [methodName]: 0 };
+}
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
 test('rejects a factory parameter that shadows an outer callable', () => {
   const discovery = discoverTempFactory(`const hidden = function hidden(state, value) { return value; };
 function createFakeHandlers(hidden) { return { hidden }; }
+module.exports = { createFakeHandlers };`);
+  assert.equal(discovery.approved, false);
+});
+
+test('ignores unreachable factory returns', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() {
+  throw new Error('unreachable');
+  return { hidden(state, value) {} };
+}
 module.exports = { createFakeHandlers };`);
   assert.equal(discovery.approved, false);
 });
