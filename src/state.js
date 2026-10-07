@@ -8,6 +8,7 @@ const createConductorCustodyHandlers = (...args) => require('./state/conductor-c
 const createMessageDispatchHandlers = (...args) => require('./state/message-dispatch').createMessageDispatchHandlers(...args);
 const createTransportReceiptHandlers = (...args) => require('./state/transport-receipts').createTransportReceiptHandlers(...args);
 const { createReadinessHandlers } = require('./state/readiness');
+const { createConfigurationHandlers } = require('./state/configuration');
 const { PREFIX: AGENT_PREFIX } = require('./agent-message');
 const legacyAgentRequestRoute = require('./state/legacy-agent-request-route');
 const { WATCHER_NOTICE_PREFIX, validateWatcherNotice } = require('./watcher-notice');
@@ -156,6 +157,7 @@ const { REPLY_LIMIT, splitReply } = require('./reply-text');
 
 class StateCorruptError extends Error {}
 class BindingError extends Error {}
+const configurationHandlers = createConfigurationHandlers({ assertText, BindingError });
 class AuthorizationError extends Error {}
 class StaleGenerationError extends Error {}
 class UnresolvedWorkError extends Error {}
@@ -589,37 +591,11 @@ class SurfaceState {
 
   beginTopicPublication(channelId, publication, expectedBinding) { return topicPublicationHandlers.beginTopicPublication.apply(this, arguments); }
 
-  setConfig(values) {
-    const allowed = ['operatorId', 'guildId', 'secretFile', 'codexCategoryId', 'claudeCategoryId'];
-    const current = this.getConfig();
-    const merged = { ...current };
-    for (const key of allowed) {
-      if (values[key] !== undefined) merged[key] = values[key];
-      if (merged[key] !== undefined) assertText(merged[key], key, 4096);
-    }
-    for (const key of ['operatorId', 'guildId', 'secretFile']) {
-      if (!merged[key]) throw new BindingError(`surface is not configured: missing ${key}`);
-    }
-    return this.transaction(() => {
-      const stmt = this.db.prepare('INSERT INTO config(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
-      for (const [key, value] of Object.entries(merged)) if (allowed.includes(key)) stmt.run(key, value);
-      this.receipt(null, 'configured', { guildId: merged.guildId, operatorId: merged.operatorId });
-      return merged;
-    });
-  }
+  setConfig(values) { return configurationHandlers.setConfig.apply(this, arguments); }
 
-  getConfig() {
-    const rows = this.db.prepare('SELECT key, value FROM config').all();
-    return Object.fromEntries(rows.map(row => [row.key, row.value]));
-  }
+  getConfig() { return configurationHandlers.getConfig.apply(this, arguments); }
 
-  requireConfig() {
-    const config = this.getConfig();
-    for (const key of ['operatorId', 'guildId', 'secretFile']) {
-      if (!config[key]) throw new BindingError(`surface is not configured: missing ${key}`);
-    }
-    return config;
-  }
+  requireConfig() { return configurationHandlers.requireConfig.apply(this, arguments); }
 
   bindingInput(binding, existing = null) {
     return bindingLifecycleHandlers.bindingInput.call(this, binding, existing);

@@ -397,6 +397,7 @@ test('public hook startup blocks when its module or runtime build is missing', t
   fs.copyFileSync(path.join(path.dirname(CLI), 'state.js'), path.join(isolated, 'state.js'));
   fs.mkdirSync(path.join(isolated, 'state'));
   fs.copyFileSync(path.join(path.dirname(CLI), 'state', 'readiness.js'), path.join(isolated, 'state', 'readiness.js'));
+  fs.copyFileSync(path.join(path.dirname(CLI), 'state', 'configuration.js'), path.join(isolated, 'state', 'configuration.js'));
   fs.copyFileSync(path.join(path.dirname(CLI), 'agent-message.js'), path.join(isolated, 'agent-message.js'));
   result = run();
   denied({ ...result, decision: JSON.parse(result.stdout).hookSpecificOutput }, /build is missing/);
