@@ -49,7 +49,9 @@ function createLocalModuleResolver(files) {
           const packageStem = packageExtension && ['.js', '.jsx', '.cjs', '.mjs', '.ts', '.tsx']
             .includes(packageExtension) ? packageBase.slice(0, -packageExtension.length) : packageBase;
           const packageCandidates = [packageBase, packageStem, `${packageStem}.js`, `${packageStem}.ts`,
-            `${packageStem}.tsx`, `${packageStem}.cjs`, `${packageStem}.mjs`];
+            `${packageStem}.tsx`, `${packageStem}.cjs`, `${packageStem}.mjs`,
+            ...['.js', '.jsx', '.cjs', '.mjs', '.ts', '.tsx']
+              .map(extension => path.join(packageStem, `index${extension}`))];
           const entry = packageCandidates.find(candidate => moduleByPath.has(path.resolve(candidate)));
           if (entry) return path.resolve(entry);
         }
@@ -74,10 +76,13 @@ function createLocalModuleResolver(files) {
     const module = {
       path: resolvedPath,
       bindings: new Map(),
+      declaredBindings: new Set(),
       imports: new Map(),
       exports: new Map(),
       defaultExport: null,
+      defaultExports: [],
       exportEquals: null,
+      exportEqualsCandidates: [],
       wildcardExports: [],
       exportAliases: new Set(['exports'])
     };
@@ -94,6 +99,17 @@ function createLocalModuleResolver(files) {
       const existing = module.exports.get(name);
       if (existing) existing.push(value);
       else module.exports.set(name, [value]);
+    };
+    const addDefaultExport = expression => {
+      if (!expression) return;
+      module.defaultExport = expression;
+      module.defaultExports.push(expression);
+    };
+    const addExportEquals = expression => {
+      if (!expression) return;
+      module.exportEquals = expression;
+      module.exportEqualsCandidates.push(expression);
+      addDefaultExport(expression);
     };
     const isExportObjectExpression = expression => {
       const node = unwrap(expression);
@@ -117,6 +133,7 @@ function createLocalModuleResolver(files) {
     };
     const recordVariable = (declaration, exported = false) => {
       if (ts.isIdentifier(declaration.name)) {
+        module.declaredBindings.add(declaration.name.text);
         addBinding(declaration.name.text, declaration.initializer);
         recordExportAlias(declaration.name.text, declaration.initializer);
         if (exported) {
@@ -126,11 +143,20 @@ function createLocalModuleResolver(files) {
         }
         return;
       }
-      if (!declaration.initializer || !ts.isObjectBindingPattern(declaration.name)) return;
+      if (!declaration.initializer || (!ts.isObjectBindingPattern(declaration.name) &&
+        !ts.isArrayBindingPattern(declaration.name))) return;
+      let index = 0;
       for (const element of declaration.name.elements) {
+        if (ts.isOmittedExpression(element)) {
+          index += 1;
+          continue;
+        }
         if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
-        const name = element.propertyName && (ts.isIdentifier(element.propertyName) ||
-          ts.isStringLiteral(element.propertyName)) ? element.propertyName.text : element.name.text;
+        const arrayBinding = ts.isArrayBindingPattern(declaration.name);
+        const name = arrayBinding ? String(index++) : element.propertyName &&
+          (ts.isIdentifier(element.propertyName) || ts.isStringLiteral(element.propertyName))
+          ? element.propertyName.text : element.name.text;
+        module.declaredBindings.add(element.name.text);
         addBinding(element.name.text, { base: declaration.initializer, name });
         if (exported) addExport(element.name.text, { binding: element.name.text });
       }
@@ -139,25 +165,25 @@ function createLocalModuleResolver(files) {
       const isDefault = declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword);
       if (!declaration.name) {
         if (exported && isDefault) {
-          module.defaultExport = declaration;
+          addDefaultExport(declaration);
         }
         return;
       }
       addBinding(declaration.name.text, declaration);
       if (exported && !isDefault) addExport(declaration.name.text, { binding: declaration.name.text });
       if (isDefault) {
-        module.defaultExport = declaration;
+        addDefaultExport(declaration);
       }
     };
     const recordClass = (declaration, exported = false) => {
       const isDefault = declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword);
       if (!declaration.name) {
-        if (exported && isDefault) module.defaultExport = declaration;
+        if (exported && isDefault) addDefaultExport(declaration);
         return;
       }
       addBinding(declaration.name.text, declaration);
       if (exported && !isDefault) addExport(declaration.name.text, { binding: declaration.name.text });
-      if (isDefault) module.defaultExport = declaration;
+      if (isDefault) addDefaultExport(declaration);
     };
     const recordImport = declaration => {
       if (!ts.isStringLiteral(declaration.moduleSpecifier)) return;
@@ -200,10 +226,61 @@ function createLocalModuleResolver(files) {
       const modulePath = resolveRequest(resolvedPath, reference.expression.text);
       if (modulePath) module.imports.set(declaration.name.text, { modulePath, name: '*' });
     };
+    const staticTruthiness = (expression, visited = new Set()) => {
+      const node = unwrap(expression);
+      if (!node || visited.has(node)) return null;
+      const seen = new Set(visited).add(node);
+      if (node.kind === ts.SyntaxKind.TrueKeyword) return true;
+      if (node.kind === ts.SyntaxKind.FalseKeyword || node.kind === ts.SyntaxKind.NullKeyword) return false;
+      if (ts.isNumericLiteral(node)) return Number(node.text) !== 0;
+      if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text.length > 0;
+      if (ts.isVoidExpression(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node) ||
+        ts.isClassExpression(node) || ts.isObjectLiteralExpression(node) || ts.isArrayLiteralExpression(node) ||
+        ts.isNewExpression(node) || ts.isClassDeclaration(node)) return !ts.isVoidExpression(node);
+      if (ts.isIdentifier(node)) {
+        if (node.text === 'undefined') return false;
+        const bindings = module.bindings.get(node.text) || [];
+        if (!bindings.length) return module.declaredBindings.has(node.text) ? false : null;
+        const states = bindings.map(binding => staticTruthiness(binding, seen));
+        return states.every(state => state === states[0]) ? states[0] : null;
+      }
+      if (ts.isPropertyAccessExpression(node) && node.name.text === 'kill' &&
+        ts.isIdentifier(node.expression) && node.expression.text === 'process' &&
+        !module.declaredBindings.has('process')) return true;
+      return null;
+    };
+    const staticNullishness = (expression, visited = new Set()) => {
+      const node = unwrap(expression);
+      if (!node || visited.has(node)) return null;
+      const seen = new Set(visited).add(node);
+      if (node.kind === ts.SyntaxKind.NullKeyword || ts.isVoidExpression(node) ||
+        ts.isIdentifier(node) && node.text === 'undefined') return true;
+      if (node.kind === ts.SyntaxKind.TrueKeyword || node.kind === ts.SyntaxKind.FalseKeyword ||
+        ts.isNumericLiteral(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ||
+        ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isClassExpression(node) ||
+        ts.isObjectLiteralExpression(node) || ts.isArrayLiteralExpression(node) || ts.isNewExpression(node)) return false;
+      if (ts.isIdentifier(node)) {
+        const bindings = module.bindings.get(node.text) || [];
+        if (!bindings.length) return module.declaredBindings.has(node.text) ? true : null;
+        const states = bindings.map(binding => staticNullishness(binding, seen));
+        return states.every(state => state === states[0]) ? states[0] : null;
+      }
+      if (ts.isPropertyAccessExpression(node) && node.name.text === 'kill' &&
+        ts.isIdentifier(node.expression) && node.expression.text === 'process' &&
+        !module.declaredBindings.has('process')) return false;
+      return null;
+    };
     const recordAssignment = expression => {
-      if (!ts.isBinaryExpression(expression) || expression.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return;
+      if (!ts.isBinaryExpression(expression)) return;
+      const operator = expression.operatorToken.kind;
+      const logicalOperator = [ts.SyntaxKind.QuestionQuestionEqualsToken,
+        ts.SyntaxKind.BarBarEqualsToken, ts.SyntaxKind.AmpersandAmpersandEqualsToken].includes(operator);
+      if (operator !== ts.SyntaxKind.EqualsToken && !logicalOperator) return;
       const left = unwrap(expression.left);
       if (ts.isIdentifier(left)) {
+        if (operator === ts.SyntaxKind.QuestionQuestionEqualsToken && staticNullishness(left) === false) return;
+        if (operator === ts.SyntaxKind.BarBarEqualsToken && staticTruthiness(left) === true) return;
+        if (operator === ts.SyntaxKind.AmpersandAmpersandEqualsToken && staticTruthiness(left) === false) return;
         addBinding(left.text, expression.right);
         recordExportAlias(left.text, expression.right);
       }
@@ -213,13 +290,11 @@ function createLocalModuleResolver(files) {
       if (isExportObjectExpression(receiver)) addExport(name, expression.right);
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module') {
-        module.defaultExport = expression.right;
-        module.exportEquals = expression.right;
+        addExportEquals(expression.right);
       }
       if (ts.isElementAccessExpression(left) && name === 'exports' && ts.isIdentifier(left.expression) &&
         left.expression.text === 'module') {
-        module.defaultExport = expression.right;
-        module.exportEquals = expression.right;
+        addExportEquals(expression.right);
       }
     };
     const recordExportExpression = expression => {
@@ -229,8 +304,7 @@ function createLocalModuleResolver(files) {
       const left = unwrap(expression.left);
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module') {
-        module.defaultExport = expression.right;
-        module.exportEquals = expression.right;
+        addExportEquals(expression.right);
         if (ts.isObjectLiteralExpression(expression.right)) {
           for (const property of expression.right.properties) {
             if (!property.name || (!ts.isPropertyAssignment(property) &&
@@ -246,15 +320,75 @@ function createLocalModuleResolver(files) {
     };
     const recordExportAssignment = statement => {
       if (statement.isExportEquals) {
-        module.exportEquals = statement.expression;
-        module.defaultExport = statement.expression;
+        addExportEquals(statement.expression);
       }
+    };
+    const recordDefineProperty = expression => {
+      if (!ts.isCallExpression(expression) || !ts.isPropertyAccessExpression(expression.expression) ||
+        expression.expression.name.text !== 'defineProperty' ||
+        !ts.isIdentifier(expression.expression.expression) || expression.expression.expression.text !== 'Object' ||
+        module.declaredBindings.has('Object')) return;
+      const [target, key, descriptor] = expression.arguments;
+      if (!target || !key || !descriptor || !isExportObjectExpression(target) ||
+        (!ts.isStringLiteral(key) && !ts.isNoSubstitutionTemplateLiteral(key)) ||
+        !ts.isObjectLiteralExpression(descriptor)) return;
+      for (const property of descriptor.properties) {
+        if (!ts.isPropertyAssignment(property) || !property.name) continue;
+        const propertyName = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
+          ? property.name.text : null;
+        if (propertyName === 'value') addExport(key.text, property.initializer);
+      }
+    };
+    const scanCallableModuleWrites = callable => {
+      const hasLocalBinding = (functionLike, assignment, name) => {
+        if (functionLike.parameters?.some(parameter =>
+          ts.isIdentifier(parameter.name) && parameter.name.text === name)) return true;
+        let current = assignment.parent;
+        while (current && current !== functionLike) {
+          if (ts.isBlock(current) && current.statements.some(statement => ts.isVariableStatement(statement) &&
+            (statement.declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
+            statement.declarationList.declarations.some(declaration =>
+              ts.isIdentifier(declaration.name) && declaration.name.text === name))) return true;
+          if (ts.isCatchClause(current) && current.variableDeclaration &&
+            ts.isIdentifier(current.variableDeclaration.name) && current.variableDeclaration.name.text === name) return true;
+          current = current.parent;
+        }
+        let hasFunctionScopedDeclaration = false;
+        const inspectDeclarations = child => {
+          if (child !== functionLike.body && ts.isFunctionLike(child)) return;
+          if (ts.isVariableDeclaration(child) && ts.isIdentifier(child.name) && child.name.text === name &&
+            (child.parent.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) === 0) {
+            hasFunctionScopedDeclaration = true;
+          }
+          ts.forEachChild(child, inspectDeclarations);
+        };
+        if (functionLike.body) inspectDeclarations(functionLike.body);
+        return hasFunctionScopedDeclaration;
+      };
+      const visit = child => {
+        if (child !== callable && ts.isFunctionLike(child)) {
+          scanCallableModuleWrites(child);
+          return;
+        }
+        if (ts.isBinaryExpression(child)) {
+          const left = unwrap(child.left);
+          if (ts.isIdentifier(left) && module.declaredBindings.has(left.text) &&
+            !hasLocalBinding(callable, child, left.text)) recordAssignment(child);
+        }
+        ts.forEachChild(child, visit);
+      };
+      if (callable.body) visit(callable.body);
+      else if (ts.isClassDeclaration(callable) || ts.isClassExpression(callable)) visit(callable);
     };
     const scanModuleLevel = node => {
       if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) ||
         ts.isArrowFunction(node) || ts.isMethodDeclaration(node) ||
-        ts.isClassDeclaration(node) || ts.isClassExpression(node)) return;
+        ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+        scanCallableModuleWrites(node);
+        return;
+      }
       if (ts.isBinaryExpression(node)) recordAssignment(node);
+      if (ts.isCallExpression(node)) recordDefineProperty(node);
       ts.forEachChild(node, scanModuleLevel);
     };
 
@@ -275,13 +409,16 @@ function createLocalModuleResolver(files) {
       }
       if (ts.isExportDeclaration(statement)) {
         const moduleSpecifier = statement.moduleSpecifier;
+        const specifier = moduleSpecifier && ts.isStringLiteral(moduleSpecifier) ? moduleSpecifier.text : null;
+        const builtinProcess = specifier === 'node:process' || specifier === 'process';
         const modulePath = moduleSpecifier && ts.isStringLiteral(moduleSpecifier)
-          ? resolveRequest(resolvedPath, moduleSpecifier.text) : null;
+          ? resolveRequest(resolvedPath, specifier) : null;
         if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
           for (const specifier of statement.exportClause.elements) {
             const exported = specifier.name.text;
             const imported = (specifier.propertyName || specifier.name).text;
             if (modulePath) addExport(exported, { modulePath, name: imported });
+            else if (builtinProcess) addExport(exported, { builtin: 'process', name: imported });
             else addExport(exported, { binding: imported });
           }
         } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause) && modulePath) {
@@ -335,6 +472,13 @@ function createLocalModuleResolver(files) {
         for (const atom of evaluate(value, currentPath, seen, new Map(), bindingOverrides)) result.add(atom);
       }
       return result;
+    }
+    if (ts.isArrayLiteralExpression(node)) {
+      const index = Number(name);
+      if (!Number.isInteger(index) || index < 0) return new Set();
+      const element = node.elements[index];
+      if (!element || ts.isSpreadElement(element)) return new Set();
+      return evaluate(element, currentPath, seen, new Map(), bindingOverrides);
     }
     if (ts.isIdentifier(node)) {
       const module = currentPath && modules.get(currentPath);
@@ -406,16 +550,31 @@ function createLocalModuleResolver(files) {
 
   const resolveClassProperty = (atom, name, currentPath, visited) => {
     if (!atom?.classDeclaration) return new Set();
+    if (visited.has(atom.classDeclaration)) return new Set();
     const result = new Set();
-    for (const expression of classPropertyExpressions(atom.classDeclaration, name, !atom.instance)) {
+    const declaration = atom.classDeclaration;
+    const seen = new Set(visited).add(declaration);
+    const expressions = classPropertyExpressions(declaration, name, !atom.instance);
+    for (const expression of expressions) {
       if (ts.isGetAccessorDeclaration(expression)) {
         for (const returnExpression of callableReturnExpressions(expression)) {
-          for (const nested of evaluate(returnExpression, atom.modulePath || currentPath, visited)) result.add(nested);
+          for (const nested of evaluate(returnExpression, atom.modulePath || currentPath, seen)) result.add(nested);
         }
       } else if (ts.isMethodDeclaration(expression)) {
         result.add({ callable: expression, modulePath: atom.modulePath || currentPath });
       } else {
-        for (const nested of evaluate(expression, atom.modulePath || currentPath, visited)) result.add(nested);
+        for (const nested of evaluate(expression, atom.modulePath || currentPath, seen)) result.add(nested);
+      }
+    }
+    if (expressions.length) return result;
+    for (const heritage of declaration.heritageClauses || []) {
+      if (heritage.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+      for (const type of heritage.types) {
+        for (const parent of evaluate(type.expression, atom.modulePath || currentPath, seen)) {
+          if (!parent?.classDeclaration) continue;
+          for (const nested of resolveClassProperty({ ...parent, instance: atom.instance }, name,
+            atom.modulePath || currentPath, seen)) result.add(nested);
+        }
       }
     }
     return result;
@@ -453,7 +612,9 @@ function createLocalModuleResolver(files) {
       const suppliedArgument = argumentsList === null ? undefined : argumentsList?.[index];
       const suppliedNode = unwrap(suppliedArgument);
       const explicitUndefined = Boolean(suppliedNode) &&
-        ts.isIdentifier(suppliedNode) && suppliedNode.text === 'undefined';
+        (ts.isIdentifier(suppliedNode) && suppliedNode.text === 'undefined' ||
+          ts.isVoidExpression(suppliedNode) && ts.isNumericLiteral(unwrap(suppliedNode.expression)) &&
+          Number(unwrap(suppliedNode.expression).text) === 0);
       const argument = suppliedArgument === undefined || explicitUndefined ? parameter.initializer : suppliedArgument;
       if (!argument) continue;
       if (ts.isIdentifier(parameter.name)) {
@@ -494,13 +655,22 @@ function createLocalModuleResolver(files) {
       const sources = [];
       let found = false;
       const collect = child => {
-        if (child !== scope && (ts.isBlock(child) || ts.isFunctionLike(child) ||
+        if (child !== scope && (ts.isFunctionLike(child) ||
           ts.isClassDeclaration(child) || ts.isClassExpression(child))) return;
+        if (child !== scope && ts.isBlock(child)) {
+          const shadowsBinding = child.statements.some(statement => ts.isVariableStatement(statement) &&
+            (statement.declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
+            statement.declarationList.declarations.some(declaration =>
+              ts.isIdentifier(declaration.name) && declaration.name.text === name));
+          if (shadowsBinding) return;
+        }
         if (ts.isVariableDeclaration(child) && ts.isIdentifier(child.name) && child.name.text === name) {
           found = true;
           if (child.initializer) sources.push(child.initializer);
         }
-        if (ts.isBinaryExpression(child) && child.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        if (ts.isBinaryExpression(child) && [ts.SyntaxKind.EqualsToken,
+          ts.SyntaxKind.QuestionQuestionEqualsToken, ts.SyntaxKind.BarBarEqualsToken,
+          ts.SyntaxKind.AmpersandAmpersandEqualsToken].includes(child.operatorToken.kind)) {
           const left = unwrap(child.left);
           if (ts.isIdentifier(left) && left.text === name) {
             found = true;
@@ -522,6 +692,8 @@ function createLocalModuleResolver(files) {
     return null;
   };
 
+  const BOUND_PROBE = 'bound-process-probe';
+  const GLOBAL_OBJECT = 'global-object';
   const evaluate = (expression, currentPath, visited = new Set(), parameterBindings = new Map(),
     bindingOverrides = new Map()) => {
     if (expression?.namespaceModulePath) return new Set([moduleAtom(expression.namespaceModulePath)]);
@@ -587,6 +759,7 @@ function createLocalModuleResolver(files) {
       if (module?.bindings.has(node.text)) return result;
       if (result.size) return result;
       if (node.text === 'process') return new Set([PROCESS_OBJECT]);
+      if (node.text === 'globalThis' || node.text === 'global') return new Set([GLOBAL_OBJECT]);
       return result;
     }
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
@@ -596,7 +769,9 @@ function createLocalModuleResolver(files) {
       const receiver = evaluate(node.expression, currentPath, seen, parameterBindings, bindingOverrides);
       const result = new Set();
       if (name === 'directPostOwnerAlive') result.add(LEGACY_OWNER);
+      if (name === 'process' && receiver.has(GLOBAL_OBJECT)) result.add(PROCESS_OBJECT);
       if (name === 'kill' && receiver.has(PROCESS_OBJECT)) result.add(PID_PROBE);
+      if (name === 'bind' && receiver.has(PID_PROBE)) result.add(BOUND_PROBE);
       for (const atom of receiver) {
         for (const nested of resolveProperty([atom], String(name), currentPath, seen)) result.add(nested);
       }
@@ -607,6 +782,10 @@ function createLocalModuleResolver(files) {
       const callableAtoms = evaluate(node.expression, currentPath, seen, parameterBindings);
       const result = new Set();
       for (const atom of callableAtoms) {
+        if (atom === BOUND_PROBE) {
+          result.add((node.arguments || []).length > 1 ? BOUND_PROBE : PID_PROBE);
+          continue;
+        }
         if (!atom || !atom.callable) continue;
         const callablePath = atom.modulePath || currentPath;
         const nestedBindings = callableParameterBindings(atom.callable, node.arguments || [], currentPath);
@@ -626,13 +805,62 @@ function createLocalModuleResolver(files) {
       if (!modulePath) return new Set();
       const result = new Set([moduleAtom(modulePath)]);
       const module = scanModule(modulePath);
-      if (module.defaultExport) {
-        for (const atom of evaluate(module.defaultExport, modulePath, seen)) result.add(atom);
+      for (const expression of module.defaultExports) {
+        for (const atom of evaluate(expression, modulePath, seen)) result.add(atom);
       }
       return result;
     }
-    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
-      return evaluate(node.right, currentPath, seen, parameterBindings, bindingOverrides);
+    if (ts.isBinaryExpression(node)) {
+      if (node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+        return evaluate(node.right, currentPath, seen, parameterBindings, bindingOverrides);
+      }
+      if ([ts.SyntaxKind.BarBarToken, ts.SyntaxKind.AmpersandAmpersandToken,
+        ts.SyntaxKind.QuestionQuestionToken].includes(node.operatorToken.kind)) {
+        const leftAtoms = evaluate(node.left, currentPath, seen, parameterBindings, bindingOverrides);
+        const leftNode = unwrap(node.left);
+        let truthy = leftAtoms.size ? true : null;
+        let nullish = leftAtoms.size ? false : null;
+        if (leftNode?.kind === ts.SyntaxKind.TrueKeyword) {
+          truthy = true;
+          nullish = false;
+        } else if (leftNode?.kind === ts.SyntaxKind.FalseKeyword ||
+          leftNode?.kind === ts.SyntaxKind.NullKeyword ||
+          ts.isIdentifier(leftNode) && leftNode.text === 'undefined' || ts.isVoidExpression(leftNode)) {
+          truthy = false;
+          nullish = leftNode.kind === ts.SyntaxKind.NullKeyword || ts.isIdentifier(leftNode) &&
+            leftNode.text === 'undefined' || ts.isVoidExpression(leftNode);
+        } else if (ts.isNumericLiteral(leftNode)) {
+          truthy = Number(leftNode.text) !== 0;
+          nullish = false;
+        } else if (ts.isStringLiteral(leftNode) || ts.isNoSubstitutionTemplateLiteral(leftNode)) {
+          truthy = leftNode.text.length > 0;
+          nullish = false;
+        } else if (ts.isFunctionExpression(leftNode) || ts.isArrowFunction(leftNode) ||
+          ts.isClassExpression(leftNode) || ts.isObjectLiteralExpression(leftNode) ||
+          ts.isArrayLiteralExpression(leftNode) || ts.isNewExpression(leftNode)) {
+          truthy = true;
+          nullish = false;
+        }
+        let includeLeft = true;
+        let includeRight = true;
+        if (node.operatorToken.kind === ts.SyntaxKind.BarBarToken) {
+          if (truthy === true) includeRight = false;
+          if (truthy === false) includeLeft = false;
+        } else if (node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) {
+          if (truthy === true) includeLeft = false;
+          if (truthy === false) includeRight = false;
+        } else {
+          if (nullish === false) includeRight = false;
+          if (nullish === true) includeLeft = false;
+        }
+        const result = includeLeft ? leftAtoms : new Set();
+        if (includeRight) {
+          for (const atom of evaluate(node.right, currentPath, seen, parameterBindings, bindingOverrides)) {
+            result.add(atom);
+          }
+        }
+        return result;
+      }
     }
     return new Set();
   };
@@ -641,8 +869,7 @@ function createLocalModuleResolver(files) {
     const module = scanModule(modulePath);
     if (!module) return new Set();
     const result = new Set();
-    const expression = module.exportEquals;
-    if (expression) {
+    for (const expression of module.exportEqualsCandidates) {
       for (const atom of evaluate(expression, module.path, new Set())) result.add(atom);
     }
     return result;
@@ -657,7 +884,9 @@ function createLocalModuleResolver(files) {
     const values = module.exports.get(name) || [];
     const result = new Set();
     for (const value of values) {
-      if (value && value.modulePath) {
+      if (value && value.builtin === 'process') {
+        result.add(value.name === 'kill' ? PID_PROBE : PROCESS_OBJECT);
+      } else if (value && value.modulePath) {
         for (const atom of resolveExport(value.modulePath, value.name, seen)) result.add(atom);
       } else if (value && value.binding) {
         for (const atom of evaluateBinding(value.binding, module.path, seen)) result.add(atom);
@@ -665,11 +894,15 @@ function createLocalModuleResolver(files) {
         for (const atom of evaluate(value, module.path, seen)) result.add(atom);
       }
     }
-    if (!values.length && name !== 'default' && module.defaultExport) {
-      for (const atom of evaluateProperty(module.defaultExport, name, module.path, seen)) result.add(atom);
+    if (!values.length && name !== 'default') {
+      for (const expression of module.defaultExports) {
+        for (const atom of evaluateProperty(expression, name, module.path, seen)) result.add(atom);
+      }
     }
-    if (name === 'default' && module.defaultExport) {
-      for (const atom of evaluate(module.defaultExport, module.path, seen)) result.add(atom);
+    if (name === 'default') {
+      for (const expression of module.defaultExports) {
+        for (const atom of evaluate(expression, module.path, seen)) result.add(atom);
+      }
     }
     if (!values.length) {
       for (const wildcardPath of module.wildcardExports || []) {
@@ -712,8 +945,8 @@ function createLocalModuleResolver(files) {
       if (!modulePath) return new Set();
       const result = new Set([moduleAtom(modulePath)]);
       const module = scanModule(modulePath);
-      if (module.defaultExport) {
-        for (const atom of evaluate(module.defaultExport, modulePath, new Set())) result.add(atom);
+      for (const expression of module.defaultExports) {
+        for (const atom of evaluate(expression, modulePath, new Set())) result.add(atom);
       }
       return result;
     },

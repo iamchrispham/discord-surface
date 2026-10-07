@@ -1374,6 +1374,14 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       }
       return found;
     }
+    if (moduleResolver?.resolveProperty) {
+      for (const atom of resolveSet(node, visited)) {
+        for (const resolved of moduleResolver.resolveProperty([atom], name, virtualPath, seen)) {
+          found.add(resolved);
+        }
+      }
+      if (found.size) return found;
+    }
     if (!ts.isIdentifier(node)) return found;
     const symbol = checker.getSymbolAtLocation(node);
     const declaration = symbolDeclaration(symbol);
@@ -1746,6 +1754,29 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         }
       } else if (!method) {
         const resolved = staticValue(callee);
+        const importedCallableInvokesProbe = [...resolved].some(atom => {
+          if (!atom?.callable || !atom.modulePath || atom.modulePath === virtualPath) return false;
+          const parameterNames = new Set();
+          for (let index = 0; index < (atom.callable.parameters || []).length; index += 1) {
+            const parameter = atom.callable.parameters[index];
+            if (!ts.isIdentifier(parameter.name) || !callArguments[index] ||
+              !hasAtom(staticValue(callArguments[index]), PID_PROBE)) continue;
+            parameterNames.add(parameter.name.text);
+          }
+          if (!parameterNames.size || !atom.callable.body) return false;
+          let invoked = false;
+          const inspect = child => {
+            if (invoked || child !== atom.callable && ts.isFunctionLike(child)) return;
+            if (ts.isCallExpression(child) && ts.isIdentifier(child.expression) &&
+              parameterNames.has(child.expression.text)) invoked = true;
+            ts.forEachChild(child, inspect);
+          };
+          inspect(atom.callable.body);
+          return invoked;
+        });
+        if (importedCallableInvokesProbe) {
+          violations.push(`unsupported process probe ${fileName}:${owner}`);
+        }
         const isBind = calleeNames.has('bind');
         if (!isBind && (hasAtom(resolved, BOUND_PROBE) || hasAtom(resolved, BOUND_REFLECT_APPLY))) {
           violations.push(`unsupported process probe ${fileName}:${owner}`);
