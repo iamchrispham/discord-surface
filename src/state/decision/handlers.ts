@@ -435,9 +435,16 @@ export function createDecisionHandlers(): DecisionHandlers {
       });
     },
 
-    recordRejectionOutcome(state, interactionId, rawOutcome) {
+    recordRejectionOutcome(state, interactionId, rawOutcome, rawRetryDeadline = null) {
       const id = text(interactionId, 'interactionId', 256);
       const nextOutcome = outcome(rawOutcome);
+      if (rawRetryDeadline !== null && rawRetryDeadline !== undefined &&
+        (typeof rawRetryDeadline !== 'number' || !Number.isFinite(rawRetryDeadline) || rawRetryDeadline <= 0)) {
+        throw new DecisionError('retryDeadline must be a positive finite number');
+      }
+      const retryDeadline = rawRetryDeadline === null || rawRetryDeadline === undefined
+        ? null
+        : Math.ceil(rawRetryDeadline);
       return state.transaction(() => {
         const click = clickFor(state, id);
         if (!click) return { accepted: false, reason: DECISION_REASONS.UNKNOWN_INTERACTION, click: null };
@@ -451,7 +458,11 @@ export function createDecisionHandlers(): DecisionHandlers {
           return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
         }
         const tokenHeld = Boolean(click.token);
-        append(state, DECISION_RECEIPT_KINDS.REJECTION_OUTCOME, { interactionId: id, outcome: nextOutcome });
+        append(state, DECISION_RECEIPT_KINDS.REJECTION_OUTCOME, {
+          interactionId: id,
+          outcome: nextOutcome,
+          ...(nextOutcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED && retryDeadline !== null ? { retryDeadline } : {})
+        });
         if (rejectionTerminal(nextOutcome)) releaseToken(state, id, tokenHeld);
         return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
       });
@@ -575,7 +586,11 @@ export function createDecisionHandlers(): DecisionHandlers {
           if (click.nativeReturn.outcome === nextOutcome) return { accepted: false, duplicate: true, reason: DECISION_REASONS.NATIVE_OUTCOME_RECORDED, click: mutableClickOutput(click) };
           const completesInFlight = click.nativeReturn.outcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT &&
             nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED;
-          if (!completesInFlight) return { accepted: false, reason: DECISION_REASONS.NATIVE_OUTCOME_CONFLICT, click: mutableClickOutput(click) };
+          const reconcilesNotSubmitted = click.nativeReturn.outcome === DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED &&
+            nextOutcome === DECISION_NATIVE_OUTCOMES.SUBMITTED;
+          if (!completesInFlight && !reconcilesNotSubmitted) {
+            return { accepted: false, reason: DECISION_REASONS.NATIVE_OUTCOME_CONFLICT, click: mutableClickOutput(click) };
+          }
         }
         const tokenHeld = Boolean(click.token);
         append(state, DECISION_RECEIPT_KINDS.NATIVE_OUTCOME, { interactionId: id, outcome: nextOutcome });

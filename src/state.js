@@ -1106,8 +1106,8 @@ class SurfaceState {
     return decisionHandlers.beginRejectionFollowup(this, interactionId);
   }
 
-  recordDecisionRejectionOutcome(interactionId, outcome) {
-    return decisionHandlers.recordRejectionOutcome(this, interactionId, outcome);
+  recordDecisionRejectionOutcome(interactionId, outcome, retryDeadline = null) {
+    return decisionHandlers.recordRejectionOutcome(this, interactionId, outcome, retryDeadline);
   }
 
   importDecisionWinner(interactionId, result) {

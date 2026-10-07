@@ -327,6 +327,7 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         callbackOutcome: null,
         rejectionAttempted: false,
         rejectionOutcome: null,
+        rejectionRetryDeadline: null,
         canonical: null,
         projectionOutcome: null,
         nativeReturn: null,
@@ -374,6 +375,10 @@ export function snapshot(state: DecisionStateStore): Snapshot {
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.REJECTION_OUTCOME) {
       click.rejectionOutcome = outcome(detail.outcome);
+      click.rejectionRetryDeadline = click.rejectionOutcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED &&
+        typeof detail.retryDeadline === 'number' && Number.isFinite(detail.retryDeadline) && detail.retryDeadline > 0
+        ? Math.ceil(detail.retryDeadline)
+        : null;
       if (!REJECTION_RETRYABLE_OUTCOMES.has(click.rejectionOutcome)) click.token = null;
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE) {
