@@ -111,7 +111,23 @@ const tokenizeSource = source => {
     tokens.push(token);
     previous = token;
   };
-  const canStartRegex = () => !previous || REGEX_PREFIXES.has(previous.value);
+  const canStartRegex = () => {
+    if (!previous || REGEX_PREFIXES.has(previous.value)) return true;
+    if (previous.value !== ')') return false;
+    let depth = 0;
+    for (let tokenIndex = tokens.length - 1; tokenIndex >= 0; tokenIndex -= 1) {
+      const value = tokens[tokenIndex].value;
+      if (value === ')') depth += 1;
+      else if (value === '(') {
+        depth -= 1;
+        if (depth === 0) {
+          return new Set(['if', 'while', 'for', 'with', 'switch', 'catch'])
+            .has(tokens[tokenIndex - 1]?.value);
+        }
+      }
+    }
+    return false;
+  };
 
   while (index < source.length) {
     const character = source[index];
@@ -593,6 +609,15 @@ const findConditionalExpressionDecision = (tokens, triggerIndex, start, end, pai
   let parenDepth = 0;
   let braceDepth = 0;
   let bracketDepth = 0;
+  for (let index = start; index < triggerIndex; index += 1) {
+    const value = tokens[index].value;
+    if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
   let questionIndex;
   for (let index = triggerIndex + 1; index < end; index += 1) {
     const value = tokens[index].value;
@@ -1046,12 +1071,9 @@ const objectAssignHasGapOutcomeAt = (tokens, index, end, pairs, aliases) => {
   const closing = pairs.get(opening);
   if (closing === undefined || closing >= end) return false;
   const argumentsList = topLevelSegments(tokens, opening + 1, closing);
-  const outcomePatch = argumentsList[1];
-  const patchStart = outcomePatch?.[0];
-  const patchEnd = outcomePatch?.[1];
-  return tokens[patchStart]?.value === '{'
+  return argumentsList.slice(1).some(([patchStart, patchEnd]) => tokens[patchStart]?.value === '{'
     && pairs.get(patchStart) === patchEnd - 1
-    && valueHasGapOutcome(tokens, patchStart, patchEnd, pairs, aliases);
+    && valueHasGapOutcome(tokens, patchStart, patchEnd, pairs, aliases));
 };
 
 const outcomeAssignmentValueStart = (tokens, index) => {
@@ -1201,7 +1223,7 @@ const isScheduledCallback = (tokens, pairs, range) => {
   let calleeIndex = callOpening - 1;
   if (tokens[calleeIndex]?.value === '?.') calleeIndex -= 1;
   const callee = tokens[calleeIndex]?.value;
-  if (callee === 'queueMicrotask') return true;
+  if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)) return true;
   return callee === 'then' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value);
 };
 
@@ -1421,12 +1443,43 @@ const findAssignmentValueEnd = (tokens, start, end) => {
   return end;
 };
 
-const resolveVisibleAssignment = (assignments, name, index, lexicalScopes, bindingIndex) => assignments
-  .filter(assignment => assignment.name === name
-    && assignment.index < index
-    && assignment.bindingIndex === bindingIndex
-    && isLexicallyVisible(assignment.scope, lexicalScopePath(lexicalScopes, index)))
-  .sort((left, right) => right.index - left.index)[0];
+const isConditionalAssignment = (tokens, pairs, assignment) => {
+  const conditionalControls = new Set(['if', 'for', 'while', 'switch', 'catch']);
+  const followsConditionalHeader = closingIndex => {
+    if (tokens[closingIndex]?.value !== ')') return false;
+    let depth = 0;
+    for (let index = closingIndex; index >= 0; index -= 1) {
+      if (tokens[index].value === ')') depth += 1;
+      else if (tokens[index].value === '(') {
+        depth -= 1;
+        if (depth === 0) return conditionalControls.has(tokens[index - 1]?.value);
+      }
+    }
+    return false;
+  };
+  if (tokens[assignment.index - 1]?.value === 'else'
+    || followsConditionalHeader(assignment.index - 1)) return true;
+  const writeScope = assignment.writeScope || assignment.scope;
+  return writeScope.some(opening => tokens[opening - 1]?.value === 'else'
+    || tokens[opening - 1]?.value === '=>'
+    || followsConditionalHeader(opening - 1));
+};
+
+const resolveVisibleAssignments = (assignments, name, index, lexicalScopes, bindingIndex, tokens, pairs) => {
+  const visible = assignments
+    .filter(assignment => assignment.name === name
+      && assignment.index < index
+      && assignment.bindingIndex === bindingIndex
+      && (isLexicallyVisible(assignment.scope, lexicalScopePath(lexicalScopes, index))
+        || isConditionalAssignment(tokens, pairs, assignment)))
+    .sort((left, right) => left.index - right.index);
+  let possibleAssignments = [];
+  for (const assignment of visible) {
+    if (isConditionalAssignment(tokens, pairs, assignment)) possibleAssignments.push(assignment);
+    else possibleAssignments = [assignment];
+  }
+  return possibleAssignments;
+};
 
 const findLexicalScopes = (tokens, pairs) => tokens.flatMap((token, opening) => {
   if (token.value !== '{') return [];
@@ -1766,6 +1819,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       ...assignment,
       bindingIndex: binding?.index,
       scope: binding?.scope || assignment.scope,
+      writeScope: assignment.scope,
       expressionStart: assignment.equalsIndex + 1,
       expressionEnd: findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, tokens.length)
     };
@@ -1879,14 +1933,16 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
         && alias.bindingIndex === sourceBinding.index
         && alias.index < sourceStart);
       if (!sourceAlias) continue;
-      const latestSourceAssignment = resolveVisibleAssignment(
+      const sourceAssignments = resolveVisibleAssignments(
         assignments,
         sourceAlias.name,
         sourceStart,
         lexicalScopes,
-        sourceBinding.index
+        sourceBinding.index,
+        tokens,
+        pairs
       );
-      if (latestSourceAssignment?.index !== sourceAlias.index) continue;
+      if (!sourceAssignments.some(candidate => candidate.index === sourceAlias.index)) continue;
       deadlineAliases.push({
         name: assignment.name,
         index: assignment.index,
@@ -1903,14 +1959,16 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       if (lexicalBindings.some(binding => binding.name === alias.name && binding.index === index)) continue;
       const binding = resolveVisibleBinding(lexicalBindings, alias.name, index, lexicalScopes);
       if (!binding || binding.index !== alias.bindingIndex) continue;
-      const assignment = resolveVisibleAssignment(
+      const visibleAssignments = resolveVisibleAssignments(
         assignments,
         alias.name,
         index,
         lexicalScopes,
-        binding.index
+        binding.index,
+        tokens,
+        pairs
       );
-      if (!assignment || assignment.index !== alias.index) continue;
+      if (!visibleAssignments.some(candidate => candidate.index === alias.index)) continue;
       if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
       const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges, alias.negated);
       const knownAliases = visibleGapAliasesAt(
@@ -3020,6 +3078,37 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     regressionAssert.equal(offendersFor(promiseCallback).length, 1);
     regressionAssert.equal(offendersFor(microtaskCallback).length, 1);
     regressionAssert.equal(offendersFor(unscheduledCallback).length, 0);
+  });
+
+  regressionTest('deadline policy inventory follows timer-scheduled boundary writers', () => {
+    const timeoutCallback = `if (deadlineReached) setTimeout(() => state.markIntakeBoundary(id, READINESS.GAP, detail), 0);`;
+    const immediateCallback = `if (deadlineReached) setImmediate(() => state.markIntakeBoundary(id, READINESS.GAP, detail));`;
+    regressionAssert.equal(offendersFor(timeoutCallback).length, 1);
+    regressionAssert.equal(offendersFor(immediateCallback).length, 1);
+  });
+
+  regressionTest('deadline policy inventory scans every Object.assign source', () => {
+    const laterSourceGap = `if (deadlineReached) Object.assign(result, metadata, { state: READINESS.GAP });`;
+    regressionAssert.equal(offendersFor(laterSourceGap).length, 1);
+  });
+
+  regressionTest('deadline policy inventory recognizes parenthesized ternary predicates', () => {
+    const parenthesizedPredicate = `function readiness(deadlineReached) { return (deadlineReached) ? READINESS.GAP : READINESS.READY; }`;
+    regressionAssert.equal(offendersFor(parenthesizedPredicate).length, 1);
+  });
+
+  regressionTest('deadline policy inventory preserves aliases across conditional writes', () => {
+    const conditionalReset = `let expired = deadlineReached; if (reset) expired = false; if (expired) return READINESS.GAP;`;
+    const conditionalBlockReset = `let expired = deadlineReached; if (reset) { audit(); expired = false; } if (expired) return READINESS.GAP;`;
+    const unconditionalReset = `let expired = deadlineReached; expired = false; if (expired) return READINESS.GAP;`;
+    regressionAssert.equal(offendersFor(conditionalReset).length, 1);
+    regressionAssert.equal(offendersFor(conditionalBlockReset).length, 1);
+    regressionAssert.equal(offendersFor(unconditionalReset).length, 0);
+  });
+
+  regressionTest('deadline policy inventory ignores deadline names inside control-body regex literals', () => {
+    const regexText = `if (enabled) /deadlineReached/.test(status) && state.markIntakeBoundary(id, READINESS.GAP, detail);`;
+    regressionAssert.equal(offendersFor(regexText).length, 0);
   });
 
   regressionTest('deadline policy inventory resolves bound boundary writers', () => {
