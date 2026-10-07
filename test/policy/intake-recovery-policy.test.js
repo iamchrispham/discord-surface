@@ -559,6 +559,32 @@ const findConditionalExpressionDecision = (tokens, triggerIndex, start, end, pai
   return { ...branchRange(tokens, selectedStart, selectedEnd, pairs), opening: null };
 };
 
+const isDirectSwitchAbruptCompletion = (tokens, index, start, pairs) => {
+  if (index === start || [';', ':', '}'].includes(tokens[index - 1]?.value)) return true;
+  if (tokens[index - 1]?.value !== ')') return false;
+  const opening = pairs.get(index - 1);
+  return !['if', 'for', 'while', 'switch', 'with', 'catch'].includes(tokens[opening - 1]?.value);
+};
+
+const switchArmHasAbruptCompletion = (tokens, start, end, pairs) => {
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  for (let index = start; index < end; index += 1) {
+    const value = tokens[index].value;
+    if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0
+      && ['break', 'continue', 'return', 'throw'].includes(value)
+      && isDirectSwitchAbruptCompletion(tokens, index, start, pairs)) return true;
+    if (value === '{') braceDepth += 1;
+    else if (value === '}') braceDepth -= 1;
+    else if (value === '(') parenDepth += 1;
+    else if (value === ')') parenDepth -= 1;
+    else if (value === '[') bracketDepth += 1;
+    else if (value === ']') bracketDepth -= 1;
+  }
+  return false;
+};
+
 const findSwitchDecision = (tokens, triggerIndex, pairs) => {
   let best = null;
   for (let index = triggerIndex - 1; index >= 0; index -= 1) {
@@ -593,15 +619,21 @@ const findSwitchDecision = (tokens, triggerIndex, pairs) => {
   const matchingLabels = labels.filter(candidate => candidate.index <= triggerIndex);
   const label = matchingLabels[matchingLabels.length - 1];
   if (!label) return null;
-  const labelPosition = labels.indexOf(label);
-  let start = label.start;
-  let nextLabelPosition = labelPosition + 1;
-  while (nextLabelPosition < labels.length && start === labels[nextLabelPosition].index) {
-    start = labels[nextLabelPosition].start;
-    nextLabelPosition += 1;
+  let bodyPosition = labels.indexOf(label);
+  while (bodyPosition + 1 < labels.length && labels[bodyPosition].start === labels[bodyPosition + 1].index) {
+    bodyPosition += 1;
   }
-  const next = labels[nextLabelPosition];
-  return { start, end: next?.index ?? best.closing, opening: best.opening };
+  const start = labels[bodyPosition].start;
+  let end = best.closing;
+  for (let index = bodyPosition; index < labels.length; index += 1) {
+    const next = labels[index + 1];
+    const armEnd = next?.index ?? best.closing;
+    if (switchArmHasAbruptCompletion(tokens, labels[index].start, armEnd, pairs)) {
+      end = armEnd;
+      break;
+    }
+  }
+  return { start, end, opening: best.opening };
 };
 
 const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) => {
@@ -681,6 +713,14 @@ const isGapMemberExpression = (tokens, start, end) => end - start === 3
   && isReadinessVocabulary(tokens[start].value)
   && tokens[start + 1]?.value === '.'
   && tokens[start + 2]?.value === 'GAP';
+
+const destructuredValueHasGapOutcome = (tokens, start, end, propertyPath, pairs) => {
+  if (propertyPath?.length !== 1 || propertyPath[0] !== 'GAP') return false;
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  return expression.end - expression.start === 1
+    && tokens[expression.start]?.type === 'identifier'
+    && isReadinessVocabulary(tokens[expression.start].value);
+};
 
 const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
@@ -984,6 +1024,7 @@ const findVariableDeclarations = (tokens, pairs, lexicalScopes, functionRanges =
         declarations.push({
           name: tokens[nameIndex].value,
           index: nameIndex,
+          propertyPath: binding.propertyPath,
           scope: tokens[index].value === 'var' && functionScope
             ? lexicalScopePath(lexicalScopes, functionScope.opening + 1)
             : lexicalScopePath(lexicalScopes, index),
@@ -1042,21 +1083,27 @@ const parameterBindingIndexes = (tokens, pairs, start, end) => {
   if (equalsIndex >= 0) end = equalsIndex;
   if (start >= end) return [];
   if (tokens[start].value === '{' || tokens[start].value === '[') {
+    const objectPattern = tokens[start].value === '{';
     const closing = pairs.get(start);
     const patternEnd = closing !== undefined && closing < end ? closing : end;
     return topLevelSegments(tokens, start + 1, patternEnd).flatMap(([segmentStart, segmentEnd]) => {
+      const rest = tokens[segmentStart]?.value === '...';
       while (segmentStart < segmentEnd && tokens[segmentStart].value === '...') segmentStart += 1;
       const colonIndex = topLevelToken(tokens, segmentStart, segmentEnd, ':');
+      const propertyPath = objectPattern && !rest ? [tokens[segmentStart]?.value] : [];
       return parameterBindingIndexes(
         tokens,
         pairs,
         colonIndex >= 0 ? colonIndex + 1 : segmentStart,
         segmentEnd
-      );
+      ).map(binding => ({
+        ...binding,
+        propertyPath: [...propertyPath, ...(binding.propertyPath || [])]
+      }));
     });
   }
   return tokens[start].type === 'identifier'
-    ? [{ name: tokens[start].value, index: start }]
+    ? [{ name: tokens[start].value, index: start, propertyPath: [] }]
     : [];
 };
 
@@ -1084,9 +1131,25 @@ const findFunctionParameterBindings = (tokens, pairs, lexicalScopes, functionRan
   ));
 });
 
+const findCatchBindings = (tokens, pairs, lexicalScopes) => {
+  const bindings = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens[index].value !== 'catch' || tokens[index + 1]?.value !== '(') continue;
+    const parameterClosing = pairs.get(index + 1);
+    const bodyOpening = parameterClosing === undefined ? undefined : parameterClosing + 1;
+    if (bodyOpening === undefined || tokens[bodyOpening]?.value !== '{') continue;
+    const scope = lexicalScopePath(lexicalScopes, bodyOpening + 1);
+    for (const binding of parameterBindingIndexes(tokens, pairs, index + 2, parameterClosing)) {
+      bindings.push({ ...binding, scope });
+    }
+  }
+  return bindings;
+};
+
 const collectLexicalBindings = (tokens, pairs, lexicalScopes, functionRanges) => [
   ...findVariableDeclarations(tokens, pairs, lexicalScopes, functionRanges),
-  ...findFunctionParameterBindings(tokens, pairs, lexicalScopes, functionRanges)
+  ...findFunctionParameterBindings(tokens, pairs, lexicalScopes, functionRanges),
+  ...findCatchBindings(tokens, pairs, lexicalScopes)
 ];
 
 const resolveVisibleBinding = (bindings, name, useIndex, lexicalScopes, useScope = null) => {
@@ -1145,13 +1208,21 @@ const visibleGapAliasesAt = (tokens, limit, pairs, lexicalScopes, functionRanges
     );
     if (!visibleBinding || visibleBinding.index !== declaration.index) continue;
     if (simpleAssignmentIndexes.has(declaration.index)) continue;
-    const assignedGap = valueHasGapOutcome(
-      tokens,
-      declaration.expressionStart,
-      declaration.expressionEnd,
-      pairs,
-      knownAliases
-    );
+    const assignedGap = declaration.propertyPath?.length
+      ? destructuredValueHasGapOutcome(
+        tokens,
+        declaration.expressionStart,
+        declaration.expressionEnd,
+        declaration.propertyPath,
+        pairs
+      )
+      : valueHasGapOutcome(
+        tokens,
+        declaration.expressionStart,
+        declaration.expressionEnd,
+        pairs,
+        knownAliases
+      );
     if (assignedGap) knownAliases.add(declaration.name);
     else knownAliases.delete(declaration.name);
   }
@@ -1349,6 +1420,14 @@ test('deadline policy inventory follows aliases assigned after declaration', () 
   assert.deepEqual(offenders, ['discord/deadline-alias-mutation.js:4']);
 });
 
+test('deadline policy inventory resolves destructured enum values', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'deadline-gap-destructured-enum.js',
+    source: 'const { GAP: nextState } = READINESS; if (deadlineReached) return nextState;'
+  }]);
+  assert.deepEqual(offenders, ['deadline-gap-destructured-enum.js:1']);
+});
+
 test('deadline policy inventory registers destructured local shadow bindings', () => {
   const offenders = findDeadlineGapOffenders([{
     relative: 'discord/destructured-shadow.js',
@@ -1362,6 +1441,20 @@ test('deadline policy inventory registers destructured local shadow bindings', (
       '}'
     ].join('\n')
   }]);
+  assert.deepEqual(offenders, []);
+});
+
+test('deadline aliases remain shadowed by simple and destructured catch bindings', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'deadline-alias-catch-shadow.js',
+      source: 'const expired = deadlineReached; try {} catch (expired) { if (expired) return READINESS.GAP; }'
+    },
+    {
+      relative: 'deadline-alias-catch-destructured-shadow.js',
+      source: 'const expired = deadlineReached; try {} catch ({ expired }) { if (expired) return READINESS.GAP; }'
+    }
+  ]);
   assert.deepEqual(offenders, []);
 });
 
@@ -1906,6 +1999,21 @@ test('deadline policy inventory follows aliases and selected control arms', () =
     'discord/negated-deadline-gap.js:1',
     'discord/aliased-deadline-gap.js:1'
   ]);
+});
+
+test('deadline policy inventory follows switch fall-through after nonempty arms', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/switch-fallthrough-gap.js',
+    source: [
+      'switch (kind) {',
+      '  case CODEX_VALIDATION_KINDS.DEADLINE:',
+      '    audit();',
+      '  case RETRY:',
+      '    return READINESS.GAP;',
+      '}'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, ['discord/switch-fallthrough-gap.js:2']);
 });
 
 test('deadline policy inventory recognizes member-qualified deadline operands', () => {
