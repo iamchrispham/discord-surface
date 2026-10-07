@@ -1117,8 +1117,6 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) =>
   return findConditionalExpressionDecision(tokens, triggerIndex, statement.start, statement.end, pairs) || statement;
 };
 
-const isBoundaryWriter = value => /boundary|readiness/i.test(value);
-
 const BOUNDARY_WRITER_STATE_ARGUMENTS = new Map([
   ['boundary', 0],
   ['markIntakeBoundary', 1],
@@ -1126,16 +1124,51 @@ const BOUNDARY_WRITER_STATE_ARGUMENTS = new Map([
   ['recordOwnedBoundary', 2]
 ]);
 
-const boundaryWriterStateArgument = value => BOUNDARY_WRITER_STATE_ARGUMENTS.get(value) ?? 1;
+const isBoundaryWriter = value => BOUNDARY_WRITER_STATE_ARGUMENTS.has(value);
+
+const boundaryWriterStateArgument = value => BOUNDARY_WRITER_STATE_ARGUMENTS.get(value);
+
+const trimExpressionRange = (tokens, start, end, pairs) => {
+  while (start < end && tokens[end - 1]?.value === ';') end -= 1;
+  while (start < end && tokens[start]?.value === '(' && pairs.get(start) === end - 1) {
+    start += 1;
+    end -= 1;
+  }
+  return { start, end };
+};
+
+const isGapMemberExpression = (tokens, start, end) => end - start === 3
+  && tokens[start]?.type === 'identifier'
+  && tokens[start + 1]?.value === '.'
+  && tokens[start + 2]?.value === 'GAP';
+
+const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
+  const expression = trimExpressionRange(tokens, start, end, pairs);
+  if (expression.start >= expression.end) return false;
+  if (expression.end - expression.start === 1 && aliases.has(tokens[expression.start].value)) return true;
+  if (isGapMemberExpression(tokens, expression.start, expression.end)) return true;
+  if (valueHasGap(tokens, expression.start, expression.end, pairs, aliases)) return true;
+
+  const wrapperStart = expression.start;
+  const wrapperOpening = wrapperStart + 3;
+  if (tokens[wrapperStart]?.value !== 'Promise'
+    || tokens[wrapperStart + 1]?.value !== '.'
+    || tokens[wrapperStart + 2]?.value !== 'resolve'
+    || tokens[wrapperOpening]?.value !== '(') return false;
+  const wrapperClosing = pairs.get(wrapperOpening);
+  if (wrapperClosing !== expression.end - 1) return false;
+  return valueHasGapOutcome(tokens, wrapperOpening + 1, wrapperClosing, pairs, aliases);
+};
 
 const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, aliases = new Set()) => {
+  if (stateArgument === undefined) return false;
   let argumentStart = opening + 1;
   let argumentIndex = 0;
   let parenDepth = 0;
   let braceDepth = 0;
   let bracketDepth = 0;
   const check = argumentEnd => argumentIndex === stateArgument
-    && valueHasGap(tokens, argumentStart, argumentEnd, pairs, aliases);
+    && valueHasGapOutcome(tokens, argumentStart, argumentEnd, pairs, aliases);
   for (let index = opening + 1; index < closing; index += 1) {
     const value = tokens[index].value;
     if (value === '(') parenDepth += 1;
@@ -1168,7 +1201,7 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
     if (token.value === 'return') {
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
-      if (valueHasGap(tokens, expressionStart, statementEnd, pairs, knownAliases, true)) return true;
+      if (valueHasGapOutcome(tokens, expressionStart, statementEnd, pairs, knownAliases)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
@@ -1176,14 +1209,14 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       && OUTCOME_NAMES.has(tokens[index + 2]?.value)
       && tokens[index + 3]?.value === '=') {
       const statementEnd = findStatementEnd(tokens, index + 4, end);
-      if (valueHasGap(tokens, index + 4, statementEnd, pairs, knownAliases, true)) return true;
+      if (valueHasGapOutcome(tokens, index + 4, statementEnd, pairs, knownAliases)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
     if (token.type === 'identifier' && tokens[index - 1]?.value !== '.'
       && tokens[index + 1]?.value === '=') {
       const statementEnd = findStatementEnd(tokens, index + 2, end);
-      const assignedGap = valueHasGap(tokens, index + 2, statementEnd, pairs, knownAliases, true);
+      const assignedGap = valueHasGapOutcome(tokens, index + 2, statementEnd, pairs, knownAliases);
       if (assignedGap) knownAliases.add(token.value);
       if (assignedGap && OUTCOME_NAMES.has(token.value)) return true;
       index = Math.max(index, statementEnd - 1);
@@ -1196,7 +1229,7 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
         && callHasGapArgument(tokens, index + 1, closing, pairs, boundaryWriterStateArgument(token.value), knownAliases)) return true;
     }
   }
-  return opening === null && valueHasGap(tokens, start, end, pairs, knownAliases);
+  return opening === null && valueHasGapOutcome(tokens, start, end, pairs, knownAliases);
 };
 
 const isDeadlineTriggerAt = (tokens, index) => {
@@ -1243,6 +1276,88 @@ const isLexicallyVisible = (declarationScope, useScope) => declarationScope.ever
   (scope, index) => useScope[index] === scope
 );
 
+const findVariableDeclarations = (tokens, pairs, lexicalScopes) => {
+  const declarations = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (!['const', 'let', 'var'].includes(tokens[index].value)) continue;
+    const nameIndex = index + 1;
+    const equalsIndex = nameIndex + 1;
+    if (tokens[nameIndex]?.type !== 'identifier' || tokens[equalsIndex]?.value !== '=') continue;
+    const statementEnd = findStatementEnd(tokens, equalsIndex + 1, tokens.length);
+    declarations.push({
+      name: tokens[nameIndex].value,
+      index: nameIndex,
+      scope: lexicalScopePath(lexicalScopes, nameIndex),
+      expressionStart: equalsIndex + 1,
+      expressionEnd: statementEnd
+    });
+  }
+  return declarations;
+};
+
+const findFunctionParameterBindings = (tokens, pairs, lexicalScopes, functionRanges) => functionRanges.flatMap(range => {
+  let parameterOpening = -1;
+  for (let index = range.start; index < range.opening; index += 1) {
+    if (tokens[index].value === '(' && pairs.get(index) < range.opening) parameterOpening = index;
+  }
+  if (parameterOpening < 0) return [];
+  const parameterClosing = pairs.get(parameterOpening);
+  if (parameterClosing === undefined || parameterClosing >= range.opening) return [];
+  const scope = lexicalScopePath(lexicalScopes, range.opening + 1);
+  return tokens.slice(parameterOpening + 1, parameterClosing).flatMap((token, offset) => {
+    const index = parameterOpening + 1 + offset;
+    const previous = tokens[index - 1]?.value;
+    return token.type === 'identifier' && ['(', ',', '...'].includes(previous)
+      ? [{ name: token.value, index, scope }]
+      : [];
+  });
+});
+
+const collectLexicalBindings = (tokens, pairs, lexicalScopes, functionRanges) => [
+  ...findVariableDeclarations(tokens, pairs, lexicalScopes),
+  ...findFunctionParameterBindings(tokens, pairs, lexicalScopes, functionRanges)
+];
+
+const resolveVisibleBinding = (bindings, name, useIndex, lexicalScopes, useScope = null) => {
+  const scope = useScope || lexicalScopePath(lexicalScopes, useIndex);
+  const candidates = bindings
+    .filter(binding => binding.name === name
+      && binding.index < useIndex
+      && isLexicallyVisible(binding.scope, scope))
+    .sort((left, right) => left.scope.length - right.scope.length || left.index - right.index);
+  return candidates[candidates.length - 1] || null;
+};
+
+const visibleGapAliasesAt = (tokens, limit, pairs, lexicalScopes, functionRanges, baseAliases = new Set()) => {
+  const declarations = findVariableDeclarations(tokens, pairs, lexicalScopes)
+    .filter(declaration => declaration.index < limit)
+    .sort((left, right) => left.index - right.index);
+  const bindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
+  const useScope = lexicalScopePath(lexicalScopes, limit);
+  const knownAliases = new Set(baseAliases);
+  for (const declaration of declarations) {
+    if (!isLexicallyVisible(declaration.scope, useScope)) continue;
+    const visibleBinding = resolveVisibleBinding(
+      bindings,
+      declaration.name,
+      limit,
+      lexicalScopes,
+      useScope
+    );
+    if (!visibleBinding || visibleBinding.index !== declaration.index) continue;
+    const assignedGap = valueHasGapOutcome(
+      tokens,
+      declaration.expressionStart,
+      declaration.expressionEnd,
+      pairs,
+      knownAliases
+    );
+    if (assignedGap) knownAliases.add(declaration.name);
+    else knownAliases.delete(declaration.name);
+  }
+  return knownAliases;
+};
+
 const isConditionalDeadlineUse = (tokens, triggerIndex, pairs, functionRanges) => {
   if (findIfDecision(tokens, triggerIndex, pairs) || findSwitchDecision(tokens, triggerIndex, pairs)) return true;
   const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
@@ -1264,6 +1379,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
   const pairs = findTokenPairs(tokens);
   const functionRanges = findFunctionRanges(tokens, pairs);
   const lexicalScopes = findLexicalScopes(tokens, pairs);
+  const lexicalBindings = collectLexicalBindings(tokens, pairs, lexicalScopes, functionRanges);
   const lines = new Set();
   const deadlineAliases = [];
   for (let index = 0; index < tokens.length; index += 1) {
@@ -1276,24 +1392,70 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       });
       if (isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) {
         const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
-        if (hasGapOutcome(tokens, decision.start, decision.end, decision.opening, pairs, functionRanges)) {
+        const knownAliases = visibleGapAliasesAt(
+          tokens,
+          decision.start,
+          pairs,
+          lexicalScopes,
+          functionRanges
+        );
+        if (hasGapOutcome(
+          tokens,
+          decision.start,
+          decision.end,
+          decision.opening,
+          pairs,
+          functionRanges,
+          knownAliases
+        )) {
           lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
         }
       }
       continue;
     }
     const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
-    if (hasGapOutcome(tokens, decision.start, decision.end, decision.opening, pairs, functionRanges)) {
+    const knownAliases = visibleGapAliasesAt(
+      tokens,
+      decision.start,
+      pairs,
+      lexicalScopes,
+      functionRanges
+    );
+    if (hasGapOutcome(
+      tokens,
+      decision.start,
+      decision.end,
+      decision.opening,
+      pairs,
+      functionRanges,
+      knownAliases
+    )) {
       lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
     }
   }
   for (const alias of deadlineAliases) {
     for (let index = 0; index < tokens.length; index += 1) {
       if (index === alias.index || tokens[index].value !== alias.name || tokens[index - 1]?.value === '.') continue;
-      if (!isLexicallyVisible(alias.scope, lexicalScopePath(lexicalScopes, index))) continue;
+      const binding = resolveVisibleBinding(lexicalBindings, alias.name, index, lexicalScopes);
+      if (!binding || binding.index !== alias.index) continue;
       if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
       const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
-      if (hasGapOutcome(tokens, decision.start, decision.end, decision.opening, pairs, functionRanges)) {
+      const knownAliases = visibleGapAliasesAt(
+        tokens,
+        decision.start,
+        pairs,
+        lexicalScopes,
+        functionRanges
+      );
+      if (hasGapOutcome(
+        tokens,
+        decision.start,
+        decision.end,
+        decision.opening,
+        pairs,
+        functionRanges,
+        knownAliases
+      )) {
         lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
       }
     }
@@ -1311,11 +1473,27 @@ test('deadline policy inventory maps local boundary state arguments', () => {
   const offenders = findDeadlineGapOffenders([{
     relative: 'discord/thread-enrollment.ts',
     source: [
-      'function boundary(state, detail) { persist(state, detail); }',
-      'if (deadlineReached) boundary(THREAD_STATES.GAP, detail);'
+      'function boundary(state, detail, source) { persist(state, detail, source); }',
+      'if (deadlineReached) boundary(THREAD_STATES.GAP, detail, source);'
     ].join('\n')
   }]);
   assert.deepEqual(offenders, ['discord/thread-enrollment.ts:2']);
+});
+
+test('deadline policy inventory ignores non-mutating boundary-shaped calls', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/readiness-predicate.js',
+    source: 'if (deadlineReached) { assertReadiness(binding, READINESS.GAP); return READINESS.UNAVAILABLE; }'
+  }]);
+  assert.deepEqual(offenders, []);
+});
+
+test('deadline policy inventory ignores gap constants used as predicate inputs', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/readiness-predicate.js',
+    source: 'if (deadlineReached) return allowed.includes(READINESS.GAP);'
+  }]);
+  assert.deepEqual(offenders, []);
 });
 
 test('deadline policy inventory follows inequality polarity', () => {
@@ -1346,6 +1524,32 @@ test('deadline aliases remain scoped to their lexical declaration', () => {
     ].join('\n')
   }]);
   assert.deepEqual(offenders, ['deadline-alias-scope.js:3']);
+});
+
+test('deadline policy inventory follows gap aliases declared before the branch', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'deadline-gap-alias.js',
+    source: [
+      'const nextState = READINESS.GAP;',
+      'if (deadlineReached) return nextState;'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, ['deadline-gap-alias.js:2']);
+});
+
+test('deadline policy inventory respects nested alias shadowing', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'deadline-alias-shadow.js',
+    source: [
+      'function outer() {',
+      '  const expired = Date.now() >= deadline;',
+      '  function inner(expired) {',
+      '    if (expired) return READINESS.GAP;',
+      '  }',
+      '}'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, []);
 });
 
 test('deadline policy inventory catches object-shaped gap decisions', () => {
