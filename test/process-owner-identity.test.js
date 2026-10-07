@@ -611,18 +611,11 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   const isSurfaceStateFacadeMember = node => surfaceStateMembers.includes(node)
     && !(node.modifiers ?? []).some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword);
   const staticAssignmentPropertyName = expression => {
+    expression = unwrapExpression(expression);
     if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
     if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
     if (!ts.isElementAccessExpression(expression) || !expression.argumentExpression) return null;
-    const argument = expression.argumentExpression;
-    if (ts.isStringLiteral(argument) || ts.isNoSubstitutionTemplateLiteral(argument)) return argument.text;
-    if (ts.isBinaryExpression(argument)
-      && argument.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-      const left = staticAssignmentPropertyName(argument.left);
-      const right = staticAssignmentPropertyName(argument.right);
-      return left !== null && right !== null ? left + right : null;
-    }
-    return null;
+    return staticStringText(expression.argumentExpression);
   };
   const isSurfaceStateReceiver = expression => {
     if (ts.isPropertyAccessExpression(expression)) {
@@ -639,6 +632,11 @@ test('17. process capture has one owner and State delegates raw arguments', () =
   const targetsSurfaceState = expression => (ts.isPropertyAccessExpression(expression)
     || ts.isElementAccessExpression(expression))
     && isSurfaceStateReceiver(expression.expression);
+  const parenthesizedFacadeOverride = parse(
+    "SurfaceState[('prototype')][('directPostOwnerIdentity')] = function () {};"
+  ).statements[0].expression;
+  assert.equal(targetsSurfaceState(parenthesizedFacadeOverride.left), true);
+  assert.equal(staticAssignmentPropertyName(parenthesizedFacadeOverride.left), 'directPostOwnerIdentity');
   const definePropertyName = node => {
     if (!ts.isCallExpression(node)
       || !ts.isPropertyAccessExpression(node.expression)
