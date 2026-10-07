@@ -374,7 +374,9 @@ export function snapshot(state: DecisionStateStore): Snapshot {
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.REJECTION_OUTCOME) {
       click.rejectionOutcome = outcome(detail.outcome);
-      if (!REJECTION_RETRYABLE_OUTCOMES.has(click.rejectionOutcome)) click.token = null;
+      const retryable = REJECTION_RETRYABLE_OUTCOMES.has(click.rejectionOutcome) ||
+        (click.rejectionOutcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN && click.callbackOutcome === DECISION_TRANSPORT_OUTCOMES.SENT);
+      if (!retryable) click.token = null;
       click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.TOKEN_RELEASE) {
       click.token = null;

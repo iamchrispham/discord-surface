@@ -1268,7 +1268,7 @@ test('known-unsent long-answer projection retries after Attach Files returns', {
   assert.equal(f.edits.length, 1);
 });
 
-test('long-answer projection failure does not dispatch native work', { timeout: 30000 }, async t => {
+test('long-answer projection failure does not block native work', { timeout: 30000 }, async t => {
   const f = await fixture(t, { attachFiles: false });
   const admitted = f.state.admitDecisionClickAndBeginCallback({
     interactionId: 'blocked-long-answer', presentationId: f.presentation.presentationId, selectedKey: 'approve',
@@ -1287,8 +1287,11 @@ test('long-answer projection failure does not dispatch native work', { timeout: 
   }).accepted, true);
 
   await f.gateway.decisionConsumer.recover(new AbortController().signal);
-  assert.equal(f.dispatches.length, 0);
-  assert.equal(f.state.getDecisionClick('blocked-long-answer')?.nativeReturn?.outcome, null);
+  const click = f.state.getDecisionClick('blocked-long-answer');
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(click?.projectionOutcome, 'not_sent');
+  assert.equal(click?.nativeReturn?.outcome, 'submitted');
+  assert.equal(click?.state, 'materialized_projection_pending');
   assert.equal(f.state.listDecisionPendingWork().length, 1);
 });
 
@@ -1420,7 +1423,7 @@ test('unknown projection remains retryable after native submission and closes cu
   assert.equal(f.state.listReceipts().some(row => String(row.detail).includes('projection-token')), false);
 });
 
-test('long-answer replay waits for SENT projection before dispatching native work', { timeout: 30000 }, async t => {
+test('long-answer replay dispatches native work while projection remains pending', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.started = true;
   f.gateway.transportReady = true;
@@ -1447,7 +1450,9 @@ test('long-answer replay waits for SENT projection before dispatching native wor
     throw Object.assign(new Error('projection response was lost'), { outcome: 'unknown' });
   };
   await f.gateway.decisionConsumer.recover(new AbortController().signal);
-  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.state.getDecisionClick('projection-replay-boundary')?.nativeReturn?.outcome, 'submitted');
+  assert.equal(f.state.getDecisionClick('projection-replay-boundary')?.state, 'materialized_projection_pending');
   assert.equal(projectionAttempts, 1);
 
   f.gateway.projectDecisionMessage = async () => { projectionAttempts += 1; };
@@ -1458,7 +1463,7 @@ test('long-answer replay waits for SENT projection before dispatching native wor
   assert.equal(f.dispatches.length, 1);
 });
 
-test('same-interaction replay retries an unknown long projection before native dispatch', { timeout: 30000 }, async t => {
+test('same-interaction replay retries an unknown long projection after native dispatch', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.started = true;
   f.gateway.transportReady = true;
@@ -1487,13 +1492,13 @@ test('same-interaction replay retries an unknown long projection before native d
   };
 
   await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
-  assert.equal(f.dispatches.length, 0);
+  assert.equal(f.dispatches.length, 1);
   await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
   assert.equal(f.dispatches.length, 1);
   assert.equal(projectionAttempts, 2);
 });
 
-test('restart classifies an interrupted rejection as terminal without resending', { timeout: 30000 }, async t => {
+test('restart retains custody for an interrupted rejection followup', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   const admitted = f.state.admitDecisionClickAndBeginAuthorization({
     interactionId: 'rejection-restart', presentationId: f.presentation.presentationId, selectedKey: 'hold',
@@ -1502,6 +1507,7 @@ test('restart classifies an interrupted rejection as terminal without resending'
   });
   assert.equal(admitted.accepted, true);
   assert.equal(f.state.recordDecisionAuthorizationOutcome('rejection-restart', 'denied').accepted, true);
+  assert.equal(f.state.recordDecisionCallbackOutcome('rejection-restart', 'sent').accepted, true);
   assert.equal(f.state.beginDecisionRejectionFollowup('rejection-restart').accepted, true);
   f.state.close();
 
@@ -1509,9 +1515,38 @@ test('restart classifies an interrupted rejection as terminal without resending'
   recovered.setConfig({ operatorId: 'operator', guildId: 'guild', secretFile: path.join(f.dir, 'discord.secret') });
   assert.equal(recovered.listDecisionPendingWork().length, 1);
   recovered.recoverAfterRestart();
-  assert.equal(recovered.listDecisionPendingWork().length, 0);
+  const pending = recovered.listDecisionPendingWork();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0]?.rejectionOutcome, 'unknown');
+  assert.equal(pending[0]?.token, 'rejection-token');
   assert.equal(recovered.listReceipts().some(row => String(row.detail).includes('rejection-token')), false);
   recovered.close();
+});
+
+test('unknown rejection followup retries once and clears custody after delivery', { timeout: 30000 }, async t => {
+  let calls = 0;
+  const f = await fixture(t, {
+    callback: async () => {
+      calls += 1;
+      if (calls === 2) throw new Error('followup response timed out');
+      return { ok: true, status: 204 };
+    }
+  });
+  f.gateway.started = true;
+  f.gateway.transportReady = true;
+  f.gateway.ready = true;
+  f.gateway.authorizeDecisionInteraction = async () => false;
+
+  const result = await f.gateway.handleInteraction(component(f.presentation, 'rejection-timeout', 0), new AbortController().signal);
+  assert.equal(result.accepted, false);
+  assert.equal(calls, 2);
+  const pending = f.state.listDecisionPendingWork();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0]?.rejectionOutcome, 'unknown');
+  assert.equal(pending[0]?.token, 'token-rejection-timeout');
+
+  await waitForCondition(() => calls === 3, 'unknown rejection followup was not retried');
+  assert.equal(f.state.listDecisionPendingWork().length, 0);
 });
 
 test('permanent rejection drains denied custody and does not retry', { timeout: 30000 }, async t => {

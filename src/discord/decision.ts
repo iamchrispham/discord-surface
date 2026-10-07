@@ -449,8 +449,9 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     const outcome = transportOutcome(result.outcome);
     const retryDelayMs = outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED
       ? decisionRecoveryDelayMs(result.retryAfterMs)
-      : 0;
-    const scheduleRetry = outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED && !signal?.aborted;
+      : DECISION_RECOVERY_DEFAULT_DELAY_MS;
+    const retryFirstUnknown = outcome === DECISION_TRANSPORT_OUTCOMES.UNKNOWN && click.rejectionOutcome === null;
+    const scheduleRetry = (outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED || retryFirstUnknown) && !signal?.aborted;
     try { state.recordDecisionRejectionOutcome(click.interactionId, outcome); } catch {}
     if (scheduleRetry) {
       scheduleRecovery(new Set([click.channelId]), {
@@ -628,10 +629,6 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     }
     const projected = await project(current, presentation, signal);
     current = state.getDecisionClick(click.interactionId) || current;
-    if (!projected && current.canonical?.answer && current.canonical.answer.length > DECISION_EMBED_DESCRIPTION_LIMIT &&
-      projectionOutcomeRetryable(current.projectionOutcome)) {
-      return { handled: true, accepted: true, click: current, canonical: current.canonical, message: safeMessage(state, current.interactionId) };
-    }
     const retryKnownUnsubmitted = recovery && projected &&
       current.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT;
     const nativeResult = await native(current, signal, retryKnownUnsubmitted);

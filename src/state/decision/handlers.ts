@@ -106,16 +106,13 @@ function requireClickInput(input: DecisionClickInput): NormalizedClickInput {
 
 function pending(click: MutableClick): boolean {
   return PENDING_STATES.has(click.state) ||
-    (click.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED &&
-      (click.rejectionOutcome === null ||
-        click.rejectionOutcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT ||
-        click.rejectionOutcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED));
+    (click.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED && !rejectionTerminal(click));
 }
 
-function rejectionTerminal(outcomeValue: DecisionTransportOutcome | null): boolean {
+function rejectionTerminal(click: MutableClick, outcomeValue = click.rejectionOutcome): boolean {
   return outcomeValue === DECISION_TRANSPORT_OUTCOMES.SENT ||
     outcomeValue === DECISION_TRANSPORT_OUTCOMES.REJECTED ||
-    outcomeValue === DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
+    (outcomeValue === DECISION_TRANSPORT_OUTCOMES.UNKNOWN && click.callbackOutcome !== DECISION_TRANSPORT_OUTCOMES.SENT);
 }
 
 function projectionRetryable(outcomeValue: DecisionTransportOutcome | null): boolean {
@@ -424,7 +421,7 @@ export function createDecisionHandlers(): DecisionHandlers {
         if (click.authorizationOutcome !== DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
           return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
         }
-        if (rejectionTerminal(click.rejectionOutcome)) {
+        if (rejectionTerminal(click)) {
           return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
         }
         if (click.rejectionAttempted && click.rejectionOutcome === null) {
@@ -447,7 +444,7 @@ export function createDecisionHandlers(): DecisionHandlers {
         if (!click.rejectionAttempted) {
           return { accepted: false, reason: DECISION_REASONS.INVALID_DECISION_INTERACTION, click: mutableClickOutput(click) };
         }
-        if (rejectionTerminal(click.rejectionOutcome)) {
+        if (rejectionTerminal(click)) {
           return { accepted: false, duplicate: true, click: mutableClickOutput(click) };
         }
         const tokenHeld = Boolean(click.token);
@@ -455,7 +452,7 @@ export function createDecisionHandlers(): DecisionHandlers {
           interactionId: id,
           outcome: nextOutcome
         });
-        if (rejectionTerminal(nextOutcome)) releaseToken(state, id, tokenHeld);
+        if (rejectionTerminal(click, nextOutcome)) releaseToken(state, id, tokenHeld);
         return { accepted: true, click: mutableClickOutput(clickFor(state, id) as MutableClick) };
       });
     },
@@ -472,13 +469,11 @@ export function createDecisionHandlers(): DecisionHandlers {
       const interruptedRejections = [...snapshot(state).clicks.values()].filter(click =>
         click.rejectionAttempted && click.rejectionOutcome === null);
       for (const click of interruptedRejections) {
-        const tokenHeld = Boolean(click.token);
         append(state, DECISION_RECEIPT_KINDS.REJECTION_OUTCOME, {
           interactionId: click.interactionId,
           outcome: DECISION_TRANSPORT_OUTCOMES.UNKNOWN,
           reason: 'process stopped before decision rejection outcome'
         });
-        releaseToken(state, click.interactionId, tokenHeld);
       }
       return interrupted.length + interruptedRejections.length;
     },
