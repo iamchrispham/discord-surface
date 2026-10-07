@@ -216,15 +216,20 @@ function receiptSites(ts, entries) {
           sites.push(`${entry.file}|${ownerOf(ts, node)}|${info.receiver}.receipt|literal:${kindText}`);
         }
       }
-      if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
-        node.expression.text === 'ORDINARY_RECEIPT_KINDS' && RECEIPT_KINDS.has(node.name.text)) {
-        sites.push(`${entry.file}|${ownerOf(ts, node)}|ORDINARY_RECEIPT_KINDS.${node.name.text}`);
+      if (ts.isPropertyAccessExpression(node)) {
+        const receiver = unwrap(ts, node.expression);
+        if (ts.isIdentifier(receiver) && receiver.text === 'ORDINARY_RECEIPT_KINDS' &&
+          RECEIPT_KINDS.has(node.name.text)) {
+          sites.push(`${entry.file}|${ownerOf(ts, node)}|ORDINARY_RECEIPT_KINDS.${node.name.text}`);
+        }
       }
-      if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) &&
-        node.expression.text === 'ORDINARY_RECEIPT_KINDS' &&
-        node.argumentExpression && ts.isStringLiteral(node.argumentExpression) &&
-        RECEIPT_KINDS.has(node.argumentExpression.text)) {
-        sites.push(`${entry.file}|${ownerOf(ts, node)}|ORDINARY_RECEIPT_KINDS['${node.argumentExpression.text}']`);
+      if (ts.isElementAccessExpression(node)) {
+        const receiver = unwrap(ts, node.expression);
+        const key = node.argumentExpression && constantStringExpression(ts, unwrap(ts, node.argumentExpression));
+        if (ts.isIdentifier(receiver) && receiver.text === 'ORDINARY_RECEIPT_KINDS' &&
+          key && RECEIPT_KINDS.has(key)) {
+          sites.push(`${entry.file}|${ownerOf(ts, node)}|ORDINARY_RECEIPT_KINDS['${key}']`);
+        }
       }
     });
   }
