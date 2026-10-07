@@ -532,6 +532,102 @@ test("forwarding and property uncertainty stay conservative", () => {
   );
 });
 
+test("review regressions retain finite probe provenance", () => {
+  runFixture(
+    "function invoke(probe, pid) { probe(pid, 0); } invoke.call(null, process.kill, 1);",
+    ["private-alias.js\u0000invoke"],
+    ["unclassified process probe private-alias.js:invoke"]
+  );
+  runFixture(
+    "function invoke(probe, pid) { probe(pid, 0); } invoke.apply(null, [process.kill, 1]);",
+    ["private-alias.js\u0000invoke"],
+    ["unclassified process probe private-alias.js:invoke"]
+  );
+  runFixture(
+    "function invoke(probe, pid) { probe(pid, 0); } const run = invoke.bind(null); run.call(null, process.kill, 1);",
+    ["private-alias.js\u0000invoke"],
+    ["unclassified process probe private-alias.js:invoke"]
+  );
+  runFixture(
+    "let probe; ({ kill: probe = () => true } = process); probe(1, 0);",
+    ["private-alias.js\u0000null"],
+    ["unclassified process probe private-alias.js:null"]
+  );
+  runFixture(
+    "let probe; ([probe = () => true] = [process.kill]); probe(1, 0);",
+    ["private-alias.js\u0000null"],
+    ["unclassified process probe private-alias.js:null"]
+  );
+  runFixture(
+    "function check(pid) { for (const probe of [process.kill]) probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+  runFixture(
+    "let probe; function check(pid) { for (probe of [process.kill]) probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+  runFixture(
+    "const key = 'kill'; const { [key]: probe } = process; probe(1, 0);",
+    ["private-alias.js\u0000null"],
+    ["unclassified process probe private-alias.js:null"]
+  );
+  runFixture(
+    "async function check(pid) { const probe = await process.kill; probe(pid, 0); }",
+    ["private-alias.js\u0000check"],
+    ["unclassified process probe private-alias.js:check"]
+  );
+  runFixture(
+    "class Runner { constructor(probe, pid) { probe(pid, 0); } } new Runner(process.kill, 1);",
+    ["private-alias.js\u0000null"],
+    ["unclassified process probe private-alias.js:null"]
+  );
+  runFixture(
+    "const helpers = { call(probe, pid) { probe(pid, 0); } }; helpers.call(process.kill, 1);",
+    ["private-alias.js\u0000call"],
+    ["unclassified process probe private-alias.js:call"]
+  );
+  runFixture(
+    "const helpers = { apply(probe, pid) { probe(pid, 0); } }; helpers.apply(process.kill, 1);",
+    ["private-alias.js\u0000apply"],
+    ["unclassified process probe private-alias.js:apply"]
+  );
+  runFixture(
+    "const helpers = { bind(probe, pid) { probe(pid, 0); } }; helpers.bind(process.kill, 1);",
+    ["private-alias.js\u0000bind"],
+    ["unclassified process probe private-alias.js:bind"]
+  );
+});
+
+test("local module exports retain live and built-in origins", () => {
+  runFilesFixture({
+    "probe.js": "export let probe = () => true; probe = process.kill;",
+    "use.js": "import { probe } from './probe.js'; probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    "probe.js": "module.exports = process.kill;",
+    "use.js": "const probe = require('./probe'); probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    "probe.js": "const process = { kill() {} }; export const probe = process.kill;",
+    "use.js": "import { probe } from './probe.js'; probe(1, 0);"
+  }, [], []);
+  runFilesFixture({
+    "probe.js": "export const probe = process.kill;",
+    "barrel.js": "export * from './probe.js';",
+    "use.js": "import { probe } from './barrel.js'; probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    "probe.js": "import proc from 'node:process'; export const probe = proc.kill;",
+    "use.js": "import { probe } from './probe.js'; probe(1, 0);"
+  }, ["use.js\u0000null"], ["unclassified process probe use.js:null"]);
+  runFilesFixture({
+    "probe.ts": "export const probe = process.kill;",
+    "use.ts": "import { probe } from './probe.js'; probe(1, 0);"
+  }, ["use.ts\u0000null"], ["unclassified process probe use.ts:null"]);
+});
+
 test("legacy owner identity survives invocation methods", () => {
   const expectedLegacy = ["private-alias.js\u0000newProbe"];
   const expectedViolation = ["legacy directPostOwnerAlive callsite private-alias.js:newProbe"];

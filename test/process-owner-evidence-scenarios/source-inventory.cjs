@@ -127,8 +127,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   const recordMemberAssignment = (access, value) => {
     pendingMemberAssignments.push({ access, value });
   };
+  const hasAtom = (set, atom) => Boolean(set) && set.has(atom);
   const indexMemberAssignment = (access, value) => {
-    const names = staticPropertyNames(access, false);
+    const names = staticPropertyNames(access, true);
     if (!names.length) return;
     for (const receiver of receiverSymbols(access.expression)) {
       let byName = memberAssignments.get(receiver);
@@ -258,12 +259,6 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       ? access.argumentExpression.expression : access.argumentExpression;
     if (ts.isStringLiteral(argument) || ts.isNumericLiteral(argument)) return [argument.text];
     if (ts.isIdentifier(argument)) {
-      const declaration = symbolDeclaration(checker.getSymbolAtLocation(argument));
-      const initializer = declaration && ts.isVariableDeclaration(declaration)
-        ? declaration.initializer : null;
-      if (initializer && (ts.isStringLiteral(initializer) || ts.isNumericLiteral(initializer))) {
-        return [initializer.text];
-      }
       const values = staticValue(argument);
       if (values.size) return [...values].filter(value => typeof value === 'string' || typeof value === 'number')
         .map(String);
@@ -280,7 +275,43 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     const symbols = names.map(name => checker.getPropertyOfType(receiverType, String(name))).filter(Boolean);
     return symbols.length ? symbols : [checker.getSymbolAtLocation(access)].filter(Boolean);
   };
+  const assignmentTargetIdentifiers = node => {
+    const target = ts.isParenthesizedExpression(node) ? node.expression : node;
+    if (ts.isIdentifier(target)) return [target];
+    if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      return assignmentTargetIdentifiers(target.left);
+    }
+    if (ts.isObjectLiteralExpression(target) || ts.isArrayLiteralExpression(target)) {
+      const identifiers = [];
+      for (const element of target.properties || target.elements) {
+        if (ts.isSpreadAssignment(element) || ts.isSpreadElement(element)) continue;
+        if (ts.isPropertyAssignment(element)) identifiers.push(...assignmentTargetIdentifiers(element.initializer));
+        else identifiers.push(...assignmentTargetIdentifiers(element));
+      }
+      return identifiers;
+    }
+    return [];
+  };
+  const recordIterationTarget = (target, source) => {
+    for (const identifier of assignmentTargetIdentifiers(target)) {
+      recordAssignment(checker.getSymbolAtLocation(identifier), { source });
+    }
+  };
+  const indexForOfStatement = statement => {
+    const iterable = ts.isParenthesizedExpression(statement.expression)
+      ? statement.expression.expression : statement.expression;
+    if (!ts.isArrayLiteralExpression(iterable)) return;
+    const declarations = ts.isVariableDeclarationList(statement.initializer)
+      ? statement.initializer.declarations : [statement.initializer];
+    for (const declaration of declarations) {
+      for (const element of iterable.elements) {
+        if (!element || ts.isSpreadElement(element)) continue;
+        recordIterationTarget(ts.isVariableDeclarationList(statement.initializer) ? declaration.name : declaration, element);
+      }
+    }
+  };
   const indexRightHandSide = expression => {
+    if (ts.isForOfStatement(expression)) indexForOfStatement(expression);
     if (!expression) return;
     const operator = ts.isBinaryExpression(expression) ? expression.operatorToken.kind : null;
     const isAssignment = operator === ts.SyntaxKind.EqualsToken ||
@@ -297,12 +328,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           let name = null;
           if (ts.isPropertyAssignment(property)) {
             name = ts.isIdentifier(property.name) ? property.name.text
-              : ts.isStringLiteral(property.name) ? property.name.text : null;
+              : ts.isStringLiteral(property.name) ? property.name.text
+                : ts.isComputedPropertyName(property.name)
+                  ? [...staticValue(property.name.expression)].find(value => typeof value === 'string' ||
+                    typeof value === 'number')?.toString() || null
+                  : null;
             // Resolve the target identifier node directly; its symbol is the
             // lexical place, which is what a call-site identifier resolves to.
-            target = ts.isIdentifier(property.initializer) ? checker.getSymbolAtLocation(property.initializer)
-              : ts.isParenthesizedExpression(property.initializer) && ts.isIdentifier(property.initializer.expression)
-                ? checker.getSymbolAtLocation(property.initializer.expression) : null;
+            const targets = assignmentTargetIdentifiers(property.initializer);
+            target = targets.length ? checker.getSymbolAtLocation(targets[0]) : null;
           } else if (ts.isShorthandPropertyAssignment(property)) {
             name = property.name.text;
             // For shorthand, `getSymbolAtLocation(property.name)` returns the
@@ -316,8 +350,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         for (let index = 0; index < left.elements.length; index += 1) {
           const target = left.elements[index];
           const source = expression.right.elements[index];
-          if (ts.isIdentifier(target) && source && !ts.isSpreadElement(source)) {
-            recordAssignment(checker.getSymbolAtLocation(target), { source });
+          if (!source || ts.isSpreadElement(source)) continue;
+          for (const identifier of assignmentTargetIdentifiers(target)) {
+            recordAssignment(checker.getSymbolAtLocation(identifier), { source });
           }
         }
       } else if (ts.isPropertyAccessExpression(left) || ts.isElementAccessExpression(left)) {
@@ -337,7 +372,11 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     if (!ts.isBindingElement(binding)) return null;
     if (binding.propertyName) {
       return ts.isIdentifier(binding.propertyName) || ts.isStringLiteral(binding.propertyName)
-        ? binding.propertyName.text : null;
+        ? binding.propertyName.text
+        : ts.isComputedPropertyName(binding.propertyName)
+          ? [...staticValue(binding.propertyName.expression)].find(value => typeof value === 'string' ||
+            typeof value === 'number')?.toString() || null
+          : null;
     }
     return ts.isIdentifier(binding.name) ? binding.name.text : null;
   };
@@ -368,11 +407,31 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       recordParameterArgument(checker.getSymbolAtLocation(binding.name), argument, propertyName);
     }
   };
+  const invocationWrapperName = callee => {
+    if (!ts.isPropertyAccessExpression(callee) && !ts.isElementAccessExpression(callee)) return null;
+    const names = staticPropertyNames(callee, true);
+    if (names.length !== 1 || !['call', 'apply', 'bind'].includes(String(names[0]))) return null;
+    const member = ts.isPropertyAccessExpression(callee)
+      ? checker.getSymbolAtLocation(callee.name) : checker.getSymbolAtLocation(callee);
+    const symbols = [member, ...propertySymbols(callee)].filter(Boolean);
+    const isUserDeclaration = symbols.some(symbol => (symbol.declarations || []).some(declaration =>
+      ts.isMethodDeclaration(declaration) || ts.isPropertyAssignment(declaration) ||
+      ts.isPropertyDeclaration(declaration) || ts.isFunctionDeclaration(declaration)));
+    return isUserDeclaration ? null : String(names[0]);
+  };
+  const classConstructorParameters = declaration => {
+    if (!declaration || (!ts.isClassDeclaration(declaration) && !ts.isClassExpression(declaration))) return [];
+    const constructor = declaration.members.find(member => ts.isConstructorDeclaration(member));
+    return constructor?.parameters || [];
+  };
   const callableParameters = (callee, visited = new Set()) => {
     if (ts.isParenthesizedExpression(callee)) return callableParameters(callee.expression, visited);
     if (ts.isFunctionExpression(callee) || ts.isArrowFunction(callee)) return callee.parameters;
+    const wrapper = invocationWrapperName(callee);
+    if (wrapper) return callableParameters(callee.expression, visited);
     const symbols = [];
-    if (ts.isIdentifier(callee) || ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
+    if (ts.isIdentifier(callee) || ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee) ||
+      ts.isClassExpression(callee)) {
       const direct = checker.getSymbolAtLocation(callee);
       if (direct) symbols.push(direct);
       if (ts.isPropertyAccessExpression(callee)) {
@@ -391,6 +450,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         ts.isArrowFunction(declaration) || ts.isMethodDeclaration(declaration))) {
         return declaration.parameters;
       }
+      if (declaration && (ts.isClassDeclaration(declaration) || ts.isClassExpression(declaration))) {
+        return classConstructorParameters(declaration);
+      }
       if (declaration && ts.isPropertyAssignment(declaration)) {
         if (ts.isFunctionExpression(declaration.initializer) || ts.isArrowFunction(declaration.initializer)) {
           return declaration.initializer.parameters;
@@ -404,6 +466,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           (ts.isFunctionExpression(declaration.initializer) || ts.isArrowFunction(declaration.initializer))) {
           return declaration.initializer.parameters;
         }
+        if (declaration.initializer && ts.isClassExpression(declaration.initializer)) {
+          return classConstructorParameters(declaration.initializer);
+        }
         if (declaration.initializer && ts.isIdentifier(declaration.initializer)) {
           return callableParameters(declaration.initializer, symbolSeen);
         }
@@ -416,8 +481,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         if (ts.isFunctionExpression(declaration.initializer) || ts.isArrowFunction(declaration.initializer)) {
           return declaration.initializer.parameters;
         }
+        if (ts.isClassExpression(declaration.initializer)) {
+          return classConstructorParameters(declaration.initializer);
+        }
         if (ts.isIdentifier(declaration.initializer)) {
           return callableParameters(declaration.initializer, symbolSeen);
+        }
+        if (ts.isCallExpression(declaration.initializer) &&
+          invocationWrapperName(declaration.initializer.expression) === 'bind') {
+          return callableParameters(declaration.initializer.expression.expression, symbolSeen);
         }
       }
       for (const assigned of assignments.get(symbol) || []) {
@@ -458,7 +530,42 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     return source.elements;
   };
   const indexParameterArguments = node => {
-    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+    if (ts.isCallExpression(node)) {
+      const wrapper = invocationWrapperName(node.expression);
+      if (wrapper) {
+        const parameters = callableParameters(node.expression.expression);
+        let argumentsList = node.arguments ? [...node.arguments] : [];
+        if (wrapper === 'call') argumentsList = argumentsList.slice(1);
+        if (wrapper === 'apply') {
+          const elements = literalArrayElements(argumentsList[1]);
+          argumentsList = elements ? [...elements] : [];
+        }
+        if (wrapper === 'bind') argumentsList = argumentsList.slice(1);
+        for (let index = 0; index < parameters.length; index += 1) {
+          const parameter = parameters[index];
+          const argument = argumentsList[index];
+          if (argument && !ts.isSpreadElement(argument)) {
+            indexParameterBinding(parameter.name, argument, parameter);
+          }
+        }
+      } else {
+        const parameters = callableParameters(node.expression);
+        const argumentsList = expandCallArguments(node.arguments);
+        if (argumentsList === null) {
+          ts.forEachChild(node, indexParameterArguments);
+          return;
+        }
+        for (let index = 0; index < parameters.length; index += 1) {
+          const parameter = parameters[index];
+          const argument = argumentsList[index];
+          if (parameter.dotDotDotToken) {
+            indexParameterBinding(parameter.name, argument, parameter, argumentsList.slice(index));
+          } else if (argument && !ts.isSpreadElement(argument)) {
+            indexParameterBinding(parameter.name, argument, parameter);
+          }
+        }
+      }
+    } else if (ts.isNewExpression(node)) {
       const parameters = callableParameters(node.expression);
       const argumentsList = expandCallArguments(node.arguments);
       if (argumentsList === null) {
@@ -479,8 +586,6 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   };
   indexParameterArguments(sourceFile);
   for (const { access, value } of pendingMemberAssignments) indexMemberAssignment(access, value);
-
-  const hasAtom = (set, atom) => Boolean(set) && set.has(atom);
 
   function accessNames(node, visited) {
     if (ts.isPropertyAccessExpression(node)) return new Set([node.name.text]);
@@ -586,7 +691,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   function transparentExpression(node) {
     if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) ||
       ts.isSatisfiesExpression(node) || ts.isNonNullExpression(node) ||
-      ts.isTypeAssertionExpression(node)) return node.expression;
+      ts.isTypeAssertionExpression(node) || ts.isAwaitExpression(node)) return node.expression;
     return null;
   }
 
@@ -945,7 +1050,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     const seen = new Set(visited).add(node);
     const transparent = transparentExpression(node);
     if (transparent) return mayBeUnresolved(transparent, seen);
-    if (ts.isNumericLiteral(node) || ts.isStringLiteral(node)) return false;
+    if (ts.isNumericLiteral(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return false;
     if (ts.isConditionalExpression(node)) {
       return mayBeUnresolved(node.whenTrue, seen) || mayBeUnresolved(node.whenFalse, seen);
     }
@@ -1013,10 +1118,29 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           if (mayBeUnresolvedProperty(property.expression, name, seen)) return true;
           continue;
         }
+        if (ts.isGetAccessorDeclaration(property)) {
+          const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
+            ? property.name.text
+            : ts.isComputedPropertyName(property.name)
+              ? [...staticValue(property.name.expression, seen)].find(value => typeof value === 'string' ||
+                typeof value === 'number')?.toString() || null
+              : null;
+          if (key !== name) continue;
+          found = true;
+          for (const statement of property.body?.statements || []) {
+            if (ts.isReturnStatement(statement) && statement.expression &&
+              mayBeUnresolved(statement.expression, seen)) return true;
+          }
+          continue;
+        }
         if (!property.name) continue;
         const shorthand = ts.isShorthandPropertyAssignment(property);
         if (!shorthand && !ts.isPropertyAssignment(property)) continue;
-        const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? property.name.text : null;
+        const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? property.name.text
+          : ts.isComputedPropertyName(property.name)
+            ? [...staticValue(property.name.expression, seen)].find(value => typeof value === 'string' ||
+              typeof value === 'number')?.toString() || null
+            : null;
         if (key !== name) continue;
         found = true;
         const value = shorthand ? property.name : property.initializer;
@@ -1063,7 +1187,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   }
 
   // Named property of a literal object origin, reached directly or through
-  // identifier aliases. Static lookup only: computed keys are not evaluated.
+  // identifier aliases. Static lookup only: keys must resolve to literals.
   function literalProperty(node, name, visited) {
     const found = new Set();
     if (!node || !name || visited.has(node)) return found;
@@ -1085,10 +1209,28 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           for (const atom of literalProperty(property.expression, name, seen)) found.add(atom);
           continue;
         }
+        if (ts.isGetAccessorDeclaration(property)) {
+          const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
+            ? property.name.text
+            : ts.isComputedPropertyName(property.name)
+              ? [...staticValue(property.name.expression, seen)].find(value => typeof value === 'string' ||
+                typeof value === 'number')?.toString() || null
+              : null;
+          if (key !== name) continue;
+          for (const statement of property.body?.statements || []) {
+            if (!ts.isReturnStatement(statement) || !statement.expression) continue;
+            for (const atom of resolveSet(statement.expression, seen)) found.add(atom);
+          }
+          continue;
+        }
         if (!property.name) continue;
         const shorthand = ts.isShorthandPropertyAssignment(property);
         if (!shorthand && !ts.isPropertyAssignment(property)) continue;
-        const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? property.name.text : null;
+        const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? property.name.text
+          : ts.isComputedPropertyName(property.name)
+            ? [...staticValue(property.name.expression, seen)].find(value => typeof value === 'string' ||
+              typeof value === 'number')?.toString() || null
+            : null;
         if (key !== name) continue;
         const value = shorthand ? property.name : property.initializer;
         for (const atom of resolveSet(value, seen)) found.add(atom);
