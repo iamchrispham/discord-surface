@@ -217,6 +217,57 @@ const PRIOR_SURFACE_METHOD_NAMES = new Set([
   'close'
 ]);
 
+function exportedClassDeclaration(source, exportName) {
+  const declarations = new Map();
+  for (const statement of source.statements) {
+    if (ts.isClassDeclaration(statement) && statement.name) {
+      declarations.set(statement.name.text, statement);
+    } else if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name) && declaration.initializer &&
+            ts.isClassExpression(declaration.initializer)) {
+          declarations.set(declaration.name.text, declaration.initializer);
+        }
+      }
+    }
+  }
+
+  const isModuleExports = node => ts.isPropertyAccessExpression(node) &&
+    ts.isIdentifier(node.expression) && node.expression.text === 'module' &&
+    node.name.text === 'exports';
+  const isNamedExport = node => ts.isPropertyAccessExpression(node) &&
+    (isModuleExports(node.expression) ||
+      (ts.isIdentifier(node.expression) && node.expression.text === 'exports')) &&
+    node.name.text === exportName;
+  const expressionForProperty = property => {
+    if (ts.isShorthandPropertyAssignment(property)) return property.name;
+    if (ts.isPropertyAssignment(property)) return property.initializer;
+    return null;
+  };
+
+  let exported = null;
+  for (const statement of source.statements) {
+    if (!ts.isExpressionStatement(statement) || !ts.isBinaryExpression(statement.expression) ||
+        statement.expression.operatorToken.kind !== ts.SyntaxKind.EqualsToken) continue;
+    const { left, right } = statement.expression;
+    if (isNamedExport(left)) {
+      exported = right;
+    } else if (isModuleExports(left)) {
+      if (!ts.isObjectLiteralExpression(right)) {
+        exported = null;
+        continue;
+      }
+      const property = right.properties.find(candidate =>
+        (ts.isShorthandPropertyAssignment(candidate) && candidate.name.text === exportName) ||
+        (ts.isPropertyAssignment(candidate) && candidate.name &&
+          ts.isIdentifier(candidate.name) && candidate.name.text === exportName));
+      exported = property && expressionForProperty(property);
+    }
+  }
+  if (ts.isClassExpression(exported)) return exported;
+  return exported && ts.isIdentifier(exported) ? declarations.get(exported.text) || null : null;
+}
+
 function matches(text, baseline, fileName = 'state.js') {
   try {
     const raw = inventory(text, fileName);
@@ -237,7 +288,8 @@ function matches(text, baseline, fileName = 'state.js') {
       if (JSON.stringify(candidate.delegationBodies[name]) !== JSON.stringify(baseline.delegationBodies[name])) return false;
     }
     const parsed = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    const owner = parsed.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'SurfaceState');
+    const owner = exportedClassDeclaration(parsed, 'SurfaceState');
+    if (!owner) return false;
     const priorUnsupportedForwarding = PRIOR_UNSUPPORTED_FORWARDING_NAMES;
     for (const method of owner.members) {
       const name = ts.isConstructorDeclaration(method) ? 'constructor' : method.name?.text;

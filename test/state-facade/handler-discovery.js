@@ -531,11 +531,12 @@ function moduleCallableDescriptor(filePath, methodName, seen = new Set()) {
   try {
     const text = fs.readFileSync(filePath, 'utf8');
     const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    const local = factoryDeclaration(source, methodName);
-    if (local) return callableDescriptor(local);
-    const bindings = requireBindings(source);
     const exported = exportedFactoryExpression(source, methodName);
     const exportedName = exported && ts.isIdentifier(exported) ? exported.text : null;
+    const local = exportedName ? factoryDeclaration(source, exportedName) : null;
+    if (local) return callableDescriptor(local);
+    if (!exported) return null;
+    const bindings = requireBindings(source);
     const receiverBinding = exported && ts.isPropertyAccessExpression(exported) && ts.isIdentifier(exported.expression)
       ? bindings.get(exported.expression.text)
       : null;
