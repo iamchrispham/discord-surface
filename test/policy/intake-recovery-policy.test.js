@@ -675,6 +675,74 @@ const findSwitchDecision = (tokens, triggerIndex, pairs, functionRanges) => {
   return { start, end, opening: best.opening };
 };
 
+const findFallthroughScopeEnd = (tokens, position, pairs, functionRanges) => {
+  const containingFunction = functionRanges.find(range =>
+    position >= range.bodyStart && position < range.bodyEnd
+  );
+  let end = containingFunction?.bodyEnd ?? tokens.length;
+  for (let opening = position - 1; opening >= 0; opening -= 1) {
+    if (tokens[opening].value !== '{') continue;
+    const closing = pairs.get(opening);
+    if (closing !== undefined && closing > position && closing < end) {
+      end = closing;
+      break;
+    }
+  }
+  return end;
+};
+
+const findFallthroughStatementsEnd = (tokens, start, end, pairs, functionRanges) => {
+  let cursor = start;
+  while (cursor < end) {
+    while (tokens[cursor]?.value === ';') cursor += 1;
+    if (cursor >= end || tokens[cursor]?.value === '}') break;
+    const statementEnd = findControlledStatementEnd(tokens, cursor, end, pairs);
+    if (statementEnd <= cursor || statementEnd > end) break;
+    if (switchArmHasAbruptCompletion(tokens, cursor, statementEnd, pairs, functionRanges)) {
+      return statementEnd;
+    }
+    cursor = statementEnd;
+  }
+  return cursor;
+};
+
+const findLoopDecision = (tokens, triggerIndex, pairs) => {
+  for (let index = triggerIndex - 1; index >= 0; index -= 1) {
+    if (!['while', 'for'].includes(tokens[index]?.value)) continue;
+    const opening = index + 1;
+    if (tokens[opening]?.value !== '(') continue;
+    const closing = pairs.get(opening);
+    if (closing === undefined || triggerIndex <= opening || triggerIndex >= closing) continue;
+
+    let conditionContainsTrigger = tokens[index].value === 'while';
+    if (tokens[index].value === 'for') {
+      let firstSeparator = null;
+      let secondSeparator = null;
+      for (let cursor = opening + 1; cursor < closing; cursor += 1) {
+        const nestedEnd = pairs.get(cursor);
+        if (nestedEnd !== undefined && nestedEnd > cursor) {
+          cursor = nestedEnd;
+          continue;
+        }
+        if (tokens[cursor].value !== ';') continue;
+        if (firstSeparator === null) firstSeparator = cursor;
+        else {
+          secondSeparator = cursor;
+          break;
+        }
+      }
+      conditionContainsTrigger = firstSeparator !== null && secondSeparator !== null
+        && triggerIndex > firstSeparator && triggerIndex < secondSeparator;
+    }
+    if (!conditionContainsTrigger) continue;
+
+    const bodyStart = closing + 1;
+    const bodyEnd = findControlledStatementEnd(tokens, bodyStart, tokens.length, pairs);
+    return branchRange(tokens, bodyStart, bodyEnd, pairs);
+  }
+  return null;
+};
+
 const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNegated = false) => {
   const ifDecision = findIfDecision(tokens, triggerIndex, pairs);
   if (ifDecision) {
@@ -685,7 +753,14 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, al
     const negated = isNegatedDeadlineCondition(tokens, conditionStart, triggerIndex);
     const deadlineBranchIsNegated = Boolean(negated) !== aliasNegated;
     if (deadlineBranchIsNegated && alternateStart === consequentEnd) {
-      const fallthroughEnd = findControlledStatementEnd(tokens, consequentEnd, tokens.length, pairs);
+      const scopeEnd = findFallthroughScopeEnd(tokens, ifDecision.start, pairs, functionRanges);
+      const fallthroughEnd = findFallthroughStatementsEnd(
+        tokens,
+        consequentEnd,
+        scopeEnd,
+        pairs,
+        functionRanges
+      );
       return branchRange(tokens, consequentEnd, fallthroughEnd, pairs);
     }
     return branchRange(
@@ -695,6 +770,8 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, al
       pairs
     );
   }
+  const loopDecision = findLoopDecision(tokens, triggerIndex, pairs);
+  if (loopDecision) return loopDecision;
   const switchDecision = findSwitchDecision(tokens, triggerIndex, pairs, functionRanges);
   if (switchDecision) return switchDecision;
   const statement = findStatementRange(tokens, triggerIndex);
@@ -737,6 +814,34 @@ const boundaryWriterStateArgument = value => BOUNDARY_WRITER_STATE_ARGUMENTS.get
 const boundaryWriterCallOpening = (tokens, index) => {
   if (tokens[index + 1]?.value === '(') return index + 1;
   if (tokens[index + 1]?.value === '?.' && tokens[index + 2]?.value === '(') return index + 2;
+  return null;
+};
+
+const staticPropertyName = token => {
+  if (token?.type === 'identifier') return token.value;
+  if (!['string', 'template'].includes(token?.type) || typeof token.value !== 'string') return null;
+  if (token.type === 'template' && token.value.includes('${')) return null;
+  const quote = token.value[0];
+  if (['"', "'", '`'].includes(quote) && token.value[token.value.length - 1] === quote) {
+    return token.value.slice(1, -1);
+  }
+  return token.value;
+};
+
+const boundaryWriterNameAt = (tokens, index) => {
+  const token = tokens[index];
+  if (token?.type === 'identifier') return token.value;
+  if (tokens[index - 1]?.value !== '[' || tokens[index + 1]?.value !== ']') return null;
+  return staticPropertyName(token);
+};
+
+const boundaryWriterCallOpeningAt = (tokens, index) => {
+  if (tokens[index + 1]?.value !== ']') return boundaryWriterCallOpening(tokens, index);
+  const afterProperty = index + 2;
+  if (tokens[afterProperty]?.value === '(') return afterProperty;
+  if (tokens[afterProperty]?.value === '?.' && tokens[afterProperty + 1]?.value === '(') {
+    return afterProperty + 1;
+  }
   return null;
 };
 
@@ -840,12 +945,13 @@ const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases
       index = nestedFunction.closing;
       continue;
     }
-    if (tokens[index]?.type !== 'identifier' || !isBoundaryWriter(tokens[index].value)) continue;
+    const writerName = boundaryWriterNameAt(tokens, index);
+    if (writerName === null || !isBoundaryWriter(writerName)) continue;
     if (tokens[index - 1]?.value === 'function') continue;
-    const opening = boundaryWriterCallOpening(tokens, index);
+    const opening = boundaryWriterCallOpeningAt(tokens, index);
     const closing = opening === null ? undefined : pairs.get(opening);
     if (closing !== undefined && closing < end
-      && callHasGapArgument(tokens, opening, closing, pairs, boundaryWriterStateArgument(tokens[index].value), aliases)) {
+      && callHasGapArgument(tokens, opening, closing, pairs, boundaryWriterStateArgument(writerName), aliases)) {
       return true;
     }
   }
@@ -906,12 +1012,13 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       index = Math.max(index, statementEnd - 1);
       continue;
     }
-    if (token.type === 'identifier' && isBoundaryWriter(token.value)
+    const writerName = boundaryWriterNameAt(tokens, index);
+    if (writerName !== null && isBoundaryWriter(writerName)
       && tokens[index - 1]?.value !== 'function') {
-      const opening = boundaryWriterCallOpening(tokens, index);
+      const opening = boundaryWriterCallOpeningAt(tokens, index);
       const closing = opening === null ? undefined : pairs.get(opening);
       if (closing !== undefined && closing < end
-        && callHasGapArgument(tokens, opening, closing, pairs, boundaryWriterStateArgument(token.value), knownAliases)) return true;
+        && callHasGapArgument(tokens, opening, closing, pairs, boundaryWriterStateArgument(writerName), knownAliases)) return true;
     }
   }
   return opening === null && valueHasGapOutcome(tokens, start, end, pairs, knownAliases);
@@ -953,7 +1060,10 @@ const isDeadlineTriggerAt = (tokens, index) => {
   const reverseComparison = reverseOperandEnd !== null
     && ['<', '<='].includes(tokens[reverseOperandEnd]?.value)
     && dateNow(reverseOperandEnd + 1 - index);
-  return directComparison || reverseComparison;
+  const remainingBudget = dateNow(0)
+    && tokens[index - 1]?.value === '-'
+    && deadlineOperandEnd(index - 2) === index - 1;
+  return directComparison || reverseComparison || remainingBudget;
 };
 
 const findAssignedAlias = (tokens, triggerIndex) => {
@@ -1293,6 +1403,7 @@ const visibleGapAliasesAt = (tokens, limit, pairs, lexicalScopes, functionRanges
 const isConditionalDeadlineUse = (tokens, triggerIndex, pairs, functionRanges) => {
   if (findIfDecision(tokens, triggerIndex, pairs)
     || findSwitchDecision(tokens, triggerIndex, pairs, functionRanges)) return true;
+  if (findLoopDecision(tokens, triggerIndex, pairs)) return true;
   const statement = findStatementRange(tokens, triggerIndex);
   if (findShortCircuitDecision(tokens, triggerIndex, statement.start, statement.end, pairs)) return true;
   const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
@@ -1492,6 +1603,56 @@ test('deadline policy inventory recognizes optional boundary writer calls', () =
     source: 'if (deadlineReached) this.recordBoundary?.(binding, null, READINESS.GAP, detail);'
   }]);
   assert.deepEqual(offenders, ['discord/optional-boundary-writer.js:1']);
+});
+
+test('deadline policy inventory scans fall-through after negated guards', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-negated-fallthrough.js',
+    source: 'function readiness(deadlineReached) { if (!deadlineReached) return READINESS.READY; audit(); return READINESS.GAP; }'
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-negated-fallthrough.js:1']);
+});
+
+test('deadline policy inventory recognizes computed boundary writers', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-computed-writer.js',
+      source: "if (deadlineReached) state['markIntakeBoundary'](id, READINESS.GAP, detail);"
+    },
+    {
+      relative: 'discord/deadline-template-writer.js',
+      source: 'if (deadlineReached) state[`markIntakeBoundary`](id, READINESS.GAP, detail);'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-computed-writer.js:1',
+    'discord/deadline-template-writer.js:1'
+  ]);
+});
+
+test('deadline policy inventory inspects deadline-controlled loops', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-while-gap.js',
+      source: 'while (deadlineReached) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/deadline-for-gap.js',
+      source: 'for (let attempt = 0; deadlineReached; attempt += 1) return READINESS.GAP;'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-while-gap.js:1',
+    'discord/deadline-for-gap.js:1'
+  ]);
+});
+
+test('deadline policy inventory follows remaining-budget aliases', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-remaining-gap.js',
+    source: 'function readiness(deadline) { const remaining = deadline - Date.now(); if (remaining <= 0) return READINESS.GAP; }'
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-remaining-gap.js:1']);
 });
 
 test('deadline policy inventory ignores non-mutating boundary-shaped calls', () => {
