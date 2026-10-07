@@ -353,6 +353,15 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     return options.scheduleRecovery?.(channelIds, recoveryOptions);
   }
 
+  function pendingRecoveryDelay(decisionId: string): number {
+    const retryDeadline = decisionRecoveryDeadlines.get(decisionId);
+    if (retryDeadline === undefined) return 0;
+    const remainingDelay = retryDeadline - Date.now();
+    if (remainingDelay > 0) return remainingDelay;
+    decisionRecoveryDeadlines.delete(decisionId);
+    return 0;
+  }
+
   async function authorizationAllowed(input: DecisionAuthorizationInput, signal?: AbortSignal): Promise<boolean | null> {
     if (typeof options.authorize !== 'function') return true;
     try {
@@ -398,6 +407,11 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   async function deliverRejection(click: DecisionClick, signal?: AbortSignal, interaction: ParsedComponentInteraction | null = null): Promise<InteractionCallbackResult | null> {
     click = await awaitCallbackOutcome(click);
     if (click.callbackAttempted && !click.callbackOutcome) return null;
+    const remainingDelay = pendingRecoveryDelay(click.interactionId);
+    if (remainingDelay > 0) {
+      if (!signal?.aborted) scheduleRecovery(new Set([click.channelId]), { delayMs: remainingDelay, decisionId: click.interactionId });
+      return null;
+    }
     const begin = state.beginDecisionRejectionFollowup(click.interactionId) as { accepted?: boolean; click?: DecisionClick | null };
     if (!begin.accepted) return null;
     const target = rejectionInteraction(click) || interaction;
@@ -793,8 +807,8 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       if (!enforceRetryDeadlines && retryDeadline !== undefined) {
         decisionRecoveryDeadlines.delete(pendingClick.interactionId);
       }
-      if (enforceRetryDeadlines && retryDeadline !== undefined) {
-        const remainingDelay = retryDeadline - Date.now();
+      if (enforceRetryDeadlines) {
+        const remainingDelay = pendingRecoveryDelay(pendingClick.interactionId);
         if (remainingDelay > 0) {
           remaining.push(pendingClick);
           scheduleRecovery(new Set([pendingClick.channelId]), {
@@ -803,7 +817,6 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
           });
           continue;
         }
-        decisionRecoveryDeadlines.delete(pendingClick.interactionId);
       }
       if (pendingClick.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
         pendingClick = await awaitCallbackOutcome(pendingClick);

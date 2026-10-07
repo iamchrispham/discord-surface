@@ -252,6 +252,7 @@ class DiscordGateway {
     this.decisionRecoveryWakeDeadline = 0;
     this.decisionRecoveryWakeChannels = new Set();
     this.decisionRecoveryWakeDeadlines = new Map();
+    this.decisionRecoveryWakeDecisionDeadlines = new Map();
     this.queuedDecisionRecoveryAll = false;
     this.queuedDecisionRecoveryChannels = new Set();
     this.queuedDecisionRecoveryDeferred = false;
@@ -1838,12 +1839,22 @@ class DiscordGateway {
 
   _reconcilePending(before, signal, ...args) { return pendingReconciliation.reconcilePending.apply(this, arguments); }
 
+  _refreshDecisionRecoveryWakeChannels() {
+    this.decisionRecoveryWakeChannels.clear();
+    for (const channelId of this.decisionRecoveryWakeDeadlines.keys()) this.decisionRecoveryWakeChannels.add(channelId);
+    for (const { channelId } of this.decisionRecoveryWakeDecisionDeadlines.values()) this.decisionRecoveryWakeChannels.add(channelId);
+  }
+
   _armDecisionRecoveryWakeTimer() {
     if (this.decisionRecoveryWakeTimer) clearTimeout(this.decisionRecoveryWakeTimer);
     this.decisionRecoveryWakeTimer = null;
     this.decisionRecoveryWakeDeadline = 0;
-    if (this.stopping || !this.decisionRecoveryWakeDeadlines?.size) return;
-    const deadline = Math.min(...this.decisionRecoveryWakeDeadlines.values());
+    if (this.stopping || (!this.decisionRecoveryWakeDeadlines?.size && !this.decisionRecoveryWakeDecisionDeadlines?.size)) return;
+    const deadlines = [
+      ...this.decisionRecoveryWakeDeadlines.values(),
+      ...[...this.decisionRecoveryWakeDecisionDeadlines.values()].map(({ deadline }) => deadline)
+    ];
+    const deadline = Math.min(...deadlines);
     this.decisionRecoveryWakeDeadline = deadline;
     this.decisionRecoveryWakeTimer = setTimeout(() => {
       this.decisionRecoveryWakeTimer = null;
@@ -1851,6 +1862,7 @@ class DiscordGateway {
       if (this.stopping) {
         this.decisionRecoveryWakeChannels.clear();
         this.decisionRecoveryWakeDeadlines.clear();
+        this.decisionRecoveryWakeDecisionDeadlines.clear();
         return;
       }
       const now = Date.now();
@@ -1859,39 +1871,54 @@ class DiscordGateway {
         if (channelDeadline > now) continue;
         channels.add(channelId);
         this.decisionRecoveryWakeDeadlines.delete(channelId);
-        this.decisionRecoveryWakeChannels.delete(channelId);
       }
+      for (const [decisionId, wake] of this.decisionRecoveryWakeDecisionDeadlines) {
+        if (wake.deadline > now) continue;
+        channels.add(wake.channelId);
+        this.decisionRecoveryWakeDecisionDeadlines.delete(decisionId);
+      }
+      this._refreshDecisionRecoveryWakeChannels();
       if (channels.size) this.startDecisionRecovery(undefined, channels);
       this._armDecisionRecoveryWakeTimer();
     }, Math.max(0, deadline - Date.now()));
   }
 
-  scheduleDecisionRecovery(channelIds, { deferIfActive = false, delayMs = 0 } = {}) {
+  scheduleDecisionRecovery(channelIds, { deferIfActive = false, delayMs = 0, decisionId = null } = {}) {
     const delay = Number(delayMs);
+    const scheduledDecisionId = typeof decisionId === 'string' && decisionId.length > 0 ? decisionId : null;
     if (!Number.isFinite(delay) || delay <= 0) {
-      if (this.decisionRecoveryWakeDeadlines?.size) {
+      if (this.decisionRecoveryWakeDeadlines?.size || this.decisionRecoveryWakeDecisionDeadlines?.size) {
+        if (scheduledDecisionId) this.decisionRecoveryWakeDecisionDeadlines.delete(scheduledDecisionId);
         if (channelIds === null) {
           this.decisionRecoveryWakeDeadlines.clear();
-          this.decisionRecoveryWakeChannels.clear();
         } else {
-          for (const channelId of channelIds || []) {
-            this.decisionRecoveryWakeDeadlines.delete(channelId);
-            this.decisionRecoveryWakeChannels.delete(channelId);
-          }
+          for (const channelId of channelIds || []) this.decisionRecoveryWakeDeadlines.delete(channelId);
         }
+        this._refreshDecisionRecoveryWakeChannels();
         this._armDecisionRecoveryWakeTimer();
       }
       return this.startDecisionRecovery(undefined, channelIds, { deferIfActive });
     }
     if (this.stopping || !this.decisionConsumer || !channelIds?.size) return this.decisionRecoveryPromise;
     if (!this.decisionRecoveryWakeDeadlines) this.decisionRecoveryWakeDeadlines = new Map();
+    if (!this.decisionRecoveryWakeDecisionDeadlines) this.decisionRecoveryWakeDecisionDeadlines = new Map();
     const deadline = Date.now() + Math.ceil(delay);
     for (const channelId of channelIds) {
       this.decisionRecoveryWakeChannels.add(channelId);
-      const currentDeadline = this.decisionRecoveryWakeDeadlines.get(channelId);
-      this.decisionRecoveryWakeDeadlines.set(channelId, currentDeadline === undefined ? deadline : Math.min(currentDeadline, deadline));
+      if (scheduledDecisionId) {
+        const currentWake = this.decisionRecoveryWakeDecisionDeadlines.get(scheduledDecisionId);
+        if (!currentWake || deadline < currentWake.deadline) {
+          this.decisionRecoveryWakeDecisionDeadlines.set(scheduledDecisionId, { channelId, deadline });
+        }
+      } else {
+        const currentDeadline = this.decisionRecoveryWakeDeadlines.get(channelId);
+        this.decisionRecoveryWakeDeadlines.set(channelId, currentDeadline === undefined ? deadline : Math.min(currentDeadline, deadline));
+      }
     }
-    const earliestDeadline = Math.min(...this.decisionRecoveryWakeDeadlines.values());
+    const earliestDeadline = Math.min(
+      ...this.decisionRecoveryWakeDeadlines.values(),
+      ...[...this.decisionRecoveryWakeDecisionDeadlines.values()].map(({ deadline: wakeDeadline }) => wakeDeadline)
+    );
     if (this.decisionRecoveryWakeTimer && this.decisionRecoveryWakeDeadline <= earliestDeadline) return this.decisionRecoveryPromise;
     this._armDecisionRecoveryWakeTimer();
     return this.decisionRecoveryPromise;

@@ -905,6 +905,41 @@ for (const retryableOutcome of ['rate_limited', 'not_sent']) {
   });
 }
 
+test('duplicate denial waits for its rejection retry deadline', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const interactionId = 'duplicate-rate-limited-rejection';
+  const recoveryCalls = [];
+  f.gateway.scheduleDecisionRecovery = (channelIds, options) => {
+    recoveryCalls.push({ channelIds: [...channelIds], options });
+    return null;
+  };
+  f.gateway.authorizeDecisionInteraction = async () => false;
+  let rejectionCalls = 0;
+  f.gateway.sendInteractionRejection = async () => {
+    rejectionCalls += 1;
+    return { outcome: 'rate_limited', retryAfterMs: 500 };
+  };
+
+  const first = await f.gateway.handleInteraction(
+    component(f.presentation, interactionId, 0, { token: 'duplicate-rate-limited-initial' }),
+    new AbortController().signal
+  );
+  assert.equal(first.accepted, false);
+  assert.equal(rejectionCalls, 1);
+
+  const duplicate = await f.gateway.handleInteraction(
+    component(f.presentation, interactionId, 0, { token: 'duplicate-rate-limited-replay' }),
+    new AbortController().signal
+  );
+  assert.equal(duplicate.accepted, false);
+  assert.equal(rejectionCalls, 1);
+  assert.equal(recoveryCalls.length, 2);
+  assert.deepEqual(recoveryCalls[0].options, { delayMs: 500, decisionId: interactionId });
+  assert.ok(recoveryCalls[1].options.delayMs > 0);
+  assert.ok(recoveryCalls[1].options.delayMs <= 500);
+  assert.equal(recoveryCalls[1].options.decisionId, interactionId);
+});
+
 test('persisted denial wins an authorization race and prevents native dispatch', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.started = true;
