@@ -706,7 +706,7 @@ const findFallthroughStatementsEnd = (tokens, start, end, pairs, functionRanges)
   return cursor;
 };
 
-const findLoopDecision = (tokens, triggerIndex, pairs) => {
+const findLoopDecision = (tokens, triggerIndex, pairs, functionRanges) => {
   for (let index = triggerIndex - 1; index >= 0; index -= 1) {
     if (!['while', 'for'].includes(tokens[index]?.value)) continue;
     const opening = index + 1;
@@ -738,6 +738,17 @@ const findLoopDecision = (tokens, triggerIndex, pairs) => {
 
     const bodyStart = closing + 1;
     const bodyEnd = findControlledStatementEnd(tokens, bodyStart, tokens.length, pairs);
+    if (isNegatedDeadlineCondition(tokens, opening + 1, triggerIndex)) {
+      const scopeEnd = findFallthroughScopeEnd(tokens, index, pairs, functionRanges);
+      const fallthroughEnd = findFallthroughStatementsEnd(
+        tokens,
+        bodyEnd,
+        scopeEnd,
+        pairs,
+        functionRanges
+      );
+      return branchRange(tokens, bodyEnd, fallthroughEnd, pairs);
+    }
     return branchRange(tokens, bodyStart, bodyEnd, pairs);
   }
   return null;
@@ -770,7 +781,7 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, al
       pairs
     );
   }
-  const loopDecision = findLoopDecision(tokens, triggerIndex, pairs);
+  const loopDecision = findLoopDecision(tokens, triggerIndex, pairs, functionRanges);
   if (loopDecision) return loopDecision;
   const switchDecision = findSwitchDecision(tokens, triggerIndex, pairs, functionRanges);
   if (switchDecision) return switchDecision;
@@ -801,7 +812,9 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, al
 const BOUNDARY_WRITER_STATE_ARGUMENTS = new Map([
   ['boundary', 0],
   ['markIntakeBoundary', 1],
+  ['intakeHandlers.markIntakeBoundary', 2],
   ['markThreadBoundary', 1],
+  ['threadEnrollmentHandlers.markThreadBoundary', 2],
   ['recordBoundary', 2],
   ['recordOwnedBoundary', 2],
   ['setBindingReadiness', 1]
@@ -833,6 +846,37 @@ const boundaryWriterNameAt = (tokens, index) => {
   if (token?.type === 'identifier') return token.value;
   if (tokens[index - 1]?.value !== '[' || tokens[index + 1]?.value !== ']') return null;
   return staticPropertyName(token);
+};
+
+const boundaryWriterDescriptorAt = (tokens, index) => {
+  const name = boundaryWriterNameAt(tokens, index);
+  if (name === null || !isBoundaryWriter(name)) return null;
+  const receiver = ['.', '?.'].includes(tokens[index - 1]?.value)
+    ? tokens[index - 2]?.value
+    : null;
+  const qualifiedName = receiver ? `${receiver}.${name}` : name;
+  return {
+    name,
+    stateArgument: boundaryWriterStateArgument(qualifiedName) ?? boundaryWriterStateArgument(name)
+  };
+};
+
+const boundaryWriterStateArgumentAt = (tokens, index, aliases) => {
+  const descriptor = boundaryWriterDescriptorAt(tokens, index);
+  if (descriptor) return descriptor.stateArgument;
+  const name = boundaryWriterNameAt(tokens, index);
+  return name === null ? undefined : aliases.get(name);
+};
+
+const boundBoundaryWriterStateArgument = (tokens, start, end, pairs) => {
+  for (let index = start; index < end; index += 1) {
+    const descriptor = boundaryWriterDescriptorAt(tokens, index);
+    if (!descriptor || tokens[index + 1]?.value !== '.'
+      || tokens[index + 2]?.value !== 'bind' || tokens[index + 3]?.value !== '(') continue;
+    const closing = pairs.get(index + 3);
+    if (closing !== undefined && closing < end) return descriptor.stateArgument;
+  }
+  return undefined;
 };
 
 const boundaryWriterCallOpeningAt = (tokens, index) => {
@@ -930,28 +974,48 @@ const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, alia
   return check(closing);
 };
 
-const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases) => {
+const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases, writerAliases = new Map()) => {
+  const knownWriterAliases = new Map(writerAliases);
   const nestedFunctionStarts = new Map(functionRanges
     .filter(range => range.start >= start && range.opening < end)
     .map(range => [range.start, range]));
   for (let index = start; index < end; index += 1) {
     const nestedFunction = nestedFunctionStarts.get(index);
     if (nestedFunction) {
-      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction)) {
+      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction)
+        || isScheduledCallback(tokens, pairs, nestedFunction)) {
         const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
         const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
-        if (hasBoundaryWriterGap(tokens, bodyStart, bodyEnd, pairs, functionRanges, aliases)) return true;
+        if (hasBoundaryWriterGap(
+          tokens,
+          bodyStart,
+          bodyEnd,
+          pairs,
+          functionRanges,
+          aliases,
+          knownWriterAliases
+        )) return true;
       }
       index = nestedFunction.closing;
       continue;
     }
+    const token = tokens[index];
+    if (token.type === 'identifier' && tokens[index - 1]?.value !== '.'
+      && tokens[index + 1]?.value === '=') {
+      const expressionStart = index + 2;
+      const expressionEnd = findAssignmentValueEnd(tokens, expressionStart, end);
+      const stateArgument = boundBoundaryWriterStateArgument(tokens, expressionStart, expressionEnd, pairs);
+      if (stateArgument === undefined) knownWriterAliases.delete(token.value);
+      else knownWriterAliases.set(token.value, stateArgument);
+    }
     const writerName = boundaryWriterNameAt(tokens, index);
-    if (writerName === null || !isBoundaryWriter(writerName)) continue;
+    const stateArgument = boundaryWriterStateArgumentAt(tokens, index, knownWriterAliases);
+    if (writerName === null || stateArgument === undefined) continue;
     if (tokens[index - 1]?.value === 'function') continue;
     const opening = boundaryWriterCallOpeningAt(tokens, index);
     const closing = opening === null ? undefined : pairs.get(opening);
     if (closing !== undefined && closing < end
-      && callHasGapArgument(tokens, opening, closing, pairs, boundaryWriterStateArgument(writerName), aliases)) {
+      && callHasGapArgument(tokens, opening, closing, pairs, stateArgument, aliases)) {
       return true;
     }
   }
@@ -971,18 +1035,53 @@ const isImmediatelyInvokedFunction = (tokens, pairs, range) => {
   return tokens[next]?.value === '(';
 };
 
-const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, aliases = new Set()) => {
+const isScheduledCallback = (tokens, pairs, range) => {
+  const start = range.start;
+  let callbackStart;
+  if (tokens[start]?.value === '=>') {
+    callbackStart = tokens[start - 1]?.value === ')'
+      ? pairs.get(start - 1)
+      : start - 1;
+  } else if (tokens[start]?.value === 'function') {
+    callbackStart = start;
+  } else {
+    return false;
+  }
+  if (tokens[callbackStart - 1]?.value === 'async') callbackStart -= 1;
+  const callOpening = callbackStart - 1;
+  if (tokens[callOpening]?.value !== '(') return false;
+  const callClosing = pairs.get(callOpening);
+  if (callClosing === undefined || callClosing < range.closing) return false;
+  let calleeIndex = callOpening - 1;
+  if (tokens[calleeIndex]?.value === '?.') calleeIndex -= 1;
+  const callee = tokens[calleeIndex]?.value;
+  if (callee === 'queueMicrotask') return true;
+  return callee === 'then' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value);
+};
+
+const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, aliases = new Set(), writerAliases = new Map()) => {
   const knownAliases = new Set(aliases);
+  const knownWriterAliases = new Map(writerAliases);
   const nestedFunctionStarts = new Map(functionRanges
     .filter(range => range.opening !== opening && range.start >= start && range.opening < end)
     .map(range => [range.start, range]));
   for (let index = start; index < end; index += 1) {
     const nestedFunction = nestedFunctionStarts.get(index);
     if (nestedFunction) {
-      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction)) {
+      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction)
+        || isScheduledCallback(tokens, pairs, nestedFunction)) {
         const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
         const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
-        if (hasGapOutcome(tokens, bodyStart, bodyEnd, nestedFunction.opening, pairs, functionRanges, knownAliases)) return true;
+        if (hasGapOutcome(
+          tokens,
+          bodyStart,
+          bodyEnd,
+          nestedFunction.opening,
+          pairs,
+          functionRanges,
+          knownAliases,
+          knownWriterAliases
+        )) return true;
       }
       index = nestedFunction.closing;
       continue;
@@ -992,7 +1091,15 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
       if (valueHasGapOutcome(tokens, expressionStart, statementEnd, pairs, knownAliases)) return true;
-      if (hasBoundaryWriterGap(tokens, expressionStart, statementEnd, pairs, functionRanges, knownAliases)) return true;
+      if (hasBoundaryWriterGap(
+        tokens,
+        expressionStart,
+        statementEnd,
+        pairs,
+        functionRanges,
+        knownAliases,
+        knownWriterAliases
+      )) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
@@ -1008,17 +1115,22 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       const statementEnd = findStatementEnd(tokens, index + 2, end);
       const assignedGap = valueHasGapOutcome(tokens, index + 2, statementEnd, pairs, knownAliases);
       if (assignedGap) knownAliases.add(token.value);
+      else knownAliases.delete(token.value);
+      const stateArgument = boundBoundaryWriterStateArgument(tokens, index + 2, statementEnd, pairs);
+      if (stateArgument === undefined) knownWriterAliases.delete(token.value);
+      else knownWriterAliases.set(token.value, stateArgument);
       if (assignedGap && OUTCOME_NAMES.has(token.value)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
     }
     const writerName = boundaryWriterNameAt(tokens, index);
-    if (writerName !== null && isBoundaryWriter(writerName)
+    const stateArgument = boundaryWriterStateArgumentAt(tokens, index, knownWriterAliases);
+    if (writerName !== null && stateArgument !== undefined
       && tokens[index - 1]?.value !== 'function') {
       const opening = boundaryWriterCallOpeningAt(tokens, index);
       const closing = opening === null ? undefined : pairs.get(opening);
       if (closing !== undefined && closing < end
-        && callHasGapArgument(tokens, opening, closing, pairs, boundaryWriterStateArgument(writerName), knownAliases)) return true;
+        && callHasGapArgument(tokens, opening, closing, pairs, stateArgument, knownAliases)) return true;
     }
   }
   return opening === null && valueHasGapOutcome(tokens, start, end, pairs, knownAliases);
@@ -1400,10 +1512,43 @@ const visibleGapAliasesAt = (tokens, limit, pairs, lexicalScopes, functionRanges
   return knownAliases;
 };
 
+const visibleBoundaryWriterAliasesAt = (
+  tokens,
+  limit,
+  pairs,
+  lexicalScopes,
+  lexicalBindings,
+  assignments
+) => {
+  const useScope = lexicalScopePath(lexicalScopes, limit);
+  const visibleNames = new Set(lexicalBindings
+    .filter(binding => binding.index < limit && isLexicallyVisible(binding.scope, useScope))
+    .map(binding => binding.name));
+  const aliases = new Map();
+  for (const name of visibleNames) {
+    const binding = resolveVisibleBinding(lexicalBindings, name, limit, lexicalScopes, useScope);
+    if (!binding) continue;
+    const assignment = assignments
+      .filter(candidate => candidate.name === name
+        && candidate.bindingIndex === binding.index
+        && candidate.index < limit)
+      .sort((left, right) => right.index - left.index)[0];
+    if (!assignment) continue;
+    const stateArgument = boundBoundaryWriterStateArgument(
+      tokens,
+      assignment.expressionStart,
+      assignment.expressionEnd,
+      pairs
+    );
+    if (stateArgument !== undefined) aliases.set(name, stateArgument);
+  }
+  return aliases;
+};
+
 const isConditionalDeadlineUse = (tokens, triggerIndex, pairs, functionRanges) => {
   if (findIfDecision(tokens, triggerIndex, pairs)
     || findSwitchDecision(tokens, triggerIndex, pairs, functionRanges)) return true;
-  if (findLoopDecision(tokens, triggerIndex, pairs)) return true;
+  if (findLoopDecision(tokens, triggerIndex, pairs, functionRanges)) return true;
   const statement = findStatementRange(tokens, triggerIndex);
   if (findShortCircuitDecision(tokens, triggerIndex, statement.start, statement.end, pairs)) return true;
   const functionDecision = findFunctionDecision(functionRanges, triggerIndex);
@@ -1435,7 +1580,9 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
     return {
       ...assignment,
       bindingIndex: binding?.index,
-      scope: binding?.scope || assignment.scope
+      scope: binding?.scope || assignment.scope,
+      expressionStart: assignment.equalsIndex + 1,
+      expressionEnd: findAssignmentValueEnd(tokens, assignment.equalsIndex + 1, tokens.length)
     };
   });
   const lines = new Set();
@@ -1465,6 +1612,14 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
           lexicalScopes,
           functionRanges
         );
+        const knownWriterAliases = visibleBoundaryWriterAliasesAt(
+          tokens,
+          decision.start,
+          pairs,
+          lexicalScopes,
+          lexicalBindings,
+          assignments
+        );
         if (hasGapOutcome(
           tokens,
           decision.start,
@@ -1472,7 +1627,8 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
           decision.opening,
           pairs,
           functionRanges,
-          knownAliases
+          knownAliases,
+          knownWriterAliases
         )) {
           lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
         }
@@ -1488,6 +1644,14 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       lexicalScopes,
       functionRanges
     );
+    const knownWriterAliases = visibleBoundaryWriterAliasesAt(
+      tokens,
+      decision.start,
+      pairs,
+      lexicalScopes,
+      lexicalBindings,
+      assignments
+    );
     if (hasGapOutcome(
       tokens,
       decision.start,
@@ -1495,7 +1659,8 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       decision.opening,
       pairs,
       functionRanges,
-      knownAliases
+      knownAliases,
+      knownWriterAliases
     )) {
       lines.add(source.slice(0, tokens[index].start).split(/\r?\n/).length);
     }
@@ -2510,5 +2675,41 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     const activeBranch = `const withinDeadline = !deadlineReached; if (withinDeadline) return READINESS.GAP;`;
     regressionAssert.equal(offendersFor(expiredBranch).length, 1);
     regressionAssert.equal(offendersFor(activeBranch).length, 0);
+  });
+
+  regressionTest('deadline policy inventory follows negated loop exits', () => {
+    const negatedExit = `while (!deadlineReached) await poll(); return READINESS.GAP;`;
+    const negatedBody = `while (!deadlineReached) { return READINESS.GAP; }`;
+    const positiveBody = `while (deadlineReached) { return READINESS.GAP; }`;
+    regressionAssert.equal(offendersFor(negatedExit).length, 1);
+    regressionAssert.equal(offendersFor(negatedBody).length, 0);
+    regressionAssert.equal(offendersFor(positiveBody).length, 1);
+  });
+
+  regressionTest('deadline policy inventory follows scheduled boundary writers', () => {
+    const promiseCallback = `if (deadlineReached) Promise.resolve().then(() => state.markIntakeBoundary(id, READINESS.GAP, detail));`;
+    const microtaskCallback = `if (deadlineReached) queueMicrotask(() => state.markIntakeBoundary(id, READINESS.GAP, detail));`;
+    const unscheduledCallback = `const callback = () => state.markIntakeBoundary(id, READINESS.GAP, detail); if (deadlineReached) callback();`;
+    regressionAssert.equal(offendersFor(promiseCallback).length, 1);
+    regressionAssert.equal(offendersFor(microtaskCallback).length, 1);
+    regressionAssert.equal(offendersFor(unscheduledCallback).length, 0);
+  });
+
+  regressionTest('deadline policy inventory resolves bound boundary writers', () => {
+    const boundWriter = `const persist = state.markIntakeBoundary.bind(state); if (deadlineReached) persist(id, READINESS.GAP, detail);`;
+    const nonDeadlineCall = `const persist = state.markIntakeBoundary.bind(state); if (!deadlineReached) persist(id, READINESS.GAP, detail);`;
+    regressionAssert.equal(offendersFor(boundWriter).length, 1);
+    regressionAssert.equal(offendersFor(nonDeadlineCall).length, 0);
+  });
+
+  regressionTest('deadline policy inventory maps handler boundary state arguments', () => {
+    const intakeHandler = `if (deadlineReached) intakeHandlers.markIntakeBoundary(store, id, READINESS.GAP, detail);`;
+    const threadHandler = `if (deadlineReached) threadEnrollmentHandlers.markThreadBoundary(store, id, READINESS.GAP, detail);`;
+    const intakeChannelGap = `if (deadlineReached) intakeHandlers.markIntakeBoundary(store, READINESS.GAP, READINESS.READY, detail);`;
+    const threadChannelGap = `if (deadlineReached) threadEnrollmentHandlers.markThreadBoundary(store, READINESS.GAP, READINESS.READY, detail);`;
+    regressionAssert.equal(offendersFor(intakeHandler).length, 1);
+    regressionAssert.equal(offendersFor(threadHandler).length, 1);
+    regressionAssert.equal(offendersFor(intakeChannelGap).length, 0);
+    regressionAssert.equal(offendersFor(threadChannelGap).length, 0);
   });
 })();
