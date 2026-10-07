@@ -137,6 +137,7 @@ function createGatewayLifecycleHandlers({
     this.decisionRecoveryWakeTimer = null;
     this.decisionRecoveryWakeDeadline = 0;
     this.decisionRecoveryWakeChannels.clear();
+    this.decisionRecoveryWakeDeadlines.clear();
     this.pendingRecoveryChannels.clear();
     this.queuedDecisionRecoveryAll = false;
     this.queuedDecisionRecoveryChannels.clear();

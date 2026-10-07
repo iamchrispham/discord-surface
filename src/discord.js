@@ -251,6 +251,7 @@ class DiscordGateway {
     this.decisionRecoveryWakeTimer = null;
     this.decisionRecoveryWakeDeadline = 0;
     this.decisionRecoveryWakeChannels = new Set();
+    this.decisionRecoveryWakeDeadlines = new Map();
     this.queuedDecisionRecoveryAll = false;
     this.queuedDecisionRecoveryChannels = new Set();
     this.queuedDecisionRecoveryDeferred = false;
@@ -1837,22 +1838,62 @@ class DiscordGateway {
 
   _reconcilePending(before, signal, ...args) { return pendingReconciliation.reconcilePending.apply(this, arguments); }
 
-  scheduleDecisionRecovery(channelIds, { deferIfActive = false, delayMs = 0 } = {}) {
-    const delay = Number(delayMs);
-    if (!Number.isFinite(delay) || delay <= 0) return this.startDecisionRecovery(undefined, channelIds, { deferIfActive });
-    if (this.stopping || !this.decisionConsumer || !channelIds?.size) return this.decisionRecoveryPromise;
-    for (const channelId of channelIds) this.decisionRecoveryWakeChannels.add(channelId);
-    const deadline = Date.now() + Math.ceil(delay);
-    if (this.decisionRecoveryWakeTimer && this.decisionRecoveryWakeDeadline >= deadline) return this.decisionRecoveryPromise;
+  _armDecisionRecoveryWakeTimer() {
     if (this.decisionRecoveryWakeTimer) clearTimeout(this.decisionRecoveryWakeTimer);
+    this.decisionRecoveryWakeTimer = null;
+    this.decisionRecoveryWakeDeadline = 0;
+    if (this.stopping || !this.decisionRecoveryWakeDeadlines?.size) return;
+    const deadline = Math.min(...this.decisionRecoveryWakeDeadlines.values());
     this.decisionRecoveryWakeDeadline = deadline;
     this.decisionRecoveryWakeTimer = setTimeout(() => {
       this.decisionRecoveryWakeTimer = null;
       this.decisionRecoveryWakeDeadline = 0;
-      const channels = new Set(this.decisionRecoveryWakeChannels);
-      this.decisionRecoveryWakeChannels.clear();
-      if (!this.stopping && channels.size) this.startDecisionRecovery(undefined, channels);
+      if (this.stopping) {
+        this.decisionRecoveryWakeChannels.clear();
+        this.decisionRecoveryWakeDeadlines.clear();
+        return;
+      }
+      const now = Date.now();
+      const channels = new Set();
+      for (const [channelId, channelDeadline] of this.decisionRecoveryWakeDeadlines) {
+        if (channelDeadline > now) continue;
+        channels.add(channelId);
+        this.decisionRecoveryWakeDeadlines.delete(channelId);
+        this.decisionRecoveryWakeChannels.delete(channelId);
+      }
+      if (channels.size) this.startDecisionRecovery(undefined, channels);
+      this._armDecisionRecoveryWakeTimer();
     }, Math.max(0, deadline - Date.now()));
+  }
+
+  scheduleDecisionRecovery(channelIds, { deferIfActive = false, delayMs = 0 } = {}) {
+    const delay = Number(delayMs);
+    if (!Number.isFinite(delay) || delay <= 0) {
+      if (this.decisionRecoveryWakeDeadlines?.size) {
+        if (channelIds === null) {
+          this.decisionRecoveryWakeDeadlines.clear();
+          this.decisionRecoveryWakeChannels.clear();
+        } else {
+          for (const channelId of channelIds || []) {
+            this.decisionRecoveryWakeDeadlines.delete(channelId);
+            this.decisionRecoveryWakeChannels.delete(channelId);
+          }
+        }
+        this._armDecisionRecoveryWakeTimer();
+      }
+      return this.startDecisionRecovery(undefined, channelIds, { deferIfActive });
+    }
+    if (this.stopping || !this.decisionConsumer || !channelIds?.size) return this.decisionRecoveryPromise;
+    if (!this.decisionRecoveryWakeDeadlines) this.decisionRecoveryWakeDeadlines = new Map();
+    const deadline = Date.now() + Math.ceil(delay);
+    for (const channelId of channelIds) {
+      this.decisionRecoveryWakeChannels.add(channelId);
+      const currentDeadline = this.decisionRecoveryWakeDeadlines.get(channelId);
+      this.decisionRecoveryWakeDeadlines.set(channelId, currentDeadline === undefined ? deadline : Math.min(currentDeadline, deadline));
+    }
+    const earliestDeadline = Math.min(...this.decisionRecoveryWakeDeadlines.values());
+    if (this.decisionRecoveryWakeTimer && this.decisionRecoveryWakeDeadline <= earliestDeadline) return this.decisionRecoveryPromise;
+    this._armDecisionRecoveryWakeTimer();
     return this.decisionRecoveryPromise;
   }
 

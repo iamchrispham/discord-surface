@@ -50,6 +50,8 @@ const { DISPATCH_OUTCOMES, MESSAGE_STATES } = require('../../src/state') as {
 const DECISION_EMBED_DESCRIPTION_LIMIT = 4096;
 const DISCORD_MESSAGE_CONTENT_LIMIT = 2000;
 const DECISION_RECOVERY_DEFAULT_DELAY_MS = 1000;
+const DECISION_PROJECTION_RETRY_MAX_DELAY_MS = 30_000;
+const DECISION_PROJECTION_RETRY_LIMIT = 5;
 
 function decisionRecoveryDelayMs(value: unknown): number {
   const delay = Number(value);
@@ -470,27 +472,49 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
     return imported.click?.canonical || state.getDecisionClick(current.interactionId)?.canonical || null;
   }
 
+  const projectionRetryAttempts = new Map<string, number>();
+
   async function project(click: DecisionClick, presentation: DecisionPresentation, signal?: AbortSignal): Promise<boolean> {
-    if (click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT || !click.canonical?.materialized || !click.canonical.answer) return true;
-    if (click.projectionOutcome && !projectionOutcomeRetryable(click.projectionOutcome)) return false;
+    if (click.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT || !click.canonical?.materialized || !click.canonical.answer) {
+      projectionRetryAttempts.delete(click.interactionId);
+      return true;
+    }
+    if (click.projectionOutcome && !projectionOutcomeRetryable(click.projectionOutcome)) {
+      projectionRetryAttempts.delete(click.interactionId);
+      return false;
+    }
     if (typeof options.project !== 'function') {
-      if (click.canonical.answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT) return true;
+      if (click.canonical.answer.length <= DECISION_EMBED_DESCRIPTION_LIMIT) {
+        projectionRetryAttempts.delete(click.interactionId);
+        return true;
+      }
       state.recordDecisionProjectionOutcome(click.interactionId, DECISION_TRANSPORT_OUTCOMES.NOT_SENT);
+      projectionRetryAttempts.delete(click.interactionId);
       return false;
     }
     try {
       await options.project({ click, presentation, answer: click.canonical.answer }, signal);
       const recorded = state.recordDecisionProjectionOutcome(click.interactionId, DECISION_TRANSPORT_OUTCOMES.SENT) as { click?: DecisionClick | null };
-      return recorded.click?.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT ||
+      const sent = recorded.click?.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT ||
         state.getDecisionClick(click.interactionId)?.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT;
+      if (sent) projectionRetryAttempts.delete(click.interactionId);
+      return sent;
     } catch (error) {
       const outcome = projectionErrorOutcome(error);
       state.recordDecisionProjectionOutcome(click.interactionId, outcome);
       const retryable = outcome !== DECISION_TRANSPORT_OUTCOMES.NOT_SENT || (error as { retryable?: unknown })?.retryable === true;
       if (!signal?.aborted && retryable && projectionOutcomeRetryable(outcome)) {
-        options.scheduleRecovery?.(new Set([click.channelId]), {
-          delayMs: decisionRecoveryDelayMs((error as { retryAfterMs?: unknown })?.retryAfterMs)
-        });
+        const attempts = (projectionRetryAttempts.get(click.interactionId) || 0) + 1;
+        projectionRetryAttempts.set(click.interactionId, attempts);
+        if (attempts <= DECISION_PROJECTION_RETRY_LIMIT) {
+          const requestedDelay = decisionRecoveryDelayMs((error as { retryAfterMs?: unknown })?.retryAfterMs);
+          const exponentialDelay = DECISION_RECOVERY_DEFAULT_DELAY_MS * (2 ** (attempts - 1));
+          options.scheduleRecovery?.(new Set([click.channelId]), {
+            delayMs: Math.min(DECISION_PROJECTION_RETRY_MAX_DELAY_MS, Math.max(requestedDelay, exponentialDelay))
+          });
+        }
+      } else {
+        projectionRetryAttempts.delete(click.interactionId);
       }
       return false;
     }

@@ -334,6 +334,22 @@ test('delayed decision recovery wakes after its retry window', { timeout: 8000 }
   assert.deepEqual(calls, [['channel']]);
 });
 
+test('delayed decision recovery wakes each channel at its own deadline', { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  const calls = [];
+  f.gateway.decisionConsumer.recover = async (_signal, channelIds) => {
+    calls.push(channelIds ? [...channelIds] : null);
+    return [];
+  };
+
+  f.gateway.scheduleDecisionRecovery(new Set(['channel-a']), { delayMs: 25 });
+  f.gateway.scheduleDecisionRecovery(new Set(['channel-b']), { delayMs: 100 });
+  await waitForCondition(() => calls.length === 1, 'first channel recovery did not wake');
+  assert.deepEqual(calls, [['channel-a']]);
+  await waitForCondition(() => calls.length === 2, 'second channel recovery did not wake');
+  assert.deepEqual(calls, [['channel-a'], ['channel-b']]);
+});
+
 test('losing projection refuses binding and config drift during question fetch', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.started = true;
@@ -999,6 +1015,51 @@ test('failed short projection remains pending after native submission', { timeou
   assert.equal(f.edits.length, 1);
   assert.equal(f.state.getDecisionClick('short-projection-retry')?.projectionOutcome, 'sent');
   assert.equal(f.state.listDecisionPendingWork().length, 0);
+});
+
+test('persistent projection failure stops self-scheduled retries but allows external recovery', { timeout: 30000 }, async t => {
+  const f = await fixture(t, { questionText: 'q'.repeat(1800), embedLinks: false, attachFiles: false });
+  const interactionId = 'bounded-projection-retry';
+  const admitted = f.state.admitDecisionClickAndBeginCallback({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel')
+  });
+  assert.equal(admitted.accepted, true);
+  assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, 'sent').accepted, true);
+  assert.equal(f.state.importDecisionWinner(interactionId, {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'bounded-answer',
+    answer: 'x'.repeat(100)
+  }).accepted, true);
+
+  const recoveryCalls = [];
+  f.gateway.scheduleDecisionRecovery = (channelIds, options) => {
+    recoveryCalls.push({ channelIds: [...channelIds], options });
+    return null;
+  };
+  let projectionAttempts = 0;
+  f.gateway.projectDecisionMessage = async () => {
+    projectionAttempts += 1;
+    throw Object.assign(new Error('projection permission remains unavailable'), { outcome: 'not_sent', retryable: true });
+  };
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await f.gateway.decisionConsumer.recover(new AbortController().signal);
+  }
+
+  assert.equal(projectionAttempts, 6);
+  assert.deepEqual(recoveryCalls.map(call => call.options.delayMs), [1000, 2000, 4000, 8000, 16000]);
+  assert.equal(f.state.getDecisionClick(interactionId)?.projectionOutcome, 'not_sent');
 });
 
 test('known-unsent long-answer projection retries after Attach Files returns', { timeout: 30000 }, async t => {
