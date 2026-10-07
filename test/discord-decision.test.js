@@ -318,6 +318,22 @@ test('a normal recovery request wakes a pass that also has deferred work', { tim
   assert.deepEqual(calls, [['channel-a'], ['channel-deferred', 'channel-live']]);
 });
 
+test('delayed decision recovery wakes after its retry window', { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  const calls = [];
+  f.gateway.decisionConsumer.recover = async (_signal, channelIds) => {
+    calls.push(channelIds ? [...channelIds] : null);
+    return [];
+  };
+
+  const startedAt = Date.now();
+  f.gateway.scheduleDecisionRecovery(new Set(['channel']), { delayMs: 25 });
+  assert.deepEqual(calls, []);
+  await waitForCondition(() => calls.length === 1, 'delayed decision recovery did not wake');
+  assert.ok(Date.now() - startedAt >= 20);
+  assert.deepEqual(calls, [['channel']]);
+});
+
 test('losing projection refuses binding and config drift during question fetch', { timeout: 30000 }, async t => {
   const f = await fixture(t);
   f.gateway.started = true;
@@ -815,12 +831,15 @@ for (const retryableOutcome of ['rate_limited', 'not_sent']) {
   test(`retryable rejection outcome schedules decision recovery: ${retryableOutcome}`, { timeout: 30000 }, async t => {
     const f = await fixture(t);
     const recoveryCalls = [];
-    f.gateway.startDecisionRecovery = (_signal, channelIds) => {
-      recoveryCalls.push(channelIds ? [...channelIds] : null);
-      return Promise.resolve([]);
+    f.gateway.scheduleDecisionRecovery = (channelIds, options) => {
+      recoveryCalls.push({ channelIds: channelIds ? [...channelIds] : null, options });
+      return null;
     };
     f.gateway.authorizeDecisionInteraction = async () => false;
-    f.gateway.sendInteractionRejection = async () => ({ outcome: retryableOutcome });
+    f.gateway.sendInteractionRejection = async () => ({
+      outcome: retryableOutcome,
+      ...(retryableOutcome === 'rate_limited' ? { retryAfterMs: 25 } : {})
+    });
 
     const result = await f.gateway.handleInteraction(
       component(f.presentation, `retryable-rejection-${retryableOutcome}`, 0),
@@ -828,7 +847,10 @@ for (const retryableOutcome of ['rate_limited', 'not_sent']) {
     );
 
     assert.equal(result.accepted, false);
-    assert.deepEqual(recoveryCalls, [['channel']]);
+    assert.deepEqual(recoveryCalls, [{
+      channelIds: ['channel'],
+      ...(retryableOutcome === 'rate_limited' ? { options: { delayMs: 25 } } : { options: undefined })
+    }]);
   });
 }
 
@@ -955,6 +977,12 @@ test('failed short projection remains pending after native submission', { timeou
     answer: 'x'.repeat(100)
   }).accepted, true);
 
+  const recoveryCalls = [];
+  f.gateway.scheduleDecisionRecovery = (channelIds, options) => {
+    recoveryCalls.push({ channelIds: [...channelIds], options });
+    return null;
+  };
+
   const result = await f.gateway.handleInteraction(component(f.presentation, interactionId, 0), new AbortController().signal);
 
   assert.equal(result.accepted, true);
@@ -962,6 +990,7 @@ test('failed short projection remains pending after native submission', { timeou
   assert.equal(f.state.getDecisionClick('short-projection-retry')?.projectionOutcome, 'not_sent');
   assert.equal(f.state.getDecisionClick('short-projection-retry')?.state, 'materialized_projection_pending');
   assert.equal(f.state.listDecisionPendingWork().length, 1);
+  assert.deepEqual(recoveryCalls, [{ channelIds: ['channel'], options: { delayMs: 1000 } }]);
 
   f.setEmbedLinks(true);
   f.setAttachFiles(true);
@@ -1281,6 +1310,17 @@ test('rejection followup distinguishes pre-send and post-send cancellation', { t
   after.abort();
   const afterResult = await pending;
   assert.equal(afterResult.outcome, 'unknown');
+
+  const rateLimited = await sendInteractionFollowup(interaction, {
+    fetchImpl: async () => ({
+      ok: false,
+      status: 429,
+      headers: { get(name) { return name.toLowerCase() === 'retry-after' ? '4.5' : null; } },
+      body: { async cancel() {} }
+    })
+  });
+  assert.equal(rateLimited.outcome, 'rate_limited');
+  assert.equal(rateLimited.retryAfterMs, 4500);
 });
 
 test('a full-length decision keeps every prompt character after selection', { timeout: 30000 }, async t => {

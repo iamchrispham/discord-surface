@@ -116,6 +116,7 @@ export interface InteractionCallbackResult {
   outcome: InteractionOutcome;
   responseMessageId?: string;
   statusCode?: number;
+  retryAfterMs?: number;
   reason?: string;
   visibility?: 'available' | 'unknown';
   terminal?: boolean;
@@ -254,6 +255,22 @@ async function cancelBody(response: InteractionCallbackFetchResponse): Promise<v
 function responseStatus(response: InteractionCallbackFetchResponse): number | null {
   const status = Number(response.status);
   return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+}
+
+async function readRetryAfterMs(response: InteractionCallbackFetchResponse, deadline: Promise<never>): Promise<number | null> {
+  const headers = response?.headers as { get?: (name: string) => unknown; [key: string]: unknown } | undefined;
+  const headerValue = typeof headers?.get === 'function'
+    ? headers.get('retry-after') ?? headers.get('Retry-After')
+    : headers?.['retry-after'] ?? headers?.['Retry-After'];
+  const headerSeconds = Number(headerValue);
+  if (Number.isFinite(headerSeconds) && headerSeconds >= 0) return Math.ceil(headerSeconds * 1000);
+  try {
+    const body = await Promise.race([response.json?.() || Promise.resolve(null), deadline]);
+    const bodySeconds = Number((body as { retry_after?: unknown } | null)?.retry_after);
+    return Number.isFinite(bodySeconds) && bodySeconds >= 0 ? Math.ceil(bodySeconds * 1000) : null;
+  } catch {
+    return null;
+  }
 }
 
 type InteractionCallbackRequest =
@@ -407,11 +424,12 @@ export async function sendInteractionFollowup(
     });
     const response = await Promise.race([request, deadline]);
     const status = responseStatus(response);
+    const retryAfterMs = status === 429 ? await readRetryAfterMs(response, deadline) : null;
     await Promise.race([cancelBody(response), deadline]);
     return response?.ok === true
       ? { outcome: INTERACTION_OUTCOMES.SENT, ...(status === null ? {} : { statusCode: status }) }
       : { outcome: status === 429 ? INTERACTION_OUTCOMES.RATE_LIMITED : status !== null && status >= 400 && status < 500 ? INTERACTION_OUTCOMES.REJECTED : INTERACTION_OUTCOMES.UNKNOWN,
-        ...(status === null ? {} : { statusCode: status }), reason: 'Discord interaction followup request rejected' };
+        ...(status === null ? {} : { statusCode: status }), ...(retryAfterMs === null ? {} : { retryAfterMs }), reason: 'Discord interaction followup request rejected' };
   } catch (error) {
     const preSend = (error as { preSend?: unknown })?.preSend === true || (!requestStarted && signal?.aborted);
     return { outcome: preSend ? INTERACTION_OUTCOMES.NOT_SENT : INTERACTION_OUTCOMES.UNKNOWN, reason: String((error as { message?: unknown })?.message || error).slice(0, 200) };

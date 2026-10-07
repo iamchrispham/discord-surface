@@ -248,6 +248,9 @@ class DiscordGateway {
     this.recoveryPromise = null;
     this.decisionRecoveryPromise = null;
     this.decisionRecoveryController = null;
+    this.decisionRecoveryWakeTimer = null;
+    this.decisionRecoveryWakeDeadline = 0;
+    this.decisionRecoveryWakeChannels = new Set();
     this.queuedDecisionRecoveryAll = false;
     this.queuedDecisionRecoveryChannels = new Set();
     this.queuedDecisionRecoveryDeferred = false;
@@ -374,7 +377,7 @@ class DiscordGateway {
       callbackTimeoutMs: this.interactionCallbackTimeoutMs,
       authorize: (input, signal) => this.authorizeDecisionInteraction(input, signal),
       reject: (interaction, reason, signal, deferred) => this.sendInteractionRejection(interaction, reason, signal, deferred),
-      scheduleRecovery: (channelIds, options) => this.startDecisionRecovery(undefined, channelIds, options),
+      scheduleRecovery: (channelIds, options) => this.scheduleDecisionRecovery(channelIds, options),
       waitForDispatch: (channelId, signal) => this.waitForInteractionDispatch({ channelId }, signal),
       processAccepted: (message, signal, options) => this.consumer.processAccepted(message, signal, options),
       project: (input, signal) => this.projectDecisionMessage(input, signal)
@@ -1833,6 +1836,25 @@ class DiscordGateway {
   }
 
   _reconcilePending(before, signal, ...args) { return pendingReconciliation.reconcilePending.apply(this, arguments); }
+
+  scheduleDecisionRecovery(channelIds, { deferIfActive = false, delayMs = 0 } = {}) {
+    const delay = Number(delayMs);
+    if (!Number.isFinite(delay) || delay <= 0) return this.startDecisionRecovery(undefined, channelIds, { deferIfActive });
+    if (this.stopping || !this.decisionConsumer || !channelIds?.size) return this.decisionRecoveryPromise;
+    for (const channelId of channelIds) this.decisionRecoveryWakeChannels.add(channelId);
+    const deadline = Date.now() + Math.ceil(delay);
+    if (this.decisionRecoveryWakeTimer && this.decisionRecoveryWakeDeadline >= deadline) return this.decisionRecoveryPromise;
+    if (this.decisionRecoveryWakeTimer) clearTimeout(this.decisionRecoveryWakeTimer);
+    this.decisionRecoveryWakeDeadline = deadline;
+    this.decisionRecoveryWakeTimer = setTimeout(() => {
+      this.decisionRecoveryWakeTimer = null;
+      this.decisionRecoveryWakeDeadline = 0;
+      const channels = new Set(this.decisionRecoveryWakeChannels);
+      this.decisionRecoveryWakeChannels.clear();
+      if (!this.stopping && channels.size) this.startDecisionRecovery(undefined, channels);
+    }, Math.max(0, deadline - Date.now()));
+    return this.decisionRecoveryPromise;
+  }
 
   startDecisionRecovery(signal, channelIds = null, { deferIfActive = false } = {}) {
     if (this.stopping || !this.decisionConsumer) return this.decisionRecoveryPromise;

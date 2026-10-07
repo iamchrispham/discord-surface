@@ -49,6 +49,12 @@ const { DISPATCH_OUTCOMES, MESSAGE_STATES } = require('../../src/state') as {
 
 const DECISION_EMBED_DESCRIPTION_LIMIT = 4096;
 const DISCORD_MESSAGE_CONTENT_LIMIT = 2000;
+const DECISION_RECOVERY_DEFAULT_DELAY_MS = 1000;
+
+function decisionRecoveryDelayMs(value: unknown): number {
+  const delay = Number(value);
+  return Number.isFinite(delay) && delay >= 0 ? Math.ceil(delay) : DECISION_RECOVERY_DEFAULT_DELAY_MS;
+}
 
 function projectionOutcomeRetryable(outcome: DecisionTransportOutcome | null): boolean {
   return outcome === null || outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT ||
@@ -164,7 +170,7 @@ export interface DecisionConsumerOptions {
   callbackTimeoutMs?: number;
   authorize?: (input: DecisionAuthorizationInput, signal?: AbortSignal) => Promise<boolean | null>;
   reject?: (interaction: ParsedComponentInteraction, reason: DecisionReason, signal?: AbortSignal, deferred?: boolean) => Promise<InteractionCallbackResult>;
-  scheduleRecovery?: (channelIds: Set<string>, options?: { deferIfActive?: boolean }) => unknown;
+  scheduleRecovery?: (channelIds: Set<string>, options?: { deferIfActive?: boolean; delayMs?: number }) => unknown;
   waitForDispatch?: (channelId: string, signal?: AbortSignal) => Promise<boolean>;
   processAccepted?: (message: DecisionMessage, signal?: AbortSignal, options?: Record<string, unknown>) => Promise<unknown>;
   project?: (input: DecisionProjectionInput, signal?: AbortSignal) => Promise<unknown>;
@@ -399,7 +405,10 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT ||
       outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED
     )) {
-      options.scheduleRecovery?.(new Set([click.channelId]));
+      const recoveryOptions = outcome === DECISION_TRANSPORT_OUTCOMES.RATE_LIMITED
+        ? { delayMs: decisionRecoveryDelayMs(result.retryAfterMs) }
+        : undefined;
+      options.scheduleRecovery?.(new Set([click.channelId]), recoveryOptions);
     }
     return result;
   }
@@ -476,11 +485,13 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         state.getDecisionClick(click.interactionId)?.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT;
     } catch (error) {
       const outcome = projectionErrorOutcome(error);
-      if (outcome === DECISION_TRANSPORT_OUTCOMES.NOT_SENT && (error as { retryable?: unknown })?.retryable === true) {
-        state.recordDecisionProjectionOutcome(click.interactionId, outcome);
-        return false;
-      }
       state.recordDecisionProjectionOutcome(click.interactionId, outcome);
+      const retryable = outcome !== DECISION_TRANSPORT_OUTCOMES.NOT_SENT || (error as { retryable?: unknown })?.retryable === true;
+      if (!signal?.aborted && retryable && projectionOutcomeRetryable(outcome)) {
+        options.scheduleRecovery?.(new Set([click.channelId]), {
+          delayMs: decisionRecoveryDelayMs((error as { retryAfterMs?: unknown })?.retryAfterMs)
+        });
+      }
       return false;
     }
   }
