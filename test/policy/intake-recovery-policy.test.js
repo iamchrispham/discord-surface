@@ -675,7 +675,7 @@ const findSwitchDecision = (tokens, triggerIndex, pairs, functionRanges) => {
   return { start, end, opening: best.opening };
 };
 
-const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) => {
+const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNegated = false) => {
   const ifDecision = findIfDecision(tokens, triggerIndex, pairs);
   if (ifDecision) {
     const conditionStart = ifDecision.start + 2;
@@ -683,14 +683,15 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges) =>
     const consequentEnd = findControlledStatementEnd(tokens, consequentStart, tokens.length, pairs, false);
     const alternateStart = tokens[consequentEnd]?.value === 'else' ? consequentEnd + 1 : consequentEnd;
     const negated = isNegatedDeadlineCondition(tokens, conditionStart, triggerIndex);
-    if (negated && alternateStart === consequentEnd) {
+    const deadlineBranchIsNegated = Boolean(negated) !== aliasNegated;
+    if (deadlineBranchIsNegated && alternateStart === consequentEnd) {
       const fallthroughEnd = findControlledStatementEnd(tokens, consequentEnd, tokens.length, pairs);
       return branchRange(tokens, consequentEnd, fallthroughEnd, pairs);
     }
     return branchRange(
       tokens,
-      negated ? alternateStart : consequentStart,
-      negated ? findControlledStatementEnd(tokens, alternateStart, tokens.length, pairs) : consequentEnd,
+      deadlineBranchIsNegated ? alternateStart : consequentStart,
+      deadlineBranchIsNegated ? findControlledStatementEnd(tokens, alternateStart, tokens.length, pairs) : consequentEnd,
       pairs
     );
   }
@@ -725,7 +726,8 @@ const BOUNDARY_WRITER_STATE_ARGUMENTS = new Map([
   ['markIntakeBoundary', 1],
   ['markThreadBoundary', 1],
   ['recordBoundary', 2],
-  ['recordOwnedBoundary', 2]
+  ['recordOwnedBoundary', 2],
+  ['setBindingReadiness', 1]
 ]);
 
 const isBoundaryWriter = value => BOUNDARY_WRITER_STATE_ARGUMENTS.has(value);
@@ -927,7 +929,11 @@ const isDeadlineTriggerAt = (tokens, index) => {
     while (tokens[memberEnd]?.value === '.' && tokens[memberEnd + 1]?.type === 'identifier') memberEnd += 2;
     return COMPARISON_OPERATORS.has(tokens[memberStart - 1]?.value)
       || COMPARISON_OPERATORS.has(tokens[memberEnd]?.value)
-      || tokens[memberStart - 1]?.value === 'case';
+      || tokens[memberStart - 1]?.value === 'case'
+      || (tokens[memberEnd]?.value === ']'
+        && tokens[memberEnd + 1]?.value === '.'
+        && tokens[memberEnd + 2]?.value === 'includes'
+        && tokens[memberEnd + 3]?.value === '(');
   }
   const deadlineOperandEnd = start => {
     if (tokens[start]?.type !== 'identifier') return null;
@@ -1327,8 +1333,10 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
     if (!isDeadlineTriggerAt(tokens, index)) continue;
     const alias = findAssignedAlias(tokens, index);
     if (alias) {
+      const aliasNegated = tokens[alias.index + 2]?.value === '!';
       deadlineAliases.push({
         ...alias,
+        negated: aliasNegated,
         bindingIndex: resolveVisibleBinding(
           lexicalBindings,
           alias.name,
@@ -1338,7 +1346,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
         scope: lexicalScopePath(lexicalScopes, alias.index)
       });
       if (isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) {
-        const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
+        const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges, aliasNegated);
         const knownAliases = visibleGapAliasesAt(
           tokens,
           decision.start,
@@ -1415,6 +1423,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       deadlineAliases.push({
         name: assignment.name,
         index: assignment.index,
+        negated: sourceAlias.negated,
         bindingIndex: assignment.bindingIndex,
         scope: assignment.scope
       });
@@ -1436,7 +1445,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       );
       if (!assignment || assignment.index !== alias.index) continue;
       if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges)) continue;
-      const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges);
+      const decision = extractDeadlineDecision(tokens, index, pairs, functionRanges, alias.negated);
       const knownAliases = visibleGapAliasesAt(
         tokens,
         decision.start,
@@ -2319,3 +2328,26 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     'discord/thread-enrollment.ts': 3
   }, 'new retryability consumers must join the class inventory before using this policy');
 });
+
+(() => {
+  const { test: regressionTest } = require('node:test');
+  const regressionAssert = require('node:assert/strict');
+  const offendersFor = source => findDeadlineGapOffenders([{ relative: 'mutation.js', source }]);
+
+  regressionTest('deadline policy inventory recognizes binding-readiness writes', () => {
+    const source = `if (deadlineReached) state.setBindingReadiness(id, READINESS.GAP, detail);`;
+    regressionAssert.equal(offendersFor(source).length, 1);
+  });
+
+  regressionTest('deadline policy inventory recognizes membership predicates', () => {
+    const source = `if ([STOPPED, CODEX_VALIDATION_KINDS.DEADLINE].includes(kind)) return READINESS.GAP;`;
+    regressionAssert.equal(offendersFor(source).length, 1);
+  });
+
+  regressionTest('deadline policy inventory preserves negated alias polarity', () => {
+    const expiredBranch = `const withinDeadline = !deadlineReached; if (!withinDeadline) return READINESS.GAP;`;
+    const activeBranch = `const withinDeadline = !deadlineReached; if (withinDeadline) return READINESS.GAP;`;
+    regressionAssert.equal(offendersFor(expiredBranch).length, 1);
+    regressionAssert.equal(offendersFor(activeBranch).length, 0);
+  });
+})();
