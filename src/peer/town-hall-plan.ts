@@ -23,8 +23,8 @@ export interface TownHallRoom {
 }
 
 export function isTownHallRoom(value: unknown): boolean {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   try {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
     const guildDescriptor = Object.getOwnPropertyDescriptor(value, 'guildId');
     const channelDescriptor = Object.getOwnPropertyDescriptor(value, 'channelId');
     if (!guildDescriptor || !channelDescriptor ||

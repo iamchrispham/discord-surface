@@ -832,9 +832,6 @@ function roomDigitPolicies(records) {
       '.cjs': '.cts',
       '.mjs': '.mts',
     }[extension];
-    if (sourceExtension) {
-      sourceCandidates.push(base.slice(0, -extension.length) + sourceExtension);
-    }
     sourceCandidates.push(
       base,
       base + '.ts',
@@ -850,6 +847,9 @@ function roomDigitPolicies(records) {
       base + '/index.cjs',
       base + '/index.mjs',
     );
+    if (sourceExtension) {
+      sourceCandidates.unshift(base.slice(0, -extension.length) + sourceExtension);
+    }
     for (const candidate of sourceCandidates) {
       if (byFile.has(candidate)) return byFile.get(candidate);
     }
@@ -1155,6 +1155,40 @@ function roomDigitPolicies(records) {
 
   const importedRegexInputs = (info, localName, imported) => {
     const inputs = [];
+    const seenDeclarations = new Set();
+    function collectReferenceInputs(reference) {
+      const parent = reference.parent;
+      if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+          parent.expression === reference &&
+          ['test', 'exec'].includes(callPropertyName(parent)) && ts.isCallExpression(parent.parent)) {
+        if (parent.parent.arguments[0]) inputs.push(parent.parent.arguments[0]);
+      } else if (ts.isCallExpression(parent) && parent.arguments[0] === reference &&
+          ['match', 'search'].includes(callPropertyName(parent.expression))) {
+        inputs.push(parent.expression.expression);
+      } else if (ts.isCallExpression(parent) && parent.arguments[1] === reference &&
+          ts.isPropertyAccessExpression(parent.expression) &&
+          parent.expression.name.text === 'call' &&
+          callPropertyName(parent.expression.expression) === 'search' && parent.arguments[0]) {
+        inputs.push(parent.arguments[0]);
+      } else if (ts.isVariableDeclaration(parent) && parent.initializer === reference &&
+          ts.isIdentifier(parent.name) &&
+          findBinding(info, parent.name.text, parent)?.declaration === parent) {
+        collectDeclarationInputs(parent);
+      }
+    }
+    function collectDeclarationInputs(declaration) {
+      if (seenDeclarations.has(declaration)) return;
+      seenDeclarations.add(declaration);
+      const name = declaration.name.text;
+      const visitDeclaration = node => {
+        if (ts.isIdentifier(node) && node.text === name && node !== declaration.name &&
+            findBinding(info, name, node)?.declaration === declaration) {
+          collectReferenceInputs(node);
+        }
+        ts.forEachChild(node, visitDeclaration);
+      };
+      visitDeclaration(info.ast);
+    }
     const visit = node => {
       if (ts.isIdentifier(node) && node.text === localName) {
         const binding = findBinding(info, localName, node);
@@ -1162,21 +1196,7 @@ function roomDigitPolicies(records) {
           (binding.kind === 'import' || binding.kind === 'commonjs-import') &&
           binding.imported === imported.imported && binding.specifier === imported.specifier;
         if (importedBinding) {
-          const parent = node.parent;
-          if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
-              parent.expression === node &&
-              ['test', 'exec'].includes(callPropertyName(parent)) && ts.isCallExpression(parent.parent)) {
-            if (parent.parent.arguments[0]) inputs.push(parent.parent.arguments[0]);
-          } else if (ts.isCallExpression(parent) && parent.arguments[0] === node &&
-              ['match', 'search'].includes(callPropertyName(parent.expression))) {
-            inputs.push(parent.expression.expression);
-          } else if (ts.isCallExpression(parent) && parent.arguments[1] === node &&
-              ts.isPropertyAccessExpression(parent.expression) &&
-              parent.expression.name.text === 'call' &&
-              callPropertyName(parent.expression.expression) === 'search' &&
-              parent.arguments[0]) {
-            inputs.push(parent.arguments[0]);
-          }
+          collectReferenceInputs(node);
         }
       }
       ts.forEachChild(node, visit);
@@ -2414,6 +2434,20 @@ test('room policy inventory records only town-hall room validators', () => {
     text: String.raw`import { ROOM_ID } from './imported-room-regex';
     function validateTownHallRoom(ROOM_ID, room) { return ROOM_ID.test(room.guildId); }`,
   };
+  const importedRegexAliasConsumer = {
+    file: 'peer/imported-regex-alias-consumer.ts',
+    text: String.raw`import { ROOM_ID } from './imported-room-regex';
+    const VALIDATOR = ROOM_ID;
+    function validateTownHallRoom(room) { return VALIDATOR.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    importedRegexHelper,
+    importedRegexAliasConsumer,
+  ]), {
+    ...expectedPolicies,
+    [importedRegexHelper.file]: 1,
+  });
   assert.deepEqual(roomDigitPolicies([
     ...records,
     importedRegexHelper,

@@ -147,7 +147,6 @@ function countIdentifierReferences(sourceFile, name) {
     binding.declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) ||
     candidates[0] || imports.find(binding => binding.importedName === name) || null;
   const namespaces = imports.filter(binding => binding.namespace);
-  if (!target && !namespaces.length) return 0;
   let count = 0;
   const visit = node => {
     if (target && ts.isIdentifier(node) && node.text === target.name &&
@@ -162,8 +161,13 @@ function countIdentifierReferences(sourceFile, name) {
           ? node.argumentExpression.text
           : null;
       const receiver = node.expression;
-      if (property === name && ts.isIdentifier(receiver) &&
-          namespaces.some(binding => resolveBinding(receiver, bindings) === binding.declaration)) {
+      const directRequire = ts.isCallExpression(receiver) &&
+        ts.isIdentifier(receiver.expression) && receiver.expression.text === 'require' &&
+        receiver.arguments.length === 1 && ts.isStringLiteralLike(receiver.arguments[0]) &&
+        !resolveBinding(receiver.expression, bindings);
+      const namespaceMember = ts.isIdentifier(receiver) &&
+        namespaces.some(binding => resolveBinding(receiver, bindings) === binding.declaration);
+      if (property === name && (namespaceMember || directRequire)) {
         count += 1;
       }
     }

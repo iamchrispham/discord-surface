@@ -9,6 +9,7 @@ const {
   TOWN_HALL_ROOM_MARKER,
   validateTownHallRoomIdentity
 } = require('../dist/peer/town-hall-room-identity');
+const { isTownHallRoom } = require('../dist/peer/town-hall-plan');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const OWNER_RELATIVE = 'src/peer/town-hall-room-identity.ts';
@@ -65,6 +66,13 @@ test('1 valid marker alone is accepted', () => {
   assert.equal(TOWN_HALL_ROOM_MARKER, '[discord-surface:town-hall:v1]');
   assert.equal(validateTownHallRoomIdentity(response(), room()), true);
   assert.equal(validateTownHallRoomIdentity(response({ topic: TOWN_HALL_ROOM_MARKER }), room()), true);
+});
+
+test('revoked room proxies are refused without throwing', () => {
+  const { proxy, revoke } = Proxy.revocable(room(), {});
+  revoke();
+  assert.doesNotThrow(() => isTownHallRoom(proxy));
+  assert.equal(isTownHallRoom(proxy), false);
 });
 
 test('2 marker followed by whitespace and an explanation is accepted', () => {

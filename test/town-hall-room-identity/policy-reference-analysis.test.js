@@ -27,4 +27,9 @@ test('reference analysis follows aliases and namespace members without shadows',
     function shadow(plan) { return plan.isTownHallRoom({}); }
     plan.isTownHallRoom({});`);
   assert.equal(countIdentifierReferences(namespaced, 'isTownHallRoom'), 1);
+
+  const directCommonJs = source(String.raw`function check(room) {
+    return require('./town-hall-plan').isTownHallRoom(room);
+  }`);
+  assert.equal(countIdentifierReferences(directCommonJs, 'isTownHallRoom'), 1);
 });
