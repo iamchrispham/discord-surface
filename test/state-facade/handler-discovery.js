@@ -565,7 +565,7 @@ function moduleCallableDescriptor(filePath, methodName, seen = new Set()) {
 function requireBindings(source) {
   const bindings = [];
   const addBinding = (name, declaration, modulePath, exportName) => {
-    bindings.push({ name, declaration, scope: declarationScope(declaration), modulePath, exportName });
+    bindings.push({ name, declaration, scope: declarationScope(declaration), modulePath, exportName, reassigned: false });
   };
   const visit = node => {
     if (node !== source && ts.isFunctionLike(node)) return;
@@ -611,11 +611,24 @@ function requireBindings(source) {
     }
     return null;
   };
+  const isAssignmentOperator = kind => kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment;
+  const markReassignments = node => {
+    if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind) && ts.isIdentifier(node.left)) {
+      const binding = resolve(node.left.text, node.left);
+      if (binding && scopeNode(node.left) === binding.scope) binding.reassigned = true;
+    }
+    ts.forEachChild(node, markReassignments);
+  };
+  markReassignments(source);
   return {
     get(name, identifier = null) {
-      if (identifier) return resolve(name, identifier);
-      const topLevel = bindings.filter(binding => binding.name === name && binding.scope === source);
-      return (topLevel.length ? topLevel : bindings.filter(binding => binding.name === name)).at(-1) || null;
+      if (identifier) {
+        const binding = resolve(name, identifier);
+        return binding && !binding.reassigned ? binding : null;
+      }
+      const topLevel = bindings.filter(binding => binding.name === name && binding.scope === source && !binding.reassigned);
+      const anyScope = bindings.filter(binding => binding.name === name && !binding.reassigned);
+      return (topLevel.length ? topLevel : anyScope).at(-1) || null;
     }
   };
 }
@@ -668,8 +681,21 @@ function exportedFactoryExpression(source, factoryName, allowDefault = false) {
     }
     return null;
   };
+  const isTopLevelExpression = node => {
+    let current = node;
+    while (current.parent && current.parent !== source) {
+      current = current.parent;
+      if ((ts.isBlock(current) && !ts.isTryStatement(current.parent)) || ts.isFunctionLike(current) ||
+          ts.isIfStatement(current) || ts.isSwitchStatement(current) ||
+          ts.isForStatement(current) || ts.isForInStatement(current) || ts.isForOfStatement(current) ||
+          ts.isWhileStatement(current) || ts.isDoStatement(current) || ts.isCatchClause(current) ||
+          ts.isConditionalExpression(current)) return false;
+    }
+    return current.parent === source;
+  };
   const visit = node => {
-    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    if (node !== source && ts.isFunctionLike(node)) return;
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && isTopLevelExpression(node)) {
       if (isNamedExport(node.left)) result = node.right;
       if (isModuleExports(node.left)) {
         result = null;
@@ -688,7 +714,8 @@ function exportedFactoryExpression(source, factoryName, allowDefault = false) {
         ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'Object' &&
         node.expression.name.text === 'defineProperty' && node.arguments.length >= 3 &&
         ts.isIdentifier(node.arguments[0]) && node.arguments[0].text === 'exports' &&
-        ts.isStringLiteral(node.arguments[1]) && node.arguments[1].text === factoryName) {
+        ts.isStringLiteral(node.arguments[1]) && node.arguments[1].text === factoryName &&
+        isTopLevelExpression(node)) {
       result = getterExpression(node.arguments[2]) || result;
     }
     ts.forEachChild(node, visit);

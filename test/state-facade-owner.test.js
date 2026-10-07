@@ -105,6 +105,28 @@ module.exports = {};`);
   assert.equal(discovery.approved, false);
 });
 
+test('ignores nested export assignments', () => {
+  const discovery = discoverTempFactory(`function createFakeHandlers() { return { hidden(state, value) {} }; }
+module.exports = {};
+function installFakeHandlers() { module.exports = { createFakeHandlers }; }`);
+  assert.equal(discovery.approved, false);
+});
+
+test('rejects reassigned require receivers', () => {
+  const discovery = discoverTempFactoryFiles({
+    'helpers.js': `function hidden(state, value) { return value; }
+module.exports = { hidden };`,
+    'companion.js': `let helpers = require('./helpers');
+helpers = {};
+function createFakeHandlers() { return { hidden: helpers.hidden }; }
+module.exports = { createFakeHandlers };`
+  }, `const { createFakeHandlers } = require('./companion');
+function createWrapper() { return createFakeHandlers({}); }
+const fakeHandlers = createWrapper();
+class SurfaceState {`);
+  assert.equal(discovery.approved, false);
+});
+
 test('accepts an unchanged callable binding before a write census', () => {
   const discovery = discoverTempFactory(`function createFakeHandlers() {
   let hidden = (state, value) => value;
