@@ -406,7 +406,21 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
 
   async function deliverRejection(click: DecisionClick, signal?: AbortSignal, interaction: ParsedComponentInteraction | null = null): Promise<InteractionCallbackResult | null> {
     click = await awaitCallbackOutcome(click);
-    if (click.callbackOutcome !== DECISION_TRANSPORT_OUTCOMES.SENT) return null;
+    if (!click.callbackOutcome) {
+      if (!signal?.aborted) scheduleRecovery(new Set([click.channelId]), { decisionId: click.interactionId });
+      return null;
+    }
+    if (click.callbackOutcome !== DECISION_TRANSPORT_OUTCOMES.SENT) {
+      const begin = state.beginDecisionRejectionFollowup(click.interactionId) as { accepted?: boolean };
+      if (!begin.accepted) return null;
+      const outcome = click.callbackOutcome === DECISION_TRANSPORT_OUTCOMES.REJECTED
+        ? DECISION_TRANSPORT_OUTCOMES.REJECTED
+        : DECISION_TRANSPORT_OUTCOMES.UNKNOWN;
+      try {
+        state.recordDecisionRejectionOutcome(click.interactionId, outcome);
+      } catch {}
+      return null;
+    }
     const remainingDelay = pendingRecoveryDelay(click.interactionId);
     if (remainingDelay > 0) {
       if (!signal?.aborted) scheduleRecovery(new Set([click.channelId]), { delayMs: remainingDelay, decisionId: click.interactionId });

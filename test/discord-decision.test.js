@@ -10,7 +10,7 @@ const { PermissionFlagsBits } = require('discord.js');
 const { presentDecision } = require('../src/decision-present');
 const { DiscordGateway } = require('../src/discord');
 const { encodeDecisionCustomId, sendInteractionFollowup } = require('../src/discord-interaction');
-const { READINESS, SurfaceState } = require('../src/state');
+const { DECISION_RECEIPT_KINDS, READINESS, SurfaceState } = require('../src/state');
 
 const NATIVE_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
 
@@ -474,7 +474,7 @@ test('callback uncertainty does not cancel canonical settlement or native custod
 });
 
 for (const callbackOutcome of ['rate_limited', 'rejected', 'not_sent', 'unknown']) {
-  test(`rejection recovery keeps ${callbackOutcome} callback custody without a follow-up`, { timeout: 30000 }, async t => {
+  test(`rejection recovery resolves ${callbackOutcome} callback custody without a follow-up`, { timeout: 30000 }, async t => {
     const f = await fixture(t);
     const interactionId = `rejection-callback-${callbackOutcome}`;
     const admitted = f.state.admitDecisionClickAndBeginAuthorization({
@@ -496,8 +496,14 @@ for (const callbackOutcome of ['rate_limited', 'rejected', 'not_sent', 'unknown'
     const remaining = await f.gateway.decisionConsumer.recover(new AbortController().signal);
 
     assert.equal(f.callbacks.length, 0);
-    assert.deepEqual(remaining.map(click => click.interactionId), [interactionId]);
-    assert.equal(remaining[0].callbackOutcome, callbackOutcome);
+    assert.deepEqual(remaining, []);
+    assert.equal(f.state.listDecisionPendingWork().length, 0);
+    const rejection = f.state.listReceipts()
+      .filter(row => row.kind === DECISION_RECEIPT_KINDS.REJECTION_OUTCOME)
+      .map(row => JSON.parse(row.detail))
+      .find(detail => detail.interactionId === interactionId);
+    assert.equal(rejection.outcome,
+      callbackOutcome === 'rejected' ? 'rejected' : 'unknown');
   });
 }
 
