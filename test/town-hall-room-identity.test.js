@@ -208,6 +208,17 @@ test('expected proxy getters cannot replace validated descriptor values', () => 
   }), expected), false);
 });
 
+test('expected proxy reads must match the validated descriptors', () => {
+  const expected = new Proxy(room(), {
+    get(target, key, receiver) {
+      if (key === 'guildId') return OTHER_GUILD;
+      if (key === 'channelId') return OTHER_CHANNEL;
+      return Reflect.get(target, key, receiver);
+    }
+  });
+  assert.equal(validateTownHallRoomIdentity(response(), expected), false);
+});
+
 test('response proxy getters cannot replace validated descriptor values', () => {
   const actual = new Proxy(response({ id: OTHER_CHANNEL, guild_id: OTHER_GUILD }), {
     get(target, key) {

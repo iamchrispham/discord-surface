@@ -18,6 +18,10 @@ export function validateTownHallRoomIdentity(response: unknown, expected: TownHa
         !Object.hasOwn(expectedGuildDescriptor, 'value')) return false;
     const expectedChannelId = expectedChannelDescriptor.value;
     const expectedGuildId = expectedGuildDescriptor.value;
+    const observedExpectedChannelId = expected.channelId;
+    const observedExpectedGuildId = expected.guildId;
+    if (observedExpectedChannelId !== expectedChannelId ||
+        observedExpectedGuildId !== expectedGuildId) return false;
     if (!isTownHallRoom({ channelId: expectedChannelId, guildId: expectedGuildId })) return false;
 
     const responseIdDescriptor = Object.getOwnPropertyDescriptor(response, 'id');

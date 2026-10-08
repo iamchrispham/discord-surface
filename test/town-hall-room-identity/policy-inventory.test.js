@@ -696,7 +696,7 @@ function roomDigitPolicies(records) {
           name,
           kind: 'commonjs-import',
           declaration: node.name,
-          scope: info.ast,
+          scope: variableDeclarationScope(node),
           specifier,
           imported: 'default',
         });
@@ -735,7 +735,7 @@ function roomDigitPolicies(records) {
               name: declaration.name.text,
               kind: 'commonjs-import',
               declaration: declaration.name,
-              scope: info.ast,
+              scope: variableDeclarationScope(declaration),
               source: initializer,
               specifier,
               imported,
@@ -751,7 +751,7 @@ function roomDigitPolicies(records) {
                 name: element.name.text,
                 kind: 'commonjs-import',
                 declaration: element.name,
-                scope: info.ast,
+                scope: variableDeclarationScope(declaration),
                 source: initializer,
                 specifier,
                 imported: propertyName,
@@ -1136,6 +1136,10 @@ function roomDigitPolicies(records) {
   const expressionIsRoomField = (node, info, seen = new Set()) => {
     const expression = unwrapPolicyExpression(node);
     if (!expression) return false;
+    if (ts.isConditionalExpression(expression)) {
+      return expressionIsRoomField(expression.whenTrue, info, new Set(seen)) &&
+        expressionIsRoomField(expression.whenFalse, info, new Set(seen));
+    }
     if (ts.isCallExpression(expression) &&
         ts.isIdentifier(expression.expression) &&
         ['String', 'Number', 'BigInt'].includes(expression.expression.text) &&
@@ -1180,6 +1184,39 @@ function roomDigitPolicies(records) {
     const inputs = [];
     const direct = regexInput(node);
     if (direct) inputs.push(direct);
+    const collectMatcherInputs = reference => {
+      let current = reference;
+      while (current.parent) {
+        const parent = current.parent;
+        if (ts.isCallExpression(parent)) {
+          const argumentIndex = parent.arguments.findIndex(argument =>
+            argument === reference || isAncestor(argument, reference));
+          if (argumentIndex !== -1) {
+            const matcher = resolveFunction(info, parent.expression);
+            if (!matcher || matcher.info !== info) {
+              current = parent;
+              continue;
+            }
+            const parameter = matcher.node.parameters[argumentIndex];
+            if (!parameter || !ts.isIdentifier(parameter.name) || !matcher.node.body) return;
+            const binding = findBinding(matcher.info, parameter.name.text, parameter.name);
+            if (!binding || binding.kind !== 'parameter') return;
+            const visitMatcher = candidate => {
+              if (ts.isIdentifier(candidate) && candidate.text === parameter.name.text &&
+                  findBinding(matcher.info, candidate.text, candidate) === binding) {
+                const input = regexInput(candidate);
+                if (input) inputs.push(input);
+              }
+              ts.forEachChild(candidate, visitMatcher);
+            };
+            visitMatcher(matcher.node.body);
+            return;
+          }
+        }
+        current = parent;
+      }
+    };
+    collectMatcherInputs(node);
     let propertyAssignment = node.parent;
     while (propertyAssignment &&
         (ts.isParenthesizedExpression(propertyAssignment) || ts.isAsExpression(propertyAssignment) ||
@@ -1261,6 +1298,7 @@ function roomDigitPolicies(records) {
       const visit = current => {
         if (ts.isIdentifier(current) && current.text === name && current !== currentDeclaration.name &&
             findBinding(info, name, current)?.declaration === currentDeclaration) {
+          collectMatcherInputs(current);
           const parent = current.parent;
           if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
               parent.expression === current &&
@@ -2767,6 +2805,33 @@ test('room policy inventory records only town-hall room validators', () => {
     commonJsNamespaceRegexHelper,
     commonJsNamespaceVoiceConsumer,
   ]), expectedPolicies);
+  const nestedCommonJsNamespaceConsumer = {
+    file: 'peer/nested-commonjs-namespace-consumer.cjs',
+    text: String.raw`function validateTownHallRoom(room) {
+      const { ROOM_ID } = require('./commonjs-namespace-room-patterns.cjs');
+      return ROOM_ID.test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    commonJsNamespaceRegexHelper,
+    nestedCommonJsNamespaceConsumer,
+  ]), {
+    ...expectedPolicies,
+    [commonJsNamespaceRegexHelper.file]: 1,
+  });
+  const nestedCommonJsNamespaceVoiceConsumer = {
+    file: 'peer/nested-commonjs-namespace-voice-consumer.cjs',
+    text: String.raw`function validateVoiceRoom(room) {
+      const { ROOM_ID } = require('./commonjs-namespace-room-patterns.cjs');
+      return ROOM_ID.test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    commonJsNamespaceRegexHelper,
+    nestedCommonJsNamespaceVoiceConsumer,
+  ]), expectedPolicies);
   const commonJsNamespaceShadowConsumer = {
     file: 'peer/commonjs-namespace-room-shadow-consumer.cjs',
     text: String.raw`const patterns = require('./commonjs-namespace-room-patterns.cjs');
@@ -3014,6 +3079,23 @@ test('room policy inventory records only town-hall room validators', () => {
     }`,
   };
   assert.deepEqual(roomDigitPolicies([...records, computedOrdinaryKey]), expectedPolicies);
+  const conditionalRoomFields = {
+    file: 'peer/conditional-room-fields.ts',
+    text: String.raw`function validateTownHallRoom(room, useGuild) {
+      return /^\d{1,21}$/.test(useGuild ? room.guildId : room.channelId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, conditionalRoomFields]), {
+    ...expectedPolicies,
+    [conditionalRoomFields.file]: 1,
+  });
+  const conditionalMixedRoomFields = {
+    file: 'peer/conditional-mixed-room-fields.ts',
+    text: String.raw`function validateTownHallRoom(room, useGuild) {
+      return /^\d{1,21}$/.test(useGuild ? room.guildId : room.name);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, conditionalMixedRoomFields]), expectedPolicies);
   const commonJsBarrelHelper = {
     file: 'peer/commonjs-barrel-room-helper.cts',
     text: String.raw`export function validateGuildId(value) { return /^\d{1,20}$/.test(value); }`,
@@ -3062,6 +3144,21 @@ test('room policy inventory records only town-hall room validators', () => {
     function validateVoiceRoom(room) { return validateGuildId.call(null, room.guildId); }`,
   };
   assert.deepEqual(roomDigitPolicies([...records, callHelperVoice]), expectedPolicies);
+  const matcherHelperRoom = {
+    file: 'peer/matcher-helper-room.ts',
+    text: String.raw`function matches(value, pattern) { return pattern.test(value); }
+    function validateTownHallRoom(room) { return matches(room.guildId, /^\d{1,21}$/); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, matcherHelperRoom]), {
+    ...expectedPolicies,
+    [matcherHelperRoom.file]: 1,
+  });
+  const matcherHelperOrdinaryField = {
+    file: 'peer/matcher-helper-ordinary-field.ts',
+    text: String.raw`function matches(value, pattern) { return pattern.test(value); }
+    function validateTownHallRoom(room) { return matches(room.name, /^\d{1,21}$/); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, matcherHelperOrdinaryField]), expectedPolicies);
   const defaultObjectShadowConsumer = {
     file: 'peer/default-object-room-regex-shadow-consumer.ts',
     text: "import patterns from './default-object-room-regex'; function inspectRoom(patterns, room) { return patterns.ROOM_ID.test(room.guildId); }",
