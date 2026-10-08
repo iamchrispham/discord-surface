@@ -535,7 +535,7 @@ test('namespace-import destructuring resolves named probe properties', () => {
 test('finite array callbacks classify direct process.kill probes', () => {
   expectProbe({ 'use.js': '[pid].forEach(process.kill);' });
   expectOrdinary({ 'use.js': '[pid].forEach(() => true);' });
-  expectOrdinary({ 'use.js': '[, pid].forEach(process.kill);' });
+  expectUnsupported({ 'use.js': '[, pid].forEach(process.kill);' });
 });
 
 test('finite array callbacks resolve statically computed method names', () => {

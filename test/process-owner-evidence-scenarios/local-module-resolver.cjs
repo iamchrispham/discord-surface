@@ -254,21 +254,42 @@ function createLocalModuleResolver(files) {
       }
       if (!declaration.initializer || (!ts.isObjectBindingPattern(declaration.name) &&
         !ts.isArrayBindingPattern(declaration.name))) return;
-      let index = 0;
-      for (const element of declaration.name.elements) {
-        if (ts.isOmittedExpression(element)) {
-          index += 1;
-          continue;
+      const recordPattern = (pattern, pathSegments = []) => {
+        if (ts.isIdentifier(pattern)) {
+          const name = pattern.text;
+          module.declaredBindings.add(name);
+          addBinding(name, { base: declaration.initializer, path: pathSegments });
+          if (exported) addExport(name, { binding: name });
+          return;
         }
-        if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
-        const arrayBinding = ts.isArrayBindingPattern(declaration.name);
-        const name = arrayBinding ? String(index++) : element.propertyName &&
-          (ts.isIdentifier(element.propertyName) || ts.isStringLiteral(element.propertyName))
-          ? element.propertyName.text : element.name.text;
-        module.declaredBindings.add(element.name.text);
-        addBinding(element.name.text, { base: declaration.initializer, name });
-        if (exported) addExport(element.name.text, { binding: element.name.text });
-      }
+        if (!ts.isObjectBindingPattern(pattern) && !ts.isArrayBindingPattern(pattern)) return;
+        let index = 0;
+        for (const element of pattern.elements) {
+          if (ts.isOmittedExpression(element)) {
+            if (ts.isArrayBindingPattern(pattern)) index += 1;
+            continue;
+          }
+          if (!ts.isBindingElement(element)) {
+            if (ts.isArrayBindingPattern(pattern)) index += 1;
+            continue;
+          }
+          let property;
+          if (ts.isArrayBindingPattern(pattern)) {
+            property = String(index++);
+          } else if (element.propertyName) {
+            if (ts.isIdentifier(element.propertyName) || ts.isStringLiteral(element.propertyName) ||
+              ts.isNumericLiteral(element.propertyName)) property = element.propertyName.text;
+            else if (ts.isComputedPropertyName(element.propertyName)) {
+              const value = staticPropertyValue(element.propertyName.expression, resolvedPath);
+              if (typeof value === 'string' || typeof value === 'number') property = String(value);
+            }
+          } else if (ts.isIdentifier(element.name)) {
+            property = element.name.text;
+          }
+          if (property !== undefined) recordPattern(element.name, [...pathSegments, property]);
+        }
+      };
+      recordPattern(declaration.name);
     };
     const recordFunction = (declaration, exported = false) => {
       const isDefault = declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.DefaultKeyword);
@@ -451,10 +472,8 @@ function createLocalModuleResolver(files) {
       }
       const nestedPath = exportObjectPath(receiver);
       const nestedObjects = new Set(nestedPath ? exportedObjectLiterals(nestedPath) : []);
-      if (ts.isIdentifier(receiver) && module.imports.has(receiver.text)) {
-        for (const atom of evaluate(receiver, resolvedPath, new Set())) {
-          if (atom?.objectLiteral) nestedObjects.add(atom.objectLiteral);
-        }
+      for (const atom of evaluate(receiver, resolvedPath, new Set())) {
+        if (atom?.objectLiteral) nestedObjects.add(atom.objectLiteral);
       }
       for (const object of nestedObjects) {
         const objectOwner = scanModule(object.getSourceFile().fileName) || module;
@@ -589,7 +608,7 @@ function createLocalModuleResolver(files) {
       if (!ts.isCallExpression(expression) || !ts.isPropertyAccessExpression(expression.expression) ||
         expression.expression.name.text !== 'assign' ||
         !ts.isIdentifier(expression.expression.expression) || expression.expression.expression.text !== 'Object' ||
-        module.declaredBindings.has('Object')) return;
+        !isUnshadowedGlobalName(expression.expression.expression, 'Object', module)) return;
       const target = expression.arguments[0];
       if (!target || !isExportObjectExpression(target)) return;
       const objectLiteralsFor = (source, visited = new Set()) => {
@@ -726,10 +745,10 @@ function createLocalModuleResolver(files) {
     const scanModuleLevel = node => {
       if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) return;
       if (ts.isIfStatement(node)) {
-        const condition = unwrap(node.expression);
-        if (condition.kind === ts.SyntaxKind.TrueKeyword) {
+        const condition = staticTruthiness(node.expression);
+        if (condition === true) {
           scanModuleLevel(node.thenStatement);
-        } else if (condition.kind === ts.SyntaxKind.FalseKeyword) {
+        } else if (condition === false) {
           if (node.elseStatement) scanModuleLevel(node.elseStatement);
         } else {
           scanModuleLevel(node.thenStatement);
@@ -890,15 +909,58 @@ function createLocalModuleResolver(files) {
     return true;
   };
 
+  const hasStaticPropertyDefinition = (expression, name, currentPath, visited = new Set()) => {
+    const node = unwrap(expression);
+    if (!node || visited.has(node)) return false;
+    const seen = new Set(visited).add(node);
+    if (ts.isObjectLiteralExpression(node)) {
+      for (let index = node.properties.length - 1; index >= 0; index -= 1) {
+        const property = node.properties[index];
+        if (ts.isSpreadAssignment(property)) {
+          if (hasStaticPropertyDefinition(property.expression, name, currentPath, seen)) return true;
+          continue;
+        }
+        if (!property.name) continue;
+        const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ||
+          ts.isNumericLiteral(property.name) ? property.name.text
+          : ts.isComputedPropertyName(property.name)
+            ? staticPropertyValue(property.name.expression, currentPath, seen) : null;
+        if (key === name) return true;
+      }
+      const ownerModule = currentPath && modules.get(path.resolve(currentPath));
+      return (ownerModule?.nestedObjectProperties.get(node)?.get(String(name)) || []).length > 0;
+    }
+    if (ts.isArrayLiteralExpression(node)) {
+      const index = Number(name);
+      const element = Number.isInteger(index) && index >= 0 ? node.elements[index] : undefined;
+      return Boolean(element && !ts.isOmittedExpression(element));
+    }
+    for (const atom of evaluate(node, currentPath, visited)) {
+      if (atom?.objectLiteral && hasStaticPropertyDefinition(atom.objectLiteral, name,
+        atom.modulePath || currentPath, seen)) return true;
+      if (atom?.arrayLiteral && hasStaticPropertyDefinition(atom.arrayLiteral, name,
+        atom.modulePath || currentPath, seen)) return true;
+      const modulePath = modulePathFromAtom(atom);
+      const module = modulePath && scanModule(modulePath);
+      if (module?.exports.has(name) || module?.commonJsExports.has(String(name))) return true;
+    }
+    return false;
+  };
+
   const evaluateProperty = (expression, name, currentPath, visited, bindingOverrides = new Map()) => {
     const node = unwrap(expression);
     if (!node || visited.has(node)) return new Set();
     const seen = new Set(visited).add(node);
     if (ts.isObjectLiteralExpression(node)) {
       const result = new Set();
-      for (const property of node.properties) {
+      for (let index = node.properties.length - 1; index >= 0; index -= 1) {
+        const property = node.properties[index];
         if (ts.isSpreadAssignment(property)) {
-          for (const atom of evaluateProperty(property.expression, name, currentPath, seen)) result.add(atom);
+          if (hasStaticPropertyDefinition(property.expression, name, currentPath, seen)) {
+            const spreadValues = evaluateProperty(property.expression, name, currentPath, seen);
+            for (const atom of spreadValues) result.add(atom);
+            break;
+          }
           continue;
         }
         const getter = ts.isGetAccessorDeclaration(property);
@@ -913,19 +975,18 @@ function createLocalModuleResolver(files) {
         if (key !== name) continue;
         if (method) {
           result.add({ callable: property, modulePath: currentPath });
-          continue;
-        }
-        if (getter) {
+        } else if (getter) {
           const statements = property.body?.statements || [];
           if (statements.length === 1 && ts.isReturnStatement(statements[0]) && statements[0].expression) {
             for (const atom of evaluate(statements[0].expression, currentPath, seen, new Map(), bindingOverrides)) {
               result.add(atom);
             }
           }
-          continue;
+        } else {
+          const value = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
+          for (const atom of evaluate(value, currentPath, seen, new Map(), bindingOverrides)) result.add(atom);
         }
-        const value = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
-        for (const atom of evaluate(value, currentPath, seen, new Map(), bindingOverrides)) result.add(atom);
+        break;
       }
       const ownerModule = currentPath && modules.get(path.resolve(currentPath));
       const nestedWrites = ownerModule?.nestedObjectProperties.get(node)?.get(String(name)) || [];
@@ -947,7 +1008,8 @@ function createLocalModuleResolver(files) {
       const result = new Set();
       for (const binding of bindings) {
         if (binding && binding.base) {
-          for (const atom of evaluateProperty(binding.base, name, currentPath, seen, bindingOverrides)) result.add(atom);
+          const values = evaluateBindingProjection(binding, currentPath, seen, bindingOverrides);
+          for (const nested of resolveProperty(values, name, currentPath, seen, bindingOverrides)) result.add(nested);
         } else {
           for (const atom of evaluateProperty(binding, name, currentPath, seen, bindingOverrides)) result.add(atom);
         }
@@ -971,6 +1033,17 @@ function createLocalModuleResolver(files) {
       if (modulePath) for (const nested of resolveExport(modulePath, name, seen)) result.add(nested);
     }
     return result;
+  };
+
+  const evaluateBindingProjection = (binding, currentPath, visited, bindingOverrides = new Map()) => {
+    const pathSegments = Array.isArray(binding.path) ? binding.path : [binding.name];
+    let values = evaluate(binding.base, currentPath, visited, new Map(), bindingOverrides);
+    for (const segment of pathSegments) {
+      if (segment === undefined || segment === null) return new Set();
+      values = resolveProperty(values, String(segment), currentPath, visited, bindingOverrides);
+      if (!values.size) break;
+    }
+    return values;
   };
 
   const staticPropertyValue = (expression, currentPath, visited = new Set()) => {
@@ -1009,7 +1082,9 @@ function createLocalModuleResolver(files) {
     for (const member of declaration.members || []) {
       if (!member.name) continue;
       const memberName = ts.isIdentifier(member.name) || ts.isStringLiteral(member.name) ||
-        ts.isNumericLiteral(member.name) ? member.name.text : null;
+        ts.isNumericLiteral(member.name) ? member.name.text
+        : ts.isComputedPropertyName(member.name)
+          ? staticPropertyValue(member.name.expression, member.getSourceFile().fileName) : null;
       if (memberName !== String(name)) continue;
       const isStatic = member.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword) || false;
       if (isStatic !== staticMember) continue;
@@ -1093,21 +1168,22 @@ function createLocalModuleResolver(files) {
     return result;
   };
 
-  const resolveProperty = (atoms, name, currentPath, visited = new Set()) => {
-    const objectAtoms = [...atoms].filter(atom => atom && atom.objectLiteral);
-    if (objectAtoms.length) {
+  const resolveProperty = (atoms, name, currentPath, visited = new Set(), bindingOverrides = new Map()) => {
+    const propertyAtoms = [...atoms].filter(atom => atom && (atom.objectLiteral || atom.arrayLiteral));
+    if (propertyAtoms.length) {
       const result = new Set();
-      for (const atom of objectAtoms) {
+      for (const atom of propertyAtoms) {
         for (const nested of evaluateProperty(
-          atom.objectLiteral,
+          atom.objectLiteral || atom.arrayLiteral,
           name,
           atom.modulePath || currentPath,
-          visited
+          visited,
+          bindingOverrides
         )) result.add(nested);
       }
-      const remaining = new Set([...atoms].filter(atom => !atom || !atom.objectLiteral));
+      const remaining = new Set([...atoms].filter(atom => !atom || (!atom.objectLiteral && !atom.arrayLiteral)));
       if (remaining.size) {
-        for (const nested of resolveProperty(remaining, name, currentPath, visited)) result.add(nested);
+        for (const nested of resolveProperty(remaining, name, currentPath, visited, bindingOverrides)) result.add(nested);
       }
       return result;
     }
@@ -1480,6 +1556,9 @@ function createLocalModuleResolver(files) {
     if (ts.isObjectLiteralExpression(node)) {
       return new Set([{ objectLiteral: node, modulePath: currentPath }]);
     }
+    if (ts.isArrayLiteralExpression(node)) {
+      return new Set([{ arrayLiteral: node, modulePath: currentPath }]);
+    }
     if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
       return new Set([{ classDeclaration: node, modulePath: currentPath, instance: false }]);
     }
@@ -1546,7 +1625,7 @@ function createLocalModuleResolver(files) {
       const result = new Set();
       for (const binding of bindings) {
         if (binding && binding.base) {
-          for (const atom of evaluateProperty(binding.base, binding.name, currentPath, seen, bindingOverrides)) result.add(atom);
+          for (const atom of evaluateBindingProjection(binding, currentPath, seen, bindingOverrides)) result.add(atom);
         } else {
           for (const atom of evaluate(binding, currentPath, seen, parameterBindings, bindingOverrides)) result.add(atom);
         }
@@ -1568,7 +1647,7 @@ function createLocalModuleResolver(files) {
       if (name === 'kill' && receiver.has(PROCESS_OBJECT)) result.add(PID_PROBE);
       if (name === 'bind' && receiver.has(PID_PROBE)) result.add(BOUND_PROBE);
       for (const atom of receiver) {
-        for (const nested of resolveProperty([atom], String(name), currentPath, seen)) result.add(nested);
+        for (const nested of resolveProperty([atom], String(name), currentPath, seen, bindingOverrides)) result.add(nested);
       }
       return result;
     }
@@ -1749,7 +1828,7 @@ function createLocalModuleResolver(files) {
     const result = new Set();
     for (const binding of bindings) {
       if (binding && binding.base) {
-        for (const atom of evaluateProperty(binding.base, binding.name, currentPath, visited)) result.add(atom);
+        for (const atom of evaluateBindingProjection(binding, currentPath, visited)) result.add(atom);
       } else if (binding && binding.builtinNamespace === 'process') {
         result.add(PROCESS_OBJECT);
       } else if (ts.isObjectLiteralExpression(binding)) {
@@ -1787,7 +1866,14 @@ function createLocalModuleResolver(files) {
       for (const atom of atoms || []) {
         if (!atom || !atom.callable) continue;
         const callablePath = atom.modulePath || callerPath;
-        const parameterBindings = callableParameterBindings(atom.callable, argumentsList, callerPath, callablePath);
+        const effectiveArguments = argumentsList === null ? null
+          : [...(atom.boundArguments || []), ...argumentsList];
+        const parameterBindings = callableParameterBindings(
+          atom.callable,
+          effectiveArguments,
+          callerPath,
+          callablePath
+        );
         for (const returnExpression of callableReturnExpressions(atom.callable)) {
           for (const returnAtom of evaluate(returnExpression, callablePath, visited, parameterBindings)) result.add(returnAtom);
         }

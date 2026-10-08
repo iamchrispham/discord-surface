@@ -623,39 +623,43 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         for (const [name, value] of properties) indexMemberAssignmentsForTarget(target, [name], value);
       }
     }
+    const indexDescriptorProperties = (target, names, descriptor) => {
+      if (!target || !names.length || !descriptor || !ts.isObjectLiteralExpression(descriptor)) return;
+      for (const property of descriptor.properties) {
+        if ((!ts.isPropertyAssignment(property) && !ts.isMethodDeclaration(property)) || !property.name) continue;
+        const descriptorName = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
+          ? property.name.text : null;
+        if (descriptorName === 'value' && ts.isPropertyAssignment(property)) {
+          indexMemberAssignmentsForTarget(target, names, { source: property.initializer });
+          continue;
+        }
+        if (descriptorName !== 'get') continue;
+        const getter = ts.isPropertyAssignment(property) ? property.initializer : property;
+        const body = ts.isMethodDeclaration(getter) || ts.isFunctionExpression(getter) ||
+          ts.isArrowFunction(getter) ? getter.body : null;
+        if (!body) continue;
+        if (!ts.isBlock(body)) {
+          indexMemberAssignmentsForTarget(target, names, { source: body });
+          continue;
+        }
+        const returnedValues = [];
+        const collectReturns = node => {
+          if (node !== body && (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) ||
+            ts.isArrowFunction(node) || ts.isMethodDeclaration(node) || ts.isGetAccessor(node) ||
+            ts.isSetAccessor(node))) return;
+          if (ts.isReturnStatement(node) && node.expression) returnedValues.push(node.expression);
+          ts.forEachChild(node, collectReturns);
+        };
+        collectReturns(body);
+        for (const value of returnedValues) indexMemberAssignmentsForTarget(target, names, { source: value });
+      }
+    };
     if (objectMethodCall === 'defineProperty' && !shadowedObject) {
       const [target, key, descriptor] = expression.arguments;
-      if (target && key && descriptor && ts.isObjectLiteralExpression(descriptor)) {
+      if (target && key) {
         const names = [...staticValue(key)].filter(value => typeof value === 'string' || typeof value === 'number')
           .map(value => value.toString());
-        for (const property of descriptor.properties) {
-          if ((!ts.isPropertyAssignment(property) && !ts.isMethodDeclaration(property)) || !property.name) continue;
-          const descriptorName = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
-            ? property.name.text : null;
-          if (descriptorName === 'value' && ts.isPropertyAssignment(property)) {
-            indexMemberAssignmentsForTarget(target, names, { source: property.initializer });
-            continue;
-          }
-          if (descriptorName !== 'get') continue;
-          const getter = ts.isPropertyAssignment(property) ? property.initializer : property;
-          const body = ts.isMethodDeclaration(getter) || ts.isFunctionExpression(getter) ||
-            ts.isArrowFunction(getter) ? getter.body : null;
-          if (!body) continue;
-          if (!ts.isBlock(body)) {
-            indexMemberAssignmentsForTarget(target, names, { source: body });
-            continue;
-          }
-          const returnedValues = [];
-          const collectReturns = node => {
-            if (node !== body && (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) ||
-              ts.isArrowFunction(node) || ts.isMethodDeclaration(node) || ts.isGetAccessor(node) ||
-              ts.isSetAccessor(node))) return;
-            if (ts.isReturnStatement(node) && node.expression) returnedValues.push(node.expression);
-            ts.forEachChild(node, collectReturns);
-          };
-          collectReturns(body);
-          for (const value of returnedValues) indexMemberAssignmentsForTarget(target, names, { source: value });
-        }
+        indexDescriptorProperties(target, names, descriptor);
       }
     }
     if (objectMethodCall === 'defineProperties' && !shadowedObject) {
@@ -673,17 +677,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
               : [];
           const descriptor = ts.isParenthesizedExpression(entry.initializer)
             ? entry.initializer.expression : entry.initializer;
-          if (!names.length || !ts.isObjectLiteralExpression(descriptor)) continue;
-          for (const property of descriptor.properties) {
-            if (!ts.isPropertyAssignment(property) || !property.name) continue;
-            const descriptorName = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
-              ? property.name.text
-              : ts.isComputedPropertyName(property.name)
-                ? [...staticValue(property.name.expression)].find(value => typeof value === 'string') || null
-                : null;
-            if (descriptorName !== 'value') continue;
-            indexMemberAssignmentsForTarget(target, names, { source: property.initializer });
-          }
+          indexDescriptorProperties(target, names, descriptor);
         }
       }
     }
@@ -2528,11 +2522,30 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       declaration.getSourceFile() === sourceFile && !isAmbientDeclaration(declaration));
   }
 
+  function recordIndexedArrayCallbackProbe(elements, owner, invokesHoles = false) {
+    if (!elements) {
+      violations.push(`unsupported process probe ${fileName}:${owner}`);
+      return;
+    }
+    let hasSafeIndex = false;
+    let hasUnsupportedIndex = false;
+    for (let index = 0; index < elements.length; index += 1) {
+      const element = elements[index];
+      const hole = !element || ts.isOmittedExpression(element);
+      if (hole && !invokesHoles) continue;
+      if (index === 0) hasSafeIndex = true;
+      else hasUnsupportedIndex = true;
+    }
+    if (hasSafeIndex) kills.push({ file: fileName, owner });
+    if (hasUnsupportedIndex) violations.push(`unsupported process probe ${fileName}:${owner}`);
+  }
+
   function isNativePromiseResult(expression, visited = new Set()) {
     if (ts.isAwaitExpression(expression)) return false;
     const transparent = transparentExpression(expression);
     if (transparent) return isNativePromiseResult(transparent, visited);
     if (isUnshadowedNativePromiseFactory(expression)) return true;
+    if (ts.isCallExpression(expression) && isNativePromiseHandler(expression.expression)) return true;
     if (!ts.isIdentifier(expression)) return false;
     const symbol = checker.getSymbolAtLocation(expression);
     if (!symbol || visited.has(symbol)) return false;
@@ -2549,7 +2562,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
   }
 
   function isNativePromiseHandler(callee) {
-    return ts.isPropertyAccessExpression(callee) &&
+    if (!ts.isPropertyAccessExpression(callee) ||
+      !['then', 'catch'].includes(callee.name.text)) return false;
+    const methodDeclaration = symbolDeclaration(checker.getSymbolAtLocation(callee));
+    const methodIsCustom = Boolean(methodDeclaration && !methodDeclaration.getSourceFile().isDeclarationFile &&
+      !isAmbientDeclaration(methodDeclaration));
+    return !methodIsCustom &&
       (callee.name.text === 'then' || callee.name.text === 'catch') &&
       isNativePromiseResult(callee.expression);
   }
@@ -2698,11 +2716,13 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           : literalArrayElements(callArguments[1], new Set(), true) || [];
         const callback = methodArguments[0];
         const elements = receiver ? literalArrayElements(receiver, new Set(), true) : null;
-        if (callback && elements?.length && hasAtom(staticValue(callback), PID_PROBE)) {
-          if (finiteArrayReducerMethods.has(borrowedMethodName)) {
+        if (callback && hasAtom(staticValue(callback), PID_PROBE)) {
+          if (!elements) {
+            violations.push(`unsupported process probe ${fileName}:${owner}`);
+          } else if (elements.length && finiteArrayReducerMethods.has(borrowedMethodName)) {
             recordFiniteReducerProbe(borrowedMethodName, elements, methodArguments.slice(1), owner);
-          } else {
-            kills.push({ file: fileName, owner });
+          } else if (!finiteArrayReducerMethods.has(borrowedMethodName)) {
+            recordIndexedArrayCallbackProbe(elements, owner);
           }
         }
       }
@@ -2720,8 +2740,8 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           const elements = input ? literalArrayElements(input) : null;
           if (expandedArguments === null || !elements) {
             violations.push(`unsupported process probe ${fileName}:${owner}`);
-          } else if (elements.length > 0) {
-            if (directProbeMapper) kills.push({ file: fileName, owner });
+          } else {
+            if (directProbeMapper) recordIndexedArrayCallbackProbe(elements, owner, true);
             if (indirectProbeMapper) violations.push(`unsupported process probe ${fileName}:${owner}`);
           }
         }
@@ -2742,7 +2762,7 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           if (!elements) violations.push(`unsupported process probe ${fileName}:${owner}`);
           else if (finiteArrayReducerMethods.has(arrayCallbackMethod)) {
             recordFiniteReducerProbe(arrayCallbackMethod, elements, expandedArguments, owner);
-          } else if (elements[0] && !ts.isOmittedExpression(elements[0])) kills.push({ file: fileName, owner });
+          } else recordIndexedArrayCallbackProbe(elements, owner);
         } else if ([BOUND_PROBE, ...INVOCATION_METHODS].some(atom => hasAtom(callbackAtoms, atom))) {
           violations.push(`unsupported process probe ${fileName}:${owner}`);
         }
