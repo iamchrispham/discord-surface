@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const ts = require('typescript');
-const { countIdentifierReferences } = require('./policy-reference-analysis');
+const { countIdentifierReferences, commonJsExportAssignment } = require('./policy-reference-analysis');
 
 const PROJECT_ROOT = path.join(__dirname, '..', '..');
 
@@ -830,32 +830,6 @@ function roomDigitPolicies(records) {
     };
     commonJsImport(info.ast);
 
-    const commonJsPropertyKey = expression => {
-      if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
-      if (ts.isElementAccessExpression(expression) && expression.argumentExpression &&
-          ts.isStringLiteralLike(expression.argumentExpression)) {
-        return expression.argumentExpression.text;
-      }
-      return null;
-    };
-    const commonJsExportTarget = expression => {
-      const property = commonJsPropertyKey(expression);
-      if (property === null) return null;
-      if (ts.isIdentifier(expression.expression) && expression.expression.text === 'exports') {
-        return property;
-      }
-      const object = expression.expression;
-      if ((ts.isPropertyAccessExpression(object) || ts.isElementAccessExpression(object)) &&
-          ts.isIdentifier(object.expression) && object.expression.text === 'module' &&
-          commonJsPropertyKey(object) === 'exports') {
-        return property;
-      }
-      if (ts.isIdentifier(expression.expression) &&
-          expression.expression.text === 'module' && property === 'exports') {
-        return 'default';
-      }
-      return null;
-    };
     const indexCommonJsFunction = (exportName, node) => {
       const fn = {
         info,
@@ -884,17 +858,19 @@ function roomDigitPolicies(records) {
     };
     const commonJsExportVisit = node => {
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-        const target = commonJsExportTarget(node.left);
+        const assignment = commonJsExportAssignment(node);
+        const target = assignment?.target || null;
         if (target && ts.isIdentifier(node.right)) {
           info.exports.set(target, node.right.text);
         } else if (target && regexExpression(node.right)) {
           indexCommonJsRegex(target, node.right);
-        } else if (target === 'default' && ts.isCallExpression(node.right) &&
-            ts.isIdentifier(node.right.expression) && node.right.expression.text === 'require' &&
-            node.right.arguments.length === 1 && ts.isStringLiteralLike(node.right.arguments[0])) {
-          const specifier = node.right.arguments[0].text;
-          info.exports.set('default', { kind: 'reexport', specifier, imported: 'default' });
-          if (!info.starExports.includes(specifier)) info.starExports.push(specifier);
+        } else if (assignment?.reExport) {
+          const { specifier, importedName } = assignment.reExport;
+          info.exports.set(target, { kind: 'reexport', specifier, imported: importedName });
+          if (target === 'default' && importedName === 'default' &&
+              !info.starExports.includes(specifier)) {
+            info.starExports.push(specifier);
+          }
         } else if (target === 'default' && ts.isObjectLiteralExpression(node.right)) {
           for (const property of node.right.properties) {
             if (ts.isShorthandPropertyAssignment(property)) {
@@ -1709,6 +1685,15 @@ test('room policy inventory records only town-hall room validators', () => {
   const importedReferenceFixture = ts.createSourceFile('peer/imported-reference-fixture.ts', String.raw`import { isTownHallRoom } from './town-hall-plan';
   isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(importedReferenceFixture, 'isTownHallRoom'), 1);
+  const importedGuardWithNamedFunctionExpressionFixture = createSourceFile(
+    'peer/imported-guard-with-named-function-expression-fixture.ts',
+    String.raw`import { isTownHallRoom } from './town-hall-plan';
+    const helper = function isTownHallRoom() { return isTownHallRoom({}); };
+    isTownHallRoom({});`);
+  assert.equal(countIdentifierReferences(
+    importedGuardWithNamedFunctionExpressionFixture,
+    'isTownHallRoom',
+  ), 1);
   const aliasedImportedReferenceFixture = ts.createSourceFile('peer/aliased-imported-reference-fixture.ts', String.raw`import { isTownHallRoom as roomGuard } from './town-hall-plan';
   roomGuard({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(aliasedImportedReferenceFixture, 'isTownHallRoom'), 1);
@@ -1729,6 +1714,54 @@ test('room policy inventory records only town-hall room validators', () => {
   const importEqualsNamespaceReferenceFixture = ts.createSourceFile('peer/import-equals-namespace-reference-fixture.cts', String.raw`import plan = require('./town-hall-plan.cjs');
   plan.isTownHallRoom({});`, ts.ScriptTarget.Latest, true);
   assert.equal(countIdentifierReferences(importEqualsNamespaceReferenceFixture, 'isTownHallRoom'), 1);
+  const destructuredNamespaceReferenceFixture = createSourceFile(
+    'peer/destructured-namespace-reference-fixture.ts',
+    String.raw`import * as plan from './town-hall-plan';
+    const { isTownHallRoom: guard } = plan;
+    guard({});`);
+  assert.equal(countIdentifierReferences(destructuredNamespaceReferenceFixture, 'isTownHallRoom'), 1);
+  const unrelatedDestructuredNamespaceReferenceFixture = createSourceFile(
+    'peer/unrelated-destructured-namespace-reference-fixture.ts',
+    String.raw`import * as voiceRoom from './voice-room';
+    const { isTownHallRoom: guard } = voiceRoom;
+    guard({});`);
+  assert.equal(countIdentifierReferences(
+    unrelatedDestructuredNamespaceReferenceFixture,
+    'isTownHallRoom',
+  ), 0);
+  const runtimeCjsSourceFixture = createSourceFile(
+    'peer/town-hall-runtime-source.cts',
+    String.raw`export { isTownHallRoom } from './town-hall-plan';`);
+  const runtimeCjsConsumerFixture = createSourceFile(
+    'peer/town-hall-runtime-consumer.cjs',
+    String.raw`const { isTownHallRoom: guard } = require('./town-hall-runtime-source.cjs');
+    guard({});`);
+  assert.equal(countIdentifierReferences(runtimeCjsConsumerFixture, 'isTownHallRoom', [
+    runtimeCjsSourceFixture,
+    runtimeCjsConsumerFixture,
+  ]), 1);
+  const runtimeMjsSourceFixture = createSourceFile(
+    'peer/town-hall-runtime-source.mts',
+    String.raw`export { isTownHallRoom } from './town-hall-plan';`);
+  const runtimeMjsConsumerFixture = createSourceFile(
+    'peer/town-hall-runtime-consumer.mjs',
+    String.raw`import { isTownHallRoom as guard } from './town-hall-runtime-source.mjs';
+    guard({});`);
+  assert.equal(countIdentifierReferences(runtimeMjsConsumerFixture, 'isTownHallRoom', [
+    runtimeMjsSourceFixture,
+    runtimeMjsConsumerFixture,
+  ]), 1);
+  const unrelatedRuntimeTypeSourceFixture = createSourceFile(
+    'peer/unrelated-runtime-source.mts',
+    String.raw`export { isTownHallRoom } from './voice-room';`);
+  const unrelatedRuntimeTypeConsumerFixture = createSourceFile(
+    'peer/unrelated-runtime-consumer.mjs',
+    String.raw`import { isTownHallRoom as guard } from './unrelated-runtime-source.mjs';
+    guard({});`);
+  assert.equal(countIdentifierReferences(unrelatedRuntimeTypeConsumerFixture, 'isTownHallRoom', [
+    unrelatedRuntimeTypeSourceFixture,
+    unrelatedRuntimeTypeConsumerFixture,
+  ]), 0);
   const namespaceExportBarrelFixture = createSourceFile('peer/namespace-export-barrel.ts',
     String.raw`export * as plan from './town-hall-plan.js';`);
   const namespaceExportConsumerFixture = createSourceFile('peer/namespace-export-consumer.ts',
@@ -1836,6 +1869,40 @@ test('room policy inventory records only town-hall room validators', () => {
   assert.deepEqual(roomDigitPolicies([...records, runtimeMjsRoomHelper, runtimeMjsRoomConsumer]), {
     ...expectedPolicies,
     'peer/runtime-mjs-room-helper.mts': 1
+  });
+  const cjsRuntimeExtensionPattern = {
+    file: 'peer/runtime-extension-pattern.cts',
+    text: String.raw`exports.ROOM_ID = /^\d{1,21}$/;`
+  };
+  const cjsRuntimeExtensionConsumer = {
+    file: 'peer/runtime-extension-town-hall-consumer.cjs',
+    text: String.raw`const { ROOM_ID } = require('./runtime-extension-pattern.cjs');
+    function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    cjsRuntimeExtensionPattern,
+    cjsRuntimeExtensionConsumer,
+  ]), {
+    ...expectedPolicies,
+    [cjsRuntimeExtensionPattern.file]: 1,
+  });
+  const mjsRuntimeExtensionPattern = {
+    file: 'peer/runtime-extension-pattern.mts',
+    text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`
+  };
+  const mjsRuntimeExtensionConsumer = {
+    file: 'peer/runtime-extension-town-hall-consumer.mjs',
+    text: String.raw`import { ROOM_ID } from './runtime-extension-pattern.mjs';
+    function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    mjsRuntimeExtensionPattern,
+    mjsRuntimeExtensionConsumer,
+  ]), {
+    ...expectedPolicies,
+    [mjsRuntimeExtensionPattern.file]: 1,
   });
   const runtimeExtensionNegativeHelper = {
     file: 'peer/runtime-extension-negative-helper.cts',
@@ -3376,6 +3443,47 @@ test('room policy inventory records only town-hall room validators', () => {
     commonJsBarrel,
     commonJsBarrelVoiceConsumer,
   ]), expectedPolicies);
+  const namedCommonJsPatternHelper = {
+    file: 'peer/named-commonjs-patterns.cts',
+    text: String.raw`exports.ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const namedCommonJsPatternBarrel = {
+    file: 'peer/named-commonjs-patterns-barrel.cjs',
+    text: String.raw`exports.ROOM_ID = require('./named-commonjs-patterns.cjs').ROOM_ID;`,
+  };
+  const namedCommonJsPatternConsumer = {
+    file: 'peer/named-commonjs-pattern-consumer.cjs',
+    text: String.raw`const { ROOM_ID } = require('./named-commonjs-patterns-barrel.cjs');
+    function validateTownHallRoom(room) { return ROOM_ID.test(room.guildId); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    namedCommonJsPatternHelper,
+    namedCommonJsPatternBarrel,
+    namedCommonJsPatternConsumer,
+  ]), {
+    ...expectedPolicies,
+    [namedCommonJsPatternHelper.file]: 1,
+  });
+  const namedCommonJsVoicePatternHelper = {
+    file: 'peer/commonjs-voice-patterns.cts',
+    text: String.raw`exports.ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const namedCommonJsVoicePatternBarrel = {
+    file: 'peer/commonjs-voice-patterns-barrel.cjs',
+    text: String.raw`module.exports.ROOM_ID = require('./commonjs-voice-patterns.cjs').ROOM_ID;`,
+  };
+  const namedCommonJsVoicePatternConsumer = {
+    file: 'peer/commonjs-voice-pattern-voice-room.cjs',
+    text: String.raw`const { ROOM_ID } = require('./commonjs-voice-patterns-barrel.cjs');
+    function inspectVoiceRoom(room) { return ROOM_ID.test(room.name); }`,
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    namedCommonJsVoicePatternHelper,
+    namedCommonJsVoicePatternBarrel,
+    namedCommonJsVoicePatternConsumer,
+  ]), expectedPolicies);
   const callHelperRoom = {
     file: 'peer/call-helper-room.ts',
     text: String.raw`function validateGuildId(value) { return /^\d{1,21}$/.test(value); }
@@ -3479,6 +3587,44 @@ test('room policy inventory records only town-hall room validators', () => {
     'isTownHallRoom',
     [commonJsTownHallBarrelFixture],
   ), 1);
+  const namedCommonJsTownHallBarrelFixture = createSourceFile(
+    'peer/named-town-hall-plan-barrel.cjs',
+    String.raw`exports.isTownHallRoom = require('./town-hall-plan').isTownHallRoom;`);
+  const namedCommonJsTownHallBarrelConsumerFixture = createSourceFile(
+    'peer/named-commonjs-town-hall-barrel-consumer.cjs',
+    String.raw`const { isTownHallRoom: roomGuard } = require('./named-town-hall-plan-barrel.cjs');
+    roomGuard({});`);
+  assert.equal(countIdentifierReferences(namedCommonJsTownHallBarrelConsumerFixture, 'isTownHallRoom', [
+    namedCommonJsTownHallBarrelFixture,
+    namedCommonJsTownHallBarrelConsumerFixture,
+  ]), 1);
+  const unrelatedNamedCommonJsBarrelFixture = createSourceFile(
+    'peer/unrelated-named-town-hall-plan-barrel.cjs',
+    String.raw`module.exports.isTownHallRoom = require('./voice-room').isTownHallRoom;`);
+  const unrelatedNamedCommonJsBarrelConsumerFixture = createSourceFile(
+    'peer/unrelated-named-commonjs-barrel-consumer.cjs',
+    String.raw`const { isTownHallRoom: roomGuard } = require('./unrelated-named-town-hall-plan-barrel.cjs');
+    roomGuard({});`);
+  assert.equal(countIdentifierReferences(
+    unrelatedNamedCommonJsBarrelConsumerFixture,
+    'isTownHallRoom',
+    [unrelatedNamedCommonJsBarrelFixture, unrelatedNamedCommonJsBarrelConsumerFixture],
+  ), 0);
+  const shadowedNamedCommonJsBarrelFixture = createSourceFile(
+    'peer/shadowed-named-commonjs-barrel.cjs',
+    String.raw`const module = {};
+    module.exports.isTownHallRoom = require('./town-hall-plan').isTownHallRoom;
+    const exports = {};
+    exports.isTownHallRoom = require('./town-hall-plan').isTownHallRoom;`);
+  const shadowedNamedCommonJsBarrelConsumerFixture = createSourceFile(
+    'peer/shadowed-named-commonjs-barrel-consumer.cjs',
+    String.raw`const { isTownHallRoom: roomGuard } = require('./shadowed-named-commonjs-barrel.cjs');
+    roomGuard({});`);
+  assert.equal(countIdentifierReferences(
+    shadowedNamedCommonJsBarrelConsumerFixture,
+    'isTownHallRoom',
+    [shadowedNamedCommonJsBarrelFixture, shadowedNamedCommonJsBarrelConsumerFixture],
+  ), 0);
   const unrelatedCommonJsBarrelFixture = ts.createSourceFile(
     'peer/unrelated-town-hall-plan-barrel.cjs',
     String.raw`module.exports = require('./voice-room');`,

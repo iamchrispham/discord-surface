@@ -46,7 +46,7 @@ function collectBindings(sourceFile) {
     } else if (ts.isFunctionDeclaration(node) && node.name) {
       addPattern(node.name, node, nearestScope(node));
     } else if (ts.isFunctionExpression(node) && node.name) {
-      addPattern(node.name, node, nearestScope(node));
+      addPattern(node.name, node, node);
     } else if (ts.isClassDeclaration(node) && node.name) {
       addPattern(node.name, node, nearestScope(node));
     } else if (ts.isParameter(node)) {
@@ -159,20 +159,91 @@ function resolveSourceFile(sourceFile, specifier, sourceFiles) {
   return candidates.map(candidate => sourcesByPath.get(candidate)).find(Boolean) || null;
 }
 
+function commonJsPropertyKey(expression) {
+  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+  if (ts.isElementAccessExpression(expression) && expression.argumentExpression &&
+      ts.isStringLiteralLike(expression.argumentExpression)) {
+    return expression.argumentExpression.text;
+  }
+  return null;
+}
+
+function commonJsExportTarget(expression) {
+  const property = commonJsPropertyKey(expression);
+  if (property === null) return null;
+  if (ts.isIdentifier(expression.expression) && expression.expression.text === 'exports') {
+    return property;
+  }
+  const object = expression.expression;
+  if ((ts.isPropertyAccessExpression(object) || ts.isElementAccessExpression(object)) &&
+      ts.isIdentifier(object.expression) && object.expression.text === 'module' &&
+      commonJsPropertyKey(object) === 'exports') {
+    return property;
+  }
+  if (ts.isIdentifier(expression.expression) &&
+      expression.expression.text === 'module' && property === 'exports') {
+    return 'default';
+  }
+  return null;
+}
+
+function commonJsExportIdentifier(expression) {
+  let current = expression;
+  while (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+    current = current.expression;
+  }
+  return ts.isIdentifier(current) ? current : null;
+}
+
+function commonJsRequireReexport(expression) {
+  let requireCall = expression;
+  let importedName = 'default';
+  if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+    importedName = commonJsPropertyKey(expression);
+    requireCall = expression.expression;
+    if (importedName === null) return null;
+  }
+  if (!ts.isCallExpression(requireCall) || !ts.isIdentifier(requireCall.expression) ||
+      requireCall.expression.text !== 'require' || requireCall.arguments.length !== 1 ||
+      !ts.isStringLiteralLike(requireCall.arguments[0])) {
+    return null;
+  }
+  return {
+    specifier: requireCall.arguments[0].text,
+    importedName,
+    requireIdentifier: requireCall.expression,
+  };
+}
+
+function commonJsExportAssignment(node) {
+  if (!ts.isBinaryExpression(node) ||
+      node.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return null;
+  const target = commonJsExportTarget(node.left);
+  if (target === null) return null;
+  return {
+    target,
+    exportIdentifier: commonJsExportIdentifier(node.left),
+    right: node.right,
+    reExport: commonJsRequireReexport(node.right),
+  };
+}
+
 function reExportBindings(sourceFile, exportedName) {
   const bindings = collectBindings(sourceFile);
   const reExports = [];
   for (const statement of sourceFile.statements) {
-    if (ts.isExpressionStatement(statement) && ts.isBinaryExpression(statement.expression) &&
-        statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-      const { left, right } = statement.expression;
-      if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
-          ts.isIdentifier(left.expression) && left.expression.text === 'module' &&
-          !resolveBinding(left.expression, bindings) && ts.isCallExpression(right) &&
-          ts.isIdentifier(right.expression) && right.expression.text === 'require' &&
-          !resolveBinding(right.expression, bindings) && right.arguments.length === 1 &&
-          ts.isStringLiteralLike(right.arguments[0])) {
-        reExports.push({ specifier: right.arguments[0].text, importedName: exportedName });
+    if (ts.isExpressionStatement(statement)) {
+      const assignment = commonJsExportAssignment(statement.expression);
+      const reExport = assignment?.reExport;
+      if (reExport && assignment.exportIdentifier &&
+          !resolveBinding(assignment.exportIdentifier, bindings) &&
+          !resolveBinding(reExport.requireIdentifier, bindings) &&
+          ((assignment.target === 'default' && reExport.importedName === 'default') ||
+            assignment.target === exportedName)) {
+        reExports.push({
+          specifier: reExport.specifier,
+          importedName: assignment.target === 'default' ? exportedName : reExport.importedName,
+        });
       }
       continue;
     }
@@ -344,12 +415,30 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
       binding.importedName,
       sourceFiles,
     ));
+  const namespaceAliases = [];
   let count = 0;
   const visit = node => {
-    if (target && ts.isIdentifier(node) && node.text === target.name &&
-        node !== target.declaration.name && isSemanticIdentifierReference(node) &&
-        resolveBinding(node, bindings) === target.declaration) {
-      count += 1;
+    if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) &&
+        node.initializer && ts.isIdentifier(node.initializer) &&
+        namespaces.some(binding =>
+          resolveBinding(node.initializer, bindings) === binding.declaration)) {
+      for (const element of node.name.elements) {
+        const property = element.propertyName || element.name;
+        const propertyName = ts.isIdentifier(property) || ts.isStringLiteralLike(property)
+          ? property.text
+          : null;
+        if (propertyName !== name || !ts.isIdentifier(element.name)) continue;
+        const alias = bindings.find(binding => binding.declaration === element);
+        if (alias) namespaceAliases.push(alias);
+      }
+    }
+    if (ts.isIdentifier(node) && isSemanticIdentifierReference(node)) {
+      const targetReference = target && node.text === target.name &&
+        node !== target.declaration.name &&
+        resolveBinding(node, bindings) === target.declaration;
+      const namespaceAliasReference = namespaceAliases.some(alias =>
+        node !== alias.declaration.name && resolveBinding(node, bindings) === alias.declaration);
+      if (targetReference || namespaceAliasReference) count += 1;
     }
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const property = ts.isPropertyAccessExpression(node)
@@ -375,4 +464,4 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
   return count;
 }
 
-module.exports = { countIdentifierReferences };
+module.exports = { countIdentifierReferences, commonJsExportAssignment };
