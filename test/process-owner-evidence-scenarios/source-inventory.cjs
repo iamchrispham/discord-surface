@@ -1293,8 +1293,15 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         }
         return result;
       }
-      if (operator === ts.SyntaxKind.AmpersandAmpersandToken ||
-        operator === ts.SyntaxKind.BarBarEqualsToken ||
+      if (operator === ts.SyntaxKind.AmpersandAmpersandToken) {
+        const condition = staticTruthiness(node.left, seen);
+        if (condition === false) return resolveSet(node.left, seen);
+        if (condition === true) return resolveSet(node.right, seen);
+        const union = resolveSet(node.left, seen);
+        for (const atom of resolveSet(node.right, seen)) union.add(atom);
+        return union;
+      }
+      if (operator === ts.SyntaxKind.BarBarEqualsToken ||
         operator === ts.SyntaxKind.QuestionQuestionEqualsToken ||
         operator === ts.SyntaxKind.AmpersandAmpersandEqualsToken) {
         const union = resolveSet(node.left, seen);
@@ -1426,13 +1433,19 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     }
 
     if (ts.isCallExpression(node)) {
-      if (node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-        ts.isStringLiteral(node.arguments[0])) {
-        const moduleName = node.arguments[0].text;
-        if (moduleName === 'node:process' || moduleName === 'process') {
-          return new Set([PROCESS_OBJECT, PROCESS_NAMESPACE]);
+      if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        const moduleNames = resolveSet(node.arguments[0], seen);
+        const result = new Set();
+        for (const moduleName of moduleNames) {
+          if (typeof moduleName !== 'string') continue;
+          if (moduleName === 'node:process' || moduleName === 'process') {
+            result.add(PROCESS_OBJECT);
+            result.add(PROCESS_NAMESPACE);
+          } else if (moduleResolver) {
+            for (const atom of moduleResolver.resolveRequire(virtualPath, moduleName)) result.add(atom);
+          }
         }
-        if (moduleResolver) return moduleResolver.resolveRequire(virtualPath, moduleName);
+        return result;
       }
       if (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'bind') {
         const receiver = resolveSet(node.expression.expression, seen);
@@ -2249,15 +2262,39 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       hasAtom(staticValue(callee.expression), PROCESS_OBJECT);
   }
 
-  function isNativePromiseThen(callee) {
-    if (!ts.isPropertyAccessExpression(callee) || callee.name.text !== 'then' ||
-      !ts.isCallExpression(callee.expression) ||
-      !ts.isPropertyAccessExpression(callee.expression.expression) ||
-      callee.expression.expression.name.text !== 'resolve') return false;
-    const promise = callee.expression.expression.expression;
+  function isUnshadowedNativePromiseResolve(expression) {
+    if (!ts.isCallExpression(expression) ||
+      !ts.isPropertyAccessExpression(expression.expression) ||
+      expression.expression.name.text !== 'resolve') return false;
+    const promise = expression.expression.expression;
     if (!ts.isIdentifier(promise) || promise.text !== 'Promise') return false;
     return !checker.getSymbolAtLocation(promise)?.declarations?.some(declaration =>
       declaration.getSourceFile() === sourceFile && !isAmbientDeclaration(declaration));
+  }
+
+  function isNativePromiseResult(expression, visited = new Set()) {
+    if (ts.isAwaitExpression(expression)) return false;
+    const transparent = transparentExpression(expression);
+    if (transparent) return isNativePromiseResult(transparent, visited);
+    if (isUnshadowedNativePromiseResolve(expression)) return true;
+    if (!ts.isIdentifier(expression)) return false;
+    const symbol = checker.getSymbolAtLocation(expression);
+    if (!symbol || visited.has(symbol)) return false;
+    const declaration = symbolDeclaration(symbol);
+    if (!declaration || !ts.isVariableDeclaration(declaration)) return false;
+    const seen = new Set(visited).add(symbol);
+    const sources = [];
+    if (declaration.initializer) sources.push(declaration.initializer);
+    for (const assigned of assignments.get(symbol) || []) {
+      const source = assigned && assigned.source ? assigned.source : assigned;
+      if (source) sources.push(source);
+    }
+    return sources.some(source => isNativePromiseResult(source, seen));
+  }
+
+  function isNativePromiseThen(callee) {
+    return ts.isPropertyAccessExpression(callee) && callee.name.text === 'then' &&
+      isNativePromiseResult(callee.expression);
   }
 
   indexRightHandSide(sourceFile);

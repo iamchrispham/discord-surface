@@ -40,6 +40,49 @@ runFixture("let first = process.kill; let second = first; function newProbe(pid)
 runFixture("let proc = process; let target = proc; function newProbe(pid) { target.kill(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
 });
 
+test("native Promise result aliases retain callback probe identity", () => {
+runFixture("function newProbe(pid) { const pending = Promise.resolve(pid); pending.then(process.kill); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+runFixture("function newProbe(pid) { let pending; pending = Promise.resolve(pid); const alias = pending; alias.then(process.kill); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+runFixture("function newProbe(pid) { const Promise = {resolve: value => ({then: callback => callback(value)})}; const pending = Promise.resolve(pid); pending.then(process.kill); }", [], []);
+});
+
+test("logical AND excludes statically unreachable probes and keeps unknowns", () => {
+runFixture("const probe = false && process.kill || (() => true); function newProbe(pid) { probe(pid, 0); }", [], []);
+runFixture("const probe = true && process.kill; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+runFixture("const probe = condition && process.kill; function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+});
+
+test("finite dynamic import aliases preserve local module probes", () => {
+  for (const specifier of ["'./producer.mjs'", "`./producer.mjs`"]) {
+    const result = inventoryFiles({
+      "consumer.mjs": `const spec = ${specifier}; const api = await import(spec); function newProbe(pid) { api.probe(pid, 0); }`,
+      "producer.mjs": "export const probe = process.kill;"
+    });
+    assert.equal(result.kills.length, 1);
+    assert.deepEqual(result.violations, ["unclassified process probe consumer.mjs:newProbe"]);
+  }
+
+  const unresolved = inventoryFiles({
+    "consumer.mjs": "const spec = chooseModule(); const api = await import(spec); function newProbe(pid) { api.probe(pid, 0); }"
+  });
+  assert.deepEqual(unresolved.kills, []);
+  assert.deepEqual(unresolved.violations, []);
+});
+
+test("static-block probe inventory remains correct through a wrapped call", () => {
+  const probe = inventoryFiles({
+    "private-alias.js": "class Api { static { this.probe = process.kill; } } function wrapped(pid) { Api.probe(pid, 0); }"
+  });
+  assert.equal(probe.kills.length, 1);
+  assert.deepEqual(probe.violations, ["unclassified process probe private-alias.js:wrapped"]);
+
+  const ordinary = inventoryFiles({
+    "private-alias.js": "class Api { static { this.probe = () => true; } } function wrapped(pid) { Api.probe(pid, 0); }"
+  });
+  assert.deepEqual(ordinary.kills, []);
+  assert.deepEqual(ordinary.violations, []);
+});
+
 test("same-name lexical shadow of an alias is not a probe", () => {
 runFixture("let probe = process.kill; function newProbe(pid) { let probe = () => true; probe(pid, 0); }", [], []);
 runFixture("let process = { kill() {} }; function newProbe(pid) { process.kill(pid, 0); }", [], []);
