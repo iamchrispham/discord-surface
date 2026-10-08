@@ -25,8 +25,20 @@ function finiteStringValues(expression, bindings, seen = new Set()) {
   }
   if (!ts.isIdentifier(value)) return null;
   const declaration = resolveBinding(value, bindings);
-  if (!declaration || seen.has(declaration) || !ts.isVariableDeclaration(declaration)) return null;
+  if (!declaration || seen.has(declaration)) return null;
   seen.add(declaration);
+  if (ts.isParameter(declaration)) {
+    const callback = declaration.parent;
+    const everyCall = callback.parent;
+    if (callback.parameters[0] !== declaration ||
+        !ts.isCallExpression(everyCall) || everyCall.arguments[0] !== callback ||
+        !ts.isPropertyAccessExpression(everyCall.expression) ||
+        everyCall.expression.name.text !== 'every') {
+      return null;
+    }
+    return finiteStringValues(everyCall.expression.expression, bindings, seen);
+  }
+  if (!ts.isVariableDeclaration(declaration)) return null;
   if (declaration.initializer) {
     const declarationList = declaration.parent;
     if (ts.isVariableDeclarationList(declarationList) &&
@@ -1609,13 +1621,18 @@ test('room policy inventory records only town-hall room validators', () => {
   const src = path.join(PROJECT_ROOT, 'src');
   const references = {};
   const records = [];
+  const sourceFiles = [];
   for (const relative of fs.readdirSync(src, { recursive: true })) {
     if (!/\.(?:[cm]?[tj]s)$/.test(relative)) continue;
     const text = fs.readFileSync(path.join(src, relative), 'utf8');
-    records.push({ file: relative.split(path.sep).join('/'), text });
-    const ast = createSourceFile(relative, text);
-    const count = countIdentifierReferences(ast, 'isTownHallRoom');
-    if (count) references[relative.split(path.sep).join('/')] = count;
+    const file = relative.split(path.sep).join('/');
+    records.push({ file, text });
+    sourceFiles.push({ file, ast: createSourceFile(file, text) });
+  }
+  const sourceAsts = sourceFiles.map(source => source.ast);
+  for (const { file, ast } of sourceFiles) {
+    const count = countIdentifierReferences(ast, 'isTownHallRoom', sourceAsts);
+    if (count) references[file] = count;
   }
   assert.deepEqual(references, { 'peer/town-hall-plan.ts': 1, 'peer/town-hall-room-identity.ts': 1 });
   const referenceFixture = ts.createSourceFile('peer/reference-fixture.ts', String.raw`// isTownHallRoom
@@ -1755,6 +1772,33 @@ test('room policy inventory records only town-hall room validators', () => {
     ...records,
     mappedRuntimeCtsHelper,
     mappedRuntimeCjsNegativeConsumer,
+  ]), expectedPolicies);
+  const extensionMtsGuardHelper = {
+    file: 'peer/runtime-extension-mts-helper.mts',
+    text: String.raw`export default function validateGuildId(value) { return /^\d{1,21}$/.test(value); }`
+  };
+  const extensionMjsGuardConsumer = {
+    file: 'peer/runtime-extension-mjs-consumer.mjs',
+    text: String.raw`import validateGuildId from './runtime-extension-mts-helper.mjs';
+    function validateRoom(room) { return validateGuildId(room.guildId); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    extensionMtsGuardHelper,
+    extensionMjsGuardConsumer,
+  ]), {
+    ...expectedPolicies,
+    [extensionMtsGuardHelper.file]: 1
+  });
+  const extensionMjsNegativeConsumer = {
+    file: 'peer/runtime-extension-mjs-negative-consumer.mjs',
+    text: String.raw`import validateGuildId from './runtime-extension-mts-helper.mjs';
+    function inspectRoom(room) { return validateGuildId(room.name); }`
+  };
+  assert.deepEqual(roomDigitPolicies([
+    ...records,
+    extensionMtsGuardHelper,
+    extensionMjsNegativeConsumer,
   ]), expectedPolicies);
   const mappedRuntimeJsRoomHelper = {
     file: 'peer/runtime-js-room-helper.ts',
@@ -3114,6 +3158,23 @@ test('room policy inventory records only town-hall room validators', () => {
     }`,
   };
   assert.deepEqual(roomDigitPolicies([...records, conditionalMixedRoomFields]), expectedPolicies);
+  const callbackRoomKeys = {
+    file: 'peer/callback-room-keys.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return ['guildId', 'channelId'].every(key => /^\d{1,21}$/.test(room[key]));
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, callbackRoomKeys]), {
+    ...expectedPolicies,
+    [callbackRoomKeys.file]: 1,
+  });
+  const callbackOrdinaryKeys = {
+    file: 'peer/callback-ordinary-keys.ts',
+    text: String.raw`function inspectRoom(room) {
+      return ['name', 'topic'].every(key => /^\d{1,21}$/.test(room[key]));
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([...records, callbackOrdinaryKeys]), expectedPolicies);
   const commonJsBarrelHelper = {
     file: 'peer/commonjs-barrel-room-helper.cts',
     text: String.raw`export function validateGuildId(value) { return /^\d{1,20}$/.test(value); }`,
@@ -3232,6 +3293,42 @@ test('room policy inventory records only town-hall room validators', () => {
     true,
   );
   assert.equal(countIdentifierReferences(importEqualsShadowReferenceFixture, 'isTownHallRoom'), 1);
+  const commonJsTownHallBarrelFixture = ts.createSourceFile(
+    'peer/town-hall-plan-barrel.cjs',
+    String.raw`module.exports = require('./town-hall-plan');`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const commonJsTownHallBarrelConsumerFixture = ts.createSourceFile(
+    'peer/commonjs-town-hall-barrel-consumer.cjs',
+    String.raw`const { isTownHallRoom: roomGuard } = require('./town-hall-plan-barrel.cjs');
+    function check(room) { return roomGuard(room); }`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(
+    commonJsTownHallBarrelConsumerFixture,
+    'isTownHallRoom',
+    [commonJsTownHallBarrelFixture],
+  ), 1);
+  const unrelatedCommonJsBarrelFixture = ts.createSourceFile(
+    'peer/unrelated-town-hall-plan-barrel.cjs',
+    String.raw`module.exports = require('./voice-room');`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const unrelatedCommonJsBarrelConsumerFixture = ts.createSourceFile(
+    'peer/unrelated-commonjs-barrel-consumer.cjs',
+    String.raw`const { isTownHallRoom: roomGuard } = require('./unrelated-town-hall-plan-barrel.cjs');
+    function check(room) { return roomGuard(room); }`,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(
+    unrelatedCommonJsBarrelConsumerFixture,
+    'isTownHallRoom',
+    [unrelatedCommonJsBarrelFixture],
+  ), 0);
   const copied = records.map(record => record.file === 'peer/town-hall-room-identity.ts'
     ? { ...record, text: record.text + inline.text } : record);
   assert.notDeepEqual(roomDigitPolicies(copied), expectedPolicies);

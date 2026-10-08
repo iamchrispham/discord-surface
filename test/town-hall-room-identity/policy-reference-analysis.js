@@ -114,23 +114,86 @@ function isSemanticIdentifierReference(node) {
   return true;
 }
 
-function isTownHallPlanModule(sourceFile, specifier) {
+function sourcePath(sourceFile, sourceRoot, nodePath) {
+  return nodePath.isAbsolute(sourceFile.fileName)
+    ? sourceFile.fileName
+    : nodePath.resolve(sourceRoot, sourceFile.fileName);
+}
+
+function resolveSourceFile(sourceFile, specifier, sourceFiles) {
+  const nodePath = require('node:path');
+  const sourceRoot = nodePath.resolve(__dirname, '../../src');
+  const importerPath = sourcePath(sourceFile, sourceRoot, nodePath);
+  const modulePath = nodePath.resolve(nodePath.dirname(importerPath), specifier);
+  const extension = nodePath.extname(modulePath);
+  const extensionlessPath = extension
+    ? modulePath.slice(0, -extension.length)
+    : modulePath;
+  const sourceExtension = {
+    '.js': '.ts',
+    '.cjs': '.cts',
+    '.mjs': '.mts',
+  }[extension];
+  const candidates = [modulePath];
+  if (sourceExtension) candidates.push(extensionlessPath + sourceExtension);
+  for (const candidateExtension of ['.ts', '.cts', '.mts', '.js', '.cjs', '.mjs']) {
+    candidates.push(extensionlessPath + candidateExtension);
+  }
+  for (const candidateExtension of ['.ts', '.cts', '.mts', '.js', '.cjs', '.mjs']) {
+    candidates.push(nodePath.join(extensionlessPath, `index${candidateExtension}`));
+  }
+  const sourcesByPath = new Map(sourceFiles.map(source => [
+    sourcePath(source, sourceRoot, nodePath),
+    source,
+  ]));
+  return candidates.map(candidate => sourcesByPath.get(candidate)).find(Boolean) || null;
+}
+
+function commonJsReExportSpecifiers(sourceFile) {
+  const bindings = collectBindings(sourceFile);
+  const specifiers = [];
+  for (const statement of sourceFile.statements) {
+    if (!ts.isExpressionStatement(statement) || !ts.isBinaryExpression(statement.expression) ||
+        statement.expression.operatorToken.kind !== ts.SyntaxKind.EqualsToken) {
+      continue;
+    }
+    const { left, right } = statement.expression;
+    if (!ts.isPropertyAccessExpression(left) || left.name.text !== 'exports' ||
+        !ts.isIdentifier(left.expression) || left.expression.text !== 'module' ||
+        resolveBinding(left.expression, bindings) || !ts.isCallExpression(right) ||
+        !ts.isIdentifier(right.expression) || right.expression.text !== 'require' ||
+        resolveBinding(right.expression, bindings) || right.arguments.length !== 1 ||
+        !ts.isStringLiteralLike(right.arguments[0])) {
+      continue;
+    }
+    specifiers.push(right.arguments[0].text);
+  }
+  return specifiers;
+}
+
+function isTownHallPlanModule(sourceFile, specifier, sourceFiles = [], seen = new Set()) {
   if (typeof specifier !== 'string' || !specifier.startsWith('.')) return false;
   const nodePath = require('node:path');
   const sourceRoot = nodePath.resolve(__dirname, '../../src');
-  const sourceFilePath = nodePath.isAbsolute(sourceFile.fileName)
-    ? sourceFile.fileName
-    : nodePath.resolve(sourceRoot, sourceFile.fileName);
+  const sourceFilePath = sourcePath(sourceFile, sourceRoot, nodePath);
   const modulePath = nodePath.resolve(nodePath.dirname(sourceFilePath), specifier);
   const extension = nodePath.extname(modulePath);
   if (extension && !['.ts', '.cts', '.mts', '.js', '.cjs', '.mjs'].includes(extension)) {
     return false;
   }
   const sourceModule = extension ? modulePath.slice(0, -extension.length) : modulePath;
-  return sourceModule === nodePath.resolve(sourceRoot, 'peer/town-hall-plan');
+  if (sourceModule === nodePath.resolve(sourceRoot, 'peer/town-hall-plan')) return true;
+  if (!sourceFiles.length) return false;
+  const barrel = resolveSourceFile(sourceFile, specifier, sourceFiles);
+  if (!barrel) return false;
+  const barrelPath = sourcePath(barrel, sourceRoot, nodePath);
+  if (seen.has(barrelPath)) return false;
+  seen.add(barrelPath);
+  return commonJsReExportSpecifiers(barrel).some(reExportSpecifier =>
+    isTownHallPlanModule(barrel, reExportSpecifier, sourceFiles, seen));
 }
 
-function countIdentifierReferences(sourceFile, name) {
+function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
   const bindings = collectBindings(sourceFile);
   const imports = [];
   const visitImports = node => {
@@ -188,12 +251,12 @@ function countIdentifierReferences(sourceFile, name) {
   const importedNames = new Set(imports.map(binding => binding.name));
   const localCandidates = candidates.filter(binding => !importedNames.has(binding.name));
   const importedTarget = imports.find(binding => binding.importedName === name &&
-    !binding.namespace && isTownHallPlanModule(sourceFile, binding.specifier));
+    !binding.namespace && isTownHallPlanModule(sourceFile, binding.specifier, sourceFiles));
   const target = localCandidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&
     binding.declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) ||
     localCandidates[0] || importedTarget || null;
   const namespaces = imports.filter(binding => binding.namespace &&
-    isTownHallPlanModule(sourceFile, binding.specifier));
+    isTownHallPlanModule(sourceFile, binding.specifier, sourceFiles));
   let count = 0;
   const visit = node => {
     if (target && ts.isIdentifier(node) && node.text === target.name &&
@@ -211,7 +274,7 @@ function countIdentifierReferences(sourceFile, name) {
       const directRequire = ts.isCallExpression(receiver) &&
         ts.isIdentifier(receiver.expression) && receiver.expression.text === 'require' &&
         receiver.arguments.length === 1 && ts.isStringLiteralLike(receiver.arguments[0]) &&
-        isTownHallPlanModule(sourceFile, receiver.arguments[0].text) &&
+        isTownHallPlanModule(sourceFile, receiver.arguments[0].text, sourceFiles) &&
         !resolveBinding(receiver.expression, bindings);
       const namespaceMember = ts.isIdentifier(receiver) &&
         namespaces.some(binding => resolveBinding(receiver, bindings) === binding.declaration);
