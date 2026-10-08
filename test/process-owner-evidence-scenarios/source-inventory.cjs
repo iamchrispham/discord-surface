@@ -1386,24 +1386,72 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
           if (moduleResolver) return moduleResolver.resolveRequire(virtualPath, moduleName.text);
         }
       }
-      if (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'freeze' &&
-        ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'Object' &&
-        node.arguments[0]) {
-        const objectDeclaration = symbolDeclaration(checker.getSymbolAtLocation(node.expression.expression));
-        if (!objectDeclaration || isAmbientDeclaration(objectDeclaration)) {
-          const objectLiteralValue = (value, visited = new Set()) => {
+      if (ts.isPropertyAccessExpression(node.expression)) {
+        const receiver = node.expression.expression;
+        const methodDeclaration = symbolDeclaration(checker.getSymbolAtLocation(node.expression));
+        const methodIsBuiltin = !methodDeclaration || isAmbientDeclaration(methodDeclaration);
+        if (node.expression.name.text === 'at' && methodIsBuiltin) {
+          const finiteArrayElements = (value, visited = new Set()) => {
             const transparent = transparentExpression(value);
             const source = transparent || value;
-            if (ts.isObjectLiteralExpression(source)) {
-              return { objectLiteral: source, modulePath: virtualPath };
+            if (ts.isArrayLiteralExpression(source)) {
+              return source.elements.some(ts.isSpreadElement) ? null : [...source.elements];
             }
             if (!ts.isIdentifier(source)) return null;
             const symbol = checker.getSymbolAtLocation(source);
             if (!symbol || visited.has(symbol)) return null;
             const declaration = symbolDeclaration(symbol);
             if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return null;
-            return objectLiteralValue(declaration.initializer, new Set(visited).add(symbol));
+            return finiteArrayElements(declaration.initializer, new Set(visited).add(symbol));
           };
+          const elements = finiteArrayElements(receiver);
+          if (elements) {
+            const indexArgument = node.arguments[0];
+            const indexNode = indexArgument && (transparentExpression(indexArgument) || indexArgument);
+            const literalIndex = !indexArgument ? null
+              : ts.isNumericLiteral(indexNode) ? Number(indexNode.text)
+                : ts.isPrefixUnaryExpression(indexNode) && ts.isNumericLiteral(indexNode.operand) &&
+                  (indexNode.operator === ts.SyntaxKind.MinusToken || indexNode.operator === ts.SyntaxKind.PlusToken)
+                  ? Number(`${indexNode.operator === ts.SyntaxKind.MinusToken ? '-' : ''}${indexNode.operand.text}`)
+                  : null;
+            const indexes = !indexArgument ? [0]
+              : literalIndex !== null ? [literalIndex]
+                : [...staticValue(indexArgument, seen)].filter(Number.isInteger);
+            const candidateIndexes = indexes.length > 0 ? indexes : elements.map((_element, index) => index);
+            const result = new Set();
+            for (const index of candidateIndexes) {
+              const normalizedIndex = index < 0 ? elements.length + index : index;
+              if (normalizedIndex < 0 || normalizedIndex >= elements.length) continue;
+              for (const element of arrayElementSources(receiver, normalizedIndex, seen)) {
+                for (const atom of resolveSet(element, seen)) result.add(atom);
+              }
+            }
+            return result;
+          }
+        }
+        if (node.expression.name.text === 'assign' &&
+          ts.isIdentifier(receiver) && receiver.text === 'Object' && methodIsBuiltin) {
+          const objectDeclaration = symbolDeclaration(checker.getSymbolAtLocation(receiver));
+          if (!objectDeclaration || isAmbientDeclaration(objectDeclaration)) {
+            const target = node.arguments[0] && objectLiteralValue(node.arguments[0]);
+            const sources = node.arguments.slice(1).map(argument => objectLiteralValue(argument));
+            if (target && sources.every(Boolean)) {
+              const properties = [
+                ...target.objectLiteral.properties,
+                ...sources.flatMap(source => source.objectLiteral.properties)
+              ];
+              const objectLiteral = ts.factory.updateObjectLiteralExpression(
+                target.objectLiteral, properties, target.objectLiteral.multiLine);
+              return new Set([{ objectLiteral, modulePath: target.modulePath }]);
+            }
+          }
+        }
+      }
+      if (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'freeze' &&
+        ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'Object' &&
+        node.arguments[0]) {
+        const objectDeclaration = symbolDeclaration(checker.getSymbolAtLocation(node.expression.expression));
+        if (!objectDeclaration || isAmbientDeclaration(objectDeclaration)) {
           const frozenObject = objectLiteralValue(node.arguments[0]);
           if (frozenObject) return new Set([frozenObject]);
           return resolveSet(node.arguments[0], seen);
@@ -1682,6 +1730,20 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
 
   // Named property of a literal object origin, reached directly or through
   // identifier aliases. Static lookup only: keys must resolve to literals.
+  function objectLiteralValue(value, visited = new Set()) {
+    const transparent = transparentExpression(value);
+    const source = transparent || value;
+    if (ts.isObjectLiteralExpression(source)) {
+      return { objectLiteral: source, modulePath: virtualPath };
+    }
+    if (!ts.isIdentifier(source)) return null;
+    const symbol = checker.getSymbolAtLocation(source);
+    if (!symbol || visited.has(symbol)) return null;
+    const declaration = symbolDeclaration(symbol);
+    if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return null;
+    return objectLiteralValue(declaration.initializer, new Set(visited).add(symbol));
+  }
+
   function literalProperty(node, name, visited) {
     const found = new Set();
     if (!node || !name || visited.has(node)) return found;
@@ -2154,6 +2216,17 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       const calleeNames = accessNames(callee);
       const expandedArguments = expandCallArguments(node.arguments);
       const callArguments = expandedArguments || [];
+      if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'construct' &&
+        ts.isIdentifier(callee.expression) && callee.expression.text === 'Reflect') {
+        const reflectDeclaration = symbolDeclaration(checker.getSymbolAtLocation(callee.expression));
+        const methodDeclaration = symbolDeclaration(checker.getSymbolAtLocation(callee));
+        const reflectIsBuiltin = !reflectDeclaration || isAmbientDeclaration(reflectDeclaration);
+        const methodIsBuiltin = !methodDeclaration || isAmbientDeclaration(methodDeclaration);
+        if (reflectIsBuiltin && methodIsBuiltin && node.arguments[1] &&
+          argumentMayCarryProbe(node.arguments[1])) {
+          violations.push(`unsupported process probe ${fileName}:${owner}`);
+        }
+      }
       if (isForwardingCallbackApi(callee)) indexForwardedCallback(node, owner);
       const borrowedArrayMethod = ts.isPropertyAccessExpression(callee) &&
         (callee.name.text === 'call' || callee.name.text === 'apply') &&

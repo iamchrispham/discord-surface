@@ -401,6 +401,42 @@ test('bound probes survive named exports and pre-bound arguments are refused', (
   });
 });
 
+test('finite static call results preserve process probe provenance', () => {
+  expectProbe({
+    'use.js': 'const api = Object.assign({}, { probe: process.kill }); api.probe(1, 0);'
+  });
+  expectProbe({ 'use.js': 'const probe = [process.kill].at(0); probe(1, 0);' });
+  expectProbe({ 'use.js': 'const probe = [() => true, process.kill].at(-1); probe(1, 0);' });
+  expectOrdinary({ 'use.js': 'const probe = [process.kill, () => true].at(-1); probe(1, 0);' });
+});
+
+test('Reflect.construct refuses finite probe-bearing constructor arguments', () => {
+  expectUnsupported({
+    'use.js': 'class Check { constructor(probe, pid) { probe(pid, 0); } } Reflect.construct(Check, [process.kill, 1]);'
+  });
+  expectOrdinary({
+    'use.js': 'const Reflect = { construct() {} }; class Check { constructor(probe, pid) { probe(pid, 0); } } Reflect.construct(Check, [process.kill, 1]);'
+  });
+});
+
+test('nested writes to exported object identities resolve in consumers', () => {
+  expectProbe({
+    'producer.cjs': 'exports.api = {}; exports.api.probe = process.kill;',
+    'use.js': "require('./producer.cjs').api.probe(1, 0);"
+  });
+});
+
+test('block loop and catch bindings shadow the CommonJS exports parameter', () => {
+  const use = "(require('./producer.cjs').probe || (() => true))(1, 0);";
+  for (const producer of [
+    '{ const exports = {}; exports.probe = process.kill; }',
+    'for (let exports of [{}]) exports.probe = process.kill;',
+    'try { throw {}; } catch (exports) { exports.probe = process.kill; }'
+  ]) {
+    expectOrdinary({ 'producer.cjs': producer, 'use.js': use });
+  }
+});
+
 test('Object.assign writes to CommonJS exports retain named probes', () => {
   for (const target of ['exports', 'module.exports']) {
     expectProbe({

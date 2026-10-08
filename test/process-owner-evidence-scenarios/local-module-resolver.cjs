@@ -88,6 +88,7 @@ function createLocalModuleResolver(files) {
       exportEqualsCandidates: [],
       wildcardExports: [],
       exportAliases: new Map([['exports', initialExportObject]]),
+      nestedObjectProperties: new WeakMap(),
       initialExportObject,
       currentExportObject: initialExportObject,
       exportExpressionObjects: new WeakMap()
@@ -117,10 +118,62 @@ function createLocalModuleResolver(files) {
       module.exportEqualsCandidates.push(expression);
       addDefaultExport(expression);
     };
+    const bindingContainsExports = name => {
+      if (!name) return false;
+      if (ts.isIdentifier(name)) return name.text === 'exports';
+      if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+        return name.elements.some(element => element.name && bindingContainsExports(element.name));
+      }
+      return false;
+    };
+    const statementDeclaresExports = statement => {
+      if (ts.isVariableStatement(statement)) {
+        const declarationList = statement.declarationList;
+        return (declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
+          declarationList.declarations.some(declaration => bindingContainsExports(declaration.name));
+      }
+      return (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) ||
+        ts.isEnumDeclaration(statement)) && bindingContainsExports(statement.name);
+    };
+    const functionDeclaresVarExports = functionLike => {
+      let found = false;
+      const visit = node => {
+        if (found || node !== functionLike && ts.isFunctionLike(node)) return;
+        if (ts.isVariableDeclaration(node) && bindingContainsExports(node.name) &&
+          (node.parent.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) === 0) {
+          found = true;
+          return;
+        }
+        ts.forEachChild(node, visit);
+      };
+      if (functionLike.body) visit(functionLike.body);
+      return found;
+    };
+    const hasLexicalCommonJsExportsBinding = identifier => {
+      for (let scope = identifier.parent; scope; scope = scope.parent) {
+        if (ts.isBlock(scope) && scope.statements.some(statementDeclaresExports)) return true;
+        if (ts.isCaseBlock(scope) && scope.clauses.some(clause =>
+          clause.statements.some(statementDeclaresExports))) return true;
+        if ((ts.isForStatement(scope) || ts.isForInStatement(scope) || ts.isForOfStatement(scope)) &&
+          ts.isVariableDeclarationList(scope.initializer) &&
+          (scope.initializer.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
+          scope.initializer.declarations.some(declaration => bindingContainsExports(declaration.name))) return true;
+        if (ts.isCatchClause(scope) && scope.variableDeclaration &&
+          bindingContainsExports(scope.variableDeclaration.name)) return true;
+        if (ts.isFunctionLike(scope) && ((scope.parameters || []).some(parameter =>
+          bindingContainsExports(parameter.name)) || scope.name && bindingContainsExports(scope.name) ||
+          functionDeclaresVarExports(scope))) return true;
+        if (ts.isSourceFile(scope) && scope.statements.some(statementDeclaresExports)) return true;
+      }
+      return false;
+    };
     const exportObjectIdentity = expression => {
       const node = unwrap(expression);
       if (!node) return null;
-      if (ts.isIdentifier(node)) return module.exportAliases.get(node.text) || null;
+      if (ts.isIdentifier(node)) {
+        if (node.text === 'exports' && hasLexicalCommonJsExportsBinding(node)) return null;
+        return module.exportAliases.get(node.text) || null;
+      }
       if (ts.isPropertyAccessExpression(node)) {
         if (node.name.text === 'exports' && ts.isIdentifier(node.expression) &&
           node.expression.text === 'module') return module.currentExportObject;
@@ -170,7 +223,10 @@ function createLocalModuleResolver(files) {
       if (ts.isIdentifier(declaration.name)) {
         module.declaredBindings.add(declaration.name.text);
         addBinding(declaration.name.text, declaration.initializer);
-        recordExportAlias(declaration.name.text, declaration.initializer);
+        if (declaration.name.text !== 'exports' ||
+          !hasLexicalCommonJsExportsBinding(declaration.name)) {
+          recordExportAlias(declaration.name.text, declaration.initializer);
+        }
         if (exported) {
           // Exported bindings are live. Resolve through every recorded value,
           // including later assignments, instead of freezing the initializer.
@@ -336,7 +392,9 @@ function createLocalModuleResolver(files) {
       if (ts.isIdentifier(left)) {
         if (includedNames && !includedNames.has(left.text)) return;
         addBinding(left.text, expression.right);
-        recordExportAlias(left.text, expression.right);
+        if (left.text !== 'exports' || !hasLexicalCommonJsExportsBinding(left)) {
+          recordExportAlias(left.text, expression.right);
+        }
       } else if (ts.isArrayLiteralExpression(left) || ts.isObjectLiteralExpression(left)) {
         const recordPattern = (pattern, source, property = null) => {
           const target = unwrap(pattern);
@@ -371,6 +429,19 @@ function createLocalModuleResolver(files) {
       if (!name || !ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) return;
       const receiver = left.expression;
       if (isExportObjectExpression(receiver)) addExport(name, assignmentValue(expression.right));
+      const nestedPath = exportObjectPath(receiver);
+      if (nestedPath) {
+        for (const object of exportedObjectLiterals(nestedPath)) {
+          let properties = module.nestedObjectProperties.get(object);
+          if (!properties) {
+            properties = new Map();
+            module.nestedObjectProperties.set(object, properties);
+          }
+          const existing = properties.get(String(name));
+          if (existing) existing.push(assignmentValue(expression.right));
+          else properties.set(String(name), [assignmentValue(expression.right)]);
+        }
+      }
       if (ts.isPropertyAccessExpression(left) && left.name.text === 'exports' &&
         ts.isIdentifier(left.expression) && left.expression.text === 'module') {
         addExportEquals(assignmentValue(expression.right));
@@ -386,6 +457,55 @@ function createLocalModuleResolver(files) {
       if (replacesModuleExports) {
         module.currentExportObject = exportObjectIdentity(assignmentValue(expression.right)) || {};
       }
+    };
+    const exportObjectPath = expression => {
+      const names = [];
+      let node = unwrap(expression);
+      while (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+        const property = propertyName(node, identifier => staticPropertyValue(identifier, resolvedPath));
+        if (property === null) return null;
+        names.unshift(String(property));
+        node = unwrap(node.expression);
+      }
+      return names.length && isExportObjectExpression(node) ? names : null;
+    };
+    const objectLiteralsFor = (source, visited = new Set()) => {
+      if (!source) return [];
+      const value = unwrap(source);
+      if (ts.isObjectLiteralExpression(value)) return [value];
+      if (!ts.isIdentifier(value) || visited.has(value.text)) return [];
+      const next = new Set(visited).add(value.text);
+      return (module.bindings.get(value.text) || []).flatMap(binding => objectLiteralsFor(binding, next));
+    };
+    const propertyValuesFor = (object, propertyName, visited = new Set()) => {
+      if (visited.has(object)) return [];
+      const seen = new Set(visited).add(object);
+      const values = [];
+      for (const property of object.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          for (const source of objectLiteralsFor(property.expression)) {
+            values.push(...propertyValuesFor(source, propertyName, seen));
+          }
+          continue;
+        }
+        if (!property.name) continue;
+        const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ||
+          ts.isNumericLiteral(property.name) ? property.name.text
+          : ts.isComputedPropertyName(property.name)
+            ? staticPropertyValue(property.name.expression, resolvedPath) : null;
+        if (key !== propertyName) continue;
+        if (ts.isPropertyAssignment(property)) values.push(property.initializer);
+        else if (ts.isShorthandPropertyAssignment(property)) values.push(property.name);
+      }
+      return values;
+    };
+    const exportedObjectLiterals = names => {
+      let values = module.exports.get(names[0]) || [];
+      for (const propertyName of names.slice(1)) {
+        values = values.flatMap(value => objectLiteralsFor(value)
+          .flatMap(object => propertyValuesFor(object, propertyName)));
+      }
+      return values.flatMap(value => objectLiteralsFor(value));
     };
     const recordExportExpression = expression => {
       if (expression.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isBinaryExpression(expression.right)) {
@@ -728,6 +848,11 @@ function createLocalModuleResolver(files) {
           continue;
         }
         const value = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
+        for (const atom of evaluate(value, currentPath, seen, new Map(), bindingOverrides)) result.add(atom);
+      }
+      const ownerModule = currentPath && modules.get(path.resolve(currentPath));
+      const nestedWrites = ownerModule?.nestedObjectProperties.get(node)?.get(String(name)) || [];
+      for (const value of nestedWrites) {
         for (const atom of evaluate(value, currentPath, seen, new Map(), bindingOverrides)) result.add(atom);
       }
       return result;
