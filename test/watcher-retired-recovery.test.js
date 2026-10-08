@@ -399,6 +399,88 @@ test('concurrent retired-notice wakes queue only one successor', { timeout: 5000
   }
 });
 
+test('successor route identity must match the retired attempt at admission and use', { timeout: 5000 }, t => {
+  const replaceRoute = f => {
+    const route = {
+      ...f.route,
+      routeGeneration: f.route.routeGeneration + 1,
+      courier: {
+        ...f.route.courier,
+        nativeId: '11111111-1111-4111-8111-111111111111',
+        workspace: `${f.dir}-replacement`,
+        sessionRoot: `${f.dir}-replacement/sessions`,
+        hostId: 'replacement-host'
+      }
+    };
+    f.state.registerCourierRoute(route);
+    return route;
+  };
+
+  const changedBeforeAdmission = createWatcherFixture(t);
+  const predecessor = beginPredecessor(changedBeforeAdmission.f, changedBeforeAdmission.message);
+  retireByPublicRecovery(changedBeforeAdmission.f, changedBeforeAdmission.message, predecessor.claim);
+  replaceRoute(changedBeforeAdmission.f);
+  const rejected = duplicateBegin(changedBeforeAdmission.f, changedBeforeAdmission.message);
+  assert.equal(rejected.accepted, false);
+  assert.equal(rejected.status, 'stale');
+  assert.equal(changedBeforeAdmission.f.state.getCourierAttempt(changedBeforeAdmission.message.id).attempt.attemptId,
+    predecessor.claim.attempt.attemptId);
+
+  const changedAfterAdmission = createWatcherFixture(t);
+  const original = beginPredecessor(changedAfterAdmission.f, changedAfterAdmission.message);
+  retireByPublicRecovery(changedAfterAdmission.f, changedAfterAdmission.message, original.claim);
+  const successor = duplicateBegin(changedAfterAdmission.f, changedAfterAdmission.message);
+  assert.equal(successor.accepted, true);
+  changedAfterAdmission.f.state.claimDispatch(changedAfterAdmission.message.id);
+  const replacement = replaceRoute(changedAfterAdmission.f);
+  const authorization = changedAfterAdmission.f.state.authorizeCourierAttempt(
+    changedAfterAdmission.message.id,
+    successor.attempt.attemptId,
+    consumerInput(changedAfterAdmission.f, changedAfterAdmission.message)
+  );
+  assert.equal(authorization.authorized, false);
+  assert.equal(authorization.status, 'stale');
+  assert.throws(() => changedAfterAdmission.f.state.readCourierInput(
+    replacement.routeId,
+    changedAfterAdmission.message.id,
+    successor.attempt.attemptId,
+    changedAfterAdmission.f.route.courier.nativeId,
+    changedAfterAdmission.f.route.courier.workspace
+  ), /courier persisted input route or workspace is not current/);
+});
+
+test('explicit recovery reopens a signed successor interrupted before queue submission', { timeout: 5000 }, t => {
+  const { f, message } = createWatcherFixture(t);
+  const predecessor = beginPredecessor(f, message);
+  retireByPublicRecovery(f, message, predecessor.claim);
+  const interrupted = duplicateBegin(f, message);
+  assert.equal(interrupted.accepted, true);
+  f.state.recordCourierOutcome(message.id, interrupted.attempt.attemptId, COURIER_OUTCOMES.NOT_SUBMITTED, {
+    reason: 'courier dispatch stopped before queue submission'
+  });
+
+  const repeatedWake = duplicateBegin(f, message);
+  assert.equal(repeatedWake.accepted, false);
+  assert.equal(repeatedWake.attempt.attemptId, interrupted.attempt.attemptId);
+
+  const recovery = f.state.recoverCourierAttempt(message.id, interrupted.attempt.attemptId);
+  assert.equal(recovery.retired, true);
+  const retry = duplicateBegin(f, message);
+  assert.equal(retry.accepted, true);
+  assert.notEqual(retry.attempt.attemptId, interrupted.attempt.attemptId);
+  assert.equal(retry.attempt.predecessorAttemptId, interrupted.attempt.attemptId);
+
+  const generic = createWatcherFixture(t);
+  const genericPredecessor = beginPredecessor(generic.f, generic.message);
+  retireByPublicRecovery(generic.f, generic.message, genericPredecessor.claim);
+  const genericSuccessor = duplicateBegin(generic.f, generic.message);
+  generic.f.state.recordCourierOutcome(generic.message.id, genericSuccessor.attempt.attemptId, COURIER_OUTCOMES.NOT_SUBMITTED, {
+    reason: 'courier provider has no fixed queue boundary'
+  });
+  assert.throws(() => generic.f.state.recoverCourierAttempt(generic.message.id, genericSuccessor.attempt.attemptId),
+    /courier recovery refused: not_submitted/);
+});
+
 test('successor admission preserves route and acknowledgment fences and refuses prompt overflow', { timeout: 5000 }, t => {
   const revoked = createWatcherFixture(t);
   const predecessor = beginPredecessor(revoked.f, revoked.message);

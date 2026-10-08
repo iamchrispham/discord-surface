@@ -1,7 +1,7 @@
 import { COURIER_ATTEMPT_STATES, COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_RESULT_STATUSES } from './constants';
 import { attemptId, attemptKey, createEnvelope, payloadHash, CourierPromptLimitError } from './envelope';
 import { hasCourierForwardClaim } from './forward';
-import { retiredCourierPredecessor } from './retirement';
+import { courierPredecessorRouteMatches, retiredCourierPredecessor } from './retirement';
 import { findMatchingRoute, isCourierOriginAllowed, type RouteMatch } from './route';
 import type {
   CourierAttempt,
@@ -126,6 +126,12 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
         return { accepted: false, status: match.status, message, route: match.route || null };
       }
       const route = match.route as CourierRoute;
+      if (predecessorAttemptId && !courierPredecessorRouteMatches(
+        deps, state, messageId, predecessorAttemptId, route
+      )) {
+        rejection(deps, state, messageId, COURIER_RESULT_STATUSES.STALE, { routeId: route.routeId });
+        return { accepted: false, status: COURIER_RESULT_STATUSES.STALE, message, route };
+      }
       const hash = payloadHash(message, input);
       const key = attemptKey(message, route, hash, predecessorAttemptId);
       const id = attemptId(key);
@@ -181,7 +187,8 @@ export function createCourierAttemptHandlers(deps: CourierDependencies) {
       const predecessorAttemptId = record.attempt.predecessorAttemptId || null;
       if (predecessorAttemptId && (!message.watcherNotice || state.hasNativeAcknowledgment(message) ||
           hasCourierForwardClaim(state, messageId) ||
-          retiredCourierPredecessor(deps, state, messageId, record.attempt.receiptId) !== predecessorAttemptId)) {
+          retiredCourierPredecessor(deps, state, messageId, record.attempt.receiptId) !== predecessorAttemptId ||
+          !courierPredecessorRouteMatches(deps, state, messageId, predecessorAttemptId, route, record.attempt.receiptId))) {
         return { authorized: false, status: COURIER_RESULT_STATUSES.STALE, message, route, ...record };
       }
       const hash = payloadHash(message, input);

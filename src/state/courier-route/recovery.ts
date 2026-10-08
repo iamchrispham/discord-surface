@@ -78,6 +78,14 @@ function needsRetryConfirmation(state: RecoveryState, message: CourierMessage, a
     !retiredByRecovery(state, message.id, Number(attempt.attempt.receiptId), attempt.attempt.attemptId, COURIER_RECOVERY_TRIGGERS.EXPLICIT));
 }
 
+const PRE_SUBMISSION_ABORT_REASON = 'courier dispatch stopped before queue submission';
+
+function interruptedSignedSuccessor(message: CourierMessage, attempt: CourierAttemptRecord): boolean {
+  return Boolean(message.watcherNotice && attempt.attempt.predecessorAttemptId &&
+    attempt.outcome?.outcome === COURIER_OUTCOMES.NOT_SUBMITTED &&
+    attempt.outcome.reason === PRE_SUBMISSION_ABORT_REASON);
+}
+
 function parentIdentityMatches(message: CourierMessage, attempt: CourierAttemptRecord): boolean {
   return attempt.attempt.parent?.guildId === message.guildId &&
     attempt.attempt.parent?.channelId === message.channelId &&
@@ -118,7 +126,9 @@ function recoveryReason(
     message.state === deps.MESSAGE_STATES.SUBMITTED;
   const guardRefusedCustody = message.state === deps.MESSAGE_STATES.ACCEPTED &&
     isConfirmedCourierGuardRefusal(attempt.outcome);
-  if (!submittedCustody && !guardRefusedCustody) return COURIER_RECOVERY_REASONS.NOT_SUBMITTED;
+  const interruptedSuccessorCustody = message.state === deps.MESSAGE_STATES.ACCEPTED &&
+    interruptedSignedSuccessor(message, attempt);
+  if (!submittedCustody && !guardRefusedCustody && !interruptedSuccessorCustody) return COURIER_RECOVERY_REASONS.NOT_SUBMITTED;
   return COURIER_RECOVERY_REASONS.ELIGIBLE;
 }
 

@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { COURIER_OUTCOMES, COURIER_RECEIPT_KINDS, COURIER_ROUTE_STATES } from './constants';
 import { attemptId, attemptKey, createEnvelope, payloadHash } from './envelope';
-import { retiredCourierPredecessor } from './retirement';
+import { courierPredecessorRouteMatches, retiredCourierPredecessor } from './retirement';
 import { findMatchingRoute, getRoute } from './route';
 import type {
   CourierAttemptRecord,
@@ -112,6 +112,7 @@ export function validatePersistedForwardEligibility(
   const predecessorAttemptId = current.attempt.predecessorAttemptId || null;
   if (predecessorAttemptId && (!message.watcherNotice ||
       retiredCourierPredecessor(deps, state, messageId, attemptReceiptId) !== predecessorAttemptId ||
+      !courierPredecessorRouteMatches(deps, state, messageId, predecessorAttemptId, route, attemptReceiptId) ||
       hasCourierForwardClaim(state, messageId))) {
     throw new deps.BindingError('courier successor is not eligible for forwarding');
   }

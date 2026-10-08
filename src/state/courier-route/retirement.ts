@@ -1,5 +1,31 @@
 import { COURIER_RECEIPT_KINDS, COURIER_RECOVERY_SOURCES, COURIER_RECOVERY_TRIGGERS } from './constants';
-import type { CourierDependencies, CourierState, SqlRow } from './types';
+import type { CourierDependencies, CourierRoute, CourierState, SqlRow } from './types';
+
+export function courierPredecessorRouteMatches(
+  deps: CourierDependencies,
+  state: CourierState,
+  messageId: string,
+  predecessorAttemptId: string,
+  route: CourierRoute,
+  beforeReceiptId = Number.MAX_SAFE_INTEGER
+): boolean {
+  const row = state.db.prepare(`SELECT detail FROM receipts WHERE kind=?
+    AND discord_id=? AND id<? ORDER BY id DESC LIMIT 1`)
+    .get(COURIER_RECEIPT_KINDS.ATTEMPT, messageId, beforeReceiptId) as SqlRow | undefined;
+  const attempt = deps.parseJson(row?.detail, null);
+  const predecessorRoute = attempt?.route;
+  const predecessorCourier = attempt?.courier;
+  const selectedCourier = route.courier;
+  return attempt?.attemptId === predecessorAttemptId &&
+    predecessorRoute?.routeId === route.routeId &&
+    predecessorRoute?.routeGeneration === route.routeGeneration &&
+    predecessorCourier?.provider === selectedCourier.provider &&
+    predecessorCourier?.nativeId === selectedCourier.nativeId &&
+    predecessorCourier?.workspace === selectedCourier.workspace &&
+    (predecessorCourier?.sessionRoot || null) === (selectedCourier.sessionRoot || null) &&
+    predecessorCourier?.recipientThreadId === selectedCourier.recipientThreadId &&
+    (predecessorCourier?.hostId || null) === (selectedCourier.hostId || null);
+}
 
 export function retiredCourierPredecessor(
   deps: CourierDependencies,
