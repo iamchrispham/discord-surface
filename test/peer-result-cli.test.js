@@ -237,6 +237,7 @@ function createNetworkTrap(f) {
       const receipt = process.env.PEER_RESULT_TEST_INSPECTOR_RECEIPT;
       const workerMarker = process.env.PEER_RESULT_TEST_INSPECTOR_WORKER_MARKER;
       const attemptMarker = process.env.PEER_RESULT_TEST_INSPECTOR_ATTEMPT_MARKER;
+      const stageMarker = attemptMarker + '.release';
       const findings = [];
       const evaluate = async expression => {
         const response = await session.post('Runtime.evaluate', { expression });
@@ -273,14 +274,15 @@ function createNetworkTrap(f) {
         if (typeof process.execve === 'function' && !(await wrapperHasScope('execve', 'processExecve'))) {
           throw new Error('execve [[Scopes]] did not expose processExecve');
         }
-        const workerData = { transport: 'simulated', workerMarker, attemptMarker };
+        const workerData = { transport: 'simulated', workerMarker, attemptMarker, stageMarker };
         const workerOptions = { eval: true, env: {}, workerData };
         const workerSource = [
           "const fs=require('node:fs');",
           "const {workerData}=require('node:worker_threads');",
+          "const stageWait=new Int32Array(new SharedArrayBuffer(4));",
           "fs.writeFileSync(workerData.workerMarker,'executed');",
-          "const deadline=setTimeout(()=>{fs.writeFileSync(workerData.attemptMarker,'deadline');process.exit(124)},1200);",
-          "const simulatedTransport={connect(port,host){if(workerData.transport!=='simulated')throw new Error('simulated transport required');const attempt={transport:workerData.transport,operation:'connect',port,host};fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state:'attempted'}));return{on(event,callback){if(event==='error'){queueMicrotask(()=>{const error=Object.assign(new Error('simulated transport error'),{code:'SIMULATED'});fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state:'error',code:error.code}));callback(error)})}return this},destroy(){}}}};",
+          "const deadline=setTimeout(()=>{fs.writeFileSync(workerData.attemptMarker,JSON.stringify({transport:'simulated',operation:'connect',port:9,host:'127.0.0.1',state:'deadline'}));process.exit(124)},1200);",
+          "const simulatedTransport={connect(port,host){if(workerData.transport!=='simulated')throw new Error('simulated transport required');const attempt={transport:workerData.transport,operation:'connect',port,host};fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state:'attempted'}));while(!fs.existsSync(workerData.stageMarker))Atomics.wait(stageWait,0,0,10);return{on(event,callback){if(event==='error'){queueMicrotask(()=>{const error=Object.assign(new Error('simulated transport error'),{code:'SIMULATED'});fs.writeFileSync(workerData.attemptMarker,JSON.stringify({...attempt,state:'error',code:error.code}));callback(error)})}return this},destroy(){}}}};",
           "try{const socket=simulatedTransport.connect(9,'127.0.0.1');",
           "socket.on('connect',()=>{clearTimeout(deadline);socket.destroy();process.exit(0)});",
           "socket.on('error',error=>{clearTimeout(deadline);process.exit(error.code==='SIMULATED'?0:1)})}",
@@ -297,8 +299,22 @@ function createNetworkTrap(f) {
       }
       const wait = new Int32Array(new SharedArrayBuffer(4));
       const deadline = Date.now() + 1800;
-      while (!fs.existsSync(attemptMarker) && Date.now() < deadline) Atomics.wait(wait, 0, 0, 10);
-      if (!fs.existsSync(attemptMarker)) throw new Error('inspector worker did not reach the loopback connect call');
+      let terminalAttempt = null;
+      let workerReleased = false;
+      while (!terminalAttempt && Date.now() < deadline) {
+        let attempt;
+        try {
+          attempt = JSON.parse(fs.readFileSync(attemptMarker, 'utf8'));
+        } catch {}
+        if (attempt && attempt.state === 'attempted' && !workerReleased) {
+          fs.writeFileSync(stageMarker, 'released');
+          workerReleased = true;
+        }
+        if (attempt && attempt.state === 'deadline') throw new Error('inspector worker reached its deadline before the simulated error');
+        if (attempt && attempt.state === 'error' && attempt.code === 'SIMULATED') terminalAttempt = attempt;
+        if (!terminalAttempt) Atomics.wait(wait, 0, 0, 10);
+      }
+      if (!terminalAttempt) throw new Error('inspector worker did not publish a terminal simulated connect error');
       fs.writeFileSync(receipt, JSON.stringify(findings));
     };
 
