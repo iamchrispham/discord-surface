@@ -159,9 +159,167 @@ function createNetworkTrap(f) {
       return spawnSync.call(this, addNetworkTrap(options));
     };
 
+    globalThis.__peerResultInspectorTargets = {
+      worker: workerThreads.Worker,
+      execve: process.execve,
+      spawn: processWrap.Process.prototype.spawn,
+      spawnSync: spawnSyncBinding.spawn
+    };
+    const originalProcessBinding = process.binding;
+    const inspectorCoverage = { node: process.versions.node, modules: [], binding: { status: 'unsupported', constructors: [] } };
+    try {
+      const binding = originalProcessBinding.call(process, 'inspector');
+      inspectorCoverage.binding = {
+        status: 'available',
+        constructors: ['Connection', 'MainThreadConnection'].map(name => ({
+          name, available: typeof binding[name] === 'function'
+        }))
+      };
+    } catch (error) {
+      inspectorCoverage.binding = { status: 'unsupported', reason: error.code || error.name, constructors: [] };
+    }
+    const disableInspectorGuard = process.env.PEER_RESULT_TEST_DISABLE_INSPECTOR_GUARD === '1';
+    const rejectInspectorAccess = blocked('node:inspector');
+    const inspectorModuleNames = ['inspector', 'node:inspector', 'inspector/promises', 'node:inspector/promises'];
+    for (const moduleName of inspectorModuleNames) {
+      let inspectorApi;
+      try {
+        inspectorApi = require(moduleName);
+      } catch (error) {
+        inspectorCoverage.modules.push({ module: moduleName, status: 'unsupported', reason: error.code || error.name, methods: [] });
+        continue;
+      }
+      const Session = inspectorApi.Session;
+      if (typeof Session !== 'function' || !Session.prototype) {
+        inspectorCoverage.modules.push({ module: moduleName, status: 'unsupported', reason: 'Session export missing', methods: [] });
+        continue;
+      }
+      const methodOwners = new Map();
+      for (let prototype = Session.prototype; prototype && prototype !== Object.prototype; prototype = Object.getPrototypeOf(prototype)) {
+        for (const name of Object.getOwnPropertyNames(prototype)) {
+          if (name.startsWith('connect') && typeof prototype[name] === 'function') methodOwners.set(name, prototype);
+        }
+      }
+      const methods = [...methodOwners.keys()];
+      const unsupportedMethods = ['connect', 'connectToMainThread'].filter(name => !methodOwners.has(name));
+      const guardedMethods = [];
+      if (!disableInspectorGuard) {
+        for (const [method, owner] of methodOwners) {
+          owner[method] = rejectInspectorAccess;
+          guardedMethods.push(method);
+        }
+        inspectorApi.Session = new Proxy(Session, {
+          construct() { return rejectInspectorAccess(); },
+          apply() { return rejectInspectorAccess(); }
+        });
+      }
+      inspectorCoverage.modules.push({
+        module: moduleName,
+        status: 'available',
+        methods,
+        unsupportedMethods,
+        guardedMethods
+      });
+    }
+    if (!disableInspectorGuard) {
+      process.binding = function(name, ...args) {
+        if (name === 'inspector') return rejectInspectorAccess();
+        return Reflect.apply(originalProcessBinding, this, [name, ...args]);
+      };
+    }
+    if (process.env.PEER_RESULT_TEST_INSPECTOR_CENSUS_FILE) {
+      fs.writeFileSync(process.env.PEER_RESULT_TEST_INSPECTOR_CENSUS_FILE, JSON.stringify(inspectorCoverage));
+    }
+
+    const runInspectorControl = async () => {
+      const inspector = require('node:inspector/promises');
+      const session = new inspector.Session();
+      const receipt = process.env.PEER_RESULT_TEST_INSPECTOR_RECEIPT;
+      const workerMarker = process.env.PEER_RESULT_TEST_INSPECTOR_WORKER_MARKER;
+      const attemptMarker = process.env.PEER_RESULT_TEST_INSPECTOR_ATTEMPT_MARKER;
+      const findings = [];
+      const evaluate = async expression => {
+        const response = await session.post('Runtime.evaluate', { expression });
+        if (response.exceptionDetails) throw new Error('inspector evaluate failed');
+        return response.result;
+      };
+      const properties = async objectId => session.post('Runtime.getProperties', { objectId, ownProperties: true });
+      const wrapperHasScope = async (name, bindingName) => {
+        const wrapper = await evaluate('globalThis.__peerResultInspectorTargets.' + name);
+        if (!wrapper.objectId) return false;
+        const details = await properties(wrapper.objectId);
+        const scopes = (details.internalProperties || []).find(item => item.name === '[[Scopes]]');
+        if (!scopes || !scopes.value.objectId) return false;
+        const scopeList = await properties(scopes.value.objectId);
+        for (const scope of scopeList.result.filter(item => /^\\d+$/.test(item.name))) {
+          if (!scope.value.objectId) continue;
+          const bindings = await properties(scope.value.objectId);
+          if (bindings.result.some(item => item.name === bindingName)) return true;
+        }
+        return false;
+      };
+      session.connect();
+      try {
+        const worker = await evaluate('globalThis.__peerResultInspectorTargets.worker');
+        const workerDetails = await properties(worker.objectId);
+        const originalWorker = (workerDetails.internalProperties || []).find(item => item.name === '[[Target]]');
+        findings.push({ site: 'Worker', reachable: Boolean(originalWorker && originalWorker.value.objectId) });
+        findings.push({ site: 'execve', reachable: await wrapperHasScope('execve', 'processExecve'), supported: typeof process.execve === 'function' });
+        findings.push({ site: 'spawn', reachable: await wrapperHasScope('spawn', 'processSpawn'), supported: true });
+        findings.push({ site: 'spawn_sync', reachable: await wrapperHasScope('spawnSync', 'spawnSync'), supported: true });
+        if (!originalWorker || !originalWorker.value.objectId) throw new Error('Worker [[Target]] was not reachable');
+        if (!(await wrapperHasScope('spawn', 'processSpawn'))) throw new Error('spawn [[Scopes]] did not expose processSpawn');
+        if (!(await wrapperHasScope('spawnSync', 'spawnSync'))) throw new Error('spawn_sync [[Scopes]] did not expose spawnSync');
+        if (typeof process.execve === 'function' && !(await wrapperHasScope('execve', 'processExecve'))) {
+          throw new Error('execve [[Scopes]] did not expose processExecve');
+        }
+        const workerSource = [
+          "const fs=require('node:fs');",
+          'fs.writeFileSync(' + JSON.stringify(workerMarker) + ", 'executed');",
+          "const net=require('node:net');",
+          'const deadline=setTimeout(()=>{fs.writeFileSync(' + JSON.stringify(attemptMarker) + ",'deadline');process.exit(124)},1200);",
+          "try{const socket=net.connect(9,'127.0.0.1');",
+          "socket.on('connect',()=>{fs.writeFileSync(" + JSON.stringify(attemptMarker) + ",'connected');clearTimeout(deadline);socket.destroy();process.exit(0)});",
+          "socket.on('error',error=>{fs.writeFileSync(" + JSON.stringify(attemptMarker) + ",'attempted:'+error.code);clearTimeout(deadline);process.exit(0)})}",
+          "catch(error){fs.writeFileSync(" + JSON.stringify(attemptMarker) + ",'attempted:'+error.code);clearTimeout(deadline);process.exit(0)}"
+        ].join('');
+        const started = await session.post('Runtime.callFunctionOn', {
+          objectId: originalWorker.value.objectId,
+          functionDeclaration: 'function(){ return new this(' + JSON.stringify(workerSource) + ', {eval:true, env:{}}); }',
+          returnByValue: false
+        });
+        if (started.exceptionDetails) throw new Error('Worker construction failed');
+      } finally {
+        session.disconnect();
+      }
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      const deadline = Date.now() + 1800;
+      while (!fs.existsSync(attemptMarker) && Date.now() < deadline) Atomics.wait(wait, 0, 0, 10);
+      if (!fs.existsSync(attemptMarker)) throw new Error('inspector worker did not reach the loopback connect call');
+      fs.writeFileSync(receipt, JSON.stringify(findings));
+    };
+
     const runProbe = probe => {
       const net = require('node:net');
       const probeActions = {
+        'inspector.session': () => new (require('node:inspector').Session)().connect(),
+        'inspector.promises.session': () => new (require('node:inspector/promises').Session)().connect(),
+        'inspector.connectToMainThread': () => require('node:inspector').Session.prototype.connectToMainThread.call({}),
+        'inspector.promises.connectToMainThread': () => require('node:inspector/promises').Session.prototype.connectToMainThread.call({}),
+        'inspector.binding': () => process.binding('inspector'),
+        'inspector.method': () => {
+          const moduleName = process.env.PEER_RESULT_TEST_INSPECTOR_MODULE;
+          const methodName = process.env.PEER_RESULT_TEST_INSPECTOR_METHOD;
+          const method = require(moduleName).Session.prototype[methodName];
+          if (typeof method !== 'function') throw new Error('inspector method disappeared: ' + moduleName + '.' + methodName);
+          return method.call({});
+        },
+        'inspector.control': () => {
+          runInspectorControl().then(
+            () => process.exit(0),
+            error => { console.error(error.stack || error.message); process.exit(1); }
+          );
+        },
         fetch: () => globalThis.fetch('http://127.0.0.1:8080/'),
         'http.get': () => require('node:http').get('http://127.0.0.1:9/'),
         'socket.connect': () => new net.Socket().connect(9, '127.0.0.1'),
@@ -354,6 +512,95 @@ test('public inspection is network-free and its trap catches an injected request
     assert.ok(probe.stderr.includes(`NETWORK_BLOCKED:${expected}`), probeName);
     assert.equal(fs.readFileSync(trap.marker, 'utf8'), expected, probeName);
   }
+});
+
+test('public CLI denies inspector access before closure guards and preserves ordinary reads', async t => {
+  const f = prepared(t);
+  const trap = createNetworkTrap(f);
+  const args = ['peer-result', '--provider', 'codex', '--db', f.db,
+    '--correlation-id', f.request.id];
+  const censusFile = path.join(path.dirname(f.db), 'inspector-census.json');
+  const attackReceipt = path.join(path.dirname(f.db), 'inspector-reachability.json');
+  const workerMarker = path.join(path.dirname(f.db), 'inspector-worker.txt');
+  const attemptMarker = path.join(path.dirname(f.db), 'inspector-connect-attempt.txt');
+  const nodeOptions = `--require=${JSON.stringify(trap.preload)}`;
+  const baseEnvironment = {
+    CODEX_THREAD_ID: NATIVE,
+    CODEX_SESSION_ID: NATIVE,
+    NODE_OPTIONS: nodeOptions,
+    PEER_RESULT_TEST_INSPECTOR_CENSUS_FILE: censusFile
+  };
+  const censusRun = runCli(f, args, baseEnvironment);
+  assert.equal(censusRun.status, 0, censusRun.stderr);
+  const census = JSON.parse(fs.readFileSync(censusFile, 'utf8'));
+  assert.equal(census.node, process.versions.node);
+  assert.deepEqual(census.modules.map(item => item.module), [
+    'inspector', 'node:inspector', 'inspector/promises', 'node:inspector/promises'
+  ]);
+  for (const module of census.modules) {
+    assert.equal(module.status, 'available', `${module.module} availability was not recorded`);
+    assert.ok(module.methods.includes('connect'), `${module.module} connect was not censused`);
+    assert.deepEqual(module.unsupportedMethods, [], `${module.module} is missing a supported connect entrypoint`);
+    assert.deepEqual(module.guardedMethods, module.methods, `${module.module} has an unguarded connect entrypoint`);
+  }
+  assert.ok(census.modules.every(module => module.methods.includes('connectToMainThread')),
+    'connectToMainThread must be present in the supported inspector facades');
+  assert.deepEqual(census.binding.constructors, [
+    { name: 'Connection', available: true },
+    { name: 'MainThreadConnection', available: true }
+  ]);
+
+  const reject = (probe, extra = {}) => {
+    fs.rmSync(trap.marker, { force: true });
+    const result = runCli(f, args, {
+      ...baseEnvironment,
+      PEER_RESULT_TEST_NETWORK_PROBE: probe,
+      ...extra
+    });
+    assert.equal(result.status, 1, `${probe}: ${result.stderr}`);
+    assert.ok(result.stderr.includes('NETWORK_BLOCKED:node:inspector'), `${probe}: ${result.stderr}`);
+    assert.equal(fs.readFileSync(trap.marker, 'utf8'), 'node:inspector', probe);
+    assert.equal(fs.existsSync(workerMarker), false, `${probe} executed an unguarded Worker`);
+    assert.equal(fs.existsSync(attemptMarker), false, `${probe} reached a private-loopback connect call`);
+  };
+  reject('inspector.session');
+  reject('inspector.promises.session');
+  reject('inspector.binding');
+  for (const module of census.modules) {
+    for (const method of module.methods) {
+      reject('inspector.method', {
+        PEER_RESULT_TEST_INSPECTOR_MODULE: module.module,
+        PEER_RESULT_TEST_INSPECTOR_METHOD: method
+      });
+    }
+  }
+
+  fs.rmSync(trap.marker, { force: true });
+  const causalControl = runCli(f, args, {
+    ...baseEnvironment,
+    PEER_RESULT_TEST_DISABLE_INSPECTOR_GUARD: '1',
+    PEER_RESULT_TEST_NETWORK_PROBE: 'inspector.control',
+    PEER_RESULT_TEST_INSPECTOR_RECEIPT: attackReceipt,
+    PEER_RESULT_TEST_INSPECTOR_WORKER_MARKER: workerMarker,
+    PEER_RESULT_TEST_INSPECTOR_ATTEMPT_MARKER: attemptMarker
+  });
+  assert.equal(causalControl.status, 0, causalControl.stderr);
+  assert.equal(fs.existsSync(trap.marker), false, 'disabled-guard control unexpectedly refused');
+  assert.equal(fs.readFileSync(workerMarker, 'utf8'), 'executed');
+  assert.match(fs.readFileSync(attemptMarker, 'utf8'), /^(attempted:.+|connected)$/);
+  const reachability = JSON.parse(fs.readFileSync(attackReceipt, 'utf8'));
+  assert.ok(reachability.filter(site => site.supported !== false).every(site => site.reachable));
+  assert.equal(reachability[0].site, 'Worker');
+  assert.equal(reachability[1].site, 'execve');
+  assert.equal(reachability[2].site, 'spawn');
+  assert.equal(reachability[3].site, 'spawn_sync');
+
+  fs.rmSync(trap.marker, { force: true });
+  const ordinaryRead = runCli(f, args, baseEnvironment);
+  assert.equal(ordinaryRead.status, 0, ordinaryRead.stderr);
+  const output = JSON.parse(ordinaryRead.stdout);
+  assert.equal(output.results[0].text, f.packet.text);
+  assert.equal(fs.existsSync(trap.marker), false);
 });
 
 test('public CLI refuses another caller correlation and cannot select a native UUID', t => {
