@@ -916,10 +916,13 @@ const isNegatedDeadlineCondition = (tokens, conditionStart, triggerIndex) => {
     || scanForInequality(triggerIndex + 1, 1);
 };
 
-const branchRange = (tokens, start, end, pairs) => {
+const branchRange = (tokens, start, end, pairs, allowLeadingBlockContinuation = false) => {
   if (start >= end) return { start, end, opening: null };
   if (tokens[start].value !== '{') return { start, end, opening: null };
   const closing = pairs.get(start);
+  if (allowLeadingBlockContinuation && closing !== undefined && closing < end - 1) {
+    return { start, end, opening: null };
+  }
   if (closing === undefined || closing >= end) return { start: start + 1, end, opening: start };
   return { start: start + 1, end: closing, opening: start };
 };
@@ -1216,11 +1219,12 @@ const findSwitchDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNe
   return { start, end, opening: best.opening };
 };
 
-const findFallthroughScopeEnd = (tokens, position, pairs, functionRanges) => {
+const findFallthroughScopeEnd = (tokens, position, pairs, functionRanges, crossBlockBoundaries = false) => {
   const containingFunction = functionRanges.find(range =>
     position >= range.bodyStart && position < range.bodyEnd
   );
   let end = containingFunction?.bodyEnd ?? tokens.length;
+  if (crossBlockBoundaries) return end;
   for (let opening = position - 1; opening >= 0; opening -= 1) {
     if (tokens[opening].value !== '{') continue;
     const closing = pairs.get(opening);
@@ -1232,11 +1236,23 @@ const findFallthroughScopeEnd = (tokens, position, pairs, functionRanges) => {
   return end;
 };
 
-const findFallthroughStatementsEnd = (tokens, start, end, pairs, functionRanges) => {
+const findFallthroughStatementsEnd = (
+  tokens,
+  start,
+  end,
+  pairs,
+  functionRanges,
+  crossBlockBoundaries = false
+) => {
   let cursor = start;
   while (cursor < end) {
     while (tokens[cursor]?.value === ';') cursor += 1;
-    if (cursor >= end || tokens[cursor]?.value === '}') break;
+    if (cursor >= end) break;
+    if (tokens[cursor]?.value === '}') {
+      if (!crossBlockBoundaries) break;
+      cursor += 1;
+      continue;
+    }
     const statementEnd = findControlledStatementEnd(tokens, cursor, end, pairs);
     if (statementEnd <= cursor || statementEnd > end) break;
     if (switchArmHasAbruptCompletion(tokens, cursor, statementEnd, pairs, functionRanges)) {
@@ -1320,15 +1336,16 @@ const findLoopDecision = (tokens, triggerIndex, pairs, functionRanges, aliasNega
       isNegatedDeadlineCondition(tokens, opening + 1, triggerIndex)
     ) !== aliasNegated;
     if (deadlineBranchIsNegated) {
-      const scopeEnd = findFallthroughScopeEnd(tokens, index, pairs, functionRanges);
+      const scopeEnd = findFallthroughScopeEnd(tokens, index, pairs, functionRanges, true);
       const fallthroughEnd = findFallthroughStatementsEnd(
         tokens,
         bodyEnd,
         scopeEnd,
         pairs,
-        functionRanges
+        functionRanges,
+        true
       );
-      return branchRange(tokens, bodyEnd, fallthroughEnd, pairs);
+      return branchRange(tokens, bodyEnd, fallthroughEnd, pairs, true);
     }
     return branchRange(tokens, bodyStart, bodyEnd, pairs);
   }
@@ -1345,15 +1362,16 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, al
     const negated = isNegatedDeadlineCondition(tokens, conditionStart, triggerIndex);
     const deadlineBranchIsNegated = Boolean(negated) !== aliasNegated;
     if (deadlineBranchIsNegated && alternateStart === consequentEnd) {
-      const scopeEnd = findFallthroughScopeEnd(tokens, ifDecision.start, pairs, functionRanges);
+      const scopeEnd = findFallthroughScopeEnd(tokens, ifDecision.start, pairs, functionRanges, true);
       const fallthroughEnd = findFallthroughStatementsEnd(
         tokens,
         consequentEnd,
         scopeEnd,
         pairs,
-        functionRanges
+        functionRanges,
+        true
       );
-      return branchRange(tokens, consequentEnd, fallthroughEnd, pairs);
+      return branchRange(tokens, consequentEnd, fallthroughEnd, pairs, true);
     }
     const selectedStart = deadlineBranchIsNegated ? alternateStart : consequentStart;
     const selectedEnd = deadlineBranchIsNegated
@@ -1530,7 +1548,7 @@ const boundBoundaryWriterStateArgument = (tokens, start, end, pairs, aliases = n
       stateArgument: Math.max(0, descriptor.stateArgument - boundArguments.length),
       stateWasPrebound,
       preboundGap: stateWasPrebound
-        && valueHasGapOutcome(tokens, preboundState[0], preboundState[1], pairs, aliases)
+        && valueHasGapOutcome(tokens, preboundState[0], preboundState[1], pairs, aliases, new Set(), false, false)
     };
   }
   return undefined;
@@ -1772,6 +1790,11 @@ const isUnshadowedIdentifierAt = (tokens, name, index, pairs) => {
   return !resolveVisibleBinding(lexicalBindings, name, index, lexicalScopes);
 };
 
+const isNativePromiseMethodAt = (tokens, index, method, pairs) => tokens[index]?.value === 'Promise'
+  && tokens[index + 1]?.value === '.'
+  && tokens[index + 2]?.value === method
+  && isUnshadowedIdentifierAt(tokens, 'Promise', index, pairs);
+
 const valueHasGapOutcome = (
   tokens,
   start,
@@ -1779,7 +1802,8 @@ const valueHasGapOutcome = (
   pairs,
   aliases = new Set(),
   resolvingArrays = new Set(),
-  allowPromiseRace = false
+  allowPromiseRace = false,
+  allowPromiseResolution = true
 ) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
   if (expression.start >= expression.end) return false;
@@ -1796,12 +1820,13 @@ const valueHasGapOutcome = (
     pairs,
     aliases,
     resolvingArrays,
-    allowPromiseRace
+    allowPromiseRace,
+    allowPromiseResolution
   );
   const commaSegments = topLevelSegments(tokens, expression.start, expression.end);
   if (commaSegments.length > 1) {
     const [lastStart, lastEnd] = commaSegments[commaSegments.length - 1];
-    return valueHasGapOutcome(tokens, lastStart, lastEnd, pairs, aliases, resolvingArrays, allowPromiseRace);
+    return valueHasGapOutcome(tokens, lastStart, lastEnd, pairs, aliases, resolvingArrays, allowPromiseRace, allowPromiseResolution);
   }
   const assignmentIndex = topLevelToken(tokens, expression.start, expression.end, '=');
   if (assignmentIndex >= 0) {
@@ -1814,7 +1839,8 @@ const valueHasGapOutcome = (
       pairs,
       aliases,
       resolvingArrays,
-      allowPromiseRace
+      allowPromiseRace,
+      allowPromiseResolution
     );
   }
   if (tokens[expression.start]?.value === 'await') {
@@ -1825,7 +1851,8 @@ const valueHasGapOutcome = (
       pairs,
       aliases,
       resolvingArrays,
-      allowPromiseRace
+      allowPromiseRace,
+      allowPromiseResolution
     );
   }
   if (['void', 'typeof', '!', '~', '+', '-', 'delete'].includes(tokens[expression.start]?.value)) return false;
@@ -1845,24 +1872,21 @@ const valueHasGapOutcome = (
       pairs,
       aliases,
       nextResolvingArrays,
-      allowPromiseRace
+      allowPromiseRace,
+      allowPromiseResolution
     );
   }
   if (isGapMemberExpression(tokens, expression.start, expression.end)) return true;
   if (valueHasGap(tokens, expression.start, expression.end, pairs, aliases)) return true;
 
   const wrapperStart = expression.start;
-  const isPromiseResolve = tokens[wrapperStart]?.value === 'Promise'
-    && tokens[wrapperStart + 1]?.value === '.'
-    && tokens[wrapperStart + 2]?.value === 'resolve';
+  const isPromiseResolve = allowPromiseResolution
+    && isNativePromiseMethodAt(tokens, wrapperStart, 'resolve', pairs);
   const isObjectFreeze = tokens[wrapperStart]?.value === 'Object'
     && tokens[wrapperStart + 1]?.value === '.'
     && tokens[wrapperStart + 2]?.value === 'freeze';
-  const isPromiseRace = tokens[wrapperStart]?.value === 'Promise'
-    && tokens[wrapperStart + 1]?.value === '.'
-    && tokens[wrapperStart + 2]?.value === 'race'
-    && allowPromiseRace
-    && isUnshadowedIdentifierAt(tokens, 'Promise', wrapperStart, pairs);
+  const isPromiseRace = allowPromiseRace
+    && isNativePromiseMethodAt(tokens, wrapperStart, 'race', pairs);
   const isPrimitiveString = tokens[wrapperStart]?.value === 'String'
     && tokens[wrapperStart - 1]?.value !== 'new'
     && isUnshadowedIdentifierAt(tokens, 'String', wrapperStart, pairs);
@@ -1890,7 +1914,8 @@ const valueHasGapOutcome = (
       pairs,
       aliases,
       resolvingArrays,
-      allowPromiseRace
+      allowPromiseRace,
+      allowPromiseResolution
     );
   }
   return effectiveArgument !== undefined
@@ -1901,7 +1926,8 @@ const valueHasGapOutcome = (
       pairs,
       aliases,
       resolvingArrays,
-      allowPromiseRace
+      allowPromiseRace,
+      allowPromiseResolution
     );
 };
 
@@ -2048,7 +2074,15 @@ const staticApplyArrayArgumentsAt = (tokens, start, end, useIndex, pairs) => {
   return topLevelSegments(tokens, arrayStart + 1, arrayEnd - 1);
 };
 
-const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, aliases = new Set()) => {
+const callHasGapArgument = (
+  tokens,
+  opening,
+  closing,
+  pairs,
+  stateArgument,
+  aliases = new Set(),
+  allowPromiseResolution = true
+) => {
   if (stateArgument === undefined) return false;
   const isApplyCall = tokens[opening - 2]?.value === '.' && tokens[opening - 1]?.value === 'apply';
   if (isApplyCall) {
@@ -2065,7 +2099,7 @@ const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, alia
     if (!functionArguments) return false;
     const gapArgument = functionArguments[stateArgument];
     return gapArgument !== undefined
-      && valueHasGapOutcome(tokens, gapArgument[0], gapArgument[1], pairs, aliases);
+      && valueHasGapOutcome(tokens, gapArgument[0], gapArgument[1], pairs, aliases, new Set(), false, allowPromiseResolution);
   }
   const argumentsList = topLevelSegments(tokens, opening + 1, closing).flatMap(([argumentStart, argumentEnd]) => {
     const arrayStart = argumentStart + 1;
@@ -2086,7 +2120,7 @@ const callHasGapArgument = (tokens, opening, closing, pairs, stateArgument, alia
   });
   const gapArgument = argumentsList[stateArgument];
   return gapArgument !== undefined
-    && valueHasGapOutcome(tokens, gapArgument[0], gapArgument[1], pairs, aliases);
+    && valueHasGapOutcome(tokens, gapArgument[0], gapArgument[1], pairs, aliases, new Set(), false, allowPromiseResolution);
 };
 
 const boundaryWriterCallHasGapAt = (tokens, index, end, pairs, aliases, writerAliases) => {
@@ -2107,7 +2141,8 @@ const boundaryWriterCallHasGapAt = (tokens, index, end, pairs, aliases, writerAl
     closing,
     pairs,
     stateArgument + boundaryWriterCallArgumentOffsetAt(tokens, opening),
-    aliases
+    aliases,
+    false
   );
 };
 
@@ -2193,6 +2228,27 @@ const isImmediatelyInvokedFunction = (tokens, pairs, range) => {
 const PROMISE_EXECUTOR_CALLBACK = 'promise-executor';
 const EAGER_ARRAY_CALLBACK_METHODS = new Set(['forEach', 'map', 'some', 'every', 'filter', 'find']);
 
+const promiseChainHasShadowedRootAt = (tokens, methodIndex, pairs) => {
+  let currentMethodIndex = methodIndex;
+  while (['then', 'catch', 'finally'].includes(tokens[currentMethodIndex]?.value)) {
+    const receiverEnd = currentMethodIndex - 2;
+    if (tokens[receiverEnd]?.value !== ')') return false;
+    const callOpening = pairs.get(receiverEnd);
+    if (callOpening === undefined) return false;
+    const receiverMethodIndex = callOpening - 1;
+    const receiverMethod = tokens[receiverMethodIndex]?.value;
+    if (!['resolve', 'reject', 'race'].includes(receiverMethod)
+      && !['then', 'catch', 'finally'].includes(receiverMethod)) return false;
+    if (!['.', '?.'].includes(tokens[receiverMethodIndex - 1]?.value)) return false;
+    const promiseIndex = receiverMethodIndex - 2;
+    if (tokens[promiseIndex]?.value === 'Promise') {
+      return !isUnshadowedIdentifierAt(tokens, 'Promise', promiseIndex, pairs);
+    }
+    currentMethodIndex = receiverMethodIndex;
+  }
+  return false;
+};
+
 const isScheduledCallback = (tokens, pairs, range) => {
   const start = range.start;
   let callbackStart;
@@ -2232,13 +2288,15 @@ const isScheduledCallback = (tokens, pairs, range) => {
   let calleeIndex = callOpening - 1;
   if (tokens[calleeIndex]?.value === '?.') calleeIndex -= 1;
   const callee = tokens[calleeIndex]?.value;
-  if (callee === 'Promise' && tokens[calleeIndex - 1]?.value === 'new') {
+  if (callee === 'Promise' && tokens[calleeIndex - 1]?.value === 'new'
+    && isUnshadowedIdentifierAt(tokens, 'Promise', calleeIndex, pairs)) {
     return PROMISE_EXECUTOR_CALLBACK;
   }
   if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)
     || (EAGER_ARRAY_CALLBACK_METHODS.has(callee) && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))
     || (callee === 'finally' && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value))) return 'discarded';
   if (!['then', 'catch'].includes(callee) || !['.', '?.'].includes(tokens[calleeIndex - 1]?.value)) return false;
+  if (promiseChainHasShadowedRootAt(tokens, calleeIndex, pairs)) return false;
   return promiseHandlerIsUnreachable(tokens, range, callee, calleeIndex, callOpening, callClosing, pairs)
     ? 'discarded'
     : 'outcome';
@@ -2252,8 +2310,7 @@ const promiseHandlerIsUnreachable = (tokens, range, callee, calleeIndex, callOpe
   const settledMethodIndex = settledOpening - 1;
   const settledMethod = tokens[settledMethodIndex]?.value;
   if (!['resolve', 'reject'].includes(settledMethod)
-    || tokens[settledMethodIndex - 1]?.value !== '.'
-    || tokens[settledMethodIndex - 2]?.value !== 'Promise') return false;
+    || !isNativePromiseMethodAt(tokens, settledMethodIndex - 2, settledMethod, pairs)) return false;
 
   const callbackArgumentIndex = topLevelSegments(tokens, callOpening + 1, callClosing)
     .findIndex(([argumentStart, argumentEnd]) => range.start >= argumentStart && range.start < argumentEnd);
@@ -2423,6 +2480,18 @@ const localFunctionForCallAt = (
       visibleBinding.expressionEnd,
       pairs
     );
+    if (initializer.end - initializer.start === 3
+      && tokens[initializer.start]?.type === 'identifier'
+      && tokens[initializer.start + 1]?.value === '.'
+      && tokens[initializer.start + 2]?.type === 'identifier') {
+      return localObjectMethodAt(
+        tokens,
+        initializer.start + 2,
+        useIndex,
+        pairs,
+        functionRanges
+      );
+    }
     if (initializer.end - initializer.start !== 1
       || tokens[initializer.start]?.type !== 'identifier') return null;
     const nextResolvingBindings = new Set(resolvingBindings);
@@ -2550,9 +2619,7 @@ const promiseHandlerOutcomesAt = (
     ? bodyStart + 1
     : bodyStart;
   const rejectedCallOpening = returnedValueStart + 3;
-  const startsWithPromiseReject = tokens[returnedValueStart]?.value === 'Promise'
-    && tokens[returnedValueStart + 1]?.value === '.'
-    && tokens[returnedValueStart + 2]?.value === 'reject'
+  const startsWithPromiseReject = isNativePromiseMethodAt(tokens, returnedValueStart, 'reject', pairs)
     && tokens[rejectedCallOpening]?.value === '(';
   const alwaysRejects = startsWithThrow
     || (startsWithPromiseReject
@@ -2574,9 +2641,7 @@ const promiseHandlerOutcomesAt = (
         handlerAliases
       );
     }
-    const rejectCall = tokens[index]?.value === 'Promise'
-      && tokens[index + 1]?.value === '.'
-      && tokens[index + 2]?.value === 'reject'
+    const rejectCall = isNativePromiseMethodAt(tokens, index, 'reject', pairs)
       && tokens[index + 3]?.value === '(';
     if (!rejectCall) continue;
     const rejectClosing = pairs.get(index + 3);
@@ -2615,9 +2680,8 @@ const promiseThenChainAt = (tokens, start, end, pairs, functionRanges, aliases) 
   while (expressionEnd > expression.start && tokens[expressionEnd - 1]?.value === ';') expressionEnd -= 1;
   const startMethod = tokens[expression.start + 2]?.value;
   const opening = expression.start + 3;
-  if (tokens[expression.start]?.value !== 'Promise'
-    || tokens[expression.start + 1]?.value !== '.'
-    || !['resolve', 'reject'].includes(startMethod)
+  if (!['resolve', 'reject'].includes(startMethod)
+    || !isNativePromiseMethodAt(tokens, expression.start, startMethod, pairs)
     || tokens[opening]?.value !== '(') return null;
   const closing = pairs.get(opening);
   if (closing === undefined || closing >= expression.end) return null;
@@ -2889,6 +2953,19 @@ const abruptCompletionIsUnconditionalAt = (tokens, index, start, end, pairs) => 
   return true;
 };
 
+const eagerNamedCallbackAt = (tokens, index, pairs) => {
+  if (!EAGER_ARRAY_CALLBACK_METHODS.has(tokens[index]?.value)
+    || !['.', '?.'].includes(tokens[index - 1]?.value)
+    || tokens[index + 1]?.value !== '(') return null;
+  const closing = pairs.get(index + 1);
+  if (closing === undefined) return null;
+  const callbackArgument = topLevelSegments(tokens, index + 2, closing)[0];
+  if (!callbackArgument) return null;
+  const callback = trimExpressionRange(tokens, callbackArgument[0], callbackArgument[1], pairs);
+  if (callback.end - callback.start !== 1 || tokens[callback.start]?.type !== 'identifier') return null;
+  return { name: tokens[callback.start].value, useIndex: callback.start };
+};
+
 const hasGapOutcome = (
   tokens,
   start,
@@ -2905,6 +2982,7 @@ const hasGapOutcome = (
   const knownBooleanAliases = new Map();
   const localAssignments = findIdentifierAssignments(tokens, findLexicalScopes(tokens, pairs));
   const knownLocalFunctions = new Map();
+  const knownOutcomeObjects = new Map();
   const unreachableRanges = new Map();
   const localFunctionScope = functionScopeOpeningAt(start, functionRanges);
   for (const candidate of functionRanges) {
@@ -2980,6 +3058,52 @@ const hasGapOutcome = (
       continue;
     }
     const token = tokens[index];
+    if (['const', 'let', 'var'].includes(token.value)
+      && tokens[index + 1]?.type === 'identifier'
+      && tokens[index + 2]?.value === '=') {
+      const objectName = tokens[index + 1].value;
+      const initializerStart = index + 3;
+      const initializerEnd = findAssignmentValueEnd(tokens, initializerStart, end);
+      if (tokens[initializerStart]?.value === '{'
+        && pairs.get(initializerStart) === initializerEnd - 1) {
+        const outcomeProperties = new Map();
+        for (const [propertyStart, propertyEnd] of topLevelSegments(
+          tokens,
+          initializerStart + 1,
+          initializerEnd - 1
+        )) {
+          const propertyName = staticPropertyName(tokens[propertyStart]);
+          const colon = topLevelToken(tokens, propertyStart, propertyEnd, ':');
+          if (propertyName === null || !OUTCOME_NAMES.has(propertyName) || colon < 0) continue;
+          outcomeProperties.set(propertyName, valueHasGapOutcome(
+            tokens,
+            colon + 1,
+            propertyEnd,
+            pairs,
+            knownAliases,
+            new Set(),
+            false,
+            false
+          ));
+        }
+        knownOutcomeObjects.set(objectName, outcomeProperties);
+      } else {
+        knownOutcomeObjects.delete(objectName);
+      }
+    }
+    if (token.value === 'delete'
+      && [';', '{', '}', undefined].includes(tokens[index - 1]?.value)) {
+      const objectName = tokens[index + 1]?.value;
+      let propertyName = null;
+      if (tokens[index + 2]?.value === '.') propertyName = tokens[index + 3]?.value;
+      else if (tokens[index + 2]?.value === '[') propertyName = staticPropertyName(tokens[index + 3]);
+      const outcomeProperties = knownOutcomeObjects.get(objectName);
+      if (outcomeProperties && propertyName !== null && OUTCOME_NAMES.has(propertyName)) {
+        outcomeProperties.delete(propertyName);
+        index = Math.max(index, findStatementEnd(tokens, index, end) - 1);
+        continue;
+      }
+    }
     if (['if', 'while', 'for'].includes(token.value) && tokens[index + 1]?.value === '(') {
       const conditionClosing = pairs.get(index + 1);
       let conditionStart = index + 2;
@@ -3062,6 +3186,57 @@ const hasGapOutcome = (
     }
     if (token.type === 'identifier' && tokens[index + 1]?.value === '(') {
       const isMemberCall = tokens[index - 1]?.value === '.';
+      const eagerCallback = eagerNamedCallbackAt(tokens, index, pairs);
+      if (eagerCallback) {
+        const callbackFunction = localFunctionForCallAt(
+          tokens,
+          eagerCallback.name,
+          eagerCallback.useIndex,
+          pairs,
+          functionRanges,
+          knownLocalFunctions
+        );
+        if (callbackFunction && !resolvingFunctions.has(callbackFunction)) {
+          const callbackStart = callbackFunction.expression
+            ? callbackFunction.bodyStart
+            : callbackFunction.opening + 1;
+          const callbackEnd = callbackFunction.expression
+            ? callbackFunction.bodyEnd
+            : callbackFunction.closing;
+          const nextResolvingFunctions = new Set(resolvingFunctions);
+          nextResolvingFunctions.add(callbackFunction);
+          const callbackHasGap = callbackFunction.expression
+            ? valueHasGapOutsideNestedFunctions(
+              tokens,
+              callbackStart,
+              callbackEnd,
+              pairs,
+              functionRanges,
+              knownAliases,
+              true
+            )
+            : hasGapOutcome(
+              tokens,
+              callbackStart,
+              callbackEnd,
+              callbackFunction.opening,
+              pairs,
+              functionRanges,
+              knownAliases,
+              knownWriterAliases,
+              nextResolvingFunctions
+            );
+          if (callbackHasGap || hasBoundaryWriterGap(
+            tokens,
+            callbackStart,
+            callbackEnd,
+            pairs,
+            functionRanges,
+            knownAliases,
+            knownWriterAliases
+          )) return true;
+        }
+      }
       const localFunction = isMemberCall
         ? localObjectMethodAt(tokens, index, index, pairs, functionRanges)
         : localFunctionForCallAt(tokens, token.value, index, pairs, functionRanges, knownLocalFunctions);
@@ -3100,6 +3275,12 @@ const hasGapOutcome = (
       const statementEnd = findStatementEnd(tokens, index + 1, end);
       const expressionStart = index + 1;
       const returnIsEffective = !returnIsOverriddenByFinally(tokens, index, end, pairs, functionRanges);
+      const returnedExpression = trimExpressionRange(tokens, expressionStart, statementEnd, pairs);
+      if (returnIsEffective && returnedExpression.end - returnedExpression.start === 1) {
+        const returnedName = tokens[returnedExpression.start]?.value;
+        const outcomeProperties = knownOutcomeObjects.get(returnedName);
+        if (outcomeProperties && [...outcomeProperties.values()].some(Boolean)) return true;
+      }
       const returnedAssignment = assignmentTargetAt(tokens, expressionStart, statementEnd, pairs);
       if (returnIsEffective && returnedAssignment
         && valueHasGapOutcome(
@@ -3196,6 +3377,24 @@ const hasGapOutcome = (
         ? tokens[index + 1].value
         : null;
       const assignmentTarget = assignmentTargetAt(tokens, index, end, pairs);
+      let outcomePropertyName = null;
+      if (tokens[index + 1]?.value === '.') outcomePropertyName = tokens[index + 2]?.value;
+      else if (tokens[index + 1]?.value === '[') outcomePropertyName = staticPropertyName(tokens[index + 2]);
+      const outcomeProperties = knownOutcomeObjects.get(token.value);
+      if (outcomeProperties && assignmentTarget && OUTCOME_NAMES.has(outcomePropertyName)) {
+        outcomeProperties.set(outcomePropertyName, valueHasGapOutcome(
+          tokens,
+          assignmentValueStart,
+          statementEnd,
+          pairs,
+          knownAliases,
+          new Set(),
+          false,
+          false
+        ));
+        index = Math.max(index, statementEnd - 1);
+        continue;
+      }
       const aliasName = assignmentTarget?.name || declaredAlias;
       const isSimpleLocalAssignment = declaredAlias !== null
         || (token.type === 'identifier' && tokens[index + 1]?.value === '=');
@@ -3289,7 +3488,8 @@ const isDeadlineTriggerAt = (tokens, index, isDeadlineTimestampAlias = () => fal
     && DEADLINE_PREDICATE_NAMES.has(value)
     && tokens[index + 1]?.value === '('
     && tokens[index + 2]?.value === ')') return true;
-  if (value === 'DEADLINE' || (tokens[index]?.type === 'string' && value === 'deadline')) {
+  if (value === 'DEADLINE'
+    || (['string', 'template'].includes(tokens[index]?.type) && value === 'deadline')) {
     const isComputedMember = ['string', 'template'].includes(tokens[index]?.type)
       && tokens[index - 1]?.value === '['
       && tokens[index + 1]?.value === ']'
@@ -6418,7 +6618,7 @@ test('pre-adoption retry classifier sites stay in the audited owners', () => {
     const gapRace = `if (deadlineReached) return Promise.race([READINESS.GAP]);`;
     const unavailableRace = `if (deadlineReached) return Promise.race([READINESS.UNAVAILABLE]);`;
     const discardedRace = `if (deadlineReached) Promise.race([READINESS.GAP]);`;
-    const shadowedPromise = `const Promise = { race: values => values[0] }; if (deadlineReached) return Promise.race([READINESS.GAP]);`;
+    const shadowedPromise = `const Promise = { race: values => READINESS.UNAVAILABLE }; if (deadlineReached) return Promise.race([READINESS.GAP]);`;
     const arrayResult = `if (deadlineReached) return Promise.all([READINESS.GAP]);`;
     regressionAssert.equal(offendersFor(gapRace).length, 1);
     regressionAssert.equal(offendersFor(unavailableRace).length, 0);
@@ -6647,4 +6847,146 @@ test('deadline policy inventory recognizes unshadowed primitive String outcomes'
   assert.deepEqual(offendersFor('function outcome(String) { if (deadlineReached) return String(READINESS.GAP); } if (deadlineReached) return outcome(value => READINESS.READY);'), []);
   assert.deepEqual(offendersFor('const String = value => READINESS.READY; if (deadlineReached) return String(READINESS.GAP);'), []);
   assert.deepEqual(offendersFor('if (deadlineReached) return new String(READINESS.GAP);'), []);
+});
+
+test('deadline policy inventory respects Promise lexical bindings', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-shadowed-promise-resolve.js',
+      source: 'const Promise = { resolve: () => READINESS.UNAVAILABLE }; if (deadlineReached) return Promise.resolve(READINESS.GAP);'
+    },
+    {
+      relative: 'discord/deadline-shadowed-promise-race.js',
+      source: 'const Promise = { race: () => READINESS.UNAVAILABLE }; if (deadlineReached) return Promise.race([READINESS.GAP]);'
+    },
+    {
+      relative: 'discord/deadline-shadowed-promise-then.js',
+      source: 'const Promise = { resolve: () => ({ then: () => READINESS.UNAVAILABLE }) }; if (deadlineReached) return Promise.resolve().then(() => READINESS.GAP);'
+    },
+    {
+      relative: 'discord/deadline-shadowed-promise-reject.js',
+      source: 'const Promise = { reject: () => ({ then: () => READINESS.UNAVAILABLE }) }; if (deadlineReached) return Promise.reject().then(undefined, () => READINESS.GAP);'
+    },
+    {
+      relative: 'discord/deadline-shadowed-promise-constructor.js',
+      source: 'const Promise = function (executor) { executor(() => {}); }; if (deadlineReached) return new Promise(resolve => resolve(READINESS.GAP));'
+    }
+  ]);
+  assert.deepEqual(offenders, []);
+});
+
+test('deadline policy inventory distinguishes returned promises from persisted promise values', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-persisted-gap.js',
+      source: 'if (deadlineReached) state.markIntakeBoundary(id, READINESS.GAP, detail);'
+    },
+    {
+      relative: 'discord/deadline-persisted-resolved-promise.js',
+      source: 'if (deadlineReached) state.markIntakeBoundary(id, Promise.resolve(READINESS.GAP), detail);'
+    },
+    {
+      relative: 'discord/deadline-persisted-race-promise.js',
+      source: 'if (deadlineReached) state.markIntakeBoundary(id, Promise.race([READINESS.GAP]), detail);'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-persisted-gap.js:1']);
+});
+
+test('deadline policy inventory follows negated guard fall-through across blocks and try finally', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-negated-intervening-block-gap.js',
+      source: 'function readiness(deadlineReached) { if (!deadlineReached) return READINESS.READY; { audit(); } return READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/deadline-negated-inner-block-gap.js',
+      source: 'function readiness(deadlineReached) { { if (!deadlineReached) return READINESS.READY; } return READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/deadline-negated-try-finally-gap.js',
+      source: 'function readiness(deadlineReached) { try { if (!deadlineReached) return READINESS.READY; } finally { audit(); } return READINESS.GAP; }'
+    },
+    {
+      relative: 'discord/deadline-negated-intervening-block-safe.js',
+      source: 'function readiness(deadlineReached) { if (!deadlineReached) return READINESS.READY; { audit(); } return READINESS.UNAVAILABLE; }'
+    },
+    {
+      relative: 'discord/deadline-negated-inner-block-safe.js',
+      source: 'function readiness(deadlineReached) { { if (!deadlineReached) return READINESS.READY; } return READINESS.UNAVAILABLE; }'
+    },
+    {
+      relative: 'discord/deadline-negated-try-finally-safe.js',
+      source: 'function readiness(deadlineReached) { try { if (!deadlineReached) return READINESS.READY; } finally { audit(); } return READINESS.UNAVAILABLE; }'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-negated-intervening-block-gap.js:1',
+    'discord/deadline-negated-inner-block-gap.js:1',
+    'discord/deadline-negated-try-finally-gap.js:1'
+  ]);
+});
+
+test('deadline policy inventory recognizes static deadline templates only', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-static-template.js',
+      source: 'if (kind === `deadline`) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/deadline-passive-template.js',
+      source: 'if (kind === `retry`) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/deadline-dynamic-template.js',
+      source: 'if (kind === `deadline-${suffix}`) return READINESS.GAP;'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-static-template.js:1']);
+});
+
+test('deadline policy inventory inspects named callbacks passed to eager APIs', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-eager-named-callback-gap.js',
+      source: 'const write = () => state.markIntakeBoundary(id, READINESS.GAP, detail); if (deadlineReached) [id].forEach(write);'
+    },
+    {
+      relative: 'discord/deadline-eager-named-callback-safe.js',
+      source: 'const write = () => state.markIntakeBoundary(id, READINESS.UNAVAILABLE, detail); if (deadlineReached) [id].forEach(write);'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-eager-named-callback-gap.js:1']);
+});
+
+test('deadline policy inventory follows local object method aliases', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-object-method-alias-gap.js',
+      source: 'const obj = { write() { state.markIntakeBoundary(id, READINESS.GAP, detail); } }; const alias = obj.write; if (deadlineReached) alias();'
+    },
+    {
+      relative: 'discord/deadline-object-method-alias-safe.js',
+      source: 'const obj = { write() { state.markIntakeBoundary(id, READINESS.UNAVAILABLE, detail); } }; const alias = obj.write; if (deadlineReached) alias();'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-object-method-alias-gap.js:1']);
+});
+
+test('deadline policy inventory waits for returned local outcome properties', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-outcome-property-overwritten.js',
+      source: 'if (deadlineReached) { const result = {}; result.state = READINESS.GAP; result.state = READINESS.UNAVAILABLE; return result; }'
+    },
+    {
+      relative: 'discord/deadline-outcome-property-deleted.js',
+      source: 'if (deadlineReached) { const result = {}; result.state = READINESS.GAP; delete result.state; return result; }'
+    },
+    {
+      relative: 'discord/deadline-outcome-property-returned.js',
+      source: 'if (deadlineReached) { const result = {}; result.state = READINESS.GAP; return result; }'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-outcome-property-returned.js:1']);
 });
