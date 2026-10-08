@@ -397,6 +397,27 @@ function isTownHallPlanModule(sourceFile, specifier, exportedName, sourceFiles =
     ));
 }
 
+function isTownHallGuardExport(sourceFile, specifier, exportedName, sourceFiles, seen = new Set()) {
+  if (exportedName === 'isTownHallRoom' &&
+      isTownHallPlanModule(sourceFile, specifier, exportedName, sourceFiles)) return true;
+  const barrel = resolveSourceFile(sourceFile, specifier, sourceFiles);
+  if (!barrel) return false;
+  const nodePath = require('node:path');
+  const sourceRoot = nodePath.resolve(__dirname, '../../src');
+  const barrelPath = sourcePath(barrel, sourceRoot, nodePath);
+  const marker = barrelPath + '\u0000' + exportedName;
+  if (seen.has(marker)) return false;
+  seen.add(marker);
+  return reExportBindings(barrel, exportedName).some(reExport =>
+    !reExport.namespace && isTownHallGuardExport(
+      barrel,
+      reExport.specifier,
+      reExport.importedName,
+      sourceFiles,
+      seen,
+    ));
+}
+
 function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
   const bindings = collectBindings(sourceFile);
   const imports = [];
@@ -472,9 +493,8 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
   const candidates = bindings.filter(binding => binding.name === name && binding.scope === sourceFile);
   const importedNames = new Set(imports.map(binding => binding.name));
   const localCandidates = candidates.filter(binding => !importedNames.has(binding.name));
-  const importedTarget = imports.find(binding => binding.importedName === name &&
-    !binding.namespace &&
-    isTownHallPlanModule(sourceFile, binding.specifier, binding.importedName, sourceFiles));
+  const importedTarget = imports.find(binding => !binding.namespace &&
+    isTownHallGuardExport(sourceFile, binding.specifier, binding.importedName, sourceFiles));
   const target = localCandidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&
     binding.declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) ||
     localCandidates[0] || importedTarget || null;

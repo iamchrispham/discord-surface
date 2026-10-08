@@ -1061,6 +1061,11 @@ function roomDigitPolicies(records) {
         expression.arguments.length === 1) {
       return expressionIsRoomField(expression.arguments[0], info, seen);
     }
+    if (ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression) &&
+        ['trim', 'toString'].includes(expression.expression.name.text) &&
+        expression.arguments.length === 0) {
+      return expressionIsRoomField(expression.expression.expression, info, seen);
+    }
     const key = policyPropertyKey(expression);
     if (key && ['guildId', 'channelId'].includes(key)) {
       const object = expression.expression;
@@ -1127,6 +1132,7 @@ function roomDigitPolicies(records) {
     regexInputs,
     importedRegexInputs,
     namespaceRegexInputs,
+    directDynamicImportRegexInputs,
     resolveRegexExport,
     resolveNamespaceExport,
     resolveImportedString,
@@ -1168,6 +1174,27 @@ function roomDigitPolicies(records) {
     visit(info.ast);
   }
   const countedRegexExports = new Set();
+  const countImportedRegexPolicy = (consumer, consumerBindings, target, importedName, input) => {
+    const resolved = target && resolveRegexExport(target, importedName);
+    if (!resolved || !hasAsciiDigitPattern(resolved.pattern)) return;
+    const scope = enclosingFunction(input) || consumer.ast;
+    const binding = ts.isIdentifier(input) && findBinding(consumer, input.text, input);
+    const roomContext = isTownHallContext(scope, consumer.ast, consumerBindings) ||
+      hasContextualParameterCall(binding);
+    if (isNeutralRoomPolicy(scope) || !roomContext || !expressionIsRoomField(input, consumer)) return;
+    const key = `${resolved.info.file}\u0000${resolved.declaration?.pos ?? resolved.pattern}`;
+    const localInputs = resolved.declaration && ts.isVariableDeclaration(resolved.declaration)
+      ? regexInputs(resolved.declaration.initializer, resolved.info)
+      : [];
+    if (localInputs.some(input => expressionIsRoomField(input, resolved.info))) {
+      countedRegexExports.add(key);
+      return;
+    }
+    if (!countedRegexExports.has(key)) {
+      sites[resolved.info.file] = (sites[resolved.info.file] || 0) + 1;
+      countedRegexExports.add(key);
+    }
+  };
   for (const consumer of infos) {
     const consumerBindings = collectBindings(consumer.ast);
     for (const [localName, imported] of consumer.imports) {
@@ -1191,26 +1218,17 @@ function roomDigitPolicies(records) {
       }
       for (const { importedName, input } of references) {
         const resolvedTarget = namespaceTarget || target;
-        const resolved = resolvedTarget && resolveRegexExport(resolvedTarget, importedName);
-        if (!resolved || !hasAsciiDigitPattern(resolved.pattern)) continue;
-        const scope = enclosingFunction(input) || consumer.ast;
-        const binding = ts.isIdentifier(input) && findBinding(consumer, input.text, input);
-        const roomContext = isTownHallContext(scope, consumer.ast, consumerBindings) ||
-          hasContextualParameterCall(binding);
-        if (isNeutralRoomPolicy(scope) || !roomContext || !expressionIsRoomField(input, consumer)) continue;
-        const key = `${resolved.info.file}\u0000${resolved.declaration?.pos ?? resolved.pattern}`;
-        const localInputs = resolved.declaration && ts.isVariableDeclaration(resolved.declaration)
-          ? regexInputs(resolved.declaration.initializer, resolved.info)
-          : [];
-        if (localInputs.some(input => expressionIsRoomField(input, resolved.info))) {
-          countedRegexExports.add(key);
-          continue;
-        }
-        if (!countedRegexExports.has(key)) {
-          sites[resolved.info.file] = (sites[resolved.info.file] || 0) + 1;
-          countedRegexExports.add(key);
-        }
+        countImportedRegexPolicy(consumer, consumerBindings, resolvedTarget, importedName, input);
       }
+    }
+    for (const { specifier, importedName, input } of directDynamicImportRegexInputs(consumer)) {
+      countImportedRegexPolicy(
+        consumer,
+        consumerBindings,
+        resolveModule(consumer, specifier),
+        importedName,
+        input,
+      );
     }
   }
   return sites;

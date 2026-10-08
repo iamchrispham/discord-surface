@@ -183,3 +183,38 @@ test('switch case bindings do not hide imported guard calls after the switch', (
     isTownHallRoom(room);`);
   assert.equal(countIdentifierReferences(bracedShadow, 'isTownHallRoom'), 1);
 });
+
+test('reference analysis follows default guard re-exports without matching other defaults', () => {
+  const plan = ts.createSourceFile(
+    'peer/town-hall-plan.ts',
+    'export function isTownHallRoom(room) { return room; } export function parseRoom(room) { return room; }',
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const guardBarrel = ts.createSourceFile(
+    'peer/default-guard-barrel.ts',
+    "export { isTownHallRoom as default } from './town-hall-plan';",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const unrelatedBarrel = ts.createSourceFile(
+    'peer/default-unrelated-barrel.ts',
+    "export { parseRoom as default } from './town-hall-plan';",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const guardConsumer = ts.createSourceFile(
+    'peer/default-guard-consumer.ts',
+    "import isTownHallRoom from './default-guard-barrel'; isTownHallRoom(room);",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const unrelatedConsumer = ts.createSourceFile(
+    'peer/default-unrelated-consumer.ts',
+    "import parseRoom from './default-unrelated-barrel'; parseRoom(room);",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(countIdentifierReferences(guardConsumer, 'isTownHallRoom', [plan, guardBarrel]), 1);
+  assert.equal(countIdentifierReferences(unrelatedConsumer, 'isTownHallRoom', [plan, unrelatedBarrel]), 0);
+});

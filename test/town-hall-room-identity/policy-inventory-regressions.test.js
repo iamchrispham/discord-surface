@@ -411,3 +411,73 @@ test('shadowed imported helpers do not contribute their regex policy', () => {
   };
   assert.deepEqual(roomDigitPolicies([helper, ordinaryField]), {});
 });
+
+test('local object destructuring keeps a regex connected to its room field', () => {
+  const consumer = {
+    file: 'peer/local-object-destructure.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      const patterns = { ROOM_ID: /^\d{1,21}$/ };
+      const { ROOM_ID } = patterns;
+      return ROOM_ID.test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([consumer]), { [consumer.file]: 1 });
+
+  const negativeConsumer = {
+    file: 'peer/local-object-destructure-negative.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      const patterns = { ROOM_ID: /^\d{1,21}$/ };
+      const { ROOM_ID } = patterns;
+      return ROOM_ID.test(room.name);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([negativeConsumer]), {});
+});
+
+test('direct dynamic regex imports are indexed without counting unrelated fields', () => {
+  const pattern = {
+    file: 'peer/direct-dynamic-pattern.ts',
+    text: String.raw`export const ROOM_ID = /^\d{1,21}$/;`,
+  };
+  const consumer = {
+    file: 'peer/direct-dynamic-consumer.ts',
+    text: String.raw`async function validateTownHallRoom(room) {
+      return (await import('./direct-dynamic-pattern')).ROOM_ID.test(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([pattern, consumer]), { [pattern.file]: 1 });
+
+  const negativeConsumer = {
+    file: 'peer/direct-dynamic-negative-consumer.ts',
+    text: String.raw`async function validateTownHallRoom(room) {
+      return (await import('./direct-dynamic-pattern')).ROOM_ID.test(room.name);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([pattern, negativeConsumer]), {});
+});
+
+test('room identifier origin survives trim and toString calls', () => {
+  const trimmed = {
+    file: 'peer/trimmed-room-identifier.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return /^\d{1,21}$/.test(room.guildId.trim());
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([trimmed]), { [trimmed.file]: 1 });
+
+  const stringified = {
+    file: 'peer/stringified-room-identifier.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return /^\d{1,21}$/.test(room.guildId.toString());
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([stringified]), { [stringified.file]: 1 });
+
+  const negativeConsumer = {
+    file: 'peer/normalized-ordinary-field.ts',
+    text: String.raw`function validateTownHallRoom(room) {
+      return /^\d{1,21}$/.test(room.name.trim());
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([negativeConsumer]), {});
+});
