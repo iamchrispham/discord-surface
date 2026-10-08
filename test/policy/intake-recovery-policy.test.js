@@ -329,6 +329,18 @@ const expressionHasGap = (tokens, start, end, aliases = new Set(), allowNestedCa
   const callParentheses = [];
   for (let index = start; index < end; index += 1) {
     const value = tokens[index].value;
+    const previousValue = tokens[index - 1]?.value;
+    const unaryOperator = ['void', 'typeof', 'delete', '!', '~'].includes(value)
+      || ['+', '-'].includes(value)
+        && (index === start || ['=', '(', '[', '{', ',', ':', 'return', '=>', '?', '&&', '||', '??'].includes(previousValue));
+    if (unaryOperator) {
+      const operandStart = index + 1;
+      let operandEnd = gapValueEnd(tokens, operandStart);
+      while (operandEnd < end
+        && (tokens[operandEnd]?.value === '.' || tokens[operandEnd]?.type === 'identifier')) operandEnd += 1;
+      index = Math.max(index, operandEnd - 1);
+      continue;
+    }
     const insideCall = allowNestedCalls && callParentheses.some(Boolean);
     if ((parenDepth === 0 && braceDepth === 0 && bracketDepth === 0 || insideCall)
       && !isComparisonOperand(tokens, index, start, end)
@@ -1106,6 +1118,37 @@ const extractDeadlineDecision = (tokens, triggerIndex, pairs, functionRanges, al
       functionRanges
     );
     if (fallthroughEnd <= ifEnd) return selected;
+    const nextIfStart = ifEnd;
+    const nextConditionOpening = nextIfStart + 1;
+    const nextConditionClosing = tokens[nextIfStart]?.value === 'if'
+      ? pairs.get(nextConditionOpening)
+      : undefined;
+    if (nextConditionClosing !== undefined) {
+      const triggerName = tokens[triggerIndex]?.value;
+      let nextTriggerIndex = nextConditionOpening + 1;
+      while (nextTriggerIndex < nextConditionClosing
+        && tokens[nextTriggerIndex]?.value !== triggerName) nextTriggerIndex += 1;
+      const nextGuardNegated = nextTriggerIndex < nextConditionClosing
+        && isNegatedDeadlineCondition(tokens, nextConditionOpening + 1, nextTriggerIndex);
+      if (nextGuardNegated) {
+        const nextConsequentStart = nextConditionClosing + 1;
+        const nextConsequentEnd = findControlledStatementEnd(
+          tokens,
+          nextConsequentStart,
+          fallthroughEnd,
+          pairs
+        );
+        const continuationStart = tokens[nextConsequentEnd]?.value === 'else'
+          ? nextConsequentEnd + 1
+          : nextConsequentEnd;
+        return {
+          ...selected,
+          continuations: continuationStart < fallthroughEnd
+            ? [branchRange(tokens, continuationStart, fallthroughEnd, pairs)]
+            : []
+        };
+      }
+    }
     return {
       ...selected,
       continuations: [branchRange(tokens, ifEnd, fallthroughEnd, pairs)]
@@ -1275,18 +1318,28 @@ const destructuredValueHasGapOutcome = (tokens, start, end, propertyPath, pairs)
 const valueHasGapOutcome = (tokens, start, end, pairs, aliases = new Set()) => {
   const expression = trimExpressionRange(tokens, start, end, pairs);
   if (expression.start >= expression.end) return false;
+  const commaSegments = topLevelSegments(tokens, expression.start, expression.end);
+  if (commaSegments.length > 1) {
+    const [lastStart, lastEnd] = commaSegments[commaSegments.length - 1];
+    return valueHasGapOutcome(tokens, lastStart, lastEnd, pairs, aliases);
+  }
   if (tokens[expression.start]?.value === 'await') {
     return valueHasGapOutcome(tokens, expression.start + 1, expression.end, pairs, aliases);
   }
+  if (['void', 'typeof', '!', '~', '+', '-', 'delete'].includes(tokens[expression.start]?.value)) return false;
   if (expression.end - expression.start === 1 && aliases.has(tokens[expression.start].value)) return true;
   if (isGapMemberExpression(tokens, expression.start, expression.end)) return true;
   if (valueHasGap(tokens, expression.start, expression.end, pairs, aliases)) return true;
 
   const wrapperStart = expression.start;
   const wrapperOpening = wrapperStart + 3;
-  if (tokens[wrapperStart]?.value !== 'Promise'
-    || tokens[wrapperStart + 1]?.value !== '.'
-    || tokens[wrapperStart + 2]?.value !== 'resolve'
+  const isPromiseResolve = tokens[wrapperStart]?.value === 'Promise'
+    && tokens[wrapperStart + 1]?.value === '.'
+    && tokens[wrapperStart + 2]?.value === 'resolve';
+  const isObjectFreeze = tokens[wrapperStart]?.value === 'Object'
+    && tokens[wrapperStart + 1]?.value === '.'
+    && tokens[wrapperStart + 2]?.value === 'freeze';
+  if ((!isPromiseResolve && !isObjectFreeze)
     || tokens[wrapperOpening]?.value !== '(') return false;
   const wrapperClosing = pairs.get(wrapperOpening);
   if (wrapperClosing !== expression.end - 1) return false;
@@ -1315,16 +1368,35 @@ const valueHasGapOutsideNestedFunctions = (tokens, start, end, pairs, functionRa
   return valueHasGapOutcome(tokens, cursor, end, pairs, aliases);
 };
 
-const objectAssignHasGapOutcomeAt = (tokens, index, end, pairs, aliases) => {
+const objectAssignHasGapOutcomeAt = (tokens, index, end, pairs, aliases, functionRanges = []) => {
   if (tokens[index]?.value !== 'Object' || tokens[index + 1]?.value !== '.'
     || tokens[index + 2]?.value !== 'assign' || tokens[index + 3]?.value !== '(') return false;
   const opening = index + 3;
   const closing = pairs.get(opening);
   if (closing === undefined || closing >= end) return false;
+  const containingFunction = functionRanges
+    .filter(range => range.opening < index && range.closing > index)
+    .sort((left, right) => (left.closing - left.opening) - (right.closing - right.opening))[0];
+  const sourceScopeStart = containingFunction ? containingFunction.opening + 1 : 0;
   const argumentsList = topLevelSegments(tokens, opening + 1, closing);
-  return argumentsList.slice(1).some(([patchStart, patchEnd]) => tokens[patchStart]?.value === '{'
-    && pairs.get(patchStart) === patchEnd - 1
-    && valueHasGapOutcome(tokens, patchStart, patchEnd, pairs, aliases));
+  return argumentsList.slice(1).some(([patchStart, patchEnd]) => {
+    if (tokens[patchStart]?.value === '{'
+      && pairs.get(patchStart) === patchEnd - 1
+      && valueHasGapOutcome(tokens, patchStart, patchEnd, pairs, aliases)) return true;
+    if (patchEnd - patchStart !== 1 || tokens[patchStart]?.type !== 'identifier') return false;
+    const patchName = tokens[patchStart].value;
+    for (let declaration = sourceScopeStart; declaration < index; declaration += 1) {
+      if (tokens[declaration]?.value !== 'const'
+        || tokens[declaration + 1]?.value !== patchName
+        || tokens[declaration + 2]?.value !== '=') continue;
+      const valueStart = declaration + 3;
+      const declarationEnd = findStatementRange(tokens, declaration).end;
+      if (tokens[valueStart]?.value === '{'
+        && pairs.get(valueStart) === declarationEnd - 2
+        && valueHasGapOutcome(tokens, valueStart, declarationEnd - 1, pairs, aliases)) return true;
+    }
+    return false;
+  });
 };
 
 const outcomeAssignmentValueStart = (tokens, index) => {
@@ -1377,11 +1449,12 @@ const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases
   for (let index = start; index < end; index += 1) {
     const nestedFunction = nestedFunctionStarts.get(index);
     if (nestedFunction) {
-      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction)
-        || isScheduledCallback(tokens, pairs, nestedFunction)) {
+      const callbackKind = isScheduledCallback(tokens, pairs, nestedFunction);
+      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction) || callbackKind) {
         const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
         const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
-        if (nestedFunction.expression
+        if (callbackKind !== 'discarded'
+          && nestedFunction.expression
           && valueHasGapOutcome(tokens, bodyStart, bodyEnd, pairs, aliases)) return true;
         if (hasBoundaryWriterGap(
           tokens,
@@ -1405,7 +1478,7 @@ const hasBoundaryWriterGap = (tokens, start, end, pairs, functionRanges, aliases
       if (stateArgument === undefined) knownWriterAliases.delete(token.value);
       else knownWriterAliases.set(token.value, stateArgument);
     }
-    if (objectAssignHasGapOutcomeAt(tokens, index, end, pairs, aliases)) return true;
+    if (objectAssignHasGapOutcomeAt(tokens, index, end, pairs, aliases, functionRanges)) return true;
     const writerName = boundaryWriterNameAt(tokens, index);
     const stateArgument = boundaryWriterStateArgumentAt(tokens, index, knownWriterAliases);
     if (writerName === null || stateArgument === undefined) continue;
@@ -1487,8 +1560,10 @@ const isScheduledCallback = (tokens, pairs, range) => {
   let calleeIndex = callOpening - 1;
   if (tokens[calleeIndex]?.value === '?.') calleeIndex -= 1;
   const callee = tokens[calleeIndex]?.value;
-  if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)) return true;
-  return ['then', 'catch'].includes(callee) && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value);
+  if (['queueMicrotask', 'setTimeout', 'setImmediate', 'setInterval'].includes(callee)) return 'discarded';
+  return ['then', 'catch'].includes(callee) && ['.', '?.'].includes(tokens[calleeIndex - 1]?.value)
+    ? 'outcome'
+    : false;
 };
 
 const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, aliases = new Set(), writerAliases = new Map()) => {
@@ -1500,11 +1575,22 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
   for (let index = start; index < end; index += 1) {
     const nestedFunction = nestedFunctionStarts.get(index);
     if (nestedFunction) {
-      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction)
-        || isScheduledCallback(tokens, pairs, nestedFunction)) {
+      const callbackKind = isScheduledCallback(tokens, pairs, nestedFunction);
+      if (isImmediatelyInvokedFunction(tokens, pairs, nestedFunction) || callbackKind) {
         const bodyStart = nestedFunction.expression ? nestedFunction.bodyStart : nestedFunction.opening + 1;
         const bodyEnd = nestedFunction.expression ? nestedFunction.bodyEnd : nestedFunction.closing;
-        if (nestedFunction.expression
+        if (callbackKind === 'discarded'
+          && hasBoundaryWriterGap(
+            tokens,
+            bodyStart,
+            bodyEnd,
+            pairs,
+            functionRanges,
+            knownAliases,
+            knownWriterAliases
+          )) return true;
+        if (callbackKind !== 'discarded'
+          && nestedFunction.expression
           && valueHasGapOutsideNestedFunctions(
             tokens,
             bodyStart,
@@ -1513,7 +1599,7 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
             functionRanges,
             knownAliases
           )) return true;
-        if (hasGapOutcome(
+        if (callbackKind !== 'discarded' && hasGapOutcome(
           tokens,
           bodyStart,
           bodyEnd,
@@ -1603,7 +1689,7 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       index = Math.max(index, statementEnd - 1);
       continue;
     }
-    if (objectAssignHasGapOutcomeAt(tokens, index, end, pairs, knownAliases)) return true;
+    if (objectAssignHasGapOutcomeAt(tokens, index, end, pairs, knownAliases, functionRanges)) return true;
     const writerName = boundaryWriterNameAt(tokens, index);
     const stateArgument = boundaryWriterStateArgumentAt(tokens, index, knownWriterAliases);
     if (writerName !== null && stateArgument !== undefined
@@ -1703,6 +1789,12 @@ const isDeadlineTriggerAt = (tokens, index) => {
 
 const findAssignedAlias = (tokens, triggerIndex) => {
   if (tokens[triggerIndex - 1]?.value === '=>' || tokens[triggerIndex + 1]?.value === '=>') return null;
+  if (tokens[triggerIndex - 1]?.value === '{'
+    && ['const', 'let', 'var'].includes(tokens[triggerIndex - 2]?.value)
+    && tokens[triggerIndex + 1]?.value === ':'
+    && tokens[triggerIndex + 2]?.type === 'identifier') {
+    return { name: tokens[triggerIndex + 2].value, index: triggerIndex + 2, destructured: true };
+  }
   let statementStart = triggerIndex;
   while (statementStart > 0 && ![';', '{', '}'].includes(tokens[statementStart - 1].value)) statementStart -= 1;
   const statementEnd = findStatementEnd(tokens, statementStart, tokens.length);
@@ -1978,8 +2070,25 @@ const findCatchBindings = (tokens, pairs, lexicalScopes) => {
   return bindings;
 };
 
+const findDestructuredDeadlineBindings = (tokens, pairs, lexicalScopes) => tokens.flatMap((token, index) => {
+  if (token.value !== 'deadlineReached'
+    || tokens[index - 1]?.value !== '{'
+    || !['const', 'let', 'var'].includes(tokens[index - 2]?.value)
+    || tokens[index + 1]?.value !== ':'
+    || tokens[index + 2]?.type !== 'identifier') return [];
+  const patternEnd = pairs.get(index - 1);
+  if (patternEnd === undefined || tokens[patternEnd + 1]?.value !== '=') return [];
+  return [{
+    name: tokens[index + 2].value,
+    index: index + 2,
+    kind: tokens[index - 2].value,
+    scope: lexicalScopePath(lexicalScopes, index - 2)
+  }];
+});
+
 const collectLexicalBindings = (tokens, pairs, lexicalScopes, functionRanges) => [
   ...findVariableDeclarations(tokens, pairs, lexicalScopes, functionRanges),
+  ...findDestructuredDeadlineBindings(tokens, pairs, lexicalScopes),
   ...findFunctionParameterBindings(tokens, pairs, lexicalScopes, functionRanges),
   ...findCatchBindings(tokens, pairs, lexicalScopes)
 ];
@@ -2324,7 +2433,7 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
         tokens,
         pairs
       );
-      if (!visibleAssignments.some(candidate => candidate.index === alias.index)) continue;
+      if (!alias.destructured && !visibleAssignments.some(candidate => candidate.index === alias.index)) continue;
       if (!isConditionalDeadlineUse(tokens, index, pairs, functionRanges, alias.negated)) continue;
       const decision = includeAbruptCompletionHandlers(
         tokens,
@@ -3831,4 +3940,22 @@ test('deadline policy inventory applies alias polarity to short-circuit decision
     }
   ]);
   assert.deepEqual(offenders, ['discord/deadline-negated-alias-or-gap.js:1']);
+});
+
+
+test('deadline policy inventory resolves named patches, destructured triggers, and identity wrappers', () => {
+  const offendersFor = source => findDeadlineGapOffenders([{ relative: "mutation.js", source }]);
+  assert.deepEqual(offendersFor("const patch = { state: READINESS.GAP }; if (deadlineReached) return Object.assign(result, patch);"), ["mutation.js:1"]);
+  assert.deepEqual(offendersFor("const { deadlineReached: expired } = status; if (expired) return READINESS.GAP;"), ["mutation.js:1"]);
+  assert.deepEqual(offendersFor("if (deadlineReached) return Object.freeze({ state: READINESS.GAP });"), ["mutation.js:1"]);
+});
+
+test('deadline policy inventory follows evaluated expiry outcomes', () => {
+  const offendersFor = source => findDeadlineGapOffenders([{ relative: "mutation.js", source }]);
+  assert.deepEqual(offendersFor("if (deadlineReached) setTimeout(() => READINESS.GAP, 0);"), []);
+  assert.deepEqual(offendersFor("if (deadlineReached) return void READINESS.GAP;"), []);
+  assert.deepEqual(offendersFor("if (deadlineReached) return typeof READINESS.GAP;"), []);
+  assert.deepEqual(offendersFor("if (deadlineReached) return void READINESS.GAP, READINESS.GAP;"), ["mutation.js:1"]);
+  assert.deepEqual(offendersFor("if (deadlineReached) cleanup(); if (!deadlineReached) return READINESS.GAP;"), []);
+  assert.deepEqual(offendersFor("if (deadlineReached) setTimeout(() => { state.markIntakeBoundary(id, READINESS.GAP, detail); }, 0);"), ["mutation.js:1"]);
 });
