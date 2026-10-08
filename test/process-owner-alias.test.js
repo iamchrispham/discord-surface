@@ -237,3 +237,50 @@ test("static template eval source is parsed without evaluating it", () => {
   runFixture("function newProbe(pid) { eval(`const value = 1`); }", [], []);
   runFixture("function newProbe(pid, source) { eval(`process.kill(${source}, 0)`); }", [], []);
 });
+
+test("native Promise catch handlers are inventoried", () => {
+  runFixture("function newProbe(pid) { Promise.resolve(Promise.reject(pid)).catch(process.kill); }", [], ["unsupported process probe private-alias.js:newProbe"]);
+  runFixture("function newProbe(pid) { Promise.resolve(Promise.reject(pid)).catch(reason => reason); }", [], []);
+});
+
+test("Object.defineProperties descriptors preserve probe aliases", () => {
+  runFixture("const api = {}; Object.defineProperties(api, { probe: { value: process.kill } }); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const api = {}; Object.defineProperties(api, { probe: { value: () => true } }); function newProbe(pid) { api.probe(pid, 0); }", [], []);
+});
+
+test("timer namespace imports forward callbacks", () => {
+  runFixture("import * as timers from 'node:timers'; function newProbe(pid) { timers.setImmediate(process.kill, pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("import * as timers from 'node:timers'; function newProbe(pid) { timers.setImmediate(() => true, pid, 0); }", [], []);
+});
+
+test("getter return traversal includes conditional branches", () => {
+  runFixture("const api = { get probe() { if (flag) return process.kill; return () => true; } }; function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("const api = { get probe() { if (flag) return () => true; return () => false; } }; function newProbe(pid) { api.probe(pid, 0); }", [], []);
+});
+
+test("constructor callable and object returns preserve probe aliases", () => {
+  runFixture("function Factory() { return process.kill; } const probe = new Factory(); function newProbe(pid) { probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function Factory() { return { probe: process.kill }; } const api = new Factory(); function newProbe(pid) { api.probe(pid, 0); }", ["private-alias.js\u0000newProbe"], ["unclassified process probe private-alias.js:newProbe"]);
+  runFixture("function Factory() { return 1; } const probe = new Factory(); function newProbe(pid) { probe(pid, 0); }", [], []);
+
+  const importedCallable = inventoryFiles({
+    "private-alias.js": "import { Factory } from './factory'; const probe = new Factory(); function newProbe(pid) { probe(pid, 0); }",
+    "factory.js": "export function Factory() { return process.kill; }"
+  });
+  assert.deepEqual(importedCallable.kills, ["private-alias.js\u0000newProbe"]);
+  assert.deepEqual(importedCallable.violations, ["unclassified process probe private-alias.js:newProbe"]);
+
+  const importedObject = inventoryFiles({
+    "private-alias.js": "import { Factory } from './factory'; const api = new Factory(); function newProbe(pid) { api.probe(pid, 0); }",
+    "factory.js": "export function Factory() { return { probe: process.kill }; }"
+  });
+  assert.deepEqual(importedObject.kills, ["private-alias.js\u0000newProbe"]);
+  assert.deepEqual(importedObject.violations, ["unclassified process probe private-alias.js:newProbe"]);
+
+  const importedOrdinary = inventoryFiles({
+    "private-alias.js": "import { Factory } from './factory'; const probe = new Factory(); function newProbe(pid) { probe(pid, 0); }",
+    "factory.js": "export function Factory() { return () => true; }"
+  });
+  assert.deepEqual(importedOrdinary.kills, []);
+  assert.deepEqual(importedOrdinary.violations, []);
+});

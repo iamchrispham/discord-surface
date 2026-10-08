@@ -620,6 +620,35 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         }
       }
     }
+    if (objectMethodCall === 'defineProperties' && !shadowedObject) {
+      const [target, descriptorMapArgument] = expression.arguments;
+      const descriptorMap = descriptorMapArgument && ts.isParenthesizedExpression(descriptorMapArgument)
+        ? descriptorMapArgument.expression : descriptorMapArgument;
+      if (target && descriptorMap && ts.isObjectLiteralExpression(descriptorMap)) {
+        for (const entry of descriptorMap.properties) {
+          if (!ts.isPropertyAssignment(entry) || !entry.name) continue;
+          const names = ts.isIdentifier(entry.name) || ts.isStringLiteral(entry.name) ||
+            ts.isNumericLiteral(entry.name) ? [entry.name.text]
+            : ts.isComputedPropertyName(entry.name)
+              ? [...staticValue(entry.name.expression)].filter(value => typeof value === 'string' ||
+                typeof value === 'number').map(value => value.toString())
+              : [];
+          const descriptor = ts.isParenthesizedExpression(entry.initializer)
+            ? entry.initializer.expression : entry.initializer;
+          if (!names.length || !ts.isObjectLiteralExpression(descriptor)) continue;
+          for (const property of descriptor.properties) {
+            if (!ts.isPropertyAssignment(property) || !property.name) continue;
+            const descriptorName = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
+              ? property.name.text
+              : ts.isComputedPropertyName(property.name)
+                ? [...staticValue(property.name.expression)].find(value => typeof value === 'string') || null
+                : null;
+            if (descriptorName !== 'value') continue;
+            indexMemberAssignmentsForTarget(target, names, { source: property.initializer });
+          }
+        }
+      }
+    }
     ts.forEachChild(expression, indexRightHandSide);
   };
   const bindingPropertyNames = binding => {
@@ -1439,8 +1468,45 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
 
     if (ts.isNewExpression(node)) {
       const constructors = resolveSet(node.expression, seen);
-      return moduleResolver?.resolveNew
-        ? moduleResolver.resolveNew(constructors, node.arguments || [], virtualPath) : empty;
+      const result = new Set(moduleResolver?.resolveNew
+        ? moduleResolver.resolveNew(constructors, node.arguments || [], virtualPath) : empty);
+      const constructorSentinels = new Set([
+        PID_PROBE, PROCESS_OBJECT, PROCESS_NAMESPACE, GLOBAL_OBJECT, REFLECT_OBJECT, BOUND_PROBE,
+        BOUND_REFLECT_APPLY, REFLECT_APPLY, REFLECT_CALL_METHOD, REFLECT_APPLY_METHOD,
+        CALL_METHOD, APPLY_METHOD, ...INVOCATION_METHODS
+      ]);
+      const addConstructorReturns = atoms => {
+        for (const atom of atoms) {
+          if (atom && typeof atom === 'object' || constructorSentinels.has(atom)) result.add(atom);
+        }
+      };
+      const addReturnExpression = expression => {
+        const returned = transparentExpression(expression) || expression;
+        if (ts.isConditionalExpression(returned)) {
+          addReturnExpression(returned.whenTrue);
+          addReturnExpression(returned.whenFalse);
+          return;
+        }
+        if (ts.isObjectLiteralExpression(returned)) {
+          result.add({ objectLiteral: returned, modulePath: virtualPath });
+          return;
+        }
+        if (ts.isArrowFunction(returned) || ts.isFunctionExpression(returned) ||
+          ts.isFunctionDeclaration(returned)) {
+          result.add({ callable: returned, modulePath: virtualPath });
+          return;
+        }
+        if (ts.isClassExpression(returned) || ts.isClassDeclaration(returned)) {
+          result.add({ classDeclaration: returned, modulePath: virtualPath, instance: false });
+          return;
+        }
+        addConstructorReturns(resolveSet(returned, seen));
+      };
+      if (moduleResolver?.resolveCall) {
+        addConstructorReturns(moduleResolver.resolveCall(constructors, node.arguments || [], virtualPath));
+      }
+      for (const expression of callableReturnExpressions(node.expression, seen)) addReturnExpression(expression);
+      return result;
     }
 
     if (ts.isCallExpression(node)) {
@@ -1920,9 +1986,18 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
                 typeof value === 'number')?.toString() || null
               : null;
           if (key !== name) continue;
-          for (const statement of property.body?.statements || []) {
-            if (!ts.isReturnStatement(statement) || !statement.expression) continue;
-            for (const atom of resolveSet(statement.expression, seen)) found.add(atom);
+          const returns = [];
+          const collectReturns = node => {
+            if (node !== property.body && ts.isFunctionLike(node)) return;
+            if (ts.isReturnStatement(node)) {
+              if (node.expression) returns.push(node.expression);
+              return;
+            }
+            ts.forEachChild(node, collectReturns);
+          };
+          if (property.body) collectReturns(property.body);
+          for (const expression of returns) {
+            for (const atom of resolveSet(expression, seen)) found.add(atom);
           }
           return found;
         }
@@ -2228,6 +2303,12 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
       if (isTimerRequire(callee.expression)) return member;
       const receiverSymbol = checker.getSymbolAtLocation(callee.expression);
       for (const declaration of receiverSymbol?.declarations || []) {
+        if (ts.isNamespaceImport(declaration)) {
+          const importDeclaration = declaration.parent.parent;
+          if (ts.isImportDeclaration(importDeclaration) && ts.isStringLiteral(importDeclaration.moduleSpecifier) &&
+            (importDeclaration.moduleSpecifier.text === 'node:timers' ||
+              importDeclaration.moduleSpecifier.text === 'timers')) return member;
+        }
         if (ts.isVariableDeclaration(declaration) && declaration.initializer &&
           isTimerRequire(declaration.initializer)) return member;
       }
@@ -2314,8 +2395,9 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
     return sources.some(source => isNativePromiseResult(source, seen));
   }
 
-  function isNativePromiseThen(callee) {
-    return ts.isPropertyAccessExpression(callee) && callee.name.text === 'then' &&
+  function isNativePromiseHandler(callee) {
+    return ts.isPropertyAccessExpression(callee) &&
+      (callee.name.text === 'then' || callee.name.text === 'catch') &&
       isNativePromiseResult(callee.expression);
   }
 
@@ -2432,8 +2514,10 @@ function parseOwnerSites(fileName, text, generatedOwner = null, moduleResolver =
         }
       }
       if (isForwardingCallbackApi(callee)) indexForwardedCallback(node, owner);
-      if (isNativePromiseThen(callee)) {
-        const callbacks = [callArguments[0] || node.arguments[0], callArguments[1] || node.arguments[1]];
+      if (isNativePromiseHandler(callee)) {
+        const callbacks = callee.name.text === 'catch'
+          ? [callArguments[0] || node.arguments[0]]
+          : [callArguments[0] || node.arguments[0], callArguments[1] || node.arguments[1]];
         const hasProbeHandler = callbacks.some(callback => {
           const callbackAtoms = callback && staticValue(callback);
           return callbackAtoms && [PID_PROBE, BOUND_PROBE, ...INVOCATION_METHODS]
