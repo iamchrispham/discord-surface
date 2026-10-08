@@ -1,6 +1,6 @@
 'use strict';
 
-function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES, DECISION_TRANSPORT_OUTCOMES }) {
+function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES, DECISION_NATIVE_OUTCOMES, DECISION_STATES, DECISION_TRANSPORT_OUTCOMES }) {
   return {
     async reconcilePending(before, signal, readyOnly = false, channelIds = null, messageIds = null) {
       const deadline = Date.now() + this.recoveryTimeoutMs;
@@ -27,6 +27,11 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
           isHeldDurable(message));
       const pendingDecisions = new Map((this.state.listDecisionPendingWork?.() || [])
         .map(click => [click.interactionId, click]));
+      const pendingNativeReturnOutcomes = new Set([
+        DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED,
+        DECISION_NATIVE_OUTCOMES.IN_FLIGHT,
+        DECISION_NATIVE_OUTCOMES.UNKNOWN
+      ]);
       const decisionProjectionPending = message => {
         const click = pendingDecisions.get(message.id);
         const retryable = click?.projectionOutcome == null || [
@@ -35,6 +40,19 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
           DECISION_TRANSPORT_OUTCOMES.UNKNOWN
         ].includes(click.projectionOutcome);
         return Boolean(click?.canonical?.materialized && click.canonical.answer?.length > 4096 && retryable);
+      };
+      const reconcileDecisionSubmission = messageId => {
+        const click = this.state.getDecisionClick?.(messageId) || pendingDecisions.get(messageId);
+        if (!pendingNativeReturnOutcomes.has(click?.nativeReturn?.outcome)) return;
+        const current = this.state.getMessage(messageId);
+        const submittedStates = [
+          MESSAGE_STATES.SUBMITTED,
+          MESSAGE_STATES.REPLY_READY,
+          MESSAGE_STATES.REPLYING,
+          MESSAGE_STATES.REPLIED
+        ];
+        if (!submittedStates.includes(current?.state)) return;
+        this.state.recordDecisionNativeReturnOutcome(messageId, DECISION_NATIVE_OUTCOMES.SUBMITTED);
       };
       const decisionRecovery = Promise.resolve(this.startDecisionRecovery(signal, selectedChannels));
       let decisionRecoverySettled = false;
@@ -347,6 +365,12 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
           };
           if (message.state === 'accepted') {
             if (pendingDecisions.has(message.id)) await settleDecisionRecovery();
+            const decisionClick = this.state.getDecisionClick?.(message.id) || pendingDecisions.get(message.id);
+            if (decisionClick && (decisionClick.state === DECISION_STATES.STALE ||
+              decisionClick.nativeReturn?.outcome !== DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED)) {
+              blockedOwners.add(key);
+              continue;
+            }
             if (decisionProjectionPending(message)) {
               blockedOwners.add(key);
               continue;
@@ -374,6 +398,7 @@ function createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STA
             recoveryOperationStarted = false;
             result = await deliverReplyWithinRecovery(storedMessage, { status: message.state, message });
           }
+          reconcileDecisionSubmission(message.id);
           if (result === DISPATCH_OUTCOMES.NOT_SUBMITTED || result?.status === DISPATCH_OUTCOMES.NOT_SUBMITTED) {
             blockedOwners.add(key);
           }

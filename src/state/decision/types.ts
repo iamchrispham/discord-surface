@@ -27,6 +27,7 @@ export const DECISION_RECEIPT_KINDS = {
   PRESENTATION_STALE: 'decision-presentation-stale',
   CLICK: 'decision-click',
   AUTHORIZATION_OUTCOME: 'decision-authorization-outcome',
+  CLICK_STALE: 'decision-click-stale',
   CALLBACK_ATTEMPT: 'decision-callback-attempt',
   CALLBACK_OUTCOME: 'decision-callback-outcome',
   REJECTION_ATTEMPT: 'decision-rejection-attempt',
@@ -338,6 +339,11 @@ export interface DecisionTransitionResult {
   click: DecisionClick | null;
 }
 
+export interface DecisionBindingRecoveryResult {
+  binding: DecisionBinding | null;
+  click: DecisionClick | null;
+}
+
 export interface DecisionHandlers {
   registerPresentation(state: DecisionStateStore, input: DecisionPresentationInput): DecisionPresentationResult;
   findPresentation(state: DecisionStateStore, input: DecisionPresentationLookupInput): DecisionPresentation | null;
@@ -348,6 +354,7 @@ export interface DecisionHandlers {
   admitClickAndBeginCallback(state: DecisionStateStore, input: DecisionClickInput): DecisionClickAdmission;
   admitClickAndBeginAuthorization(state: DecisionStateStore, input: DecisionClickInput): DecisionClickAdmission;
   recordAuthorizationOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionAuthorizationOutcome): DecisionClickAdmission;
+  reconcileClickBinding(state: DecisionStateStore, interactionId: string): DecisionBindingRecoveryResult;
   getClick(state: DecisionStateStore, interactionId: string): DecisionClick | null;
   beginCallback(state: DecisionStateStore, interactionId: string): DecisionTransitionResult;
   recordCallbackOutcome(state: DecisionStateStore, interactionId: string, outcome: DecisionTransportOutcome): DecisionTransitionResult;

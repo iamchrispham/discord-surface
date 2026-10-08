@@ -1090,6 +1090,10 @@ class SurfaceState {
     return decisionHandlers.recordAuthorizationOutcome(this, interactionId, outcome);
   }
 
+  reconcileDecisionClickBinding(interactionId) {
+    return decisionHandlers.reconcileClickBinding(this, interactionId);
+  }
+
   getDecisionClick(interactionId) {
     return decisionHandlers.getClick(this, interactionId);
   }

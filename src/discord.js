@@ -12,7 +12,7 @@ const {
 const fs = require('node:fs');
 const { ACK_WAITING, acknowledgmentCommand, createAcknowledgmentDelivery, waitForAcknowledgment, watchAcknowledgments } = require('./acknowledgment');
 const { CODEX_VALIDATION_KINDS, agentCompletionCommand, watcherNoticeCompletionCommand, ClaudeProvider, CodexProvider, probeClaudeChannel, validateCodexSessionIdentity, validateCodexSessionIdentityAsync, waitForReply } = require('./native');
-const { DISPATCH_OUTCOMES, DECISION_TRANSPORT_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
+const { DISPATCH_OUTCOMES, DECISION_NATIVE_OUTCOMES, DECISION_STATES, DECISION_TRANSPORT_OUTCOMES, MESSAGE_STATES, READINESS, RECOVERY_LIMITS, UnresolvedWorkError } = require('./state');
 const { CLAUDE_ENDPOINT_UNAVAILABLE_PREFIX } = require('./ordinary/constants');
 const { conductorMarkerMatches } = require('./topic');
 const { readDirectPostFileSnapshot } = require('./direct-post-file');
@@ -218,7 +218,7 @@ function createSurfaceConsumer(options) {
 }
 
 const liveAttachmentRecovery = createLiveAttachmentRecoveryHandlers({ recoveryKind, bindingIdentityMatches, AGENT_ATTACHMENT_RECOVERY_KINDS, CODEX_VALIDATION_KINDS, READINESS, THREAD_STATES });
-const pendingReconciliation = createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES, DECISION_TRANSPORT_OUTCOMES });
+const pendingReconciliation = createPendingReconciliationHandlers({ heldParentRequestIds, MESSAGE_STATES, CODEX_VALIDATION_KINDS, recoveryKind, waitForRecoveryOperation, startReconciliationLookup, recoveryFetch, attachReconciliationWaiter, storeReconciliationSnapshot, hasReconciliationLookup, assertPublicThread, storedChannelMatches, conductorMarkerMatchesTopic, DISPATCH_OUTCOMES, DECISION_NATIVE_OUTCOMES, DECISION_STATES, DECISION_TRANSPORT_OUTCOMES });
 const transportRecovery = createTransportRecoveryHandlers({ READINESS, THREAD_STATES, RECOVERY_POLICIES, recoveryKind, createTransportRecoveryWaiter, RECOVERY_WAITER_DEADLINE_GRACE_MS });
 
 const { createOutboundDeliveryHandlers } = require('./discord/outbound-delivery');

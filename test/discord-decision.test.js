@@ -11,9 +11,28 @@ const { presentDecision } = require('../src/decision-present');
 const { DiscordGateway } = require('../src/discord');
 const { createDecisionConsumer } = require('../src/discord/decision');
 const { encodeDecisionCustomId, sendInteractionFollowup } = require('../src/discord-interaction');
-const { DECISION_RECEIPT_KINDS, READINESS, SurfaceState } = require('../src/state');
+const {
+  DECISION_AUTHORIZATION_OUTCOMES,
+  DECISION_NATIVE_OUTCOMES,
+  DECISION_RECEIPT_KINDS,
+  DECISION_STATES,
+  DECISION_TRANSPORT_OUTCOMES,
+  MESSAGE_STATES,
+  READINESS,
+  SurfaceState
+} = require('../src/state');
 
 const NATIVE_ID = '9caa5d21-2169-429d-918b-5f08651b5dbd';
+
+test('decision recovery and native dispatch keep one owner each', () => {
+  const decisionSource = fs.readFileSync(path.join(__dirname, '../src/discord/decision.ts'), 'utf8');
+  const reconciliationSource = fs.readFileSync(path.join(__dirname, '../src/discord/pending-reconciliation.js'), 'utf8');
+
+  assert.equal((decisionSource.match(/state\.reconcileDecisionClickBinding\(/g) || []).length, 1);
+  assert.equal((decisionSource.match(/options\.processAccepted\s*\(/g) || []).length, 1);
+  assert.equal((reconciliationSource.match(/this\.consumer\.handleStoredMessage\s*\(/g) || []).length, 1);
+  assert.equal(decisionSource.includes('savedBindingIsActive'), false);
+});
 
 async function fixture(t, { callback = null, questionText = 'Choose the canonical answer', attachFiles = true, embedLinks = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-decision-gateway-'));
@@ -276,10 +295,11 @@ test('original held click resumes through startDecisionRecovery without a second
   assert.equal(decisionMessages(f.state).length, 1);
 });
 
-test('decision recovery retains authorized clicks when their saved binding is replaced or retired', { timeout: 30000 }, async t => {
+test('decision recovery settles authorized clicks only after known binding loss', { timeout: 30000 }, async t => {
   const scenarios = [
-    { name: 'replacement generation', current: binding => ({ ...binding, generation: binding.generation + 1 }) },
-    { name: 'inactive binding', current: binding => ({ ...binding, active: false }) }
+    { name: 'replacement generation', current: binding => ({ ...binding, generation: binding.generation + 1 }), stale: true },
+    { name: 'inactive binding', current: binding => ({ ...binding, active: false }), stale: true },
+    { name: 'missing lookup', current: () => null, stale: false }
   ];
 
   for (const scenario of scenarios) {
@@ -310,11 +330,12 @@ test('decision recovery retains authorized clicks when their saved binding is re
 
       const remaining = await f.gateway.startDecisionRecovery(new AbortController().signal, new Set(['channel']));
       const recovered = f.state.getDecisionClick(interactionId);
-      assert.equal(recovered.state, 'canonical_pending');
+      assert.equal(recovered.state, scenario.stale ? DECISION_STATES.STALE : 'canonical_pending');
+      assert.equal(recovered.authorizationOutcome, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED);
       assert.equal(recovered.canonical, null);
       assert.equal(recovered.nativeReturn, null);
-      assert.deepEqual(f.state.listDecisionPendingWork().map(click => click.interactionId), [interactionId]);
-      assert.deepEqual(remaining.map(click => click.interactionId), [interactionId]);
+      assert.deepEqual(f.state.listDecisionPendingWork().map(click => click.interactionId), scenario.stale ? [] : [interactionId]);
+      assert.deepEqual(remaining.map(click => click.interactionId), scenario.stale ? [] : [interactionId]);
       assert.equal(f.dispatches.length, 0);
     });
   }
@@ -1582,6 +1603,127 @@ test('generic recovery does not dispatch while a decision projection is pending'
   assert.equal(f.state.recordDecisionProjectionOutcome('generic-projection-gate', 'rejected').accepted, true);
   await f.gateway.reconcilePending();
   assert.equal(f.dispatches.length, 1);
+});
+
+test('generic recovery does not dispatch an accepted message for a stale decision click', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const interactionId = 'generic-stale-decision';
+  const savedBinding = f.state.getBinding('channel');
+  assert.equal(f.state.admitDecisionClickAndBeginAuthorization({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: savedBinding,
+    applicationId: 'application'
+  }).accepted, true);
+  assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+  assert.equal(f.state.recordDecisionAuthorizationOutcome(interactionId, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED).accepted, true);
+  assert.equal(f.state.importDecisionWinner(interactionId, {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'answer-stale-generic',
+    answer: 'canonical answer'
+  }).accepted, true);
+  assert.equal(f.state.recordDecisionProjectionOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+  assert.equal(f.state.recordDecisionNativeReturnOutcome(interactionId, DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED).accepted, true);
+
+  const getBinding = f.state.getBinding.bind(f.state);
+  f.state.getBinding = channelId => channelId === 'channel' ? { ...savedBinding, active: false } : getBinding(channelId);
+  assert.equal(f.state.reconcileDecisionClickBinding(interactionId).click.state, DECISION_STATES.STALE);
+  f.state.getBinding = getBinding;
+
+  await f.gateway.reconcilePending();
+
+  assert.equal(f.state.getMessage(interactionId).state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(f.state.getDecisionClick(interactionId).state, DECISION_STATES.STALE);
+  assert.equal(f.dispatches.length, 0);
+});
+
+test('generic recovery preserves an unknown decision native return', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const interactionId = 'generic-unknown-decision';
+  assert.equal(f.state.admitDecisionClickAndBeginAuthorization({
+    interactionId,
+    presentationId: f.presentation.presentationId,
+    selectedKey: 'approve',
+    actorId: 'operator',
+    guildId: 'guild',
+    channelId: 'channel',
+    messageId: f.presentation.messageId,
+    binding: f.state.getBinding('channel'),
+    applicationId: 'application'
+  }).accepted, true);
+  assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+  assert.equal(f.state.recordDecisionAuthorizationOutcome(interactionId, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED).accepted, true);
+  assert.equal(f.state.importDecisionWinner(interactionId, {
+    qid: f.presentation.qid,
+    questionGeneration: f.presentation.questionGeneration,
+    target: f.presentation.target,
+    source: 'current',
+    materialized: true,
+    reference: 'answer-unknown-generic',
+    answer: 'canonical answer'
+  }).accepted, true);
+  assert.equal(f.state.recordDecisionProjectionOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+  assert.equal(f.state.recordDecisionNativeReturnOutcome(interactionId, DECISION_NATIVE_OUTCOMES.UNKNOWN).accepted, true);
+
+  await f.gateway.reconcilePending();
+
+  assert.equal(f.state.getMessage(interactionId).state, MESSAGE_STATES.ACCEPTED);
+  assert.equal(f.state.getDecisionClick(interactionId).nativeReturn.outcome, DECISION_NATIVE_OUTCOMES.UNKNOWN);
+  assert.equal(f.state.listDecisionPendingWork().some(click => click.interactionId === interactionId), true);
+  assert.equal(f.dispatches.length, 0);
+});
+
+test('generic recovery records decision submission after dispatch for completed projections', { timeout: 30000 }, async t => {
+  for (const projectionOutcome of [DECISION_TRANSPORT_OUTCOMES.SENT, DECISION_TRANSPORT_OUTCOMES.REJECTED]) {
+    await t.test(projectionOutcome, async subtest => {
+      const f = await fixture(subtest);
+      const interactionId = `generic-decision-${projectionOutcome}`;
+      const admitted = f.state.admitDecisionClickAndBeginAuthorization({
+        interactionId,
+        presentationId: f.presentation.presentationId,
+        selectedKey: 'approve',
+        actorId: 'operator',
+        guildId: 'guild',
+        channelId: 'channel',
+        messageId: f.presentation.messageId,
+        binding: f.state.getBinding('channel'),
+        applicationId: 'application'
+      });
+      assert.equal(admitted.accepted, true);
+      assert.equal(f.state.recordDecisionCallbackOutcome(interactionId, DECISION_TRANSPORT_OUTCOMES.SENT).accepted, true);
+      assert.equal(f.state.recordDecisionAuthorizationOutcome(interactionId, DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED).accepted, true);
+      assert.equal(f.state.importDecisionWinner(interactionId, {
+        qid: f.presentation.qid,
+        questionGeneration: f.presentation.questionGeneration,
+        target: f.presentation.target,
+        source: 'current',
+        materialized: true,
+        reference: `answer-${projectionOutcome}`,
+        answer: 'canonical answer'
+      }).accepted, true);
+      assert.equal(f.state.recordDecisionProjectionOutcome(interactionId, projectionOutcome).accepted, true);
+      const queuedDuplicate = f.state.queueDecisionNativeReturn(interactionId);
+      assert.equal(queuedDuplicate.accepted, false);
+      assert.equal(queuedDuplicate.duplicate, true);
+      assert.equal(f.state.recordDecisionNativeReturnOutcome(interactionId, DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED).accepted, true);
+
+      await f.gateway.reconcilePending();
+
+      assert.equal(f.state.getMessage(interactionId).state, MESSAGE_STATES.SUBMITTED);
+      assert.equal(f.state.getDecisionClick(interactionId).nativeReturn.outcome, DECISION_NATIVE_OUTCOMES.SUBMITTED);
+      assert.equal(f.state.listDecisionPendingWork().some(click => click.interactionId === interactionId), false);
+      assert.equal(f.dispatches.length, 1);
+    });
+  }
 });
 
 test('deleted question projection is terminal and releases long-answer native custody', { timeout: 30000 }, async t => {

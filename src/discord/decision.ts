@@ -142,6 +142,7 @@ export interface DecisionConsumerState {
   beginDecisionRejectionFollowup(interactionId: string): unknown;
   recordDecisionRejectionOutcome(interactionId: string, outcome: DecisionTransportOutcome): unknown;
   getDecisionClick(interactionId: string): DecisionClick | null;
+  reconcileDecisionClickBinding(interactionId: string): { binding: DecisionBinding | null; click: DecisionClick | null };
   recordDecisionCallbackOutcome(interactionId: string, outcome: DecisionTransportOutcome): unknown;
   importDecisionWinner(interactionId: string, result: DecisionCanonicalResult): {
     accepted: boolean;
@@ -228,14 +229,6 @@ function provider(value: unknown): value is AgentProvider {
 function bindingInput(value: DecisionBinding | null): DecisionBindingInput | null {
   if (!value || value.active !== true || value.readiness !== 'ready' || !provider(value.provider)) return null;
   return { ...value, provider: value.provider, readiness: value.readiness as Readiness };
-}
-
-function savedBindingIsActive(
-  click: DecisionClick,
-  state: DecisionConsumerState,
-  current = state.getBinding(click.channelId)
-): boolean {
-  return current?.active === true && current.generation === click.binding.generation;
 }
 
 function transportOutcome(value: unknown): DecisionTransportOutcome {
@@ -392,11 +385,7 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
   }
 
   function authorizationTransition(interactionId: string, outcome: DecisionAuthorizationOutcome): { outcome: DecisionAuthorizationOutcome | null; click: DecisionClick | null } {
-    const current = state.getDecisionClick(interactionId);
-    const nextOutcome = outcome === DECISION_AUTHORIZATION_OUTCOMES.AUTHORIZED && current && !savedBindingIsActive(current, state)
-      ? DECISION_AUTHORIZATION_OUTCOMES.DENIED
-      : outcome;
-    const transition = state.recordDecisionAuthorizationOutcome(interactionId, nextOutcome) as { click?: DecisionClick | null };
+    const transition = state.recordDecisionAuthorizationOutcome(interactionId, outcome) as { click?: DecisionClick | null };
     const click = transition?.click || state.getDecisionClick(interactionId);
     return { outcome: click?.authorizationOutcome || null, click };
   }
@@ -589,7 +578,10 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
 
   async function native(click: DecisionClick, signal?: AbortSignal, retryKnownUnsubmitted = false): Promise<unknown> {
     const message = safeMessage(state, click.interactionId);
-    if (!message || !options.processAccepted || click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED ||
+    if (!message || message.state !== MESSAGE_STATES.ACCEPTED || !options.processAccepted ||
+      click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT ||
+      click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.SUBMITTED ||
+      click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.UNKNOWN ||
       (click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.NOT_SUBMITTED && !retryKnownUnsubmitted) ||
       click.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.REJECTED) return message;
     const result = await options.processAccepted(message, signal, { continueUntilFinal: false, awaitDispatchOutcome: true });
@@ -864,21 +856,18 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
         if (state.listDecisionPendingWork().some(click => click.interactionId === pendingClick.interactionId)) remaining.push(pendingClick);
         continue;
       }
-      const activeBinding = state.getBinding(pendingClick.channelId);
-      if (!savedBindingIsActive(pendingClick, state, activeBinding)) {
-        if (pendingClick.authorizationOutcome === null) {
-          const transition = authorizationTransition(pendingClick.interactionId, DECISION_AUTHORIZATION_OUTCOMES.DENIED);
-          if (transition.outcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
-            await deliverRejection(transition.click || pendingClick, signal);
-          }
-          const unresolved = state.listDecisionPendingWork().find(click => click.interactionId === pendingClick.interactionId);
-          if (unresolved) remaining.push(unresolved);
-        } else {
-          remaining.push(pendingClick);
-        }
+      const bindingRecovery = state.reconcileDecisionClickBinding(pendingClick.interactionId);
+      pendingClick = bindingRecovery.click || pendingClick;
+      if (pendingClick.authorizationOutcome === DECISION_AUTHORIZATION_OUTCOMES.DENIED) {
+        try { await deliverRejection(pendingClick, signal); } catch {}
+        const unresolved = state.listDecisionPendingWork().find(click => click.interactionId === pendingClick.interactionId);
+        if (unresolved) remaining.push(unresolved);
         continue;
       }
-      if (!bindingInput(activeBinding)) {
+      if (pendingClick.state === DECISION_STATES.STALE) {
+        continue;
+      }
+      if (!bindingInput(bindingRecovery.binding)) {
         remaining.push(pendingClick);
         continue;
       }
@@ -886,6 +875,18 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
       const projectionEnded = pendingClick.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.SENT ||
         pendingClick.projectionOutcome === DECISION_TRANSPORT_OUTCOMES.REJECTED;
       if (stored?.decisionResult && projectionEnded) {
+        const uncertainNativeOutcome = pendingClick.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.IN_FLIGHT ||
+          pendingClick.nativeReturn?.outcome === DECISION_NATIVE_OUTCOMES.UNKNOWN;
+        const storedSubmissionConfirmed = [
+          MESSAGE_STATES.SUBMITTED,
+          MESSAGE_STATES.REPLY_READY,
+          MESSAGE_STATES.REPLYING,
+          MESSAGE_STATES.REPLIED
+        ].includes(stored.state);
+        if (uncertainNativeOutcome && !storedSubmissionConfirmed) {
+          remaining.push(pendingClick);
+          continue;
+        }
         const reconciledNativeOutcome = nativeOutcomeFor(stored, null);
         if (reconciledNativeOutcome && reconciledNativeOutcome !== pendingClick.nativeReturn?.outcome) {
           try {
@@ -895,6 +896,8 @@ export function createDecisionConsumer(options: DecisionConsumerOptions) {
             if (!/native-outcome-conflict/.test(String((error as Error)?.message || error))) throw error;
           }
         }
+        const unresolved = state.listDecisionPendingWork().find(click => click.interactionId === pendingClick.interactionId);
+        if (unresolved) remaining.push(unresolved);
         continue;
       }
       try {

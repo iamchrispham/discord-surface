@@ -348,6 +348,9 @@ export function snapshot(state: DecisionStateStore): Snapshot {
         ? DECISION_STATES.REFUSED
         : click.callbackOutcome ? DECISION_STATES.CANONICAL_PENDING : DECISION_STATES.CALLBACK_PENDING;
       click.updatedAt = row.created_at;
+    } else if (row.kind === DECISION_RECEIPT_KINDS.CLICK_STALE) {
+      click.state = DECISION_STATES.STALE;
+      click.updatedAt = row.created_at;
     } else if (row.kind === DECISION_RECEIPT_KINDS.CALLBACK_ATTEMPT) {
       click.callbackAttempted = true;
       if (!click.canonical && !click.nativeReturn && click.authorizationOutcome === null) click.state = click.state === DECISION_STATES.AUTHORIZATION_PENDING
@@ -500,7 +503,10 @@ export function sameClickInput(click: MutableClick, input: Omit<DecisionClickInp
     click.messageId === input.messageId && bindingMatches(click.binding, binding);
 }
 
-export function currentBinding(state: DecisionStateStore, binding: DecisionBinding): boolean {
-  const current = state.getBinding(binding.channelId);
+export function currentBinding(
+  state: DecisionStateStore,
+  binding: DecisionBinding,
+  current = state.getBinding(binding.channelId)
+): boolean {
   return Boolean(current && current.active !== false && bindingMatches(normalizeBinding(current), binding));
 }
