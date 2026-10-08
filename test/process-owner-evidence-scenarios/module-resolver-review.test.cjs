@@ -225,6 +225,55 @@ test('imported callable bodies with probe arguments are conservatively refused',
   assert.deepEqual(identityResult.violations, ['unclassified process probe use.js:newProbe']);
 });
 
+test('unreachable CommonJS statement branches do not contribute exported probes', () => {
+  expectOrdinary({
+    'producer.js': 'if (false) module.exports = { probe: process.kill }; else module.exports = { probe: () => true };',
+    'use.js': "require('./producer').probe(1, 0);"
+  });
+});
+
+test('identity-preserving export wrappers and class attachments retain probe provenance', () => {
+  expectProbe({
+    'producer.js': 'module.exports = Object.freeze({ probe: process.kill });',
+    'use.js': "require('./producer').probe(1, 0);"
+  });
+  expectProbe({
+    'producer.js': 'class Api {}; Api.probe = process.kill; module.exports = Api;',
+    'use.js': "require('./producer').probe(1, 0);"
+  });
+});
+
+test('block-scoped Object shadows do not create CommonJS exports', () => {
+  expectOrdinary({
+    'producer.js': '{ const Object = { defineProperty() {} }; Object.defineProperty(module.exports, "probe", { value: process.kill }); } exports.probe = () => true;',
+    'use.js': "require('./producer').probe(1, 0);"
+  });
+});
+
+test('imported callable invocation wrappers preserve forwarded probe arguments', () => {
+  const producer = 'export function invoke(probe, pid) { probe(pid, 0); return true; }';
+  for (const call of [
+    'invoke.call(null, process.kill, 1)',
+    'invoke.apply(null, [process.kill, 1])',
+    'invoke.bind(null, process.kill, 1)()'
+  ]) {
+    expectUnsupported({
+      'producer.js': producer,
+      'use.js': `import { invoke } from './producer.js'; ${call};`
+    });
+  }
+});
+
+test('omitted and undefined process.kill signals are unsupported', () => {
+  expectUnsupported({ 'use.js': 'process.kill(1);' });
+  expectUnsupported({ 'use.js': 'process.kill(1, undefined);' });
+});
+
+test('finite Reflect.get probe lookups resolve only the unshadowed builtin', () => {
+  expectProbe({ 'use.js': "const probe = Reflect.get(process, 'kill'); probe(1, 0);" });
+  expectOrdinary({ 'use.js': "const Reflect = { get: () => 0 }; Reflect.get(process, 'kill');" });
+});
+
 test('unreachable local writes and short-circuited CommonJS writes stay ordinary', () => {
   expectOrdinary({
     'producer.js': 'export let probe = () => true; function install() { probe = process.kill; }',

@@ -537,7 +537,7 @@ function createLocalModuleResolver(files) {
       if (!ts.isCallExpression(expression) || !ts.isPropertyAccessExpression(expression.expression) ||
         expression.expression.name.text !== 'defineProperty' ||
         !ts.isIdentifier(expression.expression.expression) || expression.expression.expression.text !== 'Object' ||
-        module.declaredBindings.has('Object')) return;
+        !isUnshadowedGlobalName(expression.expression.expression, 'Object', module)) return;
       const [target, key, descriptor] = expression.arguments;
       if (!target || !key || !descriptor || !isExportObjectExpression(target) ||
         !ts.isObjectLiteralExpression(descriptor)) return;
@@ -694,6 +694,18 @@ function createLocalModuleResolver(files) {
     };
     const scanModuleLevel = node => {
       if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) return;
+      if (ts.isIfStatement(node)) {
+        const condition = unwrap(node.expression);
+        if (condition.kind === ts.SyntaxKind.TrueKeyword) {
+          scanModuleLevel(node.thenStatement);
+        } else if (condition.kind === ts.SyntaxKind.FalseKeyword) {
+          if (node.elseStatement) scanModuleLevel(node.elseStatement);
+        } else {
+          scanModuleLevel(node.thenStatement);
+          if (node.elseStatement) scanModuleLevel(node.elseStatement);
+        }
+        return;
+      }
       if (ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isMethodDeclaration(node) ||
         ts.isClassExpression(node)) {
         scanCallableModuleWrites(node);
@@ -811,6 +823,40 @@ function createLocalModuleResolver(files) {
     for (const callable of reachableCallables) scanCallableModuleWrites(callable);
     scanModuleLevel(sourceFile);
     return module;
+  };
+
+  const bindingPatternContains = (pattern, name) => {
+    if (ts.isIdentifier(pattern)) return pattern.text === name;
+    if (ts.isObjectBindingPattern(pattern) || ts.isArrayBindingPattern(pattern)) {
+      return pattern.elements.some(element => bindingPatternContains(element.name, name));
+    }
+    return false;
+  };
+
+  const isUnshadowedGlobalName = (identifier, name, module) => {
+    if (!ts.isIdentifier(identifier) || identifier.text !== name || module?.declaredBindings.has(name)) return false;
+    for (let scope = identifier.parent; scope && !ts.isSourceFile(scope); scope = scope.parent) {
+      if ((ts.isFunctionDeclaration(scope) || ts.isFunctionExpression(scope) || ts.isArrowFunction(scope) ||
+        ts.isMethodDeclaration(scope)) &&
+        scope.parameters.some(parameter => bindingPatternContains(parameter.name, name))) return false;
+      if ((ts.isClassDeclaration(scope) || ts.isClassExpression(scope)) && scope.name?.text === name) return false;
+      if (ts.isCatchClause(scope) && scope.variableDeclaration &&
+        bindingPatternContains(scope.variableDeclaration.name, name)) return false;
+      if (ts.isBlock(scope) && scope.statements.some(statement => {
+        if (ts.isVariableStatement(statement)) {
+          return statement.declarationList.declarations.some(declaration =>
+            bindingPatternContains(declaration.name, name));
+        }
+        return (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+          statement.name?.text === name;
+      })) return false;
+      if ((ts.isForStatement(scope) || ts.isForInStatement(scope) || ts.isForOfStatement(scope)) &&
+        scope.initializer && ts.isVariableDeclarationList(scope.initializer) &&
+        scope.initializer.declarations.some(declaration => bindingPatternContains(declaration.name, name))) {
+        return false;
+      }
+    }
+    return true;
   };
 
   const evaluateProperty = (expression, name, currentPath, visited, bindingOverrides = new Map()) => {
@@ -1042,14 +1088,16 @@ function createLocalModuleResolver(files) {
       } else {
         for (const nested of resolveClassProperty(atom, name, currentPath, visited)) result.add(nested);
       }
-      if (atom?.callable && ts.isFunctionDeclaration(atom.callable) && atom.callable.name) {
+      const attachedDeclaration = atom?.callable || atom?.classDeclaration;
+      if (attachedDeclaration && (ts.isFunctionDeclaration(attachedDeclaration) ||
+        ts.isClassDeclaration(attachedDeclaration)) && attachedDeclaration.name) {
         const callablePath = atom.modulePath || modulePath || currentPath;
-        for (const statement of atom.callable.getSourceFile().statements) {
+        for (const statement of attachedDeclaration.getSourceFile().statements) {
           if (!ts.isExpressionStatement(statement) || !ts.isBinaryExpression(statement.expression) ||
             statement.expression.operatorToken.kind !== ts.SyntaxKind.EqualsToken) continue;
           const left = unwrap(statement.expression.left);
           if (!ts.isPropertyAccessExpression(left) && !ts.isElementAccessExpression(left)) continue;
-          if (!ts.isIdentifier(left.expression) || left.expression.text !== atom.callable.name.text) continue;
+          if (!ts.isIdentifier(left.expression) || left.expression.text !== attachedDeclaration.name.text) continue;
           const assignedName = ts.isPropertyAccessExpression(left) ? left.name.text
             : staticPropertyValue(left.argumentExpression, callablePath);
           if (String(assignedName) !== String(name)) continue;
@@ -1413,6 +1461,11 @@ function createLocalModuleResolver(files) {
       evaluate(node.expression, currentPath, seen, parameterBindings), node.arguments || [], currentPath
     );
     if (ts.isCallExpression(node)) {
+      if (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'freeze' &&
+        node.arguments[0] && isUnshadowedGlobalName(node.expression.expression, 'Object',
+          currentPath && scanModule(currentPath))) {
+        return evaluate(node.arguments[0], currentPath, seen, parameterBindings, bindingOverrides);
+      }
       const callableAtoms = evaluate(node.expression, currentPath, seen, parameterBindings);
       const result = new Set();
       for (const atom of callableAtoms) {
