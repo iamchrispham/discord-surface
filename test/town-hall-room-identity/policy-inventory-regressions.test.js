@@ -707,6 +707,81 @@ test('default regex parameters apply only when the call omits that argument', ()
     }`,
   };
   assert.deepEqual(roomDigitPolicies([explicitPattern]), { [explicitPattern.file]: 1 });
+
+  const explicitUndefined = {
+    file: 'peer/default-room-pattern-undefined.ts',
+    text: String.raw`function matches(value, pattern = /^\d{1,21}$/) {
+      return pattern.test(value);
+    }
+    function validateTownHallRoom(room) {
+      return matches(room.guildId, undefined);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([explicitUndefined]), { [explicitUndefined.file]: 1 });
+
+  const shadowedUndefined = {
+    file: 'peer/default-room-pattern-shadowed-undefined.ts',
+    text: String.raw`function matches(value, pattern = /^\d{1,21}$/) {
+      return pattern.test(value);
+    }
+    function validateTownHallRoom(room, undefined) {
+      return matches(room.guildId, undefined);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([shadowedUndefined]), {});
+
+  const explicitUndefinedOrdinary = {
+    file: 'peer/default-room-pattern-undefined-ordinary.ts',
+    text: String.raw`function matches(value, pattern = /^\d{1,21}$/) {
+      return pattern.test(value);
+    }
+    function validateTownHallRoom(room) {
+      return matches(room.name, undefined);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([explicitUndefinedOrdinary]), {});
+});
+
+test('finite Function.apply arrays propagate only room identifier fields', () => {
+  const helper = {
+    file: 'peer/apply-room-policy.ts',
+    text: String.raw`export function check(value) {
+      return /^\d{1,22}$/.test(value);
+    }`,
+  };
+  const consumer = {
+    file: 'peer/apply-room-consumer.ts',
+    text: String.raw`import { check } from './apply-room-policy';
+    function validateTownHallRoom(room) {
+      return check.apply(null, [room.guildId]);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, consumer]), { [helper.file]: 1 });
+
+  const ordinary = {
+    file: 'peer/apply-room-ordinary-consumer.ts',
+    text: String.raw`import { check } from './apply-room-policy';
+    function validateTownHallRoom(room) {
+      return check.apply(null, [room.name]);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, ordinary]), {});
+});
+
+test('bound require parameters are not treated as CommonJS modules', () => {
+  const helper = {
+    file: 'peer/shadowed-require-room-policy.ts',
+    text: String.raw`export function check(value) {
+      return /^\d{1,22}$/.test(value);
+    }`,
+  };
+  const consumer = {
+    file: 'peer/shadowed-require-room-consumer.ts',
+    text: String.raw`function validateTownHallRoom(room, require) {
+      return require('./shadowed-require-room-policy').check(room.guildId);
+    }`,
+  };
+  assert.deepEqual(roomDigitPolicies([helper, consumer]), {});
 });
 
 test('native RegExp constructor aliases retain lexical shadowing', () => {

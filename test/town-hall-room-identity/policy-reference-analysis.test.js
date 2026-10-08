@@ -246,3 +246,33 @@ test('reference analysis follows default guard re-exports without matching other
   assert.equal(countIdentifierReferences(guardConsumer, 'isTownHallRoom', [plan, guardBarrel]), 1);
   assert.equal(countIdentifierReferences(unrelatedConsumer, 'isTownHallRoom', [plan, unrelatedBarrel]), 0);
 });
+
+test('reference analysis ignores labels and jump targets', () => {
+  const labels = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
+    isTownHallRoom: while (true) {
+      break isTownHallRoom;
+      continue isTownHallRoom;
+    }`);
+  assert.equal(countIdentifierReferences(labels, 'isTownHallRoom'), 0);
+
+  const realImport = source(String.raw`import { isTownHallRoom } from './town-hall-plan';
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(realImport, 'isTownHallRoom'), 1);
+});
+
+test('reference analysis ignores locally bound CommonJS loaders', () => {
+  const parameterLoader = source(String.raw`function load(require) {
+    const { isTownHallRoom } = require('./town-hall-plan');
+    return isTownHallRoom(room);
+  }`);
+  assert.equal(countIdentifierReferences(parameterLoader, 'isTownHallRoom'), 0);
+
+  const localLoader = source(String.raw`const require = loader;
+    const { isTownHallRoom } = require('./town-hall-plan');
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(localLoader, 'isTownHallRoom'), 0);
+
+  const realLoader = source(String.raw`const { isTownHallRoom } = require('./town-hall-plan');
+    isTownHallRoom(room);`);
+  assert.equal(countIdentifierReferences(realLoader, 'isTownHallRoom'), 1);
+});

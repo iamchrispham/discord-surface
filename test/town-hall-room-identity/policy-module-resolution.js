@@ -193,6 +193,7 @@ function createPolicyModuleGraph({
       if (ts.isCallExpression(expression.expression) &&
           ts.isIdentifier(expression.expression.expression) &&
           expression.expression.expression.text === 'require' &&
+          !findBinding(info, 'require', expression.expression.expression) &&
           expression.expression.arguments.length === 1 &&
           ts.isStringLiteralLike(expression.expression.arguments[0])) {
         const target = resolveModule(info, expression.expression.arguments[0].text);
@@ -204,11 +205,23 @@ function createPolicyModuleGraph({
   for (const info of infos) {
     const visit = node => {
       if (ts.isCallExpression(node)) {
-        const callMethod = ts.isPropertyAccessExpression(node.expression) &&
-          node.expression.name.text === 'call';
+        const callMethodName = ts.isPropertyAccessExpression(node.expression)
+          ? node.expression.name.text
+          : null;
+        const callMethod = callMethodName === 'call' || callMethodName === 'apply';
         const callReceiver = callMethod ? resolveFunction(info, node.expression.expression) : null;
         const fn = callReceiver || resolveFunction(info, node.expression);
-        const args = callReceiver ? node.arguments.slice(1) : node.arguments;
+        let args = node.arguments;
+        if (callReceiver && callMethodName === 'call') {
+          args = node.arguments.slice(1);
+        }
+        if (callReceiver && callMethodName === 'apply') {
+          const suppliedArguments = node.arguments[1];
+          args = suppliedArguments && ts.isArrayLiteralExpression(suppliedArguments) &&
+            !suppliedArguments.elements.some(element => ts.isSpreadElement(element))
+            ? suppliedArguments.elements
+            : [];
+        }
         if (fn) fn.calls.push({ info, args, node });
       }
       ts.forEachChild(node, visit);

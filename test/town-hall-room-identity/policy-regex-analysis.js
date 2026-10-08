@@ -105,8 +105,12 @@ function createPolicyRegexAnalysis({
           if (ts.isCallExpression(candidate) &&
               !candidate.arguments.some(argument => ts.isSpreadElement(argument))) {
             const resolved = resolveFunction(info, candidate.expression);
+            const defaultArgument = candidate.arguments[patternIndex];
+            const usesDefault = candidate.arguments.length <= patternIndex ||
+              (ts.isIdentifier(defaultArgument) && defaultArgument.text === 'undefined' &&
+                !findBinding(info, 'undefined', defaultArgument));
             if (resolved?.info === info && resolved.node === matcher.node &&
-                candidate.arguments.length <= patternIndex) {
+                usesDefault) {
               for (const inputIndex of inputParameterIndexes) {
                 if (candidate.arguments[inputIndex]) inputs.push(candidate.arguments[inputIndex]);
               }

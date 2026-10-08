@@ -119,6 +119,10 @@ function isSemanticIdentifierReference(node) {
   const parent = node.parent;
   if (!parent) return true;
   if (isTypePosition(node)) return false;
+  if (ts.isLabeledStatement(parent) && parent.label === node) return false;
+  if ((ts.isBreakStatement(parent) || ts.isContinueStatement(parent)) && parent.label === node) {
+    return false;
+  }
   if (ts.isPropertyAccessExpression(parent) && parent.name === node) return false;
   if (ts.isQualifiedName(parent) && parent.right === node) return false;
   if (ts.isBindingElement(parent) && (parent.propertyName === node || parent.name === node)) return false;
@@ -466,7 +470,8 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
         ? node.initializer.expression
         : node.initializer;
       const isRequireCall = ts.isCallExpression(initializer) &&
-        ts.isIdentifier(initializer.expression) && initializer.expression.text === 'require';
+        ts.isIdentifier(initializer.expression) && initializer.expression.text === 'require' &&
+        !resolveBinding(initializer.expression, bindings);
       const isDynamicImport = ts.isCallExpression(initializer) &&
         initializer.expression.kind === ts.SyntaxKind.ImportKeyword;
       if (!isRequireCall && !isDynamicImport) {
@@ -503,7 +508,8 @@ function countIdentifierReferences(sourceFile, name, sourceFiles = []) {
   bindings.push(...imports);
   const candidates = bindings.filter(binding => binding.name === name && binding.scope === sourceFile);
   const importedNames = new Set(imports.map(binding => binding.name));
-  const localCandidates = candidates.filter(binding => !importedNames.has(binding.name));
+  const localCandidates = candidates.filter(binding =>
+    !importedNames.has(binding.name) && !ts.isBindingElement(binding.declaration));
   const importedTarget = imports.find(binding => !binding.namespace &&
     isTownHallGuardExport(sourceFile, binding.specifier, binding.importedName, sourceFiles));
   const target = localCandidates.find(binding => ts.isFunctionDeclaration(binding.declaration) &&
