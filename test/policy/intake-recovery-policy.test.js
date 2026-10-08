@@ -361,6 +361,9 @@ const objectHasTopLevelStateGap = (tokens, openingIndex, closingIndex, pairs, al
       if (spreadEnd !== undefined
         && objectHasTopLevelStateGap(tokens, index + 1, spreadEnd, pairs, aliases, allowNestedCalls)) return true;
     }
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0
+      && value === '...' && tokens[index + 1]?.type === 'identifier'
+      && aliases.has(tokens[index + 1].value)) return true;
     const computedKey = value === '[' && tokens[index + 2]?.value === ']';
     const propertyName = computedKey
       ? staticPropertyName(tokens[index + 1])
@@ -1367,7 +1370,26 @@ const isScheduledCallback = (tokens, pairs, range) => {
     return false;
   }
   if (tokens[callbackStart - 1]?.value === 'async') callbackStart -= 1;
-  const callOpening = callbackStart - 1;
+  let callOpening = callbackStart - 1;
+  if (tokens[callOpening]?.value !== '(') {
+    let nestedClosers = 0;
+    for (let index = callOpening - 1; index >= 0; index -= 1) {
+      if ([')', '}', ']'].includes(tokens[index].value)) {
+        nestedClosers += 1;
+        continue;
+      }
+      if (!['(', '{', '['].includes(tokens[index].value)) continue;
+      if (nestedClosers > 0) {
+        nestedClosers -= 1;
+        continue;
+      }
+      if (tokens[index].value === '(') {
+        callOpening = index;
+        break;
+      }
+      return false;
+    }
+  }
   if (tokens[callOpening]?.value !== '(') return false;
   const callClosing = pairs.get(callOpening);
   if (callClosing === undefined || callClosing < range.closing) return false;
@@ -1444,6 +1466,24 @@ const hasGapOutcome = (tokens, start, end, opening, pairs, functionRanges, alias
       if (valueHasGapOutcome(tokens, assignmentValueStart, statementEnd, pairs, knownAliases)) return true;
       index = Math.max(index, statementEnd - 1);
       continue;
+    }
+    if (['const', 'let', 'var'].includes(token.value) && tokens[index + 1]?.value === '{') {
+      const bindingEnd = pairs.get(index + 1);
+      const equalsIndex = bindingEnd === undefined ? undefined : bindingEnd + 1;
+      if (equalsIndex !== undefined && tokens[equalsIndex]?.value === '='
+        && tokens[equalsIndex + 1]?.value === 'READINESS') {
+        for (const [bindingStart, bindingSegmentEnd] of topLevelSegments(tokens, index + 2, bindingEnd)) {
+          const propertyName = staticPropertyName(tokens[bindingStart]);
+          const colonIndex = topLevelToken(tokens, bindingStart, bindingSegmentEnd, ':');
+          const aliasIndex = colonIndex >= 0 ? colonIndex + 1 : bindingStart;
+          if (propertyName === 'GAP' && tokens[aliasIndex]?.type === 'identifier') {
+            knownAliases.add(tokens[aliasIndex].value);
+          }
+        }
+        const statementEnd = findStatementEnd(tokens, equalsIndex + 1, end);
+        index = Math.max(index, statementEnd - 1);
+        continue;
+      }
     }
     if (token.type === 'identifier' && tokens[index - 1]?.value !== '.'
       && tokens[index + 1]?.value === '=') {
@@ -1543,7 +1583,10 @@ const isDeadlineTriggerAt = (tokens, index) => {
   const remainingBudget = dateNow(0)
     && tokens[index - 1]?.value === '-'
     && deadlineOperandEnd(index - 2) === index - 1;
-  return directComparison || reverseComparison || remainingBudget;
+  const elapsedTime = dateNow(0)
+    && tokens[index + 5]?.value === '-'
+    && deadlineOperandEnd(index + 6) !== null;
+  return directComparison || reverseComparison || remainingBudget || elapsedTime;
 };
 
 const findAssignedAlias = (tokens, triggerIndex) => {
@@ -2001,7 +2044,22 @@ const findDeadlineGapOffenders = entries => entries.flatMap(({ relative, source 
       for (let negationIndex = alias.index + 2; tokens[negationIndex]?.value === '!'; negationIndex += 1) {
         aliasNegationCount += 1;
       }
-      const aliasNegated = aliasNegationCount % 2 === 1;
+      const isBooleanComparison = (operator, literal) => ['===', '!==', '==', '!='].includes(operator)
+        && ['true', 'false'].includes(literal);
+      let comparisonOperator = null;
+      let comparisonLiteral = null;
+      if (isBooleanComparison(tokens[index + 1]?.value, tokens[index + 2]?.value)) {
+        comparisonOperator = tokens[index + 1].value;
+        comparisonLiteral = tokens[index + 2].value;
+      } else if (isBooleanComparison(tokens[index - 1]?.value, tokens[index - 2]?.value)) {
+        comparisonOperator = tokens[index - 1].value;
+        comparisonLiteral = tokens[index - 2].value;
+      }
+      const comparisonNegated = comparisonOperator !== null
+        && ((['===', '=='].includes(comparisonOperator) && comparisonLiteral === 'false')
+          || (['!==', '!='].includes(comparisonOperator) && comparisonLiteral === 'true'));
+      const aliasPolarity = (aliasNegationCount % 2 === 1) !== comparisonNegated;
+      const aliasNegated = aliasPolarity;
       deadlineAliases.push({
         ...alias,
         negated: aliasNegated,
@@ -2233,12 +2291,31 @@ test('deadline policy inventory inspects braced callbacks in returned promises',
   assert.deepEqual(offenders, ['discord/deadline-returned-promise-gap.js:1']);
 });
 
+test('deadline policy inventory inspects secondary promise continuation callbacks', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-rejected-promise-gap.js',
+    source: 'if (deadlineReached) return Promise.reject().then(undefined, () => state.markIntakeBoundary(id, READINESS.GAP, detail));'
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-rejected-promise-gap.js:1']);
+});
+
 test('deadline policy inventory recognizes static computed outcome keys', () => {
   const offenders = findDeadlineGapOffenders([{
     relative: 'discord/deadline-computed-outcome-key.js',
     source: "if (deadlineReached) return { ['state']: READINESS.GAP };"
   }]);
   assert.deepEqual(offenders, ['discord/deadline-computed-outcome-key.js:1']);
+});
+
+test('deadline policy inventory resolves named object spreads in outcomes', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-named-object-spread.js',
+    source: [
+      'const gap = { state: READINESS.GAP };',
+      'if (deadlineReached) return { ...gap };'
+    ].join('\n')
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-named-object-spread.js:2']);
 });
 
 test('deadline policy inventory recognizes boundary writers invoked through call', () => {
@@ -2349,6 +2426,23 @@ test('deadline policy inventory follows remaining-budget aliases', () => {
   assert.deepEqual(offenders, ['discord/deadline-remaining-gap.js:1']);
 });
 
+test('deadline policy inventory recognizes elapsed-time deadline arithmetic', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-elapsed-direct-gap.js',
+      source: 'if (Date.now() - deadline >= 0) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/deadline-elapsed-alias-gap.js',
+      source: 'const elapsed = Date.now() - deadline; if (elapsed >= 0) return READINESS.GAP;'
+    }
+  ]);
+  assert.deepEqual(offenders, [
+    'discord/deadline-elapsed-direct-gap.js:1',
+    'discord/deadline-elapsed-alias-gap.js:1'
+  ]);
+});
+
 test('deadline policy inventory recognizes parenthesized operands in both comparison directions', () => {
   const offenders = findDeadlineGapOffenders([
     {
@@ -2445,6 +2539,20 @@ test('deadline policy inventory counts all negations in direct aliases', () => {
   assert.deepEqual(offenders, ['discord/deadline-even-negated-alias.js:1']);
 });
 
+test('deadline policy inventory preserves boolean-comparison alias polarity', () => {
+  const offenders = findDeadlineGapOffenders([
+    {
+      relative: 'discord/deadline-boolean-comparison-expiry-gap.js',
+      source: 'const within = deadlineReached === false; if (!within) return READINESS.GAP;'
+    },
+    {
+      relative: 'discord/deadline-boolean-comparison-before-expiry-gap.js',
+      source: 'const within = deadlineReached === false; if (within) return READINESS.GAP;'
+    }
+  ]);
+  assert.deepEqual(offenders, ['discord/deadline-boolean-comparison-expiry-gap.js:1']);
+});
+
 test('deadline policy inventory ignores passive deadline metadata and types', () => {
   const offenders = findDeadlineGapOffenders([
     {
@@ -2465,6 +2573,14 @@ test('deadline policy inventory resolves destructured enum values', () => {
     source: 'const { GAP: nextState } = READINESS; if (deadlineReached) return nextState;'
   }]);
   assert.deepEqual(offenders, ['deadline-gap-destructured-enum.js:1']);
+});
+
+test('deadline policy inventory tracks branch-local destructured gap aliases', () => {
+  const offenders = findDeadlineGapOffenders([{
+    relative: 'discord/deadline-branch-destructured-gap.js',
+    source: 'if (deadlineReached) { const { GAP: state } = READINESS; return { state }; }'
+  }]);
+  assert.deepEqual(offenders, ['discord/deadline-branch-destructured-gap.js:1']);
 });
 
 test('deadline policy inventory registers destructured local shadow bindings', () => {
